@@ -1,0 +1,100 @@
+#!/bin/bash -l
+#PBS -N saw_safety_submit
+#PBS -l walltime=00:02:00
+#PBS -l select=1:ncpus=1:mem=2GB
+#PBS -j oe
+#PBS -m n
+
+# ============================================================
+# job_safety_experiment.pbs
+# Submits three sequential jobs:
+#   1. safety_baseline   — Stage 5 WITH  CRASH + CRASHPT skims
+#   2. safety_nosafety   — Stage 5 WITHOUT safety skims
+#   3. safety_analysis   — compares outputs, plots, HTML report
+# ============================================================
+
+cd $PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+# ── Job 1: baseline (safety skims included) ──────────────────
+cat > _tmp_safety_baseline.pbs << 'INNER'
+#!/bin/bash -l
+#PBS -N saw_safety_base
+#PBS -l walltime=23:59:00
+#PBS -l select=1:ncpus=4:mem=194GB
+#PBS -j oe
+#PBS -m n
+cd $PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+mkdir -p runs/safety_baseline/plots
+echo "[$(date)] safety_baseline starting"
+export SAFETY_EXPERIMENT_MODE=baseline
+python -u pipeline_logger.py safety_baseline \
+    > log_safety_baseline.out 2> log_safety_baseline.err
+echo "[$(date)] safety_baseline done  exit=$?"
+INNER
+
+# ── Job 2: no-safety (safety skims excluded) ─────────────────
+cat > _tmp_safety_nosafety.pbs << 'INNER'
+#!/bin/bash -l
+#PBS -N saw_safety_nosa
+#PBS -l walltime=23:59:00
+#PBS -l select=1:ncpus=4:mem=194GB
+#PBS -j oe
+#PBS -m n
+cd $PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+mkdir -p runs/safety_nosafety/plots
+echo "[$(date)] safety_nosafety starting"
+export SAFETY_EXPERIMENT_MODE=nosafety
+python -u pipeline_logger.py safety_nosafety \
+    > log_safety_nosafety.out 2> log_safety_nosafety.err
+echo "[$(date)] safety_nosafety done  exit=$?"
+INNER
+
+# ── Job 3: analysis ───────────────────────────────────────────
+cat > _tmp_safety_analysis.pbs << 'INNER'
+#!/bin/bash -l
+#PBS -N saw_safety_anal
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -j oe
+#PBS -m n
+cd $PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+mkdir -p runs/safety_analysis/plots
+echo "[$(date)] safety_analysis starting"
+python -u safety_experiment_analysis.py \
+    > log_safety_analysis.out 2> log_safety_analysis.err
+echo "[$(date)] safety_analysis done  exit=$?"
+INNER
+
+# ── Submit chain ──────────────────────────────────────────────
+JID1=$(qsub _tmp_safety_baseline.pbs)
+echo "Submitted safety_baseline  → $JID1"
+
+JID2=$(qsub -W depend=afterok:$JID1 _tmp_safety_nosafety.pbs)
+echo "Submitted safety_nosafety  → $JID2  (after $JID1)"
+
+JID3=$(qsub -W depend=afterok:$JID2 _tmp_safety_analysis.pbs)
+echo "Submitted safety_analysis  → $JID3  (after $JID2)"
+
+rm -f _tmp_safety_baseline.pbs _tmp_safety_nosafety.pbs _tmp_safety_analysis.pbs
+
+echo ""
+echo "Monitor:  qstat -u \$USER"
+echo "Logs:     tail -f log_safety_baseline.err"
+echo "          tail -f log_safety_nosafety.err"
+echo "          tail -f log_safety_analysis.err"

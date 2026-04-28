@@ -1,0 +1,80 @@
+#!/bin/bash -l
+# Generic PBS runner for pipeline_logger.py modes.
+#
+# Submit via qsub with environment variables, for example:
+#   qsub -v MODE=main,ZONE_ARG=40,CONDA_ENV=zigenv,THREADS=2 pbs_pipeline_mode.pbs
+
+#PBS -j eo
+#PBS -m n
+#PBS -r y
+
+set -eu
+
+MODE=${MODE:-main}
+ZONE_ARG=${ZONE_ARG:-}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+THREADS=${THREADS:-1}
+S5_WORKERS=${S5_WORKERS:-1}
+RUN_ROOT=${RUN_ROOT:-runs}
+PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+PIPELINE_RUN_TAG=${PIPELINE_RUN_TAG:-${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}
+
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# Keep linear algebra and numba-backed sections from oversubscribing cores.
+# THREADS controls BLAS/numba; S5_WORKERS controls Stage 5 zone parallelism.
+# Rule of thumb: S5_WORKERS = ncpus / THREADS  (e.g. ncpus=8,THREADS=1 → S5_WORKERS=8)
+export OMP_NUM_THREADS="$THREADS"
+export OPENBLAS_NUM_THREADS="$THREADS"
+export MKL_NUM_THREADS="$THREADS"
+export NUMEXPR_NUM_THREADS="$THREADS"
+export STAGE5_WORKERS="$S5_WORKERS"
+export PIPELINE_ACCELERATOR
+export PIPELINE_RUN_TAG
+export PIPELINE_RUN_ROOT="$RUN_ROOT"
+
+run_suffix="$MODE"
+if [ -n "$ZONE_ARG" ]; then
+    safe_arg=${ZONE_ARG//\//_}
+    safe_arg=${safe_arg//\\/_}
+    safe_arg=${safe_arg// /}
+    run_suffix="${MODE}_${safe_arg}"
+fi
+run_suffix="${run_suffix}__${PIPELINE_RUN_TAG}"
+
+mkdir -p "$RUN_ROOT/$run_suffix/plots"
+
+echo "=========================================="
+echo "PBS job ${PBS_JOBID:-unknown}"
+echo "Mode:        $MODE"
+echo "Zone arg:    ${ZONE_ARG:-<all>}"
+echo "Conda env:   $CONDA_ENV"
+echo "Threads:     $THREADS"
+echo "Accelerator: $PIPELINE_ACCELERATOR"
+echo "Run tag:     $PIPELINE_RUN_TAG"
+echo "Working dir: $PBS_O_WORKDIR"
+echo "Run dir:     ${RUN_ROOT}/${run_suffix}"
+echo "Started:     $(date)"
+echo "=========================================="
+
+if [ "$MODE" = "safety_analysis" ]; then
+    stdbuf -oL python -u safety_experiment_analysis.py \
+        2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+else
+    if [ -n "$ZONE_ARG" ]; then
+        stdbuf -oL python -u pipeline_logger.py "$MODE" "$ZONE_ARG" \
+            2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+    else
+        stdbuf -oL python -u pipeline_logger.py "$MODE" \
+            2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+    fi
+fi
+
+EXIT_CODE=$?
+echo "Finished: $(date)  exit_code=${EXIT_CODE}"
+exit "$EXIT_CODE"

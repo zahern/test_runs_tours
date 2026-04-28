@@ -1,0 +1,38 @@
+#!/bin/bash -l
+#PBS -N saw_all
+#PBS -l walltime=23:59:00
+#PBS -l select=1:ncpus=4:mem=194GB
+#PBS -j eo
+#PBS -m n
+#PBS -r y
+
+cd $PBS_O_WORKDIR
+
+module purge
+module load Anaconda3/2024.02-1
+
+# Clean logs for this job
+rm -f saw_all.o*
+rm -f saw_all.e*
+
+# Activate environment
+conda activate zigenv
+module unload Anaconda3
+
+# List of modes to run
+MODES=("main" "ga" "ga_staged")
+
+echo "Running all modes: ${MODES[@]}"
+
+for MODE in "${MODES[@]}"; do
+    echo "----------------------------------------"
+    echo "Running mode: $MODE"
+    echo "----------------------------------------"
+
+    # Run the pipeline for this mode
+    python pipeline_logger.py "$MODE" > "log_${MODE}.out" 2> "log_${MODE}.err"
+
+    echo "Finished mode: $MODE"
+done
+
+echo "All modes completed."

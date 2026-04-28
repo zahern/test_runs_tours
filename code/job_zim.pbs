@@ -1,0 +1,26 @@
+#!/bin/bash -l
+#PBS -N sawjn_all
+#PBS -l walltime=23:59:00
+#PBS -l select=1:ncpus=1:mem=94GB
+#PBS -j eo
+#PBS -m n
+#PBS -r y
+
+cd $PBS_O_WORKDIR
+
+module purge
+module load Anaconda3/2024.02-1
+
+# Activate environment
+conda activate zigenv
+module unload Anaconda3
+
+FILEPATH="saved_data/zone_ids_sa2/order_40.csv"
+
+MODES=("main" "ga" "ga_staged")
+
+for MODE in "${MODES[@]}"; do
+    TAG="sawjn_${MODE}"
+    python pipeline_logger.py "$MODE" "$FILEPATH" \
+        > ${TAG}.out 2> ${TAG}.err
+done

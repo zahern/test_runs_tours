@@ -1,0 +1,33 @@
+#!/bin/bash -l
+#PBS -N saw_main
+#PBS -l walltime=20:59:00
+#PBS -l select=1:ncpus=1:mem=194GB:ngpus=1
+#PBS -j eo
+#PBS -m abe
+#PBS -r y
+
+cd $PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+rm -f saw_main.o* saw_main.e*
+rm -f log_main.o* log_main.e* log_main.out log_main.err
+conda activate zigenv
+module unload Anaconda3
+
+# Create the run directory before Python starts so the manifest is written
+# even if Python fails immediately (helps diagnose import errors etc.)
+mkdir -p runs/main/plots
+
+echo "=========================================="
+echo "PBS job $PBS_JOBID  mode=main"
+echo "Working dir: $PBS_O_WORKDIR"
+echo "Output dir:  runs/main/"
+echo "Started:     $(date)"
+echo "=========================================="
+
+# -u = unbuffered stdout so print() appears in .out immediately (not lost on OOM kill)
+python -u pipeline_logger.py main     > log_main.out     2> log_main.err
+
+EXIT_CODE=$?
+echo "Finished: $(date)  exit_code=${EXIT_CODE}"
+exit ${EXIT_CODE}

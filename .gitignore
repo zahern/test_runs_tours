@@ -1,0 +1,75 @@
+# ============================================================
+# .gitignore — test_runs_tours/code
+# ============================================================
+# NOTE: Git cannot filter by file size in .gitignore.
+# GitHub hard-rejects any single file > 100 MB at push time.
+# Add known large files explicitly in the section below, or
+# use Git LFS:  git lfs track "*.omx"
+# ============================================================
+
+# ── Virtual environment ─────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Editor / AI assistant ───────────────────────────────────
+.vscode/
+.claude/
+.idea/
+
+# ── Cluster / PBS log files (*.err, *.out, *.eNNNNNNN, *.oNNNNNNN) ─────────
+*.err
+*.out
+*.e[0-9]*
+*.o[0-9]*
+
+# ── Generated outputs and run artefacts ─────────────────────
+saved_data/
+runs/
+_runs/
+
+# ── External library bundled in repo ────────────────────────
+activitysim-main/
+
+# ── Shapefile / GIS folders and large spatial data ──────────
+SA1_SHP/
+SA2_2021_AUST_SHP_GDA2020/
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.sbn
+*.sbx
+
+# ── Large spreadsheets and datasets ─────────────────────────
+*.xlsx
+*.xls
+code/comprehensive_dataset.csv
+code/initial_trips_hhts.csv
+code/pddopulation_by_order_with_osm_and_landuse.csv
+
+# ── Text / LaTeX files ──────────────────────────────────────
+*.txt
+*.tex
+
+# ── Known large binary / data files (> 100 MB) ──────────────
+# Uncomment or add any file whose size exceeds GitHub's 100 MB limit.
+# To check sizes:  Get-ChildItem -Recurse | Where-Object {$_.Length -gt 100MB}
+*.omx
+# comprehensive_dataset.csv
+# initial_trips_hhts.csv
+# pddopulation_by_order_with_osm_and_landuse.csv
+
+# ── Python cache / compiled files ───────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# ── OS artefacts ────────────────────────────────────────────
+.DS_Store
+Thumbs.db

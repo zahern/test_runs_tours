@@ -1,0 +1,22 @@
+#!/bin/bash -l
+#PBS -N saw
+#PBS -l walltime=23:59:00
+#PBS -l select=1:ncpus=1:mem=194GB
+#PBS -j eo
+#PBS -m n
+#PBS -r y
+
+
+cd $PBS_O_WORKDIR
+module purge
+#module load cuda/11.3.1
+module load Anaconda3/2024.02-1
+rm -f *saw.o*  # Remove .o files
+rm -f *saw.e*  # Remove .e files
+
+# Activate the environment
+conda activate zigenv
+module unload Anaconda3
+
+python pipeline_logger.py 
+

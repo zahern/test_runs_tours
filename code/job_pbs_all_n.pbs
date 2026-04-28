@@ -1,0 +1,136 @@
+#!/bin/bash -l
+#
+# job_pbs_all_n.pbs
+# ==================
+# Submits main, ga, and ga_staged as three independent PBS jobs.
+# Each job gets its OWN walltime window and writes to its OWN output folder:
+#
+#   runs/main/        ← python pipeline_logger.py main
+#   runs/ga/          ← python pipeline_logger.py ga
+#   runs/ga_staged/   ← python pipeline_logger.py ga_staged
+#
+# Usage:
+#   qsub job_pbs_all_n.pbs            → submit all three simultaneously (default: parallel)
+#   qsub job_pbs_all_n.pbs sequential → main first, ga after, ga_staged last (afterok chain)
+#
+# Each mode writes to its OWN directory:
+#   runs/main/        ← python -u pipeline_logger.py main
+#   runs/ga/          ← python -u pipeline_logger.py ga
+#   runs/ga_staged/   ← python -u pipeline_logger.py ga_staged
+#
+# The submission script itself runs near-instantly — it just calls qsub 3 times.
+
+#PBS -N saw_submit
+#PBS -l walltime=00:02:00
+#PBS -l select=1:ncpus=1:mem=2GB
+#PBS -j eo
+#PBS -m n
+
+cd $PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+# Clean stale scheduler and redirected logs so each run starts with fresh files.
+rm -f log_main.o* log_main.e* log_main.out log_main.err
+rm -f log_ga.o* log_ga.e* log_ga.out log_ga.err
+rm -f log_ga_staged.o* log_ga_staged.e* log_ga_staged.out log_ga_staged.err
+rm -f saw_submit.o* saw_submit.e* saw_submit,o* saw_submit,e*
+conda activate zigenv
+module unload Anaconda3
+
+# Default: parallel — all three modes run independently.
+# Use: qsub job_pbs_all_n.pbs sequential  if you want main→ga→ga_staged chain.
+SUBMIT_MODE=${1:-"parallel"}     # "parallel" (default) or "sequential"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Write per-mode job scripts
+# Each script:
+#   1. Creates its run directory (runs/<mode>/) before Python starts
+#   2. Calls pipeline_logger.py <mode> which sets OUT_DIR=runs/<mode>/
+#   3. Redirects stdout/stderr to log_<mode>.out / log_<mode>.err
+# ─────────────────────────────────────────────────────────────────────────────
+write_job() {
+    local MODE=$1
+    local SCRIPT="job_${MODE}.pbs"
+
+    cat > "${SCRIPT}" << INNER
+#!/bin/bash -l
+#PBS -N saw_${MODE}
+#PBS -l walltime=20:59:00
+#PBS -l select=1:ncpus=1:mem=194GB:ngpus=1
+#PBS -j eo
+#PBS -m abe
+#PBS -r y
+
+cd \$PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+rm -f saw_${MODE}.o* saw_${MODE}.e*
+rm -f log_${MODE}.o* log_${MODE}.e* log_${MODE}.out log_${MODE}.err
+conda activate zigenv
+module unload Anaconda3
+
+# Create the run directory before Python starts so the manifest is written
+# even if Python fails immediately (helps diagnose import errors etc.)
+mkdir -p runs/${MODE}/plots
+
+echo "=========================================="
+echo "PBS job \$PBS_JOBID  mode=${MODE}"
+echo "Working dir: \$PBS_O_WORKDIR"
+echo "Output dir:  runs/${MODE}/"
+echo "Started:     \$(date)"
+echo "=========================================="
+
+# -u = unbuffered stdout so print() appears in .out immediately (not lost on OOM kill)
+python -u pipeline_logger.py ${MODE} \
+    > log_${MODE}.out \
+    2> log_${MODE}.err
+
+EXIT_CODE=\$?
+echo "Finished: \$(date)  exit_code=\${EXIT_CODE}"
+exit \${EXIT_CODE}
+INNER
+
+    echo "  wrote ${SCRIPT}"
+}
+
+for MODE in main ga ga_staged; do
+    write_job "${MODE}"
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Submit
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "${SUBMIT_MODE}" = "parallel" ]; then
+    # All three run simultaneously — no dependencies
+    JID_MAIN=$(qsub job_main.pbs)
+    JID_GA=$(qsub job_ga.pbs)
+    JID_STAGED=$(qsub job_ga_staged.pbs)
+    echo "Submitted in PARALLEL:"
+    echo "  main       → ${JID_MAIN}  (logs: log_main.out / log_main.err)"
+    echo "  ga         → ${JID_GA}  (logs: log_ga.out / log_ga.err)"
+    echo "  ga_staged  → ${JID_STAGED}  (logs: log_ga_staged.out / log_ga_staged.err)"
+else
+    # Sequential with afterok dependencies so each mode only starts if the prior one succeeded
+    JID_MAIN=$(qsub job_main.pbs)
+    echo "Submitted main      → ${JID_MAIN}"
+
+    JID_GA=$(qsub -W depend=afterok:${JID_MAIN} job_ga.pbs)
+    echo "Submitted ga        → ${JID_GA}  (after ${JID_MAIN})"
+
+    JID_STAGED=$(qsub -W depend=afterok:${JID_GA} job_ga_staged.pbs)
+    echo "Submitted ga_staged → ${JID_STAGED}  (after ${JID_GA})"
+fi
+
+echo ""
+echo "Output directories:"
+echo "  runs/main/         ← main run outputs"
+echo "  runs/ga/           ← ga run outputs"
+echo "  runs/ga_staged/    ← ga_staged run outputs"
+echo ""
+echo "Monitor with:"
+echo "  qstat -u \$USER"
+echo "  tail -f log_main.err"
+echo "  tail -f log_ga.err"
+echo "  tail -f log_ga_staged.err"
+echo ""
+echo "To run in parallel: qsub job_pbs_all_n.pbs parallel"

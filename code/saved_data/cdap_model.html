@@ -1,0 +1,110 @@
+<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>CDAP Results</title>
+<style>body{font-family:Arial,sans-serif;margin:40px;max-width:1200px}
+h1{border-bottom:2px solid #1565c0;padding-bottom:8px}h2{color:#1565c0}
+.stats{background:#e3f2fd;padding:6px 12px;border-radius:4px;margin-bottom:10px}
+table{border-collapse:collapse;width:100%;margin-bottom:20px}
+th{background:#1565c0;color:white;padding:8px 12px;text-align:left}
+td{padding:5px 12px;border-bottom:1px solid #eee;font-size:.9em}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:32px}</style></head>
+<body><h1>CDAP — Coordinated Daily Activity Pattern</h1>
+<p><b>H</b>=Home | <b>N</b>=Non-mandatory | <b>M</b>=Mandatory (work/school)</p>
+<p>Reference alternative: H. Prefixes: <code>b_N_</code>=H→N effect, <code>b_M_</code>=H→M effect.
+MXL random coefficients (s_*) show taste heterogeneity — significant std dev means people vary in that preference.</p>
+<div class="grid"><div><h2>MNL — Base Model</h2><p class="stats">LL=-11879.1 | ρ²=nan</p><table><thead><tr><th>Parameter</th><th>Value</th><th>Std Err</th><th>t-stat</th><th>★</th></tr></thead><tbody><tr><td>ASC_M</td><td style="text-align:right">-6.0842</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>ASC_N</td><td style="text-align:right">0.6749</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_age_child</td><td style="text-align:right">0.6854</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_age_norm</td><td style="text-align:right">2.1013</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_age_older</td><td style="text-align:right">-0.6029</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_age_senior</td><td style="text-align:right">-1.3981</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_age_teen</td><td style="text-align:right">0.0266</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_has_licence</td><td style="text-align:right">0.1420</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_has_vehicle</td><td style="text-align:right">0.6157</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_hh_alone</td><td style="text-align:right">-0.1838</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_hh_child</td><td style="text-align:right">-0.2197</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_hh_size_large</td><td style="text-align:right">0.4622</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_hh_spouse</td><td style="text-align:right">-0.3056</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_income_midplus</td><td style="text-align:right">0.6099</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_is_female</td><td style="text-align:right">0.2106</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_FullTimeWorker</td><td style="text-align:right">5.9941</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_PartTimeWorker</td><td style="text-align:right">5.9860</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_Preschool</td><td style="text-align:right">7.3337</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_Retired</td><td style="text-align:right">-8.3029</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_SchoolChild</td><td style="text-align:right">6.7877</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_UniversityStudent</td><td style="text-align:right">5.2005</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_WorkingStudent</td><td style="text-align:right">6.2092</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_wfh</td><td style="text-align:right">-1.0949</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_age_child</td><td style="text-align:right">0.7287</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_age_norm</td><td style="text-align:right">-2.9775</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_age_older</td><td style="text-align:right">0.7146</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_age_senior</td><td style="text-align:right">0.9144</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_age_teen</td><td style="text-align:right">-0.6933</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_has_licence</td><td style="text-align:right">0.8325</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_has_vehicle</td><td style="text-align:right">0.4332</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_hh_alone</td><td style="text-align:right">-0.1210</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_hh_child</td><td style="text-align:right">-0.1527</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_hh_size_large</td><td style="text-align:right">0.0136</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_hh_spouse</td><td style="text-align:right">-0.1486</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_income_midplus</td><td style="text-align:right">0.6988</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_is_female</td><td style="text-align:right">0.0908</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_FullTimeWorker</td><td style="text-align:right">-10.0000</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_PartTimeWorker</td><td style="text-align:right">-7.3084</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_Preschool</td><td style="text-align:right">-0.3674</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_Retired</td><td style="text-align:right">0.2651</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_SchoolChild</td><td style="text-align:right">-3.1511</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_UniversityStudent</td><td style="text-align:right">-3.0732</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_WorkingStudent</td><td style="text-align:right">-5.6183</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_wfh</td><td style="text-align:right">-2.9143</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+</tbody></table></div>
+<div><h2>Mixed Logit — Random Coefficients</h2><p class="stats">LL=-11865.0 | ρ²=nan</p><table><thead><tr><th>Parameter</th><th>Value</th><th>Std Err</th><th>t-stat</th><th>★</th></tr></thead><tbody><tr><td>ASC_M</td><td style="text-align:right">-6.3677</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>ASC_N</td><td style="text-align:right">1.1921</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_age_child</td><td style="text-align:right">0.6159</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_age_norm</td><td style="text-align:right">1.6785</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_age_older</td><td style="text-align:right">-0.4296</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_age_senior</td><td style="text-align:right">-0.8947</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_age_teen</td><td style="text-align:right">-0.0822</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_has_licence</td><td style="text-align:right">0.1724</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_has_vehicle</td><td style="text-align:right">0.5023</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_hh_alone</td><td style="text-align:right">-0.2291</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_hh_child</td><td style="text-align:right">-0.2567</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_hh_size_large</td><td style="text-align:right">0.4144</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_hh_spouse</td><td style="text-align:right">-0.3077</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_income_midplus</td><td style="text-align:right">0.6166</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_is_female</td><td style="text-align:right">0.1907</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_FullTimeWorker</td><td style="text-align:right">6.5459</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_PartTimeWorker</td><td style="text-align:right">6.5834</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_Preschool</td><td style="text-align:right">7.8685</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_Retired</td><td style="text-align:right">-8.3044</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_SchoolChild</td><td style="text-align:right">7.4253</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_UniversityStudent</td><td style="text-align:right">5.7963</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_ptype_WorkingStudent</td><td style="text-align:right">6.7919</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_M_wfh</td><td style="text-align:right">-1.0934</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_age_child</td><td style="text-align:right">1.1626</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_age_norm</td><td style="text-align:right">-4.0043</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_age_older</td><td style="text-align:right">0.7887</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_age_senior</td><td style="text-align:right">1.0964</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_age_teen</td><td style="text-align:right">-0.9663</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_has_licence</td><td style="text-align:right">0.7782</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_has_vehicle</td><td style="text-align:right">0.3888</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_hh_alone</td><td style="text-align:right">-0.1373</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_hh_child</td><td style="text-align:right">-0.2117</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_hh_size_large</td><td style="text-align:right">-0.0146</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_hh_spouse</td><td style="text-align:right">-0.1846</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_income_midplus</td><td style="text-align:right">0.7951</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_is_female</td><td style="text-align:right">0.1043</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_FullTimeWorker</td><td style="text-align:right">-10.0000</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_PartTimeWorker</td><td style="text-align:right">-7.5126</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_Preschool</td><td style="text-align:right">-1.1968</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_Retired</td><td style="text-align:right">0.4937</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_SchoolChild</td><td style="text-align:right">-3.5627</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_UniversityStudent</td><td style="text-align:right">-2.6446</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_ptype_WorkingStudent</td><td style="text-align:right">-6.1475</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>b_N_wfh</td><td style="text-align:right">-2.9293</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>s_M_age_norm</td><td style="text-align:right">0.0010</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>s_M_has_vehicle</td><td style="text-align:right">0.0010</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>s_M_ptype_FullTimeWorker</td><td style="text-align:right">0.0010</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>s_N_age_norm</td><td style="text-align:right">0.0010</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>s_N_has_vehicle</td><td style="text-align:right">0.0010</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+<tr><td>s_N_ptype_FullTimeWorker</td><td style="text-align:right">0.0010</td><td style="text-align:right">nan</td><td style="text-align:right;color:#721c24">nan</td><td></td></tr>
+</tbody></table></div></div>
+</body></html>

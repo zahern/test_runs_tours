@@ -24,7 +24,11 @@ env/
 *.o[0-9]*
 
 # ── Generated outputs and run artefacts ─────────────────────
-saved_data/
+# saved_data/ is ignored in bulk, but zone_ids_sa2/ is source-controlled
+# (it is the synthetic population input, not a generated output).
+# Git cannot negate a directory-level rule, so we use wildcard form:
+saved_data/*
+!saved_data/zone_ids_sa2/
 runs/
 _runs/
 
@@ -49,7 +53,7 @@ code/comprehensive_dataset.csv
 code/initial_trips_hhts.csv
 code/pddopulation_by_order_with_osm_and_landuse.csv
 
-# ── Text / LaTeX files ──────────────────────────────────────
+# ── Text / LaTeX files (keep README.md, ignore everything else) ─────────────
 *.txt
 *.tex
 

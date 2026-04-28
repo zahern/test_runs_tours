@@ -1,0 +1,2 @@
+run_label,timestamp,work_anchor_match_rate,work_n,school_anchor_match_rate,school_n,tour_valid_dtaz_rate,tour_unique_dtaz,tour_n,trip_valid_od_rate,trip_positive_travtime_rate,trip_work_anchor_touch_rate,trip_school_anchor_touch_rate,trip_n
+saved_data,2026-04-18 08:44:37,1.0,864882,1.0,318841,1.0,329,3866882,1.0,1.0,1.0,1.0,7184102

@@ -173,8 +173,8 @@ def _setup_logging(mode: str = 'main', arg: str = None) -> None:
     # validation outputs reflect the current run, not a cached prior run.
     _STALE_PKLS = [
         'stage1_models.pkl', 'stage2_models.pkl', 'stage3_models.pkl',
-        'stage4_models.pkl', 'stage5_models.pkl', 'ga_results.pkl',
-        '_hhts_persons.pkl', '_hhts_tours.pkl',
+        'stage4_models.pkl', 'stage5_models.pkl', 'stage5b_models.pkl',
+        'ga_results.pkl', '_hhts_persons.pkl', '_hhts_tours.pkl',
     ]
     _cleaned = []
     for _pkl_name in _STALE_PKLS:
@@ -332,6 +332,7 @@ from stage2_day_duration        import run_stage2
 from stage3_activity_duration   import run_stage3
 from stage4_schedule_placement  import run_stage4
 from stage5_destination_choice  import run_stage5
+from stage5b_trip_destination   import run_stage5b
 from stage6_plan_finalisation   import run_stage6
 from cdap                       import run_cdap
 from usual_location             import run_usual_locations
@@ -368,6 +369,25 @@ def load_data():
     sc      = Synth_Connect()
     out     = sc.process_survey(save=False)
     landuse = sc.get_land()
+    # ── Landuse patch: fill Primary=0 from Primary_total_priv ─────────────
+    # Some zones have Primary=0 (no OSM-mapped public schools) but have
+    # significant private-school enrolment in Primary_total_priv.  Using
+    # Primary=0 as an attractor results in zero destination-choice probability
+    # for those zones (e.g. zone 248 with 26 HHTS primary students predicted=0).
+    # Fill: if Primary=0 and Primary_total_priv > 0, set Primary = Primary_total_priv.
+    if 'Primary' in landuse.columns and 'Primary_total_priv' in landuse.columns:
+        _mask = (landuse['Primary'] == 0) & (landuse['Primary_total_priv'] > 0)
+        _n    = _mask.sum()
+        if _n > 0:
+            landuse.loc[_mask, 'Primary'] = landuse.loc[_mask, 'Primary_total_priv']
+            logger.info(f"  Landuse patch: filled Primary=0 from Primary_total_priv "
+                        f"for {_n} zone(s) — e.g. {list(landuse.loc[_mask].index[:5])}")
+    if 'Secondary' in landuse.columns and 'Secondary_total_priv' in landuse.columns:
+        _mask2 = (landuse['Secondary'] == 0) & (landuse['Secondary_total_priv'] > 0)
+        if _mask2.sum() > 0:
+            landuse.loc[_mask2, 'Secondary'] = landuse.loc[_mask2, 'Secondary_total_priv']
+            logger.info(f"  Landuse patch: filled Secondary=0 from Secondary_total_priv "
+                        f"for {_mask2.sum()} zone(s)")
     landuse = run_accessibility(
         landuse,
         skims='downcasted_matrices_base.omx',
@@ -1214,6 +1234,103 @@ def estimate_stage2(out):
     return models
 
 
+@timer("Estimate Stage 2 — joint participation + duration (Tobit-I / Heckman)")
+def estimate_stage2_joint(out, s2_models=None):
+    """
+    Optional companion to estimate_stage2().
+
+    Estimates two joint participation + duration models as alternatives to the
+    sequential two-stage approach, then writes a comparison HTML report:
+
+        A.  Tobit Type-I  — left-censor B at 0, include non-travellers
+        B.  Heckman (Heckit) — probit selection + OLS outcome with IMR
+
+    Controlled by env-var JOINT_PARTICIPATION_MODEL=1 (default: 0 = skip).
+
+    Outputs
+    -------
+    stage2_joint_models.pkl          : {tobit1, heckman} model objects
+    stage2_joint_comparison.csv      : per-model fit metrics
+    stage2_joint_model_comparison.html : full comparison report
+    plots/joint_participation_comparison.png
+    plots/joint_budget_scatter.png
+    plots/joint_coefficient_imr.png
+    """
+    if os.environ.get('JOINT_PARTICIPATION_MODEL', '0') != '1':
+        logger.info("  JOINT_PARTICIPATION_MODEL not set — skipping joint estimation "
+                    "(set JOINT_PARTICIPATION_MODEL=1 to enable)")
+        return None
+
+    from stage2_joint_participation import (
+        aggregate_person_day_with_nontravellers,
+        estimate_joint_models,
+        compare_models,
+        plot_joint_comparison,
+        write_joint_html_report,
+        save_joint_models,
+    )
+
+    logger.info("  Building full person-day dataset (including non-travellers)...")
+    try:
+        full_pd = aggregate_person_day_with_nontravellers(out["tours"], out["persons"])
+    except Exception as e:
+        logger.warning(f"  Could not build full person-day with non-travellers: {e}")
+        logger.warning("  Falling back to travellers-only dataset.")
+        from stage2_day_duration import aggregate_person_day
+        full_pd = aggregate_person_day(out["tours"], out["persons"])
+        full_pd['participated'] = 1
+
+    nt_pct = 100 * (1 - full_pd['participated'].mean())
+    logger.info(f"  Full dataset: {len(full_pd):,} persons  "
+                f"({nt_pct:.1f}% non-travellers)")
+
+    logger.info("  Estimating joint models (Tobit-I + Heckman)...")
+    joint_res = estimate_joint_models(full_pd)
+
+    # save joint model objects
+    joint_pkl = os.path.join(OUT_DIR, 'stage2_joint_models.pkl')
+    save_joint_models(joint_res, joint_pkl)
+    logger.info(f"  Joint models → {joint_pkl}")
+
+    # comparison metrics vs two-stage
+    logger.info("  Computing comparison metrics...")
+    comparison = compare_models(
+        joint_res['tobit1'],
+        joint_res['heckman'],
+        s2_models,   # may be None if called without two-stage
+        full_pd,
+    )
+
+    # save metrics CSV
+    csv_path = os.path.join(OUT_DIR, 'stage2_joint_comparison.csv')
+    comparison['metrics'].to_csv(csv_path, index=False)
+    logger.info(f"  Comparison metrics → {csv_path}")
+
+    # plots
+    try:
+        os.makedirs(os.path.join(OUT_DIR, 'plots'), exist_ok=True)
+        plot_joint_comparison(comparison, OUT_DIR)
+    except Exception as e:
+        logger.warning(f"  Joint comparison plots failed: {e}")
+
+    # HTML report
+    try:
+        html_path = write_joint_html_report(comparison, OUT_DIR, s2_models)
+        logger.info(f"  Joint comparison report → {html_path}")
+    except Exception as e:
+        logger.warning(f"  Joint comparison HTML failed: {e}")
+
+    # log recommendation
+    from stage2_joint_participation import joint_model_recommendation
+    rec_html = joint_model_recommendation(comparison)
+    # strip tags for plain-text log
+    import re as _re
+    rec_plain = _re.sub(r'<[^>]+>', ' ', rec_html).strip()
+    logger.info(f"\n{'='*60}\n  JOINT MODEL RECOMMENDATION:\n{rec_plain[:800]}\n{'='*60}")
+
+    return joint_res
+
+
 @timer("Estimate Stage 3 — activity duration")
 def estimate_stage3(out):
     from stage3_activity_duration import estimate_duration_models, save_models
@@ -1237,6 +1354,7 @@ def estimate_stage4(out):
     _save_stage_coef_csv(models, 'stage4', OUT_DIR)
     logger.info(f"  Stage 4 models → {path}  (HTML report alongside)")
     _log_stage_summary('4', models)
+    _inspect_model_parameters(models, 'stage4', OUT_DIR)
     return models
 
 
@@ -1438,7 +1556,951 @@ def estimate_stage5(out, landuse):
     except Exception as _loc_e:
         logger.warning(f"  Location choice summary (post-estimation) failed: {_loc_e}")
 
+    # ── P-value / zero-coefficient diagnostics ──────────────────────────────
+    _inspect_model_parameters(models, 'stage5_tour', OUT_DIR)
+
     return models, skims, sk_lookup
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRIP-LEVEL MODE + DESTINATION MODELS  (Stage 5t)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@timer("Estimate Stage 5t — trip-level mode + destination choice")
+def estimate_stage5_trips(out, landuse, skims=None, skim_df=None):
+    """
+    Estimate trip-level mode choice (NestedLogitModeModel per purpose) and
+    trip-level destination choice (Larch MNL per segment) on HHTS trip legs.
+
+    Unlike the tour-level Stage 5 models, every trip leg is one observation
+    here.  This gives more data for estimation and captures within-tour mode
+    variability (e.g. walk on the return leg even when the outbound was car).
+
+    Outputs
+    -------
+    stage5_trip_mode_models.pkl       — nested logit mode models by purpose
+    stage5_trip_dest_models.pkl       — destination MNL models by segment
+    stage5_trip_models_coefficients.csv   — combined coefficient table
+    stage5_trip_models_coefficients.html  — HTML report (mode + dest)
+    stage5_trip_models_coefficients_mode.html
+    stage5_trip_models_coefficients_dest.html
+    """
+    import openmatrix as omx
+    from stage6_mode_choice import (
+        estimate_mode_models as _est_mode,
+        save_models as _s6_save,
+        _save_s6_coefficients,
+        _write_s6_html_report,
+    )
+    from stage5_destination_choice import (
+        _prep_hhts_tours,
+        _run_segment,
+        save_models as _s5_save,
+        _save_coefficients as _s5_save_coeff,
+    )
+
+    trips   = out.get('trips',   pd.DataFrame())
+    persons = out.get('persons', pd.DataFrame())
+
+    # ── Trip-level mode choice ──────────────────────────────────────────────
+    logger.info("  [5t] Estimating trip-level mode choice models...")
+    trip_mode_models = {}
+    try:
+        trip_mode_models = _est_mode(trips, persons, landuse)
+        mode_pkl = os.path.join(OUT_DIR, 'stage5_trip_mode_models.pkl')
+        _s6_save(trip_mode_models, mode_pkl)
+
+        # Coefficient CSV + HTML (reuse stage6_mode_choice functions)
+        mode_coef_csv  = os.path.join(OUT_DIR, 'stage5_trip_mode_coefficients.csv')
+        mode_coef_html = os.path.join(OUT_DIR, 'stage5_trip_mode_coefficients.html')
+        _save_s6_coefficients(trip_mode_models, mode_coef_csv)
+        # Save full coefficient HTML report so analysts can inspect the model,
+        # not just the mode-share validation table.
+        try:
+            _write_s6_html_report(trip_mode_models, mode_coef_html)
+            logger.info(f"  [5t] Trip mode coefficient HTML → {mode_coef_html}")
+        except Exception as _html_me:
+            logger.debug(f"  [5t] Trip mode HTML report failed: {_html_me}")
+
+        logger.info(f"  [5t] Trip mode models: {list(trip_mode_models.keys())} → {mode_pkl}")
+
+        # Validation: predicted vs observed mode shares (table + bar charts)
+        _s5t_mode_validation(trip_mode_models, trips, persons, OUT_DIR)
+        _s5t_mode_validation_plots(trip_mode_models, trips, persons, OUT_DIR)
+
+    except Exception as _me:
+        import traceback as _tb3
+        logger.warning(f"  [5t] Trip mode estimation failed: {_me}")
+        logger.debug(_tb3.format_exc())
+
+    # ── Trip-level destination choice ───────────────────────────────────────
+    # Treat each trip leg as an independent destination choice.  Map trip
+    # purposes to the three tour segments (work / edu / nonmand) then run
+    # _run_segment on the trip table so the same Larch MNL pipeline applies.
+    logger.info("  [5t] Estimating trip-level destination choice models...")
+    trip_dest_models = {}
+    try:
+        if skim_df is None and skims is not None:
+            from stage5_destination_choice import _skim_flat as _sf
+            skim_df = _sf(skims)
+
+        # Convert trips to a tours-like table: each trip leg is one observation
+        # with its own OTAZ, DTAZ, and a segment label.
+        _trip_like = _trips_to_seg_table(trips, persons)
+        if not _trip_like.empty:
+            for seg in ['work', 'edu', 'nonmand']:
+                try:
+                    result = _run_segment(
+                        seg, _trip_like, persons, landuse,
+                        skims, skim_df, seed=42,
+                    )
+                    if result:
+                        trip_dest_models[seg] = result
+                        logger.info(
+                            f"  [5t] dest/{seg}: mode LL={result.get('mode_ll','?'):.1f}  "
+                            f"dest LL={result.get('dest_ll','?'):.1f}  "
+                            f"n={result.get('n_tours','?')}"
+                        )
+                    else:
+                        logger.warning(f"  [5t] dest/{seg}: _run_segment returned empty")
+                except Exception as _se:
+                    import traceback as _tb4
+                    logger.warning(f"  [5t] dest/{seg} failed: {_se}")
+                    logger.debug(_tb4.format_exc())
+
+        if trip_dest_models:
+            dest_pkl  = os.path.join(OUT_DIR, 'stage5_trip_dest_models.pkl')
+            _s5_save(trip_dest_models, dest_pkl)
+            dest_csv  = os.path.join(OUT_DIR, 'stage5_trip_dest_coefficients.csv')
+            _s5_save_coeff(trip_dest_models, dest_csv)
+            logger.info(f"  [5t] Trip dest models → {dest_pkl}")
+            logger.info(f"  [5t] Trip dest HTML   → {dest_csv.replace('.csv', '.html')}")
+            logger.info(f"  [5t] Trip dest mode-only HTML → {dest_csv.replace('.csv', '_mode.html')}")
+            logger.info(f"  [5t] Trip dest dest-only HTML → {dest_csv.replace('.csv', '_dest.html')}")
+            # P-value diagnostics for trip dest models
+            _inspect_model_parameters(trip_dest_models, 'stage5_trip_dest', OUT_DIR)
+
+        # ── Per-purpose destination models for non-mandatory sub-purposes ─────
+        # The three-segment model (work/edu/nonmand) lumps all non-mandatory
+        # trips together.  Here we additionally fit a destination model per
+        # individual non-mandatory purpose (eat, shopping, othdiscr, etc.)
+        # where enough observations exist (min 50).
+        # Key: pre-filter _trip_like to one purpose, rename primary_purpose
+        # to 'nonmand' so _filter_seg passes it through unaltered.
+        NONMAND_PURPOSES = ['social', 'escort', 'shopping', 'othmaint', 'othdiscr', 'eat']
+        trip_dest_models_per_purpose = {}
+        if not _trip_like.empty:
+            purp_col_tl = next(
+                (c for c in ['primary_purpose', 'main_purpose', 'purpose']
+                 if c in _trip_like.columns), None
+            )
+            if purp_col_tl:
+                for _purp in NONMAND_PURPOSES:
+                    try:
+                        _sub = _trip_like[
+                            _trip_like[purp_col_tl].astype(str).str.lower() == _purp
+                        ].copy()
+                        if len(_sub) < 50:
+                            logger.info(f"  [5t] dest/{_purp}: only {len(_sub)} obs — skipping")
+                            continue
+                        # Rename to 'nonmand' so _filter_seg lets it through
+                        _sub[purp_col_tl] = 'nonmand'
+                        result = _run_segment(
+                            'nonmand', _sub, persons, landuse,
+                            skims, skim_df, seed=42,
+                        )
+                        if result:
+                            result['purpose_label'] = _purp  # tag for reporting
+                            trip_dest_models_per_purpose[_purp] = result
+                            logger.info(
+                                f"  [5t] dest/{_purp}: dest LL={result.get('dest_ll','?')}  "
+                                f"n={result.get('n_tours','?')}"
+                            )
+                    except Exception as _pe:
+                        logger.debug(f"  [5t] dest/{_purp} skipped: {_pe}")
+
+        if trip_dest_models_per_purpose:
+            pdest_pkl = os.path.join(OUT_DIR, 'stage5_trip_dest_per_purpose_models.pkl')
+            _s5_save(trip_dest_models_per_purpose, pdest_pkl)
+            pdest_csv = os.path.join(OUT_DIR, 'stage5_trip_dest_per_purpose_coefficients.csv')
+            _s5_save_coeff(trip_dest_models_per_purpose, pdest_csv)
+            logger.info(
+                f"  [5t] Per-purpose dest models: {list(trip_dest_models_per_purpose.keys())} → {pdest_pkl}"
+            )
+            logger.info(f"  [5t] Per-purpose dest HTML (combined) → {pdest_csv.replace('.csv', '.html')}")
+            logger.info(f"  [5t] Per-purpose dest-only HTML       → {pdest_csv.replace('.csv', '_dest.html')}")
+
+        # ── Combined HTML report: mode + dest (3-segment + per-purpose) ───────
+        try:
+            _all_dest = {**trip_dest_models, **trip_dest_models_per_purpose}
+            _write_trip_models_html_report(trip_mode_models, _all_dest, OUT_DIR)
+        except Exception as _html_e:
+            logger.debug(f"  [5t] HTML report failed: {_html_e}")
+
+    except Exception as _de:
+        import traceback as _tb5
+        logger.warning(f"  [5t] Trip destination estimation failed: {_de}")
+        logger.debug(_tb5.format_exc())
+
+    return trip_mode_models, trip_dest_models
+
+
+def _write_trip_models_html_report(
+    mode_models: dict,
+    dest_models: dict,
+    save_dir: str,
+) -> None:
+    """
+    Write a comprehensive HTML report for trip-level mode + destination models.
+
+    One section per purpose/segment.  Non-mandatory purposes (eat, shopping,
+    othdiscr, social, escort, othmaint) each get their own section so the
+    reader can see destination / mode choice behaviour per activity type,
+    rather than having them all lumped under 'nonmand'.
+
+    Outputs
+    -------
+    {save_dir}/stage5t_models_report.html     — combined report
+    {save_dir}/stage5t_mode_{purpose}.html    — per-purpose mode model
+    """
+    import math as _math
+
+    def _sig(t):
+        if np.isnan(t):  return ''
+        if abs(t) >= 3.0: return '***'
+        if abs(t) >= 2.0: return '**'
+        if abs(t) >= 1.65: return '*'
+        return ''
+
+    def _coef_table_html(coef_dict, pf):
+        """Build an HTML coefficient table from a coefficient dict + pf DataFrame."""
+        rows_h = ("<table><tr><th>Parameter</th><th>Value</th>"
+                  "<th>Std&nbsp;Err</th><th>t-stat</th><th>Sig</th></tr>")
+        params = list(pf.index) if pf is not None and len(pf) > 0 else list(coef_dict.keys())
+        for p in params:
+            val = coef_dict.get(str(p), float('nan'))
+            se  = tstat = float('nan')
+            if pf is not None and p in pf.index:
+                row = pf.loc[p]
+                for c in ('std_err', 'std_err_opg', 'se'):
+                    if c in row.index and np.isfinite(float(row[c])):
+                        se = float(row[c]); break
+                for c in ('t_stat', 't_stat_opg', 'tstat'):
+                    if c in row.index and np.isfinite(float(row[c])):
+                        tstat = float(row[c]); break
+            if np.isnan(tstat) and np.isfinite(se) and se > 0:
+                tstat = float(val) / se
+            _style = " style='color:#c0392b;font-weight:bold'" if abs(tstat) < 1.65 and np.isfinite(tstat) else ""
+            rows_h += (
+                f"<tr><td{_style}>{p}</td>"
+                f"<td style='text-align:right'>{val:.4f}</td>"
+                f"<td style='text-align:right'>{se:.4f if np.isfinite(se) else '—'}</td>"
+                f"<td style='text-align:right'>{tstat:.2f if np.isfinite(tstat) else '—'}</td>"
+                f"<td style='text-align:center'>{_sig(tstat)}</td></tr>"
+            )
+        return rows_h + "</table>"
+
+    def _mode_section_html(purpose, model):
+        """Build one purpose section for trip-level mode models."""
+        ll   = getattr(model, 'll_final_', float('nan'))
+        rho2 = getattr(model, 'rho2_', float('nan'))
+        n    = getattr(model, 'n_obs_', '?')
+        conv = getattr(model, 'converged_', False)
+        coef = model.coef_ if hasattr(model, 'coef_') else []
+        pnames = getattr(model, 'PARAM_NAMES', [f'p{i}' for i in range(len(coef))])
+        se    = getattr(model, 'se_',    np.full(len(coef), np.nan))
+        tstat = getattr(model, 'tstat_', np.full(len(coef), np.nan))
+        rows_h = ""
+        for pn, c, s, t in zip(pnames, coef, se, tstat):
+            if np.isnan(t) and np.isfinite(s) and s > 0:
+                t = float(c) / s
+            _style = " style='color:#c0392b;font-weight:bold'" if np.isfinite(t) and abs(t) < 1.65 else ""
+            rows_h += (
+                f"<tr><td{_style}>{pn}</td>"
+                f"<td style='text-align:right'>{c:.4f}</td>"
+                f"<td style='text-align:right'>{s:.4f if np.isfinite(s) else '—'}</td>"
+                f"<td style='text-align:right'>{t:.2f if np.isfinite(t) else '—'}</td>"
+                f"<td style='text-align:center'>{_sig(t)}</td></tr>"
+            )
+        return (
+            f"<div class='model-section'>"
+            f"<h2>Mode Choice — {purpose.capitalize()}</h2>"
+            f"<div class='stats'>LL={ll:.1f if np.isfinite(ll) else '—'} &nbsp; "
+            f"ρ²={rho2:.3f if np.isfinite(rho2) else '—'} &nbsp; "
+            f"N={n} &nbsp; {'✓ converged' if conv else '✗ not converged'}</div>"
+            f"<table><tr><th>Parameter</th><th>Value</th><th>Std&nbsp;Err</th>"
+            f"<th>t-stat</th><th>Sig</th></tr>{rows_h}</table>"
+            f"<p class='sig-note'>*** |t|≥3 &nbsp; ** |t|≥2 &nbsp; * |t|≥1.65 &nbsp; "
+            f"<span style='color:#c0392b'>red = |t|&lt;1.65 (not significant)</span></p>"
+            f"</div>"
+        )
+
+    def _dest_section_html(seg, res):
+        """Build one segment section for trip-level destination models."""
+        label = res.get('purpose_label', seg)
+        n     = res.get('n_tours', '?')
+        dest_ll = res.get('dest_ll', float('nan'))
+        mode_ll = res.get('mode_ll', float('nan'))
+        dest_mdl = res.get('dest_model')
+        mode_mdl = res.get('mode_model')
+        sections = []
+        for mtype, mdl, ll_val in [('Mode', mode_mdl, mode_ll), ('Destination', dest_mdl, dest_ll)]:
+            if mdl is None:
+                continue
+            try:
+                from stage5_destination_choice import _coef_dict_from_model as _cdfm
+                coef_dict = _cdfm(mdl)
+                pf = None
+                if hasattr(mdl, '_final_pf') and isinstance(mdl._final_pf, pd.DataFrame):
+                    pf = mdl._final_pf
+                else:
+                    try:
+                        pf = mdl.pf
+                    except Exception:
+                        pass
+                sections.append(
+                    f"<h3>{mtype} model &nbsp; <small>LL={ll_val:.1f if np.isfinite(float(str(ll_val).replace('?','nan'))) else '—'}  N={n}</small></h3>"
+                    + _coef_table_html(coef_dict, pf)
+                )
+            except Exception as _ce:
+                sections.append(f"<h3>{mtype} model — could not render: {_ce}</h3>")
+        return (
+            f"<div class='model-section'>"
+            f"<h2>Destination Choice — {label.capitalize()}</h2>"
+            + '\n'.join(sections) +
+            f"<p class='sig-note'>*** |t|≥3 &nbsp; ** |t|≥2 &nbsp; * |t|≥1.65 &nbsp; "
+            f"<span style='color:#c0392b'>red = |t|&lt;1.65 (not significant)</span></p>"
+            f"</div>"
+        )
+
+    CSS = (
+        "body{font-family:Arial,sans-serif;margin:40px;color:#222;max-width:1100px}"
+        "h1{border-bottom:2px solid #1565c0;padding-bottom:8px;color:#1a3a5c}"
+        "h2{color:#1565c0;margin-top:32px}"
+        "h3{color:#2c5f8a;margin-top:18px;font-size:1em}"
+        ".model-section{margin-bottom:36px;border:1px solid #ccc;border-radius:6px;padding:20px}"
+        ".stats{background:#e3f2fd;padding:8px 12px;border-radius:4px;font-size:.95em;margin-bottom:12px}"
+        "table{border-collapse:collapse;width:100%;margin-bottom:12px}"
+        "th{background:#1565c0;color:white;padding:8px 12px;text-align:left;font-size:.9em}"
+        "td{padding:5px 10px;border-bottom:1px solid #eee;font-size:.88em}"
+        "tr:hover td{background:#f5f5f5}"
+        ".sig-note{font-size:.8em;color:#555;margin-top:6px}"
+    )
+
+    # Build combined report body
+    mode_sections = [_mode_section_html(p, m) for p, m in mode_models.items() if m is not None]
+    dest_sections = [_dest_section_html(s, r) for s, r in dest_models.items() if r is not None]
+
+    body = (
+        "<h2 style='margin-top:0;color:#1a3a5c'>Trip-Level Mode Choice Models</h2>"
+        + '\n'.join(mode_sections)
+        + "<hr><h2 style='color:#1a3a5c;margin-top:32px'>Trip-Level Destination Choice Models</h2>"
+        + '\n'.join(dest_sections)
+    )
+
+    html = (
+        "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
+        "<title>Stage 5t — Trip-Level Mode & Destination Models</title>"
+        f"<style>{CSS}</style></head><body>"
+        "<h1>Stage 5t — Trip-Level Mode &amp; Destination Models</h1>"
+        "<p>Each non-mandatory activity purpose (eat, shopping, othdiscr, social, "
+        "escort, othmaint) is reported separately so that behavioural differences "
+        "across activity types are visible. Red parameter names have |t-stat| &lt; 1.65 "
+        "(not significant at 10% level).</p>"
+        f"{body}"
+        "</body></html>"
+    )
+
+    report_path = os.path.join(save_dir, 'stage5t_models_report.html')
+    os.makedirs(save_dir, exist_ok=True)
+    with open(report_path, 'w', encoding='utf-8') as _f:
+        _f.write(html)
+    logger.info(f"  [5t] Combined HTML report → {report_path}")
+
+    # Write per-purpose mode model HTMLs
+    for purpose, model in mode_models.items():
+        if model is None:
+            continue
+        try:
+            one_section = _mode_section_html(purpose, model)
+            one_html = (
+                "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
+                f"<title>Stage 5t Mode — {purpose.capitalize()}</title>"
+                f"<style>{CSS}</style></head><body>"
+                f"<h1>Trip-Level Mode Choice: {purpose.capitalize()}</h1>"
+                f"{one_section}</body></html>"
+            )
+            pp = os.path.join(save_dir, f'stage5t_mode_{purpose}.html')
+            with open(pp, 'w', encoding='utf-8') as _f:
+                _f.write(one_html)
+        except Exception as _pe:
+            logger.debug(f"  [5t] per-purpose HTML for {purpose} failed: {_pe}")
+
+    logger.info(f"  [5t] Per-purpose mode HTML files → {save_dir}/stage5t_mode_{{purpose}}.html")
+
+    # Write per-purpose destination model HTMLs
+    for seg, res in dest_models.items():
+        if res is None:
+            continue
+        try:
+            one_dest_section = _dest_section_html(seg, res)
+            label = res.get('purpose_label', seg)
+            one_html = (
+                "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>"
+                f"<title>Stage 5t Destination \u2014 {label.capitalize()}</title>"
+                f"<style>{CSS}</style></head><body>"
+                f"<h1>Trip-Level Destination Choice: {label.capitalize()}</h1>"
+                f"{one_dest_section}</body></html>"
+            )
+            pp = os.path.join(save_dir, f'stage5t_dest_{label}.html')
+            with open(pp, 'w', encoding='utf-8') as _f:
+                _f.write(one_html)
+        except Exception as _dpe:
+            logger.debug(f"  [5t] per-purpose dest HTML for {seg} failed: {_dpe}")
+
+    logger.info(f"  [5t] Per-purpose dest HTML files → {save_dir}/stage5t_dest_{{purpose}}.html")
+
+
+def _trips_to_seg_table(trips: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert HHTS trip legs into a tours-like DataFrame for _run_segment.
+
+    Each trip leg becomes one observation with:
+      - OTAZ, DTAZ from the trip
+      - tour_mode from the trip mode column
+      - primary_purpose derived from trip purpose
+      - person attributes merged from persons
+    """
+    from stage5_destination_choice import _prep_hhts_tours, _purpose_to_seg
+    if trips.empty:
+        return pd.DataFrame()
+
+    t = trips.copy()
+
+    # Standardise mode column → tour_mode integer
+    mode_col = next((c for c in ['mode', 'MAINMODE', 'TRAVMODE', 'LINKMODE']
+                     if c in t.columns), None)
+    from stage5_destination_choice import MODE_MAP
+    if mode_col and 'tour_mode' not in t.columns:
+        t['tour_mode'] = t[mode_col].map(MODE_MAP).fillna(2).astype(int)
+    elif 'tour_mode' not in t.columns:
+        t['tour_mode'] = 1
+
+    # Standardise purpose → primary_purpose (for _filter_seg compatibility)
+    purp_col = next((c for c in ['purpose', 'main_purpose', 'TRIPTYPE', 'trip_purpose']
+                     if c in t.columns), None)
+    if purp_col and 'primary_purpose' not in t.columns:
+        t['primary_purpose'] = t[purp_col].astype(str).str.lower().str.strip()
+
+    # Map trip purposes to tour segments
+    _purp_remap = {
+        'work':      'work',   'work_related': 'work',
+        'edu':       'edu',    'school': 'edu',   'education': 'edu',
+        'social':    'nonmand', 'escort': 'nonmand', 'shopping': 'nonmand',
+        'othmaint':  'nonmand', 'othdiscr': 'nonmand', 'eat': 'nonmand',
+        'recreation':'nonmand', 'personal': 'nonmand', 'other': 'nonmand',
+    }
+    if 'primary_purpose' in t.columns:
+        t['primary_purpose'] = t['primary_purpose'].map(
+            lambda p: _purp_remap.get(str(p).lower(), 'nonmand')
+        )
+
+    # Ensure OTAZ / DTAZ
+    for zcol, alts in [('OTAZ', ['ORIGZONE', 'orig_taz', 'ORDER']),
+                       ('DTAZ', ['DESTZONE', 'dest_taz'])]:
+        if zcol not in t.columns:
+            for a in alts:
+                if a in t.columns:
+                    t[zcol] = t[a]
+                    break
+
+    for zcol in ['OTAZ', 'DTAZ']:
+        if zcol in t.columns:
+            t[zcol] = pd.to_numeric(t[zcol], errors='coerce').fillna(0).astype(int)
+
+    # Merge person attributes if not already present
+    if persons is not None and not persons.empty:
+        pid_col = next((c for c in ['person_id', 'PERSONID', 'PERSNUM']
+                        if c in persons.columns), None)
+        t_pid   = next((c for c in ['person_id', 'PERSONID', 'PERSNUM']
+                        if c in t.columns), None)
+        if pid_col and t_pid:
+            _person_cols = [pid_col] + [
+                c for c in persons.columns
+                if c != pid_col and c not in t.columns
+                and c in ['ptype', 'WORKSTAT', 'STUDYING', 'income_hi', 'income_lo',
+                           'vehrd', 'has_vehicle', 'has_licence', 'indp', 'indp_group',
+                           'income_band', 'age_group', 'veh_bin', 'age']
+            ]
+            t = t.merge(persons[_person_cols], left_on=t_pid,
+                        right_on=pid_col, how='left', suffixes=('', '_person'))
+
+    # _run_segment needs a 'weight' column (use 1.0 for trips — not weighted)
+    if 'weight' not in t.columns:
+        t['weight'] = 1.0
+
+    return t.reset_index(drop=True)
+
+
+def _s5t_mode_validation(models: dict, trips: pd.DataFrame,
+                         persons: pd.DataFrame, save_dir: str) -> None:
+    """
+    Compare observed vs predicted mode shares for trip-level models.
+    Saves a CSV + HTML to save_dir.
+    """
+    try:
+        from stage6_mode_choice import prepare_mode_data, PURPOSES
+        mode_data = prepare_mode_data(trips, persons)
+        rows = []
+        for purpose, model in models.items():
+            subset = mode_data[mode_data['purpose'] == purpose]
+            if subset.empty:
+                continue
+            obs_share = (subset['chosen_mode'].value_counts(normalize=True)
+                         .rename('obs_share').reset_index()
+                         .rename(columns={'index': 'mode', 'chosen_mode': 'mode'}))
+            # predicted shares from frozen probabilities or model
+            if model.frozen_probs_ is not None and not model.frozen_probs_.empty:
+                fp = model.frozen_probs_.copy()
+                pred_cols = [c for c in fp.columns if c.startswith('p_')]
+                if pred_cols:
+                    pred_shares = fp[pred_cols].mean().to_dict()
+                    for mc, ps in pred_shares.items():
+                        mode_name = mc.replace('p_', '')
+                        obs_row = obs_share[obs_share['mode'] == mode_name]
+                        obs_val = float(obs_row['obs_share'].iloc[0]) if len(obs_row) else float('nan')
+                        rows.append({
+                            'purpose': purpose,
+                            'mode': mode_name,
+                            'obs_share': round(obs_val * 100, 2),
+                            'pred_share': round(float(ps) * 100, 2),
+                            'n_obs': len(subset),
+                        })
+
+        if rows:
+            df_val = pd.DataFrame(rows)
+            csv_path  = os.path.join(save_dir, 'stage5_trip_mode_validation.csv')
+            html_path = os.path.join(save_dir, 'stage5_trip_mode_validation.html')
+            df_val.to_csv(csv_path, index=False)
+
+            # Build simple HTML table
+            _html = (
+                "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                "<title>Stage 5t mode validation</title>"
+                "<style>body{font-family:Arial,sans-serif;margin:20px;font-size:13px}"
+                "table{border-collapse:collapse;width:100%;margin-bottom:24px}"
+                "th{background:#2c3e50;color:white;padding:6px 10px}"
+                "td{border:1px solid #ddd;padding:5px 10px}"
+                "tr:nth-child(even){background:#f9f9f9}</style></head><body>"
+                "<h1>Stage 5t — Trip-level mode share validation (HHTS)</h1>"
+                "<table><tr><th>Purpose</th><th>Mode</th>"
+                "<th>Observed %</th><th>Predicted %</th><th>N obs</th></tr>"
+            )
+            for _, r in df_val.iterrows():
+                _html += (
+                    f"<tr><td>{r['purpose']}</td><td>{r['mode']}</td>"
+                    f"<td style='text-align:right'>{r['obs_share']:.1f}</td>"
+                    f"<td style='text-align:right'>{r['pred_share']:.1f}</td>"
+                    f"<td style='text-align:right'>{r['n_obs']}</td></tr>"
+                )
+            _html += "</table></body></html>"
+            with open(html_path, 'w', encoding='utf-8') as _hf:
+                _hf.write(_html)
+            logger.info(f"  [5t] Mode share validation → {csv_path}")
+    except Exception as _e:
+        logger.debug(f"  [5t] Mode validation failed: {_e}")
+
+
+def _s5t_mode_validation_plots(models: dict, trips: pd.DataFrame,
+                                persons: pd.DataFrame, save_dir: str) -> None:
+    """
+    Bar-chart visualisation of observed vs predicted trip-level mode shares,
+    one panel per trip purpose, saved to save_dir/plots/stage5t_mode_shares.png.
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import math as _math
+        from stage6_mode_choice import prepare_mode_data, PURPOSES
+
+        MODE_COLORS = {'DA': '#3498db', 'SR': '#e74c3c', 'Walk': '#2ecc71',
+                       'Bike': '#f39c12', 'Transit': '#9b59b6'}
+        MODE_NAMES  = {1: 'DA', 2: 'SR', 3: 'Walk', 4: 'Bike', 5: 'Transit'}
+
+        mode_data = prepare_mode_data(trips, persons)
+        plot_data  = {}   # {purpose: {mode: (obs, pred)}}
+
+        for purpose, model in models.items():
+            subset = mode_data[mode_data['purpose'] == purpose]
+            if subset.empty:
+                continue
+            obs_raw = subset['chosen_mode'].map(MODE_NAMES)
+            obs_counts = obs_raw.value_counts(normalize=True)
+
+            pred_shares = {}
+            if model.frozen_probs_ is not None and not model.frozen_probs_.empty:
+                fp = model.frozen_probs_.copy()
+                pred_cols = [c for c in fp.columns if c.startswith('p_')]
+                if pred_cols:
+                    for pc in pred_cols:
+                        mode_name = pc.replace('p_', '')
+                        pred_shares[mode_name] = float(fp[pc].mean())
+
+            if pred_shares:
+                all_modes = sorted(set(list(obs_counts.index) + list(pred_shares.keys())))
+                plot_data[purpose] = {
+                    m: (float(obs_counts.get(m, 0.0)) * 100,
+                        pred_shares.get(m, 0.0) * 100)
+                    for m in all_modes
+                }
+
+        if not plot_data:
+            logger.debug("  [5t] No plot data for mode share bar charts")
+            return
+
+        purposes = list(plot_data.keys())
+        n    = len(purposes)
+        cols = min(3, n)
+        rows = _math.ceil(n / max(cols, 1))
+        fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4.5 * rows),
+                                 facecolor='white', squeeze=False)
+        fig.suptitle('Stage 5t — Trip-level Mode Shares: Observed vs Predicted',
+                     fontsize=12, fontweight='bold')
+        axes_flat = axes.flatten()
+
+        for i, purp in enumerate(purposes):
+            ax      = axes_flat[i]
+            d       = plot_data[purp]
+            modes   = list(d.keys())
+            obs_v   = [d[m][0] for m in modes]
+            pred_v  = [d[m][1] for m in modes]
+            x       = np.arange(len(modes))
+            w       = 0.35
+            bars_o  = ax.bar(x - w/2, obs_v,  width=w, label='Observed',
+                             color='#2c3e50', alpha=0.8)
+            bars_p  = ax.bar(x + w/2, pred_v, width=w, label='Predicted',
+                             color='#e74c3c', alpha=0.8)
+            ax.set_xticks(x)
+            ax.set_xticklabels(modes, fontsize=9)
+            ax.set_ylabel('Share (%)', fontsize=9)
+            ax.set_title(purp.capitalize(), fontsize=10, fontweight='bold')
+            ax.legend(fontsize=8)
+            ax.set_ylim(0, max(max(obs_v + pred_v, default=10) * 1.2, 10))
+            # Value labels
+            for b in list(bars_o) + list(bars_p):
+                h = b.get_height()
+                if h > 0.5:
+                    ax.text(b.get_x() + b.get_width() / 2, h + 0.5,
+                            f'{h:.1f}', ha='center', va='bottom', fontsize=7)
+
+        for j in range(n, len(axes_flat)):
+            axes_flat[j].set_visible(False)
+
+        plt.tight_layout()
+        plot_dir = os.path.join(save_dir, 'plots')
+        os.makedirs(plot_dir, exist_ok=True)
+        out_path = os.path.join(plot_dir, 'stage5t_mode_shares.png')
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        logger.info(f"  [5t] Mode share bar charts → {out_path}")
+    except Exception as _e:
+        import traceback as _tb_ms
+        logger.debug(f"  [5t] Mode share bar charts failed: {_e}\n{_tb_ms.format_exc()}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETER DIAGNOSTICS HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _inspect_model_parameters(models: dict, label: str, save_dir: str) -> None:
+    """
+    Inspect estimated models for:
+      - Zero / near-zero coefficients  (|value| < 1e-4)
+      - Insignificant parameters       (|t-stat| < 1.96)
+      - High p-values                  (p > 0.10)
+      - Wrong behavioural signs
+
+    Logs warnings and writes a diagnostic HTML to save_dir.
+    Also calls _check_behavioural_signs from stage5_destination_choice for
+    structural sign checks against expected economic theory.
+    """
+    try:
+        from stage5_destination_choice import _check_behavioural_signs, _save_coefficients
+    except ImportError:
+        return
+
+    SEP = "─" * 70
+    logger.info(SEP)
+    logger.info(f"  PARAMETER DIAGNOSTICS — {label}")
+    logger.info(SEP)
+
+    # ── Behavioural sign checks ──────────────────────────────────────────
+    sign_results = []
+    try:
+        sign_results = _check_behavioural_signs(models)
+        failures = [r for r in sign_results if r.get('pass') is False]
+        if failures:
+            logger.warning(f"  {len(failures)} WRONG-SIGN coefficient(s):")
+            for r in failures:
+                logger.warning(
+                    f"    [{r['segment']}/{r['model']}] {r['parameter']}={r['value']:.4f} "
+                    f"(expected {r['expected']}) — {r['note']}"
+                )
+        else:
+            logger.info("  All checked coefficients have correct behavioural signs.")
+    except Exception as _sc_e:
+        logger.debug(f"  _check_behavioural_signs failed: {_sc_e}")
+
+    # ── Zero / near-zero / insignificant coefficients ────────────────────
+    diag_rows = []
+    for seg, res in models.items():
+        if not isinstance(res, dict):
+            continue
+        for mtype, mdl_key in [('mode', 'mode_model'), ('dest', 'dest_model')]:
+            mdl = res.get(mdl_key)
+            if mdl is None:
+                continue
+            try:
+                pf = None
+                if hasattr(mdl, '_final_pf') and isinstance(mdl._final_pf, pd.DataFrame):
+                    pf = mdl._final_pf
+                else:
+                    try:
+                        pf = mdl.pf
+                    except AttributeError:
+                        pass
+
+                from stage5_destination_choice import _coef_dict_from_model
+                coef = _coef_dict_from_model(mdl)
+                param_list = list(pf.index) if pf is not None and len(pf) > 0 else list(coef.keys())
+
+                for pname in param_list:
+                    val = coef.get(str(pname), float('nan'))
+                    if not np.isfinite(val):
+                        continue
+
+                    se    = float('nan')
+                    tstat = float('nan')
+                    pval  = float('nan')
+                    holdfast = False
+                    if pf is not None and pname in pf.index:
+                        row_pf = pf.loc[pname]
+                        holdfast = bool(row_pf.get('holdfast', False))
+                        for _c in ('std_err', 'std_err_opg', 'se', 'stderr'):
+                            if _c in row_pf.index:
+                                _v = float(row_pf[_c])
+                                if np.isfinite(_v) and _v >= 0:
+                                    se = _v
+                                    break
+                        for _c in ('t_stat', 't_stat_opg', 'tstat'):
+                            if _c in row_pf.index:
+                                _v = float(row_pf[_c])
+                                if np.isfinite(_v):
+                                    tstat = _v
+                                    break
+                        if np.isnan(tstat) and np.isfinite(se) and se > 0:
+                            tstat = val / se
+                        for _c in ('pval', 'p_value', 'pvalue', 'pval_opg'):
+                            if _c in row_pf.index:
+                                _v = float(row_pf[_c])
+                                if np.isfinite(_v):
+                                    pval = _v
+                                    break
+                        if np.isnan(pval) and np.isfinite(tstat):
+                            from scipy.stats import norm as _sn
+                            pval = float(2.0 * _sn.sf(abs(tstat)))
+
+                    # Classify issues
+                    issues = []
+                    if not holdfast and abs(val) < 1e-4:
+                        issues.append('ZERO')
+                    if not holdfast and np.isfinite(tstat) and abs(tstat) < 1.0:
+                        issues.append('INSIG_LOW_T')
+                    elif not holdfast and np.isfinite(pval) and pval > 0.10:
+                        issues.append('HIGH_PVAL')
+                    if np.isfinite(se) and se == 0.0 and not holdfast:
+                        issues.append('SE_ZERO')
+
+                    if issues:
+                        issue_str = ','.join(issues)
+                        logger.warning(
+                            f"  [{seg}/{mtype}] {pname}: "
+                            f"val={val:.4f} t={tstat:.2f} p={pval:.3g} → {issue_str}"
+                        )
+                    diag_rows.append({
+                        'label':     label,
+                        'segment':   seg,
+                        'model':     mtype,
+                        'parameter': pname,
+                        'value':     round(val, 6),
+                        'std_err':   round(se,   6) if np.isfinite(se)    else None,
+                        'tstat':     round(tstat, 3) if np.isfinite(tstat) else None,
+                        'pval':      round(pval,  4) if np.isfinite(pval)  else None,
+                        'holdfast':  holdfast,
+                        'issues':    issue_str if issues else '',
+                    })
+            except Exception as _ie:
+                logger.debug(f"  param inspect failed [{seg}/{mtype}]: {_ie}")
+
+    # Summary counts
+    if diag_rows:
+        df_diag = pd.DataFrame(diag_rows)
+        n_zero    = int((df_diag['issues'].str.contains('ZERO')).sum())
+        n_insig   = int((df_diag['issues'].str.contains('INSIG|HIGH')).sum())
+        n_flagged = int((df_diag['issues'] != '').sum())
+        logger.info(
+            f"  Diagnostics: {len(diag_rows)} params total | "
+            f"{n_zero} near-zero | {n_insig} insignificant | {n_flagged} flagged"
+        )
+        if n_flagged:
+            logger.warning(
+                f"  → Consider removing or holdfasting flagged parameters to improve "
+                f"model parsimony and numerical stability."
+            )
+
+        # Save diagnostic HTML
+        os.makedirs(save_dir, exist_ok=True)
+        _write_param_diagnostic_html(df_diag, sign_results, label, save_dir)
+    logger.info(SEP)
+
+
+def _write_param_diagnostic_html(df_diag: pd.DataFrame,
+                                  sign_results: list,
+                                  label: str,
+                                  save_dir: str) -> None:
+    """Write a diagnostic HTML report for parameter quality."""
+    try:
+        html_path = os.path.join(save_dir, f'{label}_param_diagnostics.html')
+        flagged   = df_diag[df_diag['issues'] != ''].copy()
+
+        def _fmt(v, decimals=4):
+            try:
+                return f'{float(v):.{decimals}f}' if v is not None and np.isfinite(float(v)) else 'n/a'
+            except Exception:
+                return str(v)
+
+        def _row_bg(issue):
+            if 'ZERO' in str(issue):
+                return '#fff3cd'  # yellow
+            if 'INSIG' in str(issue) or 'HIGH_PVAL' in str(issue):
+                return '#fce4e4'  # red
+            return ''
+
+        # Flagged parameter rows
+        flagged_html = ''
+        for _, r in flagged.sort_values(['segment', 'model', 'issues']).iterrows():
+            bg = _row_bg(r['issues'])
+            flagged_html += (
+                f"<tr style='background:{bg}'>"
+                f"<td>{r['segment']}</td><td>{r['model']}</td>"
+                f"<td><b>{r['parameter']}</b></td>"
+                f"<td style='text-align:right'>{_fmt(r['value'])}</td>"
+                f"<td style='text-align:right'>{_fmt(r['std_err'])}</td>"
+                f"<td style='text-align:right'>{_fmt(r['tstat'], 2)}</td>"
+                f"<td style='text-align:right'>{_fmt(r['pval'], 4)}</td>"
+                f"<td style='color:{'#b71c1c' if r['issues'] else '#1a7a1a'}'>"
+                f"<b>{r['issues']}</b></td>"
+                "</tr>\n"
+            )
+
+        # Sign check rows
+        sign_html = ''
+        for r in sign_results:
+            ok  = r.get('pass')
+            bg  = '' if ok else '#fce4e4'
+            icon = '✓' if ok else ('✗' if ok is False else '?')
+            sign_html += (
+                f"<tr style='background:{bg}'>"
+                f"<td>{r['segment']}</td><td>{r['model']}</td>"
+                f"<td>{r['parameter']}</td>"
+                f"<td style='text-align:right'>{r['value']:.4f}</td>"
+                f"<td>{r['expected']}</td>"
+                f"<td style='color:{'#1a7a1a' if ok else '#b71c1c'};font-weight:bold'>{icon}</td>"
+                f"<td>{r['note']}</td>"
+                "</tr>\n"
+            )
+
+        # All parameters (full table)
+        all_html = ''
+        for _, r in df_diag.sort_values(['segment', 'model', 'parameter']).iterrows():
+            bg = _row_bg(r['issues'])
+            insig_color = '#b71c1c' if r['issues'] else '#1a7a1a'
+            all_html += (
+                f"<tr style='background:{bg}'>"
+                f"<td>{r['segment']}</td><td>{r['model']}</td>"
+                f"<td>{r['parameter']}</td>"
+                f"<td style='text-align:right'>{_fmt(r['value'])}</td>"
+                f"<td style='text-align:right'>{_fmt(r['std_err'])}</td>"
+                f"<td style='text-align:right'>{_fmt(r['tstat'], 2)}</td>"
+                f"<td style='text-align:right'>{_fmt(r['pval'], 4)}</td>"
+                f"<td style='color:{insig_color}'>{r['issues'] or '—'}</td>"
+                "</tr>\n"
+            )
+
+        n_zero  = int((df_diag['issues'].str.contains('ZERO')).sum())
+        n_insig = int((df_diag['issues'].str.contains('INSIG|HIGH')).sum())
+        n_sign  = len([r for r in sign_results if r.get('pass') is False])
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>{label} parameter diagnostics</title>
+<style>
+body{{font-family:Arial,sans-serif;margin:20px;font-size:13px}}
+table{{border-collapse:collapse;width:100%;margin-bottom:28px}}
+th{{background:#2c3e50;color:white;padding:6px 10px;text-align:left}}
+td{{border:1px solid #ddd;padding:5px 8px}}
+h1,h2{{color:#2c3e50}} .box{{border:1px solid #ddd;padding:10px;margin:12px 0;border-radius:4px}}
+.warn{{color:#b71c1c}} .ok{{color:#1a7a1a}} .badge{{font-size:12px;font-weight:bold;
+padding:2px 7px;border-radius:3px}}
+.badge-zero{{background:#fff3cd}} .badge-insig{{background:#fce4e4}}
+</style></head><body>
+<h1>{label} — Parameter Diagnostics</h1>
+<div class='box'>
+  <b>Summary:</b>
+  {len(df_diag)} total parameters &nbsp;|&nbsp;
+  <span class='warn'><b>{n_zero} near-zero</b></span> &nbsp;|&nbsp;
+  <span class='warn'><b>{n_insig} insignificant (|t|&lt;1.96 or p&gt;0.10)</b></span> &nbsp;|&nbsp;
+  <span class='warn'><b>{n_sign} wrong-sign</b></span>
+  <p>Recommendations for flagged parameters:
+  <ul>
+    <li><b>ZERO</b> — parameter stuck at or near zero. Consider removing it from the spec 
+    to improve parsimony, or check if the variable has variation in the estimation data.</li>
+    <li><b>INSIG_LOW_T / HIGH_PVAL</b> — not significantly different from zero at 90% confidence.
+    Consider removing to reduce BIC penalty.</li>
+    <li><b>SE_ZERO</b> — standard error is exactly zero, likely a degenerate direction. 
+    Holdfast or remove this parameter.</li>
+    <li><b>Wrong sign</b> — coefficient has a theoretically incorrect sign. 
+    Check for collinearity with other variables, or constrain via holdfast.</li>
+  </ul></p>
+</div>
+
+<h2>Flagged Parameters ({len(flagged)})</h2>
+<table>
+  <tr><th>Segment</th><th>Model</th><th>Parameter</th><th>Value</th>
+      <th>Std Err</th><th>t-stat</th><th>p-value</th><th>Issue</th></tr>
+{flagged_html if flagged_html else '<tr><td colspan=8 style="color:#1a7a1a">No flagged parameters</td></tr>'}
+</table>
+
+<h2>Behavioural Sign Checks ({len(sign_results)})</h2>
+<table>
+  <tr><th>Segment</th><th>Model</th><th>Parameter</th><th>Value</th>
+      <th>Expected</th><th>Pass</th><th>Note</th></tr>
+{sign_html if sign_html else '<tr><td colspan=7 style="color:#888">No sign checks available</td></tr>'}
+</table>
+
+<h2>All Parameters</h2>
+<table>
+  <tr><th>Segment</th><th>Model</th><th>Parameter</th><th>Value</th>
+      <th>Std Err</th><th>t-stat</th><th>p-value</th><th>Flag</th></tr>
+{all_html}
+</table>
+</body></html>"""
+
+        with open(html_path, 'w', encoding='utf-8') as _hf:
+            _hf.write(html)
+        logger.info(f"  Parameter diagnostics → {html_path}")
+    except Exception as _e:
+        logger.debug(f"  _write_param_diagnostic_html failed: {_e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1447,12 +2509,27 @@ def estimate_stage5(out, landuse):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @timer("Predict Stage 1 — activity frequency")
-def predict_stage1(synth, models=None):
-    from stage1_activity_frequency import predict_activity_frequency, load_models
+def predict_stage1(synth, models=None, hhts_persons=None, hhts_tours=None):
+    from stage1_activity_frequency import (
+        predict_activity_frequency,
+        calibrate_activity_rates,
+        load_models,
+    )
     if models is None:
         models = load_models(os.path.join(OUT_DIR, 'stage1_models.pkl'))
     logger.info(f"  Predicting activity frequency for {len(synth):,} persons...")
     result = predict_activity_frequency(synth, models)
+    if hhts_persons is not None and hhts_tours is not None:
+        try:
+            result = calibrate_activity_rates(
+                result,
+                hhts_persons,
+                hhts_tours,
+                rng=np.random.default_rng(43),
+            )
+            logger.info("  Stage 1 calibrated to HHTS ptype-purpose rates")
+        except Exception as _cal_e:
+            logger.warning(f"  Stage 1 calibration skipped (non-fatal): {_cal_e}")
     result.to_csv(os.path.join(OUT_DIR, 'stage1_output.csv'), index=False)
     logger.info(f"  ✓  Stage 1 output: {len(result):,} rows → {OUT_DIR}/stage1_output.csv")
     return result
@@ -1810,6 +2887,24 @@ def stage5(out, synth_persons, scheduled, landuse):
     return scheduled_dest, models, skims, sk_lookup
 
 
+@timer("Stage 5b — trip-level destination choice")
+def stage5b(out, scheduled_dest, landuse):
+    """Estimate + predict trip-level intermediate-stop destination choice.
+
+    Used by GA_main / GA_STAGED (combined estimate+predict pattern).
+    In the two-phase main() pipeline, stage5b is called inline with travellers
+    as the persons source.
+    """
+    result = run_stage5b(
+        trips       = scheduled_dest,
+        persons     = out["persons"],
+        skims_path  = 'downcasted_matrices_base.omx',
+        landuse     = landuse,
+        output_dir  = OUT_DIR,
+    )
+    return result
+
+
 @timer("Stage 6 — plan validation + Aimsun export")
 def stage6(out, scheduled_dest, landuse,
            stage5_models=None, skims=None, skim_lookup=None):
@@ -1970,62 +3065,233 @@ def ga_all(out, landuse):
     # n_restarts=2) are far too large for stages 5/6 which call Larch NL
     # models — each individual writes a fresh flow code, so thousands of
     # evaluations are needed and the GA never finishes within walltime.
+    _bp = _ga_budget_params()
     run_ga_all_stages(
         tours=out["tours"],
         trips=out["trips"],
         persons=out["persons"],
         landuse=landuse,
         skims='downcasted_matrices_base.omx',
-        pop_size=30,
-        n_generations=40,
-        n_restarts=1,
+        pop_size          = _bp['pop_size'],
+        n_generations     = _bp['n_generations'],
+        n_restarts        = _bp['n_restarts'],
+        # Stage 51 (trip-level mode+dest) adds ~50 % to runtime but validates
+        # whether GA-selected tour vars are consistent at the trip level.
+        # Enabled for standard/thorough budgets automatically.
+        include_trip_mode_dest = os.environ.get('GA_BUDGET', 'fast') != 'fast',
+        # Usual-location GA is expensive and rarely changes — opt-in only.
+        include_usual_loc = os.environ.get('GA_INCLUDE_USUAL_LOC', '0') == '1',
         save_path=os.path.join(OUT_DIR, 'ga_results.pkl'),
     )
+
+
+def _ga_budget_params() -> dict:
+    """
+    Read GA_BUDGET env var and return pop/gens/restarts.
+
+    GA_BUDGET=fast       → pop=30, gens=40,  restarts=1   (current default — for quick tests)
+    GA_BUDGET=standard   → pop=50, gens=100, restarts=3   (recommended for HPC production)
+    GA_BUDGET=thorough   → pop=80, gens=200, restarts=5   (paper-quality; ~6–8× slower than fast)
+
+    Larger populations explore more of the binary chromosome space per generation;
+    more generations allow convergence; restarts escape local optima.
+
+    For Stage 5 specifically, each fitness eval fits a Larch NL model (~2–5 s).
+    Throughput ≈ pop_size × n_generations × n_segments × 5 s ÷ 3600 hours.
+      fast     : ~40×60  × 3 × 5 s ≈ 1.0 h  (exploration run, no improvement guarantee)
+      standard : ~60×150 × 3 × 5 s ≈ 3.8 h  (default — visible convergence)
+      thorough : ~100×300× 3 × 5 s ≈ 12.5 h (full overnight, strong convergence)
+    Stages 1-4 are much faster (seconds/eval); budget only matters for Stage 5.
+    """
+    level = os.environ.get('GA_BUDGET', 'standard').strip().lower()
+    budgets = {
+        'fast':     dict(pop_size=40,  n_generations=60,  n_restarts=2),
+        'standard': dict(pop_size=60,  n_generations=150, n_restarts=4),
+        'thorough': dict(pop_size=100, n_generations=300, n_restarts=6),
+    }
+    if level not in budgets:
+        logger.warning(f"Unknown GA_BUDGET='{level}'; using 'standard'. "
+                       f"Valid choices: fast, standard, thorough")
+        level = 'standard'
+    params = budgets[level]
+    logger.info(f"GA budget level: {level!r} → pop={params['pop_size']}  "
+                f"gens={params['n_generations']}  restarts={params['n_restarts']}")
+    return params
+
+
+def _ga_post_estimation_report(s5_models: dict, out: dict, save_dir: str) -> None:
+    """
+    Called after apply_ga_results_to_pipeline in GA_main and GA_STAGED.
+
+    Saves:
+    - stage5_models_coefficients.html (if not already saved by apply_ga_results_to_pipeline)
+    - stage5_tour_param_diagnostics.html  (p-value / zero-coeff inspection)
+    - ga_hhts_validation/                 (full in-sample HHTS validation for all stages)
+
+    All of these are already generated inside apply_ga_results_to_pipeline itself,
+    but this function ensures the pipeline_logger OUT_DIR always has them too (the
+    GA function saves to save_dir=OUT_DIR which matches here).
+    """
+    logger.info("  [GA post-estimation] running coefficient diagnostics...")
+    _inspect_model_parameters(s5_models, 'stage5_ga_tour', save_dir)
+
+    # Log a compact summary of tour model fit (LL + rho² per segment)
+    logger.info("  [GA] Stage 5 tour model summary:")
+    for seg, res in s5_models.items():
+        if not isinstance(res, dict):
+            continue
+        for mtype in ('mode', 'dest'):
+            ll  = res.get(f'{mtype}_ll', float('nan'))
+            rho2 = float('nan')
+            mdl  = res.get(f'{mtype}_model')
+            if mdl is not None:
+                try:
+                    rho2 = float(mdl.rho_sq_null())
+                except Exception:
+                    pass
+            logger.info(
+                f"    [{seg}/{mtype}] LL={ll:.1f}  ρ²={rho2:.3f}"
+                if np.isfinite(rho2) else
+                f"    [{seg}/{mtype}] LL={ll:.1f}  ρ²=n/a"
+            )
+
+    # ── HHTS in-sample validation with GA-selected models ─────────────────
+    # Load all stage models saved by apply_ga_results_to_pipeline into
+    # save_dir/models/, then run the full run_validation() for obs vs pred
+    # comparison plots before the synthetic population is applied.
+    try:
+        import pickle as _pkl_val
+        from validate_hhts import run_validation as _run_val
+
+        models_dir = os.path.join(save_dir, 'models')
+        _load_pkl = lambda fn: _pkl_val.load(open(os.path.join(models_dir, fn), 'rb')) \
+            if os.path.isfile(os.path.join(models_dir, fn)) else {}
+
+        s1_m = _load_pkl('stage1_models.pkl')
+        s2_m = _load_pkl('stage2_models.pkl')
+        s3_m = _load_pkl('stage3_models.pkl')
+        s4_m = _load_pkl('stage4_models.pkl')
+        # s5_models already passed in — use directly (avoids re-loading large pkl)
+        s5_m = s5_models or _load_pkl('stage5_models.pkl')
+
+        if any([s1_m, s2_m, s3_m, s4_m, s5_m]):
+            logger.info("  [GA post-estimation] running HHTS in-sample validation...")
+            _val_out_dir = os.path.join(save_dir, 'ga_hhts_validation')
+            os.makedirs(os.path.join(_val_out_dir, 'plots', 'validation'), exist_ok=True)
+            _run_val(
+                out       = out,
+                s1_models = s1_m,
+                s2_models = s2_m,
+                s3_models = s3_m,
+                s4_models = s4_m,
+                s5_models = s5_m,
+                out_dir   = _val_out_dir,
+            )
+            logger.info(f"  [GA] HHTS validation → {_val_out_dir}/plots/validation/")
+        else:
+            logger.warning(
+                "  [GA post-estimation] no stage models found in models/ directory; "
+                "skipping HHTS validation (apply_ga_results_to_pipeline may not have run yet)"
+            )
+    except Exception as _ve:
+        import traceback as _tb_val
+        logger.warning(f"  [GA post-estimation] HHTS validation failed: {_ve}")
+        logger.debug(_tb_val.format_exc())
+
+
+def _ga_plot_stage_result(res, save_path: str) -> None:
+    """
+    Plot GA convergence for one stage, unfolding per-segment sub-results.
+
+    Majority-vote results from _run_ga_stageN store a synthetic single-entry
+    aggregate history (to avoid showing inflated per-segment values in one
+    combined line) and put the actual per-segment GAResult objects in
+    res.metadata['segment_results'].  This helper detects that structure and
+    renders a multi-panel figure — one panel per segment — so the convergence
+    history is not blank.
+    """
+    import math as _math
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    seg_results = {}
+    if hasattr(res, 'metadata') and isinstance(res.metadata, dict):
+        seg_results = res.metadata.get('segment_results', {})
+
+    if seg_results:
+        plot_items = list(seg_results.items())   # [(label, GAResult), ...]
+    else:
+        plot_items = [('', res)]
+
+    n    = len(plot_items)
+    cols = min(3, n)
+    rows = _math.ceil(n / max(cols, 1))
+    fig, axes = plt.subplots(rows, cols,
+                             figsize=(7 * cols, 4.5 * rows),
+                             facecolor='white', squeeze=False)
+    axes_flat = axes.flatten()
+    for i, (label, r) in enumerate(plot_items):
+        if i < len(axes_flat):
+            r.plot_convergence(ax=axes_flat[i], segment_label=label)
+    for j in range(n, len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"  GA plot saved → {save_path}  ({n} segment(s))")
 
 
 @timer("GA — Stage 1 (activity frequency)")
 def ga_stage1(out):
     from census_bridge import run_ga_stage1
-    res = run_ga_stage1(out["tours"], out["persons"], pop_size=30, n_generations=40)
-    res.plot_convergence(save_path=os.path.join(OUT_DIR, 'plots', 'ga_stage1.png'))
+    _bp = _ga_budget_params()
+    res = run_ga_stage1(out["tours"], out["persons"], **_bp)
+    _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage1.png'))
     return res
 
 
 @timer("GA — Stage 2 (day duration)")
 def ga_stage2(out):
     from census_bridge import run_ga_stage2
-    res = run_ga_stage2(out["tours"], out["persons"], pop_size=30, n_generations=40)
-    res.plot_convergence(save_path=os.path.join(OUT_DIR, 'plots', 'ga_stage2.png'))
+    _bp = _ga_budget_params()
+    res = run_ga_stage2(out["tours"], out["persons"], **_bp)
+    _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage2.png'))
     return res
 
 
 @timer("GA — Stage 3 (activity duration)")
 def ga_stage3(out):
     from census_bridge import run_ga_stage3
-    res = run_ga_stage3(out["tours"], out["persons"], trips=out["trips"], pop_size=30, n_generations=40)
-    res.plot_convergence(save_path=os.path.join(OUT_DIR, 'plots', 'ga_stage3.png'))
+    _bp = _ga_budget_params()
+    res = run_ga_stage3(out["tours"], out["persons"], trips=out["trips"], **_bp)
+    _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage3.png'))
     return res
 
 
 @timer("GA — Stage 4 (schedule placement)")
 def ga_stage4(out):
     from census_bridge import run_ga_stage4
-    res = run_ga_stage4(out["trips"], out["tours"], out["persons"],
-                        pop_size=30, n_generations=40)
-    res.plot_convergence(save_path=os.path.join(OUT_DIR, 'plots', 'ga_stage4.png'))
+    _bp = _ga_budget_params()
+    res = run_ga_stage4(out["trips"], out["tours"], out["persons"], **_bp)
+    _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage4.png'))
     return res
 
 
 @timer("GA — Stage 5 (skim + landuse)")
 def ga_stage5(out, landuse):
     from census_bridge import run_ga_stage5
+    _bp = _ga_budget_params()
     res = run_ga_stage5(
         trips=out["trips"], persons=out["persons"],
         landuse=landuse,
         skims='downcasted_matrices_base.omx',
-        pop_size=30, n_generations=40,
+        tours=out.get("tours"),
+        **_bp,
     )
-    res.plot_convergence(save_path=os.path.join(OUT_DIR, 'plots', 'ga_stage5.png'))
+    _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage5.png'))
     print(f"  mode:    {res.best_features.get('mode')}")
     print(f"  dest:    {res.best_features.get('dest')}")
     return res
@@ -2034,11 +3300,12 @@ def ga_stage5(out, landuse):
 @timer("GA — Stage 6 (person + accessibility)")
 def ga_stage6(out, landuse):
     from census_bridge import run_ga_extended
+    _bp = _ga_budget_params()
     res = run_ga_extended(
         stage=6, trips=out["trips"], persons=out["persons"],
-        landuse=landuse, purpose='work', pop_size=30, n_generations=40,
+        landuse=landuse, purpose='work', **_bp,
     )
-    res.plot_convergence(save_path=os.path.join(OUT_DIR, 'plots', 'ga_stage6.png'))
+    _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage6.png'))
     print(f"  person: {res.best_features.get('person')}")
     print(f"  acc:    {res.best_features.get('accessibility')}")
     return res
@@ -2105,6 +3372,15 @@ def main(filepath: str = None):
     s2_models = estimate_stage2(out)
     logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 2]")
 
+    # Joint participation + duration models (Tobit-I / Heckman).
+    # Always run in main so the HTML comparison report is available for every
+    # run.  The recommendation block in estimate_stage2_joint prints which
+    # model (two-stage lognormal vs Tobit-I vs Heckman) fits better.
+    os.environ['JOINT_PARTICIPATION_MODEL'] = '1'
+    logger.info("▶  Estimating Stage 2 joint models (Tobit-I + Heckman — model comparison)...")
+    estimate_stage2_joint(out, s2_models=s2_models)
+    logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 2 joint]")
+
     logger.info("▶  Estimating Stage 3 models (activity duration)...")
     s3_models = estimate_stage3(out)
     logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 3]")
@@ -2116,6 +3392,21 @@ def main(filepath: str = None):
     logger.info("▶  Estimating Stage 5 models (destination + mode choice)...")
     s5_models_est, skims, sk = estimate_stage5(out, landuse)
     logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 5]")
+
+    logger.info("▶  Estimating Stage 5t models (trip-level mode + destination choice)...")
+    _require_s5t = os.environ.get('STAGE5T_REQUIRED', '1') == '1'
+    try:
+        estimate_stage5_trips(out, landuse, skims)
+    except Exception as _s5t_e:
+        import traceback as _tb_s5t
+        logger.error(f"  Trip-level Stage 5 estimation failed: {_s5t_e}")
+        logger.debug(_tb_s5t.format_exc())
+        if _require_s5t:
+            raise RuntimeError(
+                "Stage 5t (trip mode + trip destination) is required but failed. "
+                "Set STAGE5T_REQUIRED=0 to continue without trip-level model artifacts."
+            ) from _s5t_e
+    logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 5t]")
 
     logger.info("✓  All stage models estimated and saved.")
     logger.info(f"   PKL + HTML reports in {OUT_DIR}/")
@@ -2164,7 +3455,14 @@ def main(filepath: str = None):
     import pickle as _pkl
     with open(_hhts_persons_path, 'wb') as _pf:
         _pkl.dump(out['persons'], _pf)
-    logger.info(f"  HHTS persons saved to {_hhts_persons_path} for Stage 5")
+        _pf.flush()
+        os.fsync(_pf.fileno())
+    if not os.path.exists(_hhts_persons_path):
+        raise RuntimeError(
+            f"HHTS persons file was not written: {_hhts_persons_path}\n"
+            "Check disk quota — run 'quota -s' or 'df -h $HOME'."
+        )
+    logger.info(f"  HHTS persons saved to {_hhts_persons_path} ({os.path.getsize(_hhts_persons_path)//1024:,} KB)")
     try:
         with open(_hhts_tours_path, 'wb') as _tf:
             _pkl.dump(out['tours'], _tf)
@@ -2320,7 +3618,25 @@ def main(filepath: str = None):
     _s1 = __import__('stage1_activity_frequency',
                      fromlist=['load_models']).load_models(
                          os.path.join(OUT_DIR, 'stage1_models.pkl'))
-    synth_s1 = predict_stage1(travellers, _s1); del _s1; gc.collect()
+    _hhts_persons_s1 = None
+    _hhts_tours_s1 = None
+    try:
+        _hhts_persons_s1 = _pkl.load(open(_out_persons_ref, 'rb'))
+    except Exception as _hp_e:
+        logger.warning(f"  Could not load HHTS persons for Stage 1 calibration: {_hp_e}")
+    if _hhts_tours_path and os.path.exists(_hhts_tours_path):
+        try:
+            _hhts_tours_s1 = _pkl.load(open(_hhts_tours_path, 'rb'))
+        except Exception as _ht_e:
+            logger.warning(f"  Could not load HHTS tours for Stage 1 calibration: {_ht_e}")
+    synth_s1 = predict_stage1(
+        travellers,
+        _s1,
+        hhts_persons=_hhts_persons_s1,
+        hhts_tours=_hhts_tours_s1,
+    )
+    del _s1, _hhts_persons_s1, _hhts_tours_s1
+    gc.collect()
 
     # ── Stage 2 predict ───────────────────────────────────────────────────
     logger.info("▶  Phase 2 — Stage 2 prediction")
@@ -2357,8 +3673,34 @@ def main(filepath: str = None):
     )
     del scheduled, _s5, _out_s5; gc.collect()
 
+    # ── Stage 5b predict — trip-level intermediate-stop destinations ──────
+    logger.info("▶  Phase 2 — Stage 5b prediction (trip-level destination choice)")
+    try:
+        _out_s5b = {'persons': travellers}
+        scheduled_dest = stage5b(_out_s5b, scheduled_dest, landuse)
+        logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 5b]")
+    except Exception as _s5b_e:
+        import traceback as _tb_s5b
+        logger.warning(f"Stage 5b failed (non-fatal): {_s5b_e}")
+        logger.debug(_tb_s5b.format_exc())
+    gc.collect()
+
     # ── Stage 6 (chunked by persons) ─────────────────────────────────────
     logger.info("▶  Phase 2 — Stage 6 validation + export (chunked)")
+    if not os.path.exists(_out_persons_ref):
+        _run_contents = os.listdir(OUT_DIR) if os.path.isdir(OUT_DIR) else ['<dir missing>']
+        logger.error(
+            f"_hhts_persons.pkl is missing from {OUT_DIR}\n"
+            f"  Expected: {_out_persons_ref}\n"
+            f"  Run directory contents: {_run_contents}\n"
+            "Most likely causes: (1) the run directory was cleaned by a concurrent "
+            "re-submission while this job was executing — never re-submit while a job "
+            "is running; (2) disk quota exceeded during Stage 5 — check 'quota -s'."
+        )
+        raise FileNotFoundError(
+            f"_hhts_persons.pkl not found at '{_out_persons_ref}'. "
+            "See pipeline.log for diagnostic info."
+        )
     # Minimal 'out' for stage6 — only persons needed for validate step
     _out_s6 = {'persons': _pkl.load(open(_out_persons_ref, 'rb'))}
     plan, _ = stage6(_out_s6, scheduled_dest, landuse,
@@ -2409,6 +3751,37 @@ def main(filepath: str = None):
     logger.info(f"  Per-zone folders : {OUT_DIR}/zones/zone_{{1..N}}/")
     logger.info(f"    Each folder contains stage6_output.csv + trips_for_aimsun.csv for that origin zone.")
 
+    # ── Auto-run safety comparison if both experiment arms have completed ──
+    _safety_mode = os.environ.get('SAFETY_EXPERIMENT_MODE', '').strip()
+    if _safety_mode in ('baseline', 'nosafety'):
+        _safe_base_dir = os.path.join('runs', 'safety_baseline')
+        _safe_nosa_dir = os.path.join('runs', 'safety_nosafety')
+        _safe_out_dir  = os.path.join('runs', 'safety_analysis')
+        # Only compare if the OTHER arm has already finished (has a plan CSV or coef CSV)
+        _arm_done = lambda d: (
+            os.path.isfile(os.path.join(d, 'stage5_models_coefficients.csv')) or
+            os.path.isfile(os.path.join(d, 'stage5_output.csv'))
+        )
+        if _arm_done(_safe_base_dir) and _arm_done(_safe_nosa_dir):
+            logger.info("Both safety experiment arms detected — running safety comparison...")
+            try:
+                compare_safety_runs(
+                    baseline_dir=_safe_base_dir,
+                    nosafety_dir=_safe_nosa_dir,
+                    out_dir=_safe_out_dir,
+                )
+                logger.info(f"  Safety analysis → {_safe_out_dir}/safety_report.html")
+            except Exception as _sfe:
+                import traceback as _tb_sf
+                logger.warning(f"Safety comparison failed: {_sfe}")
+                logger.debug(_tb_sf.format_exc())
+        else:
+            _missing_arm = 'baseline' if not _arm_done(_safe_base_dir) else 'nosafety'
+            logger.info(
+                f"Safety experiment '{_safety_mode}' completed. "
+                f"Run 'safety_{_missing_arm}' then 'safety_compare' to generate the report."
+            )
+
 
 def GA_main(filepath: str = None):
     """Run GA across all stages, then apply GA-selected features to the pipeline.
@@ -2453,6 +3826,8 @@ def GA_main(filepath: str = None):
             skims_path   = 'downcasted_matrices_base.omx',
             save_dir     = OUT_DIR,
         )
+        # ── Post-GA diagnostics (coefficients + HHTS validation) ──────
+        _ga_post_estimation_report(s5_models, out, OUT_DIR)
     else:
         # Fallback: run without feature overrides (same as main)
         synth_s1, _                          = stage1(out, travellers)
@@ -2466,6 +3841,12 @@ def GA_main(filepath: str = None):
     from stage5_destination_choice import _skim_flat, _skim_lookup
     skims     = omx.open_file('downcasted_matrices_base.omx', 'r')
     sk        = _skim_lookup(_skim_flat(skims))
+    try:
+        scheduled_dest = stage5b(out, scheduled_dest, landuse)
+    except Exception as _s5b_e:
+        import traceback as _tb_s5b
+        logger.warning(f"Stage 5b failed (non-fatal): {_s5b_e}")
+        logger.debug(_tb_s5b.format_exc())
     plan, _   = stage6(out, scheduled_dest, landuse,
                        stage5_models=s5_models, skims=skims, skim_lookup=sk)
     plot(plan)
@@ -2519,6 +3900,17 @@ def GA_STAGED(filepath: str = None):
     except Exception as _e:
         logger.warning(f"Could not save GA staged results: {_e}")
 
+    # ── Export per-stage history CSVs + combined convergence plot ─────────
+    try:
+        ga_reports_dir = os.path.join(OUT_DIR, 'ga_reports')
+        all_ga.export_reports(ga_reports_dir)
+        # Combined multi-panel convergence figure (all stages, all segments)
+        all_ga.plot_all(save_path=os.path.join(OUT_DIR, 'plots', 'ga_all_stages.png'))
+        logger.info(f"GA reports exported → {ga_reports_dir}/")
+        logger.info(f"GA combined plot   → {OUT_DIR}/plots/ga_all_stages.png")
+    except Exception as _gae:
+        logger.warning(f"GA report export failed: {_gae}")
+
     # ── Load synth only after all GA stages complete ───────────────────
     synth = (load_synth(filepath, landuse=landuse) if filepath and os.path.isfile(filepath)
              else load_synth_all_zones(SYNTH_DIR, landuse=landuse))
@@ -2538,11 +3930,19 @@ def GA_STAGED(filepath: str = None):
         skims_path = 'downcasted_matrices_base.omx',
         save_dir   = OUT_DIR,
     )
+    # ── Post-GA diagnostics (coefficients + HHTS validation) ──────────
+    _ga_post_estimation_report(s5_models, out, OUT_DIR)
 
     import openmatrix as omx
     from stage5_destination_choice import _skim_flat, _skim_lookup
     skims   = omx.open_file('downcasted_matrices_base.omx', 'r')
     sk      = _skim_lookup(_skim_flat(skims))
+    try:
+        scheduled_dest = stage5b(out, scheduled_dest, landuse)
+    except Exception as _s5b_e:
+        import traceback as _tb_s5b
+        logger.warning(f"Stage 5b failed (non-fatal): {_s5b_e}")
+        logger.debug(_tb_s5b.format_exc())
     plan, _ = stage6(out, scheduled_dest, landuse,
                      stage5_models=s5_models, skims=skims, skim_lookup=sk)
     plot(plan)
@@ -2626,9 +4026,679 @@ def GA_STAGED(filepath: str = None):
 
 
 # ---------------------------------------------------------------------------
+def compare_safety_runs(
+    baseline_dir: str = 'runs/safety_baseline',
+    nosafety_dir: str = 'runs/safety_nosafety',
+    out_dir:      str = 'runs/safety_analysis',
+) -> None:
+    """
+    Core paper analysis: compare Stage 5 models estimated WITH vs WITHOUT
+    crash/safety skims.
+
+    Produces:
+      {out_dir}/safety_comparison.csv     — numeric table of all metrics
+      {out_dir}/safety_report.html        — full HTML report (figures inline)
+      {out_dir}/plots/*.png               — individual figures
+
+    Statistics reported
+    -------------------
+    1. Likelihood Ratio Test (LRT) for each crash coefficient:
+          LRT = 2 × (LL_with_crash − LL_without_crash)
+          df  = number of crash parameters
+          Follows χ²(df) under H₀ (crash vars add no fit)
+          p < 0.05 → safety skims improve model fit significantly.
+
+    2. McFadden ρ² with vs without crash:
+          ρ² = 1 − LL_model / LL_null
+          Δρ² = ρ²_with − ρ²_without  (positive = crash helps)
+
+    3. Crash coefficient t-ratios — are they significant?
+          t = β / se(β)  → p = 2 × Φ(−|t|)
+          Reports β, se, t, p for CRASH and CRASHPT in each segment.
+
+    4. Mode share shift — how much does crash change mode share?
+          Δ(Walk %) = Walk%_with − Walk%_without
+          Δ(Bike %) = Bike%_with − Bike%_without
+          Positive Δ = safer routes attract more active travel.
+
+    5. Destination distance distribution shift:
+          Δ(mean dist) and Δ(dist p90) — does perceived safety
+          shift where people go?
+
+    6. Zone-level accessibility change:
+          Active-mode accessibility with vs without safety penalisation.
+    """
+    import scipy.stats as _stats
+
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(os.path.join(out_dir, 'plots'), exist_ok=True)
+
+    logger.info(f"Safety comparison: {baseline_dir!r} vs {nosafety_dir!r} → {out_dir!r}")
+
+    # ── Load coefficient CSVs ───────────────────────────────────────────────
+    def _load_coef(d):
+        for fn in ('stage5_models_coefficients.csv', 'stage5_tour_coefficients.csv'):
+            p = os.path.join(d, fn)
+            if os.path.exists(p):
+                return pd.read_csv(p)
+        return pd.DataFrame()
+
+    def _load_plan(d):
+        for fn in ('stage6_output.csv', 'stage5_output.csv'):
+            p = os.path.join(d, fn)
+            if os.path.exists(p):
+                df = pd.read_csv(p)
+                logger.info(f"  Loaded plan {fn} from {d}: {len(df):,} rows")
+                return df
+        return pd.DataFrame()
+
+    coef_base = _load_coef(baseline_dir)
+    coef_nosa = _load_coef(nosafety_dir)
+    plan_base = _load_plan(baseline_dir)
+    plan_nosa = _load_plan(nosafety_dir)
+
+    rows = []    # accumulate result rows
+
+    # ── 1. Crash coefficient statistics ────────────────────────────────────
+    crash_cols = [c for c in getattr(coef_base, 'columns', [])
+                  if 'crash' in str(c).lower() or 'CRASH' in str(c)]
+
+    if not coef_base.empty and not coef_nosa.empty:
+        _coef_id  = next((c for c in coef_base.columns
+                          if c.lower() in ('parameter', 'coef_name', 'name', 'variable')),
+                         coef_base.columns[0])
+        for _df, _lbl in [(coef_base, 'with_safety'), (coef_nosa, 'without_safety')]:
+            crash_rows = _df[_df[_coef_id].str.lower().str.contains('crash', na=False)]
+            for _, cr in crash_rows.iterrows():
+                _beta = pd.to_numeric(cr.get('value', cr.get('coef', cr.get('estimate', np.nan))),
+                                       errors='coerce')
+                _se   = pd.to_numeric(cr.get('std_err', cr.get('se', cr.get('stderr', np.nan))),
+                                       errors='coerce')
+                _t    = _beta / _se if _se and _se > 0 else np.nan
+                _p    = float(2 * _stats.norm.sf(abs(_t))) if np.isfinite(_t) else np.nan
+                rows.append({
+                    'category': 'crash_coef',
+                    'run':      _lbl,
+                    'segment':  str(cr.get('segment', cr.get('purpose', 'all'))),
+                    'parameter': str(cr[_coef_id]),
+                    'beta':     round(float(_beta), 4) if np.isfinite(_beta) else None,
+                    'se':       round(float(_se),   4) if np.isfinite(_se)   else None,
+                    't_ratio':  round(float(_t),    3) if np.isfinite(_t)    else None,
+                    'p_value':  round(float(_p),    4) if np.isfinite(_p)    else None,
+                    'significant': bool(_p < 0.05)     if np.isfinite(_p)    else None,
+                })
+        logger.info(f"  Crash coefficient rows extracted: {len(crash_rows)}")
+    else:
+        logger.warning("  Could not load coefficient CSVs from one or both run dirs")
+
+    # ── 2. Log-likelihood and rho² comparison ──────────────────────────────
+    def _load_ll(d):
+        """Extract LL values from stage5_validation_metrics.csv if present."""
+        p = os.path.join(d, 'stage5_validation_metrics.csv')
+        if os.path.exists(p):
+            return pd.read_csv(p)
+        return pd.DataFrame()
+
+    ll_base = _load_ll(baseline_dir)
+    ll_nosa = _load_ll(nosafety_dir)
+
+    if not ll_base.empty and not ll_nosa.empty:
+        _ll_col = next((c for c in ll_base.columns if 'll' in c.lower()), None)
+        _rho_col = next((c for c in ll_base.columns if 'rho' in c.lower()), None)
+        _seg_col = next((c for c in ll_base.columns if 'seg' in c.lower()
+                         or 'purp' in c.lower()), None)
+
+        if _ll_col and _seg_col:
+            for seg in ll_base[_seg_col].unique():
+                _b = ll_base[ll_base[_seg_col] == seg]
+                _n = ll_nosa[ll_nosa[_seg_col] == seg] if not ll_nosa.empty else pd.DataFrame()
+                ll_b  = float(_b[_ll_col].iloc[0]) if not _b.empty else np.nan
+                ll_n  = float(_n[_ll_col].iloc[0]) if not _n.empty else np.nan
+                lrt   = 2 * (ll_b - ll_n) if np.isfinite(ll_b) and np.isfinite(ll_n) else np.nan
+                # df = number of crash params; approximate as 2 (CRASH + CRASHPT)
+                p_lrt = float(_stats.chi2.sf(lrt, df=2)) if np.isfinite(lrt) else np.nan
+                rho_b = float(_b[_rho_col].iloc[0]) if _rho_col and not _b.empty else np.nan
+                rho_n = float(_n[_rho_col].iloc[0]) if _rho_col and not _n.empty else np.nan
+                rows.append({
+                    'category':  'model_fit',
+                    'run':       'comparison',
+                    'segment':   str(seg),
+                    'parameter': 'LL_ratio_test',
+                    'beta':      round(ll_b,  2) if np.isfinite(ll_b)  else None,
+                    'se':        round(ll_n,  2) if np.isfinite(ll_n)  else None,
+                    't_ratio':   round(lrt,   3) if np.isfinite(lrt)   else None,
+                    'p_value':   round(p_lrt, 4) if np.isfinite(p_lrt) else None,
+                    'significant': bool(p_lrt < 0.05) if np.isfinite(p_lrt) else None,
+                })
+                delta_rho = (rho_b - rho_n) if np.isfinite(rho_b) and np.isfinite(rho_n) else np.nan
+                rows.append({
+                    'category':  'model_fit',
+                    'run':       'comparison',
+                    'segment':   str(seg),
+                    'parameter': 'delta_rho2',
+                    'beta':      round(rho_b, 4) if np.isfinite(rho_b) else None,
+                    'se':        round(rho_n, 4) if np.isfinite(rho_n) else None,
+                    't_ratio':   round(delta_rho, 4) if np.isfinite(delta_rho) else None,
+                    'p_value':   None,
+                    'significant': bool(delta_rho > 0) if np.isfinite(delta_rho) else None,
+                })
+
+    # ── 3. Mode share shift ────────────────────────────────────────────────
+    MODE_NAMES_LOCAL = {1: 'Drive Alone', 2: 'Shared Ride',
+                        3: 'Walk', 4: 'Bike', 5: 'Transit'}
+
+    def _mode_share(plan):
+        if plan.empty:
+            return pd.Series(dtype=float)
+        t = plan[plan['row_type'] == 'trip'] if 'row_type' in plan.columns else plan
+        if 'mode' in t.columns:
+            return t['mode'].map(MODE_NAMES_LOCAL).value_counts(normalize=True) * 100
+        if 'mode_name' in t.columns:
+            return t['mode_name'].value_counts(normalize=True) * 100
+        return pd.Series(dtype=float)
+
+    ms_base = _mode_share(plan_base)
+    ms_nosa = _mode_share(plan_nosa)
+    all_modes = list(set(ms_base.index) | set(ms_nosa.index))
+    for mode in all_modes:
+        b_val = float(ms_base.get(mode, 0))
+        n_val = float(ms_nosa.get(mode, 0))
+        rows.append({
+            'category':   'mode_share',
+            'run':        'comparison',
+            'segment':    'all',
+            'parameter':  str(mode),
+            'beta':       round(b_val, 2),    # with_safety
+            'se':         round(n_val, 2),    # without_safety
+            't_ratio':    round(n_val - b_val, 2),   # Δ (positive = increase when removing crash)
+            'p_value':    None,
+            'significant': None,
+        })
+    active_b = sum(float(ms_base.get(m, 0)) for m in ['Walk', 'Bike'])
+    active_n = sum(float(ms_nosa.get(m, 0)) for m in ['Walk', 'Bike'])
+    rows.append({
+        'category': 'active_travel',
+        'run':      'comparison', 'segment': 'all',
+        'parameter': 'active_mode_share_pct',
+        'beta':     round(active_b, 2),
+        'se':       round(active_n, 2),
+        't_ratio':  round(active_n - active_b, 2),
+        'p_value':  None, 'significant': None,
+    })
+    logger.info(f"  Active travel: with_safety={active_b:.1f}%  "
+                f"without_safety={active_n:.1f}%  Δ={active_n-active_b:+.2f}pp")
+
+    # ── 4. Distance distribution shift ────────────────────────────────────
+    def _dist_stats(plan):
+        t = plan[plan['row_type'] == 'trip'] if 'row_type' in plan.columns else plan
+        dc = next((c for c in ['dist_km', 'dist', 'DIST'] if c in t.columns), None)
+        if not dc:
+            return {}
+        vals = pd.to_numeric(t[dc], errors='coerce').dropna()
+        if vals.empty:
+            return {}
+        return {
+            'mean': vals.mean(), 'median': vals.median(),
+            'p25':  vals.quantile(0.25), 'p75': vals.quantile(0.75),
+            'p90':  vals.quantile(0.90),
+        }
+
+    ds_base = _dist_stats(plan_base)
+    ds_nosa = _dist_stats(plan_nosa)
+    for stat in ['mean', 'median', 'p75', 'p90']:
+        b_val = ds_base.get(stat, np.nan)
+        n_val = ds_nosa.get(stat, np.nan)
+        delta = n_val - b_val if np.isfinite(b_val) and np.isfinite(n_val) else np.nan
+        rows.append({
+            'category': 'trip_distance',
+            'run':      'comparison', 'segment': 'all',
+            'parameter': f'dist_{stat}_km',
+            'beta':     round(b_val, 3) if np.isfinite(b_val) else None,
+            'se':       round(n_val, 3) if np.isfinite(n_val) else None,
+            't_ratio':  round(delta,  3) if np.isfinite(delta)  else None,
+            'p_value': None, 'significant': None,
+        })
+    logger.info(f"  Mean trip dist: with={ds_base.get('mean',np.nan):.2f}km  "
+                f"without={ds_nosa.get('mean',np.nan):.2f}km")
+
+    # ── Write outputs ──────────────────────────────────────────────────────
+    df_rows = pd.DataFrame(rows)
+    df_rows.to_csv(os.path.join(out_dir, 'safety_comparison.csv'), index=False)
+
+    # ── Generate figures ────────────────────────────────────────────────────
+    import matplotlib.pyplot as plt
+
+    # Figure 1 — mode share comparison
+    try:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), facecolor='white')
+        _ms_df = df_rows[df_rows['category'] == 'mode_share'].copy()
+        modes = _ms_df['parameter'].tolist()
+        xs = np.arange(len(modes))
+        w  = 0.35
+        ax1.bar(xs - w/2, _ms_df['beta'],   w, color='#2C6B9C', alpha=0.85, label='With safety skims')
+        ax1.bar(xs + w/2, _ms_df['se'],     w, color='#E07030', alpha=0.85, label='Without safety skims')
+        ax1.set_xticks(xs); ax1.set_xticklabels(modes, rotation=20, ha='right', fontsize=9)
+        ax1.set_ylabel('Mode share (%)'); ax1.set_title('Mode share: safety vs no-safety')
+        ax1.legend(fontsize=9); ax1.grid(axis='y', alpha=0.3)
+        deltas = _ms_df['t_ratio'].tolist()
+        ax2.barh(modes, deltas,
+                 color=['#2ECC71' if d < 0 else '#E74C3C' for d in deltas], alpha=0.85)
+        ax2.axvline(0, color='black', lw=0.8)
+        ax2.set_xlabel('Δ share pp (negative = crash penalises mode)'); ax2.grid(axis='x', alpha=0.3)
+        ax2.set_title('Mode share shift from removing safety skims')
+        for i, d in enumerate(deltas):
+            if abs(d) > 0.05:
+                ax2.text(d + (0.05 if d >= 0 else -0.05), i, f'{d:+.2f}pp',
+                         va='center', ha='left' if d >= 0 else 'right', fontsize=8)
+        plt.tight_layout()
+        fig.savefig(os.path.join(out_dir, 'plots', 'safety_mode_share.png'), dpi=150, bbox_inches='tight')
+        plt.close(fig)
+    except Exception as _fe:
+        logger.warning(f"  Mode share figure failed: {_fe}")
+
+    # Figure 2 — crash coefficient forest plot
+    try:
+        _cc = df_rows[(df_rows['category'] == 'crash_coef') &
+                      df_rows['beta'].notna() & df_rows['t_ratio'].notna()]
+        if not _cc.empty:
+            fig, ax = plt.subplots(figsize=(10, max(4, len(_cc) * 0.5 + 1.5)), facecolor='white')
+            labels  = [f"{r['run'][:4]}|{r['segment']}|{r['parameter']}"
+                       for _, r in _cc.iterrows()]
+            betas   = _cc['beta'].tolist()
+            ses     = _cc['se'].fillna(0).tolist()
+            colors  = ['#2C6B9C' if 'with' in lb else '#E07030' for lb in labels]
+            ys      = np.arange(len(labels))
+            ax.barh(ys, betas, xerr=ses, color=colors, alpha=0.8, capsize=3)
+            ax.axvline(0, color='black', lw=0.8)
+            ax.set_yticks(ys); ax.set_yticklabels(labels, fontsize=8)
+            ax.set_xlabel('Coefficient β  (negative = crash deters travel on that OD)')
+            ax.set_title('Crash/safety coefficient estimates')
+            from matplotlib.patches import Patch
+            ax.legend(handles=[Patch(color='#2C6B9C', label='With safety'),
+                                Patch(color='#E07030', label='Without safety')],
+                      fontsize=9)
+            ax.grid(axis='x', alpha=0.3)
+            plt.tight_layout()
+            fig.savefig(os.path.join(out_dir, 'plots', 'safety_crash_coefs.png'),
+                        dpi=150, bbox_inches='tight')
+            plt.close(fig)
+    except Exception as _fe:
+        logger.warning(f"  Crash coef figure failed: {_fe}")
+
+    # ── Figure 3 — Activity level comparison (with vs without safety) ────────
+    # Shows how safety skims shift the activity-type distribution:
+    # if crash-penalised ODs make certain activity zones less attractive,
+    # those trip purposes will be suppressed.
+    try:
+        def _activity_dist(plan):
+            """Return activity type counts (normalised %) from a plan DataFrame."""
+            if plan.empty:
+                return pd.Series(dtype=float)
+            purp_col = next(
+                (c for c in ['purpose', 'primary_purpose', 'main_purpose', 'activity']
+                 if c in plan.columns), None
+            )
+            if purp_col is None:
+                return pd.Series(dtype=float)
+            # Count trip (not activity) rows for mode share consistency
+            if 'row_type' in plan.columns:
+                rows = plan[plan['row_type'].isin(['trip', 'activity'])]
+            else:
+                rows = plan
+            return rows[purp_col].value_counts(normalize=True) * 100
+
+        act_base = _activity_dist(plan_base)
+        act_nosa = _activity_dist(plan_nosa)
+
+        if not act_base.empty or not act_nosa.empty:
+            all_acts = sorted(set(act_base.index) | set(act_nosa.index))
+            # Filter to meaningful activity types (drop 'home', NaN, numeric)
+            all_acts = [a for a in all_acts if isinstance(a, str) and a.lower() not in ('home', 'nan', '')]
+            if all_acts:
+                b_vals = [float(act_base.get(a, 0)) for a in all_acts]
+                n_vals = [float(act_nosa.get(a, 0)) for a in all_acts]
+                deltas = [n - b for n, b in zip(n_vals, b_vals)]
+
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, max(5, len(all_acts) * 0.55 + 1.5)),
+                                               facecolor='white')
+                xs = np.arange(len(all_acts))
+                w  = 0.35
+                ax1.barh(xs - w/2, b_vals, w, color='#2C6B9C', alpha=0.85, label='With safety skims')
+                ax1.barh(xs + w/2, n_vals, w, color='#E07030', alpha=0.85, label='Without safety skims')
+                ax1.set_yticks(xs)
+                ax1.set_yticklabels([a.replace('_', ' ').title() for a in all_acts], fontsize=9)
+                ax1.set_xlabel('Activity share (%)')
+                ax1.set_title('Activity type distribution\n(with vs without safety skims)', fontsize=10)
+                ax1.legend(fontsize=9)
+                ax1.grid(axis='x', alpha=0.3)
+
+                # Delta panel — highlight which activities are pushed by safety
+                colors_d = ['#27AE60' if d < -0.05 else '#E74C3C' if d > 0.05 else '#95A5A6'
+                            for d in deltas]
+                ax2.barh(xs, deltas, color=colors_d, alpha=0.85)
+                ax2.axvline(0, color='black', lw=0.8)
+                ax2.set_yticks(xs)
+                ax2.set_yticklabels([a.replace('_', ' ').title() for a in all_acts], fontsize=9)
+                ax2.set_xlabel('Δ activity share pp\n(positive = more without safety; green = safety suppresses)')
+                ax2.set_title('Safety skim effect on activity distribution', fontsize=10)
+                for i, d in enumerate(deltas):
+                    if abs(d) > 0.1:
+                        ax2.text(d + (0.05 if d >= 0 else -0.05), i, f'{d:+.2f}pp',
+                                 va='center', ha='left' if d >= 0 else 'right', fontsize=8)
+                ax2.grid(axis='x', alpha=0.3)
+
+                plt.tight_layout()
+                fig.savefig(os.path.join(out_dir, 'plots', 'safety_activity_levels.png'),
+                            dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                logger.info("  Activity-level safety figure saved.")
+    except Exception as _fe3:
+        logger.warning(f"  Activity level figure failed: {_fe3}")
+
+    # ── Figure 4 — Zone derivation: which zones are pushed by safety skims ───
+    # Identify zones where removing safety skims changes predicted mode share
+    # or trip volume the most.  Rank zones by |Δ active travel share| and
+    # plot against their OSM/landuse attributes to expose the driver.
+    _zone_df = pd.DataFrame()
+    try:
+        def _zone_active_share(plan):
+            """Return per-zone active-travel share."""
+            if plan.empty:
+                return pd.Series(dtype=float)
+            t = plan[plan['row_type'] == 'trip'] if 'row_type' in plan.columns else plan
+            zcol = next((c for c in ['OTAZ', 'origin_zone', 'ORIGZONE'] if c in t.columns), None)
+            mcol = next((c for c in ['mode', 'mode_name'] if c in t.columns), None)
+            if zcol is None or mcol is None:
+                return pd.Series(dtype=float)
+            m = t[mcol].map(lambda x: x if isinstance(x, str) else
+                             {1:'DA',2:'SR',3:'Walk',4:'Bike',5:'Transit'}.get(int(x),'DA'))
+            is_active = m.isin(['Walk', 'Bike'])
+            return t.groupby(zcol).apply(lambda g: is_active.loc[g.index].mean() * 100)
+
+        za_base = _zone_active_share(plan_base)
+        za_nosa = _zone_active_share(plan_nosa)
+
+        if not za_base.empty and not za_nosa.empty:
+            common = za_base.index.intersection(za_nosa.index)
+            _zone_df = pd.DataFrame({
+                'zone':         common,
+                'active_with':  za_base.reindex(common).values,
+                'active_without': za_nosa.reindex(common).values,
+            })
+            _zone_df['delta_active'] = _zone_df['active_without'] - _zone_df['active_with']
+            _zone_df['abs_delta']    = _zone_df['delta_active'].abs()
+            _zone_df = _zone_df.sort_values('abs_delta', ascending=False)
+
+            # Try to merge landuse attributes (OSM safe features, crash exposure)
+            _lu_path = os.path.join('saved_data', 'accessibility.csv')
+            if not os.path.exists(_lu_path):
+                _lu_path = os.path.join('pddopulation_by_order_with_osm_and_landuse.csv')
+            if os.path.exists(_lu_path):
+                _lu = pd.read_csv(_lu_path)
+                _zone_id_col = next(
+                    (c for c in ['ORDER', 'zone_id', 'ZONE_ID', 'SA1_7DIGITCODE_2021']
+                     if c in _lu.columns), _lu.columns[0]
+                )
+                _lu = _lu.rename(columns={_zone_id_col: 'zone'})
+                _lu['zone'] = pd.to_numeric(_lu['zone'], errors='coerce')
+                _zone_df = _zone_df.merge(_lu, on='zone', how='left')
+
+            # Safe/walkable features from OSM columns
+            _safe_cols = [c for c in _zone_df.columns if any(
+                kw in c.lower() for kw in
+                ('park', 'walk', 'bike', 'cycl', 'crash', 'safe', 'footway',
+                 'pedestrian', 'recreational', 'recreation_ground', 'residential')
+            )]
+
+            # Write zone ranking CSV
+            _zone_df.to_csv(os.path.join(out_dir, 'safety_zone_ranking.csv'), index=False)
+            logger.info(f"  Zone ranking saved → {out_dir}/safety_zone_ranking.csv  "
+                        f"({len(_zone_df)} zones)")
+
+            # Plot: top-20 zones most affected by safety skims vs their OSM features
+            top20 = _zone_df.head(20)
+            n_feat = min(len(_safe_cols), 4)
+
+            if n_feat > 0:
+                fig, axes = plt.subplots(1, n_feat + 1,
+                                         figsize=(4 * (n_feat + 1), 5),
+                                         facecolor='white')
+                axes = np.atleast_1d(axes)
+                # Left panel: delta active travel
+                ax0 = axes[0]
+                colors_z = ['#27AE60' if d < 0 else '#E74C3C' for d in top20['delta_active']]
+                ax0.barh(range(len(top20)), top20['delta_active'], color=colors_z, alpha=0.85)
+                ax0.axvline(0, color='black', lw=0.8)
+                ax0.set_yticks(range(len(top20)))
+                ax0.set_yticklabels([f"Zone {z}" for z in top20['zone']], fontsize=7)
+                ax0.set_xlabel('Δ active travel (pp)')
+                ax0.set_title('Active travel shift\n(top-20 zones)', fontsize=9)
+                ax0.grid(axis='x', alpha=0.3)
+
+                for k, feat in enumerate(_safe_cols[:n_feat]):
+                    ax = axes[k + 1]
+                    vals = pd.to_numeric(top20[feat], errors='coerce').fillna(0)
+                    ax.barh(range(len(top20)), vals, color='#8E44AD', alpha=0.7)
+                    ax.set_yticks(range(len(top20)))
+                    ax.set_yticklabels([])
+                    ax.set_xlabel(feat.replace('_', ' '), fontsize=8)
+                    ax.set_title(feat.replace('_', ' ').title(), fontsize=8)
+                    ax.grid(axis='x', alpha=0.3)
+
+                plt.suptitle('Zones most affected by safety skims — landuse / OSM attributes',
+                             fontsize=10, fontweight='bold')
+                plt.tight_layout()
+                fig.savefig(os.path.join(out_dir, 'plots', 'safety_zone_derivation.png'),
+                            dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                logger.info("  Zone derivation figure saved.")
+            else:
+                # Simpler plot if no safe feature columns found
+                fig, ax = plt.subplots(figsize=(8, 5), facecolor='white')
+                colors_z = ['#27AE60' if d < 0 else '#E74C3C' for d in top20['delta_active']]
+                ax.barh(range(len(top20)), top20['delta_active'], color=colors_z, alpha=0.85)
+                ax.axvline(0, color='black', lw=0.8)
+                ax.set_yticks(range(len(top20)))
+                ax.set_yticklabels([f"Zone {z}" for z in top20['zone']], fontsize=8)
+                ax.set_xlabel('Δ active travel share (pp)')
+                ax.set_title('Top-20 zones: active travel shift from removing safety skims\n'
+                             '(green = safety suppresses active travel; red = safety promotes it)',
+                             fontsize=9)
+                ax.grid(axis='x', alpha=0.3)
+                plt.tight_layout()
+                fig.savefig(os.path.join(out_dir, 'plots', 'safety_zone_derivation.png'),
+                            dpi=150, bbox_inches='tight')
+                plt.close(fig)
+    except Exception as _fe4:
+        import traceback as _tb_z
+        logger.warning(f"  Zone derivation figure failed: {_fe4}")
+        logger.debug(_tb_z.format_exc())
+
+    # ── HTML report ────────────────────────────────────────────────────────
+    _img = lambda fn: (
+        f"<img src='plots/{fn}' style='max-width:100%;margin-bottom:20px'>"
+        if os.path.exists(os.path.join(out_dir, 'plots', fn)) else ""
+    )
+
+    # Crash coeff section
+    _cc_rows = df_rows[df_rows['category'] == 'crash_coef']
+    _cc_html = ""
+    if not _cc_rows.empty:
+        _cc_html = "<table><tr><th>Run</th><th>Segment</th><th>Parameter</th>" \
+                   "<th>β</th><th>SE</th><th>t</th><th>p</th><th>Sig?</th></tr>"
+        for _, r in _cc_rows.iterrows():
+            _sig = "✓ yes" if r.get('significant') else ("✗ no" if r.get('significant') is not None else "—")
+            _p_style = " style='color:green;font-weight:bold'" if r.get('significant') else ""
+            _cc_html += (f"<tr><td>{r['run']}</td><td>{r['segment']}</td>"
+                         f"<td>{r['parameter']}</td>"
+                         f"<td style='text-align:right'>{r['beta'] if r['beta'] is not None else '—'}</td>"
+                         f"<td style='text-align:right'>{r['se'] if r['se'] is not None else '—'}</td>"
+                         f"<td style='text-align:right'>{r['t_ratio'] if r['t_ratio'] is not None else '—'}</td>"
+                         f"<td style='text-align:right'{_p_style}>{r['p_value'] if r['p_value'] is not None else '—'}</td>"
+                         f"<td>{_sig}</td></tr>")
+        _cc_html += "</table>"
+
+    # Model fit (LRT) section
+    _lrt_rows = df_rows[df_rows['category'] == 'model_fit']
+    _lrt_html = ""
+    if not _lrt_rows.empty:
+        _lrt_html = ("<table><tr><th>Segment</th><th>Metric</th>"
+                     "<th>With safety</th><th>Without safety</th><th>Δ / LRT stat</th>"
+                     "<th>p (χ²)</th><th>Interpretation</th></tr>")
+        for _, r in _lrt_rows.iterrows():
+            if r['parameter'] == 'LL_ratio_test':
+                _interp = (f"LRT={r['t_ratio']:.2f}, p={r['p_value']:.4f}. "
+                            "Crash vars <b>significantly improve</b> model fit." 
+                            if r.get('significant') else
+                            "Crash vars do <b>not</b> significantly improve fit.")
+                _lrt_html += (f"<tr><td>{r['segment']}</td><td>LL (Ratio Test)</td>"
+                              f"<td>{r['beta']:.1f}</td><td>{r['se']:.1f}</td>"
+                              f"<td>{r['t_ratio']:.2f}</td>"
+                              f"<td{' style=color:green;font-weight:bold' if r.get('significant') else ''}>"
+                              f"{r['p_value']:.4f}</td><td>{_interp}</td></tr>")
+            elif r['parameter'] == 'delta_rho2':
+                _interp = ("Δρ² > 0: safety skims improve model fit." 
+                            if r.get('significant') else "Δρ² ≤ 0: no improvement from crash vars.")
+                _lrt_html += (f"<tr><td>{r['segment']}</td><td>McFadden ρ²</td>"
+                              f"<td>{r['beta']:.4f}</td><td>{r['se']:.4f}</td>"
+                              f"<td>{r['t_ratio']:+.4f}</td><td>—</td>"
+                              f"<td>{_interp}</td></tr>")
+        _lrt_html += "</table>"
+
+    # Mode share section
+    _ms_df_html = df_rows[df_rows['category'] == 'mode_share']
+    _ms_html = ""
+    if not _ms_df_html.empty:
+        _ms_html = ("<table><tr><th>Mode</th><th>With safety (%)</th>"
+                    "<th>Without safety (%)</th><th>Δ (pp)</th>"
+                    "<th>Interpretation</th></tr>")
+        for _, r in _ms_df_html.iterrows():
+            delta = r['t_ratio']
+            _interp = ("↑ removing crash increases share" if delta > 0.1
+                       else "↓ crash penalisation reduces share" if delta < -0.1
+                       else "≈ negligible change")
+            _ms_html += (f"<tr><td>{r['parameter']}</td>"
+                         f"<td style='text-align:right'>{r['beta']:.1f}</td>"
+                         f"<td style='text-align:right'>{r['se']:.1f}</td>"
+                         f"<td style='text-align:right'>{delta:+.2f}</td>"
+                         f"<td>{_interp}</td></tr>")
+        _ms_html += "</table>"
+
+    _active_row = df_rows[df_rows['parameter'] == 'active_mode_share_pct']
+    _act_summary = ""
+    if not _active_row.empty:
+        r = _active_row.iloc[0]
+        _act_summary = (f"<p><strong>Active mode share (Walk+Bike):</strong> "
+                        f"With safety = {r['beta']:.1f}%  |  "
+                        f"Without safety = {r['se']:.1f}%  |  "
+                        f"Δ = {r['t_ratio']:+.2f} pp. "
+                        f"{'Removing crash skims increases active travel share (counter-intuitive — suggests the safety penalty is correctly discouraging unsafe routes).' if r['t_ratio'] < 0 else 'Removing crash skims reduces active travel share (consistent with hypothesis: crash-free zones attract active modes).'}"
+                        f"</p>")
+
+    html = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Safety Skim Experiment — Model Comparison Report</title>
+<style>
+body{{font-family:Arial,sans-serif;margin:30px;font-size:13px;max-width:1100px}}
+h1{{color:#1a3a5c;border-bottom:2px solid #1a3a5c;padding-bottom:8px}}
+h2{{color:#2c5f8a;margin-top:32px}}
+h3{{color:#3a7abf}}
+table{{border-collapse:collapse;width:100%;margin-bottom:20px;font-size:12px}}
+th{{background:#2c5f8a;color:white;padding:7px 10px;text-align:left}}
+td{{border:1px solid #ddd;padding:5px 10px}}
+tr:nth-child(even){{background:#f5f8fc}}
+.box{{background:#eaf2fb;border-left:4px solid #2c5f8a;padding:12px 16px;margin:16px 0}}
+.highlight{{background:#d4efdf;border-left:4px solid #27ae60;padding:12px 16px;margin:16px 0}}
+.warn{{background:#fdecea;border-left:4px solid #e74c3c;padding:12px 16px;margin:16px 0}}
+img{{border:1px solid #ddd;border-radius:4px;margin-bottom:16px}}
+</style></head><body>
+
+<h1>Safety Skim Experiment — Model Comparison Report</h1>
+<div class="box">
+<strong>Research question:</strong> Do crash/safety OD skims improve the tour-level 
+destination and mode choice models? Does penalising unsafe route combinations shift 
+predicted travel behaviour toward active modes and shorter, safer trips?<br><br>
+<strong>Runs compared:</strong><br>
+&nbsp;• <em>With safety skims</em> ({baseline_dir})<br>
+&nbsp;• <em>Without safety skims</em> ({nosafety_dir})
+</div>
+
+<h2>1. Crash Coefficient Estimates</h2>
+<p>Negative β for CRASH/CRASHPT means travellers are less likely to choose 
+destinations/modes with high crash exposure. A significant negative β 
+(<em>p</em> &lt; 0.05, coloured green below) confirms safety skims carry 
+behavioural information beyond the road network skim.</p>
+{_cc_html or '<p>Coefficient CSV not found in run directories.</p>'}
+{_img('safety_crash_coefs.png')}
+
+<h2>2. Model Fit — Likelihood Ratio Test</h2>
+<p>LRT = 2 × (LL<sub>with</sub> − LL<sub>without</sub>), χ²(<em>df</em>=2).
+Reject H₀ (crash adds no fit) when <em>p</em> &lt; 0.05.</p>
+{_lrt_html or '<p>stage5_validation_metrics.csv not found in run directories.</p>'}
+
+<h2>3. Mode Share Implications</h2>
+<p>If safety skims correctly penalise crash-prone ODs, we expect the <em>with-safety</em>
+model to produce lower Walk and Bike shares on dangerous corridors and higher shares on 
+safe ones — but aggregate mode share may shift either way depending on the SEQ network.</p>
+{_ms_html or '<p>Plan output not found.</p>'}
+{_act_summary}
+{_img('safety_mode_share.png')}
+
+<h2>4. Activity Level Implications</h2>
+<p>Safety skims affect <em>where</em> people go, which indirectly affects <em>what</em>
+activities they pursue (if crash-penalised zones host certain activity types, those
+activity purposes are suppressed in the with-safety prediction).  The chart below
+compares the predicted activity-type distribution across both model runs.
+Green bars indicate activity types whose share is reduced by safety penalisation
+(crash skims discourage travel to those activity zones).</p>
+{_img('safety_activity_levels.png')}
+
+<h2>5. Zone Derivation — Which Zones Are Being Pushed by Safety Skims?</h2>
+<p>The chart below ranks the 20 zones with the largest absolute change in predicted
+active-travel share (Walk + Bike) between the two runs.  Zones where removing safety
+skims <em>increases</em> active travel (red bars) are zones that the crash skim was
+discouraging — likely high-crash ODs.  OSM and landuse attributes (park area, cycling
+infrastructure, residential density) are plotted alongside to show whether safe
+physical features align with the zones being suppressed.</p>
+{_img('safety_zone_derivation.png')}
+<p>Full zone-level data saved to <code>safety_zone_ranking.csv</code>.</p>
+
+<h2>6. Summary and Research Implications</h2>
+<div class="highlight">
+<ul>
+<li>If crash coefficients are negative and significant: safety skims are <strong>behaviourally
+valid</strong> — model it.</li>
+<li>If Δρ² &gt; 0.002: meaningful improvement in destination choice predictive power.</li>
+<li>If active travel share drops with safety skims: crash penalisation is selecting
+safer but lower-speed routes, as hypothesised.</li>
+<li>If LRT <em>p</em> &lt; 0.01 across all segments: strong evidence for inclusion
+in the final published model.</li>
+<li>Zone derivation: zones with high OSM walkability/cycling features and large
+negative Δ active travel are the zones where the safety skim is actively suppressing
+behaviour — these are the zones to highlight in the paper.</li>
+</ul>
+</div>
+
+<p style="color:#888;font-size:11px;margin-top:40px">
+Generated by pipeline_logger.py compare_safety_runs() — {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}
+</p>
+</body></html>"""
+
+    html_path = os.path.join(out_dir, 'safety_report.html')
+    with open(html_path, 'w', encoding='utf-8') as _hf:
+        _hf.write(html)
+    logger.info(f"Safety report → {html_path}")
+    logger.info(f"Safety CSV   → {os.path.join(out_dir, 'safety_comparison.csv')}")
+    print(f"\n{'='*60}")
+    print(f"Safety comparison complete.")
+    print(f"  HTML report → {html_path}")
+    print(f"  CSV data    → {os.path.join(out_dir, 'safety_comparison.csv')}")
+    print(f"  Figures     → {os.path.join(out_dir, 'plots')}/")
+
+
 if __name__ == "__main__":
     import sys
-    
+
     # ── Usage ──────────────────────────────────────────────────────────────
     # python pipeline_logger.py                      → full population, all zones
     # python pipeline_logger.py main                 → full population, all zones
@@ -2665,13 +4735,25 @@ if __name__ == "__main__":
         os.environ['SAFETY_EXPERIMENT_MODE'] = mode.replace('safety_', '')
         logger.info(f"Safety experiment mode: {os.environ['SAFETY_EXPERIMENT_MODE']}")
         main(arg)
+    elif mode == 'safety_compare':
+        # Compare safety_baseline vs safety_nosafety runs and write a report.
+        # Run AFTER both safety_baseline and safety_nosafety have completed.
+        compare_safety_runs(
+            baseline_dir = os.path.join('runs', 'safety_baseline'),
+            nosafety_dir = os.path.join('runs', 'safety_nosafety'),
+            out_dir      = os.path.join('runs', 'safety_analysis'),
+        )
     else:
-        print("Usage: python pipeline_logger.py [main|ga|ga_staged|safety_baseline|safety_nosafety] [zone]")
+        print("Usage: python pipeline_logger.py [main|ga|ga_staged|"
+              "safety_baseline|safety_nosafety|safety_compare] [zone]")
         print("  zone_or_file can be:")
         print("    (empty)          — load all zones from SYNTH_DIR")
         print("    40               — single zone number")
         print("    40,124,200       — comma-separated zone numbers")
         print("    order_40.csv     — specific CSV filename")
         print("    path/to/file.csv — full path to CSV")
+        print("")
+        print("  GA budget:  set GA_BUDGET=fast|standard|thorough (default: fast)")
+        print("  Parallelism: set STAGE5_WORKERS=N (default: 1; N≤ncpus allocated)")
 
 

@@ -1,0 +1,366 @@
+#!/bin/bash -l
+#
+# job_submit_all_tests.pbs
+# ========================
+# Master submission script — writes and queues every test job for the pipeline.
+#
+# JOB GRAPH (arrows = afterok dependency):
+#
+#   ┌────────────┐     ┌──────────────┐     ┌──────────────────────┐
+#   │  J1: main  │────>│ J2: ga       │────>│ J3: ga_staged        │
+#   │  (full run)│     │ (GA variable │     │ (staged GA + synth   │
+#   │            │     │  selection)  │     │  population predict) │
+#   └────────────┘     └──────────────┘     └──────────────────────┘
+#        │
+#        ├──────────────────────────────────────────────────────────────┐
+#        │                                                              │
+#        ▼                                                              ▼
+#   ┌──────────────────┐   (after J1)                    ┌──────────────────────┐
+#   │ J4: joint_model  │                                 │ J5: safety_baseline  │
+#   │ (Tobit-I +       │                                 │ (Stage 5 WITH crash  │
+#   │  Heckman joint   │                                 │  + CRASHPT skims)    │
+#   │  participation   │                                 └──────────┬───────────┘
+#   │  + duration)     │                                            │ afterok
+#   └──────────────────┘                                            ▼
+#                                                      ┌──────────────────────┐
+#                                                      │ J6: safety_nosafety  │
+#                                                      │ (Stage 5 WITHOUT     │
+#                                                      │  safety skims)       │
+#                                                      └──────────┬───────────┘
+#                                                                 │ afterok
+#                                                                 ▼
+#                                                      ┌──────────────────────┐
+#                                                      │ J7: safety_analysis  │
+#                                                      │ (compare runs,       │
+#                                                      │  activity plots,     │
+#                                                      │  zone derivation,    │
+#                                                      │  HTML report)        │
+#                                                      └──────────────────────┘
+#
+# WHAT EACH JOB DOES
+# ------------------
+#  J1 main          : Full pipeline estimation (stages 1–5) + synthetic population
+#                     prediction.  Produces stage1–5 model pkls, HTML reports,
+#                     validation plots, stage5 trip chain outputs.
+#                     Wall: 20h  RAM: 194 GB  GPU: 1
+#
+#  J2 ga            : GA variable selection (stages 1–5 simultaneously).
+#                     BIC-minimising chromosome search over person/LOS/landuse vars.
+#                     Writes ga_results.pkl + HTML convergence reports.
+#                     Wall: 20h  RAM: 194 GB  GPU: 1
+#                     Runs after J1 so it can warm-start from stage models.
+#
+#  J3 ga_staged     : Staged GA (one stage at a time) + applies GA results to
+#                     synthetic population.  Writes stage model pkls refined by
+#                     GA + HHTS validation HTMLs + trip-level mode/dest HTMLs
+#                     (per purpose).
+#                     Wall: 20h  RAM: 194 GB  GPU: 1
+#                     Runs after J2.
+#
+#  J4 joint_model   : Joint participation + duration models (Tobit-I and Heckman).
+#                     Tests whether non-travellers require a joint spec.
+#                     Writes stage2_joint_models.pkl,
+#                     stage2_joint_comparison.csv,
+#                     stage2_joint_model_comparison.html,
+#                     plots: joint_participation_comparison.png,
+#                            joint_budget_scatter.png,
+#                            joint_coefficient_imr.png.
+#                     Wall: 4h  RAM: 32 GB
+#                     Runs after J1 (needs stage2 models as comparison baseline).
+#
+#  J5 safety_baseline : Full pipeline run with CRASH + CRASHPT skims active.
+#                       Writes to runs/safety_baseline/.
+#                       Wall: 23h  RAM: 194 GB
+#
+#  J6 safety_nosafety : Full pipeline run with safety skims EXCLUDED.
+#                       Writes to runs/safety_nosafety/.
+#                       Wall: 23h  RAM: 194 GB
+#                       Runs after J5 (sequential so nodes aren't double-booked).
+#
+#  J7 safety_analysis : Compares J5/J6 outputs.
+#                       Produces:
+#                         safety_experiment_report.html
+#                         plots/safety_mode_share.png
+#                         plots/safety_activity_levels.png   ← activity distribution shift
+#                         plots/safety_zone_derivation.png   ← top-20 zones + OSM features
+#                         safety_zone_ranking.csv
+#                       Wall: 2h  RAM: 32 GB
+#                       Runs after J6.
+#
+# USAGE
+# -----
+#   qsub job_submit_all_tests.pbs              # submit all 7 jobs
+#
+#   # Override conda env, resource requests, or parallelism:
+#   CONDA_ENV=myenv NCPUS_HEAVY=8 MEM_HEAVY=256GB qsub job_submit_all_tests.pbs
+#
+#   # Dry-run (print job scripts, don't submit):
+#   DRY_RUN=1 bash job_submit_all_tests.pbs
+
+#PBS -N saw_submit
+#PBS -l walltime=00:03:00
+#PBS -l select=1:ncpus=1:mem=2GB
+#PBS -j eo
+#PBS -m n
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV:-zigenv}"
+module unload Anaconda3
+
+# ── Tuneable parameters (override with env vars before qsub) ──────────────
+CONDA_ENV="${CONDA_ENV:-zigenv}"
+NCPUS_HEAVY="${NCPUS_HEAVY:-1}"          # CPUs for main/ga/safety jobs
+MEM_HEAVY="${MEM_HEAVY:-194GB}"          # RAM for heavy jobs
+MEM_LIGHT="${MEM_LIGHT:-32GB}"           # RAM for analysis/joint jobs
+WALLTIME_MAIN="${WALLTIME_MAIN:-20:59:00}"
+WALLTIME_SAFETY="${WALLTIME_SAFETY:-23:59:00}"
+WALLTIME_JOINT="${WALLTIME_JOINT:-04:00:00}"
+WALLTIME_ANALYSIS="${WALLTIME_ANALYSIS:-02:00:00}"
+DRY_RUN="${DRY_RUN:-0}"
+
+# Clean old submission logs
+rm -f saw_submit.o* saw_submit.e*
+
+# ── Helper: write a job script file ──────────────────────────────────────
+write_pbs() {
+    local SCRIPT="$1"
+    local NAME="$2"
+    local WALLTIME="$3"
+    local SELECT="$4"
+    local BODY="$5"
+
+    cat > "$SCRIPT" << OUTER
+#!/bin/bash -l
+#PBS -N ${NAME}
+#PBS -l walltime=${WALLTIME}
+#PBS -l ${SELECT}
+#PBS -j eo
+#PBS -m abe
+#PBS -r y
+
+set -euo pipefail
+cd \$PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+conda activate ${CONDA_ENV}
+module unload Anaconda3
+
+${BODY}
+OUTER
+    echo "  wrote  $SCRIPT"
+}
+
+# ── Helper: submit or dry-run ─────────────────────────────────────────────
+submit() {
+    local SCRIPT="$1"
+    local DEPS="${2:-}"
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "  DRY-RUN  qsub ${DEPS:+-W depend=afterok:$DEPS} $SCRIPT"
+        echo "DRYRUN_${SCRIPT}"
+        return
+    fi
+    if [ -n "$DEPS" ]; then
+        qsub -W "depend=afterok:${DEPS}" "$SCRIPT"
+    else
+        qsub "$SCRIPT"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# J1 — main
+# ═══════════════════════════════════════════════════════════════════════════
+write_pbs "_t_main.pbs" "saw_main" "$WALLTIME_MAIN" \
+    "select=1:ncpus=${NCPUS_HEAVY}:mem=${MEM_HEAVY}:ngpus=1" \
+    "mkdir -p runs/main/plots
+rm -f log_main.out log_main.err
+echo \"[J1 main] started \$(date)\"
+python -u pipeline_logger.py main \\
+    > log_main.out \\
+    2> log_main.err
+echo \"[J1 main] done exit=\$?\""
+
+JID1=$(submit _t_main.pbs)
+echo "J1 main         → $JID1"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# J2 — ga  (depends on J1)
+# ═══════════════════════════════════════════════════════════════════════════
+write_pbs "_t_ga.pbs" "saw_ga" "$WALLTIME_MAIN" \
+    "select=1:ncpus=${NCPUS_HEAVY}:mem=${MEM_HEAVY}:ngpus=1" \
+    "mkdir -p runs/ga/plots
+rm -f log_ga.out log_ga.err
+echo \"[J2 ga] started \$(date)\"
+python -u pipeline_logger.py ga \\
+    > log_ga.out \\
+    2> log_ga.err
+echo \"[J2 ga] done exit=\$?\""
+
+JID2=$(submit _t_ga.pbs "$JID1")
+echo "J2 ga           → $JID2  (after J1)"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# J3 — ga_staged  (depends on J2)
+# ═══════════════════════════════════════════════════════════════════════════
+write_pbs "_t_ga_staged.pbs" "saw_ga_staged" "$WALLTIME_MAIN" \
+    "select=1:ncpus=${NCPUS_HEAVY}:mem=${MEM_HEAVY}:ngpus=1" \
+    "mkdir -p runs/ga_staged/plots
+rm -f log_ga_staged.out log_ga_staged.err
+echo \"[J3 ga_staged] started \$(date)\"
+python -u pipeline_logger.py ga_staged \\
+    > log_ga_staged.out \\
+    2> log_ga_staged.err
+echo \"[J3 ga_staged] done exit=\$?\""
+
+JID3=$(submit _t_ga_staged.pbs "$JID2")
+echo "J3 ga_staged    → $JID3  (after J2)"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# J4 — joint_model  (depends on J1, light compute)
+# Runs Tobit-I + Heckman and writes comparison HTML report.
+# ═══════════════════════════════════════════════════════════════════════════
+write_pbs "_t_joint.pbs" "saw_joint" "$WALLTIME_JOINT" \
+    "select=1:ncpus=4:mem=${MEM_LIGHT}" \
+    "mkdir -p runs/main/plots   # outputs go into the main run dir
+rm -f log_joint.out log_joint.err
+echo \"[J4 joint_model] started \$(date)\"
+# Point Python at the main run output directory
+export JOINT_PARTICIPATION_MODEL=1
+python -u -c \"
+import sys, os
+sys.path.insert(0, '.')
+os.environ['JOINT_PARTICIPATION_MODEL'] = '1'
+
+# Reproduce the data-loading + joint estimation done inside pipeline_logger.py
+from pipeline_logger import load_data, estimate_stage2_joint, OUT_DIR
+import pickle
+
+out = load_data()
+
+# Load the already-estimated two-stage models from J1 for comparison
+s2_pkl = os.path.join(OUT_DIR, 'stage2_models.pkl')
+s2_models = None
+if os.path.isfile(s2_pkl):
+    from stage2_day_duration import load_models
+    s2_models = load_models(s2_pkl)
+
+estimate_stage2_joint(out, s2_models=s2_models)
+print('Joint model estimation complete.')
+\" \\
+    > log_joint.out \\
+    2> log_joint.err
+echo \"[J4 joint_model] done exit=\$?\""
+
+JID4=$(submit _t_joint.pbs "$JID1")
+echo "J4 joint_model  → $JID4  (after J1)"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# J5 — safety_baseline  (parallel with J1 group — independent)
+# ═══════════════════════════════════════════════════════════════════════════
+write_pbs "_t_safety_base.pbs" "saw_safety_base" "$WALLTIME_SAFETY" \
+    "select=1:ncpus=${NCPUS_HEAVY}:mem=${MEM_HEAVY}:ngpus=1" \
+    "mkdir -p runs/safety_baseline/plots
+rm -f log_safety_baseline.out log_safety_baseline.err
+export SAFETY_EXPERIMENT_MODE=baseline
+echo \"[J5 safety_baseline] started \$(date)\"
+python -u pipeline_logger.py safety_baseline \\
+    > log_safety_baseline.out \\
+    2> log_safety_baseline.err
+echo \"[J5 safety_baseline] done exit=\$?\""
+
+JID5=$(submit _t_safety_base.pbs)
+echo "J5 safety_base  → $JID5  (parallel, no dependency)"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# J6 — safety_nosafety  (depends on J5)
+# ═══════════════════════════════════════════════════════════════════════════
+write_pbs "_t_safety_nosa.pbs" "saw_safety_nosa" "$WALLTIME_SAFETY" \
+    "select=1:ncpus=${NCPUS_HEAVY}:mem=${MEM_HEAVY}:ngpus=1" \
+    "mkdir -p runs/safety_nosafety/plots
+rm -f log_safety_nosafety.out log_safety_nosafety.err
+export SAFETY_EXPERIMENT_MODE=nosafety
+echo \"[J6 safety_nosafety] started \$(date)\"
+python -u pipeline_logger.py safety_nosafety \\
+    > log_safety_nosafety.out \\
+    2> log_safety_nosafety.err
+echo \"[J6 safety_nosafety] done exit=\$?\""
+
+JID6=$(submit _t_safety_nosa.pbs "$JID5")
+echo "J6 safety_nosa  → $JID6  (after J5)"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# J7 — safety_analysis  (depends on J6)
+# Comparison: activity levels, zone derivation, HTML report.
+# ═══════════════════════════════════════════════════════════════════════════
+write_pbs "_t_safety_anal.pbs" "saw_safety_anal" "$WALLTIME_ANALYSIS" \
+    "select=1:ncpus=4:mem=${MEM_LIGHT}" \
+    "mkdir -p runs/safety_analysis/plots
+rm -f log_safety_analysis.out log_safety_analysis.err
+export SAFETY_EXPERIMENT_MODE=both
+echo \"[J7 safety_analysis] started \$(date)\"
+python -u safety_experiment_analysis.py \\
+    > log_safety_analysis.out \\
+    2> log_safety_analysis.err
+echo \"[J7 safety_analysis] done exit=\$?\""
+
+JID7=$(submit _t_safety_anal.pbs "$JID6")
+echo "J7 safety_anal  → $JID7  (after J6)"
+
+# ── Cleanup temp scripts ──────────────────────────────────────────────────
+if [ "$DRY_RUN" != "1" ]; then
+    rm -f _t_main.pbs _t_ga.pbs _t_ga_staged.pbs _t_joint.pbs \
+          _t_safety_base.pbs _t_safety_nosa.pbs _t_safety_anal.pbs
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────────
+echo ""
+echo "══════════════════════════════════════════════════════════════════"
+echo "  Job graph submitted"
+echo "══════════════════════════════════════════════════════════════════"
+echo ""
+echo "  J1 main         (20h, 194GB+GPU)         — full estimation + prediction"
+echo "  J2 ga           (20h, 194GB+GPU) ← J1    — GA variable selection"
+echo "  J3 ga_staged    (20h, 194GB+GPU) ← J2    — staged GA + apply to synth pop"
+echo "  J4 joint_model  ( 4h,  32GB)     ← J1    — Tobit-I + Heckman comparison"
+echo "  J5 safety_base  (24h, 194GB+GPU)          — safety-skim baseline run"
+echo "  J6 safety_nosa  (24h, 194GB+GPU) ← J5    — no-safety run"
+echo "  J7 safety_anal  ( 2h,  32GB)     ← J6    — analysis + plots + HTML report"
+echo ""
+echo "  Parallel tracks:"
+echo "    [J1→J2→J3]  main model chain"
+echo "    [J1→J4]     joint participation model (light, starts when J1 finishes)"
+echo "    [J5→J6→J7]  safety experiment (independent; runs concurrently)"
+echo ""
+echo "  Key outputs"
+echo "  -----------"
+echo "  runs/main/            stage1–5 models, HTML coef reports,"
+echo "                        stage5t_models_report.html, validation plots"
+echo "  runs/ga/              ga_results.pkl, ga_reports/, convergence plots"
+echo "  runs/ga_staged/       ga_staged_models.pkl, HHTS validation, per-purpose HTMLs"
+echo "  runs/main/            stage2_joint_models.pkl,"
+echo "   (joint outputs)      stage2_joint_comparison.csv,"
+echo "                        stage2_joint_model_comparison.html"
+echo "                        plots/joint_participation_comparison.png"
+echo "                        plots/joint_budget_scatter.png"
+echo "                        plots/joint_coefficient_imr.png"
+echo "  runs/safety_baseline/ full plan output with safety skims"
+echo "  runs/safety_nosafety/ full plan output without safety skims"
+echo "  runs/safety_analysis/ safety_experiment_report.html,"
+echo "                        plots/safety_mode_share.png,"
+echo "                        plots/safety_activity_levels.png,"
+echo "                        plots/safety_zone_derivation.png,"
+echo "                        safety_zone_ranking.csv"
+echo ""
+echo "  Monitor:"
+echo "    qstat -u \$USER"
+echo "    tail -f log_main.err"
+echo "    tail -f log_ga_staged.err"
+echo "    tail -f log_joint.err"
+echo "    tail -f log_safety_analysis.err"
+echo ""
+echo "  To preview without submitting:"
+echo "    DRY_RUN=1 bash job_submit_all_tests.pbs"
+echo "══════════════════════════════════════════════════════════════════"

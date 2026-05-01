@@ -1653,6 +1653,22 @@ def _mode_tree(tours, persons, landuse, skims, skim_df: pd.DataFrame = None):
     """
     import xarray as xr
 
+    # Ensure ptour_id is unique before building the DataTree.
+    # Larch's from_idca raises "cannot convert a DataFrame with a non-unique
+    # MultiIndex into xarray" when case_ids repeat (e.g. after _filter_seg
+    # on HHTS data where tour_id resets per person).
+    if tours['ptour_id'].duplicated().any():
+        n_dup = tours['ptour_id'].duplicated().sum()
+        logger.warning(
+            f"_mode_tree: {n_dup} duplicate ptour_ids — "
+            "reassigning row-index-based unique ids"
+        )
+        tours = tours.copy()
+        tours['ptour_id'] = (
+            tours['person_id'].astype(str) + '_'
+            + np.arange(len(tours)).astype(str)
+        )
+
     alt_ids   = list(MODE_MAP.values())           # [1, 2, 3, 4, 5]
     case_ids  = list(tours['ptour_id'].values)
 
@@ -2241,6 +2257,34 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
         _numeric_ca = ca_df.select_dtypes(include=[np.number])
         _ca_stds = _numeric_ca.std(axis=0)
         _nonzero_cols = _ca_stds[_ca_stds > 1e-8].index.tolist()
+
+        # Restrict to genuinely CA-varying columns — those with nonzero mean
+        # within-chooser variance.  IDCO (person-level) variables are constant
+        # across alternatives by definition; their apparent cross-correlation in
+        # the expanded ptour×alt matrix is a structural artifact, not real
+        # collinearity.  Checking them causes nearly every CO variable pair to
+        # be flagged as |r|=1.0 and holdfasted, leaving only log_DIST_1 free
+        # and making every GA chromosome produce identical fitness.
+        # Also exclude identifier / weight columns that are never in the utility.
+        _id_cols = {'ptour_id', '_altid_', 'OTAZ', 'DTAZ', 'weight',
+                    'person_id', 'chosen', 'avail', 'tour_id'}
+        if 'ptour_id' in ca_df.columns and len(_nonzero_cols) > 1:
+            try:
+                _within_var = (
+                    ca_df[['ptour_id'] + [c for c in _nonzero_cols if c in ca_df.columns]]
+                    .groupby('ptour_id')[[c for c in _nonzero_cols if c in ca_df.columns]]
+                    .var()
+                    .mean()
+                )
+                _nonzero_cols = [
+                    c for c in _nonzero_cols
+                    if c not in _id_cols and _within_var.get(c, 0.0) > 1e-12
+                ]
+            except Exception:
+                _nonzero_cols = [c for c in _nonzero_cols if c not in _id_cols]
+        else:
+            _nonzero_cols = [c for c in _nonzero_cols if c not in _id_cols]
+
         if len(_nonzero_cols) > 1:
             _ca_mat = _numeric_ca[_nonzero_cols].values.astype(np.float64)
             # Normalize each column before corrcoef to avoid float32 precision issues
@@ -9893,6 +9937,30 @@ def _build_trip_chain(
     print(f"  Batch prediction complete: {df['DTAZ'].nunique()} unique destination zones "
           f"({'model' if _pred_ok else 'gravity/default fallback'})")
 
+    # ── STEP 1b: hard distance cap for nonmandatory destinations ──────────
+    # The destination model can assign implausibly distant zones (~100+ km)
+    # for nonmandatory activities (social, shopping, etc.).  Cap these at
+    # MAX_NONMAND_DIST_KM from the person's home zone and fall back to the
+    # home zone itself so at least the tour structure stays valid.
+    MAX_NONMAND_DIST_KM = 80.0
+    _nonmand_mask = ~df['purpose'].isin(['work', 'edu'])
+    if _nonmand_mask.any() and skim_lookup:
+        _cap_count = 0
+        for idx in df.index[_nonmand_mask]:
+            pid_str = str(df.at[idx, 'person_id'])
+            h_zone  = int(home_otaz.get(pid_str, home_otaz.get(df.at[idx, 'person_id'], 1)))
+            d_zone  = int(df.at[idx, 'DTAZ'])
+            skim_v  = skim_lookup.get((h_zone, d_zone), {})
+            dist_km = skim_v.get('DIST', skim_v.get('dist', None))
+            if dist_km is not None and float(dist_km) > MAX_NONMAND_DIST_KM:
+                df.at[idx, 'DTAZ'] = h_zone
+                _cap_count += 1
+        if _cap_count:
+            logger.info(
+                f"_build_trip_chain: capped {_cap_count} nonmandatory destinations "
+                f">{MAX_NONMAND_DIST_KM:.0f} km from home → home zone fallback"
+            )
+
     # ── STEP 2: build tour-structured trip chain ───────────────────────────
     # ActivitySim tour model: each out-of-home activity is its own HOME-BASED
     # TOUR: home → activity → home.  Mandatory activities come first; non-
@@ -9960,7 +10028,7 @@ def _build_trip_chain(
 
         global_seq = 0
 
-        for tour_type, tour_acts in tours:
+        for tour_idx, (tour_type, tour_acts) in enumerate(tours):
             # ── determine tour-level mode (use pred_mode of first activity) ──
             first_act   = tour_acts[0]
             tour_mode   = int(first_act.get('pred_mode', 1))
@@ -10077,6 +10145,41 @@ def _build_trip_chain(
                 home_trip[c] = last_act.get(c, None)
             all_rows.append(home_trip)
             global_seq += 1
+
+            # ── home dwell between tours ───────────────────────────────────
+            # Insert a 'home' activity row between every pair of consecutive tours
+            # so the plan has no back-to-back trip rows at tour boundaries.
+            if tour_idx < len(tours) - 1:
+                home_arrive = last_end + return_tt
+                next_first_act = tours[tour_idx + 1][1][0]
+                next_outbound_tt = _get_tt(
+                    skim_lookup, home_z,
+                    int(next_first_act.get('DTAZ', home_z)),
+                    int(next_first_act.get('pred_mode', 1)),
+                )
+                next_depart = max(
+                    float(next_first_act.get('STARTIME', home_arrive + 30)) - next_outbound_tt,
+                    home_arrive,
+                )
+                if next_depart > home_arrive:
+                    home_dwell = {
+                        'person_id':              pid,
+                        'row_type':               'activity',
+                        'seq':                    global_seq,
+                        'purpose':                'home',
+                        'OTAZ':                   home_z,
+                        'DTAZ':                   home_z,
+                        'STARTIME':               home_arrive,
+                        'ENDTIME':                next_depart,
+                        'mode':                   0,
+                        'mode_name':              '',
+                        'travtime':               0.0,
+                        'predicted_duration_min': next_depart - home_arrive,
+                    }
+                    for c in attr_cols:
+                        home_dwell[c] = last_act.get(c, None)
+                    all_rows.append(home_dwell)
+                    global_seq += 1
 
     plan = pd.DataFrame(all_rows)
     plan['OTAZ'] = plan['OTAZ'].fillna(1).astype(int).clip(lower=1)

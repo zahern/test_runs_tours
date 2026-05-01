@@ -308,10 +308,6 @@ def _build_larch_nl_mode_s6(df: pd.DataFrame) -> tuple:
         + P('pt_tr') * X('trip.part_time')
         + P('pub_tr')* X('trip.indp_public')
     )
-        + P('stu_tr')* X('trip.student')
-        + P('fem_tr')* X('trip.female')
-        + P('inc_tr')* X('trip.inc_lo')
-    )
     m.utility_co[_LARCH_MODE_IDS['Walk']] = (
         P('asc_wk')
         + P('ldw')   * X('trip.ldw')
@@ -1855,6 +1851,72 @@ def export_for_dashboard(activity_plan: pd.DataFrame,
 # 6.  SAVE / LOAD
 # ---------------------------------------------------------------------------
 
+def _save_s6_destinations_html(activity_plan: pd.DataFrame, path: str) -> None:
+    """Save an HTML report showing predicted destination distributions by purpose.
+
+    Shows for each trip purpose: top-10 destination zones by trip count, median
+    distance, and a mini bar chart of mode share, sourced from the activity_plan
+    produced by run_stage6.
+    """
+    trips = activity_plan[activity_plan.get('row_type', pd.Series('trip')) == 'trip'].copy() \
+        if 'row_type' in activity_plan.columns else activity_plan.copy()
+
+    if trips.empty or 'purpose' not in trips.columns or 'DTAZ' not in trips.columns:
+        logger.warning("_save_s6_destinations_html: no trip rows / missing columns — skipped")
+        return
+
+    PURPS = [p for p in PURPOSES if p in trips['purpose'].values]
+    rows_html = []
+    for purp in PURPS:
+        sub = trips[trips['purpose'] == purp]
+        if sub.empty:
+            continue
+        n_total = len(sub)
+        top_zones = (sub['DTAZ'].value_counts().head(10)
+                     .reset_index().rename(columns={'DTAZ': 'zone', 'count': 'n_trips'}))
+        top_zones['pct'] = (top_zones['n_trips'] / n_total * 100).round(1)
+
+        dist_med = f"{sub['dist'].median():.1f} km" if 'dist' in sub.columns else 'n/a'
+
+        mode_share = ''
+        if 'mode' in sub.columns:
+            mc = sub['mode'].value_counts(normalize=True).mul(100).round(1)
+            mode_share = '  '.join(f'{m}: {v:.1f}%' for m, v in mc.items())
+
+        zone_rows = ''.join(
+            f"<tr><td>{r['zone']}</td><td>{r['n_trips']:,}</td>"
+            f"<td>{r['pct']:.1f}%</td></tr>"
+            for _, r in top_zones.iterrows()
+        )
+        rows_html.append(f"""
+        <h3>{purp} <span class="n">n={n_total:,}</span></h3>
+        <p>Median trip distance: <b>{dist_med}</b> &nbsp;|&nbsp; Mode share: {mode_share}</p>
+        <table>
+          <tr><th>DTAZ</th><th>Trips</th><th>Share</th></tr>
+          {zone_rows}
+        </table>""")
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Stage 6 — Destination distributions by purpose</title>
+<style>
+  body{{font-family:Arial,sans-serif;font-size:13px;margin:20px}}
+  h2{{color:#2c3e50}} h3{{color:#34495e;margin-top:18px}}
+  .n{{font-size:11px;color:#888;font-weight:normal}}
+  table{{border-collapse:collapse;margin-bottom:12px;font-size:12px}}
+  th,td{{border:1px solid #ddd;padding:4px 10px;text-align:left}}
+  th{{background:#eef2f7}}
+</style></head><body>
+<h2>Stage 6 — Predicted destinations by purpose</h2>
+<p>Top-10 DTAZ zones per purpose from synthetic population prediction.</p>
+{''.join(rows_html)}
+</body></html>"""
+
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(html)
+    print(f"  Stage 6 destinations → {path}")
+
+
 def save_models(models: dict, path: str = 'saved_data/stage6_models.pkl'):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'wb') as f:
@@ -2118,6 +2180,14 @@ def run_stage6(
 
     print("\n[3/3] Building final activity plan...")
     activity_plan = build_activity_plan(scheduled)
+
+    # Save destinations-by-purpose HTML alongside the model pickle
+    if save_path:
+        _dest_html = save_path.replace('.pkl', '_destinations.html')
+        try:
+            _save_s6_destinations_html(activity_plan, _dest_html)
+        except Exception as _de:
+            logger.warning(f"Stage 6 destinations HTML failed: {_de}")
 
     print(
         f"\n{'='*55}\n"

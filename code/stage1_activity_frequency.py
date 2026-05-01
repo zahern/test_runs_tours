@@ -890,15 +890,22 @@ def _emit_model_entry(rows: list, entry: dict, label: str) -> None:
 def save_models(models: dict, path: str = 'saved_data/stage1_models.pkl'):
     """Pickle the fitted models dict and write an HTML coefficient report."""
     import pickle, os
-    from paper_model_forms import write_stage_paper_artifacts
+    # Save pkl first — artifact generation is non-fatal.
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
     with open(path, 'wb') as f:
         pickle.dump(models, f)
     print(f"Models saved to {path}")
-    html_path = path.replace('.pkl', '_report.html')
-    _write_model_html(models, html_path, 'Stage 1 — Activity Frequency',
-                      notes=f'Saved: {path}')
-    write_stage_paper_artifacts('stage1', os.path.dirname(path) or 'saved_data')
+    try:
+        html_path = path.replace('.pkl', '_report.html')
+        _write_model_html(models, html_path, 'Stage 1 — Activity Frequency',
+                          notes=f'Saved: {path}')
+    except Exception as _html_e:
+        print(f"  Stage 1 HTML report failed (non-fatal): {_html_e}")
+    try:
+        from paper_model_forms import write_stage_paper_artifacts
+        write_stage_paper_artifacts('stage1', os.path.dirname(path) or 'saved_data')
+    except Exception as _paper_e:
+        print(f"  Stage 1 paper artifacts failed (non-fatal): {_paper_e}")
 
 
 def load_models(path: str = 'saved_data/stage1_models.pkl') -> dict:

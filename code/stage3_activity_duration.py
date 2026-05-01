@@ -940,27 +940,34 @@ def _emit_model_entry(rows: list, entry: dict, label: str) -> None:
         f"<td>{_h.escape(stat)}</td></tr>"
     )
 def save_models(models: dict, path: str = 'saved_data/stage3_models.pkl'):
-    from paper_model_forms import write_stage_paper_artifacts
+    # Save pkl first — artifact generation is non-fatal.
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
     with open(path, 'wb') as f:
         pickle.dump(models, f)
     print(f"Stage 3 models saved → {path}")
-    html_path = path.replace('.pkl', '_report.html')
-    flat = {}
-    for purpose, entry in models.items():
-        flat[purpose] = {
-            'model': entry.get('model'),
-            'n_obs': entry.get('n_obs', '?'),
-            'features': entry.get('features', []),
-            'converged': getattr(entry.get('model'), 'converged_', True),
-            'll': entry.get('ll'),
-            'rmse': entry.get('rmse'),
-            'stat': f"sigma={entry.get('sigma','?')}"
-        }
-    _write_model_html({'lognormal': flat}, html_path,
-                      'Stage 3 — Activity Duration',
-                      notes=f'Lognormal duration models. Saved: {path}')
-    write_stage_paper_artifacts('stage3', os.path.dirname(path) or 'saved_data')
+    try:
+        html_path = path.replace('.pkl', '_report.html')
+        flat = {}
+        for purpose, entry in models.items():
+            flat[purpose] = {
+                'model': entry.get('model'),
+                'n_obs': entry.get('n_obs', '?'),
+                'features': entry.get('features', []),
+                'converged': getattr(entry.get('model'), 'converged_', True),
+                'll': entry.get('ll'),
+                'rmse': entry.get('rmse'),
+                'stat': f"sigma={entry.get('sigma','?')}"
+            }
+        _write_model_html({'lognormal': flat}, html_path,
+                          'Stage 3 — Activity Duration',
+                          notes=f'Lognormal duration models. Saved: {path}')
+    except Exception as _html_e:
+        print(f"  Stage 3 HTML report failed (non-fatal): {_html_e}")
+    try:
+        from paper_model_forms import write_stage_paper_artifacts
+        write_stage_paper_artifacts('stage3', os.path.dirname(path) or 'saved_data')
+    except Exception as _paper_e:
+        print(f"  Stage 3 paper artifacts failed (non-fatal): {_paper_e}")
 
 
 def load_models(path: str = 'saved_data/stage3_models.pkl') -> dict:

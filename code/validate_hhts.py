@@ -41,7 +41,8 @@ def validate_stage1(out: dict, models: dict, save_dir: str) -> dict:
     For each (purpose, ptype): predicted mean vs observed mean; bar chart.
     """
     from stage1_activity_frequency import (
-        prepare_frequency_data, predict_activity_frequency, PURPOSES as S1_PURPS,
+        prepare_frequency_data, predict_activity_frequency, calibrate_activity_rates,
+        PURPOSES as S1_PURPS,
         PTYPE_PREDICTION_MAP,
     )
 
@@ -51,6 +52,14 @@ def validate_stage1(out: dict, models: dict, save_dir: str) -> dict:
     # the majority probability for low-frequency activities is class=0.
     # Sampled prediction gives the full distribution, matching observed means.
     pred = predict_activity_frequency(data.copy(), models, sample=True, seed=42)
+    # Use the same post-prediction ptype-purpose calibration as pipeline_logger
+    # so validation reflects production predictions.
+    pred = calibrate_activity_rates(
+        pred,
+        out.get("persons", pd.DataFrame()),
+        out.get("tours", pd.DataFrame()),
+        rng=np.random.default_rng(43),
+    )
 
     figs = []
     n_purp = len(S1_PURPS)
@@ -284,23 +293,43 @@ def validate_stage3(out: dict, models: dict, save_dir: str) -> dict:
         pred_vals  = None
 
         if purp in models:
-            m = models[purp]
-            # Build the same feature matrix used during estimation
-            try:
-                ptypes = sorted(data['ptype'].dropna().unique().tolist()) if 'ptype' in data.columns else []
-                feats  = _feature_cols(data, ptypes, feature_override=None)
-                # Keep only columns that the model actually saw (len(m.mu_) == len(feats_used))
-                feats_model = [f for f in feats if f in subset.columns][:len(m.mu_)]
-                X = subset[feats_model].fillna(0).values.astype(float)
-                if X.shape[1] == len(m.mu_):
-                    pred_arr  = m.predict_sampled(X, rng)
-                    pred_arr  = np.clip(pred_arr, 1, 1440)
-                    pred_vals = pd.Series(pred_arr)
-                    pred_mean = float(pred_vals.mean())
-                    pred_p50  = float(pred_vals.quantile(0.5))
-                    pred_p90  = float(pred_vals.quantile(0.9))
-            except Exception as e:
-                logger.debug(f"  Stage 3 validate {purp}: {e}")
+            entry = models[purp]
+            # models[purp] is a dict {'model': BudgetLognormal, 'features': [...], ...}
+            # unwrap to get the actual BudgetLognormal object
+            if isinstance(entry, dict):
+                m = entry.get('model')
+            else:
+                m = entry
+            if m is not None:
+                # Build the same feature matrix used during estimation
+                try:
+                    ptypes = sorted(data['ptype'].dropna().unique().tolist()) if 'ptype' in data.columns else []
+                    # Prefer stored feature names (set during fit) so ordering/count
+                    # exactly matches what the model was trained on.  Also fall back
+                    # to the 'features' list stored alongside the model in the dict.
+                    model_feats = (getattr(m, 'feature_names_', None)
+                                   or (entry.get('features') if isinstance(entry, dict) else None))
+                    if model_feats is not None:
+                        X = np.zeros((len(subset), len(model_feats)), dtype=float)
+                        for _j, _f in enumerate(model_feats):
+                            if _f in subset.columns:
+                                X[:, _j] = pd.to_numeric(subset[_f], errors='coerce').fillna(0).values
+                    else:
+                        feats  = _feature_cols(data, ptypes, feature_override=None)
+                        feats_model = [f for f in feats if f in subset.columns][:len(m.mu_)]
+                        X = subset[feats_model].fillna(0).values.astype(float)
+                    if X.shape[1] == len(m.mu_):
+                        pred_arr  = m.predict_sampled(X, rng)
+                        pred_arr  = np.clip(pred_arr, 1, 1440)
+                        pred_vals = pd.Series(pred_arr)
+                        pred_mean = float(pred_vals.mean())
+                        pred_p50  = float(pred_vals.quantile(0.5))
+                        pred_p90  = float(pred_vals.quantile(0.9))
+                except Exception as e:
+                    logger.debug(f"  Stage 3 validate {purp}: {e}")
+
+        # ── plot ─────────────────────────────────────────────────────────
+        bins = np.linspace(0, min(dur.quantile(0.99) * 1.2, 720), 30)
 
         # ── plot ─────────────────────────────────────────────────────────
         bins = np.linspace(0, min(dur.quantile(0.99) * 1.2, 720), 30)
@@ -1102,6 +1131,110 @@ def validate_stage5(out: dict, s5_models: dict, save_dir: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# STAGE 5b — trip stop destination + trip mode
+# ---------------------------------------------------------------------------
+
+def validate_stage5b(out: dict, dest_models: dict, mode_models: dict,
+                     save_dir: str) -> dict:
+    """
+    In-sample validation for Stage 5b trip-level destination and mode models.
+
+    Produces:
+      val_stage5b_dest_hit_rate.png  — fraction of stop trips where predicted
+                                       zone matches observed zone (per purpose)
+      val_stage5b_mode_shares.png    — observed vs predicted mode share (per purpose)
+    """
+    logger.info("  [validate] Stage 5b — trip destination + mode")
+    figs    = []
+    metrics = {}
+
+    trips   = out.get("trips",   pd.DataFrame())
+    persons = out.get("persons", pd.DataFrame())
+
+    # ── destination hit-rate per purpose ─────────────────────────────────
+    if dest_models and not trips.empty:
+        try:
+            from stage5b_trip_destination import build_trip_records
+            trips_aug = build_trip_records(trips.copy())
+            stop_mask = trips_aug.get("is_tour_dest_leg", pd.Series(1)) == 0
+            stop_trips = trips_aug[stop_mask] if stop_mask.any() else trips_aug
+
+            purposes = sorted(dest_models.keys())
+            hit_rates = []
+            for purp in purposes:
+                seg = stop_trips[stop_trips.get("purpose", pd.Series()) == purp] \
+                    if "purpose" in stop_trips.columns else pd.DataFrame()
+                # crude hit: predicted == observed dest_taz
+                if not seg.empty and "dest_taz_predicted" in seg.columns and "dest_taz" in seg.columns:
+                    obs  = pd.to_numeric(seg["dest_taz"],           errors='coerce').fillna(-1)
+                    pred = pd.to_numeric(seg["dest_taz_predicted"], errors='coerce').fillna(-2)
+                    hit  = float((obs == pred).mean())
+                else:
+                    hit = float('nan')
+                hit_rates.append(hit)
+                metrics[f"dest_hit_{purp}"] = hit
+
+            if any(np.isfinite(h) for h in hit_rates):
+                fig, ax = plt.subplots(figsize=(max(6, len(purposes)), 4))
+                x = np.arange(len(purposes))
+                bars = ax.bar(x, [h if np.isfinite(h) else 0 for h in hit_rates],
+                              color='#3498db', alpha=0.8)
+                ax.set_xticks(x); ax.set_xticklabels(purposes, rotation=30, ha='right')
+                ax.set_ylabel('Hit rate (pred zone == obs zone)')
+                ax.set_title('Stage 5b — Stop Destination Hit Rate by Purpose', fontweight='bold')
+                ax.set_ylim(0, 1); ax.grid(axis='y', alpha=0.3)
+                plt.tight_layout()
+                p = os.path.join(save_dir, 'val_stage5b_dest_hit_rate.png')
+                fig.savefig(p, dpi=130, bbox_inches='tight'); plt.close(fig)
+                figs.append(p)
+        except Exception as exc:
+            logger.debug(f"  Stage 5b dest validation failed: {exc}")
+
+    # ── mode share comparison per purpose ────────────────────────────────
+    if mode_models and not trips.empty:
+        try:
+            from stage6_mode_choice import prepare_mode_data, PURPOSES as S6_PURPS, MODES
+            mode_data = prepare_mode_data(trips, persons)
+            purposes  = [p for p in S6_PURPS if p in mode_models]
+            if purposes:
+                MODE_NAMES_LOCAL = {1: 'DA', 2: 'SR', 3: 'Walk', 4: 'Bike', 5: 'Transit'}
+                ncols = min(4, len(purposes)); nrows = int(np.ceil(len(purposes) / ncols))
+                fig, axes = plt.subplots(nrows, ncols, figsize=(4*ncols, 3.5*nrows))
+                axes = np.array(axes).flatten()
+                fig.suptitle('Stage 5b — Trip Mode Shares: Observed vs Predicted',
+                             fontsize=12, fontweight='bold')
+                for ax_i, purp in enumerate(purposes):
+                    ax   = axes[ax_i]
+                    seg  = mode_data[mode_data['purpose'] == purp].copy()
+                    if seg.empty:
+                        ax.set_visible(False); continue
+                    obs_shares  = seg['chosen_mode'].value_counts(normalize=True).reindex(MODES, fill_value=0)
+                    try:
+                        pred_probs = mode_models[purp].predict_proba(seg)
+                        pred_shares = pd.Series(pred_probs.mean(axis=0), index=MODES)
+                    except Exception:
+                        pred_shares = pd.Series(float('nan'), index=MODES)
+                    x = np.arange(len(MODES)); w = 0.35
+                    ax.bar(x - w/2, obs_shares.values,  w, label='Observed',  color='#2E86AB', alpha=0.85)
+                    ax.bar(x + w/2, pred_shares.values, w, label='Predicted', color='#E84855', alpha=0.75)
+                    ax.set_xticks(x)
+                    ax.set_xticklabels([MODE_NAMES_LOCAL.get(m, str(m)) for m in MODES],
+                                       fontsize=8)
+                    ax.set_title(purp, fontsize=9); ax.set_ylabel('Share')
+                    ax.legend(fontsize=7); ax.grid(axis='y', alpha=0.3)
+                for ax in axes[len(purposes):]:
+                    ax.set_visible(False)
+                plt.tight_layout()
+                p = os.path.join(save_dir, 'val_stage5b_mode_shares.png')
+                fig.savefig(p, dpi=130, bbox_inches='tight'); plt.close(fig)
+                figs.append(p)
+        except Exception as exc:
+            logger.debug(f"  Stage 5b mode validation failed: {exc}")
+
+    return {'stage': '5b', 'plots': figs, 'metrics': metrics}
+
+
+# ---------------------------------------------------------------------------
 # SUMMARY PLOT — model fit metrics in one dashboard
 # ---------------------------------------------------------------------------
 
@@ -1350,7 +1483,9 @@ Generated by validate_hhts.py | Training data: HHTS</p>
 def run_validation(out: dict,
                    s1_models: dict, s2_models: dict, s3_models: dict,
                    s4_models: dict, s5_models: dict,
-                   out_dir: str):
+                   out_dir: str,
+                   s5b_dest_models: dict = None,
+                   s5b_mode_models: dict = None):
     """
     Run in-sample validation for all five estimation stages.
 
@@ -1398,6 +1533,18 @@ def run_validation(out: dict,
         results.append(validate_stage5(out, s5_models, val_dir))
     except Exception as e:
         logger.warning(f"  Stage 5 validation failed: {e}")
+
+    # Stage 5b (optional — trip destination + mode)
+    if s5b_dest_models is not None or s5b_mode_models is not None:
+        try:
+            results.append(validate_stage5b(
+                out,
+                s5b_dest_models or {},
+                s5b_mode_models or {},
+                val_dir,
+            ))
+        except Exception as e:
+            logger.warning(f"  Stage 5b validation failed: {e}")
 
     # Summary dashboard + report
     summary_plot = ''

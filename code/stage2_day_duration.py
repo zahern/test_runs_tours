@@ -71,8 +71,8 @@ PERSON_FEATURES = ['sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING', 'incp']
 #   Non-workers:start ~480-600 (8-10am), end ~900-1080 (3-6pm)
 MIN_START  = 300    #  5:00 am  â€” hard floor for prediction clip
 MAX_START  = 720    # 12:00 pm  â€” hard ceiling for prediction clip
-MIN_END    = 720    # 12:00 pm  â€” minimum end of day (at least noon)
-MAX_END    = 1380   # 11:00 pm  â€” maximum end of day
+MIN_END    = 660    # 11:00 am  -- opened from noon to 11am
+MAX_END    = 1440   # midnight  -- extended from 11pm
 MIN_BUDGET = 0.5    # 30 minutes minimum out-of-home (hours)
 MAX_BUDGET = 16.0   # 16 hours maximum (hours)
 
@@ -353,7 +353,7 @@ class TobitModel:
             neg_ll += self.ridge * float(np.sum(params[1:n_feat + 1] ** 2))
         return neg_ll
 
-    def fit(self, X: np.ndarray, y: np.ndarray):
+    def fit(self, X: np.ndarray, y: np.ndarray, maxiter: int = 600):
         from scipy.optimize import minimize
 
         self.mu_ = X.mean(axis=0)
@@ -383,7 +383,7 @@ class TobitModel:
             self._neg_ll, init, args=(Xs, y),
             method='L-BFGS-B',
             bounds=opt_bounds,
-            options={'maxiter': 600, 'ftol': 1e-10},
+            options={'maxiter': maxiter, 'ftol': 1e-10},
         )
         self.intercept_ = res.x[0]
         self.coef_ = res.x[1:n_feat + 1]
@@ -643,8 +643,8 @@ def estimate_day_models(person_day: pd.DataFrame,
 
     y_end = person_day['end_of_day'].clip(MIN_END, MAX_END).values
 
-    m_end = TobitModel(lo=MIN_END, hi=MAX_END, log_y=False)
-    m_end.fit(X_end, y_end)
+    m_end = TobitModel(lo=MIN_END, hi=MAX_END, log_y=False, ridge=0.05)
+    m_end.fit(X_end, y_end, maxiter=2000)
     m_end.feature_names_ = end_cols
     logger.info(f"end_of_day Tobit    RMSE={m_end.rmse_:.1f} min  LL={m_end.ll_:.1f}")
 
@@ -924,25 +924,31 @@ def _emit_model_entry(rows: list, entry: dict, label: str) -> None:
         f"<td>{_h.escape(stat)}</td></tr>"
     )
 def save_models(models: dict, path: str = 'saved_data/stage2_models.pkl'):
-    from paper_model_forms import write_stage_paper_artifacts
+    # Save pkl first — artifact generation is non-fatal.
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
     with open(path, 'wb') as f:
         pickle.dump(models, f)
-    print(f"Stage 2 models saved â†’ {path}")
-    html_path = path.replace('.pkl', '_report.html')
-    # Flatten stage2 models for HTML: add n_obs/rmse from model objects
-    flat = {}
-    for k, v in models.items():
-        mdl = v.get('model')
-        flat[k] = {'model': mdl,
-                   'n_obs': getattr(mdl, 'n_', '?'),
-                   'rmse':  getattr(mdl, 'rmse_', None),
-                   'll':    getattr(mdl, 'll_', None),
-                   'features': (['intercept', 'log_sigma'] + list(v.get('features', [])) if k in ['start', 'end'] else ['intercept'] + list(v.get('features', []))),
-                   'converged': getattr(mdl, 'converged_', True)}
-    _write_model_html({'stage2': flat}, html_path, 'Stage 2 - Day Duration',
-                      notes=f'start/end/budget duration models. Saved: {path}')
-    write_stage_paper_artifacts('stage2', os.path.dirname(path) or 'saved_data')
+    print(f"Stage 2 models saved → {path}")
+    try:
+        html_path = path.replace('.pkl', '_report.html')
+        flat = {}
+        for k, v in models.items():
+            mdl = v.get('model')
+            flat[k] = {'model': mdl,
+                       'n_obs': getattr(mdl, 'n_', '?'),
+                       'rmse':  getattr(mdl, 'rmse_', None),
+                       'll':    getattr(mdl, 'll_', None),
+                       'features': (['intercept', 'log_sigma'] + list(v.get('features', [])) if k in ['start', 'end'] else ['intercept'] + list(v.get('features', []))),
+                       'converged': getattr(mdl, 'converged_', True)}
+        _write_model_html({'stage2': flat}, html_path, 'Stage 2 - Day Duration',
+                          notes=f'start/end/budget duration models. Saved: {path}')
+    except Exception as _html_e:
+        print(f"  Stage 2 HTML report failed (non-fatal): {_html_e}")
+    try:
+        from paper_model_forms import write_stage_paper_artifacts
+        write_stage_paper_artifacts('stage2', os.path.dirname(path) or 'saved_data')
+    except Exception as _paper_e:
+        print(f"  Stage 2 paper artifacts failed (non-fatal): {_paper_e}")
 
 def load_models(path: str = 'saved_data/stage2_models.pkl') -> dict:
     with open(path, 'rb') as f:

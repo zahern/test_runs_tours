@@ -4,7 +4,6 @@
 # Submit via qsub with environment variables, for example:
 #   qsub -v MODE=main,ZONE_ARG=40,CONDA_ENV=zigenv,THREADS=2 pbs_pipeline_mode.pbs
 
-#PBS -j eo
 #PBS -m n
 #PBS -r y
 
@@ -18,6 +17,8 @@ S5_WORKERS=${S5_WORKERS:-1}
 RUN_ROOT=${RUN_ROOT:-runs}
 PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
 PIPELINE_RUN_TAG=${PIPELINE_RUN_TAG:-${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}
+GA_ESTIMATOR=${GA_ESTIMATOR:-default}
+INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS:-0}
 
 cd "$PBS_O_WORKDIR"
 
@@ -25,6 +26,61 @@ module purge
 module load Anaconda3/2024.02-1
 conda activate "$CONDA_ENV"
 module unload Anaconda3
+
+# ── Ensure MetaCount + SearchLibrium are installed ─────────────────────────
+# INSTALL_ESTIMATORS=1  → force (re-)install regardless of current state.
+# Otherwise packages are installed on-demand only when GA_ESTIMATOR requires
+# them and they are not yet importable.
+# The HPC editable source paths are tried first; PyPI is the fallback.
+#
+#   First-time setup (run once, or pass --force-install to submit script):
+#     pip install -e /mnt/hpccs01/home/ahernz/source/MetaCount
+#     pip install -e /mnt/hpccs01/home/ahernz/source/SearchLibrium
+#     pip install jax jaxlib jaxopt
+#
+_HPC_MC=/mnt/hpccs01/home/ahernz/source/MetaCount
+_HPC_SL=/mnt/hpccs01/home/ahernz/source/SearchLibrium
+
+_need_metacount=0
+_need_searchlib=0
+case "$GA_ESTIMATOR" in
+    metacount)     _need_metacount=1 ;;
+    searchlibrium) _need_searchlib=1 ;;
+    both)          _need_metacount=1; _need_searchlib=1 ;;
+esac
+
+if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_metacount" = "1" ]; then
+    if [ "$INSTALL_ESTIMATORS" = "1" ] || ! python -c "import metacountregressor" 2>/dev/null; then
+        echo "[pkg] Installing MetaCount..."
+        if [ -d "$_HPC_MC" ]; then
+            pip install -e "$_HPC_MC" -q \
+                && echo "[pkg] MetaCount installed (editable: $_HPC_MC)"
+        else
+            pip install metacountregressor --upgrade -q \
+                && echo "[pkg] MetaCount installed (PyPI)"
+        fi
+        pip install jax jaxlib jaxopt -q \
+            && echo "[pkg] jax/jaxlib/jaxopt installed"
+    else
+        echo "[pkg] metacountregressor already installed — skipping."
+    fi
+fi
+
+if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_searchlib" = "1" ]; then
+    if [ "$INSTALL_ESTIMATORS" = "1" ] || ! python -c "import SearchLibrium" 2>/dev/null; then
+        echo "[pkg] Installing SearchLibrium..."
+        if [ -d "$_HPC_SL" ]; then
+            pip install -e "$_HPC_SL" -q \
+                && echo "[pkg] SearchLibrium installed (editable: $_HPC_SL)"
+        else
+            pip install SearchLibrium --upgrade -q \
+                && echo "[pkg] SearchLibrium installed (PyPI)"
+        fi
+    else
+        echo "[pkg] SearchLibrium already installed — skipping."
+    fi
+fi
+# ──────────────────────────────────────────────────────────────────────────
 
 # Keep linear algebra and numba-backed sections from oversubscribing cores.
 # THREADS controls BLAS/numba; S5_WORKERS controls Stage 5 zone parallelism.
@@ -37,6 +93,20 @@ export STAGE5_WORKERS="$S5_WORKERS"
 export PIPELINE_ACCELERATOR
 export PIPELINE_RUN_TAG
 export PIPELINE_RUN_ROOT="$RUN_ROOT"
+export GA_ESTIMATOR
+
+# Derive SAFETY_EXPERIMENT_MODE from mode name so the pipeline knows which arm to run.
+# This avoids needing to pass it as a separate -v variable from submit_pipeline_runs.sh.
+case "$MODE" in
+    safety_baseline*)  export SAFETY_EXPERIMENT_MODE="${SAFETY_EXPERIMENT_MODE:-baseline}" ;;
+    safety_nosafety*)  export SAFETY_EXPERIMENT_MODE="${SAFETY_EXPERIMENT_MODE:-nosafety}"  ;;
+    safety_analysis*)  export SAFETY_EXPERIMENT_MODE="${SAFETY_EXPERIMENT_MODE:-both}"      ;;
+esac
+
+# Enable joint participation model estimation for the dedicated joint_model job.
+if [ "$MODE" = "joint_model" ]; then
+    export JOINT_PARTICIPATION_MODEL=1
+fi
 
 run_suffix="$MODE"
 if [ -n "$ZONE_ARG" ]; then
@@ -44,6 +114,11 @@ if [ -n "$ZONE_ARG" ]; then
     safe_arg=${safe_arg//\\/_}
     safe_arg=${safe_arg// /}
     run_suffix="${MODE}_${safe_arg}"
+fi
+# Append estimator name so parallel estimator-variant runs land in distinct dirs.
+# e.g. main_metacount__JOBID/  vs  main__JOBID/  vs  main_both__JOBID/
+if [ -n "$GA_ESTIMATOR" ] && [ "$GA_ESTIMATOR" != "default" ]; then
+    run_suffix="${run_suffix}_${GA_ESTIMATOR}"
 fi
 run_suffix="${run_suffix}__${PIPELINE_RUN_TAG}"
 
@@ -56,6 +131,7 @@ echo "Zone arg:    ${ZONE_ARG:-<all>}"
 echo "Conda env:   $CONDA_ENV"
 echo "Threads:     $THREADS"
 echo "Accelerator: $PIPELINE_ACCELERATOR"
+echo "GA estimator:$GA_ESTIMATOR"
 echo "Run tag:     $PIPELINE_RUN_TAG"
 echo "Working dir: $PBS_O_WORKDIR"
 echo "Run dir:     ${RUN_ROOT}/${run_suffix}"
@@ -65,6 +141,40 @@ echo "=========================================="
 if [ "$MODE" = "safety_analysis" ]; then
     stdbuf -oL python -u safety_experiment_analysis.py \
         2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+elif [ "$MODE" = "joint_model" ]; then
+    # Tobit-I + Heckman joint participation+duration comparison.
+    # Loads data and the already-estimated Stage 2 models from the most-recent
+    # main run, then runs estimate_stage2_joint() and writes the comparison HTML.
+    stdbuf -oL python -u - << 'PYEOF' \
+        2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+import sys, os
+sys.path.insert(0, '.')
+os.environ.setdefault('JOINT_PARTICIPATION_MODEL', '1')
+
+from pipeline_logger import load_data, estimate_stage2_joint, OUT_DIR
+from stage2_day_duration import load_models
+import glob, os as _os
+
+out = load_data()
+
+# Find the most recent stage2_models.pkl in any main run directory
+s2_pkl = _os.path.join(OUT_DIR, 'stage2_models.pkl')
+if not _os.path.isfile(s2_pkl):
+    candidates = sorted(glob.glob('runs/main*/stage2_models.pkl'), key=_os.path.getmtime)
+    if candidates:
+        s2_pkl = candidates[-1]
+        print(f'Using stage2 models from: {s2_pkl}')
+
+s2_models = None
+if _os.path.isfile(s2_pkl):
+    s2_models = load_models(s2_pkl)
+    print(f'Loaded two-stage models: {s2_pkl}')
+else:
+    print('WARNING: stage2_models.pkl not found - comparison will show joint models only')
+
+estimate_stage2_joint(out, s2_models=s2_models)
+print('Joint model estimation complete.')
+PYEOF
 else
     if [ -n "$ZONE_ARG" ]; then
         stdbuf -oL python -u pipeline_logger.py "$MODE" "$ZONE_ARG" \

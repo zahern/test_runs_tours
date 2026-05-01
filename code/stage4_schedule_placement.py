@@ -310,6 +310,8 @@ class MNLTimingModel:
         self.t_stat_export_ = None
         self.p_value_export_ = None
         self.within_period_draws_ = {}
+        self.observed_period_shares_ = None
+        self.period_blend_alpha_ = 0.0
         self.include_person_features_ = True
         self.fit_status_ = 'not_fit'
 
@@ -407,6 +409,7 @@ class MNLTimingModel:
         # the flat-gradient regime that caused nan coefficients in production.
         period_counts = np.bincount(y, minlength=K).astype(float)
         period_counts = np.maximum(period_counts, 1.0)   # avoid log(0)
+        self.observed_period_shares_ = (period_counts / period_counts.sum()).astype(float)
         log_shares    = np.log(period_counts / period_counts.sum())
         # Base period (0) fixed at 0 → intercepts = log_share[k] - log_share[0]
         init_intercepts = log_shares[1:] - log_shares[0]
@@ -598,6 +601,18 @@ def estimate_timing_models(
     ptypes = sorted(data['ptype'].dropna().unique())
 
     models = {}
+    _alpha_scale = float(os.environ.get('STAGE4_PERIOD_BLEND', '1.0') or 1.0)
+    _alpha_scale = float(np.clip(_alpha_scale, 0.0, 2.0))
+    _purpose_alpha = {
+        'work': 0.08,
+        'edu': 0.08,
+        'social': 0.20,
+        'escort': 0.35,
+        'shopping': 0.30,
+        'othmaint': 0.30,
+        'othdiscr': 0.25,
+        'eat': 0.30,
+    }
 
     for purpose in PURPOSES:
         subset = data[data['purpose'] == purpose].copy()
@@ -634,11 +649,15 @@ def estimate_timing_models(
                 m = m2
 
         m.fit_within_period_offsets(subset)
+        m.period_blend_alpha_ = float(
+            np.clip(_purpose_alpha.get(purpose, 0.20) * _alpha_scale, 0.0, 0.60)
+        )
         models[purpose] = m
         _rho2 = m.rho2_ if np.isfinite(m.rho2_) else float('nan')
         logger.info(
             f"  timing/{purpose}: n={len(subset)}, periods observed={present_periods}, "
-            f"rho\u00b2={_rho2:.3f}, status={getattr(m, 'fit_status_', 'na')}"
+            f"rho\u00b2={_rho2:.3f}, status={getattr(m, 'fit_status_', 'na')}, "
+            f"blend_alpha={getattr(m, 'period_blend_alpha_', 0.0):.2f}"
         )
 
     print(f"Stage 4: fitted {len(models)} timing models")
@@ -878,6 +897,19 @@ def predict_schedule(
         try:
             X = model._build_X(sub_feat)
             proba = model.predict_proba(X)           # (n, K) — one batch call
+            _alpha = float(getattr(model, 'period_blend_alpha_', 0.0) or 0.0)
+            _target = getattr(model, 'observed_period_shares_', None)
+            if _alpha > 0.0 and _target is not None:
+                _target = np.asarray(_target, dtype=float)
+                if (
+                    _target.ndim == 1
+                    and len(_target) == proba.shape[1]
+                    and np.isfinite(_target).all()
+                    and _target.sum() > 0
+                ):
+                    _target = _target / _target.sum()
+                    proba = (1.0 - _alpha) * proba + _alpha * _target.reshape(1, -1)
+                    proba = proba / np.clip(proba.sum(axis=1, keepdims=True), 1e-12, None)
             idxs  = np.array([rng.choice(model.n_periods_, p=proba[i].astype(np.float64))
                                for i in range(len(proba))])
             period_col[mask] = idxs
@@ -1036,28 +1068,37 @@ def _emit_model_entry(rows: list, entry: dict, label: str) -> None:
         f"<td>{_h.escape(stat)}</td></tr>"
     )
 def save_models(models: dict, path: str = 'saved_data/stage4_models.pkl'):
-    from paper_model_forms import write_stage_paper_artifacts
+    # Save the pkl FIRST — HTML/paper artifact generation is non-fatal.
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
     with open(path, 'wb') as f:
         pickle.dump(models, f)
     print(f"Stage 4 models saved → {path}")
-    html_path = path.replace('.pkl', '_report.html')
-    flat = {}
-    for purpose, mdl in models.items():
-        pf_df = getattr(mdl, 'pf', None)
-        n_rows = getattr(mdl, 'n_obs_', getattr(mdl, 'n_', '?'))
-        ll_val = getattr(mdl, 'll_', getattr(mdl, 'loglik_', None))
-        flat[purpose] = {
-            'model': mdl,
-            'n_obs': n_rows,
-            'features': list(getattr(mdl, 'coef_export_names_', [])),
-            'converged': getattr(mdl, 'converged_', True),
-            'll': ll_val,
-        }
-    _write_model_html({'mnl_timing': flat}, html_path,
-                      'Stage 4 — Schedule Placement (MNL Timing)',
-                      notes=f'MNL timing models per purpose. Saved: {path}')
-    write_stage_paper_artifacts('stage4', os.path.dirname(path) or 'saved_data')
+    # ── Optional artifacts (HTML report + paper LaTeX) ───────────────────
+    # Wrapped in try/except so that a missing dependency (e.g. paper_model_forms,
+    # matplotlib backend) never prevents the pkl from being reported as saved.
+    try:
+        html_path = path.replace('.pkl', '_report.html')
+        flat = {}
+        for purpose, mdl in models.items():
+            n_rows = getattr(mdl, 'n_obs_', getattr(mdl, 'n_', '?'))
+            ll_val = getattr(mdl, 'll_', getattr(mdl, 'loglik_', None))
+            flat[purpose] = {
+                'model': mdl,
+                'n_obs': n_rows,
+                'features': list(getattr(mdl, 'coef_export_names_', [])),
+                'converged': getattr(mdl, 'converged_', True),
+                'll': ll_val,
+            }
+        _write_model_html({'mnl_timing': flat}, html_path,
+                          'Stage 4 — Schedule Placement (MNL Timing)',
+                          notes=f'MNL timing models per purpose. Saved: {path}')
+    except Exception as _html_e:
+        print(f"  Stage 4 HTML report failed (non-fatal): {_html_e}")
+    try:
+        from paper_model_forms import write_stage_paper_artifacts
+        write_stage_paper_artifacts('stage4', os.path.dirname(path) or 'saved_data')
+    except Exception as _paper_e:
+        print(f"  Stage 4 paper artifacts failed (non-fatal): {_paper_e}")
 
 
 def load_models(path: str = 'saved_data/stage4_models.pkl') -> dict:

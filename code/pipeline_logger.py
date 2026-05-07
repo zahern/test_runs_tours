@@ -1,4 +1,5 @@
 # pipeline_logger.py
+import argparse
 import time
 import logging
 import functools
@@ -7,7 +8,10 @@ import glob
 import gc
 import sys
 import pickle
+import re
+import json
 import numpy as np
+from typing import Optional
 
 # Suppress XLA/TensorFlow verbose logging BEFORE any JAX or Larch import.
 # These env vars must be set prior to the first XLA initialisation; setting
@@ -147,6 +151,10 @@ def _setup_logging(mode: str = 'main', arg: str = None) -> None:
     if arg:
         safe_arg = arg.replace('/', '_').replace('\\', '_').replace(' ', '')
         suffix = f"{mode}_{safe_arg}"
+
+    ga_estimator = os.environ.get('GA_ESTIMATOR', 'default').strip().lower()
+    if ga_estimator and ga_estimator != 'default':
+        suffix = f"{suffix}_{ga_estimator}"
 
     _run_tag_env = os.environ.get('PIPELINE_RUN_TAG', '').strip()
     _run_tag_pbs = os.environ.get('PBS_JOBID', '').strip()
@@ -973,6 +981,207 @@ def _save_stage_coef_csv(models: dict, stage_name: str, save_dir: str):
     logger.info(f"  {stage_name} coefficient HTML → {html_path}")
 
 
+def _auto_prune_enabled(stage_name: str) -> bool:
+    """Return True when automatic prune+refit is enabled for this stage."""
+    global_flag = os.environ.get('AUTO_PRUNE_REFIT', '1') == '1'
+    stage_flag = os.environ.get(f'AUTO_PRUNE_REFIT_{stage_name.upper()}', '1') == '1'
+    return global_flag and stage_flag
+
+
+def _parse_name_set(csv_text: str) -> set[str]:
+    if not csv_text:
+        return set()
+    return {x.strip() for x in csv_text.split(',') if x.strip()}
+
+
+def _is_significant_row(row: pd.Series,
+                        p_thresh: float = 0.10,
+                        t_thresh: float = 1.96) -> bool:
+    """Significance rule with p-value preferred, t-stat fallback."""
+    p_cols = ['p_value', 'pval', 'pvalue']
+    t_cols = ['t_stat', 'tstat']
+
+    p_val = np.nan
+    t_val = np.nan
+
+    for c in p_cols:
+        if c in row.index:
+            p_val = pd.to_numeric(row.get(c), errors='coerce')
+            if np.isfinite(p_val):
+                break
+    for c in t_cols:
+        if c in row.index:
+            t_val = pd.to_numeric(row.get(c), errors='coerce')
+            if np.isfinite(t_val):
+                break
+
+    if np.isfinite(p_val):
+        return bool(p_val <= p_thresh)
+    if np.isfinite(t_val):
+        return bool(abs(t_val) >= t_thresh)
+    return False
+
+
+def _auto_prune_features_from_coef_csv(
+    stage_name: str,
+    candidate_features: list[str],
+    save_dir: str,
+    protected_features: Optional[set[str]] = None,
+    p_thresh: float = 0.10,
+    t_thresh: float = 1.96,
+    min_keep: int = 4,
+) -> Optional[list[str]]:
+    """
+    Build a pruned feature override from an exported stage coefficient CSV.
+
+    Returns a pruned feature list, or None if no safe prune is available.
+    """
+    coef_path = os.path.join(save_dir, f'{stage_name}_coefficients.csv')
+    if not os.path.exists(coef_path):
+        return None
+
+    try:
+        df = pd.read_csv(coef_path)
+    except Exception as exc:
+        logger.warning(f"  {stage_name}: could not read coefficient CSV for pruning: {exc}")
+        return None
+
+    if df.empty:
+        return None
+
+    param_col = 'param' if 'param' in df.columns else ('parameter' if 'parameter' in df.columns else None)
+    if not param_col:
+        return None
+
+    protected = set(protected_features or set())
+    protected |= _parse_name_set(os.environ.get(f'{stage_name.upper()}_PRUNE_PROTECT', ''))
+
+    cand_set = set(candidate_features)
+    df = df[df[param_col].astype(str).isin(cand_set)].copy()
+    if df.empty:
+        return None
+
+    keep = set()
+    for _, row in df.iterrows():
+        name = str(row.get(param_col, '')).strip()
+        if not name:
+            continue
+        if name in protected or _is_significant_row(row, p_thresh=p_thresh, t_thresh=t_thresh):
+            keep.add(name)
+
+    keep |= (cand_set & protected)
+    ordered = [f for f in candidate_features if f in keep]
+
+    if len(ordered) < max(min_keep, len(cand_set & protected)):
+        logger.info(f"  {stage_name}: prune skipped — too few statistically defensible features ({len(ordered)})")
+        return None
+    if len(ordered) >= len(candidate_features):
+        return None
+    return ordered
+
+
+def _extract_stage5_warm_coefs(models: dict) -> dict:
+    """Extract a flat warm-start coefficient dict per segment from stage5 model results."""
+    warm = {}
+    for seg, res in (models or {}).items():
+        if not isinstance(res, dict):
+            continue
+        coefs = {}
+        for src in ('mode_coef', 'coef', 'dest_coef'):
+            c = res.get(src, {})
+            if isinstance(c, dict):
+                coefs.update(c)
+        if coefs:
+            warm[seg] = coefs
+    return warm
+
+
+def _extract_expr_vars(expr: str) -> set[str]:
+    """Extract source variable tokens used in a Larch expression."""
+    vars_found = set()
+    for token in re.findall(r'od\.([A-Za-z0-9_]+)', str(expr)):
+        vars_found.add(token)
+    for token in re.findall(r'emp\.([A-Za-z0-9_]+)', str(expr)):
+        vars_found.add(token)
+    if 'logsum' in str(expr):
+        vars_found.add('logsum')
+    return vars_found
+
+
+def _derive_stage5_pruned_overrides(
+    coef_csv_path: str,
+    p_thresh: float = 0.10,
+    t_thresh: float = 1.96,
+) -> tuple[list[str], list[str], dict]:
+    """
+    Convert Stage 5 coefficient significance into mode/destination override lists.
+
+    Protected destination structure terms (distance/crash/size/logsum) are always
+    retained so OD behavior does not collapse.
+    """
+    from stage5_destination_choice import MODE_UEC, DEST_UEC
+
+    if not os.path.exists(coef_csv_path):
+        return [], [], {'changed': False, 'reason': 'missing_coefficient_csv'}
+
+    try:
+        df = pd.read_csv(coef_csv_path)
+    except Exception as exc:
+        logger.warning(f"  stage5 prune: failed to read {coef_csv_path}: {exc}")
+        return [], [], {'changed': False, 'reason': 'read_failed'}
+
+    if df.empty or 'parameter' not in df.columns or 'model_type' not in df.columns:
+        return [], [], {'changed': False, 'reason': 'bad_schema'}
+
+    mode_keep_coeff = set(_parse_name_set(os.environ.get('STAGE5_MODE_PROTECT_COEFFS', '')))
+    dest_keep_coeff = set(_parse_name_set(os.environ.get('STAGE5_DEST_PROTECT_COEFFS', '')))
+
+    # Never prune these destination structure terms.
+    dest_keep_coeff |= {
+        'c_logsum', 'c_log_dist', 'c_dist', 'c_crash',
+        'c_size_term', 'c_aggl', 'c_comp',
+    }
+
+    for _, row in df.iterrows():
+        coeff = str(row.get('parameter', '')).strip()
+        mtype = str(row.get('model_type', '')).strip().lower()
+        if not coeff or mtype not in ('mode', 'dest'):
+            continue
+        if _is_significant_row(row, p_thresh=p_thresh, t_thresh=t_thresh):
+            if mtype == 'mode':
+                mode_keep_coeff.add(coeff)
+            else:
+                dest_keep_coeff.add(coeff)
+
+    # Map kept coefficient names back to override variable tokens.
+    mode_vars = set(_parse_name_set(os.environ.get('STAGE5_MODE_PROTECT_VARS', '')))
+    dest_vars = set(_parse_name_set(os.environ.get('STAGE5_DEST_PROTECT_VARS', '')))
+
+    # Critical OD terms protected by default.
+    dest_vars |= {'DIST', 'SOVTOLL_DIST__AM', 'SOVTOLL_TIME__AM', 'CRASH',
+                  'size_term', 'acdc_aggl', 'acdc_comp', 'logsum'}
+
+    for coeff, (expr, _) in MODE_UEC.items():
+        if coeff in mode_keep_coeff:
+            mode_vars |= _extract_expr_vars(expr)
+
+    for coeff, (expr, _) in DEST_UEC.items():
+        if coeff in dest_keep_coeff:
+            dest_vars |= _extract_expr_vars(expr)
+
+    mode_override = sorted(mode_vars)
+    dest_override = sorted(dest_vars)
+    changed = bool(mode_override or dest_override)
+    meta = {
+        'changed': changed,
+        'mode_n': len(mode_override),
+        'dest_n': len(dest_override),
+        'mode_coeff_kept': len(mode_keep_coeff),
+        'dest_coeff_kept': len(dest_keep_coeff),
+    }
+    return mode_override, dest_override, meta
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STAGE DIAGNOSTICS HELPER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1199,6 +1408,139 @@ def _log_stage_summary(stage: str, models: dict, label: str = "estimation") -> N
     logger.info(SEP)
 
 
+def _write_stage_checkpoint_report(
+    stage_tag: str,
+    title: str,
+    summary: dict,
+    table: Optional[pd.DataFrame] = None,
+    max_rows: int = 200,
+) -> None:
+    """
+    Persist a compact stage checkpoint in machine-readable and paper-ready forms.
+
+    Files written under OUT_DIR/stage_reports:
+      - <stage_tag>.json
+      - <stage_tag>.html
+      - <stage_tag>.tex
+      - <stage_tag>_table.csv   (optional)
+    For GA stages, includes selected features prominently in the report.
+    BIC values shown as positive (minimized, lower = better).
+    """
+    try:
+        rep_dir = os.path.join(OUT_DIR, 'stage_reports')
+        os.makedirs(rep_dir, exist_ok=True)
+
+        def _jsonable(v):
+            if v is None or isinstance(v, (str, int, float, bool)):
+                return v
+            if isinstance(v, (list, tuple)):
+                return [_jsonable(x) for x in v]
+            if isinstance(v, dict):
+                return {str(k): _jsonable(x) for k, x in v.items()}
+            try:
+                return float(v)
+            except Exception:
+                return str(v)
+
+        clean_summary = {str(k): _jsonable(v) for k, v in (summary or {}).items()}
+        clean_summary['stage_tag'] = stage_tag
+        clean_summary['title'] = title
+        clean_summary['timestamp'] = pd.Timestamp.now().isoformat()
+
+        json_path = os.path.join(rep_dir, f'{stage_tag}.json')
+        with open(json_path, 'w', encoding='utf-8') as _jf:
+            json.dump(clean_summary, _jf, indent=2)
+
+        summary_df = pd.DataFrame([
+            {'metric': k, 'value': v} for k, v in clean_summary.items()
+            if k not in ('stage_tag', 'title', 'timestamp', 'selected_features')
+        ])
+
+        table_html = '<p>No table preview available.</p>'
+        table_latex = ''
+        if isinstance(table, pd.DataFrame) and not table.empty:
+            tbl = table.head(max_rows).copy()
+            csv_path = os.path.join(rep_dir, f'{stage_tag}_table.csv')
+            tbl.to_csv(csv_path, index=False)
+            table_html = tbl.to_html(index=False)
+            try:
+                table_latex = tbl.to_latex(index=False, escape=True)
+            except Exception:
+                table_latex = ''
+
+        html_path = os.path.join(rep_dir, f'{stage_tag}.html')
+        # Build enhanced HTML with selected features section
+        selected_features_html = ''
+        if 'selected_features' in clean_summary and clean_summary['selected_features']:
+            selected_features = clean_summary['selected_features']
+            selected_features_html = (
+                "<h2>Selected Variables / Model Specification</h2>"
+                "<p style='background:#f0f0f0;padding:8px;border-left:4px solid #2c3e50'>"
+                f"<strong>{selected_features}</strong>"
+                "</p>"
+            )
+
+        with open(html_path, 'w', encoding='utf-8') as _hf:
+            _hf.write(
+                "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                f"<title>{title}</title>"
+                "<style>body{font-family:Arial,sans-serif;margin:18px}"
+                "table{border-collapse:collapse;width:100%;margin-top:10px}"
+                "th{background:#2c3e50;color:#fff;padding:6px;text-align:left}"
+                "td{border:1px solid #ddd;padding:6px}</style></head><body>"
+                "h2{color:#2c3e50;border-bottom:2px solid #2c3e50;padding-bottom:5px}"
+                "h2{color:#2c3e50;border-bottom:2px solid #2c3e50;padding-bottom:5px}</style></head><body>"
+                f"<h1>{title}</h1>"
+                f"{selected_features_html}"
+                "<h2>Summary Metrics</h2>"
+                f"{summary_df.to_html(index=False)}"
+                "<h2>Table Preview</h2>"
+                f"{table_html}"
+                "<h2>Convergence History (Generations)</h2>"
+                f"{table_html}"
+                "</body></html>"
+            )
+
+        tex_path = os.path.join(rep_dir, f'{stage_tag}.tex')
+        with open(tex_path, 'w', encoding='utf-8') as _tf:
+            _tf.write(
+                "\\section*{" + str(title).replace('_', '\\_') + "}\n"
+                "\\subsection*{Summary}\n"
+                + summary_df.to_latex(index=False, escape=True)
+            )
+            if table_latex:
+                _tf.write("\n\\subsection*{Table Preview}\n")
+                _tf.write(table_latex)
+        tex_content = (
+            "\\section*{" + str(title).replace('_', '\\_') + "}\n"
+            "\\subsection*{Summary Metrics}\n"
+            + summary_df.to_latex(index=False, escape=True)
+        )
+        
+        # Add selected features section for GA stages
+        if 'selected_features' in clean_summary and clean_summary['selected_features']:
+            tex_content += (
+                "\n\n\\subsection*{Selected Variables}\n"
+                "\\begin{quote}\n"
+                f"{clean_summary['selected_features'].replace('_', '\\_')}\n"
+                "\\end{quote}\n"
+            )
+        
+        if table_latex:
+            tex_content += "\n\\subsection*{Convergence History}\n"
+            tex_content += table_latex
+        
+        _tf.write(tex_content)
+
+        logger.info(f"  Stage report bundle saved → {rep_dir}/{stage_tag}.*")
+    except Exception as _sr_e:
+        logger.warning(f"  Stage checkpoint report failed ({stage_tag}): {_sr_e}")
+
+        logger.info(f"  Stage report bundle saved → {rep_dir}/{stage_tag}.*")
+    except Exception as _sr_e:
+        logger.warning(f"  Stage checkpoint report failed ({stage_tag}): {_sr_e}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ESTIMATION WRAPPERS  (Phase 1 — HHTS only)
 # Each returns the fitted models dict and saves PKL + HTML to OUT_DIR.
@@ -1213,14 +1555,33 @@ def estimate_stage1(out):
     path = os.path.join(OUT_DIR, 'stage1_models.pkl')
     save_models(models, path)
     _save_stage_coef_csv(models, 'stage1', OUT_DIR)
+    if _auto_prune_enabled('stage1'):
+        logger.info("  Stage 1 auto-prune skipped: ordered-logit exports do not provide reliable p-values for feature-level pruning.")
     logger.info(f"  Stage 1 models → {path}  (HTML report alongside)")
     _log_stage_summary('1', models)
+    _coef = pd.read_csv(os.path.join(OUT_DIR, 'stage1_coefficients.csv')) \
+        if os.path.exists(os.path.join(OUT_DIR, 'stage1_coefficients.csv')) else None
+    _write_stage_checkpoint_report(
+        stage_tag='estimate_stage1',
+        title='Estimate Stage 1 - Activity Frequency',
+        summary={
+            'n_segments': len(models),
+            'model_path': path,
+            'coefficients_csv': os.path.join(OUT_DIR, 'stage1_coefficients.csv'),
+        },
+        table=_coef,
+    )
     return models
 
 
 @timer("Estimate Stage 2 — day duration")
 def estimate_stage2(out):
-    from stage2_day_duration import estimate_day_models, save_models, aggregate_person_day
+    from stage2_day_duration import (
+        estimate_day_models,
+        save_models,
+        aggregate_person_day,
+        PERSON_FEATURES,
+    )
     logger.info("  Preparing HHTS person-day data...")
     person_day = aggregate_person_day(out["tours"], out["persons"])
     logger.info(f"  person_day rows: {len(person_day):,}  "
@@ -1229,8 +1590,39 @@ def estimate_stage2(out):
     path = os.path.join(OUT_DIR, 'stage2_models.pkl')
     save_models(models, path)
     _save_stage_coef_csv(models, 'stage2', OUT_DIR)
+
+    if _auto_prune_enabled('stage2'):
+        protected = {'incp', 'vehrd', 'has_vehicle', 'WORKSTAT', 'STUDYING'}
+        pruned = _auto_prune_features_from_coef_csv(
+            stage_name='stage2',
+            candidate_features=list(PERSON_FEATURES),
+            save_dir=OUT_DIR,
+            protected_features=protected,
+            p_thresh=float(os.environ.get('STAGE2_PRUNE_P_THRESHOLD', '0.10')),
+            t_thresh=float(os.environ.get('STAGE2_PRUNE_T_THRESHOLD', '1.96')),
+            min_keep=int(os.environ.get('STAGE2_PRUNE_MIN_KEEP', '6')),
+        )
+        if pruned:
+            logger.info(f"  Stage 2 prune+refit: {len(PERSON_FEATURES)} → {len(pruned)} person features")
+            models = estimate_day_models(person_day, feature_override=pruned)
+            save_models(models, path)
+            _save_stage_coef_csv(models, 'stage2', OUT_DIR)
+
     logger.info(f"  Stage 2 models → {path}  (HTML report alongside)")
     _log_stage_summary('2', models)
+    _coef = pd.read_csv(os.path.join(OUT_DIR, 'stage2_coefficients.csv')) \
+        if os.path.exists(os.path.join(OUT_DIR, 'stage2_coefficients.csv')) else None
+    _write_stage_checkpoint_report(
+        stage_tag='estimate_stage2',
+        title='Estimate Stage 2 - Day Duration',
+        summary={
+            'n_models': len(models),
+            'person_day_rows': len(person_day),
+            'model_path': path,
+            'coefficients_csv': os.path.join(OUT_DIR, 'stage2_coefficients.csv'),
+        },
+        table=_coef,
+    )
     return models
 
 
@@ -1328,33 +1720,111 @@ def estimate_stage2_joint(out, s2_models=None):
     rec_plain = _re.sub(r'<[^>]+>', ' ', rec_html).strip()
     logger.info(f"\n{'='*60}\n  JOINT MODEL RECOMMENDATION:\n{rec_plain[:800]}\n{'='*60}")
 
+    _write_stage_checkpoint_report(
+        stage_tag='estimate_stage2_joint',
+        title='Estimate Stage 2 Joint - Tobit and Heckman',
+        summary={
+            'full_person_day_rows': len(full_pd),
+            'comparison_csv': csv_path,
+            'joint_models_pkl': joint_pkl,
+            'report_html': os.path.join(OUT_DIR, 'stage2_joint_model_comparison.html'),
+        },
+        table=comparison.get('metrics') if isinstance(comparison, dict) else None,
+    )
+
     return joint_res
 
 
 @timer("Estimate Stage 3 — activity duration")
 def estimate_stage3(out):
-    from stage3_activity_duration import estimate_duration_models, save_models
+    from stage3_activity_duration import estimate_duration_models, save_models, PERSON_FEATURES
     logger.info("  Preparing HHTS duration data...")
     models = estimate_duration_models(out["tours"], out["persons"], trips=out["trips"])
     path = os.path.join(OUT_DIR, 'stage3_models.pkl')
     save_models(models, path)
     _save_stage_coef_csv(models, 'stage3', OUT_DIR)
+
+    if _auto_prune_enabled('stage3'):
+        protected = {'incp', 'vehrd', 'has_vehicle', 'WORKSTAT', 'STUDYING'}
+        pruned = _auto_prune_features_from_coef_csv(
+            stage_name='stage3',
+            candidate_features=list(PERSON_FEATURES),
+            save_dir=OUT_DIR,
+            protected_features=protected,
+            p_thresh=float(os.environ.get('STAGE3_PRUNE_P_THRESHOLD', '0.10')),
+            t_thresh=float(os.environ.get('STAGE3_PRUNE_T_THRESHOLD', '1.96')),
+            min_keep=int(os.environ.get('STAGE3_PRUNE_MIN_KEEP', '6')),
+        )
+        if pruned:
+            logger.info(f"  Stage 3 prune+refit: {len(PERSON_FEATURES)} → {len(pruned)} person features")
+            models = estimate_duration_models(
+                out["tours"], out["persons"], trips=out["trips"],
+                feature_override=pruned,
+            )
+            save_models(models, path)
+            _save_stage_coef_csv(models, 'stage3', OUT_DIR)
+
     logger.info(f"  Stage 3 models → {path}  (HTML report alongside)")
     _log_stage_summary('3', models)
+    _coef = pd.read_csv(os.path.join(OUT_DIR, 'stage3_coefficients.csv')) \
+        if os.path.exists(os.path.join(OUT_DIR, 'stage3_coefficients.csv')) else None
+    _write_stage_checkpoint_report(
+        stage_tag='estimate_stage3',
+        title='Estimate Stage 3 - Activity Duration',
+        summary={
+            'n_models': len(models),
+            'model_path': path,
+            'coefficients_csv': os.path.join(OUT_DIR, 'stage3_coefficients.csv'),
+        },
+        table=_coef,
+    )
     return models
 
 
 @timer("Estimate Stage 4 — schedule placement")
 def estimate_stage4(out):
-    from stage4_schedule_placement import estimate_timing_models, save_models
+    from stage4_schedule_placement import estimate_timing_models, save_models, PERSON_FEATURES
     logger.info("  Preparing HHTS timing data...")
     models = estimate_timing_models(out["trips"], out["tours"], out["persons"])
     path = os.path.join(OUT_DIR, 'stage4_models.pkl')
     save_models(models, path)
     _save_stage_coef_csv(models, 'stage4', OUT_DIR)
+
+    if _auto_prune_enabled('stage4'):
+        protected = {'incp', 'vehrd', 'has_vehicle', 'WORKSTAT', 'STUDYING'}
+        pruned = _auto_prune_features_from_coef_csv(
+            stage_name='stage4',
+            candidate_features=list(PERSON_FEATURES),
+            save_dir=OUT_DIR,
+            protected_features=protected,
+            p_thresh=float(os.environ.get('STAGE4_PRUNE_P_THRESHOLD', '0.10')),
+            t_thresh=float(os.environ.get('STAGE4_PRUNE_T_THRESHOLD', '1.96')),
+            min_keep=int(os.environ.get('STAGE4_PRUNE_MIN_KEEP', '6')),
+        )
+        if pruned:
+            logger.info(f"  Stage 4 prune+refit: {len(PERSON_FEATURES)} → {len(pruned)} person features")
+            models = estimate_timing_models(
+                out["trips"], out["tours"], out["persons"],
+                feature_override=pruned,
+            )
+            save_models(models, path)
+            _save_stage_coef_csv(models, 'stage4', OUT_DIR)
+
     logger.info(f"  Stage 4 models → {path}  (HTML report alongside)")
     _log_stage_summary('4', models)
     _inspect_model_parameters(models, 'stage4', OUT_DIR)
+    _coef = pd.read_csv(os.path.join(OUT_DIR, 'stage4_coefficients.csv')) \
+        if os.path.exists(os.path.join(OUT_DIR, 'stage4_coefficients.csv')) else None
+    _write_stage_checkpoint_report(
+        stage_tag='estimate_stage4',
+        title='Estimate Stage 4 - Schedule Placement',
+        summary={
+            'n_models': len(models),
+            'model_path': path,
+            'coefficients_csv': os.path.join(OUT_DIR, 'stage4_coefficients.csv'),
+        },
+        table=_coef,
+    )
     return models
 
 
@@ -1539,6 +2009,48 @@ def estimate_stage5(out, landuse):
     from stage5_destination_choice import _save_coefficients
     coef_path = path.replace('.pkl', '_coefficients.csv')
     _save_coefficients(models, coef_path)
+
+    if _auto_prune_enabled('stage5'):
+        mode_override, dest_override, meta = _derive_stage5_pruned_overrides(
+            coef_csv_path=coef_path,
+            p_thresh=float(os.environ.get('STAGE5_PRUNE_P_THRESHOLD', '0.10')),
+            t_thresh=float(os.environ.get('STAGE5_PRUNE_T_THRESHOLD', '1.96')),
+        )
+        if meta.get('changed') and (mode_override or dest_override):
+            logger.info(
+                "  Stage 5 prune+refit: "
+                f"mode_vars={len(mode_override)} dest_vars={len(dest_override)} "
+                f"(critical DIST/CRASH/size/logsum terms protected)"
+            )
+            _warm_refit = _extract_stage5_warm_coefs(models)
+            _pruned_models = {}
+            for seg in segments:
+                try:
+                    _r = _run_segment(
+                        seg, hhts_tours, out["persons"], landuse,
+                        skims, skim_df, seed=42,
+                        mode_feature_override=mode_override,
+                        dest_feature_override=dest_override,
+                        coef_warm_start=_warm_refit.get(seg),
+                    )
+                    if _r:
+                        _pruned_models[seg] = _r
+                except Exception as _pr_err:
+                    logger.warning(f"  Stage5 prune-refit failed for {seg}: {_pr_err}")
+
+            if _pruned_models:
+                models = _pruned_models
+                s5_save(models, path)
+                _save_coefficients(models, coef_path)
+                pd.DataFrame([
+                    {'group': 'mode_override', 'variable': v} for v in mode_override
+                ] + [
+                    {'group': 'dest_override', 'variable': v} for v in dest_override
+                ]).to_csv(os.path.join(OUT_DIR, 'stage5_pruned_overrides.csv'), index=False)
+                logger.info("  Stage 5 prune+refit models saved (stage5_pruned_overrides.csv written)")
+            else:
+                logger.warning("  Stage 5 prune+refit produced no valid segment models; keeping original estimates")
+
     logger.info(f"  Stage 5 models → {path}  (HTML report alongside)")
     _log_stage_summary('5', models)
 
@@ -1558,6 +2070,19 @@ def estimate_stage5(out, landuse):
 
     # ── P-value / zero-coefficient diagnostics ──────────────────────────────
     _inspect_model_parameters(models, 'stage5_tour', OUT_DIR)
+
+    _coef = pd.read_csv(os.path.join(OUT_DIR, 'stage5_models_coefficients.csv')) \
+        if os.path.exists(os.path.join(OUT_DIR, 'stage5_models_coefficients.csv')) else None
+    _write_stage_checkpoint_report(
+        stage_tag='estimate_stage5',
+        title='Estimate Stage 5 - Mode and Destination Choice',
+        summary={
+            'n_segments': len(models),
+            'model_path': path,
+            'coefficients_csv': os.path.join(OUT_DIR, 'stage5_models_coefficients.csv'),
+        },
+        table=_coef,
+    )
 
     return models, skims, sk_lookup
 
@@ -2532,6 +3057,16 @@ def predict_stage1(synth, models=None, hhts_persons=None, hhts_tours=None):
             logger.warning(f"  Stage 1 calibration skipped (non-fatal): {_cal_e}")
     result.to_csv(os.path.join(OUT_DIR, 'stage1_output.csv'), index=False)
     logger.info(f"  ✓  Stage 1 output: {len(result):,} rows → {OUT_DIR}/stage1_output.csv")
+    _write_stage_checkpoint_report(
+        stage_tag='predict_stage1',
+        title='Predict Stage 1 - Activity Frequency',
+        summary={
+            'n_rows': len(result),
+            'n_persons': int(result['person_id'].nunique()) if 'person_id' in result.columns else None,
+            'output_csv': os.path.join(OUT_DIR, 'stage1_output.csv'),
+        },
+        table=result,
+    )
     return result
 
 
@@ -2544,6 +3079,16 @@ def predict_stage2(synth_s1, models=None):
     result = predict_day_budget(synth_s1, models)
     result.to_csv(os.path.join(OUT_DIR, 'stage2_output.csv'), index=False)
     logger.info(f"  ✓  Stage 2 output: {len(result):,} rows → {OUT_DIR}/stage2_output.csv")
+    _write_stage_checkpoint_report(
+        stage_tag='predict_stage2',
+        title='Predict Stage 2 - Day Duration',
+        summary={
+            'n_rows': len(result),
+            'n_persons': int(result['person_id'].nunique()) if 'person_id' in result.columns else None,
+            'output_csv': os.path.join(OUT_DIR, 'stage2_output.csv'),
+        },
+        table=result,
+    )
     return result
 
 
@@ -2557,6 +3102,16 @@ def predict_stage3(synth_s2, models=None):
     result.to_csv(os.path.join(OUT_DIR, 'stage3_output.csv'), index=False)
     logger.info(f"  ✓  Stage 3 output: {len(result):,} rows "
                 f"({result['person_id'].nunique():,} persons) → {OUT_DIR}/stage3_output.csv")
+    _write_stage_checkpoint_report(
+        stage_tag='predict_stage3',
+        title='Predict Stage 3 - Activity Duration',
+        summary={
+            'n_rows': len(result),
+            'n_persons': int(result['person_id'].nunique()) if 'person_id' in result.columns else None,
+            'output_csv': os.path.join(OUT_DIR, 'stage3_output.csv'),
+        },
+        table=result,
+    )
     return result
 
 
@@ -2570,6 +3125,16 @@ def predict_stage4(activities, models=None):
     result = predict_schedule(activities, models)
     result.to_csv(os.path.join(OUT_DIR, 'stage4_output.csv'), index=False)
     logger.info(f"  ✓  Stage 4 output: {len(result):,} rows → {OUT_DIR}/stage4_output.csv")
+    _write_stage_checkpoint_report(
+        stage_tag='predict_stage4',
+        title='Predict Stage 4 - Schedule Placement',
+        summary={
+            'n_rows': len(result),
+            'n_persons': int(result['person_id'].nunique()) if 'person_id' in result.columns else None,
+            'output_csv': os.path.join(OUT_DIR, 'stage4_output.csv'),
+        },
+        table=result,
+    )
     return result
 
 
@@ -2801,6 +3366,21 @@ def predict_stage5(activities, models=None, out=None, landuse=None, skims=None, 
     except Exception as _s5_val_e:
         logger.debug(f"Stage 5 post-predict validation skipped ({_s5_val_e})")
 
+    _write_stage_checkpoint_report(
+        stage_tag='predict_stage5',
+        title='Predict Stage 5 - Destination and Mode Choice',
+        summary={
+            'n_rows': len(result),
+            'n_persons': int(result['person_id'].nunique()) if 'person_id' in result.columns else None,
+            'n_zones': int(n_zones),
+            'n_zones_ok': int(n_ok),
+            'stage5_output_csv': out_path,
+            'stage5_zone_timings_csv': os.path.join(OUT_DIR, 'stage5_zone_timings.csv'),
+            'stage5_validation_csv': os.path.join(OUT_DIR, 'stage5_validation_metrics.csv'),
+        },
+        table=result,
+    )
+
     return result
 
 
@@ -2815,6 +3395,12 @@ def stage1(out, synth):
                                     save_path=os.path.join(OUT_DIR, 'stage1_models.pkl'))
     _save_stage_coef_csv(models, 'stage1', OUT_DIR)
     synth_s1.to_csv(os.path.join(OUT_DIR, 'stage1_output.csv'), index=False)
+    _write_stage_checkpoint_report(
+        stage_tag='legacy_stage1',
+        title='Legacy Stage 1 - Estimate and Predict',
+        summary={'n_rows': len(synth_s1), 'n_models': len(models)},
+        table=synth_s1,
+    )
     return synth_s1, models
 
 
@@ -2824,6 +3410,12 @@ def stage2(out, synth_s1):
                                     save_path=os.path.join(OUT_DIR, 'stage2_models.pkl'))
     _save_stage_coef_csv(models, 'stage2', OUT_DIR)
     synth_s2.to_csv(os.path.join(OUT_DIR, 'stage2_output.csv'), index=False)
+    _write_stage_checkpoint_report(
+        stage_tag='legacy_stage2',
+        title='Legacy Stage 2 - Estimate and Predict',
+        summary={'n_rows': len(synth_s2), 'n_models': len(models)},
+        table=synth_s2,
+    )
     return synth_s2, models
 
 
@@ -2835,6 +3427,12 @@ def stage3(out, synth_s2):
     )
     _save_stage_coef_csv(models, 'stage3', OUT_DIR)
     activities.to_csv(os.path.join(OUT_DIR, 'stage3_output.csv'), index=False)
+    _write_stage_checkpoint_report(
+        stage_tag='legacy_stage3',
+        title='Legacy Stage 3 - Estimate and Predict',
+        summary={'n_rows': len(activities), 'n_models': len(models)},
+        table=activities,
+    )
     return activities, models
 
 
@@ -2846,6 +3444,12 @@ def stage4(out, activities):
     )
     _save_stage_coef_csv(models, 'stage4', OUT_DIR)
     scheduled.to_csv(os.path.join(OUT_DIR, 'stage4_output.csv'), index=False)
+    _write_stage_checkpoint_report(
+        stage_tag='legacy_stage4',
+        title='Legacy Stage 4 - Estimate and Predict',
+        summary={'n_rows': len(scheduled), 'n_models': len(models)},
+        table=scheduled,
+    )
     return scheduled, models
 
 
@@ -2881,6 +3485,16 @@ def stage5(out, synth_persons, scheduled, landuse):
         crash_skims=crash_skims,
     )
     scheduled_dest.to_csv(os.path.join(OUT_DIR, 'stage5_output.csv'), index=False)
+    _write_stage_checkpoint_report(
+        stage_tag='legacy_stage5',
+        title='Legacy Stage 5 - Estimate and Predict',
+        summary={
+            'n_rows': len(scheduled_dest),
+            'n_persons': int(scheduled_dest['person_id'].nunique()) if 'person_id' in scheduled_dest.columns else None,
+            'n_segments': len(models),
+        },
+        table=scheduled_dest,
+    )
     skims      = omx.open_file(skims_path, 'r')
     skim_df    = _skim_flat(skims)
     sk_lookup  = _skim_lookup(skim_df)
@@ -2902,6 +3516,10 @@ def stage5b(out, scheduled_dest, landuse):
         landuse     = landuse,
         output_dir  = OUT_DIR,
     )
+    # run_stage5b always returns a dict {'trips': df, ...}; extract the DataFrame
+    # so callers (stage6, GA paths) always receive a DataFrame, not a dict.
+    if isinstance(result, dict):
+        return result.get('trips', scheduled_dest)
     return result
 
 
@@ -2943,6 +3561,18 @@ def stage6(out, scheduled_dest, landuse,
         save_dir           = OUT_DIR,
     )
     logger.info(f"  Per-zone folders: {OUT_DIR}/zones/zone_*/")
+    _write_stage_checkpoint_report(
+        stage_tag='legacy_stage6',
+        title='Legacy Stage 6 - Finalisation and Export',
+        summary={
+            'n_rows': len(final_plan),
+            'n_persons': int(final_plan['person_id'].nunique()) if 'person_id' in final_plan.columns else None,
+            'n_trips_for_aimsun': int(len(trips_aimsun)),
+            'stage6_output_csv': os.path.join(OUT_DIR, 'stage6_output.csv'),
+            'aimsun_csv': os.path.join(OUT_DIR, 'trips_for_aimsun.csv'),
+        },
+        table=final_plan,
+    )
     return final_plan, trips_aimsun
 
 
@@ -3030,8 +3660,12 @@ def spatial_plots(plan, synth, landuse):
         if 'person_id' in plan_coords.columns:
             rt_col = 'row_type' if 'row_type' in plan_coords.columns else None
             trip_rows = plan_coords[plan_coords[rt_col] == 'trip'] if rt_col else plan_coords
-            if 'dist_km' in trip_rows.columns and len(trip_rows) > 0:
-                top_pids = (trip_rows.groupby('person_id')['dist_km']
+            # Prefer skim road distance ('dist') over haversine ('dist_km') so
+            # the top-traveller ranking is not inflated by centroid overestimates.
+            _dist_col = 'dist' if 'dist' in trip_rows.columns and trip_rows['dist'].notna().any() \
+                        else ('dist_km' if 'dist_km' in trip_rows.columns else None)
+            if _dist_col and len(trip_rows) > 0:
+                top_pids = (trip_rows.groupby('person_id')[_dist_col]
                             .sum().sort_values(ascending=False)
                             .head(20).index.tolist())
                 import numpy as np
@@ -3060,29 +3694,136 @@ def spatial_plots(plan, synth, landuse):
 
 @timer("GA — all stages")
 def ga_all(out, landuse):
-    # pop_size / n_generations must match the staged wrappers below.
-    # The defaults in run_ga_all_stages (pop_size=40, n_generations=60,
-    # n_restarts=2) are far too large for stages 5/6 which call Larch NL
-    # models — each individual writes a fresh flow code, so thousands of
-    # evaluations are needed and the GA never finishes within walltime.
-    _bp = _ga_budget_params()
-    run_ga_all_stages(
-        tours=out["tours"],
-        trips=out["trips"],
-        persons=out["persons"],
-        landuse=landuse,
-        skims='downcasted_matrices_base.omx',
-        pop_size          = _bp['pop_size'],
-        n_generations     = _bp['n_generations'],
-        n_restarts        = _bp['n_restarts'],
-        # Stage 51 (trip-level mode+dest) adds ~50 % to runtime but validates
-        # whether GA-selected tour vars are consistent at the trip level.
-        # Enabled for standard/thorough budgets automatically.
-        include_trip_mode_dest = os.environ.get('GA_BUDGET', 'fast') != 'fast',
-        # Usual-location GA is expensive and rarely changes — opt-in only.
-        include_usual_loc = os.environ.get('GA_INCLUDE_USUAL_LOC', '0') == '1',
-        save_path=os.path.join(OUT_DIR, 'ga_results.pkl'),
-    )
+    _run_ga_stages_with_checkpoints(out, landuse)
+
+
+def _save_ga_checkpoint(all_ga, stage_id=None, failed=False):
+    """Persist GA progress so long runs always leave usable artifacts."""
+    import json
+    status = {
+        'completed_stages': sorted(int(k) for k in all_ga.results.keys()),
+        'last_stage': int(stage_id) if stage_id is not None else None,
+        'failed': bool(failed),
+        'out_dir': OUT_DIR,
+        'timestamp': pd.Timestamp.now().isoformat(),
+    }
+
+    # Keep a rolling partial plus the canonical ga_results.pkl.
+    for _path in (
+        os.path.join(OUT_DIR, 'ga_results_checkpoint.pkl'),
+        os.path.join(OUT_DIR, 'ga_results.pkl'),
+    ):
+        try:
+            with open(_path, 'wb') as _f:
+                pickle.dump(all_ga, _f)
+        except Exception as _e:
+            logger.warning(f"Could not save GA checkpoint {_path}: {_e}")
+
+    try:
+        with open(os.path.join(OUT_DIR, 'ga_progress.json'), 'w', encoding='utf-8') as _f:
+            json.dump(status, _f, indent=2)
+    except Exception as _e:
+        logger.warning(f"Could not write ga_progress.json: {_e}")
+
+    # Keep lightweight CSV/TXT reports in sync with every checkpoint so users
+    # can inspect best-found models even when a later stage fails.
+    try:
+        _reports_dir = os.path.join(OUT_DIR, 'ga_reports')
+        all_ga.export_reports(_reports_dir)
+    except Exception as _e:
+        logger.warning(f"Could not export GA checkpoint reports: {_e}")
+
+
+def _format_ga_checkpoint_summary(res) -> dict:
+    """
+    Extract and format GA result for checkpoint reporting.
+    
+    Shows:
+    - Actual BIC (positive, to be minimized) not negative fitness
+    - Selected variables (best_features)
+    - Key metrics
+    """
+    if res is None:
+        return {}
+    
+    best_fitness = float(getattr(res, 'best_fitness', np.nan))
+    fitness_metric = str(getattr(res, 'fitness_metric', 'unknown'))
+    best_features = getattr(res, 'best_features', [])
+    
+    # Convert best_features to list if it's a dict (for multi-segment results)
+    if isinstance(best_features, dict):
+        # For dict, show count and keys
+        best_features_list = list(best_features.keys()) if best_features else []
+        n_features = len(best_features_list)
+    else:
+        best_features_list = list(best_features) if best_features else []
+        n_features = len(best_features_list)
+    
+    summary = {
+        'n_selected_features': n_features,
+        'selected_features': ', '.join(str(f) for f in best_features_list[:20]),  # truncate long lists
+        'n_generations': len(getattr(res, 'history', [])),
+        'fitness_metric': fitness_metric,
+    }
+    
+    # Report actual BIC (positive, minimized) not negative fitness
+    if 'BIC' in fitness_metric and np.isfinite(best_fitness):
+        # fitness = -BIC/n, so BIC/n = -fitness
+        bic_per_obs = -best_fitness
+        summary['best_BIC_per_obs'] = f"{bic_per_obs:.6f}"
+        summary['best_fitness_note'] = f"(BIC/n to minimize, lower = better)"
+    else:
+        summary['best_fitness'] = f"{best_fitness:.6f}"
+        summary['fitness_note'] = "(higher = better)"
+    
+    return summary
+
+
+def _run_ga_stages_with_checkpoints(out, landuse):
+    """Run GA stages sequentially with after-stage checkpointing."""
+    from ga_hypothesis_testing import AllStagesResult
+
+    all_ga = AllStagesResult()
+    _save_ga_checkpoint(all_ga, stage_id=0, failed=False)
+
+    _stages = [
+        (1, lambda: ga_stage1(out)),
+        (2, lambda: ga_stage2(out)),
+        (3, lambda: ga_stage3(out)),
+        (4, lambda: ga_stage4(out)),
+        (5, lambda: ga_stage5(out, landuse)),
+    ]
+
+    for sid, runner in _stages:
+        try:
+            all_ga.results[sid] = runner()
+            _res = all_ga.results[sid]
+            _hist = getattr(_res, 'history', []) if _res is not None else []
+            _hist_df = pd.DataFrame(_hist) if _hist else None
+            
+            # Build enhanced summary with model details and proper BIC reporting
+            summary = _format_ga_checkpoint_summary(_res)
+            
+            _write_stage_checkpoint_report(
+                stage_tag=f'ga_stage{sid}',
+                title=f'GA Stage {sid} - Selected Model & Convergence',
+                summary=summary,
+                table=_hist_df,
+            )
+            _save_ga_checkpoint(all_ga, stage_id=sid, failed=False)
+            logger.info(
+                f"GA checkpoint saved after stage {sid} "
+                f"({len(all_ga.results)} stage(s) complete)"
+            )
+        except Exception:
+            _save_ga_checkpoint(all_ga, stage_id=sid, failed=True)
+            logger.error(
+                f"GA failed during stage {sid}. "
+                "Partial results were checkpointed to ga_results.pkl"
+            )
+            raise
+
+    return all_ga
 
 
 def _ga_budget_params() -> dict:
@@ -3654,9 +4395,24 @@ def main(filepath: str = None):
 
     # ── Stage 4 predict ───────────────────────────────────────────────────
     logger.info("▶  Phase 2 — Stage 4 prediction")
+    _stage4_path = os.path.join(OUT_DIR, 'stage4_models.pkl')
+    if not os.path.exists(_stage4_path):
+        _run_contents = os.listdir(OUT_DIR) if os.path.isdir(OUT_DIR) else ['<dir missing>']
+        logger.error(
+            f"stage4_models.pkl is missing from {OUT_DIR}\n"
+            f"  Expected: {_stage4_path}\n"
+            f"  Run directory contents: {_run_contents}\n"
+            "Most likely causes: (1) Stage 4 estimation failed earlier in this run; "
+            "(2) run-directory contents were cleared by a concurrent re-submission; "
+            "(3) disk quota exceeded during model writes."
+        )
+        raise FileNotFoundError(
+            f"stage4_models.pkl not found at '{_stage4_path}'. "
+            "Check pipeline.log for upstream Stage 4 estimation errors and run-directory cleanup events."
+        )
     _s4 = __import__('stage4_schedule_placement',
                      fromlist=['load_models']).load_models(
-                         os.path.join(OUT_DIR, 'stage4_models.pkl'))
+                         _stage4_path)
     scheduled = predict_stage4(activities, _s4); del _s4, activities; gc.collect()
 
     # ── Stage 5 predict (one zone at a time) ──────────────────────────────
@@ -3880,25 +4636,8 @@ def GA_STAGED(filepath: str = None):
     sc, out, landuse = load_data()
 
     # ── GA estimation for all stages (HHTS only) ──────────────────────
-    # Capture results so we can pass feature_override to the pipeline stages.
-    from ga_hypothesis_testing import AllStagesResult
-    import pickle
-
-    all_ga = AllStagesResult()
-    all_ga.results[1] = ga_stage1(out)
-    all_ga.results[2] = ga_stage2(out)
-    all_ga.results[3] = ga_stage3(out)
-    all_ga.results[4] = ga_stage4(out)
-    all_ga.results[5] = ga_stage5(out, landuse)
-
-    # Save combined results for reference
-    ga_path = os.path.join(OUT_DIR, 'ga_results.pkl')
-    try:
-        with open(ga_path, 'wb') as _f:
-            pickle.dump(all_ga, _f)
-        logger.info(f"GA staged results saved → {ga_path}")
-    except Exception as _e:
-        logger.warning(f"Could not save GA staged results: {_e}")
+    # Checkpoints are written after every stage to avoid all-or-nothing runs.
+    all_ga = _run_ga_stages_with_checkpoints(out, landuse)
 
     # ── Export per-stage history CSVs + combined convergence plot ─────────
     try:
@@ -4696,31 +5435,389 @@ Generated by pipeline_logger.py compare_safety_runs() — {pd.Timestamp.now().st
     print(f"  Figures     → {os.path.join(out_dir, 'plots')}/")
 
 
+def _get_model_zoo_searches() -> dict:
+    try:
+        from model_zoo import get_search_presets
+        return get_search_presets()
+    except Exception as exc:
+        logger.warning(f"Unable to load model_zoo search presets: {exc}")
+        return {}
+
+
+def _print_model_zoo_searches() -> None:
+    searches = _get_model_zoo_searches()
+    if not searches:
+        print("No model_zoo search presets available.")
+        return
+    print("Available model_zoo / HHTS search presets:")
+    for key, spec in searches.items():
+        print(f"  {key:18s} {spec.get('pipeline_mode', 'n/a'):7s}  {spec.get('description', '')}")
+
+
+def run_hhts_optional_pipeline(
+    search_name: str,
+    force_mode: Optional[str] = None,
+    n_iter: Optional[int] = None,
+    temperature: Optional[float] = None,
+    search_model: Optional[str] = None,
+) -> None:
+    searches = _get_model_zoo_searches()
+    preset = searches.get(search_name)
+    if preset is None:
+        raise ValueError(
+            f"Unknown HHTS/model_zoo search preset '{search_name}'. "
+            f"Available presets: {', '.join(sorted(searches))}"
+        )
+
+    try:
+        from main_2 import run_core as _run_core, run_search as _run_search
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to load the legacy HHTS stage0-4 runner from main_2.py"
+        ) from exc
+
+    mode = (force_mode or preset.get("pipeline_mode", "core")).lower().strip()
+    sa_iter = int(n_iter if n_iter is not None else preset.get("n_iter", 400))
+    sa_temp = float(temperature if temperature is not None else preset.get("temperature", 2.0))
+    sa_model = (search_model or preset.get("search_model", "nested")).lower().strip()
+
+    logger.info("=" * 70)
+    logger.info("Optional HHTS/model_zoo pipeline requested via pipeline_logger")
+    logger.info(f"  preset       : {search_name}")
+    logger.info(f"  description  : {preset.get('description', '')}")
+    logger.info(f"  mode         : {mode}")
+    logger.info(f"  search_model : {sa_model}")
+    logger.info(f"  n_iter       : {sa_iter}")
+    logger.info(f"  temperature  : {sa_temp}")
+    logger.info("=" * 70)
+
+    old_env = {
+        "MODE": os.environ.get("MODE"),
+        "SA_N_ITER": os.environ.get("SA_N_ITER"),
+        "SA_TEMP": os.environ.get("SA_TEMP"),
+        "SA_MODEL": os.environ.get("SA_MODEL"),
+    }
+    try:
+        os.environ["MODE"] = mode
+        os.environ["SA_N_ITER"] = str(sa_iter)
+        os.environ["SA_TEMP"] = str(sa_temp)
+        os.environ["SA_MODEL"] = sa_model
+        if mode == "search":
+            _run_search(n_iter=sa_iter, temperature=sa_temp, search_model=sa_model)
+        else:
+            _run_core()
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _to_jsonable(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    try:
+        import numpy as _np
+        if isinstance(value, (_np.integer, _np.floating)):
+            return value.item()
+        if isinstance(value, _np.ndarray):
+            return value.tolist()
+    except Exception:
+        pass
+    return str(value)
+
+
+@timer("MCR structure search")
+def run_mcr_search(data_arg: Optional[str] = None) -> None:
+    """
+    Run a standalone MetaCount structure search job.
+
+    Family mapping:
+      count    -> crash frequency count family
+      duration -> survival/AFT-style positive-duration family
+      linear   -> Gaussian continuous-outcome family
+      cmf      -> Crash Modification Function family
+
+    Random-parameter capability is enabled by exposing roles 2/3/4 in
+    default_roles for the search evaluator.
+    """
+    try:
+        from metacountregressor import (
+            ExperimentBuilder,
+            load_example16_3_model_data,
+            load_example_duration_data,
+            load_example_linear_data,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "metacountregressor is required for mcr_search mode"
+        ) from exc
+
+    family = os.environ.get("MCR_FAMILY", "count").strip().lower()
+    algo = os.environ.get("MCR_ALGO", "sa").strip().lower()
+    max_iter = int(os.environ.get("MCR_MAX_ITER", "2000"))
+    draws_r = int(os.environ.get("MCR_R", "200"))
+
+    if family not in {"count", "duration", "linear", "cmf"}:
+        raise ValueError(
+            f"Unsupported MCR_FAMILY '{family}'. "
+            "Use one of: count, duration, linear, cmf"
+        )
+    if algo not in {"sa", "de", "hs"}:
+        raise ValueError(
+            f"Unsupported MCR_ALGO '{algo}'. Use one of: sa, de, hs"
+        )
+
+    logger.info("=" * 70)
+    logger.info("MCR structure search")
+    logger.info(f"  family   : {family}")
+    logger.info(f"  algo     : {algo}")
+    logger.info(f"  max_iter : {max_iter}")
+    logger.info(f"  R draws  : {draws_r}")
+    logger.info("  random-parameter roles enabled: [2, 3, 4]")
+    logger.info("=" * 70)
+
+    base_df = None
+    if data_arg and os.path.isfile(data_arg):
+        base_df = pd.read_csv(data_arg)
+        logger.info(f"Using external dataset from arg: {data_arg}")
+
+    if family == "count":
+        df = base_df.copy() if base_df is not None else load_example16_3_model_data()
+        if "OFFSET" not in df.columns and {"AADT", "LENGTH"}.issubset(df.columns):
+            df["OFFSET"] = np.log(np.clip(df["AADT"] * df["LENGTH"] * 365 / 1e8, 1e-12, None))
+        y_col = "FREQ"
+        id_col = "ID"
+        offset_col = "OFFSET" if "OFFSET" in df.columns else None
+        variables = [v for v in ["AADT", "LENGTH", "SPEED", "CURVES", "WIDTH", "SHOULDERW", "SLOPE", "SHOULDER"] if v in df.columns]
+        family_kwargs = {}
+    elif family == "duration":
+        # Survival models in MetaCount are searched under model_family="duration".
+        df = base_df.copy() if base_df is not None else load_example_duration_data()
+        if "DURATION" not in df.columns:
+            df["DURATION"] = np.exp(
+                0.5
+                + 0.01 * df.get("WIDTH", 0)
+                + 0.02 * df.get("CURVES", 0)
+                + 0.00002 * df.get("AADT", 0)
+            )
+        if "B" not in df.columns:
+            df["B"] = np.clip(df.get("LENGTH", 1.0), 1e-6, None)
+        y_col = "DURATION"
+        id_col = "ID" if "ID" in df.columns else "obs_id"
+        if id_col == "obs_id":
+            df[id_col] = np.arange(len(df))
+        offset_col = None
+        variables = [v for v in ["AADT", "LENGTH", "SPEED", "CURVES", "WIDTH", "SHOULDERW", "SLOPE"] if v in df.columns]
+        family_kwargs = {"budget_col": "B"}
+    elif family == "linear":
+        df = base_df.copy() if base_df is not None else load_example_linear_data()
+        if "LINEAR_TARGET" not in df.columns:
+            df["LINEAR_TARGET"] = (
+                0.1 * df.get("WIDTH", 0)
+                + 0.2 * df.get("CURVES", 0)
+                + 0.05 * df.get("SLOPE", 0)
+                + 0.01 * df.get("AADT", 0) / 100.0
+            )
+        y_col = "LINEAR_TARGET"
+        id_col = "ID" if "ID" in df.columns else "obs_id"
+        if id_col == "obs_id":
+            df[id_col] = np.arange(len(df))
+        offset_col = None
+        variables = [v for v in ["AADT", "LENGTH", "SPEED", "CURVES", "WIDTH", "SHOULDERW", "SLOPE"] if v in df.columns]
+        family_kwargs = {}
+    else:  # cmf
+        df = base_df.copy() if base_df is not None else load_example16_3_model_data()
+        if "OFFSET" not in df.columns and {"AADT", "LENGTH"}.issubset(df.columns):
+            df["OFFSET"] = np.log(np.clip(df["AADT"] * df["LENGTH"] * 365 / 1e8, 1e-12, None))
+        y_col = "FREQ"
+        id_col = "ID"
+        offset_col = "OFFSET" if "OFFSET" in df.columns else None
+        variables = [v for v in ["AADT", "LENGTH", "SPEED", "CURVES", "WIDTH", "SHOULDERW", "SLOPE"] if v in df.columns]
+        baseline_vars = [v for v in ["LENGTH", "SPEED", "CURVES", "WIDTH", "SLOPE", "SHOULDER", "SHOULDERW"] if v in df.columns]
+        local_vars = [v for v in ["SHOULDERW", "SHOULDER", "CURVES", "SLOPE"] if v in df.columns]
+        if not local_vars and baseline_vars:
+            local_vars = [baseline_vars[-1]]
+            baseline_vars = baseline_vars[:-1]
+        family_kwargs = {
+            "aadt_col": "AADT",
+            "baseline_vars": baseline_vars,
+            "local_vars": local_vars,
+        }
+
+    builder = ExperimentBuilder(
+        df=df,
+        id_col=id_col,
+        y_col=y_col,
+        offset_col=offset_col,
+    )
+
+    # Roles include random independent/correlated/grouped parameters.
+    default_roles = [0, 1, 2, 3, 4, 5, 6]
+    evaluator = builder.build_evaluator(
+        variables=variables,
+        model_family=family,
+        default_roles=default_roles,
+        max_latent_classes=1,
+        R=draws_r,
+        **family_kwargs,
+    )
+
+    # Compatibility across MetaCount API variants:
+    # - count family returns a StructureEvaluatorLC (builder.run)
+    # - duration/linear/cmf may return a *SearchProblem object with .run()
+    if hasattr(evaluator, "vars"):
+        result = builder.run(
+            evaluator,
+            algo=algo,
+            max_iter=max_iter,
+            n_jobs=1,
+            seed=42,
+        )
+    elif hasattr(evaluator, "run"):
+        result = evaluator.run(algo=algo, max_iter=max_iter, seed=42)
+    else:
+        raise TypeError(
+            f"Unsupported evaluator object for family '{family}': {type(evaluator).__name__}"
+        )
+
+    if isinstance(result, dict):
+        best_score = result.get("best_score", result.get("best_obj", result.get("best_objective")))
+        best_spec = result.get("best_spec", result.get("best_solution", result.get("spec")))
+    else:
+        best_score = getattr(result, "best_score", None)
+        best_spec = getattr(result, "best_spec", None)
+    result_payload = {
+        "family": family,
+        "algo": algo,
+        "max_iter": max_iter,
+        "R": draws_r,
+        "n_rows": int(len(df)),
+        "y_col": y_col,
+        "id_col": id_col,
+        "offset_col": offset_col,
+        "variables": variables,
+        "default_roles": default_roles,
+        "random_parameters_enabled": True,
+        "best_score": _to_jsonable(best_score),
+    }
+
+    result_json_path = os.path.join(OUT_DIR, "mcr_search_result.json")
+    best_spec_path = os.path.join(OUT_DIR, "best_spec.json")
+    summary_html_path = os.path.join(OUT_DIR, "mcr_search_summary.html")
+
+    with open(result_json_path, "w", encoding="utf-8") as fh:
+        json.dump(_to_jsonable(result_payload), fh, indent=2)
+
+    with open(best_spec_path, "w", encoding="utf-8") as fh:
+        json.dump(_to_jsonable(best_spec), fh, indent=2)
+
+    variable_descriptions = {
+        "ID": "Segment identifier",
+        "FREQ": "Observed crash frequency on the segment",
+        "AADT": "Annual Average Daily Traffic",
+        "LENGTH": "Segment length",
+        "SPEED": "Posted or operating speed",
+        "WIDTH": "Roadway width",
+        "CURVES": "Horizontal curvature measure",
+        "SLOPE": "Vertical grade/slope",
+        "SHOULDER": "Shoulder indicator/measure",
+        "SHOULDERW": "Shoulder width",
+        "OFFSET": "Log exposure term log(AADT * LENGTH * 365 / 1e8)",
+        "DURATION": "Positive duration response used for survival-duration examples",
+        "B": "Budget/reference positive duration covariate for duration-family search",
+        "LINEAR_TARGET": "Continuous target for Gaussian/linear-family search",
+    }
+
+    numeric_cols = [c for c in df.columns if np.issubdtype(df[c].dtype, np.number)]
+    describe_html = df[numeric_cols].describe().to_html(classes="table table-sm", border=0)
+    vars_html = "".join(
+        f"<tr><td>{col}</td><td>{variable_descriptions.get(col, 'No description provided')}</td></tr>"
+        for col in df.columns
+    )
+    html = (
+        "<html><head><meta charset='utf-8'><title>MCR Search Summary</title>"
+        "<style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;}"
+        "table{border-collapse:collapse;width:100%;margin:12px 0;}"
+        "th,td{border:1px solid #d0d7de;padding:6px 8px;text-align:left;}"
+        "th{background:#f6f8fa;} code{background:#f2f4f7;padding:1px 4px;border-radius:3px;}"
+        "</style></head><body>"
+        f"<h1>MCR Search Summary ({family})</h1>"
+        "<p><strong>Survival mapping:</strong> survival/AFT search is run under "
+        "<code>model_family='duration'</code>.</p>"
+        "<p><strong>Random parameters:</strong> enabled via roles 2/3/4 in "
+        "<code>default_roles=[0,1,2,3,4,5,6]</code>.</p>"
+        f"<p><strong>Algorithm:</strong> {algo} &nbsp; <strong>Max iterations:</strong> {max_iter} "
+        f"&nbsp; <strong>R:</strong> {draws_r}</p>"
+        f"<p><strong>Best score:</strong> {best_score}</p>"
+        "<h2>Example 16-3 Data Properties</h2>"
+        f"{describe_html}"
+        "<h2>Variable Descriptions</h2>"
+        "<table><thead><tr><th>Variable</th><th>Description</th></tr></thead><tbody>"
+        f"{vars_html}"
+        "</tbody></table>"
+        "</body></html>"
+    )
+    with open(summary_html_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+
+    logger.info(f"MCR search result JSON  -> {result_json_path}")
+    logger.info(f"MCR best spec JSON      -> {best_spec_path}")
+    logger.info(f"MCR summary HTML        -> {summary_html_path}")
+
+
 if __name__ == "__main__":
-    import sys
+    parser = argparse.ArgumentParser(
+        description="SEQ pipeline runner with optional HHTS/model_zoo presets.",
+    )
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        default="main",
+        choices=[
+            "main",
+            "debug",
+            "ga",
+            "ga_staged",
+            "mcr_search",
+            "safety_baseline",
+            "safety_nosafety",
+            "safety_compare",
+            "hhts_core",
+            "hhts_search",
+            "list_searches",
+        ],
+    )
+    parser.add_argument(
+        "arg",
+        nargs="?",
+        default=None,
+        help="Zone selector / file path for main modes.",
+    )
+    parser.add_argument(
+        "--search",
+        default=None,
+        help="Optional HHTS/model_zoo preset name. Use list_searches to inspect choices.",
+    )
+    parser.add_argument("--sa-iter", type=int, default=None, help="Override SA iterations for HHTS search modes.")
+    parser.add_argument("--sa-temp", type=float, default=None, help="Override SA temperature for HHTS search modes.")
+    parser.add_argument(
+        "--sa-model",
+        choices=["nested", "mnl"],
+        default=None,
+        help="Override the Stage-4 search model for HHTS search modes.",
+    )
+    args = parser.parse_args()
 
-    # ── Usage ──────────────────────────────────────────────────────────────
-    # python pipeline_logger.py                      → full population, all zones
-    # python pipeline_logger.py main                 → full population, all zones
-    # python pipeline_logger.py main 40              → zone 40 only
-    # python pipeline_logger.py main 40,124,200      → zones 40, 124, 200
-    # python pipeline_logger.py main order_40.csv    → single file (legacy)
-    # python pipeline_logger.py ga                   → GA + full population
-    # python pipeline_logger.py ga_staged            → staged GA + full population
-    
-    mode = sys.argv[1] if len(sys.argv) > 1 else 'main'
-    # 'debug' is an alias for 'main' with verbose logging already enabled
-    # via _setup_logging; no separate branch is needed.
-    #TODO allow the debug mode to only sample one zone 40
-    
-    #TODO allow the arguments to be selectivabel with defaults (e.g. --mode=ga --zones=40,124,200)
-    
-    
-    if mode == 'debug':
-        mode = 'main'
-    arg  = sys.argv[2] if len(sys.argv) > 2 else None
+    mode = 'main' if args.mode == 'debug' else args.mode
+    arg = args.arg
 
-    _setup_logging(mode, arg)
+    _setup_logging(mode, arg or args.search)
 
     if mode == 'main':
         main(arg)
@@ -4728,6 +5825,26 @@ if __name__ == "__main__":
         GA_main(arg)
     elif mode == 'ga_staged':
         GA_STAGED(arg)
+    elif mode == 'mcr_search':
+        run_mcr_search(arg)
+    elif mode == 'hhts_core':
+        run_hhts_optional_pipeline(
+            search_name=args.search or 'core_fixed',
+            force_mode='core',
+            n_iter=args.sa_iter,
+            temperature=args.sa_temp,
+            search_model=args.sa_model,
+        )
+    elif mode == 'hhts_search':
+        run_hhts_optional_pipeline(
+            search_name=args.search or 'nested_standard',
+            force_mode='search',
+            n_iter=args.sa_iter,
+            temperature=args.sa_temp,
+            search_model=args.sa_model,
+        )
+    elif mode == 'list_searches':
+        _print_model_zoo_searches()
     elif mode in ('safety_baseline', 'safety_nosafety'):
         # Safety-skim experiment modes.
         # safety_baseline  → run normally (safety skims INCLUDED in stage 5)
@@ -4744,16 +5861,6 @@ if __name__ == "__main__":
             out_dir      = os.path.join('runs', 'safety_analysis'),
         )
     else:
-        print("Usage: python pipeline_logger.py [main|ga|ga_staged|"
-              "safety_baseline|safety_nosafety|safety_compare] [zone]")
-        print("  zone_or_file can be:")
-        print("    (empty)          — load all zones from SYNTH_DIR")
-        print("    40               — single zone number")
-        print("    40,124,200       — comma-separated zone numbers")
-        print("    order_40.csv     — specific CSV filename")
-        print("    path/to/file.csv — full path to CSV")
-        print("")
-        print("  GA budget:  set GA_BUDGET=fast|standard|thorough (default: fast)")
-        print("  Parallelism: set STAGE5_WORKERS=N (default: 1; N≤ncpus allocated)")
+        parser.print_help()
 
 

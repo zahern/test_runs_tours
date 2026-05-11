@@ -100,6 +100,48 @@ PURPOSES = list(PURPOSE_PRIORITY.keys())
 
 PERSON_FEATURES = ['sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING']
 
+DEFAULT_FEATURES_BY_PURPOSE = {
+    'work': ['WORKSTAT', 'CARLICENCE', 'vehrd', 'ptype_FullTimeWorker', 'ptype_WorkingStudent', 'wfh'],
+    'edu': ['STUDYING', 'ptype_SchoolChild', 'ptype_UniversityStudent', 'age_child', 'age_teen', 'transit_acc'],
+    'escort': ['hh_child', 'vehrd', 'has_vehicle', 'nprd', 'WORKSTAT'],
+    'shopping': ['incp', 'vehrd', 'has_vehicle', 'nprd', 'walk_acc'],
+    'social': ['is_female', 'nprd', 'age_teen', 'age_older', 'walk_acc'],
+    'othmaint': ['WORKSTAT', 'vehrd', 'nprd', 'auto_nonmand_acc'],
+    'othdiscr': ['incp', 'vehrd', 'age_older', 'walk_acc'],
+    'eat': ['incp', 'nprd', 'walk_acc', 'transit_acc'],
+}
+
+
+def _timing_person_features(df: pd.DataFrame, purpose: str, feature_override=None) -> list:
+    if isinstance(feature_override, dict):
+        names = feature_override.get(purpose, feature_override.get('*', []))
+    elif feature_override is not None:
+        names = feature_override
+    else:
+        names = DEFAULT_FEATURES_BY_PURPOSE.get(purpose, PERSON_FEATURES)
+    if not names:
+        names = PERSON_FEATURES
+    return [c for c in dict.fromkeys(names) if c in df.columns]
+
+
+def _numerical_hessian(func, params: np.ndarray, eps: float = 1e-4) -> np.ndarray:
+    params = np.asarray(params, dtype=float)
+    n = len(params)
+    hess = np.zeros((n, n), dtype=float)
+    for i in range(n):
+        ei = np.zeros(n, dtype=float)
+        ei[i] = eps
+        for j in range(i, n):
+            ej = np.zeros(n, dtype=float)
+            ej[j] = eps
+            fpp = func(params + ei + ej)
+            fpm = func(params + ei - ej)
+            fmp = func(params - ei + ej)
+            fmm = func(params - ei - ej)
+            hess[i, j] = (fpp - fpm - fmp + fmm) / (4.0 * eps * eps)
+            hess[j, i] = hess[i, j]
+    return hess
+
 
 # ---------------------------------------------------------------------------
 # 0.  HELPERS
@@ -477,10 +519,10 @@ class MNLTimingModel:
         self.converged_ = bool(res.success) or (np.isfinite(rho2) and rho2 > 0.05)
         self.fit_status_ = 'ok' if self.converged_ else 'optimizer_stopped'
         try:
-            hess_inv = res.hess_inv.todense() if hasattr(res.hess_inv, 'todense') else np.asarray(res.hess_inv)
-            hess_inv = np.asarray(hess_inv, dtype=float)
             params = res.x.copy()
-            self.std_err_ = np.sqrt(np.clip(np.diag(hess_inv), 0.0, None))
+            hess = _numerical_hessian(neg_ll_reg, params)
+            cov = np.linalg.pinv(hess)
+            self.std_err_ = np.sqrt(np.clip(np.diag(cov), 0.0, None))
             self.t_stat_ = np.divide(params, self.std_err_, out=np.full_like(params, np.nan), where=self.std_err_ > 0)
             from scipy.stats import norm as _norm
             self.p_value_ = 2.0 * _norm.sf(np.abs(self.t_stat_))
@@ -627,8 +669,7 @@ def estimate_timing_models(
 
         m = MNLTimingModel()
         m.ptypes_ = ptypes
-        if feature_override:
-            m.feature_override_ = feature_override
+        m.feature_override_ = _timing_person_features(data, purpose, feature_override)
         X = m._build_X(subset)
         m.fit(X, y)
 
@@ -636,8 +677,7 @@ def estimate_timing_models(
             logger.warning(f"  timing/{purpose}: retrying with reduced person features")
             m2 = MNLTimingModel()
             m2.ptypes_ = ptypes
-            if feature_override:
-                m2.feature_override_ = feature_override
+            m2.feature_override_ = _timing_person_features(data, purpose, feature_override)
             m2.include_person_features_ = False
             X2 = m2._build_X(subset)
             m2.fit(X2, y)

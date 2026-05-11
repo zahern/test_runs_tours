@@ -14,8 +14,30 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings('ignore')
 
-DIR_BASE  = 'runs/safety_baseline'
-DIR_NOSA  = 'runs/safety_nosafety'
+
+def _latest_run_dir(prefix: str, base: str = 'runs') -> str:
+    """
+    Return the most-recently-modified run directory whose name starts with
+    ``prefix`` (e.g. 'safety_baseline').  Falls back to ``runs/<prefix>``
+    (the old fixed name) if nothing with a job-tag suffix exists.
+    """
+    import glob as _glob
+    pattern = os.path.join(base, prefix + '__*')
+    candidates = sorted(
+        _glob.glob(pattern),
+        key=lambda p: os.path.getmtime(p) if os.path.isdir(p) else 0,
+        reverse=True,
+    )
+    # Filter to directories only
+    candidates = [p for p in candidates if os.path.isdir(p)]
+    if candidates:
+        return candidates[0]
+    # Legacy fixed name
+    return os.path.join(base, prefix)
+
+
+DIR_BASE  = _latest_run_dir('safety_baseline')
+DIR_NOSA  = _latest_run_dir('safety_nosafety')
 DIR_OUT   = 'runs/safety_analysis'
 PLOTS_DIR = os.path.join(DIR_OUT, 'plots')
 os.makedirs(PLOTS_DIR, exist_ok=True)

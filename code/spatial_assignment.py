@@ -1317,7 +1317,9 @@ def plot_person_movement(
         t_h = int(row.get('STARTIME', 0) / 60)
         t_m = int(row.get('STARTIME', 0) % 60)
         mode = str(row.get('mode_name', row.get('mode', '')))
-        dist = float(row.get('dist_km', 0))
+        # Prefer skim road distance ('dist') over haversine ('dist_km') —
+        # haversine between zone centroids can significantly overestimate.
+        dist = float(row.get('dist') or row.get('dist_km') or 0)
         ax.text((o_lon+d_lon)/2, (o_lat+d_lat)/2 + 0.002,
                 f"{t_h:02d}:{t_m:02d} {mode} {dist:.1f}km",
                 fontsize=6, color='white', ha='center', alpha=0.85,
@@ -1344,7 +1346,14 @@ def plot_person_movement(
     for sp in ax.spines.values(): sp.set_edgecolor('#334466')
 
     ptype = person.iloc[0].get('ptype','') if len(person) else ''
-    total_km = trips['dist_km'].sum() if 'dist_km' in trips.columns else 0
+    # Prefer skim road distance sum ('dist') over haversine centroid distance
+    # ('dist_km') — haversine overestimates road distance significantly.
+    if 'dist' in trips.columns and trips['dist'].notna().any():
+        total_km = trips['dist'].sum()
+    elif 'dist_km' in trips.columns:
+        total_km = trips['dist_km'].sum()
+    else:
+        total_km = 0
     # Use activity count for the human-readable title — that's what "trips" means
     # to a user (one trip = one out-of-home activity visit, not each trip leg).
     n_activities = len(acts)
@@ -1378,8 +1387,16 @@ def plot_distance_distribution(
     else:
         trips = plan_with_coords.copy()
 
-    if 'dist_km' not in trips.columns or len(trips) == 0:
+    if 'dist_km' not in trips.columns and 'dist' not in trips.columns:
         print("  No dist_km — run assign_coordinates() first")
+        return None
+
+    # Prefer skim road distance ('dist') over haversine zone-centroid distance
+    # ('dist_km'): haversine overestimates road distance by ~20-40% for SEQ zones.
+    if 'dist' in trips.columns and trips['dist'].notna().any():
+        trips = trips.copy()
+        trips['dist_km'] = trips['dist']
+    elif 'dist_km' not in trips.columns:
         return None
 
     mode_col = 'mode_name' if 'mode_name' in trips.columns else 'mode'
@@ -1562,7 +1579,15 @@ def plot_spatial_metrics(
     else:
         trips = plan_with_coords.copy()
 
-    if 'dist_km' not in trips.columns: return None
+    if 'dist_km' not in trips.columns and 'dist' not in trips.columns:
+        return None
+
+    # Prefer skim road distance over haversine zone-centroid distance
+    if 'dist' in trips.columns and trips['dist'].notna().any():
+        trips = trips.copy()
+        trips['dist_km'] = trips['dist']
+    elif 'dist_km' not in trips.columns:
+        return None
 
     mode_col = 'mode_name' if 'mode_name' in trips.columns else 'mode'
     _mm = {1:'DA',2:'SR',3:'Walk',4:'Bike',5:'Transit'}
@@ -1770,11 +1795,15 @@ if __name__ == '__main__':
     # per-person movement plots for the top 4 highest-mileage persons
     rt_col = 'row_type' if 'row_type' in plan_coords.columns else None
     trip_rows = plan_coords[plan_coords[rt_col] == 'trip'] if rt_col else plan_coords
-    if 'dist_km' in trip_rows.columns and 'person_id' in trip_rows.columns:
+    if 'person_id' in trip_rows.columns:
         import numpy as np
-        top_pids = (trip_rows.groupby('person_id')['dist_km']
-                    .sum().sort_values(ascending=False)
-                    .head(20).index.tolist())
+        # Prefer skim road distance ('dist') over haversine ('dist_km')
+        _dc = 'dist' if 'dist' in trip_rows.columns and trip_rows['dist'].notna().any() \
+              else ('dist_km' if 'dist_km' in trip_rows.columns else None)
+        if _dc:
+            top_pids = (trip_rows.groupby('person_id')[_dc]
+                        .sum().sort_values(ascending=False)
+                        .head(20).index.tolist())
         rng = np.random.default_rng(42)
         sample_pids = rng.choice(top_pids, size=min(4, len(top_pids)),
                                   replace=False).tolist()

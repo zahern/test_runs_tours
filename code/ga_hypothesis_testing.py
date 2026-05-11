@@ -73,16 +73,174 @@ Fitness metrics (all stages)
     Stage 6  (nested logit)     : –BIC/n  (higher = better)
 """
 
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 import logging
 import pickle
 import os
+import glob
 import copy
+import html
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Callable, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def _ga_save_stage_coef_csv(models: dict, stage_name: str, save_dir: str) -> None:
+    """Write stage coefficient CSV/HTML for GA runs (parity with main path)."""
+    rows = []
+
+    def _add_rows(segment: str, obj: Any):
+        pf = getattr(obj, 'pf', None)
+        if pf is not None and hasattr(pf, 'iterrows'):
+            for param, row in pf.iterrows():
+                rows.append({
+                    'stage': stage_name,
+                    'segment': segment,
+                    'param': str(param),
+                    'value': float(row.get('value', float('nan'))),
+                    'std_err': float(row.get('std_err', float('nan'))),
+                    't_stat': float(row.get('t_stat', float('nan'))),
+                    'p_value': float(row.get('pval', row.get('p_value', float('nan')))),
+                    'source': 'larch_pf',
+                })
+            return
+
+        if isinstance(obj, dict):
+            if 'model' in obj and len(obj) <= 8:
+                _add_rows(segment, obj['model'])
+                if hasattr(obj.get('model', None), 'thresholds_'):
+                    thr = getattr(obj['model'], 'thresholds_', None)
+                    if thr is not None:
+                        for i, v in enumerate(thr):
+                            rows.append({
+                                'stage': stage_name,
+                                'segment': segment,
+                                'param': f'threshold_{i}',
+                                'value': float(v),
+                                'std_err': float('nan'),
+                                't_stat': float('nan'),
+                                'p_value': float('nan'),
+                                'source': 'ordered_logit_threshold',
+                            })
+                return
+            coef = obj.get('coef', obj.get('coefficients', None))
+            if isinstance(coef, dict):
+                se = obj.get('std_err', obj.get('std_errors', {})) or {}
+                ts = obj.get('t_stat', obj.get('t_stats', {})) or {}
+                pv = obj.get('p_value', obj.get('pval', {})) or {}
+                for k, v in coef.items():
+                    rows.append({
+                        'stage': stage_name,
+                        'segment': segment,
+                        'param': str(k),
+                        'value': float(v),
+                        'std_err': float(se.get(k, float('nan'))),
+                        't_stat': float(ts.get(k, float('nan'))),
+                        'p_value': float(pv.get(k, float('nan'))),
+                        'source': 'dict',
+                    })
+                return
+
+        coef_arr = getattr(obj, 'coef_export_values_', getattr(obj, 'coef_', None))
+        if coef_arr is not None:
+            coef_flat = np.asarray(coef_arr).ravel()
+            feats = list(getattr(obj, 'coef_export_names_', getattr(obj, 'feature_names_', [])))
+            if not feats:
+                feats = [f'x{i}' for i in range(len(coef_flat))]
+            se = np.asarray(getattr(obj, 'std_err_export_', getattr(obj, 'std_err_', [])), dtype=float).ravel()
+            ts = np.asarray(getattr(obj, 't_stat_export_', getattr(obj, 't_stat_', [])), dtype=float).ravel()
+            pv = np.asarray(getattr(obj, 'p_value_export_', getattr(obj, 'p_value_', [])), dtype=float).ravel()
+            for i, (f, v) in enumerate(zip(feats, coef_flat)):
+                rows.append({
+                    'stage': stage_name,
+                    'segment': segment,
+                    'param': str(f),
+                    'value': float(v),
+                    'std_err': float(se[i]) if i < len(se) else float('nan'),
+                    't_stat': float(ts[i]) if i < len(ts) else float('nan'),
+                    'p_value': float(pv[i]) if i < len(pv) else float('nan'),
+                    'source': 'model_object',
+                })
+
+    for key, obj in (models or {}).items():
+        if isinstance(obj, dict):
+            vals = list(obj.values())
+            if vals and isinstance(vals[0], dict) and 'model' in vals[0]:
+                for sk, sv in obj.items():
+                    _add_rows(f'{key}/{sk}', sv)
+                continue
+        _add_rows(str(key), obj)
+
+    if not rows:
+        return
+
+    df = pd.DataFrame(rows)
+    csv_path = os.path.join(save_dir, f'{stage_name}_coefficients.csv')
+    html_path = os.path.join(save_dir, f'{stage_name}_coefficients.html')
+    df.to_csv(csv_path, index=False)
+
+    html_rows = []
+    for seg, seg_df in df.sort_values(['segment', 'param']).groupby('segment', dropna=False):
+        html_rows.append(
+            f"<h2>{html.escape(str(seg))}</h2>"
+            "<table><tr><th>Parameter</th><th>Value</th><th>Std Err</th><th>t-stat</th><th>p-value</th><th>Source</th></tr>"
+        )
+        for _, r in seg_df.iterrows():
+            html_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(r['param']))}</td>"
+                f"<td style='text-align:right'>{float(r['value']):.6f}</td>"
+                f"<td style='text-align:right'>{float(r.get('std_err', float('nan'))):.6f}</td>"
+                f"<td style='text-align:right'>{float(r.get('t_stat', float('nan'))):.3f}</td>"
+                f"<td style='text-align:right'>{float(r.get('p_value', float('nan'))):.4g}</td>"
+                f"<td>{html.escape(str(r.get('source', '')))}</td>"
+                "</tr>"
+            )
+        html_rows.append("</table>")
+    html_doc = (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<title>{stage_name} coefficients</title>"
+        "<style>body{font-family:Arial,sans-serif;margin:20px;font-size:13px}"
+        "table{border-collapse:collapse;width:100%;margin-bottom:24px}"
+        "th{background:#2c3e50;color:white;padding:6px 10px;text-align:left}"
+        "td{border:1px solid #ddd;padding:5px 10px}"
+        "tr:nth-child(even){background:#f9f9f9}"
+        "</style></head><body>"
+        f"<h1>{stage_name} coefficients</h1>"
+        + "\n".join(html_rows)
+        + "</body></html>"
+    )
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(html_doc)
+
+
+def _ga_run_validation_hhts(
+    out: dict,
+    s1_models: dict,
+    s2_models: dict,
+    s3_models: dict,
+    s4_models: dict,
+    s5_models: dict,
+    save_dir: str,
+) -> None:
+    """Run full HHTS validation to the same output location contract as main."""
+    try:
+        from validate_hhts import run_validation
+        run_validation(
+            out=out,
+            s1_models=s1_models,
+            s2_models=s2_models,
+            s3_models=s3_models,
+            s4_models=s4_models,
+            s5_models=s5_models,
+            out_dir=save_dir,
+        )
+    except Exception as exc:
+        logger.warning(f"GA full HHTS validation failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +348,7 @@ def _repair_collinearity(
     feature_names: List[str],
     collinear_groups: List[List[str]],
     rng: np.random.Generator,
+    protected_idx: Optional[set[int]] = None,
 ) -> np.ndarray:
     """
     Repair a chromosome so at most ONE gene per collinearity group is active.
@@ -198,16 +357,100 @@ def _repair_collinearity(
     This is called after every mutation and during population initialisation.
     """
     genes = genes.copy()
+    protected_idx = protected_idx or set()
     feat_idx = {f: i for i, f in enumerate(feature_names)}
     for group in collinear_groups:
         active_idx = [feat_idx[f] for f in group
                       if f in feat_idx and genes[feat_idx[f]] == 1]
         if len(active_idx) > 1:
-            keep = rng.choice(active_idx)
+            protected_active = [idx for idx in active_idx if idx in protected_idx]
+            keep = (protected_active[0] if protected_active
+                    else int(rng.choice(active_idx)))
             for idx in active_idx:
                 if idx != keep:
                     genes[idx] = 0
     return genes
+
+
+def _enforce_feature_bounds(
+    genes: np.ndarray,
+    min_features: int,
+    max_features: int,
+    rng: np.random.Generator,
+    feature_names: Optional[List[str]] = None,
+    collinear_groups: Optional[List[List[str]]] = None,
+    protected_idx: Optional[set[int]] = None,
+) -> np.ndarray:
+    """Repair active-feature count after any other chromosome repair."""
+    genes = genes.copy()
+    protected_idx = protected_idx or set()
+    feature_names = feature_names or []
+    collinear_groups = collinear_groups or []
+
+    genes[list(protected_idx)] = 1
+
+    while int(genes.sum()) > max_features:
+        removable = [idx for idx in np.where(genes == 1)[0] if idx not in protected_idx]
+        if not removable:
+            break
+        genes[int(rng.choice(removable))] = 0
+
+    while int(genes.sum()) < min_features:
+        inactive = [idx for idx in np.where(genes == 0)[0] if idx not in protected_idx]
+        if not inactive:
+            break
+        pick = int(rng.choice(inactive))
+        genes[pick] = 1
+        if collinear_groups and feature_names:
+            genes = _repair_collinearity(
+                genes, feature_names, collinear_groups, rng,
+                protected_idx=protected_idx,
+            )
+            genes[list(protected_idx)] = 1
+    return genes
+
+
+def _combine_segment_feature_results(
+    stage: int,
+    segment_results: Dict[str, GAResult],
+    feature_map: Dict[str, List[str]],
+    fitness_metric: str,
+    n_restarts: int,
+) -> GAResult:
+    """Bundle per-segment GA outputs when each segment uses its own feature space."""
+    all_feature_names = sorted({
+        feat
+        for res in segment_results.values()
+        for feat in getattr(res, 'feature_names', [])
+    })
+    best_fitness = (float(np.mean([r.best_fitness for r in segment_results.values()]))
+                    if segment_results else -1e9)
+    history = [{
+        'generation': 0,
+        'best_fitness': best_fitness,
+        'best_so_far': best_fitness,
+        'mean_fitness': best_fitness,
+        'worst_fitness': best_fitness,
+        'diversity': 0.0,
+        'mutation_rate': 0.0,
+        'n_features': int(sum(len(v) for v in feature_map.values())),
+        'stagnation': 0,
+    }]
+    dummy = Individual(genes=np.zeros(len(all_feature_names), dtype=int), fitness=best_fitness)
+    combined = GAResult(
+        stage=stage,
+        best_features=feature_map,
+        best_fitness=best_fitness,
+        best_individual=dummy,
+        history=history,
+        all_candidates=[r.best_individual.copy() for r in segment_results.values()],
+        feature_names=all_feature_names,
+        fitness_metric=fitness_metric,
+        n_restarts=n_restarts,
+        cache_hits=sum(r.cache_hits for r in segment_results.values()),
+    )
+    combined.metadata['segment_results'] = segment_results
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +703,65 @@ class AllStagesResult:
             if not hist.empty:
                 hist.to_csv(os.path.join(out_dir, f'ga_stage{stage}_history.csv'), index=False)
 
+            # Explicit per-stage best-model artifact (easy to inspect from run folders)
+            best_txt = os.path.join(out_dir, f'ga_stage{stage}_best_model.txt')
+            try:
+                with open(best_txt, 'w', encoding='utf-8') as handle:
+                    handle.write(f"stage={stage}\n")
+                    handle.write(f"fitness_metric={res.fitness_metric}\n")
+                    handle.write(f"best_fitness={res.best_fitness:.10f}\n")
+                    if 'BIC' in res.fitness_metric and np.isfinite(res.best_fitness):
+                        handle.write(f"best_bic_per_obs={-res.best_fitness:.10f}\n")
+                    if isinstance(res.best_features, dict):
+                        for k, vals in res.best_features.items():
+                            handle.write(f"{k}={','.join(map(str, vals))}\n")
+                    else:
+                        handle.write(f"features={','.join(map(str, res.best_features))}\n")
+            except Exception as exc:
+                logger.warning(f"Could not write {best_txt}: {exc}")
+
+            rows = []
+            if isinstance(res.best_features, dict):
+                for group, vals in res.best_features.items():
+                    if not vals:
+                        rows.append({'stage': stage, 'group': group, 'feature': ''})
+                    else:
+                        for feat in vals:
+                            rows.append({'stage': stage, 'group': group, 'feature': feat})
+            else:
+                if not res.best_features:
+                    rows.append({'stage': stage, 'group': 'all', 'feature': ''})
+                else:
+                    for feat in res.best_features:
+                        rows.append({'stage': stage, 'group': 'all', 'feature': feat})
+            try:
+                pd.DataFrame(rows).to_csv(
+                    os.path.join(out_dir, f'ga_stage{stage}_best_features.csv'),
+                    index=False,
+                )
+            except Exception as exc:
+                logger.warning(f"Could not write ga_stage{stage}_best_features.csv: {exc}")
+
+            seg_results = res.metadata.get('segment_results', {}) if isinstance(res.metadata, dict) else {}
+            if seg_results:
+                seg_rows = []
+                for seg_label, seg_res in seg_results.items():
+                    seg_rows.append({
+                        'stage': stage,
+                        'segment': seg_label,
+                        'best_fitness': seg_res.best_fitness,
+                        'best_bic_per_obs': -seg_res.best_fitness if 'BIC' in seg_res.fitness_metric else np.nan,
+                        'n_features': len(seg_res.best_features),
+                        'best_features': ', '.join(seg_res.best_features),
+                    })
+                try:
+                    pd.DataFrame(seg_rows).to_csv(
+                        os.path.join(out_dir, f'ga_stage{stage}_segment_best.csv'),
+                        index=False,
+                    )
+                except Exception as exc:
+                    logger.warning(f"Could not write ga_stage{stage}_segment_best.csv: {exc}")
+
     def summary(self):
         STAGE_LABELS = {
              0: 'CDAP (daily activity pattern)',
@@ -548,11 +850,11 @@ class GeneticAlgorithm:
         pop_size:            int   = 40,
         n_generations:       int   = 60,
         mutation_rate:       float = 0.08,
-        mutation_rate_max:   float = 0.25,    # boosted rate when diversity low
-        diversity_threshold: float = 0.20,    # fraction below which mutation boosts
+        mutation_rate_max:   float = 0.35,    # boosted rate when diversity low
+        diversity_threshold: float = 0.30,    # fraction below which mutation boosts
         crossover_rate:      float = 0.75,
         elitism_k:           int   = 4,
-        min_features:        int   = 2,
+        min_features:        int   = 3,
         max_features:        int   = None,    # None = no upper limit
         tournament_k:        int   = 4,
         stagnation_limit:    int   = 12,      # gens without improvement → mutation boost
@@ -560,6 +862,9 @@ class GeneticAlgorithm:
         verbose:             bool  = True,
         feature_names:       List[str] = None,    # required for collinearity repair
         collinear_groups:    List[List[str]] = None,  # from STAGE_COLLINEAR_GROUPS
+        fixed_features:      Optional[List[str]] = None,
+        progress_label:      str = '',
+        fitness_metric:      str = 'mean(-BIC/n)',
     ):
         self.n_features          = n_features
         self.fitness_fn          = fitness_fn
@@ -578,33 +883,96 @@ class GeneticAlgorithm:
         self.rng                 = np.random.default_rng(seed)
         self.feature_names       = feature_names or []
         self.collinear_groups    = collinear_groups or []
+        self.fixed_features      = fixed_features or []
+        self.progress_label      = progress_label
+        self.fitness_metric      = fitness_metric
+        self._fixed_idx          = {
+            i for i, name in enumerate(self.feature_names)
+            if name in set(self.fixed_features)
+        }
 
         # fitness cache — shared across restarts
         self._cache: dict = {}
         self.cache_hits   = 0
 
+    def _active_feature_names(self, genes: np.ndarray, limit: int = 8) -> str:
+        if not self.feature_names:
+            return f"n={int(genes.sum())}"
+        active = [name for name, flag in zip(self.feature_names, genes) if flag == 1]
+        if len(active) > limit:
+            shown = active[:limit] + [f"... (+{len(active) - limit})"]
+        else:
+            shown = active
+        return str(shown)
+
     # ── initialisation ────────────────────────────────────────────────────
 
-    def _random_individual(self) -> Individual:
-        n_active = self.rng.integers(self.min_features, self.max_features + 1)
+    def _random_individual(self, n_active: int = None) -> Individual:
+        min_active = max(self.min_features, len(self._fixed_idx))
+        if n_active is None:
+            n_active = int(self.rng.integers(min_active, self.max_features + 1))
+        n_active = max(min_active, min(n_active, self.max_features))
         genes    = np.zeros(self.n_features, dtype=int)
-        active   = self.rng.choice(self.n_features, size=n_active, replace=False)
-        genes[active] = 1
+        if self._fixed_idx:
+            genes[list(self._fixed_idx)] = 1
+        extra_needed = max(0, n_active - int(genes.sum()))
+        candidate_idx = [i for i in range(self.n_features) if i not in self._fixed_idx]
+        if extra_needed > 0 and candidate_idx:
+            active = self.rng.choice(candidate_idx, size=min(extra_needed, len(candidate_idx)), replace=False)
+            genes[active] = 1
         if self.collinear_groups and self.feature_names:
             genes = _repair_collinearity(genes, self.feature_names,
-                                         self.collinear_groups, self.rng)
+                                         self.collinear_groups, self.rng,
+                                         protected_idx=self._fixed_idx)
+        genes = _enforce_feature_bounds(
+            genes, min_active, self.max_features, self.rng,
+            feature_names=self.feature_names,
+            collinear_groups=self.collinear_groups,
+            protected_idx=self._fixed_idx,
+        )
         return Individual(genes=genes)
 
     def _init_population(self, seed_individuals: list = None) -> List[Individual]:
         """
-        Initialise population with balanced sparsity + biased-toward-active seeding.
-        If seed_individuals (elites from a previous run) are supplied they are
-        included directly and the rest of the population is random.
+        Stratified initialisation: spread the population across four density
+        levels so the GA doesn't converge from a single sparsity mode.
+
+          25% sparse    (min_features  .. 25th percentile of range)
+          25% medium    (25th  .. 50th percentile)
+          25% rich      (50th  .. 75th percentile)
+          25% dense     (75th percentile .. max_features)
+
+        Seeded elites from a previous run are inserted first.  Stratification
+        ensures the initial BIC landscape is well-explored even when the true
+        best model is moderately large.
         """
         pop = []
         if seed_individuals:
             for ind in seed_individuals[:self.elitism_k]:
                 pop.append(ind.copy())
+
+        span  = max(self.max_features - self.min_features, 1)
+        q1    = self.min_features + span // 4
+        q2    = self.min_features + span // 2
+        q3    = self.min_features + 3 * span // 4
+
+        def _band_size(idx: int) -> int:
+            """Number of individuals to generate for band idx (0-3)."""
+            remaining = self.pop_size - len(pop)
+            n_bands   = max(1, 4 - idx)
+            return max(1, remaining // n_bands)
+
+        for lo, hi, _idx in [
+            (self.min_features, max(self.min_features, q1),  0),
+            (max(self.min_features, q1), max(q1 + 1, q2),    1),
+            (max(q1 + 1, q2),            max(q2 + 1, q3),    2),
+            (max(q2 + 1, q3),            self.max_features,  3),
+        ]:
+            for _ in range(_band_size(_idx)):
+                if len(pop) >= self.pop_size:
+                    break
+                n_act = int(self.rng.integers(lo, hi + 1)) if lo < hi else lo
+                pop.append(self._random_individual(n_act))
 
         while len(pop) < self.pop_size:
             pop.append(self._random_individual())
@@ -647,28 +1015,28 @@ class GeneticAlgorithm:
 
     def _mutate(self, ind: Individual, rate: float) -> Individual:
         genes = ind.genes.copy()
-        flip  = self.rng.random(self.n_features) < rate
+        mutable_idx = np.array([i for i in range(self.n_features) if i not in self._fixed_idx], dtype=int)
+        flip = np.zeros(self.n_features, dtype=bool)
+        if len(mutable_idx) > 0:
+            flip[mutable_idx] = self.rng.random(len(mutable_idx)) < rate
         genes[flip] = 1 - genes[flip]
+        if self._fixed_idx:
+            genes[list(self._fixed_idx)] = 1
 
         # repair: enforce min/max features
-        n_active = genes.sum()
-        if n_active < self.min_features:
-            inactive = np.where(genes == 0)[0]
-            extra    = self.rng.choice(inactive,
-                                       size=self.min_features - n_active,
-                                       replace=False)
-            genes[extra] = 1
-        if n_active > self.max_features:
-            active   = np.where(genes == 1)[0]
-            remove   = self.rng.choice(active,
-                                       size=n_active - self.max_features,
-                                       replace=False)
-            genes[remove] = 0
-
-        # repair: collinearity — keep at most one per correlated group
         if self.collinear_groups and self.feature_names:
             genes = _repair_collinearity(genes, self.feature_names,
-                                         self.collinear_groups, self.rng)
+                                         self.collinear_groups, self.rng,
+                                         protected_idx=self._fixed_idx)
+        genes = _enforce_feature_bounds(
+            genes,
+            max(self.min_features, len(self._fixed_idx)),
+            self.max_features,
+            self.rng,
+            feature_names=self.feature_names,
+            collinear_groups=self.collinear_groups,
+            protected_idx=self._fixed_idx,
+        )
 
         return Individual(genes=genes)
 
@@ -715,6 +1083,7 @@ class GeneticAlgorithm:
         history  = []
         best_ever = max(pop, key=lambda x: x.fitness).copy()
         stagnation_count = 0
+        invalid_warned = False
 
         for gen in range(self.n_generations):
             fitnesses = [ind.fitness for ind in pop]
@@ -724,8 +1093,20 @@ class GeneticAlgorithm:
             if gen_best.fitness > best_ever.fitness:
                 best_ever        = gen_best.copy()
                 stagnation_count = 0
+                if self.verbose:
+                    label = f" [{self.progress_label}]" if self.progress_label else ""
+                    metric = f"BIC/n={-best_ever.fitness:.4f}" if best_ever.fitness > -1e8 else f"fitness={best_ever.fitness:.4f}"
+                    print(f"    ↑ New best{label}: {metric}  feats={self._active_feature_names(best_ever.genes)}")
             else:
                 stagnation_count += 1
+
+            if not invalid_warned and gen_best.fitness <= -1e8:
+                invalid_warned = True
+                label = f" [{self.progress_label}]" if self.progress_label else ""
+                print(
+                    f"    ! No valid model yet{label}: all candidates are at the sentinel penalty. "
+                    "Check estimator availability, data coverage, or model setup."
+                )
 
             # adaptive mutation: boost when stagnating or diversity low
             if stagnation_count >= self.stagnation_limit or div < self.diversity_threshold:
@@ -748,11 +1129,18 @@ class GeneticAlgorithm:
             })
 
             if self.verbose and gen % 5 == 0:
-                print(f"  Gen {gen:3d} | best={gen_best.fitness:.4f} "
-                      f"mean={np.mean(fitnesses):.4f} "
-                      f"n_feat={int(gen_best.genes.sum())} "
-                      f"div={div:.2f} mut={cur_rate:.3f} "
-                      f"stag={stagnation_count}")
+                if 'BIC' in self.fitness_metric:
+                    print(f"  Gen {gen:3d} | best_BIC/n={-gen_best.fitness:.4f} "
+                          f"mean_BIC/n={-np.mean(fitnesses):.4f} "
+                          f"n_feat={int(gen_best.genes.sum())} "
+                          f"div={div:.2f} mut={cur_rate:.3f} "
+                          f"stag={stagnation_count}")
+                else:
+                    print(f"  Gen {gen:3d} | best={gen_best.fitness:.4f} "
+                          f"mean={np.mean(fitnesses):.4f} "
+                          f"n_feat={int(gen_best.genes.sum())} "
+                          f"div={div:.2f} mut={cur_rate:.3f} "
+                          f"stag={stagnation_count}")
 
             # elitism
             elites  = sorted(pop, key=lambda x: x.fitness, reverse=True)[:self.elitism_k]
@@ -1108,6 +1496,11 @@ def _stage5_mode_only_fitness(
         mode_ll  = float(mode_mdl.loglike())
         n   = len(seg_tours)
         k   = int(mode_genes.sum())
+        _seen = getattr(_stage5_mode_only_fitness, '_valid_logged', set())
+        if segment not in _seen:
+            print(f"    First valid Stage 5 mode model [{segment}]: LL={mode_ll:.2f}  n={n}  k={k}")
+            _seen.add(segment)
+            _stage5_mode_only_fitness._valid_logged = _seen
         bic = -2.0 * mode_ll + k * np.log(max(n, 2))
         return -bic / max(n, 1)
     except Exception as e:
@@ -1143,6 +1536,11 @@ def _stage5_dest_only_fitness(
         dest_ll  = float(dest_mdl.loglike())
         n   = len(seg_tours)
         k   = int(dest_genes.sum())
+        _seen = getattr(_stage5_dest_only_fitness, '_valid_logged', set())
+        if segment not in _seen:
+            print(f"    First valid Stage 5 dest model [{segment}]: LL={dest_ll:.2f}  n={n}  k={k}")
+            _seen.add(segment)
+            _stage5_dest_only_fitness._valid_logged = _seen
         bic = -2.0 * dest_ll + k * np.log(max(n, 2))
         return -bic / max(n, 1)
     except Exception as e:
@@ -1190,6 +1588,11 @@ def _stage5_fitness_larch(
     if len(seg_tours) < 50:
         return -1e9
 
+    # Force Larch to use numba engine in GA context — avoids cusolver_gesvdj_ffi
+    # CUDA kernel error that fires with JAX on HPC (jaxlib 0.10.0 / CUDA 13).
+    # Each fitness evaluation is small enough that numba CPU is faster anyway.
+    _prev_ga_engine = os.environ.get('GA_LARCH_ENGINE', '')
+    os.environ['GA_LARCH_ENGINE'] = 'numba'
     try:
         # Mode model on HHTS
         dt_m     = _mode_tree(seg_tours, persons, landuse, skims)
@@ -1221,6 +1624,12 @@ def _stage5_fitness_larch(
     except Exception as e:
         logger.debug(f"Stage5 fitness [{segment}]: {e}")
         return -1e9
+    finally:
+        # Restore previous engine setting so non-GA Larch calls are unaffected
+        if _prev_ga_engine:
+            os.environ['GA_LARCH_ENGINE'] = _prev_ga_engine
+        else:
+            os.environ.pop('GA_LARCH_ENGINE', None)
 
 
 def _stage5_fitness_aggregate(
@@ -1777,6 +2186,216 @@ def _taste_interaction_candidates(
     return added
 
 
+def _meaningful_interaction_candidates(
+    data: pd.DataFrame,
+    specs: List[Tuple[str, str, str]],
+    min_nonzero_share: float = 0.05,
+    max_abs_corr: float = 0.97,
+) -> List[str]:
+    """Create only interactions with usable coverage and without parent duplication."""
+    added: List[str] = []
+    for left, right, name in specs:
+        if left not in data.columns or right not in data.columns:
+            continue
+        lhs = pd.to_numeric(data[left], errors='coerce').fillna(0.0).astype(float)
+        rhs = pd.to_numeric(data[right], errors='coerce').fillna(0.0).astype(float)
+        vals = lhs * rhs
+        nonzero_share = float((np.abs(vals) > 1e-9).mean())
+        if vals.std() <= 1e-9 or nonzero_share < min_nonzero_share:
+            continue
+        keep = True
+        for parent in (lhs, rhs):
+            if parent.std() <= 1e-9:
+                continue
+            corr = np.corrcoef(vals, parent)[0, 1]
+            if np.isfinite(corr) and abs(float(corr)) >= max_abs_corr:
+                keep = False
+                break
+        if not keep:
+            continue
+        data[name] = vals
+        added.append(name)
+    return added
+
+
+def _available_feature_list(data: pd.DataFrame, names: List[str]) -> List[str]:
+    return [c for c in dict.fromkeys(names) if c in data.columns]
+
+
+_S1_CORE_BY_PURPOSE = {
+    'work': ['WORKSTAT', 'mandatory_role', 'incp', 'vehrd', 'CARLICENCE',
+             'auto_work_acc', 'ptype_FullTimeWorker', 'ptype_PartTimeWorker',
+             'ptype_WorkingStudent'],
+    'edu': ['STUDYING', 'ptype_SchoolChild', 'ptype_UniversityStudent',
+            'ptype_WorkingStudent', 'age_child', 'age_teen', 'transit_acc'],
+    'escort': ['hh_child', 'nprd', 'vehrd', 'has_vehicle', 'age_working'],
+    'shopping': ['incp', 'vehrd', 'has_vehicle', 'auto_shop_acc', 'nprd'],
+    'social': ['nprd', 'vehrd', 'walk_acc', 'transit_acc', 'is_female'],
+    'othmaint': ['nprd', 'vehrd', 'has_vehicle', 'auto_nonmand_acc'],
+    'othdiscr': ['incp', 'vehrd', 'auto_nonmand_acc', 'age_older'],
+    'eat': ['incp', 'nprd', 'walk_acc', 'transit_acc'],
+}
+
+_S1_OPTIONAL_BY_PURPOSE = {
+    'work': ['nprd', 'HHSIZE', 'is_female', 'age_working', 'wfh', 'WFHWEEK',
+             'n_workers_hh', 'income_hi', 'income_lo', 'occp_group', 'empp'],
+    'edu': ['vehrd', 'has_vehicle', 'is_female', 'income_lo', 'mandatory_role',
+            'auto_work_acc', 'walk_acc'],
+    'escort': ['WORKSTAT', 'is_female', 'auto_nonmand_acc', 'no_vehicle',
+               'ptype_FullTimeWorker', 'ptype_PartTimeWorker', 'income_midplus'],
+    'shopping': ['hh_child', 'age_older', 'wfh', 'income_hi', 'is_female',
+                 'no_vehicle', 'bike_acc', 'walk_acc'],
+    'social': ['incp', 'age_teen', 'age_older', 'hh_child', 'bikes', 'no_vehicle'],
+    'othmaint': ['WORKSTAT', 'hh_child', 'is_female', 'income_lo', 'walk_acc'],
+    'othdiscr': ['walk_acc', 'transit_acc', 'is_female', 'nprd', 'bikes'],
+    'eat': ['is_female', 'income_hi', 'age_working', 'bike_acc', 'auto_nonmand_acc'],
+}
+
+_S1_INTERACTIONS = {
+    'work': [('WORKSTAT', 'incp', 's1_worker_x_income'),
+             ('CARLICENCE', 'vehrd', 's1_licence_x_vehicle')],
+    'escort': [('hh_child', 'vehrd', 's1_child_x_vehicle')],
+    'shopping': [('income_hi', 'has_vehicle', 's1_hiinc_x_vehicle')],
+    'social': [('age_teen', 'walk_acc', 's1_teen_x_walkacc')],
+}
+
+_S2_CORE_BY_TARGET = {
+    'start_of_day': ['n_work_out', 'n_edu_out', 'WORKSTAT', 'STUDYING', 'vehrd', 'wfh', 'WFHWEEK'],
+    'end_of_day': ['n_work_out', 'n_edu_out', 'n_tours', 'WORKSTAT', 'STUDYING', 'vehrd'],
+    'B': ['n_total', 'n_tours', 'n_work_out', 'n_edu_out', 'WORKSTAT', 'STUDYING', 'incp', 'vehrd'],
+}
+
+_S2_OPTIONAL_BY_TARGET = {
+    'start_of_day': ['n_social_out', 'n_escort_out', 'sexp', 'nprd', 'income_hi', 'has_vehicle'],
+    'end_of_day': ['n_social_out', 'n_shopping_out', 'sexp', 'nprd', 'income_hi', 'has_vehicle'],
+    'B': ['n_social_out', 'n_escort_out', 'n_shopping_out', 'n_othmaint_out',
+          'n_othdiscr_out', 'sexp', 'nprd', 'income_hi', 'income_lo', 'has_vehicle'],
+}
+
+_S3_PURPOSE_PERSON_CORE = {
+    'work': ['WORKSTAT', 'incp', 'vehrd', 'CARLICENCE', 'ptype_FullTimeWorker', 'ptype_WorkingStudent'],
+    'edu': ['STUDYING', 'age_child', 'age_teen', 'ptype_SchoolChild', 'ptype_UniversityStudent'],
+    'escort': ['hh_child', 'nprd', 'vehrd', 'has_vehicle'],
+    'shopping': ['incp', 'vehrd', 'nprd', 'has_vehicle'],
+    'social': ['nprd', 'is_female', 'age_teen', 'age_older'],
+    'othmaint': ['nprd', 'has_vehicle', 'WORKSTAT'],
+    'othdiscr': ['incp', 'vehrd', 'age_older'],
+    'eat': ['incp', 'nprd', 'age_working'],
+}
+
+_S3_PURPOSE_OPTIONAL = {
+    'work': ['n_workers_hh', 'income_hi', 'wfh', 'auto_work_acc'],
+    'edu': ['transit_acc', 'walk_acc', 'income_lo'],
+    'escort': ['WORKSTAT', 'is_female', 'income_midplus'],
+    'shopping': ['age_older', 'walk_acc', 'auto_shop_acc'],
+    'social': ['transit_acc', 'walk_acc', 'income_hi'],
+    'othmaint': ['hh_child', 'income_lo', 'auto_nonmand_acc'],
+    'othdiscr': ['walk_acc', 'bike_acc', 'is_female'],
+    'eat': ['walk_acc', 'transit_acc', 'is_female'],
+}
+
+_S3_INTERACTIONS = {
+    'work': [('WORKSTAT', 'start_hr', 's3_worker_x_start_hr')],
+    'escort': [('hh_child', 'B', 's3_child_x_budget')],
+    'shopping': [('income_hi', 'log_dist', 's3_hiinc_x_log_dist')],
+}
+
+_S4_PURPOSE_PERSON_CORE = {
+    'work': ['WORKSTAT', 'CARLICENCE', 'vehrd', 'ptype_FullTimeWorker', 'ptype_WorkingStudent'],
+    'edu': ['STUDYING', 'ptype_SchoolChild', 'ptype_UniversityStudent', 'age_child', 'age_teen'],
+    'escort': ['hh_child', 'vehrd', 'has_vehicle', 'nprd'],
+    'shopping': ['incp', 'vehrd', 'has_vehicle', 'nprd'],
+    'social': ['is_female', 'nprd', 'age_teen', 'age_older'],
+    'othmaint': ['WORKSTAT', 'vehrd', 'nprd'],
+    'othdiscr': ['incp', 'vehrd', 'age_older'],
+    'eat': ['incp', 'nprd', 'walk_acc'],
+}
+
+_S4_PURPOSE_OPTIONAL = {
+    'work': ['wfh', 'WFHWEEK', 'income_hi', 'n_workers_hh'],
+    'edu': ['transit_acc', 'walk_acc', 'income_lo'],
+    'escort': ['WORKSTAT', 'is_female', 'income_midplus'],
+    'shopping': ['walk_acc', 'bike_acc', 'age_older'],
+    'social': ['transit_acc', 'walk_acc', 'income_hi'],
+    'othmaint': ['hh_child', 'income_lo', 'auto_nonmand_acc'],
+    'othdiscr': ['walk_acc', 'bike_acc', 'is_female'],
+    'eat': ['transit_acc', 'is_female', 'income_hi'],
+}
+
+_S4_INTERACTIONS = {
+    'work': [('WORKSTAT', 'time_consumed', 's4_worker_x_time_used')],
+    'edu': [('STUDYING', 'day_position', 's4_student_x_daypos')],
+    'escort': [('hh_child', 'time_consumed', 's4_child_x_time_used')],
+}
+
+
+def _stage1_feature_spec(data: pd.DataFrame, purpose: str) -> Tuple[List[str], List[str]]:
+    core = _available_feature_list(data, _S1_CORE_BY_PURPOSE.get(purpose, []))
+    optional = _available_feature_list(data, _S1_OPTIONAL_BY_PURPOSE.get(purpose, []))
+    interactions = _meaningful_interaction_candidates(data, _S1_INTERACTIONS.get(purpose, []))
+    return list(dict.fromkeys(core + optional + interactions)), core
+
+
+def _filter_candidates_by_signal(
+    data: pd.DataFrame,
+    candidates: List[str],
+    min_unique: int = 2,
+    min_binary_share: float = 0.01,
+    max_binary_share: float = 0.99,
+) -> List[str]:
+    """Drop near-constant or all-missing candidates that destabilize GA selection."""
+    keep: List[str] = []
+    for c in candidates:
+        if c not in data.columns:
+            continue
+        s = pd.to_numeric(data[c], errors='coerce') if data[c].dtype == object else data[c]
+        s = pd.Series(s).dropna()
+        if s.empty:
+            continue
+        nunq = int(s.nunique(dropna=True))
+        if nunq < min_unique:
+            continue
+        # Binary columns with extreme prevalence have little identification power.
+        if nunq == 2:
+            p = float((s > 0).mean())
+            if p < min_binary_share or p > max_binary_share:
+                continue
+        keep.append(c)
+    return list(dict.fromkeys(keep))
+
+
+def _stage2_feature_spec(data: pd.DataFrame, target: str) -> Tuple[List[str], List[str]]:
+    core = _available_feature_list(data, _S2_CORE_BY_TARGET.get(target, []))
+    optional = _available_feature_list(data, _S2_OPTIONAL_BY_TARGET.get(target, []))
+    return list(dict.fromkeys(core + optional)), core
+
+
+def _stage3_feature_spec(data: pd.DataFrame, purpose: str) -> Tuple[List[str], List[str]]:
+    structural = _available_feature_list(
+        data,
+        ['start_hr', 'log_dist', 'B', 'budget_per_activity_hr', 'day_span_hr',
+         'n_mandatory', 'n_discretionary',
+         'n_work_out', 'n_edu_out', 'n_social_out', 'n_escort_out',
+         'n_shopping_out', 'n_othmaint_out', 'n_othdiscr_out', 'n_eat_out'],
+    )
+    core = structural + _available_feature_list(data, _S3_PURPOSE_PERSON_CORE.get(purpose, []))
+    optional = _available_feature_list(data, _S3_PURPOSE_OPTIONAL.get(purpose, []))
+    interactions = _meaningful_interaction_candidates(data, _S3_INTERACTIONS.get(purpose, []))
+    return list(dict.fromkeys(core + optional + interactions)), list(dict.fromkeys(core))
+
+
+def _stage4_feature_spec(data: pd.DataFrame, purpose: str) -> Tuple[List[str], List[str]]:
+    structural = _available_feature_list(
+        data,
+        ['day_position', 'time_consumed', 'duration_min', 'time_remaining',
+         'time_of_day_sin', 'time_of_day_cos'],
+    )
+    core = structural + _available_feature_list(data, _S4_PURPOSE_PERSON_CORE.get(purpose, []))
+    optional = _available_feature_list(data, _S4_PURPOSE_OPTIONAL.get(purpose, []))
+    interactions = _meaningful_interaction_candidates(data, _S4_INTERACTIONS.get(purpose, []))
+    return list(dict.fromkeys(core + optional + interactions)), list(dict.fromkeys(core))
+
+
 def _stage1_candidates(data: pd.DataFrame) -> List[str]:
     """Stage 1 (activity frequency / ordered logit) — full candidate set."""
     base    = ['sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING', 'incp',
@@ -1984,6 +2603,62 @@ def _stage5_dest_candidates() -> List[str]:
         skim_extra + emp_work + emp_edu + emp_nonmand + pop_area +
         acc_dest + person_dest_int
     ))
+
+
+def _stage5_mode_candidates_for_segment(segment: str) -> List[str]:
+    """Purpose-aware stage 5 mode candidates by segment."""
+    base = {
+        'SOVTOLL_TIME__PM', 'HOV2TOLL_TIME__AM', 'WLK_LOC_WLK_XWAIT__AM',
+        'vehrd', 'has_vehicle', 'no_vehicle', 'CARLICENCE',
+        'sexp', 'is_female', 'incp', 'income_hi', 'income_lo',
+        'age_working', 'age_older', 'nprd', 'hh_child', 'n_workers_hh',
+        'WORKSTAT', 'STUDYING', 'mandatory_role',
+    }
+    by_seg = {
+        'work': {
+            'ptype_FullTimeWorker', 'ptype_PartTimeWorker',
+            'mtwp', 'empp', 'wfh', 'WFHWEEK',
+        },
+        'edu': {
+            'ptype_UniversityStudent', 'ptype_WorkingStudent', 'ptype_SchoolChild',
+            'age_child', 'age_teen', 'bikes',
+        },
+        'nonmand': {
+            'ptype_Retired', 'bikes', 'hh_size_large',
+            'age_senior',
+        },
+    }
+    return list(dict.fromkeys(sorted(base | by_seg.get(segment, set()))))
+
+
+def _stage5_dest_candidates_for_segment(segment: str) -> List[str]:
+    """Purpose-aware stage 5 destination candidates by segment."""
+    common = {
+        'SOVTOLL_TIME__AM',
+        'TOTPOP', 'TOTHH', 'sa2_area',
+        'auto_work_acc', 'auto_shop_acc', 'walk_acc', 'transit_acc',
+        'incp', 'has_vehicle', 'n_workers_hh', 'is_female',
+    }
+    by_seg = {
+        'work': {
+            'TOTEMP', 'FPSEMPN', 'HEREMPN', 'RETEMPN', 'AGREMPN', 'MWTEMPN',
+            'commercial', 'industrial', 'government', 'governmental',
+            'ptype_FullTimeWorker', 'income_hi',
+        },
+        'edu': {
+            'Education', 'Primary', 'Secondary', 'HSENROLL', 'AGE0519',
+            'Primary_total_priv', 'Secondary_total_priv',
+            'ptype_UniversityStudent', 'hh_child', 'age_working',
+        },
+        'nonmand': {
+            'Shopping', 'Entertainment', 'OTHERMAINTENANCE', 'OTHERDISCRFacilities',
+            'EATOUT', 'OTHEMP', 'Healthcare', 'Public_Services', 'childcare',
+            'recreation_ground', 'sport', 'park', 'community', 'civic',
+            'residential', 'retail', 'construction',
+            'age_older',
+        },
+    }
+    return list(dict.fromkeys(sorted(common | by_seg.get(segment, set()))))
 
 
 def _stage6_candidates(data: pd.DataFrame) -> List[str]:
@@ -2239,42 +2914,74 @@ def _run_ga_stage1(tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
     print("\n[Stage 1] Preparing estimation data...")
     data       = prepare_frequency_data(tours, persons)
     ptypes     = data['ptype'].dropna().unique().tolist()
-    feat_names = _stage1_candidates(data)
     purposes   = [p for p in PURPOSES if f'n_{p}_out' in data.columns]
     est        = ga_estimator()
 
-    print(f"  {len(data)} persons | {len(feat_names)} candidate features | "
+    print(f"  {len(data)} persons | purpose-specific candidate sets | "
           f"{len(purposes)} purposes × {len(ptypes)} ptypes | estimator={est}")
 
-    # Select fitness function based on GA_ESTIMATOR
-    if est in ('metacount', 'both'):
-        def _fit_fn(genes, _purps=purposes):
-            return stage1_fitness_metacount(genes, data, feat_names, _purps)
-        fitness_metric = 'mean(-BIC/n) [MetaCount NB2]'
-    else:
-        def _fit_fn(genes, _purps=purposes, _pt=ptypes):
-            return _stage1_fitness_aggregate(genes, data, feat_names, _purps, _pt)
-        fitness_metric = 'mean(-BIC/n)'
+    fallback_to_default = os.environ.get('GA_ESTIMATOR_FALLBACK', '1') == '1'
+    fallback_warned = set()
+    mc_state = {'enabled': est in ('metacount', 'both', 'hybrid'), 'calls': 0, 'fails': 0, 'warned': False}
+
+    fitness_metric = (
+        'mean(-BIC/n) [MetaCount NB2 + fallback]'
+        if est in ('metacount', 'both', 'hybrid')
+        else 'mean(-BIC/n)'
+    )
 
     segment_results: dict = {}
-    purp_best_genes: dict = {}
+    purp_best_feats: dict = {}
+
+    all_feat_names: set = set()
 
     for purpose in purposes:
         purp_label = f"Stage1 — {_PURP_LABELS.get(purpose, purpose)}"
         print(f"\n  [{purp_label}] Running per-purpose GA ...")
 
-        if est in ('metacount', 'both'):
-            def _purp_fit(genes, _p=purpose):
-                return stage1_fitness_metacount(genes, data, feat_names, [_p])
+        feat_names, fixed_feats = _stage1_feature_spec(data, purpose)
+        feat_names = _filter_candidates_by_signal(data, feat_names)
+        fixed_feats = [f for f in fixed_feats if f in feat_names]
+        if not feat_names:
+            print(f"    ! {purp_label}: no usable candidates after filtering, skipping")
+            continue
+        all_feat_names.update(feat_names)
+
+        def _stage1_default_fit(genes, _p=purpose, _fn=feat_names, _pt=ptypes):
+            return _stage1_fitness_aggregate(genes, data, _fn, [_p], _pt)
+
+        if mc_state['enabled']:
+            def _purp_fit(genes, _p=purpose, _fn=feat_names):
+                score = stage1_fitness_metacount(genes, data, _fn, [_p])
+                mc_state['calls'] += 1
+                if score <= -1e8:
+                    mc_state['fails'] += 1
+                    if (mc_state['calls'] >= 20 and
+                            (mc_state['fails'] / max(mc_state['calls'], 1)) >= 0.8 and
+                            not mc_state['warned']):
+                        mc_state['warned'] = True
+                        mc_state['enabled'] = False
+                        print("    ! Stage1 MetaCount repeatedly failing; disabling MetaCount for remaining evaluations")
+                if score > -1e8 or not fallback_to_default:
+                    return score
+                fb = _stage1_default_fit(genes, [_p])
+                key = f'stage1_{_p}'
+                if fb > -1e8 and key not in fallback_warned:
+                    fallback_warned.add(key)
+                    print(f"    ! Stage1 MetaCount failed for {_p}; using default ordered-logit fallback")
+                return fb if fb > -1e8 else score
         else:
             def _purp_fit(genes, _p=purpose, _pt=ptypes):
                 return _stage1_fitness_aggregate(genes, data, feat_names, [_p], _pt)
 
+        _ga_kwargs = dict(ga_kwargs)
+        _ga_kwargs['min_features'] = max(int(_ga_kwargs.get('min_features', 3)), len(fixed_feats) + 1)
         purp_ga  = GeneticAlgorithm(
             len(feat_names), _purp_fit,
             feature_names    = feat_names,
             collinear_groups = STAGE_COLLINEAR_GROUPS.get(1, []),
-            **ga_kwargs,
+            fixed_features   = fixed_feats,
+            **_ga_kwargs,
         )
         purp_best, purp_hist, purp_pop = purp_ga.run_with_restarts(n_restarts=n_restarts)
         purp_feats = [f for f, g in zip(feat_names, purp_best.genes) if g == 1]
@@ -2286,13 +2993,16 @@ def _run_ga_stage1(tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
             n_restarts=n_restarts, cache_hits=purp_ga.cache_hits,
         )
         segment_results[purp_label] = seg_result
-        purp_best_genes[purpose]    = purp_best.genes.copy()
+        purp_best_feats[purpose]    = purp_feats
         print(f"    BIC/n={-purp_best.fitness:.4f}  feats={purp_feats}")
 
-    agg_fn = _fit_fn
-    return _majority_vote_result(segment_results, purp_best_genes, feat_names,
-                                 agg_fn, stage=1, fitness_metric=fitness_metric,
-                                 n_restarts=n_restarts)
+    return _combine_segment_feature_results(
+        stage=1,
+        segment_results=segment_results,
+        feature_map=purp_best_feats,
+        fitness_metric=fitness_metric,
+        n_restarts=n_restarts,
+    )
 
 
 def _run_ga_stage2(tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
@@ -2301,11 +3011,10 @@ def _run_ga_stage2(tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
 
     print("\n[Stage 2] Preparing estimation data...")
     data       = aggregate_person_day(tours, persons)
-    feat_names = _stage2_candidates(data)
     targets    = [t for t in ['start_of_day', 'end_of_day', 'B'] if t in data.columns]
     est        = ga_estimator()
 
-    print(f"  {len(data)} person-days | {len(feat_names)} features | "
+    print(f"  {len(data)} person-days | target-specific feature sets | "
           f"targets: {targets} | estimator={est}")
 
     _TARGET_LABELS = {
@@ -2314,30 +3023,70 @@ def _run_ga_stage2(tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
         'B':            'Stage2 — Day Duration (B)',
     }
 
-    if est in ('metacount', 'both'):
-        fitness_metric = 'mean(-BIC/n) [MetaCount lognormal]'
+    fallback_to_default = os.environ.get('GA_ESTIMATOR_FALLBACK', '1') == '1'
+    fallback_warned = set()
+    mc_state = {'enabled': est in ('metacount', 'both', 'hybrid'), 'calls': 0, 'fails': 0, 'warned': False}
+
+    if est in ('metacount', 'both', 'hybrid'):
+        fitness_metric = 'mean(-BIC/n) [MetaCount lognormal + fallback]'
     else:
         fitness_metric = 'mean(-BIC/n)'
 
     segment_results: dict = {}
-    tgt_best_genes:  dict = {}
+    tgt_best_feats:  dict = {}
+
+    _target_key_map = {
+        'start_of_day': 'start',
+        'end_of_day': 'end',
+        'B': 'budget',
+    }
 
     for target in targets:
         tgt_label = _TARGET_LABELS.get(target, f'Stage2 — {target}')
         print(f"\n  [{tgt_label}] Running per-target GA ...")
 
-        if est in ('metacount', 'both'):
-            def _tgt_fit(genes, _t=target):
-                return stage2_fitness_metacount(genes, data, feat_names, [_t])
+        feat_names, fixed_feats = _stage2_feature_spec(data, target)
+        feat_names = _filter_candidates_by_signal(data, feat_names)
+        fixed_feats = [f for f in fixed_feats if f in feat_names]
+        if not feat_names:
+            print(f"    ! {tgt_label}: no usable candidates after filtering, skipping")
+            continue
+
+        def _stage2_default_fit(genes, _t=target, _fn=feat_names):
+            return _stage2_fitness_aggregate(genes, data, _fn, [_t])
+
+        if mc_state['enabled']:
+            def _tgt_fit(genes, _t=target, _fn=feat_names):
+                score = stage2_fitness_metacount(genes, data, _fn, [_t])
+                mc_state['calls'] += 1
+                if score <= -1e8:
+                    mc_state['fails'] += 1
+                    if (mc_state['calls'] >= 20 and
+                            (mc_state['fails'] / max(mc_state['calls'], 1)) >= 0.8 and
+                            not mc_state['warned']):
+                        mc_state['warned'] = True
+                        mc_state['enabled'] = False
+                        print("    ! Stage2 MetaCount repeatedly failing; disabling MetaCount for remaining evaluations")
+                if score > -1e8 or not fallback_to_default:
+                    return score
+                fb = _stage2_default_fit(genes, [_t])
+                key = f'stage2_{_t}'
+                if fb > -1e8 and key not in fallback_warned:
+                    fallback_warned.add(key)
+                    print(f"    ! Stage2 MetaCount failed for {_t}; using default OLS/lognormal fallback")
+                return fb if fb > -1e8 else score
         else:
             def _tgt_fit(genes, _t=target):
                 return _stage2_fitness_aggregate(genes, data, feat_names, [_t])
 
+        _ga_kwargs = dict(ga_kwargs)
+        _ga_kwargs['min_features'] = max(int(_ga_kwargs.get('min_features', 3)), len(fixed_feats) + 1)
         tgt_ga   = GeneticAlgorithm(
             len(feat_names), _tgt_fit,
             feature_names    = feat_names,
             collinear_groups = STAGE_COLLINEAR_GROUPS.get(2, []),
-            **ga_kwargs,
+            fixed_features   = fixed_feats,
+            **_ga_kwargs,
         )
         tgt_best, tgt_hist, tgt_pop = tgt_ga.run_with_restarts(n_restarts=n_restarts)
         tgt_feats = [f for f, g in zip(feat_names, tgt_best.genes) if g == 1]
@@ -2349,16 +3098,16 @@ def _run_ga_stage2(tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
             n_restarts=n_restarts, cache_hits=tgt_ga.cache_hits,
         )
         segment_results[tgt_label] = seg_result
-        tgt_best_genes[target]     = tgt_best.genes.copy()
+        tgt_best_feats[_target_key_map.get(target, target)] = tgt_feats
         print(f"    BIC/n={-tgt_best.fitness:.4f}  feats={tgt_feats}")
 
-    if est in ('metacount', 'both'):
-        agg_fn = lambda g: stage2_fitness_metacount(g, data, feat_names, targets)
-    else:
-        agg_fn = lambda g: _stage2_fitness_aggregate(g, data, feat_names, targets)
-    return _majority_vote_result(segment_results, tgt_best_genes, feat_names,
-                                 agg_fn, stage=2, fitness_metric=fitness_metric,
-                                 n_restarts=n_restarts)
+    return _combine_segment_feature_results(
+        stage=2,
+        segment_results=segment_results,
+        feature_map=tgt_best_feats,
+        fitness_metric=fitness_metric,
+        n_restarts=n_restarts,
+    )
 
 
 def _run_ga_stage3(tours, persons, ga_kwargs, trips=None, n_restarts=2) -> GAResult:
@@ -2374,37 +3123,56 @@ def _run_ga_stage3(tours, persons, ga_kwargs, trips=None, n_restarts=2) -> GARes
     if purp_col is None:
         raise RuntimeError("Stage 3 GA: no purpose column in prepared data.")
 
-    feat_names = _stage3_candidates(data)
     purposes   = [p for p in PURPOSES if len(data[data[purp_col] == p]) >= 30]
     est        = ga_estimator()
     dur_col    = next((c for c in ['duration_min', 'duration', 'B'] if c in data.columns), None)
-    print(f"  {len(data)} activities | {len(feat_names)} features | "
-          f"{len(purposes)} purposes with n\u226530 | estimator={est}")
+    print(f"  {len(data)} activities | purpose-specific feature sets | "
+          f"{len(purposes)} purposes with n>=30 | estimator={est}")
 
-    if est in ('metacount', 'both'):
-        fitness_metric = 'mean(-BIC/n) [MetaCount lognormal]'
+    fallback_to_default = os.environ.get('GA_ESTIMATOR_FALLBACK', '1') == '1'
+    fallback_warned = set()
+
+    if est in ('metacount', 'both', 'hybrid'):
+        fitness_metric = 'mean(-BIC/n) [MetaCount lognormal + fallback]'
     else:
         fitness_metric = 'mean(-BIC/n)'
 
     segment_results: dict = {}
-    purp_best_genes: dict = {}
+    purp_best_feats: dict = {}
 
     for purpose in purposes:
         purp_label = f"Stage3 — {_PURP_LABELS.get(purpose, purpose)}"
         print(f"\n  [{purp_label}] Running per-purpose GA ...")
+        feat_names, fixed_feats = _stage3_feature_spec(data, purpose)
+        if not feat_names:
+            continue
 
-        if est in ('metacount', 'both') and dur_col:
-            def _purp_fit(genes, _p=purpose, _pc=purp_col, _dc=dur_col):
-                return stage3_fitness_metacount(genes, data, feat_names, [_p], _pc, _dc)
+        def _stage3_default_fit(genes, _purposes, _pc=purp_col, _fn=feat_names):
+            return _stage3_fitness_aggregate(genes, data, _fn, _purposes, _pc)
+
+        if est in ('metacount', 'both', 'hybrid') and dur_col:
+            def _purp_fit(genes, _p=purpose, _pc=purp_col, _dc=dur_col, _fn=feat_names):
+                score = stage3_fitness_metacount(genes, data, _fn, [_p], _pc, _dc)
+                if score > -1e8 or not fallback_to_default:
+                    return score
+                fb = _stage3_default_fit(genes, [_p], _pc)
+                key = f'stage3_{_p}'
+                if fb > -1e8 and key not in fallback_warned:
+                    fallback_warned.add(key)
+                    print(f"    ! Stage3 MetaCount failed for {_p}; using default lognormal fallback")
+                return fb if fb > -1e8 else score
         else:
-            def _purp_fit(genes, _p=purpose, _pc=purp_col):
-                return _stage3_fitness_aggregate(genes, data, feat_names, [_p], _pc)
+            def _purp_fit(genes, _p=purpose, _pc=purp_col, _fn=feat_names):
+                return _stage3_fitness_aggregate(genes, data, _fn, [_p], _pc)
 
+        _ga_kwargs = dict(ga_kwargs)
+        _ga_kwargs['min_features'] = max(int(_ga_kwargs.get('min_features', 3)), len(fixed_feats) + 1)
         purp_ga  = GeneticAlgorithm(
             len(feat_names), _purp_fit,
             feature_names    = feat_names,
             collinear_groups = STAGE_COLLINEAR_GROUPS.get(3, []),
-            **ga_kwargs,
+            fixed_features   = fixed_feats,
+            **_ga_kwargs,
         )
         purp_best, purp_hist, purp_pop = purp_ga.run_with_restarts(n_restarts=n_restarts)
         purp_feats = [f for f, g in zip(feat_names, purp_best.genes) if g == 1]
@@ -2416,16 +3184,16 @@ def _run_ga_stage3(tours, persons, ga_kwargs, trips=None, n_restarts=2) -> GARes
             n_restarts=n_restarts, cache_hits=purp_ga.cache_hits,
         )
         segment_results[purp_label] = seg_result
-        purp_best_genes[purpose]    = purp_best.genes.copy()
+        purp_best_feats[purpose]    = purp_feats
         print(f"    BIC/n={-purp_best.fitness:.4f}  feats={purp_feats}")
 
-    if est in ('metacount', 'both') and dur_col:
-        agg_fn = lambda g: stage3_fitness_metacount(g, data, feat_names, purposes, purp_col, dur_col)
-    else:
-        agg_fn = lambda g: _stage3_fitness_aggregate(g, data, feat_names, purposes, purp_col)
-    return _majority_vote_result(segment_results, purp_best_genes, feat_names,
-                                 agg_fn, stage=3, fitness_metric=fitness_metric,
-                                 n_restarts=n_restarts)
+    return _combine_segment_feature_results(
+        stage=3,
+        segment_results=segment_results,
+        feature_map=purp_best_feats,
+        fitness_metric=fitness_metric,
+        n_restarts=n_restarts,
+    )
 
 
 def _run_ga_stage4(trips, tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
@@ -2434,37 +3202,56 @@ def _run_ga_stage4(trips, tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
 
     print("\n[Stage 4] Preparing estimation data...")
     data       = prepare_timing_data(trips, tours, persons)
-    feat_names = _stage4_candidates(data)
     purposes   = [p for p in PURPOSES if len(data[data['purpose'] == p]) >= 30]
     est      = ga_estimator()
     n_alts   = int(data['period'].max() + 1) if 'period' in data.columns else 6
-    print(f"  {len(data)} trips | {len(feat_names)} features | "
+    print(f"  {len(data)} trips | purpose-specific feature sets | "
           f"{len(purposes)} purposes | estimator={est}")
 
-    if est in ('searchlibrium', 'both'):
-        fitness_metric = 'mean(-BIC/n) [SearchLibrium MNL]'
+    fallback_to_default = os.environ.get('GA_ESTIMATOR_FALLBACK', '1') == '1'
+    fallback_warned = set()
+
+    if est in ('searchlibrium', 'both', 'hybrid'):
+        fitness_metric = 'mean(-BIC/n) [SearchLibrium MNL + fallback]'
     else:
         fitness_metric = 'mean(-BIC/n)'
 
     segment_results: dict = {}
-    purp_best_genes: dict = {}
+    purp_best_feats: dict = {}
 
     for purpose in purposes:
         purp_label = f"Stage4 — {_PURP_LABELS.get(purpose, purpose)}"
         print(f"\n  [{purp_label}] Running per-purpose GA ...")
+        feat_names, fixed_feats = _stage4_feature_spec(data, purpose)
+        if not feat_names:
+            continue
 
-        if est in ('searchlibrium', 'both'):
-            def _purp_fit(genes, _p=purpose, _na=n_alts):
-                return stage4_fitness_searchlibrium(genes, data, feat_names, [_p], n_alts=_na)
+        def _stage4_default_fit(genes, _purposes, _fn=feat_names):
+            return _stage4_fitness_aggregate(genes, data, _fn, _purposes)
+
+        if est in ('searchlibrium', 'both', 'hybrid'):
+            def _purp_fit(genes, _p=purpose, _na=n_alts, _fn=feat_names):
+                score = stage4_fitness_searchlibrium(genes, data, _fn, [_p], n_alts=_na)
+                if score > -1e8 or not fallback_to_default:
+                    return score
+                fb = _stage4_default_fit(genes, [_p])
+                key = f'stage4_{_p}'
+                if fb > -1e8 and key not in fallback_warned:
+                    fallback_warned.add(key)
+                    print(f"    ! Stage4 SearchLibrium failed for {_p}; using default MNL fallback")
+                return fb if fb > -1e8 else score
         else:
-            def _purp_fit(genes, _p=purpose):
-                return _stage4_fitness_aggregate(genes, data, feat_names, [_p])
+            def _purp_fit(genes, _p=purpose, _fn=feat_names):
+                return _stage4_fitness_aggregate(genes, data, _fn, [_p])
 
+        _ga_kwargs = dict(ga_kwargs)
+        _ga_kwargs['min_features'] = max(int(_ga_kwargs.get('min_features', 3)), len(fixed_feats) + 1)
         purp_ga  = GeneticAlgorithm(
             len(feat_names), _purp_fit,
             feature_names    = feat_names,
             collinear_groups = STAGE_COLLINEAR_GROUPS.get(4, []),
-            **ga_kwargs,
+            fixed_features   = fixed_feats,
+            **_ga_kwargs,
         )
         purp_best, purp_hist, purp_pop = purp_ga.run_with_restarts(n_restarts=n_restarts)
         purp_feats = [f for f, g in zip(feat_names, purp_best.genes) if g == 1]
@@ -2476,16 +3263,16 @@ def _run_ga_stage4(trips, tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
             n_restarts=n_restarts, cache_hits=purp_ga.cache_hits,
         )
         segment_results[purp_label] = seg_result
-        purp_best_genes[purpose]    = purp_best.genes.copy()
+        purp_best_feats[purpose]    = purp_feats
         print(f"    BIC/n={-purp_best.fitness:.4f}  feats={purp_feats}")
 
-    if est in ('searchlibrium', 'both'):
-        agg_fn = lambda g: stage4_fitness_searchlibrium(g, data, feat_names, purposes, n_alts=n_alts)
-    else:
-        agg_fn = lambda g: _stage4_fitness_aggregate(g, data, feat_names, purposes)
-    return _majority_vote_result(segment_results, purp_best_genes, feat_names,
-                                 agg_fn, stage=4, fitness_metric=fitness_metric,
-                                 n_restarts=n_restarts)
+    return _combine_segment_feature_results(
+        stage=4,
+        segment_results=segment_results,
+        feature_map=purp_best_feats,
+        fitness_metric=fitness_metric,
+        n_restarts=n_restarts,
+    )
 
 
 def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
@@ -2542,8 +3329,6 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
     mode_cands = _stage5_mode_candidates()
     dest_cands = _stage5_dest_candidates()
     n_mode     = len(mode_cands)
-    n_total    = n_mode + len(dest_cands)
-    feat_names = mode_cands + dest_cands
 
     # ── Segment mapping ────────────────────────────────────────────────────
     # Tour-level segments: work, edu (school), nonmand (non-mandatory).
@@ -2564,8 +3349,8 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
     # destination pools.  Mode GA runs first; its best vars are used to
     # pre-compute logsums for the subsequent destination GA.
     segment_results: dict = {}
-    seg_best_mode_genes: dict = {}
-    seg_best_dest_genes: dict = {}
+    seg_best_mode_vars: dict = {}
+    seg_best_dest_vars: dict = {}
 
     from stage5_destination_choice import (
         _filter_seg, _mode_tree, _build_mode_model, _estimate, _logsums,
@@ -2575,33 +3360,44 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
     for seg in valid_segs:
         seg_label = SEG_LABELS.get(seg, seg)
         seg_tours = _filter_seg(tours, seg)
+        seg_mode_cands = _filter_candidates_by_signal(seg_tours, _stage5_mode_candidates_for_segment(seg))
+        seg_dest_cands = _filter_candidates_by_signal(seg_tours, _stage5_dest_candidates_for_segment(seg))
+        seg_mode_cands = [c for c in seg_mode_cands if c in mode_cands]
+        seg_dest_cands = [c for c in seg_dest_cands if c in dest_cands]
+
+        if not seg_mode_cands:
+            seg_mode_cands = mode_cands[:]
+        if not seg_dest_cands:
+            seg_dest_cands = dest_cands[:]
+
         print(f"\n  [Stage 5 — {seg_label}] Mode GA ...")
+        print(f"    Candidate pools: mode={len(seg_mode_cands)}  dest={len(seg_dest_cands)}")
 
         # ── Mode GA (chromosome = mode candidates only) ────────────────────
         def _mode_fit(genes, _s=seg):
             return _stage5_mode_only_fitness(
-                genes, mode_cands, _s, tours, persons, landuse, skims)
+                genes, seg_mode_cands, _s, tours, persons, landuse, skims)
 
         mode_ga  = GeneticAlgorithm(
-            n_mode, _mode_fit,
-            feature_names    = mode_cands,
+            len(seg_mode_cands), _mode_fit,
+            feature_names    = seg_mode_cands,
             collinear_groups = STAGE_COLLINEAR_GROUPS.get('5_mode', []),
             **ga_kwargs,
         )
         mode_best, mode_hist, mode_pop = mode_ga.run_with_restarts(n_restarts=n_restarts)
-        best_mode_vars = [v for v, g in zip(mode_cands, mode_best.genes) if g == 1]
+        best_mode_vars = [v for v, g in zip(seg_mode_cands, mode_best.genes) if g == 1]
         print(f"    Mode best vars: {best_mode_vars}  BIC/n={-mode_best.fitness:.4f}")
 
         mode_seg_result = GAResult(
             stage=5, best_features={'mode': best_mode_vars, 'dest': []},
             best_fitness=mode_best.fitness, best_individual=mode_best,
             history=mode_hist, all_candidates=mode_pop,
-            feature_names=mode_cands, fitness_metric='mean(-BIC/n)',
+            feature_names=seg_mode_cands, fitness_metric='mean(-BIC/n)',
             n_restarts=n_restarts, cache_hits=mode_ga.cache_hits,
         )
         mode_seg_result.metadata['sub_model'] = 'mode'
         segment_results[f'{seg_label} — Mode'] = mode_seg_result
-        seg_best_mode_genes[seg] = mode_best.genes.copy()
+        seg_best_mode_vars[seg] = best_mode_vars
 
         # ── Pre-compute mode logsums with best mode vars ───────────────────
         ls_cached    = None
@@ -2627,11 +3423,11 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
             def _dest_fit(genes, _s=seg, _ls=ls_cached, _acdc=seg_acdc,
                           _lu=lu_st_cached, _st=seg_tours):
                 return _stage5_dest_only_fitness(
-                    genes, dest_cands, _s, _st, persons, _lu, skims, _ls, _acdc)
+                    genes, seg_dest_cands, _s, _st, persons, _lu, skims, _ls, _acdc)
 
             dest_ga = GeneticAlgorithm(
-                len(dest_cands), _dest_fit,
-                feature_names    = dest_cands,
+                len(seg_dest_cands), _dest_fit,
+                feature_names    = seg_dest_cands,
                 collinear_groups = STAGE_COLLINEAR_GROUPS.get('5_dest', []),
                 **ga_kwargs,
             )
@@ -2641,27 +3437,27 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
             # Fallback: joint GA if logsums could not be computed
             def _joint_fit(genes, _s=seg):
                 return _stage5_fitness_larch(
-                    genes[:n_mode], genes[n_mode:], mode_cands, dest_cands,
+                    genes[:len(seg_mode_cands)], genes[len(seg_mode_cands):], seg_mode_cands, seg_dest_cands,
                     _s, tours, persons, landuse, skims, skim_df)
-            fallback_genes = np.zeros(len(dest_cands), dtype=int)
+            fallback_genes = np.zeros(len(seg_dest_cands), dtype=int)
             dest_best  = Individual(genes=fallback_genes, fitness=-1e9)
             dest_hist  = []
             dest_pop   = [dest_best]
             dest_cache = 0
 
-        best_dest_vars = [v for v, g in zip(dest_cands, dest_best.genes) if g == 1]
+        best_dest_vars = [v for v, g in zip(seg_dest_cands, dest_best.genes) if g == 1]
         print(f"    Dest best vars: {best_dest_vars}  BIC/n={-dest_best.fitness:.4f}")
 
         dest_seg_result = GAResult(
             stage=5, best_features={'mode': best_mode_vars, 'dest': best_dest_vars},
             best_fitness=dest_best.fitness, best_individual=dest_best,
             history=dest_hist, all_candidates=dest_pop,
-            feature_names=dest_cands, fitness_metric='mean(-BIC/n)',
+            feature_names=seg_dest_cands, fitness_metric='mean(-BIC/n)',
             n_restarts=n_restarts, cache_hits=dest_cache,
         )
         dest_seg_result.metadata['sub_model'] = 'dest'
         segment_results[f'{seg_label} — Dest'] = dest_seg_result
-        seg_best_dest_genes[seg] = dest_best.genes.copy()
+        seg_best_dest_vars[seg] = best_dest_vars
 
     # ── Aggregate: majority vote across segments per sub-model ────────────
     def _mode_agg(g):
@@ -2696,21 +3492,27 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
                 pass
         return float(np.mean(scores)) if scores else -1e9
 
-    if seg_best_mode_genes:
-        mode_vote = np.array(list(seg_best_mode_genes.values())).mean(axis=0)
-        consensus_mode = (mode_vote >= 0.5).astype(int)
-        best_mode_feats = [v for v, g in zip(mode_cands, consensus_mode) if g == 1]
-    else:
-        consensus_mode  = np.zeros(n_mode, dtype=int)
-        best_mode_feats = []
+    mode_counts: Dict[str, int] = {}
+    for vals in seg_best_mode_vars.values():
+        for v in vals:
+            mode_counts[v] = mode_counts.get(v, 0) + 1
+    dest_counts: Dict[str, int] = {}
+    for vals in seg_best_dest_vars.values():
+        for v in vals:
+            dest_counts[v] = dest_counts.get(v, 0) + 1
 
-    if seg_best_dest_genes:
-        dest_vote = np.array(list(seg_best_dest_genes.values())).mean(axis=0)
-        consensus_dest = (dest_vote >= 0.5).astype(int)
-        best_dest_feats = [v for v, g in zip(dest_cands, consensus_dest) if g == 1]
-    else:
-        consensus_dest  = np.zeros(len(dest_cands), dtype=int)
-        best_dest_feats = []
+    vote_n = max(len(valid_segs), 1)
+    best_mode_feats = sorted([v for v, k in mode_counts.items() if k / vote_n >= 0.5])
+    best_dest_feats = sorted([v for v, k in dest_counts.items() if k / vote_n >= 0.5])
+
+    # Guardrail: if majority vote is too sparse, keep top-supported candidates.
+    if len(best_mode_feats) < 3 and mode_counts:
+        best_mode_feats = [k for k, _ in sorted(mode_counts.items(), key=lambda x: x[1], reverse=True)[:3]]
+    if len(best_dest_feats) < 4 and dest_counts:
+        best_dest_feats = [k for k, _ in sorted(dest_counts.items(), key=lambda x: x[1], reverse=True)[:4]]
+
+    consensus_mode = np.array([1 if v in set(best_mode_feats) else 0 for v in mode_cands], dtype=int)
+    consensus_dest = np.array([1 if v in set(best_dest_feats) else 0 for v in dest_cands], dtype=int)
 
     consensus_genes = np.concatenate([consensus_mode, consensus_dest])
     try:
@@ -3166,7 +3968,8 @@ def apply_ga_results_to_pipeline(
         feature_override=s1_feats.best_features if s1_feats else None,
     )
     synth_s1.to_csv(os.path.join(save_dir, 'stage1_output.csv'), index=False)
-    _save_model(s1_models, os.path.join(models_dir, 'stage1_models.pkl'))
+    _save_model_bundle(s1_models, save_dir, models_dir, 'stage1_models.pkl')
+    _ga_save_stage_coef_csv(s1_models, 'stage1', save_dir)
 
     print("\n[2/5] Stage 2 — day duration prediction...")
     synth_s2, s2_models = run_stage2(
@@ -3174,7 +3977,8 @@ def apply_ga_results_to_pipeline(
         feature_override=s2_feats.best_features if s2_feats else None,
     )
     synth_s2.to_csv(os.path.join(save_dir, 'stage2_output.csv'), index=False)
-    _save_model(s2_models, os.path.join(models_dir, 'stage2_models.pkl'))
+    _save_model_bundle(s2_models, save_dir, models_dir, 'stage2_models.pkl')
+    _ga_save_stage_coef_csv(s2_models, 'stage2', save_dir)
 
     print("\n[3/5] Stage 3 — activity duration prediction...")
     activities, s3_models = run_stage3(
@@ -3182,7 +3986,8 @@ def apply_ga_results_to_pipeline(
         feature_override=s3_feats.best_features if s3_feats else None,
     )
     activities.to_csv(os.path.join(save_dir, 'stage3_output.csv'), index=False)
-    _save_model(s3_models, os.path.join(models_dir, 'stage3_models.pkl'))
+    _save_model_bundle(s3_models, save_dir, models_dir, 'stage3_models.pkl')
+    _ga_save_stage_coef_csv(s3_models, 'stage3', save_dir)
 
     print("\n[4/5] Stage 4 — schedule placement prediction...")
     scheduled, s4_models = run_stage4(
@@ -3190,7 +3995,8 @@ def apply_ga_results_to_pipeline(
         feature_override=s4_feats.best_features if s4_feats else None,
     )
     scheduled.to_csv(os.path.join(save_dir, 'stage4_output.csv'), index=False)
-    _save_model(s4_models, os.path.join(models_dir, 'stage4_models.pkl'))
+    _save_model_bundle(s4_models, save_dir, models_dir, 'stage4_models.pkl')
+    _ga_save_stage_coef_csv(s4_models, 'stage4', save_dir)
 
     print("\n[5/5] Stage 5 — destination + mode choice (zone-by-zone)...")
     s5_result = ga_results.results.get(5, None)
@@ -3207,7 +4013,8 @@ def apply_ga_results_to_pipeline(
         dest_feature_override = s5_dest_feats,
     )
     scheduled_dest.to_csv(os.path.join(save_dir, 'stage5_output.csv'), index=False)
-    _save_model(s5_models, os.path.join(models_dir, 'stage5_models.pkl'))
+    scheduled_dest.to_csv(os.path.join(save_dir, 'stage6_output.csv'), index=False)
+    _save_model_bundle(s5_models, save_dir, models_dir, 'stage5_models.pkl')
 
     # ── Save Stage 5 tour-model coefficient HTML (same as main pipeline) ──
     try:
@@ -3231,6 +4038,17 @@ def apply_ga_results_to_pipeline(
     except Exception as _lce:
         logger.warning(f"  GA location choice summary failed: {_lce}")
 
+    # ── Full HHTS validation (parity with main pipeline) ──────────────────
+    _ga_run_validation_hhts(
+        out=out,
+        s1_models=s1_models,
+        s2_models=s2_models,
+        s3_models=s3_models,
+        s4_models=s4_models,
+        s5_models=s5_models,
+        save_dir=save_dir,
+    )
+
     # ── Trip-level mode + destination models ─────────────────────────────
     # Estimate separate trip-level models so the GA run produces the same
     # artefacts as the main pipeline.
@@ -3239,6 +4057,7 @@ def apply_ga_results_to_pipeline(
             estimate_mode_models as _est_trip_mode,
             save_models as _s6_save,
             _save_s6_coefficients,
+            _write_s6_html_report,
         )
         from stage5_destination_choice import (
             _skim_flat as _s5_skim_flat,
@@ -3250,10 +4069,14 @@ def apply_ga_results_to_pipeline(
 
         # Trip mode models
         _trip_mode_mdls = _est_trip_mode(out["trips"], out.get("persons", pd.DataFrame()), landuse)
-        _save_model(_trip_mode_mdls, os.path.join(models_dir, 'stage5_trip_mode_models.pkl'))
+        _save_model_bundle(_trip_mode_mdls, save_dir, models_dir, 'stage5_trip_mode_models.pkl')
         _save_s6_coefficients(_trip_mode_mdls,
                               os.path.join(save_dir, 'stage5_trip_mode_coefficients.csv'))
-        print(f"  GA trip mode models → {models_dir}/stage5_trip_mode_models.pkl")
+        _write_s6_html_report(
+            _trip_mode_mdls,
+            os.path.join(save_dir, 'stage5_trip_mode_coefficients.html'),
+        )
+        print(f"  GA trip mode models → {save_dir}/stage5_trip_mode_models.pkl")
 
         # Trip destination models
         _skims_ga = omx.open_file(skims_path, 'r')
@@ -3270,10 +4093,20 @@ def apply_ga_results_to_pipeline(
             except Exception as _se:
                 logger.debug(f"  GA trip dest [{_seg}]: {_se}")
         if _trip_dest_mdls:
-            _save_model(_trip_dest_mdls, os.path.join(models_dir, 'stage5_trip_dest_models.pkl'))
+            _save_model_bundle(_trip_dest_mdls, save_dir, models_dir, 'stage5_trip_dest_models.pkl')
             _s5_save_trip_coeff(_trip_dest_mdls,
                                 os.path.join(save_dir, 'stage5_trip_dest_coefficients.csv'))
-            print(f"  GA trip dest models → {models_dir}/stage5_trip_dest_models.pkl")
+            print(f"  GA trip dest models → {save_dir}/stage5_trip_dest_models.pkl")
+        if _trip_mode_mdls or _trip_dest_mdls:
+            _save_model_bundle(
+                {
+                    'trip_mode_models': _trip_mode_mdls,
+                    'trip_dest_models': _trip_dest_mdls,
+                },
+                save_dir,
+                models_dir,
+                'stage5b_models.pkl',
+            )
         _skims_ga.close()
     except Exception as _tte:
         logger.warning(f"  GA trip model estimation failed: {_tte}")
@@ -3290,6 +4123,87 @@ def apply_ga_results_to_pipeline(
     print(f"  Trips:   {(scheduled_dest['row_type']=='trip').sum() if 'row_type' in scheduled_dest.columns else len(scheduled_dest):,}")
     print(f"  Models saved → {models_dir}/")
     print(f"  Coefficients → {save_dir}/stage5_models_coefficients.html")
+
+    _write_ga_vs_main_tex(ga_results, save_dir)
+
+    # ── Metacount final-model HTML (when GA_ESTIMATOR includes metacount) ─────
+    # Re-run the best-selected features through the mixed metacount estimator
+    # at full draw count and save the NB2/lognormal coefficients as HTML.
+    _mc_est = os.environ.get('GA_ESTIMATOR', 'default').strip().lower()
+    if _mc_est in ('metacount', 'both', 'hybrid'):
+        try:
+            from ga_external_estimators import (
+                stage1_final_mixed_metacount  as _s1_mc,
+                stage23_final_mixed_metacount as _s23_mc,
+                _write_metacount_html,
+            )
+            from stage1_activity_frequency import prepare_estimation_data as _prep_s1
+            from stage2_day_duration       import prepare_data            as _prep_s2
+            from stage3_activity_duration  import prepare_data            as _prep_s3
+
+            _R_final = int(os.environ.get('MCR_R_FINAL', '500'))
+            print(f"\n  Metacount final-model estimation (R={_R_final}) ...")
+
+            # Stage 1
+            try:
+                _s1_data = _prep_s1(out['tours'], out['persons'])
+                _s1_feats = ga_results.results.get(1, None)
+                _s1_vars  = _s1_feats.best_features if _s1_feats else []
+                if _s1_vars:
+                    _purps = [p for p in ['work', 'edu', 'nonmand', 'social', 'shopping']
+                              if f'n_{p}_out' in _s1_data.columns]
+                    _s1_scores, _s1_coefs = _s1_mc(_s1_data, _s1_vars, _purps, R=_R_final)
+                    _write_metacount_html(
+                        _s1_coefs,
+                        os.path.join(save_dir, 'stage1_metacount_coefficients.html'),
+                        'Stage 1 — MetaCount NB2 (mixed) coefficients',
+                    )
+                    print(f"  Stage 1 metacount HTML → {save_dir}/stage1_metacount_coefficients.html")
+            except Exception as _e1:
+                logger.warning(f"  Stage 1 metacount final fit failed: {_e1}")
+
+            # Stage 2
+            try:
+                _s2_data  = _prep_s2(out['tours'], out['persons'])
+                _s2_feats = ga_results.results.get(2, None)
+                _s2_vars  = _s2_feats.best_features if _s2_feats else []
+                if _s2_vars:
+                    _s2_coef_map = {}
+                    for _ycol in ['start_of_day', 'end_of_day']:
+                        if _ycol in _s2_data.columns:
+                            _sc, _cr = _s23_mc(_s2_data, _s2_vars, _ycol, 'Stage2', R=_R_final)
+                            _s2_coef_map[_ycol] = _cr
+                    _write_metacount_html(
+                        _s2_coef_map,
+                        os.path.join(save_dir, 'stage2_metacount_coefficients.html'),
+                        'Stage 2 — MetaCount lognormal (mixed) coefficients',
+                    )
+                    print(f"  Stage 2 metacount HTML → {save_dir}/stage2_metacount_coefficients.html")
+            except Exception as _e2:
+                logger.warning(f"  Stage 2 metacount final fit failed: {_e2}")
+
+            # Stage 3
+            try:
+                _s3_data  = _prep_s3(out['tours'], out['persons'], trips=out.get('trips'))
+                _s3_feats = ga_results.results.get(3, None)
+                _s3_vars  = _s3_feats.best_features if _s3_feats else []
+                if _s3_vars:
+                    _dur_col = next((c for c in ['duration', 'dur_min', 'act_duration'] if c in _s3_data.columns), None)
+                    _s3_coef_map = {}
+                    if _dur_col:
+                        _sc, _cr = _s23_mc(_s3_data, _s3_vars, _dur_col, 'Stage3', R=_R_final)
+                        _s3_coef_map[_dur_col] = _cr
+                    _write_metacount_html(
+                        _s3_coef_map,
+                        os.path.join(save_dir, 'stage3_metacount_coefficients.html'),
+                        'Stage 3 — MetaCount lognormal (mixed) coefficients',
+                    )
+                    print(f"  Stage 3 metacount HTML → {save_dir}/stage3_metacount_coefficients.html")
+            except Exception as _e3:
+                logger.warning(f"  Stage 3 metacount final fit failed: {_e3}")
+
+        except Exception as _mc_html_e:
+            logger.warning(f"  Metacount HTML report generation failed: {_mc_html_e}")
 
     return scheduled_dest, s5_models
 
@@ -3509,11 +4423,200 @@ h1,h2{{color:#2c3e50}}</style></head><body>
 def _save_model(model, path: str) -> None:
     """Silently save a model object (dict, fitted estimator, etc.) to pickle."""
     try:
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         with open(path, 'wb') as f:
             pickle.dump(model, f)
         print(f"    Model saved → {path}")
     except Exception as e:
         logger.warning(f"Could not save model to {path}: {e}")
+
+
+def _save_model_bundle(model, save_dir: str, models_dir: str, *filenames: str) -> None:
+    """Save a pickle both at the run root and under models/."""
+    seen = set()
+    for filename in filenames:
+        for folder in (save_dir, models_dir):
+            path = os.path.join(folder, filename)
+            if path in seen:
+                continue
+            seen.add(path)
+            _save_model(model, path)
+
+
+def _tex_escape(value: Any) -> str:
+    text = str(value)
+    replacements = {
+        '\\': r'\textbackslash{}',
+        '&': r'\&',
+        '%': r'\%',
+        '$': r'\$',
+        '#': r'\#',
+        '_': r'\_',
+        '{': r'\{',
+        '}': r'\}',
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def _latest_main_run_dir(save_dir: str) -> Optional[str]:
+    """Pick the most recent main run directory with comparable outputs."""
+    run_root = os.environ.get('PIPELINE_RUN_ROOT', 'runs')
+    candidate_roots = [
+        os.path.dirname(os.path.abspath(save_dir)),
+        os.path.join(os.getcwd(), run_root),
+    ]
+    candidates = []
+    for base in candidate_roots:
+        if not os.path.isdir(base):
+            continue
+        candidates.extend(glob.glob(os.path.join(base, 'main__*')))
+        candidates.extend(glob.glob(os.path.join(base, 'main_*')))
+
+    valid = []
+    for path in candidates:
+        if not os.path.isdir(path):
+            continue
+        if any(
+            os.path.exists(os.path.join(path, filename))
+            for filename in ('stage6_output.csv', 'stage5_output.csv', 'validation_report.html')
+        ):
+            valid.append(path)
+    if not valid:
+        return None
+    valid.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+    return valid[0]
+
+
+def _load_plan_for_compare(run_dir: Optional[str]) -> pd.DataFrame:
+    if not run_dir:
+        return pd.DataFrame()
+    for filename in ('stage6_output.csv', 'stage5_output.csv'):
+        path = os.path.join(run_dir, filename)
+        if os.path.exists(path):
+            try:
+                return pd.read_csv(path)
+            except Exception as exc:
+                logger.warning(f"Could not read comparison plan {path}: {exc}")
+    return pd.DataFrame()
+
+
+def _plan_shape_metrics(plan: pd.DataFrame) -> dict:
+    if plan.empty:
+        return {'persons': None, 'trip_rows': None, 'activity_rows': None, 'rows': 0}
+    row_type = plan['row_type'] if 'row_type' in plan.columns else pd.Series('', index=plan.index)
+    trip_rows = int((row_type == 'trip').sum()) if 'row_type' in plan.columns else None
+    activity_rows = int((row_type == 'activity').sum()) if 'row_type' in plan.columns else None
+    persons = int(plan['person_id'].nunique()) if 'person_id' in plan.columns else None
+    return {
+        'persons': persons,
+        'trip_rows': trip_rows,
+        'activity_rows': activity_rows,
+        'rows': int(len(plan)),
+    }
+
+
+def _write_ga_vs_main_tex(
+    ga_results: 'AllStagesResult',
+    save_dir: str,
+    main_dir: Optional[str] = None,
+) -> Optional[str]:
+    """Write a LaTeX summary comparing the current GA run to the latest main run."""
+    main_dir = main_dir or _latest_main_run_dir(save_dir)
+    tex_path = os.path.join(save_dir, 'ga_vs_main_model.tex')
+
+    ga_plan = _load_plan_for_compare(save_dir)
+    main_plan = _load_plan_for_compare(main_dir)
+    ga_metrics = _plan_shape_metrics(ga_plan)
+    main_metrics = _plan_shape_metrics(main_plan)
+
+    estimator_rows = []
+    summary = ga_results.summary_table()
+    if not summary.empty:
+        for _, row in summary.iterrows():
+            estimator_rows.append(
+                f"{_tex_escape(row.get('stage_label', row.get('stage', 'stage')))} & "
+                f"{_tex_escape(row.get('metric', ''))} & "
+                f"{row.get('best_fitness', float('nan')):.4f} \\\\"
+            )
+
+    artifact_names = [
+        'stage1_models.pkl', 'stage2_models.pkl', 'stage3_models.pkl',
+        'stage4_models.pkl', 'stage5_models.pkl', 'stage5_trip_mode_models.pkl',
+        'stage5_trip_dest_models.pkl', 'stage5b_models.pkl',
+    ]
+    artifact_rows = []
+    for name in artifact_names:
+        ga_exists = os.path.exists(os.path.join(save_dir, name))
+        main_exists = os.path.exists(os.path.join(main_dir, name)) if main_dir else False
+        artifact_rows.append(
+            f"{_tex_escape(name)} & {'yes' if ga_exists else 'no'} & {'yes' if main_exists else 'no'} & "
+            f"{'yes' if ga_exists == main_exists else 'no'} \\\\"
+        )
+
+    comparison_rows = []
+    for label, key in [
+        ('Persons', 'persons'),
+        ('Trip rows', 'trip_rows'),
+        ('Activity rows', 'activity_rows'),
+        ('Total rows', 'rows'),
+    ]:
+        ga_val = ga_metrics.get(key)
+        main_val = main_metrics.get(key)
+        match = (ga_val == main_val) if ga_val is not None and main_val is not None else False
+        comparison_rows.append(
+            f"{label} & {_tex_escape(ga_val if ga_val is not None else 'n/a')} & "
+            f"{_tex_escape(main_val if main_val is not None else 'n/a')} & "
+            f"{'yes' if match else 'no'} \\\\"
+        )
+
+    estimator_table = '\n'.join(estimator_rows) if estimator_rows else 'No stage metrics were available.\\'
+    artifact_table = '\n'.join(artifact_rows)
+    comparison_table = '\n'.join(comparison_rows)
+    baseline_text = _tex_escape(main_dir) if main_dir else 'No main run found'
+    ga_dir_text = _tex_escape(save_dir)
+    estimator_name = _tex_escape(os.environ.get('GA_ESTIMATOR', 'default'))
+
+    tex = f"""% Auto-generated GA vs main comparison summary
+\\section*{{GA Estimator Comparison Summary}}
+
+Current GA estimator override: \\texttt{{{estimator_name}}}.\\
+Current GA validation directory: \\texttt{{{ga_dir_text}}}.\\
+Main-model comparison directory: \\texttt{{{baseline_text}}}.\\
+
+\\subsection*{{Estimator-Specific GA Stages}}
+\\begin{{tabular}}{{lll}}
+Stage & Fitness metric & Best fitness \\\\
+\\hline
+{estimator_table}
+\\end{{tabular}}
+
+\\subsection*{{Prediction Shape Check}}
+These counts should usually remain aligned with the main-model run if the same synthetic population and schedule skeleton are being propagated.\\
+\\begin{{tabular}}{{lrrl}}
+Measure & GA run & Main run & Match \\\\
+\\hline
+{comparison_table}
+\\end{{tabular}}
+
+\\subsection*{{Pickle Availability}}
+The GA validation path now saves root-level pickles so downstream tooling can treat the GA output like a normal run directory.\\
+\\begin{{tabular}}{{llll}}
+Artifact & GA run & Main run & Same availability \\\\
+\\hline
+{artifact_table}
+\\end{{tabular}}
+"""
+
+    try:
+        with open(tex_path, 'w', encoding='utf-8') as handle:
+            handle.write(tex.strip() + '\n')
+        print(f"GA vs main TeX summary → {tex_path}")
+        return tex_path
+    except Exception as exc:
+        logger.warning(f"Could not write GA vs main TeX summary: {exc}")
+        return None
 
 
 def generate_ga_validation(
@@ -3645,10 +4748,10 @@ def run_ga_stage(
     mutation_rate:    float = 0.08,
     crossover_rate:   float = 0.75,
     elitism_k:        int   = 4,
-    min_features:     int   = 2,
+    min_features:     int   = 5,
     max_features:     int   = None,
     tournament_k:     int   = 4,
-    stagnation_limit: int   = 12,
+    stagnation_limit: int   = 15,
     n_restarts:       int   = 2,
     seed:             int   = 42,
     verbose:          bool  = True,
@@ -3783,6 +4886,8 @@ def run_ga_all_stages(
                             Built-in defaults for stages 1-4 encourage more
                             exploration (larger pop, more gens, more restarts).
     """
+    from ga_external_estimators import report_availability
+
     # Default exploration-boosting overrides for early stages (1-4).
     # These stages are fast (seconds/eval) so larger budgets are cheap.
     # Higher mutation_rate and tournament_k keep diversity up over the expanded
@@ -3812,6 +4917,8 @@ def run_ga_all_stages(
                 merged_overrides[stg].update(ov)
             else:
                 merged_overrides[stg] = dict(ov)
+
+    report_availability()
 
     if stages is None:
         stages = []

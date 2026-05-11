@@ -763,7 +763,7 @@ def run_ga_extended(
         mutation_rate    = mutation_rate,
         crossover_rate   = 0.75,
         elitism_k        = 4,
-        min_features     = 2,
+        min_features     = 3,    # at least 3 features: prevents degenerate 1-2 var models
         tournament_k     = 4,
         stagnation_limit = 12,
         seed             = seed,

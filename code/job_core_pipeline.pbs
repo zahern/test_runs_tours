@@ -1,0 +1,123 @@
+#!/bin/bash
+#PBS -N saw_core_pipeline
+#PBS -l walltime=08:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -m abe
+#PBS -r y
+
+# ─────────────────────────────────────────────────────────────────────────────
+# job_core_pipeline.pbs
+# ─────────────────────────────────────────────────────────────────────────────
+# Two-mode pipeline launcher for main_2.py.
+#
+# Controlled by the PIPELINE_MODE variable at submission time:
+#
+#   qsub job_core_pipeline.pbs                     # default: core (no search)
+#   qsub -v PIPELINE_MODE=core   job_core_pipeline.pbs
+#   qsub -v PIPELINE_MODE=search job_core_pipeline.pbs
+#
+# Optional tuning (pass via -v, comma-separated):
+#   SA_N_ITER=400       SA iterations per purpose in search mode  (default 400)
+#   SA_TEMP=2.0         initial SA temperature                    (default 2.0)
+#   SA_MODEL=nested     Larch model type inside SA: mnl|nested    (default nested)
+#   SIG_T_THRESH=1.96   significance |t| threshold                (default 1.96)
+#   PARSIMONY_SLACK=0   extra params allowed vs stored spec       (default 0)
+#   LARCH_ENGINE=jax    jax (default, exact autodiff) | numba     (default jax)
+#   SL_JAX=1            1=SearchLibrium uses JAX backend          (default 1)
+#
+# Examples
+# --------
+#   # Core validation run (no search, fast):
+#   qsub -v PIPELINE_MODE=core job_core_pipeline.pbs
+#
+#   # Search run with 600 SA iterations and looser parsimony:
+#   qsub -v "PIPELINE_MODE=search,SA_N_ITER=600,PARSIMONY_SLACK=2" job_core_pipeline.pbs
+#
+# Best-specification persistence
+# --------------------------------
+# Both modes read from and write to saved_data/best_specs.json.
+# In search mode, only specs that pass all three gates are promoted:
+#   1. BIC strictly lower than stored best
+#   2. All parameter |t| >= SIG_T_THRESH (significance)
+#   3. Number of params <= stored k + PARSIMONY_SLACK (parsimony)
+#
+# The JSON file survives across job submissions and acts as the hall-of-fame.
+# Delete it to start fresh from scratch.
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+# ── Environment ───────────────────────────────────────────────────────────────
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+# ── Defaults (can be overridden by -v at submission) ─────────────────────────
+PIPELINE_MODE="${PIPELINE_MODE:-core}"
+SA_N_ITER="${SA_N_ITER:-400}"
+SA_TEMP="${SA_TEMP:-2.0}"
+SA_MODEL="${SA_MODEL:-nested}"
+SIG_T_THRESH="${SIG_T_THRESH:-1.96}"
+PARSIMONY_SLACK="${PARSIMONY_SLACK:-0}"
+LARCH_ENGINE="${LARCH_ENGINE:-jax}"
+SL_JAX="${SL_JAX:-1}"
+
+# ── CPU-only JAX/XLA enforcement ──────────────────────────────────────────────
+# These must be exported before any Python import of JAX, SearchLibrium or MCR.
+export JAX_PLATFORM_NAME=cpu
+export JAX_PLATFORMS=cpu
+export CUDA_VISIBLE_DEVICES=""
+export TF_CPP_MIN_LOG_LEVEL=3
+export XLA_FLAGS="--xla_force_host_platform_device_count=${NCPUS:-4}"
+
+# ── Pass pipeline parameters to Python via env vars ──────────────────────────
+export MODE="$PIPELINE_MODE"
+export SA_N_ITER="$SA_N_ITER"
+export SA_TEMP="$SA_TEMP"
+export SA_MODEL="$SA_MODEL"
+export SIG_T_THRESH="$SIG_T_THRESH"
+export PARSIMONY_SLACK="$PARSIMONY_SLACK"
+export LARCH_ENGINE="$LARCH_ENGINE"
+export SL_JAX="$SL_JAX"
+
+# ── Log headers ───────────────────────────────────────────────────────────────
+LOG_OUT="log_core_pipeline_${PIPELINE_MODE}.out"
+LOG_ERR="log_core_pipeline_${PIPELINE_MODE}.err"
+
+# Clean previous logs for this mode only
+rm -f "$LOG_OUT" "$LOG_ERR"
+
+echo "==========================================================" | tee -a "$LOG_OUT"
+echo "PBS job  : $PBS_JOBID"                                       | tee -a "$LOG_OUT"
+echo "Node     : $(hostname)"                                      | tee -a "$LOG_OUT"
+echo "Mode     : $PIPELINE_MODE"                                   | tee -a "$LOG_OUT"
+echo "Workdir  : $PBS_O_WORKDIR"                                   | tee -a "$LOG_OUT"
+echo "Started  : $(date)"                                          | tee -a "$LOG_OUT"
+echo "----------------------------------------------------------" | tee -a "$LOG_OUT"
+echo "  LARCH_ENGINE     = $LARCH_ENGINE"                          | tee -a "$LOG_OUT"
+echo "  SL_JAX           = $SL_JAX"                               | tee -a "$LOG_OUT"
+echo "  SA_N_ITER        = $SA_N_ITER"                            | tee -a "$LOG_OUT"
+echo "  SA_TEMP          = $SA_TEMP"                              | tee -a "$LOG_OUT"
+echo "  SA_MODEL         = $SA_MODEL"                             | tee -a "$LOG_OUT"
+echo "  SIG_T_THRESH     = $SIG_T_THRESH"                        | tee -a "$LOG_OUT"
+echo "  PARSIMONY_SLACK  = $PARSIMONY_SLACK"                      | tee -a "$LOG_OUT"
+echo "==========================================================" | tee -a "$LOG_OUT"
+
+# ── Ensure output dirs exist ──────────────────────────────────────────────────
+mkdir -p saved_data
+mkdir -p "runs/main2_${PIPELINE_MODE}/plots"
+
+# ── Run pipeline ──────────────────────────────────────────────────────────────
+python -u main_2.py >> "$LOG_OUT" 2>> "$LOG_ERR"
+
+EXIT_CODE=$?
+echo "Finished : $(date)  exit_code=${EXIT_CODE}" | tee -a "$LOG_OUT"
+
+if [ "$EXIT_CODE" -ne 0 ]; then
+    echo "ERROR: pipeline exited with code ${EXIT_CODE}. Check ${LOG_ERR}" | tee -a "$LOG_OUT"
+fi
+
+exit "${EXIT_CODE}"

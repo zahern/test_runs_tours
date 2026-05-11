@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 import logging
 from typing import Optional
+from scipy.stats import norm
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,53 @@ PERSON_FEATURES = [
     'WORKSTAT',    # work status code
     'incp',        # income band (1-17)
 ]
+
+DEFAULT_FEATURES_BY_PURPOSE = {
+    'work': ['WORKSTAT', 'incp', 'vehrd', 'CARLICENCE', 'mandatory_role',
+             'ptype_FullTimeWorker', 'ptype_PartTimeWorker', 'ptype_WorkingStudent',
+             'auto_work_acc', 'n_workers_hh', 'wfh'],
+    'edu': ['STUDYING', 'ptype_SchoolChild', 'ptype_UniversityStudent',
+            'ptype_WorkingStudent', 'age_child', 'age_teen', 'transit_acc',
+            'walk_acc', 'vehrd'],
+    'escort': ['hh_child', 'nprd', 'vehrd', 'has_vehicle', 'WORKSTAT', 'is_female'],
+    'shopping': ['incp', 'vehrd', 'has_vehicle', 'auto_shop_acc', 'nprd', 'age_older'],
+    'social': ['nprd', 'is_female', 'vehrd', 'walk_acc', 'transit_acc', 'age_teen'],
+    'othmaint': ['nprd', 'vehrd', 'has_vehicle', 'auto_nonmand_acc', 'WORKSTAT'],
+    'othdiscr': ['incp', 'vehrd', 'auto_nonmand_acc', 'age_older', 'walk_acc'],
+    'eat': ['incp', 'nprd', 'walk_acc', 'transit_acc', 'is_female'],
+}
+
+
+def _stage1_features_for_purpose(data: pd.DataFrame, purpose: str, feature_override=None) -> list:
+    if isinstance(feature_override, dict):
+        names = feature_override.get(purpose, feature_override.get('*', []))
+    elif feature_override is not None:
+        names = feature_override
+    else:
+        names = DEFAULT_FEATURES_BY_PURPOSE.get(purpose, PERSON_FEATURES)
+    if not names:
+        names = PERSON_FEATURES
+    return [c for c in dict.fromkeys(names) if c in data.columns]
+
+
+def _numerical_hessian(func, params: np.ndarray, eps: float = 1e-4) -> np.ndarray:
+    """Central-difference Hessian for small MLE problems."""
+    params = np.asarray(params, dtype=float)
+    n = len(params)
+    hess = np.zeros((n, n), dtype=float)
+    for i in range(n):
+        ei = np.zeros(n, dtype=float)
+        ei[i] = eps
+        for j in range(i, n):
+            ej = np.zeros(n, dtype=float)
+            ej[j] = eps
+            fpp = func(params + ei + ej)
+            fpm = func(params + ei - ej)
+            fmp = func(params - ei + ej)
+            fmm = func(params - ei - ej)
+            hess[i, j] = (fpp - fpm - fmp + fmm) / (4.0 * eps * eps)
+            hess[j, i] = hess[i, j]
+    return hess
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +402,9 @@ class OrderedLogit:
         self.classes_   = None   # sorted unique outcome values
         self.feature_names_ = None
         self.converged_ = False
+        self.std_err_   = None
+        self.t_stat_    = None
+        self.p_value_   = None
 
     def _pack(self, beta, raw_cuts):
         return np.concatenate([beta, raw_cuts])
@@ -428,6 +479,25 @@ class OrderedLogit:
         self.ll_         = float(-res.fun)
         # null LL: uniform probabilities
         self.ll0_        = float(len(y) * np.log(1.0 / J))
+        try:
+            hess = _numerical_hessian(lambda p: self._log_likelihood(p, X, y, K), res.x)
+            cov = np.linalg.pinv(hess)
+            params = np.concatenate([self.coef_, self.thresholds_])
+            raw_se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+            # Report thresholds on the transformed scale; use the same variance slots.
+            self.std_err_ = raw_se
+            self.t_stat_ = np.divide(
+                params,
+                self.std_err_,
+                out=np.full_like(params, np.nan, dtype=float),
+                where=self.std_err_ > 0,
+            )
+            self.p_value_ = 2.0 * norm.sf(np.abs(self.t_stat_))
+        except Exception:
+            size = K + max(J - 1, 0)
+            self.std_err_ = np.full(size, np.nan)
+            self.t_stat_ = np.full(size, np.nan)
+            self.p_value_ = np.full(size, np.nan)
         return self
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -499,13 +569,6 @@ def estimate_frequency_models(
                         GA-selected variable sets.
     """
     data = prepare_frequency_data(tours, persons)
-    if feature_override is not None:
-        feature_cols = [c for c in feature_override if c in data.columns]
-        if not feature_cols:
-            feature_cols = [c for c in PERSON_FEATURES if c in data.columns]
-    else:
-        feature_cols = [c for c in PERSON_FEATURES if c in data.columns]
-
     models = {}
 
     for purpose in PURPOSES:
@@ -516,6 +579,7 @@ def estimate_frequency_models(
 
         for ptype in ptypes:
             subset = data[data['ptype'] == ptype].copy()
+            feature_cols = _stage1_features_for_purpose(data, purpose, feature_override)
 
             if len(subset) < min_sample:
                 logger.warning(

@@ -676,6 +676,29 @@ def run_stage5b(
     os.makedirs(output_dir, exist_ok=True)
     logger.info("Stage 5b: trip-level destination choice starting")
 
+    # ── Guard: is_outbound is required for tour structure; derive if missing ─
+    if 'is_outbound' not in trips.columns:
+        if 'tour_id' in trips.columns and 'trip_num_in_tour' in trips.columns:
+            max_leg = trips.groupby('tour_id')['trip_num_in_tour'].transform('max')
+            trips = trips.copy()
+            trips['is_outbound'] = (trips['trip_num_in_tour'] <= max_leg / 2).astype(int)
+            logger.warning("Stage 5b: 'is_outbound' column missing — derived from trip_num_in_tour")
+        elif 'ptour_id' in trips.columns and 'seq' in trips.columns:
+            # Plan-format input from predict_stage5: seq is position in person's day.
+            # Trips before the midpoint of the tour's seq range are outbound.
+            trips = trips.copy()
+            min_seq = trips.groupby('ptour_id')['seq'].transform('min')
+            max_seq = trips.groupby('ptour_id')['seq'].transform('max')
+            mid_seq = (min_seq + max_seq) / 2.0
+            trips['is_outbound'] = (trips['seq'] <= mid_seq).astype(int)
+            trips['tour_id'] = trips['ptour_id']
+            trips['trip_num_in_tour'] = trips.groupby('ptour_id').cumcount() + 1
+            logger.warning("Stage 5b: 'is_outbound' derived from ptour_id/seq (plan-format input)")
+        else:
+            logger.error("Stage 5b: 'is_outbound' column missing and cannot be derived — aborting")
+            return {'trips': trips, 'models': {}, 'validation': None, 'bic_total': 0.0}
+
+
     # ── Merge person covariates onto trips ──────────────────────────────────
     person_cols_needed = [
         "person_id", home_taz_col,

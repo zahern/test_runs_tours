@@ -7,7 +7,7 @@
 #PBS -m n
 #PBS -r y
 
-set -eu
+set -euo pipefail
 
 MODE=${MODE:-main}
 ZONE_ARG=${ZONE_ARG:-}
@@ -18,7 +18,8 @@ RUN_ROOT=${RUN_ROOT:-runs}
 PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
 PIPELINE_RUN_TAG=${PIPELINE_RUN_TAG:-${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}
 GA_ESTIMATOR=${GA_ESTIMATOR:-default}
-INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS:-0}
+INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS:-1}
+ESTIMATOR_SOURCE=${ESTIMATOR_SOURCE:-pypi}
 
 cd "$PBS_O_WORKDIR"
 
@@ -29,11 +30,10 @@ module unload Anaconda3
 
 # ── Ensure MetaCount + SearchLibrium are installed ─────────────────────────
 # INSTALL_ESTIMATORS=1  → force (re-)install regardless of current state.
-# Otherwise packages are installed on-demand only when GA_ESTIMATOR requires
-# them and they are not yet importable.
-# The HPC editable source paths are tried first; PyPI is the fallback.
+# ESTIMATOR_SOURCE=pypi (default) always installs latest published releases.
+# ESTIMATOR_SOURCE=editable uses local source trees when present.
 #
-#   First-time setup (run once, or pass --force-install to submit script):
+#   Editable-source setup (optional, for package development):
 #     pip install -e /mnt/hpccs01/home/ahernz/source/MetaCount
 #     pip install -e /mnt/hpccs01/home/ahernz/source/SearchLibrium
 #     pip install jax jaxlib jaxopt
@@ -50,34 +50,26 @@ case "$GA_ESTIMATOR" in
 esac
 
 if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_metacount" = "1" ]; then
-    if [ "$INSTALL_ESTIMATORS" = "1" ] || ! python -c "import metacountregressor" 2>/dev/null; then
-        echo "[pkg] Installing MetaCount..."
-        if [ -d "$_HPC_MC" ]; then
-            pip install -e "$_HPC_MC" -q \
-                && echo "[pkg] MetaCount installed (editable: $_HPC_MC)"
-        else
-            pip install metacountregressor --upgrade -q \
-                && echo "[pkg] MetaCount installed (PyPI)"
-        fi
-        pip install jax jaxlib jaxopt -q \
-            && echo "[pkg] jax/jaxlib/jaxopt installed"
+    echo "[pkg] Installing MetaCount estimator (${ESTIMATOR_SOURCE})..."
+    if [ "$ESTIMATOR_SOURCE" = "editable" ] && [ -d "$_HPC_MC" ]; then
+        pip install -e "$_HPC_MC" --upgrade -q \
+            && echo "[pkg] MetaCount installed (editable: $_HPC_MC)"
     else
-        echo "[pkg] metacountregressor already installed — skipping."
+        pip install --upgrade --no-cache-dir -q "metacountregressor" \
+            && echo "[pkg] MetaCount installed (PyPI latest)"
     fi
+    pip install --upgrade --no-cache-dir -q jax jaxlib jaxopt \
+        && echo "[pkg] jax/jaxlib/jaxopt installed"
 fi
 
 if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_searchlib" = "1" ]; then
-    if [ "$INSTALL_ESTIMATORS" = "1" ] || ! python -c "import SearchLibrium" 2>/dev/null; then
-        echo "[pkg] Installing SearchLibrium..."
-        if [ -d "$_HPC_SL" ]; then
-            pip install -e "$_HPC_SL" -q \
-                && echo "[pkg] SearchLibrium installed (editable: $_HPC_SL)"
-        else
-            pip install SearchLibrium --upgrade -q \
-                && echo "[pkg] SearchLibrium installed (PyPI)"
-        fi
+    echo "[pkg] Installing SearchLibrium estimator (${ESTIMATOR_SOURCE})..."
+    if [ "$ESTIMATOR_SOURCE" = "editable" ] && [ -d "$_HPC_SL" ]; then
+        pip install -e "$_HPC_SL" --upgrade -q \
+            && echo "[pkg] SearchLibrium installed (editable: $_HPC_SL)"
     else
-        echo "[pkg] SearchLibrium already installed — skipping."
+        pip install --upgrade --no-cache-dir -q "SearchLibrium" \
+            && echo "[pkg] SearchLibrium installed (PyPI latest)"
     fi
 fi
 # ──────────────────────────────────────────────────────────────────────────
@@ -94,6 +86,26 @@ export PIPELINE_ACCELERATOR
 export PIPELINE_RUN_TAG
 export PIPELINE_RUN_ROOT="$RUN_ROOT"
 export GA_ESTIMATOR
+# Force Larch to use numba engine during GA fitness evaluations to avoid
+# cusolver_gesvdj_ffi CUDA kernel errors (jaxlib 0.10.0 / CUDA 13 incompatibility).
+# Small per-purpose datasets in GA context are faster on numba CPU anyway.
+export GA_LARCH_ENGINE="${GA_LARCH_ENGINE:-numba}"
+# Force MetaCount to always use CPU (cusolver_gesvdj_ffi unavailable on CUDA 13).
+export GA_METACOUNT_FORCE_CPU="${GA_METACOUNT_FORCE_CPU:-1}"
+# For GA search modes, force JAX to CPU to prevent CUDA kernel errors during
+# per-case fitness evaluations (small batches are faster on numba/CPU anyway).
+# ga_stage5_smoke is excluded: it uses GPU (JAX/XLA) for the final model fit,
+# which benefits from CUDA when a GPU node is requested (--gpu 1 --accelerator gpu).
+case "$MODE" in
+    ga|ga_metacount|ga_searchlibrium)
+        export JAX_PLATFORMS=cpu
+        ;;
+    ga_stage5_smoke)
+        if [ "${PIPELINE_ACCELERATOR:-cpu}" != "gpu" ]; then
+            export JAX_PLATFORMS=cpu
+        fi
+        ;;
+esac
 
 # Derive SAFETY_EXPERIMENT_MODE from mode name so the pipeline knows which arm to run.
 # This avoids needing to pass it as a separate -v variable from submit_pipeline_runs.sh.
@@ -138,6 +150,110 @@ echo "Run dir:     ${RUN_ROOT}/${run_suffix}"
 echo "Started:     $(date)"
 echo "=========================================="
 
+# ── Write run outline ───────────────────────────────────────────────────────
+# Describes what this job is testing so outputs in the run dir are self-contained.
+_outline="${RUN_ROOT}/${run_suffix}/run_outline.txt"
+cat > "$_outline" <<OUTLINE
+Run Outline
+===========
+PBS job       : ${PBS_JOBID:-unknown}
+Submit host   : ${PBS_O_HOST:-unknown}
+Mode          : ${MODE}
+Zone argument : ${ZONE_ARG:-<all zones>}
+GA estimator  : ${GA_ESTIMATOR}
+GA budget     : ${GA_BUDGET:-standard}
+Accelerator   : ${PIPELINE_ACCELERATOR}
+Threads       : ${THREADS}
+S5 workers    : ${S5_WORKERS}
+Resources     : $(qstat -f "${PBS_JOBID:-unknown}" 2>/dev/null | grep Resource_List | head -1 | sed 's/.*Resource_List.//' || echo 'n/a')
+Conda env     : ${CONDA_ENV}
+Working dir   : ${PBS_O_WORKDIR}
+Run dir       : ${RUN_ROOT}/${run_suffix}
+Log file      : ${RUN_ROOT}/${run_suffix}/pipeline_run.log
+Started       : $(date -Iseconds)
+
+What this job tests
+-------------------
+$(case "$MODE" in
+    main)
+        echo "Full ABM pipeline (stages 1–6) on synthetic population."
+        echo "Estimates models on HHTS data, predicts for all SA2 zones."
+        echo "Estimator: ${GA_ESTIMATOR} (controls activity frequency / duration models)."
+        ;;
+    ga)
+        echo "GA variable selection on HHTS data (stages 1–5, estimation only)."
+        echo "Identifies best feature subsets via genetic algorithm."
+        echo "Estimator: ${GA_ESTIMATOR}."
+        echo "No synthetic-population prediction — run ga_staged or main afterwards."
+        ;;
+    ga_staged)
+        echo "GA variable selection (stages 1–5) + full pipeline prediction."
+        echo "Applies GA-selected features to synth population after estimation."
+        echo "Estimator: ${GA_ESTIMATOR}."
+        ;;
+    ga_stage5_smoke)
+        echo "GA Stage 5-only smoke test (ultra-small GA budget)."
+        echo "Runs estimation-only wiring check and writes stage reports/checkpoints."
+        echo "No full synthetic-population prediction in this mode."
+        ;;
+    safety_baseline)
+        echo "Safety experiment — baseline run with crash-risk skims active."
+        echo "Generates trip plans used to measure safety-aware mode shift."
+        ;;
+    safety_nosafety)
+        echo "Safety experiment — counterfactual run with crash-risk skims zeroed."
+        echo "Contrast with safety_baseline to measure mode-shift from safety utility."
+        ;;
+    safety_analysis)
+        echo "Safety experiment — compares baseline vs no-safety trip plans."
+        echo "Produces safety_experiment_report.html and zone-ranking CSV."
+        ;;
+    joint_model)
+        echo "Joint participation + duration model comparison."
+        echo "Fits Tobit-I and Heckman models on HHTS day-duration data."
+        echo "Writes stage2_joint_model_comparison.html into the most recent main run dir."
+        ;;
+    mcr_search)
+        echo "MetaCount ExperimentBuilder structure search."
+        echo "Family: ${MCR_FAMILY:-n/a}  Algorithm: ${MCR_ALGO:-sa}"
+        echo "Max iterations: ${MCR_MAX_ITER:-2000}  Halton draws R=${MCR_R:-200}."
+        echo "Searches over model structure (random parameters, dispersion, zero-inflation)."
+        ;;
+    *)
+        echo "Mode: ${MODE} — see pipeline_logger.py for details."
+        ;;
+esac)
+
+Outputs expected
+----------------
+$(case "$MODE" in
+    main|ga_staged)
+        echo "  stage1_coefficients.html  stage2_coefficients.html  stage3_coefficients.html"
+        echo "  stage4_coefficients.html  stage5_models_coefficients.html"
+        echo "  stage6_output.csv  trips_for_aimsun.csv"
+        echo "  plots/  — activity patterns, destination share, mode share"
+        ;;
+    ga)
+        echo "  ga_results.pkl  ga_reports/ga_summary.html"
+        echo "  ga_reports/ga_stage*_best_model.txt  ga_reports/ga_stage*_best_features.csv"
+        echo "  plots/ga_stage*.png  plots/ga_all_stages.png"
+        ;;
+    ga_stage5_smoke)
+        echo "  ga_results_stage5_smoke.pkl"
+        echo "  stage_reports/ga_stage5_smoke.*"
+        echo "  ga_reports/ga_summary.html  plots/ga_stage5.png"
+        ;;
+    mcr_search)
+        echo "  mcr_search_result.json  best_spec.json  mcr_search_summary.html"
+        ;;
+    *)
+        echo "  See pipeline_run.log for outputs."
+        ;;
+esac)
+OUTLINE
+echo "  run_outline.txt → ${_outline}"
+
+set +e
 if [ "$MODE" = "safety_analysis" ]; then
     stdbuf -oL python -u safety_experiment_analysis.py \
         2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
@@ -184,7 +300,7 @@ else
             2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
     fi
 fi
-
 EXIT_CODE=$?
+set -e
 echo "Finished: $(date)  exit_code=${EXIT_CODE}"
 exit "$EXIT_CODE"

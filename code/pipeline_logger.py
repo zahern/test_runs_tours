@@ -1452,90 +1452,106 @@ def _write_stage_checkpoint_report(
             json.dump(clean_summary, _jf, indent=2)
 
         summary_df = pd.DataFrame([
-            {'metric': k, 'value': v} for k, v in clean_summary.items()
-            if k not in ('stage_tag', 'title', 'timestamp', 'selected_features')
+            {'metric': k, 'value': v}
+            for k, v in clean_summary.items()
+            if k not in (
+                'stage_tag', 'title', 'timestamp',
+                'selected_features', 'selected_features_list', 'selected_features_by_block'
+            )
         ])
 
         table_html = '<p>No table preview available.</p>'
         table_latex = ''
+        table_title = 'Table Preview'
+        csv_written = None
         if isinstance(table, pd.DataFrame) and not table.empty:
             tbl = table.head(max_rows).copy()
             csv_path = os.path.join(rep_dir, f'{stage_tag}_table.csv')
             tbl.to_csv(csv_path, index=False)
+            csv_written = csv_path
             table_html = tbl.to_html(index=False)
             try:
                 table_latex = tbl.to_latex(index=False, escape=True)
             except Exception:
                 table_latex = ''
+            cols_lower = {str(c).lower() for c in tbl.columns}
+            if 'generation' in cols_lower:
+                table_title = 'Convergence History (Generations)'
 
-        html_path = os.path.join(rep_dir, f'{stage_tag}.html')
-        # Build enhanced HTML with selected features section
+        selected_features = str(clean_summary.get('selected_features', '') or '').strip()
+        selected_features_by_block = clean_summary.get('selected_features_by_block', {}) or {}
         selected_features_html = ''
-        if 'selected_features' in clean_summary and clean_summary['selected_features']:
-            selected_features = clean_summary['selected_features']
+        selected_features_tex = ''
+        if selected_features:
+            block_html = ''
+            if isinstance(selected_features_by_block, dict) and selected_features_by_block:
+                rows = []
+                for block, vals in selected_features_by_block.items():
+                    vals_str = ', '.join(str(v) for v in vals) if isinstance(vals, list) else str(vals)
+                    rows.append(
+                        "<tr><td><strong>" + str(block) + "</strong></td><td>" + vals_str + "</td></tr>"
+                    )
+                block_html = (
+                    "<h3>Selected Variables by Block</h3>"
+                    "<table><thead><tr><th>Block</th><th>Variables</th></tr></thead><tbody>"
+                    + ''.join(rows)
+                    + "</tbody></table>"
+                )
+
             selected_features_html = (
                 "<h2>Selected Variables / Model Specification</h2>"
-                "<p style='background:#f0f0f0;padding:8px;border-left:4px solid #2c3e50'>"
-                f"<strong>{selected_features}</strong>"
-                "</p>"
+                "<pre style='background:#f6f8fa;padding:10px;border:1px solid #ddd;white-space:pre-wrap'>"
+                f"{selected_features}"
+                "</pre>"
+                + block_html
             )
 
-        with open(html_path, 'w', encoding='utf-8') as _hf:
-            _hf.write(
-                "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-                f"<title>{title}</title>"
-                "<style>body{font-family:Arial,sans-serif;margin:18px}"
-                "table{border-collapse:collapse;width:100%;margin-top:10px}"
-                "th{background:#2c3e50;color:#fff;padding:6px;text-align:left}"
-                "td{border:1px solid #ddd;padding:6px}</style></head><body>"
-                "h2{color:#2c3e50;border-bottom:2px solid #2c3e50;padding-bottom:5px}"
-                "h2{color:#2c3e50;border-bottom:2px solid #2c3e50;padding-bottom:5px}</style></head><body>"
-                f"<h1>{title}</h1>"
-                f"{selected_features_html}"
-                "<h2>Summary Metrics</h2>"
-                f"{summary_df.to_html(index=False)}"
-                "<h2>Table Preview</h2>"
-                f"{table_html}"
-                "<h2>Convergence History (Generations)</h2>"
-                f"{table_html}"
-                "</body></html>"
+            selected_features_tex = (
+                "\n\\subsection*{Selected Variables}\n"
+                "\\begin{quote}\n"
+                + selected_features.replace('_', '\\_')
+                + "\n\\end{quote}\n"
             )
+
+        html_path = os.path.join(rep_dir, f'{stage_tag}.html')
+        html_content = (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<title>{title}</title>"
+            "<style>"
+            "body{font-family:Arial,sans-serif;margin:18px}"
+            "table{border-collapse:collapse;width:100%;margin-top:10px}"
+            "th{background:#2c3e50;color:#fff;padding:6px;text-align:left}"
+            "td{border:1px solid #ddd;padding:6px;vertical-align:top}"
+            "h2{color:#2c3e50;border-bottom:2px solid #2c3e50;padding-bottom:5px}"
+            "h3{color:#1f3a56;margin-top:16px}"
+            "</style></head><body>"
+            f"<h1>{title}</h1>"
+            f"{selected_features_html}"
+            "<h2>Summary Metrics</h2>"
+            f"{summary_df.to_html(index=False)}"
+            f"<h2>{table_title}</h2>"
+            f"{table_html}"
+            "</body></html>"
+        )
+        with open(html_path, 'w', encoding='utf-8') as _hf:
+            _hf.write(html_content)
 
         tex_path = os.path.join(rep_dir, f'{stage_tag}.tex')
-        with open(tex_path, 'w', encoding='utf-8') as _tf:
-            _tf.write(
-                "\\section*{" + str(title).replace('_', '\\_') + "}\n"
-                "\\subsection*{Summary}\n"
-                + summary_df.to_latex(index=False, escape=True)
-            )
-            if table_latex:
-                _tf.write("\n\\subsection*{Table Preview}\n")
-                _tf.write(table_latex)
         tex_content = (
             "\\section*{" + str(title).replace('_', '\\_') + "}\n"
             "\\subsection*{Summary Metrics}\n"
             + summary_df.to_latex(index=False, escape=True)
+            + selected_features_tex
         )
-        
-        # Add selected features section for GA stages
-        if 'selected_features' in clean_summary and clean_summary['selected_features']:
-            tex_content += (
-                "\n\n\\subsection*{Selected Variables}\n"
-                "\\begin{quote}\n"
-                f"{clean_summary['selected_features'].replace('_', '\\_')}\n"
-                "\\end{quote}\n"
-            )
-        
         if table_latex:
-            tex_content += "\n\\subsection*{Convergence History}\n"
+            tex_content += "\n\\subsection*{" + table_title.replace('_', '\\_') + "}\n"
             tex_content += table_latex
-        
-        _tf.write(tex_content)
 
-        logger.info(f"  Stage report bundle saved → {rep_dir}/{stage_tag}.*")
-    except Exception as _sr_e:
-        logger.warning(f"  Stage checkpoint report failed ({stage_tag}): {_sr_e}")
+        with open(tex_path, 'w', encoding='utf-8') as _tf:
+            _tf.write(tex_content)
 
+        if csv_written:
+            logger.info(f"  Stage report table CSV saved → {csv_written}")
         logger.info(f"  Stage report bundle saved → {rep_dir}/{stage_tag}.*")
     except Exception as _sr_e:
         logger.warning(f"  Stage checkpoint report failed ({stage_tag}): {_sr_e}")
@@ -1739,7 +1755,10 @@ def estimate_stage2_joint(out, s2_models=None):
 def estimate_stage3(out):
     from stage3_activity_duration import estimate_duration_models, save_models, PERSON_FEATURES
     logger.info("  Preparing HHTS duration data...")
-    models = estimate_duration_models(out["tours"], out["persons"], trips=out["trips"])
+    _use_mdcev = os.environ.get('STAGE3_USE_MDCEV', '0') == '1'
+    models = estimate_duration_models(
+        out["tours"], out["persons"], trips=out["trips"], use_mdcev=_use_mdcev
+    )
     path = os.path.join(OUT_DIR, 'stage3_models.pkl')
     save_models(models, path)
     _save_stage_coef_csv(models, 'stage3', OUT_DIR)
@@ -1759,6 +1778,7 @@ def estimate_stage3(out):
             logger.info(f"  Stage 3 prune+refit: {len(PERSON_FEATURES)} → {len(pruned)} person features")
             models = estimate_duration_models(
                 out["tours"], out["persons"], trips=out["trips"],
+                use_mdcev=_use_mdcev,
                 feature_override=pruned,
             )
             save_models(models, path)
@@ -3097,8 +3117,9 @@ def predict_stage3(synth_s2, models=None):
     from stage3_activity_duration import predict_activity_durations, load_models
     if models is None:
         models = load_models(os.path.join(OUT_DIR, 'stage3_models.pkl'))
+    _use_mdcev = os.environ.get('STAGE3_USE_MDCEV', '0') == '1'
     logger.info(f"  Predicting activity durations for {len(synth_s2):,} persons...")
-    result = predict_activity_durations(synth_s2, models)
+    result = predict_activity_durations(synth_s2, models, use_mdcev=_use_mdcev)
     result.to_csv(os.path.join(OUT_DIR, 'stage3_output.csv'), index=False)
     logger.info(f"  ✓  Stage 3 output: {len(result):,} rows "
                 f"({result['person_id'].nunique():,} persons) → {OUT_DIR}/stage3_output.csv")
@@ -3464,12 +3485,7 @@ def stage5(out, synth_persons, scheduled, landuse):
     # Keep destination-estimation requirement enabled by default.
     os.environ.setdefault('STAGE5_REQUIRE_DEST_ESTIMATION', '1')
 
-    crash_candidates = [
-        'OD_Crashes.csv',
-        'SA2_OD_Crash_Matrix_PT.xlsx',
-        'SA2_OD_Crash_Matrix.xlsx',
-    ]
-    crash_skims = next((p for p in crash_candidates if os.path.isfile(p)), None)
+    crash_skims = _detect_stage5_crash_source()
     if crash_skims:
         logger.info(f"Stage 5 crash source detected: {crash_skims}")
     else:
@@ -3655,33 +3671,55 @@ def spatial_plots(plan, synth, landuse):
             logger.warning(f"  Plot '{_fn}' failed: {_pe}")
         sys.stdout.flush()
 
-    # Sample person-movement plots (top travellers by distance)
+    # Sample person-movement plots — representative travellers (not outliers)
     try:
         if 'person_id' in plan_coords.columns:
             rt_col = 'row_type' if 'row_type' in plan_coords.columns else None
             trip_rows = plan_coords[plan_coords[rt_col] == 'trip'] if rt_col else plan_coords
-            # Prefer skim road distance ('dist') over haversine ('dist_km') so
-            # the top-traveller ranking is not inflated by centroid overestimates.
-            _dist_col = 'dist' if 'dist' in trip_rows.columns and trip_rows['dist'].notna().any() \
-                        else ('dist_km' if 'dist_km' in trip_rows.columns else None)
+            # Use haversine dist_km for ranking (always computed; skim dist may have
+            # artefacts for edge OD pairs that produce unrealistically long trips).
+            _dist_col = ('dist_km' if 'dist_km' in trip_rows.columns
+                         else ('dist' if 'dist' in trip_rows.columns else None))
             if _dist_col and len(trip_rows) > 0:
-                top_pids = (trip_rows.groupby('person_id')[_dist_col]
-                            .sum().sort_values(ascending=False)
-                            .head(20).index.tolist())
-                import numpy as np
-                rng = np.random.default_rng(42)
-                sample_pids = rng.choice(top_pids, size=min(4, len(top_pids)),
-                                         replace=False).tolist()
-                for pid in sample_pids:
-                    try:
-                        _sp = os.path.join(_pdir, f'person_{pid}_movement.png')
-                        plot_person_movement(plan_coords, pid, save_path=_sp)
-                        _saved.append(f'person_{pid}_movement.png')
-                        logger.info(f"  Movement plot → {_sp}")
-                    except Exception as _mpe:
-                        logger.warning(f"  Movement plot for {pid} failed: {_mpe}")
+                _dist_per_person = (trip_rows.groupby('person_id')[_dist_col]
+                                    .sum().dropna())
+                _p10 = float(_dist_per_person.quantile(0.10))
+                _p90 = float(_dist_per_person.quantile(0.90))
+                # Select from the bulk of travellers, not extreme outliers
+                _repr = _dist_per_person[
+                    (_dist_per_person >= _p10) & (_dist_per_person <= _p90)
+                ]
+                if len(_repr) == 0:
+                    _repr = _dist_per_person
+                sample_pids = _repr.sample(
+                    min(4, len(_repr)), random_state=42
+                ).index.tolist()
+                logger.info(
+                    f"  Movement plots: {len(sample_pids)} representative travellers "
+                    f"(daily dist_km p10={_p10:.1f}-p90={_p90:.1f} km)"
+                )
+            else:
+                sample_pids = []
+            for pid in sample_pids:
+                try:
+                    _sp = os.path.join(_pdir, f'person_{pid}_movement.png')
+                    plot_person_movement(plan_coords, pid, save_path=_sp)
+                    _saved.append(f'person_{pid}_movement.png')
+                    logger.info(f"  Movement plot -> {_sp}")
+                except Exception as _mpe:
+                    logger.warning(f"  Movement plot for {pid} failed: {_mpe}")
     except Exception as _e:
         logger.warning(f"  Person movement plots failed: {_e}")
+
+    # Distance-linked sample plans: re-draw Gantt charts with dist_km annotations
+    try:
+        from plot_activity_plans import plot_sample_plans as _psp
+        _spdist_path = os.path.join(_pdir, 'sample_plans_with_distances.png')
+        _psp(plan_coords, n=8, save_path=_spdist_path, seed=42)
+        _saved.append('sample_plans_with_distances.png')
+        logger.info(f"  Distance-linked sample plans -> {_spdist_path}")
+    except Exception as _spe:
+        logger.warning(f"  sample_plans_with_distances failed: {_spe}")
 
     logger.info(f"  Spatial plots complete: {len(_saved)} files in {_pdir}/")
     sys.stdout.flush()
@@ -3749,20 +3787,49 @@ def _format_ga_checkpoint_summary(res) -> dict:
     best_fitness = float(getattr(res, 'best_fitness', np.nan))
     fitness_metric = str(getattr(res, 'fitness_metric', 'unknown'))
     best_features = getattr(res, 'best_features', [])
-    
-    # Convert best_features to list if it's a dict (for multi-segment results)
+
+    selected_features_text = ""
+    selected_features_list = []
+    selected_features_by_block = {}
+    n_features = 0
+
     if isinstance(best_features, dict):
-        # For dict, show count and keys
-        best_features_list = list(best_features.keys()) if best_features else []
-        n_features = len(best_features_list)
+        for block, vals in best_features.items():
+            if vals is None:
+                vals_list = []
+            elif isinstance(vals, (list, tuple, set)):
+                vals_list = [str(v) for v in vals]
+            else:
+                vals_list = [str(vals)]
+            selected_features_by_block[str(block)] = vals_list
+            for v in vals_list:
+                selected_features_list.append(f"{block}:{v}")
+
+        n_features = sum(len(v) for v in selected_features_by_block.values())
+        lines = []
+        for block, vals in selected_features_by_block.items():
+            if vals:
+                lines.append(f"{block}: " + ", ".join(vals))
+            else:
+                lines.append(f"{block}: (none)")
+        selected_features_text = "\n".join(lines)
     else:
-        best_features_list = list(best_features) if best_features else []
-        n_features = len(best_features_list)
-    
+        if best_features is None:
+            selected_features_list = []
+        elif isinstance(best_features, (list, tuple, set)):
+            selected_features_list = [str(v) for v in best_features]
+        else:
+            selected_features_list = [str(best_features)]
+        n_features = len(selected_features_list)
+        selected_features_text = ", ".join(selected_features_list)
+
     summary = {
         'n_selected_features': n_features,
-        'selected_features': ', '.join(str(f) for f in best_features_list[:20]),  # truncate long lists
+        'selected_features': selected_features_text,
+        'selected_features_list': selected_features_list,
+        'selected_features_by_block': selected_features_by_block,
         'n_generations': len(getattr(res, 'history', [])),
+        'n_candidates_evaluated': len(getattr(res, 'all_candidates', []) or []),
         'fitness_metric': fitness_metric,
     }
     
@@ -3771,7 +3838,7 @@ def _format_ga_checkpoint_summary(res) -> dict:
         # fitness = -BIC/n, so BIC/n = -fitness
         bic_per_obs = -best_fitness
         summary['best_BIC_per_obs'] = f"{bic_per_obs:.6f}"
-        summary['best_fitness_note'] = f"(BIC/n to minimize, lower = better)"
+        summary['best_fitness_note'] = "(BIC/n to minimize, lower = better)"
     else:
         summary['best_fitness'] = f"{best_fitness:.6f}"
         summary['fitness_note'] = "(higher = better)"
@@ -3830,6 +3897,7 @@ def _ga_budget_params() -> dict:
     """
     Read GA_BUDGET env var and return pop/gens/restarts.
 
+    GA_BUDGET=smoke      → pop=8,  gens=2,   restarts=0   (sanity check only)
     GA_BUDGET=fast       → pop=30, gens=40,  restarts=1   (current default — for quick tests)
     GA_BUDGET=standard   → pop=50, gens=100, restarts=3   (recommended for HPC production)
     GA_BUDGET=thorough   → pop=80, gens=200, restarts=5   (paper-quality; ~6–8× slower than fast)
@@ -3846,15 +3914,31 @@ def _ga_budget_params() -> dict:
     """
     level = os.environ.get('GA_BUDGET', 'standard').strip().lower()
     budgets = {
+        'smoke':    dict(pop_size=8,   n_generations=2,   n_restarts=0),
         'fast':     dict(pop_size=40,  n_generations=60,  n_restarts=2),
         'standard': dict(pop_size=60,  n_generations=150, n_restarts=4),
         'thorough': dict(pop_size=100, n_generations=300, n_restarts=6),
     }
     if level not in budgets:
         logger.warning(f"Unknown GA_BUDGET='{level}'; using 'standard'. "
-                       f"Valid choices: fast, standard, thorough")
+                   f"Valid choices: smoke, fast, standard, thorough")
         level = 'standard'
-    params = budgets[level]
+    params = dict(budgets[level])
+
+    # MetaCount/SearchLibrium fitness calls can be substantially slower or
+    # may trigger frequent estimator fallbacks. Use a lighter default budget
+    # so staged GA runs complete and write plots/checkpoints before walltime.
+    est = os.environ.get('GA_ESTIMATOR', 'default').strip().lower()
+    if est in ('metacount', 'searchlibrium', 'both', 'hybrid'):
+        if level == 'standard':
+            params = {'pop_size': 35, 'n_generations': 80, 'n_restarts': 2}
+        elif level == 'thorough':
+            params = {'pop_size': 60, 'n_generations': 160, 'n_restarts': 3}
+        logger.info(
+            f"GA estimator={est!r}: using estimator-safe budget "
+            f"pop={params['pop_size']} gens={params['n_generations']} restarts={params['n_restarts']}"
+        )
+
     logger.info(f"GA budget level: {level!r} → pop={params['pop_size']}  "
                 f"gens={params['n_generations']}  restarts={params['n_restarts']}")
     return params
@@ -4036,6 +4120,1013 @@ def ga_stage5(out, landuse):
     print(f"  mode:    {res.best_features.get('mode')}")
     print(f"  dest:    {res.best_features.get('dest')}")
     return res
+
+
+def _detect_stage5_crash_source() -> Optional[str]:
+    """Prefer an OMX with CRASH matrix, then fallback to tabular crash files."""
+    import openmatrix as omx
+
+    omx_candidates = [
+        'downcasted_matrices_base.omx',
+    ]
+    for path in omx_candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with omx.open_file(path, 'r') as cf:
+                if 'CRASH' in cf.listMatrices():
+                    return path
+        except Exception as exc:
+            logger.warning(f"Could not inspect crash OMX source {path}: {exc}")
+
+    crash_candidates = [
+        'OD_Crashes.csv',
+        'SA2_OD_Crash_Matrix_PT.xlsx',
+        'SA2_OD_Crash_Matrix.xlsx',
+    ]
+    return next((path for path in crash_candidates if os.path.isfile(path)), None)
+
+
+def _write_smoke_models_html(models: dict, save_dir: str, title: str = 'Stage 5 Smoke — Model Coefficients') -> None:
+        """Write a full HTML coefficient report for all smoke-test stage 5 models."""
+        try:
+                from stage5_destination_choice import _coef_dict_from_model
+        except ImportError:
+                return
+        from scipy.stats import norm as _sn
+
+        def _fmt(v, fmt='.4f'):
+                try:
+                        f = float(v)
+                        return format(f, fmt) if np.isfinite(f) else '—'
+                except Exception:
+                        return '—'
+
+        def _pval_from_t(t):
+                try:
+                        return float(2.0 * _sn.sf(abs(float(t))))
+                except Exception:
+                        return float('nan')
+
+        def _p_style(p):
+                try:
+                        pf = float(p)
+                        if not np.isfinite(pf): return ''
+                        if pf < 0.001: return "color:#1a7a1a;font-weight:bold"
+                        if pf < 0.01:  return "color:#2e7d32;font-weight:bold"
+                        if pf < 0.05:  return "color:#558b2f"
+                        if pf < 0.10:  return "color:#f57c00"
+                        return "color:#b71c1c"
+                except Exception:
+                        return ''
+
+        def _coef_rows_html(mdl):
+                try:
+                        coef = _coef_dict_from_model(mdl)
+                        pf = None
+                        if hasattr(mdl, '_final_pf') and isinstance(mdl._final_pf, pd.DataFrame):
+                                pf = mdl._final_pf
+                        else:
+                                try: pf = mdl.pf
+                                except Exception: pass
+                        params = list(pf.index) if pf is not None and len(pf) > 0 else list(coef.keys())
+                        rows = ""
+                        for p in params:
+                                val = coef.get(str(p), float('nan'))
+                                se = tstat = pval = float('nan')
+                                if pf is not None and p in pf.index:
+                                        row = pf.loc[p]
+                                        for c in ('std_err', 'std_err_opg', 'se'):
+                                                if c in row.index and np.isfinite(float(row[c])): se = float(row[c]); break
+                                        for c in ('t_stat', 't_stat_opg', 'tstat'):
+                                                if c in row.index and np.isfinite(float(row[c])): tstat = float(row[c]); break
+                                        for c in ('pval', 'p_value', 'pvalue', 'pval_opg'):
+                                                if c in row.index and np.isfinite(float(row[c])): pval = float(row[c]); break
+                                if np.isnan(tstat) and np.isfinite(se) and se > 0:
+                                        tstat = val / se
+                                if np.isnan(pval) and np.isfinite(tstat):
+                                        pval = _pval_from_t(tstat)
+                                t_style = _p_style(pval)
+                                p_style = _p_style(pval)
+                                rows += (
+                                        f"<tr>"
+                                        f"<td style='{t_style}'>{p}</td>"
+                                        f"<td style='text-align:right'>{_fmt(val)}</td>"
+                                        f"<td style='text-align:right'>{_fmt(se)}</td>"
+                                        f"<td style='text-align:right;{t_style}'>{_fmt(tstat, '.2f')}</td>"
+                                        f"<td style='text-align:right;{p_style}'>{_fmt(pval, '.4f')}</td>"
+                                        f"</tr>"
+                                )
+                        return rows
+                except Exception as e:
+                        return f"<tr><td colspan='5'>Could not render: {e}</td></tr>"
+
+        def _model_stats_html(mdl, ll, seg, mtype):
+                """Extract rho2 and n_obs from live model attributes."""
+                try:
+                        rho2 = getattr(mdl, 'rho2_', float('nan'))
+                        if not np.isfinite(rho2):
+                                rho2 = getattr(mdl, '_rho2', float('nan'))
+                except Exception:
+                        rho2 = float('nan')
+                try:
+                        n = getattr(mdl, 'n_obs_', None) or getattr(mdl, '_n_obs', None)
+                        if n is None and hasattr(mdl, 'pf'):
+                                n = '?'
+                except Exception:
+                        n = '?'
+                ll_s   = _fmt(ll,   '.2f')
+                rho2_s = _fmt(rho2, '.4f')
+                try:
+                        pf = mdl._final_pf if hasattr(mdl, '_final_pf') and isinstance(getattr(mdl, '_final_pf', None), pd.DataFrame) else mdl.pf
+                        n_free = int((pf.get('holdfast', pd.Series([False]*len(pf))) == False).sum())
+                except Exception:
+                        n_free = '?'
+                return (f"<p class='stats'>"
+                        f"<b>Log-likelihood:</b> {ll_s} &nbsp;|&nbsp;"
+                        f"<b>McFadden ρ²:</b> {rho2_s} &nbsp;|&nbsp;"
+                        f"<b>N obs:</b> {n} &nbsp;|&nbsp;"
+                        f"<b>Free params:</b> {n_free}"
+                        f"</p>")
+
+        sections = ""
+        for seg, res in models.items():
+                if not isinstance(res, dict):
+                        continue
+                n = res.get('n_tours', '?')
+                sections += (
+                        f"<div class='seg-header'>"
+                        f"<h2>Segment: {seg.upper()}</h2>"
+                        f"<p>HHTS estimation tours: <b>{n}</b></p>"
+                        f"</div>"
+                )
+                for mtype, mdl_key, ll_key in [
+                        ('Destination choice', 'dest_model', 'dest_ll'),
+                        ('Mode choice',        'mode_model', 'mode_ll'),
+                ]:
+                        mdl = res.get(mdl_key)
+                        ll  = float(res.get(ll_key, float('nan')))
+                        if mdl is None:
+                                sections += f"<div class='model-section'><h3>{mtype} — not estimated</h3></div>"
+                                continue
+                        sections += (
+                                f"<div class='model-section'>"
+                                f"<h3>{mtype} &nbsp; <span class='seg-tag'>{seg}</span></h3>"
+                                + _model_stats_html(mdl, ll, seg, mtype) +
+                                "<table><thead><tr>"
+                                "<th>Parameter</th><th>Value</th><th>Std&nbsp;Err</th>"
+                                "<th>t-stat</th><th>p-value</th>"
+                                "</tr></thead><tbody>"
+                                + _coef_rows_html(mdl) +
+                                "</tbody></table>"
+                                "<p class='sig-note'>"
+                                "<span style='color:#1a7a1a;font-weight:bold'>p&lt;0.001</span> "
+                                "<span style='color:#2e7d32;font-weight:bold'>p&lt;0.01</span> "
+                                "<span style='color:#558b2f'>p&lt;0.05</span> "
+                                "<span style='color:#f57c00'>p&lt;0.10</span> "
+                                "<span style='color:#b71c1c'>p&ge;0.10 (not significant)</span>"
+                                "</p></div>"
+                        )
+
+        os.makedirs(save_dir, exist_ok=True)
+        html_path = os.path.join(save_dir, 'stage5_smoke_models_report.html')
+        with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(f"""<!DOCTYPE html>
+<html lang='en'><head><meta charset='utf-8'>
+<title>{title}</title>
+<style>
+body{{font-family:Arial,sans-serif;margin:30px;font-size:13px;max-width:1300px;color:#222}}
+h1{{color:#1a3a5c;border-bottom:3px solid #1a3a5c;padding-bottom:10px;font-size:1.6rem}}
+h2{{color:#1565c0;margin:32px 0 4px;font-size:1.2rem}}
+h3{{color:#2c5f8a;margin:0 0 6px;font-size:1rem}}
+.seg-header{{background:#e3f2fd;border-left:5px solid #1565c0;padding:10px 16px;margin:28px 0 0;border-radius:4px}}
+.model-section{{border:1px solid #ccc;border-radius:6px;padding:16px;margin:10px 0 20px}}
+.seg-tag{{background:#1565c0;color:white;font-size:0.75rem;padding:2px 8px;border-radius:10px;vertical-align:middle;margin-left:6px}}
+.stats{{background:#e8f5e9;padding:8px 14px;border-radius:4px;font-size:0.92em;margin:6px 0 12px;border-left:4px solid #43a047}}
+.sig-note{{font-size:0.78em;color:#666;margin-top:6px}}
+table{{border-collapse:collapse;width:100%;font-size:12px;margin-top:6px}}
+th{{background:#1565c0;color:white;padding:7px 10px;text-align:left;white-space:nowrap}}
+td{{padding:5px 10px;border-bottom:1px solid #eee}}
+tr:hover td{{background:#f5f9ff}}
+tr:nth-child(even) td{{background:#fafafa}}
+tr:nth-child(even):hover td{{background:#f0f4ff}}
+</style></head><body>
+<h1>{title}</h1>
+<p style='color:#555;font-size:12px'>
+  Generated {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp;
+  All segments: work &middot; edu &middot; nonmand &nbsp;|&nbsp;
+  All model types: destination choice &middot; mode choice
+</p>
+{sections}
+</body></html>""")
+        logger.info(f"  Smoke model coefficient HTML -> {html_path}")
+
+
+def _fit_stage5_smoke_models(
+        out: dict,
+        landuse: pd.DataFrame,
+        save_dir: str,
+        mode_feature_override: Optional[list] = None,
+        dest_feature_override: Optional[list] = None,
+        safety_mode: str = 'baseline',
+        use_gpu: bool = False,
+) -> dict:
+        """Estimate Stage 5 HHTS models for the smoke run and write main-run style artifacts."""
+        import openmatrix as omx
+        from stage5_destination_choice import (
+                _skim_flat,
+                _prep_hhts_tours,
+                _run_segment,
+                _save_coefficients,
+                save_models as _save_stage5_models,
+                save_location_choice_summary,
+        )
+
+        os.makedirs(save_dir, exist_ok=True)
+        skims_path = 'downcasted_matrices_base.omx'
+        crash_skims = _detect_stage5_crash_source()
+
+        prev_safety_mode = os.environ.get('SAFETY_EXPERIMENT_MODE')
+        os.environ['SAFETY_EXPERIMENT_MODE'] = safety_mode
+
+        # GPU: force JAX engine (XLA can use CUDA if available) and prevent
+        # pre-allocation to avoid OOM on shared HPC nodes.
+        prev_larch_engine = os.environ.get('GA_LARCH_ENGINE')
+        if use_gpu:
+                os.environ['GA_LARCH_ENGINE'] = 'jax'
+                os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
+                logger.info(f"Stage 5 smoke [{safety_mode}]: GPU mode — forcing JAX engine (XLA/CUDA)")
+
+        skims = None
+        try:
+            skims = omx.open_file(skims_path, 'r')
+            skim_df = _skim_flat(skims)
+
+            _hhts_tours_src = out['tours']
+            if 'tour_mode' not in _hhts_tours_src.columns or _hhts_tours_src['tour_mode'].isna().all():
+                    _mode_col = next(
+                            (c for c in ['mode', 'MAINMODE', 'TRAVMODE', 'LINKMODE'] if c in out['trips'].columns),
+                            None,
+                    )
+                    if _mode_col:
+                            _dom = (
+                                    out['trips']
+                                    .groupby(['person_id', 'tour_id'])[_mode_col]
+                                    .agg(lambda x: x.value_counts().idxmax() if len(x) else 'DA')
+                                    .reset_index()
+                                    .rename(columns={_mode_col: 'tour_mode'})
+                            )
+                            _hhts_tours_src = _hhts_tours_src.copy()
+                            if 'tour_mode' in _hhts_tours_src.columns:
+                                    _hhts_tours_src = _hhts_tours_src.drop(columns=['tour_mode'])
+                            _hhts_tours_src = _hhts_tours_src.merge(_dom, on=['person_id', 'tour_id'], how='left')
+
+            hhts_tours = _prep_hhts_tours(_hhts_tours_src, out['persons'])
+            logger.info(
+                    f"Stage 5 smoke [{safety_mode}]: estimating selected models for {len(hhts_tours):,} HHTS tours"
+            )
+
+            models = {}
+            for seg in ('work', 'edu', 'nonmand'):
+                    try:
+                            result = _run_segment(
+                                    seg,
+                                    hhts_tours,
+                                    out['persons'],
+                                    landuse,
+                                    skims,
+                                    skim_df,
+                                    seed=42,
+                                    mode_feature_override=mode_feature_override,
+                                    dest_feature_override=dest_feature_override,
+                                    crash_skims=crash_skims,
+                            )
+                            if result:
+                                    models[seg] = result
+                    except Exception as exc:
+                            logger.warning(f"Stage 5 smoke [{safety_mode}] failed for {seg}: {exc}")
+
+            model_path = os.path.join(save_dir, 'stage5_models.pkl')
+            coef_path = os.path.join(save_dir, 'stage5_models_coefficients.csv')
+            _save_stage5_models(models, model_path)
+            _save_coefficients(models, coef_path)
+            save_location_choice_summary(
+                    models=models,
+                    obs_tours=out.get('tours', pd.DataFrame()),
+                    landuse=landuse,
+                    save_dir=save_dir,
+                    persons=out.get('persons'),
+            )
+            _inspect_model_parameters(models, 'stage5_tour', save_dir)
+            _write_smoke_models_html(
+                    models,
+                    save_dir,
+                    title=f'Stage 5 Smoke [{safety_mode}] — Model Coefficients',
+            )
+            logger.info(f"Stage 5 smoke [{safety_mode}] artifacts saved -> {save_dir}")
+            return models
+        finally:
+                if skims is not None:
+                        try:
+                                skims.close()
+                        except Exception:
+                                pass
+                if prev_safety_mode is None:
+                        os.environ.pop('SAFETY_EXPERIMENT_MODE', None)
+                else:
+                        os.environ['SAFETY_EXPERIMENT_MODE'] = prev_safety_mode
+                if use_gpu:
+                        if prev_larch_engine is None:
+                                os.environ.pop('GA_LARCH_ENGINE', None)
+                        else:
+                                os.environ['GA_LARCH_ENGINE'] = prev_larch_engine
+
+
+def _write_interactive_safety_dashboard(
+        baseline_dir: str,
+        nosafety_dir: str,
+        out_dir: str,
+        landuse: Optional[pd.DataFrame] = None,
+        comparison_df: Optional[pd.DataFrame] = None,
+        hhts_obs: Optional[pd.DataFrame] = None,
+        dest_zone_shift: Optional[list] = None,
+) -> Optional[str]:
+        """Create an interactive HTML dashboard for the Stage 5 safety comparison."""
+        try:
+                import geopandas as gpd
+                from stage5_destination_choice import _read_crash_od_table
+        except Exception as exc:
+                logger.warning(f"Interactive safety dashboard skipped: {exc}")
+                return None
+
+        def _load_location_summary(run_dir: str) -> pd.DataFrame:
+                path = os.path.join(run_dir, 'location_choice', 'location_choice_summary.csv')
+                if os.path.exists(path):
+                        return pd.read_csv(path)
+                return pd.DataFrame()
+
+        def _clean_for_json(df: pd.DataFrame) -> list[dict]:
+                if df is None or df.empty:
+                        return []
+                clean = df.where(pd.notna(df), None)
+                return clean.to_dict(orient='records')
+
+        coef_base = _load_location_summary(baseline_dir)
+        coef_nosa = _load_location_summary(nosafety_dir)
+        if coef_base.empty:
+                logger.warning("Interactive safety dashboard skipped: baseline location_choice summary not found")
+                return None
+
+        if landuse is None or getattr(landuse, 'empty', True):
+                candidate_landuse_paths = [
+                        os.path.join('saved_data', 'accessibility.csv'),
+                        'pddopulation_by_order_with_osm_and_landuse.csv',
+                ]
+                for candidate in candidate_landuse_paths:
+                        if os.path.exists(candidate):
+                                try:
+                                        landuse = pd.read_csv(candidate)
+                                        break
+                                except Exception:
+                                        continue
+        if landuse is None or getattr(landuse, 'empty', True):
+                logger.warning("Interactive safety dashboard skipped: landuse data unavailable")
+                return None
+
+        zone_map = pd.read_csv('seq_zone_ids_.csv')
+
+        def _pick_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+            for c in candidates:
+                if c in df.columns:
+                    return c
+            return None
+
+        def _normalize_sa2_code(series: pd.Series) -> pd.Series:
+            s = series.astype(str).str.strip()
+            s = s.str.replace(r'\.0$', '', regex=True)
+            s = s.replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
+            return s
+
+        zone_code_col = _pick_column(zone_map, ['SA2_MAIN16', 'SA2_CODE16', 'SA2_MAIN21', 'SA2_CODE21', 'SA2_CODE'])
+        zone_name_col = _pick_column(zone_map, ['SA2_NAME16', 'SA2_NAME21', 'SA2_NAME'])
+        if zone_code_col is None:
+            raise KeyError(f"No SA2 code column found in seq_zone_ids_.csv. Columns: {list(zone_map.columns)}")
+
+        zone_map['ORDER'] = pd.to_numeric(zone_map['ORDER'], errors='coerce')
+        zone_map['SA2_CODE'] = _normalize_sa2_code(zone_map[zone_code_col])
+        zone_map['SA2_NAME'] = zone_map[zone_name_col].astype(str) if zone_name_col else 'Unknown'
+
+        lu = landuse.copy()
+        if 'ORDER' not in lu.columns:
+                for col in ('zone_id', 'ORDER_rel'):
+                        if col in lu.columns:
+                                lu = lu.rename(columns={col: 'ORDER'})
+                                break
+        lu['ORDER'] = pd.to_numeric(lu['ORDER'], errors='coerce')
+        zone_df = zone_map[['ORDER', 'SA2_CODE', 'SA2_NAME', 'latitude', 'longitude']].merge(
+                lu,
+                on='ORDER',
+                how='left',
+        )
+        zone_df['SA2_NAME16'] = zone_df['SA2_NAME']
+
+        crash_source = _detect_stage5_crash_source()
+        crash_df = _read_crash_od_table(crash_source, zone_ids=zone_df['ORDER'].dropna().astype(int).tolist()) \
+                if crash_source else pd.DataFrame(columns=['OTAZ', 'DTAZ', 'CRASH'])
+        if not crash_df.empty:
+                crash_df['log_crash'] = np.log(pd.to_numeric(crash_df['CRASH'], errors='coerce').fillna(0.0) + 1.0)
+                crash_zone = (
+                        crash_df.groupby('DTAZ', as_index=False)
+                        .agg(
+                                inbound_crash_mean=('CRASH', 'mean'),
+                                inbound_crash_log_mean=('log_crash', 'mean'),
+                                inbound_crash_total=('CRASH', 'sum'),
+                        )
+                        .rename(columns={'DTAZ': 'ORDER'})
+                )
+                zone_df = zone_df.merge(crash_zone, on='ORDER', how='left')
+        else:
+                zone_df['inbound_crash_mean'] = np.nan
+                zone_df['inbound_crash_log_mean'] = np.nan
+                zone_df['inbound_crash_total'] = np.nan
+
+        crash_coef_rows = coef_base[
+                coef_base['coefficient_name'].astype(str).str.lower().isin(['c_crash', 'c_crash_veh'])
+        ].copy()
+        crash_coef_rows['value'] = pd.to_numeric(crash_coef_rows['value'], errors='coerce')
+        if 'p_value' in crash_coef_rows.columns:
+                crash_coef_rows['p_value'] = pd.to_numeric(crash_coef_rows['p_value'], errors='coerce')
+        else:
+                crash_coef_rows['p_value'] = np.nan
+
+        for seg in ('work', 'edu', 'nonmand'):
+                _seg_dest = crash_coef_rows[
+                        (crash_coef_rows['segment'] == seg) & (crash_coef_rows['model_type'] == 'dest')
+                ]
+                _seg_mode = crash_coef_rows[
+                        (crash_coef_rows['segment'] == seg) & (crash_coef_rows['model_type'] == 'mode')
+                ]
+                dest_beta = float(_seg_dest['value'].iloc[0]) if len(_seg_dest) else np.nan
+                mode_beta = float(_seg_mode['value'].iloc[0]) if len(_seg_mode) else np.nan
+                zone_df[f'{seg}_dest_safety_penalty'] = pd.to_numeric(
+                        zone_df.get('inbound_crash_log_mean'),
+                        errors='coerce',
+                ) * dest_beta
+                zone_df[f'{seg}_mode_safety_penalty'] = pd.to_numeric(
+                        zone_df.get('inbound_crash_log_mean'),
+                        errors='coerce',
+                ) * mode_beta
+
+        penalty_cols = [c for c in zone_df.columns if c.endswith('_dest_safety_penalty')]
+        zone_df['max_dest_safety_penalty'] = zone_df[penalty_cols].min(axis=1) if penalty_cols else np.nan
+        zone_df['mean_dest_safety_penalty'] = zone_df[penalty_cols].mean(axis=1) if penalty_cols else np.nan
+
+        feature_candidates = [
+                'TOTPOP', 'TOTEMP', 'sa2_area', 'residential_y', 'commercial_y', 'retail_y',
+                'park_y', 'recreation_ground_y', 'education_y', 'trees_y', 'childcare_y',
+                'government_y', 'industrial_y', 'sport_y', 'utility_y', 'village_green_y',
+        ]
+        corr_rows = []
+        target = pd.to_numeric(zone_df['max_dest_safety_penalty'], errors='coerce')
+        for col in feature_candidates:
+                if col not in zone_df.columns:
+                        continue
+                vals = pd.to_numeric(zone_df[col], errors='coerce')
+                pair = pd.DataFrame({'x': vals, 'y': target}).dropna()
+                if len(pair) < 8 or pair['x'].std() == 0 or pair['y'].std() == 0:
+                        continue
+                corr_rows.append({
+                        'feature': col,
+                        'correlation': float(pair['x'].corr(pair['y'])),
+                        'mean_value': float(pair['x'].mean()),
+                })
+        corr_df = pd.DataFrame(corr_rows)
+        if not corr_df.empty:
+                corr_df = corr_df.sort_values('correlation')
+        else:
+                corr_df = pd.DataFrame(columns=['feature', 'correlation', 'mean_value'])
+
+        top_zone_cols = [
+                'ORDER', 'SA2_NAME16', 'inbound_crash_mean', 'inbound_crash_total',
+                'max_dest_safety_penalty', 'mean_dest_safety_penalty',
+                'TOTPOP', 'TOTEMP', 'commercial_y', 'retail_y', 'residential_y',
+                'education_y', 'park_y', 'recreation_ground_y', 'trees_y',
+        ]
+        top_zone_cols = [c for c in top_zone_cols if c in zone_df.columns]
+        top_zones = zone_df.sort_values('max_dest_safety_penalty').head(25)[top_zone_cols].copy()
+        top_zones.to_csv(os.path.join(out_dir, 'safety_dashboard_top_zones.csv'), index=False)
+        corr_df.to_csv(os.path.join(out_dir, 'safety_dashboard_feature_correlations.csv'), index=False)
+
+        shp_path = os.path.join(
+                'saved_data',
+                'SA2_2021_AUST_SHP_GDA2020',
+                'SA2_2021_AUST_GDA2020.shp',
+        )
+        geo_df = gpd.read_file(shp_path)
+        geo_code_col = _pick_column(geo_df, ['SA2_MAIN16', 'SA2_CODE16', 'SA2_MAIN21', 'SA2_CODE21', 'SA2_CODE'])
+        geo_name_col = _pick_column(geo_df, ['SA2_NAME16', 'SA2_NAME21', 'SA2_NAME'])
+        if geo_code_col is None:
+            raise KeyError(f"No SA2 code column found in shapefile. Columns: {list(geo_df.columns)}")
+
+        geo_df['SA2_CODE'] = _normalize_sa2_code(geo_df[geo_code_col])
+        if geo_name_col and 'SA2_NAME16' not in geo_df.columns:
+            geo_df['SA2_NAME16'] = geo_df[geo_name_col]
+
+        geo_df = geo_df[geo_df['SA2_CODE'].isin(zone_df['SA2_CODE'].dropna())].copy()
+        geo_df = geo_df.merge(zone_df, on='SA2_CODE', how='left')
+        geo_df = geo_df.to_crs(epsg=4326)
+        geojson = json.loads(geo_df.to_json())
+
+        # ── Load comparison CSV for mode/destination shift panels ────────────
+        _cmp_df = comparison_df
+        if _cmp_df is None or getattr(_cmp_df, 'empty', True):
+                _cmp_csv = os.path.join(out_dir, 'safety_comparison.csv')
+                if os.path.exists(_cmp_csv):
+                        try:
+                                _cmp_df = pd.read_csv(_cmp_csv)
+                        except Exception:
+                                _cmp_df = pd.DataFrame()
+                else:
+                        _cmp_df = pd.DataFrame()
+
+        mode_share_rows = []
+        dest_shift_rows = []
+        if not _cmp_df.empty:
+                _ms = _cmp_df[_cmp_df['category'] == 'mode_share'] if 'category' in _cmp_df.columns else pd.DataFrame()
+                for _, r in _ms.iterrows():
+                        mode_share_rows.append({
+                                'mode':          str(r.get('parameter', '')),
+                                'with_safety':   float(r['beta'])   if pd.notna(r.get('beta'))    else 0,
+                                'without_safety':float(r['se'])     if pd.notna(r.get('se'))      else 0,
+                                'delta':         float(r['t_ratio'])if pd.notna(r.get('t_ratio')) else 0,
+                        })
+                _ds = _cmp_df[_cmp_df['category'] == 'trip_distance'] if 'category' in _cmp_df.columns else pd.DataFrame()
+                for _, r in _ds.iterrows():
+                        dest_shift_rows.append({
+                                'stat':          str(r.get('parameter', '')),
+                                'with_safety':   float(r['beta'])   if pd.notna(r.get('beta'))    else None,
+                                'without_safety':float(r['se'])     if pd.notna(r.get('se'))      else None,
+                                'delta':         float(r['t_ratio'])if pd.notna(r.get('t_ratio')) else None,
+                        })
+
+        # ── Build OD flow network from HHTS observations ───────────────────
+        # Load zone centroids for lat/lon lookup
+        od_flows = []
+        try:
+                _zone_centroids = zone_map.set_index('ORDER')[['latitude', 'longitude']].dropna()
+                _obs = hhts_obs if (hhts_obs is not None and not getattr(hhts_obs, 'empty', True)) else None
+                if _obs is None:
+                        _obs_path = os.path.join(baseline_dir, 'location_choice', 'location_choice_observations.csv')
+                        if os.path.exists(_obs_path):
+                                _obs = pd.read_csv(_obs_path)
+
+                if _obs is not None and len(_obs) > 0:
+                        _mode_names = {1: 'DA', 2: 'SR', 3: 'Walk', 4: 'Bike', 5: 'Transit'}
+                        _mode_col = next((c for c in ['tour_mode', 'mode', 'TOURMODE'] if c in _obs.columns), None)
+                        _od = _obs.groupby(['OTAZ', 'choice']).size().reset_index(name='flow')
+                        if _mode_col:
+                                _od_mode = (
+                                        _obs.groupby(['OTAZ', 'choice', _mode_col])
+                                        .size()
+                                        .reset_index(name='n')
+                                )
+                                _dom_mode = _od_mode.loc[_od_mode.groupby(['OTAZ', 'choice'])['n'].idxmax()]
+                                _od = _od.merge(_dom_mode[['OTAZ', 'choice', _mode_col]], on=['OTAZ', 'choice'], how='left')
+                                _od['mode_name'] = pd.to_numeric(_od[_mode_col], errors='coerce').map(_mode_names).fillna('DA')
+                        else:
+                                _od['mode_name'] = 'DA'
+
+                        # Only keep top OD pairs by flow to keep JSON small
+                        _od = _od.nlargest(500, 'flow')
+                        for _, r in _od.iterrows():
+                                otaz = int(r['OTAZ'])
+                                dtaz = int(r['choice'])
+                                if otaz not in _zone_centroids.index or dtaz not in _zone_centroids.index:
+                                        continue
+                                olat, olon = float(_zone_centroids.at[otaz, 'latitude']), float(_zone_centroids.at[otaz, 'longitude'])
+                                dlat, dlon = float(_zone_centroids.at[dtaz, 'latitude']), float(_zone_centroids.at[dtaz, 'longitude'])
+                                od_flows.append({
+                                        'o': otaz, 'd': dtaz,
+                                        'oLat': olat, 'oLon': olon,
+                                        'dLat': dlat, 'dLon': dlon,
+                                        'flow': int(r['flow']),
+                                        'mode': str(r['mode_name']),
+                                })
+        except Exception as _od_e:
+                logger.debug(f"OD flow network build failed: {_od_e}")
+
+        dashboard_payload = {
+                'geojson': geojson,
+                'coefficients_with_safety': _clean_for_json(coef_base),
+                'coefficients_without_safety': _clean_for_json(coef_nosa),
+                'crash_coefficients': _clean_for_json(crash_coef_rows),
+                'feature_correlations': _clean_for_json(corr_df.head(15)),
+                'top_zones': _clean_for_json(top_zones),
+                'mode_share': mode_share_rows,
+                'dest_shift': dest_shift_rows,
+                'od_flows': od_flows,
+                'dest_zone_shift': dest_zone_shift if dest_zone_shift else [],
+        }
+        with open(os.path.join(out_dir, 'safety_dashboard_data.json'), 'w', encoding='utf-8') as handle:
+                json.dump(dashboard_payload, handle)
+
+        html_path = os.path.join(out_dir, 'safety_dashboard.html')
+        html = """<!DOCTYPE html>
+<html lang='en'>
+<head>
+    <meta charset='utf-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <title>Stage 5 Safety Dashboard</title>
+    <link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'>
+    <script src='https://cdn.plot.ly/plotly-2.35.2.min.js'></script>
+    <script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>
+    <style>
+        :root {{
+            --bg: #f5efe3;
+            --panel: rgba(255,255,255,0.88);
+            --ink: #17313e;
+            --muted: #5f6e75;
+            --accent: #ad3f2f;
+            --accent-2: #1f6a73;
+            --line: rgba(23,49,62,0.12);
+        }}
+        body {{ margin: 0; font-family: Georgia, 'Palatino Linotype', serif; background:
+            radial-gradient(circle at top left, #f6d8a8 0%, #f5efe3 35%, #d8ebe8 100%); color: var(--ink); }}
+        .wrap {{ max-width: 1500px; margin: 0 auto; padding: 24px; }}
+        h1 {{ font-size: 2.2rem; margin: 0 0 8px; }}
+        h2 {{ margin: 0 0 10px; font-size: 1.1rem; }}
+        p {{ color: var(--muted); line-height: 1.45; }}
+        .cards {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 20px 0; }}
+        .card, .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 18px; box-shadow: 0 16px 40px rgba(23,49,62,0.08); }}
+        .card {{ padding: 16px 18px; }}
+        .card .label {{ font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }}
+        .card .value {{ font-size: 1.55rem; margin-top: 6px; font-weight: 700; }}
+        .grid {{ display: grid; grid-template-columns: 1.2fr 1fr; gap: 14px; }}
+        .panel {{ padding: 16px; }}
+        #map {{ height: 640px; border-radius: 14px; }}
+        .controls {{ display: flex; gap: 10px; margin: 12px 0 14px; flex-wrap: wrap; }}
+        select {{ border-radius: 999px; border: 1px solid var(--line); padding: 8px 14px; background: white; color: var(--ink); }}
+        .plot {{ height: 320px; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; }}
+        th, td {{ border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; }}
+        th {{ color: var(--muted); font-size: 0.78rem; letter-spacing: 0.05em; text-transform: uppercase; }}
+        @media (max-width: 1100px) {{ .grid, .cards {{ grid-template-columns: 1fr; }} }}
+    </style>
+</head>
+<body>
+    <div class='wrap'>
+        <h1>Stage 5 Safety Dashboard</h1>
+        <p>Interactive comparison of the selected Stage 5 smoke-test model with and without safety terms. The map shows which SA2 destinations are penalised most strongly by crash exposure, while the charts link that penalty back to coefficients, crash burden, and land-use context.</p>
+        <div class='cards'>
+            <div class='card'><div class='label'>Baseline Run</div><div class='value'>__BASELINE_LABEL__</div></div>
+            <div class='card'><div class='label'>No-Safety Run</div><div class='value'>__NOSAFETY_LABEL__</div></div>
+            <div class='card'><div class='label'>Zones Covered</div><div class='value'>__ZONE_COUNT__</div></div>
+            <div class='card'><div class='label'>Crash Source</div><div class='value'>__CRASH_SOURCE__</div></div>
+        </div>
+        <div class='grid'>
+            <div class='panel'>
+                <div class='controls'>
+                    <label>Map metric
+                        <select id='metricSelect'>
+                            <option value='max_dest_safety_penalty'>Max destination safety penalty</option>
+                            <option value='mean_dest_safety_penalty'>Mean destination safety penalty</option>
+                            <option value='work_dest_safety_penalty'>Work destination penalty</option>
+                            <option value='edu_dest_safety_penalty'>Education destination penalty</option>
+                            <option value='nonmand_dest_safety_penalty'>Non-mandatory destination penalty</option>
+                            <option value='inbound_crash_total'>Inbound crash total</option>
+                            <option value='inbound_crash_mean'>Inbound crash mean</option>
+                        </select>
+                    </label>
+                    <label style='margin-left:10px'>
+                        <input type='checkbox' id='odToggle' checked> HHTS OD flows
+                    </label>
+                    <label style='margin-left:10px'>
+                        OD mode
+                        <select id='odModeFilter'>
+                            <option value='all'>All modes</option>
+                            <option value='DA'>Drive Alone</option>
+                            <option value='SR'>Shared Ride</option>
+                            <option value='Walk'>Walk</option>
+                            <option value='Bike'>Bike</option>
+                            <option value='Transit'>Transit</option>
+                        </select>
+                    </label>
+                </div>
+                <div id='map'></div>
+            </div>
+            <div style='display:grid; gap:14px;'>
+                <div class='panel'><div id='coefPlot' class='plot'></div></div>
+                <div class='panel'><div id='corrPlot' class='plot'></div></div>
+                <div class='panel'><div id='zonePlot' class='plot'></div></div>
+            </div>
+        </div>
+        <div class='grid' style='margin-top:14px;'>
+            <div class='panel'>
+                <h2>Top Penalised SA2 Destinations</h2>
+                <table id='zoneTable'></table>
+            </div>
+            <div class='panel'>
+                <h2>Safety Coefficients</h2>
+                <table id='coefTable'></table>
+            </div>
+        </div>
+        <div style='margin-top:14px;'>
+            <h2 style='font-size:1.05rem;margin:0 0 10px'>Behaviour Shift: With vs Without Safety Skims</h2>
+            <div class='grid'>
+                <div class='panel'><div id='modeSharePlot' class='plot'></div></div>
+                <div class='panel'><div id='destShiftPlot' class='plot'></div></div>
+            </div>
+            <div class='panel' style='margin-top:14px;'>
+                <div id='modeDeltaPlot' class='plot'></div>
+            </div>
+            <div class='panel' style='margin-top:14px;'>
+                <div id='destZoneShiftPlot' style='height:420px;'></div>
+            </div>
+        </div>
+    </div>
+    <script>
+        const payload = __PAYLOAD_JSON__;
+        const crashRows = payload.crash_coefficients || [];
+        const corrRows = payload.feature_correlations || [];
+        const topZones = payload.top_zones || [];
+        const modeShareRows = payload.mode_share || [];
+        const destShiftRows = payload.dest_shift || [];
+        const odFlows = payload.od_flows || [];
+        const destZoneShift = payload.dest_zone_shift || [];
+        const metricSelect = document.getElementById('metricSelect');
+        const odToggle = document.getElementById('odToggle');
+        const odModeFilter = document.getElementById('odModeFilter');
+        const map = L.map('map').setView([-27.47, 153.03], 8.7);
+        L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ attribution: '&copy; OpenStreetMap contributors' }}).addTo(map);
+
+        function valuesFor(metric) {{
+            return payload.geojson.features
+                .map(f => Number(f.properties?.[metric]))
+                .filter(v => Number.isFinite(v));
+        }}
+
+        function colorScale(value, minVal, maxVal) {{
+            if (!Number.isFinite(value)) return '#c9d4d8';
+            const span = (maxVal - minVal) || 1;
+            const t = Math.max(0, Math.min(1, (value - minVal) / span));
+            const r = Math.round(25 + t * 190);
+            const g = Math.round(114 + (1 - t) * 90);
+            const b = Math.round(110 + (1 - t) * 70);
+            return `rgb(${{r}},${{g}},${{b}})`;
+        }}
+
+        let layer;
+        function renderMap(metric) {{
+            const vals = valuesFor(metric);
+            const minVal = vals.length ? Math.min(...vals) : 0;
+            const maxVal = vals.length ? Math.max(...vals) : 1;
+            if (layer) map.removeLayer(layer);
+            layer = L.geoJSON(payload.geojson, {{
+                style: feature => {{
+                    const value = Number(feature.properties?.[metric]);
+                    return {{ color: '#ffffff', weight: 0.6, fillOpacity: 0.74, fillColor: colorScale(value, minVal, maxVal) }};
+                }},
+                onEachFeature: (feature, lyr) => {{
+                    const p = feature.properties || {{}};
+                    const zoneName = p.SA2_NAME16 || p.SA2_NAME16_x || p.SA2_NAME16_y || p.SA2_NAME || 'Unknown SA2';
+                    lyr.bindPopup(`
+                        <strong>${{zoneName}}</strong><br>
+                        ORDER: ${{p.ORDER ?? 'n/a'}}<br>
+                        ${metric}: ${{Number.isFinite(Number(p[metric])) ? Number(p[metric]).toFixed(3) : 'n/a'}}<br>
+                        inbound_crash_total: ${{Number.isFinite(Number(p.inbound_crash_total)) ? Number(p.inbound_crash_total).toFixed(1) : 'n/a'}}<br>
+                        TOTEMP: ${{Number.isFinite(Number(p.TOTEMP)) ? Number(p.TOTEMP).toFixed(0) : 'n/a'}}<br>
+                        TOTPOP: ${{Number.isFinite(Number(p.TOTPOP)) ? Number(p.TOTPOP).toFixed(0) : 'n/a'}}
+                    `);
+                }}
+            }}).addTo(map);
+        }}
+
+        function renderCoeffPlot() {{
+            const order = ['work dest', 'edu dest', 'nonmand dest', 'work mode', 'edu mode', 'nonmand mode'];
+            const label = r => `${{r.segment}} ${{r.model_type}}`;
+            const sorted = [...crashRows].sort((a, b) => order.indexOf(label(a)) - order.indexOf(label(b)));
+            Plotly.newPlot('coefPlot', [{
+                x: sorted.map(r => label(r)),
+                y: sorted.map(r => Number(r.value)),
+                type: 'bar',
+                marker: {{ color: sorted.map(r => r.model_type === 'dest' ? '#ad3f2f' : '#1f6a73') }},
+                customdata: sorted.map(r => [r.coefficient_name, r.p_value]),
+                hovertemplate: '%{x}<br>coef=%{y:.4f}<br>param=%{customdata[0]}<br>p=%{customdata[1]:.4g}<extra></extra>'
+            }], {{
+                title: 'Crash-related coefficients kept in the smoke model',
+                paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                margin: {{ l: 40, r: 10, t: 40, b: 80 }}
+            }}, {{responsive: true}});
+        }}
+
+        function renderCorrPlot() {{
+            const rows = corrRows.slice(0, 12).reverse();
+            Plotly.newPlot('corrPlot', [{
+                x: rows.map(r => Number(r.correlation)),
+                y: rows.map(r => String(r.feature).replace(/_y$/, '').replace(/_/g, ' ')),
+                type: 'bar', orientation: 'h', marker: {{ color: rows.map(r => Number(r.correlation) < 0 ? '#ad3f2f' : '#1f6a73') }}
+            }], {{
+                title: 'Features most associated with the safety penalty map',
+                paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                margin: {{ l: 130, r: 10, t: 40, b: 40 }}
+            }}, {{responsive: true}});
+        }}
+
+        function renderZonePlot() {{
+            const rows = topZones.slice(0, 20).reverse();
+            Plotly.newPlot('zonePlot', [{
+                x: rows.map(r => Number(r.max_dest_safety_penalty)),
+                y: rows.map(r => r.SA2_NAME16 || `Zone ${{r.ORDER}}`),
+                type: 'bar', orientation: 'h', marker: {{ color: '#ad3f2f' }}
+            }], {{
+                title: 'Most penalised destination zones',
+                paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                margin: {{ l: 170, r: 10, t: 40, b: 40 }}
+            }}, {{responsive: true}});
+        }}
+
+        function renderTables() {{
+            const zTable = document.getElementById('zoneTable');
+            zTable.innerHTML = '<tr><th>SA2</th><th>Penalty</th><th>Crash</th><th>TOTEMP</th><th>TOTPOP</th></tr>' +
+                topZones.slice(0, 15).map(r => `
+                    <tr>
+                        <td>${{r.SA2_NAME16 || r.ORDER}}</td>
+                        <td>${{Number(r.max_dest_safety_penalty).toFixed(3)}}</td>
+                        <td>${{Number.isFinite(Number(r.inbound_crash_total)) ? Number(r.inbound_crash_total).toFixed(1) : 'n/a'}}</td>
+                        <td>${{Number.isFinite(Number(r.TOTEMP)) ? Number(r.TOTEMP).toFixed(0) : 'n/a'}}</td>
+                        <td>${{Number.isFinite(Number(r.TOTPOP)) ? Number(r.TOTPOP).toFixed(0) : 'n/a'}}</td>
+                    </tr>`).join('');
+
+            const cTable = document.getElementById('coefTable');
+            cTable.innerHTML = '<tr><th>Segment</th><th>Model</th><th>Parameter</th><th>Coef</th><th>p-value</th></tr>' +
+                crashRows.map(r => `
+                    <tr>
+                        <td>${{r.segment}}</td>
+                        <td>${{r.model_type}}</td>
+                        <td>${{r.coefficient_name}}</td>
+                        <td>${{Number(r.value).toFixed(4)}}</td>
+                        <td>${{Number.isFinite(Number(r.p_value)) ? Number(r.p_value).toFixed(4) : 'n/a'}}</td>
+                    </tr>`).join('');
+        }}
+
+        function renderModeSharePlot() {{
+            if (!modeShareRows.length) return;
+            const modes = modeShareRows.map(r => r.mode);
+            Plotly.newPlot('modeSharePlot', [
+                {{
+                    name: 'With safety skims',
+                    x: modes, y: modeShareRows.map(r => Number(r.with_safety)),
+                    type: 'bar', marker: {{color: '#2C6B9C'}},
+                    hovertemplate: '%{{x}}: %{{y:.1f}}%<extra>with safety</extra>'
+                }},
+                {{
+                    name: 'Without safety skims',
+                    x: modes, y: modeShareRows.map(r => Number(r.without_safety)),
+                    type: 'bar', marker: {{color: '#E07030'}},
+                    hovertemplate: '%{{x}}: %{{y:.1f}}%<extra>without safety</extra>'
+                }}
+            ], {{
+                title: 'Mode share: with vs without safety skims',
+                barmode: 'group',
+                paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                yaxis: {{title: 'Mode share (%)'}},
+                legend: {{orientation: 'h', y: -0.2}},
+                margin: {{l: 50, r: 10, t: 50, b: 60}}
+            }}, {{responsive: true}});
+        }}
+
+        function renderModeDeltaPlot() {{
+            if (!modeShareRows.length) return;
+            const modes = modeShareRows.map(r => r.mode);
+            const deltas = modeShareRows.map(r => Number(r.delta));
+            Plotly.newPlot('modeDeltaPlot', [{{
+                x: modes, y: deltas, type: 'bar',
+                marker: {{color: deltas.map(d => d < 0 ? '#2ECC71' : '#E74C3C')}},
+                hovertemplate: '%{{x}}: %{{y:+.2f}} pp<extra></extra>',
+                text: deltas.map(d => `${{d > 0 ? '+' : ''}}${{d.toFixed(2)}}pp`),
+                textposition: 'outside'
+            }}], {{
+                title: 'Mode share shift from removing safety skims (positive = increases without crash penalty)',
+                paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                yaxis: {{title: 'Δ share (pp)', zeroline: true}},
+                margin: {{l: 50, r: 10, t: 50, b: 60}}
+            }}, {{responsive: true}});
+        }}
+
+        function renderDestShiftPlot() {{
+            if (!destShiftRows.length) return;
+            const stats = destShiftRows.map(r => r.stat.replace('dist_', '').replace('_km', ''));
+            const bVals = destShiftRows.map(r => r.with_safety);
+            const nVals = destShiftRows.map(r => r.without_safety);
+            const deltas = destShiftRows.map(r => r.delta);
+            Plotly.newPlot('destShiftPlot', [
+                {{
+                    name: 'With safety', x: stats, y: bVals, type: 'bar',
+                    marker: {{color: '#2C6B9C'}},
+                    hovertemplate: '%{{x}}: %{{y:.2f}} km<extra>with safety</extra>'
+                }},
+                {{
+                    name: 'Without safety', x: stats, y: nVals, type: 'bar',
+                    marker: {{color: '#E07030'}},
+                    hovertemplate: '%{{x}}: %{{y:.2f}} km<extra>without safety</extra>'
+                }},
+                {{
+                    name: 'Δ (km)', x: stats, y: deltas, type: 'scatter', mode: 'markers+text',
+                    marker: {{color: '#1f6a73', size: 10, symbol: 'diamond'}},
+                    text: deltas.map(d => d !== null ? `${{d > 0 ? '+' : ''}}${{Number(d).toFixed(2)}}km` : ''),
+                    textposition: 'top center',
+                    yaxis: 'y2'
+                }}
+            ], {{
+                title: 'Trip distance distribution: with vs without safety skims',
+                barmode: 'group',
+                paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                yaxis: {{title: 'Distance (km)'}},
+                yaxis2: {{title: 'Δ km', overlaying: 'y', side: 'right', showgrid: false}},
+                legend: {{orientation: 'h', y: -0.2}},
+                margin: {{l: 50, r: 60, t: 50, b: 60}}
+            }}, {{responsive: true}});
+        }}
+
+        // ── OD flow network (HHTS observed tours as lines) ─────────────────
+        const modeColors = {{
+            DA: '#E74C3C', SR: '#E67E22', Walk: '#27AE60',
+            Bike: '#3498DB', Transit: '#9B59B6'
+        }};
+        let odLayer = null;
+        function renderOdFlows() {{
+            if (odLayer) {{ map.removeLayer(odLayer); odLayer = null; }}
+            if (!odToggle.checked || !odFlows.length) return;
+            const modeFilter = odModeFilter.value;
+            const maxFlow = Math.max(...odFlows.map(r => r.flow));
+            const lines = odFlows
+                .filter(r => modeFilter === 'all' || r.mode === modeFilter)
+                .map(r => {{
+                    const w = Math.max(0.8, (r.flow / maxFlow) * 6);
+                    const col = modeColors[r.mode] || '#888';
+                    return L.polyline(
+                        [[r.oLat, r.oLon], [r.dLat, r.dLon]],
+                        {{ color: col, weight: w, opacity: 0.55 }}
+                    ).bindPopup(`OTAZ ${{r.o}} → DTAZ ${{r.d}}<br>Mode: ${{r.mode}}<br>HHTS flows: ${{r.flow}}`);
+                }});
+            odLayer = L.layerGroup(lines).addTo(map);
+        }}
+
+        // ── Destination zone shift Plotly chart ────────────────────────────
+        function renderDestZoneShiftPlot() {{
+            if (!destZoneShift.length) return;
+            const el = document.getElementById('destZoneShiftPlot');
+            if (!el) return;
+            const segs = [...new Set(destZoneShift.map(r => r.segment))];
+            const traces = segs.map(seg => {{
+                const rows = destZoneShift
+                    .filter(r => r.segment === seg)
+                    .sort((a, b) => a.delta_pred - b.delta_pred)
+                    .slice(0, 30);
+                return {{
+                    name: seg,
+                    x: rows.map(r => Number(r.delta_pred)),
+                    y: rows.map(r => `Zone ${{r.zone}}`),
+                    type: 'bar', orientation: 'h',
+                    hovertemplate: `${{seg}} Zone %{{y}}<br>Δ pred share: %{{x:.4f}}<extra></extra>`
+                }};
+            }});
+            Plotly.newPlot('destZoneShiftPlot', traces, {{
+                title: 'Destination zone probability shift (baseline pred − nosafety pred)',
+                barmode: 'overlay',
+                paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+                xaxis: {{title: 'Δ predicted share (baseline − nosafety)'}},
+                margin: {{l: 80, r: 10, t: 50, b: 50}}
+            }}, {{responsive: true}});
+        }}
+
+        metricSelect.addEventListener('change', e => renderMap(e.target.value));
+        odToggle.addEventListener('change', renderOdFlows);
+        odModeFilter.addEventListener('change', renderOdFlows);
+        renderMap(metricSelect.value);
+        renderOdFlows();
+        renderCoeffPlot();
+        renderCorrPlot();
+        renderZonePlot();
+        renderTables();
+        renderModeSharePlot();
+        renderModeDeltaPlot();
+        renderDestShiftPlot();
+        renderDestZoneShiftPlot();
+    </script>
+</body>
+</html>"""
+        html = (
+                html.replace('__PAYLOAD_JSON__', json.dumps(dashboard_payload))
+                .replace('__BASELINE_LABEL__', os.path.basename(baseline_dir))
+                .replace('__NOSAFETY_LABEL__', os.path.basename(nosafety_dir))
+                .replace('__ZONE_COUNT__', str(int(zone_df['ORDER'].nunique())))
+                .replace('__CRASH_SOURCE__', os.path.basename(crash_source) if crash_source else 'none')
+        )
+        with open(html_path, 'w', encoding='utf-8') as handle:
+                handle.write(html)
+        logger.info(f"Interactive safety dashboard -> {html_path}")
+        return html_path
 
 
 @timer("GA — Stage 6 (person + accessibility)")
@@ -4765,10 +5856,104 @@ def GA_STAGED(filepath: str = None):
 
 
 # ---------------------------------------------------------------------------
+def GA_STAGE5_SMOKE(filepath: str = None):
+    """Run only GA Stage 5 with an ultra-small budget for wiring checks.
+
+    This mode is intentionally minimal and does not run full synth prediction.
+    It exists to quickly verify Stage 5 GA setup, checkpoint writing, and
+    report generation without paying the full runtime of ga/ga_staged.
+    """
+    import pickle
+
+    logger.info("Starting Stage 5-only GA smoke test (no full pipeline run).")
+    sc, out, landuse = load_data()
+
+    prev_budget = os.environ.get('GA_BUDGET')
+    os.environ['GA_BUDGET'] = 'smoke'
+    try:
+        res = ga_stage5(out, landuse)
+    finally:
+        if prev_budget is None:
+            os.environ.pop('GA_BUDGET', None)
+        else:
+            os.environ['GA_BUDGET'] = prev_budget
+
+    from ga_hypothesis_testing import AllStagesResult
+    all_ga = AllStagesResult()
+    all_ga.results[5] = res
+
+    # Save smoke artifacts without overwriting the main staged output file.
+    smoke_pkl = os.path.join(OUT_DIR, 'ga_results_stage5_smoke.pkl')
+    with open(smoke_pkl, 'wb') as _f:
+        pickle.dump(all_ga, _f)
+    logger.info(f"Stage 5 smoke GA results saved -> {smoke_pkl}")
+
+    # Standard checkpoint/report bundle for parity with full staged runs.
+    _save_ga_checkpoint(all_ga, stage_id=5, failed=False)
+    _hist = getattr(res, 'history', []) if res is not None else []
+    _hist_df = pd.DataFrame(_hist) if _hist else None
+    _write_stage_checkpoint_report(
+        stage_tag='ga_stage5_smoke',
+        title='GA Stage 5 Smoke Test - Selected Model & Convergence',
+        summary=_format_ga_checkpoint_summary(res),
+        table=_hist_df,
+    )
+
+    try:
+        ga_reports_dir = os.path.join(OUT_DIR, 'ga_reports')
+        all_ga.export_reports(ga_reports_dir)
+        logger.info(f"GA smoke reports exported -> {ga_reports_dir}/")
+    except Exception as _gae:
+        logger.warning(f"GA smoke report export failed: {_gae}")
+
+    try:
+        mode_feats = res.best_features.get('mode') if getattr(res, 'best_features', None) else None
+        dest_feats = res.best_features.get('dest') if getattr(res, 'best_features', None) else None
+
+        logger.info("Stage 5 smoke: fitting final selected Stage 5 models with safety terms...")
+        _fit_stage5_smoke_models(
+            out=out,
+            landuse=landuse,
+            save_dir=OUT_DIR,
+            mode_feature_override=mode_feats,
+            dest_feature_override=dest_feats,
+            safety_mode='baseline',
+            use_gpu=True,
+        )
+
+        nosafety_dir = os.path.join(OUT_DIR, 'safety_nosafety')
+        logger.info("Stage 5 smoke: refitting the same selected Stage 5 models without safety terms...")
+        _fit_stage5_smoke_models(
+            out=out,
+            landuse=landuse,
+            save_dir=nosafety_dir,
+            mode_feature_override=mode_feats,
+            dest_feature_override=dest_feats,
+            use_gpu=True,
+            safety_mode='nosafety',
+        )
+
+        safety_out_dir = os.path.join(OUT_DIR, 'safety_analysis')
+        compare_safety_runs(
+            baseline_dir=OUT_DIR,
+            nosafety_dir=nosafety_dir,
+            out_dir=safety_out_dir,
+            landuse=landuse,
+        )
+    except Exception as _s5e:
+        import traceback as _tb_s5
+        logger.warning(f"Stage 5 smoke final estimation/reporting failed: {_s5e}")
+        logger.debug(_tb_s5.format_exc())
+
+    logger.info("Stage 5-only GA smoke test complete.")
+
+
+# ---------------------------------------------------------------------------
 def compare_safety_runs(
     baseline_dir: str = 'runs/safety_baseline',
     nosafety_dir: str = 'runs/safety_nosafety',
     out_dir:      str = 'runs/safety_analysis',
+    landuse: Optional[pd.DataFrame] = None,
 ) -> None:
     """
     Core paper analysis: compare Stage 5 models estimated WITH vs WITHOUT
@@ -4822,19 +6007,37 @@ def compare_safety_runs(
                 return pd.read_csv(p)
         return pd.DataFrame()
 
-    def _load_plan(d):
-        for fn in ('stage6_output.csv', 'stage5_output.csv'):
-            p = os.path.join(d, fn)
-            if os.path.exists(p):
-                df = pd.read_csv(p)
-                logger.info(f"  Loaded plan {fn} from {d}: {len(df):,} rows")
-                return df
+    def _load_loc_obs(d):
+        """Load HHTS location-choice observations (OTAZ, DTAZ, mode, dist_km)."""
+        p = os.path.join(d, 'location_choice', 'location_choice_observations.csv')
+        if os.path.exists(p):
+            df = pd.read_csv(p)
+            logger.info(f"  Loaded location_choice_observations from {d}: {len(df):,} rows")
+            return df
+        return pd.DataFrame()
+
+    def _load_mode_validation(d):
+        """Load mode_share_validation.csv from location_choice dir."""
+        p = os.path.join(d, 'location_choice', 'mode_share_validation.csv')
+        if os.path.exists(p):
+            return pd.read_csv(p)
+        return pd.DataFrame()
+
+    def _load_dest_validation(d):
+        """Load location_choice_validation.csv (zone-level pred_share)."""
+        p = os.path.join(d, 'location_choice', 'location_choice_validation.csv')
+        if os.path.exists(p):
+            return pd.read_csv(p)
         return pd.DataFrame()
 
     coef_base = _load_coef(baseline_dir)
     coef_nosa = _load_coef(nosafety_dir)
-    plan_base = _load_plan(baseline_dir)
-    plan_nosa = _load_plan(nosafety_dir)
+    obs_base  = _load_loc_obs(baseline_dir)
+    obs_nosa  = _load_loc_obs(nosafety_dir)
+    ms_val_base = _load_mode_validation(baseline_dir)
+    ms_val_nosa = _load_mode_validation(nosafety_dir)
+    dv_base = _load_dest_validation(baseline_dir)
+    dv_nosa = _load_dest_validation(nosafety_dir)
 
     rows = []    # accumulate result rows
 
@@ -4842,12 +6045,18 @@ def compare_safety_runs(
     crash_cols = [c for c in getattr(coef_base, 'columns', [])
                   if 'crash' in str(c).lower() or 'CRASH' in str(c)]
 
-    if not coef_base.empty and not coef_nosa.empty:
+    if not coef_base.empty:
         _coef_id  = next((c for c in coef_base.columns
-                          if c.lower() in ('parameter', 'coef_name', 'name', 'variable')),
+                          if c.lower() in ('parameter', 'coef_name', 'coefficient_name', 'name', 'variable')),
                          coef_base.columns[0])
-        for _df, _lbl in [(coef_base, 'with_safety'), (coef_nosa, 'without_safety')]:
-            crash_rows = _df[_df[_coef_id].str.lower().str.contains('crash', na=False)]
+        _pairs = [(coef_base, 'with_safety')]
+        if not coef_nosa.empty:
+            _pairs.append((coef_nosa, 'without_safety'))
+        for _df, _lbl in _pairs:
+            _coef_id_local = next((c for c in _df.columns
+                                   if c.lower() in ('parameter', 'coef_name', 'coefficient_name', 'name', 'variable')),
+                                  _df.columns[0])
+            crash_rows = _df[_df[_coef_id_local].str.lower().str.contains('crash', na=False)]
             for _, cr in crash_rows.iterrows():
                 _beta = pd.to_numeric(cr.get('value', cr.get('coef', cr.get('estimate', np.nan))),
                                        errors='coerce')
@@ -4859,7 +6068,7 @@ def compare_safety_runs(
                     'category': 'crash_coef',
                     'run':      _lbl,
                     'segment':  str(cr.get('segment', cr.get('purpose', 'all'))),
-                    'parameter': str(cr[_coef_id]),
+                    'parameter': str(cr[_coef_id_local]),
                     'beta':     round(float(_beta), 4) if np.isfinite(_beta) else None,
                     'se':       round(float(_se),   4) if np.isfinite(_se)   else None,
                     't_ratio':  round(float(_t),    3) if np.isfinite(_t)    else None,
@@ -4922,83 +6131,132 @@ def compare_safety_runs(
                     'significant': bool(delta_rho > 0) if np.isfinite(delta_rho) else None,
                 })
 
-    # ── 3. Mode share shift ────────────────────────────────────────────────
-    MODE_NAMES_LOCAL = {1: 'Drive Alone', 2: 'Shared Ride',
-                        3: 'Walk', 4: 'Bike', 5: 'Transit'}
+    # ── 3. Mode share shift (from location_choice/mode_share_validation.csv) ─
+    # Prefer predicted mode shares from model validation; fall back to HHTS observed.
+    def _extract_ms_from_validation(mv_df):
+        """Return {mode_name: pred_share_pct} from mode_share_validation.csv."""
+        if mv_df.empty or 'mode_name' not in mv_df.columns:
+            return {}
+        # Only include rows where at least one run has non-zero predicted share
+        col = 'pred_share_pct' if 'pred_share_pct' in mv_df.columns else 'obs_share_pct'
+        result = {}
+        for _, r in mv_df.iterrows():
+            mode = str(r['mode_name'])
+            val = float(r[col]) if pd.notna(r.get(col)) else 0.0
+            result[mode] = result.get(mode, 0.0) + val / mv_df['segment'].nunique()
+        return result
 
-    def _mode_share(plan):
-        if plan.empty:
-            return pd.Series(dtype=float)
-        t = plan[plan['row_type'] == 'trip'] if 'row_type' in plan.columns else plan
-        if 'mode' in t.columns:
-            return t['mode'].map(MODE_NAMES_LOCAL).value_counts(normalize=True) * 100
-        if 'mode_name' in t.columns:
-            return t['mode_name'].value_counts(normalize=True) * 100
-        return pd.Series(dtype=float)
+    def _obs_ms_from_validation(mv_df):
+        """Return {mode_name: obs_share_pct} averaged across segments."""
+        if mv_df.empty or 'mode_name' not in mv_df.columns:
+            return {}
+        result = {}
+        for _, r in mv_df.iterrows():
+            mode = str(r['mode_name'])
+            val = float(r['obs_share_pct']) if pd.notna(r.get('obs_share_pct')) else 0.0
+            result[mode] = result.get(mode, 0.0) + val / mv_df['segment'].nunique()
+        return result
 
-    ms_base = _mode_share(plan_base)
-    ms_nosa = _mode_share(plan_nosa)
-    all_modes = list(set(ms_base.index) | set(ms_nosa.index))
+    # baseline: use predicted shares; nosafety: use observed (since nosafety predictions
+    # may be zero if the model DataTree wasn't live during validation)
+    ms_base_pred = _extract_ms_from_validation(ms_val_base)
+    ms_nosa_pred = _extract_ms_from_validation(ms_val_nosa)
+    ms_base_obs  = _obs_ms_from_validation(ms_val_base)
+
+    # If nosafety predictions are all zero, fall back to obs for nosafety
+    # and show baseline_pred vs baseline_obs (effect of including safety)
+    nosa_has_preds = any(v > 0 for v in ms_nosa_pred.values())
+    if not nosa_has_preds and ms_base_pred:
+        logger.info("  Nosafety mode shares are zero — showing baseline pred vs HHTS observed mode shift")
+        ms_with   = ms_base_pred
+        ms_without = ms_base_obs
+        ms_label  = 'predicted_vs_observed'
+    else:
+        ms_with   = ms_base_pred
+        ms_without = ms_nosa_pred
+        ms_label  = 'with_vs_without_safety'
+
+    all_modes = sorted(set(ms_with.keys()) | set(ms_without.keys()))
     for mode in all_modes:
-        b_val = float(ms_base.get(mode, 0))
-        n_val = float(ms_nosa.get(mode, 0))
+        b_val = float(ms_with.get(mode, 0))
+        n_val = float(ms_without.get(mode, 0))
         rows.append({
             'category':   'mode_share',
-            'run':        'comparison',
+            'run':        ms_label,
             'segment':    'all',
             'parameter':  str(mode),
-            'beta':       round(b_val, 2),    # with_safety
-            'se':         round(n_val, 2),    # without_safety
-            't_ratio':    round(n_val - b_val, 2),   # Δ (positive = increase when removing crash)
+            'beta':       round(b_val, 2),
+            'se':         round(n_val, 2),
+            't_ratio':    round(n_val - b_val, 2),
             'p_value':    None,
             'significant': None,
         })
-    active_b = sum(float(ms_base.get(m, 0)) for m in ['Walk', 'Bike'])
-    active_n = sum(float(ms_nosa.get(m, 0)) for m in ['Walk', 'Bike'])
+    active_b = sum(float(ms_with.get(m, 0)) for m in ['Walk', 'Bike'])
+    active_n = sum(float(ms_without.get(m, 0)) for m in ['Walk', 'Bike'])
     rows.append({
         'category': 'active_travel',
-        'run':      'comparison', 'segment': 'all',
+        'run': ms_label, 'segment': 'all',
         'parameter': 'active_mode_share_pct',
-        'beta':     round(active_b, 2),
-        'se':       round(active_n, 2),
-        't_ratio':  round(active_n - active_b, 2),
-        'p_value':  None, 'significant': None,
+        'beta': round(active_b, 2), 'se': round(active_n, 2),
+        't_ratio': round(active_n - active_b, 2),
+        'p_value': None, 'significant': None,
     })
-    logger.info(f"  Active travel: with_safety={active_b:.1f}%  "
-                f"without_safety={active_n:.1f}%  Δ={active_n-active_b:+.2f}pp")
+    logger.info(f"  Active travel ({ms_label}): with={active_b:.1f}%  without={active_n:.1f}%  Δ={active_n-active_b:+.2f}pp")
 
-    # ── 4. Distance distribution shift ────────────────────────────────────
-    def _dist_stats(plan):
-        t = plan[plan['row_type'] == 'trip'] if 'row_type' in plan.columns else plan
-        dc = next((c for c in ['dist_km', 'dist', 'DIST'] if c in t.columns), None)
-        if not dc:
+    # ── 4. Destination zone shift (from location_choice_validation.csv) ───────
+    # Compare predicted zone share between baseline and nosafety models.
+    dest_zone_shift_rows = []
+    if not dv_base.empty:
+        _dv = dv_base.copy()
+        if not dv_nosa.empty and not dv_nosa['pred_share'].eq(0).all():
+            _dv = _dv.merge(
+                dv_nosa[['segment', 'zone', 'pred_share']].rename(columns={'pred_share': 'pred_share_nosa'}),
+                on=['segment', 'zone'], how='left',
+            )
+            _dv['delta_pred'] = _dv['pred_share_nosa'].fillna(0) - _dv['pred_share']
+        else:
+            # Nosafety predictions unavailable — compare model pred vs HHTS obs
+            _dv['pred_share_nosa'] = _dv['obs_share']
+            _dv['delta_pred'] = _dv['obs_share'] - _dv['pred_share']
+        for _, r in _dv.iterrows():
+            dest_zone_shift_rows.append({
+                'segment': str(r['segment']),
+                'zone': int(r['zone']) if pd.notna(r['zone']) else None,
+                'obs_share': float(r['obs_share']),
+                'pred_share_base': float(r['pred_share']),
+                'pred_share_nosa': float(r.get('pred_share_nosa', 0)),
+                'delta_pred': float(r.get('delta_pred', 0)),
+            })
+
+    # Distance stats from HHTS observations
+    def _dist_stats(obs_df):
+        dc = next((c for c in ['trip_dist', 'dist_km', 'dist', 'DIST'] if c in obs_df.columns), None)
+        if obs_df.empty or not dc:
             return {}
-        vals = pd.to_numeric(t[dc], errors='coerce').dropna()
+        vals = pd.to_numeric(obs_df[dc], errors='coerce').dropna()
         if vals.empty:
             return {}
         return {
             'mean': vals.mean(), 'median': vals.median(),
-            'p25':  vals.quantile(0.25), 'p75': vals.quantile(0.75),
-            'p90':  vals.quantile(0.90),
+            'p25': vals.quantile(0.25), 'p75': vals.quantile(0.75),
+            'p90': vals.quantile(0.90),
         }
 
-    ds_base = _dist_stats(plan_base)
-    ds_nosa = _dist_stats(plan_nosa)
+    ds_base = _dist_stats(obs_base)
+    ds_nosa = _dist_stats(obs_nosa)
     for stat in ['mean', 'median', 'p75', 'p90']:
         b_val = ds_base.get(stat, np.nan)
         n_val = ds_nosa.get(stat, np.nan)
         delta = n_val - b_val if np.isfinite(b_val) and np.isfinite(n_val) else np.nan
         rows.append({
-            'category': 'trip_distance',
-            'run':      'comparison', 'segment': 'all',
+            'category': 'trip_distance', 'run': 'comparison', 'segment': 'all',
             'parameter': f'dist_{stat}_km',
-            'beta':     round(b_val, 3) if np.isfinite(b_val) else None,
-            'se':       round(n_val, 3) if np.isfinite(n_val) else None,
-            't_ratio':  round(delta,  3) if np.isfinite(delta)  else None,
+            'beta': round(b_val, 3) if np.isfinite(b_val) else None,
+            'se':   round(n_val, 3) if np.isfinite(n_val) else None,
+            't_ratio': round(delta, 3) if np.isfinite(delta) else None,
             'p_value': None, 'significant': None,
         })
-    logger.info(f"  Mean trip dist: with={ds_base.get('mean',np.nan):.2f}km  "
-                f"without={ds_nosa.get('mean',np.nan):.2f}km")
+    logger.info(f"  Mean trip dist (HHTS obs): {ds_base.get('mean', np.nan):.2f} km")
 
     # ── Write outputs ──────────────────────────────────────────────────────
     df_rows = pd.DataFrame(rows)
@@ -5086,8 +6344,8 @@ def compare_safety_runs(
                 rows = plan
             return rows[purp_col].value_counts(normalize=True) * 100
 
-        act_base = _activity_dist(plan_base)
-        act_nosa = _activity_dist(plan_nosa)
+        act_base = _activity_dist(obs_base)
+        act_nosa = _activity_dist(obs_nosa)
 
         if not act_base.empty or not act_nosa.empty:
             all_acts = sorted(set(act_base.index) | set(act_nosa.index))
@@ -5154,8 +6412,8 @@ def compare_safety_runs(
             is_active = m.isin(['Walk', 'Bike'])
             return t.groupby(zcol).apply(lambda g: is_active.loc[g.index].mean() * 100)
 
-        za_base = _zone_active_share(plan_base)
-        za_nosa = _zone_active_share(plan_nosa)
+        za_base = _zone_active_share(obs_base)
+        za_nosa = _zone_active_share(obs_nosa)
 
         if not za_base.empty and not za_nosa.empty:
             common = za_base.index.intersection(za_nosa.index)
@@ -5428,11 +6686,663 @@ Generated by pipeline_logger.py compare_safety_runs() — {pd.Timestamp.now().st
         _hf.write(html)
     logger.info(f"Safety report → {html_path}")
     logger.info(f"Safety CSV   → {os.path.join(out_dir, 'safety_comparison.csv')}")
+
+    try:
+        _write_interactive_safety_dashboard(
+            baseline_dir=baseline_dir,
+            nosafety_dir=nosafety_dir,
+            out_dir=out_dir,
+            landuse=landuse,
+            comparison_df=df_rows,
+            hhts_obs=obs_base,
+            dest_zone_shift=dest_zone_shift_rows,
+        )
+    except Exception as _dash_e:
+        logger.warning(f"Interactive safety dashboard failed: {_dash_e}")
+
+    try:
+        spatial_path = _write_spatial_destination_dashboard(
+            baseline_dir=baseline_dir,
+            nosafety_dir=nosafety_dir,
+            out_dir=out_dir,
+            landuse=landuse,
+        )
+        if spatial_path:
+            print(f"  Spatial dashboard -> {spatial_path}")
+    except Exception as _sp_e:
+        import traceback as _tb_sp
+        logger.warning(f"Spatial destination dashboard failed: {_sp_e}")
+        logger.debug(_tb_sp.format_exc())
+
     print(f"\n{'='*60}")
     print(f"Safety comparison complete.")
-    print(f"  HTML report → {html_path}")
-    print(f"  CSV data    → {os.path.join(out_dir, 'safety_comparison.csv')}")
-    print(f"  Figures     → {os.path.join(out_dir, 'plots')}/")
+    print(f"  HTML report -> {html_path}")
+    print(f"  CSV data    -> {os.path.join(out_dir, 'safety_comparison.csv')}")
+    print(f"  Figures     -> {os.path.join(out_dir, 'plots')}/")
+
+
+def _write_spatial_destination_dashboard(
+    baseline_dir: str,
+    nosafety_dir: str,
+    out_dir: str,
+    landuse: Optional[pd.DataFrame] = None,
+) -> Optional[str]:
+    """
+    Full interactive spatial dashboard: observed destination flows, person-type
+    attraction, land-use context, and safety-induced redistribution.
+
+    Uses baseline location_choice_observations (HHTS observed tours with OTAZ/DTAZ,
+    mode, purpose, person attributes) plus zone-level model pred_share vs obs_share
+    to show where safety skims shift destination probabilities and who is most affected.
+    """
+    import geopandas as gpd
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ── Zone centroid lookup ──────────────────────────────────────────────────
+    zone_centroids = pd.read_csv('seq_zone_ids_.csv')
+    zone_centroids['ORDER'] = pd.to_numeric(zone_centroids['ORDER'], errors='coerce')
+    zone_centroids = zone_centroids.dropna(subset=['ORDER', 'latitude', 'longitude'])
+    zone_centroids = zone_centroids.set_index('ORDER')
+    zname_col = next((c for c in ['SA2_NAME16', 'SA2_NAME21', 'SA2_NAME'] if c in zone_centroids.columns), None)
+
+    def _zone_name(order):
+        try:
+            return str(zone_centroids.at[int(order), zname_col]) if zname_col else f'Zone {int(order)}'
+        except Exception:
+            return f'Zone {int(order) if order else "?"}'
+
+    # ── Load baseline HHTS observations ──────────────────────────────────────
+    obs_path = os.path.join(baseline_dir, 'location_choice', 'location_choice_observations.csv')
+    if not os.path.exists(obs_path):
+        logger.warning(f"Spatial dashboard: observations not found at {obs_path}")
+        return None
+    obs = pd.read_csv(obs_path)
+    obs['DTAZ']     = pd.to_numeric(obs['choice'],     errors='coerce')
+    obs['OTAZ']     = pd.to_numeric(obs['OTAZ'],       errors='coerce')
+    obs['tour_mode']= pd.to_numeric(obs['tour_mode'],  errors='coerce')
+    obs['trip_dist']= pd.to_numeric(obs['trip_dist'],  errors='coerce')
+    obs = obs.dropna(subset=['DTAZ', 'OTAZ'])
+
+    # ── Derive person-type groupings from obs columns ─────────────────────────
+    # HHTS obs uses case/person IDs that don't match the synthetic population
+    # persons file. Derive meaningful traveller types from obs fields directly.
+    MODE_NAMES = {1: 'DA', 2: 'SR', 3: 'Walk', 4: 'Bike', 5: 'Transit'}
+    obs['_mode_name'] = obs['tour_mode'].map(MODE_NAMES).fillna('DA')
+
+    # Traveller type from segment + study_level
+    def _traveller_type(row):
+        seg = str(row.get('segment', ''))
+        sl  = int(row['study_level']) if pd.notna(row.get('study_level')) else 0
+        if seg == 'work':
+            return 'Worker'
+        if seg == 'edu' or sl > 0:
+            return 'Student'
+        return 'Leisure'
+    obs['_traveller_type'] = obs.apply(_traveller_type, axis=1)
+
+    # Mobility type from mode
+    def _mobility_type(mode_code):
+        m = MODE_NAMES.get(int(mode_code) if pd.notna(mode_code) else 1, 'DA')
+        if m in ('Walk', 'Bike'):    return 'Active'
+        if m == 'Transit':           return 'Transit'
+        return 'Private car'
+    obs['_mobility_type'] = obs['tour_mode'].apply(_mobility_type)
+
+    # Study level label
+    STUDY_LABELS = {0: 'Non-student', 1: 'Primary', 2: 'Secondary', 3: 'Tertiary', 4: 'Postgrad'}
+    obs['_study_level'] = obs['study_level'].map(STUDY_LABELS).fillna('Non-student')
+
+    # ── Load validation CSV (pred_share vs obs_share per zone/segment) ────────
+    val_path = os.path.join(baseline_dir, 'location_choice', 'location_choice_validation.csv')
+    val_df   = pd.read_csv(val_path) if os.path.exists(val_path) else pd.DataFrame()
+
+    # Aggregate pred/obs share across segments per zone
+    if not val_df.empty:
+        zone_val = (
+            val_df.groupby('zone', as_index=False)
+            .agg(obs_tours_total=('obs_tours','sum'),
+                 obs_share_mean=('obs_share','mean'),
+                 pred_share_mean=('pred_share','mean'))
+        )
+        zone_val['delta_share'] = zone_val['pred_share_mean'] - zone_val['obs_share_mean']
+        zone_val['zone'] = pd.to_numeric(zone_val['zone'], errors='coerce')
+        zone_val_dict = zone_val.set_index('zone').to_dict('index')
+    else:
+        zone_val_dict = {}
+
+    # ── Load accessibility ────────────────────────────────────────────────────
+    acc_df = pd.DataFrame()
+    for acc_path in ['saved_data/accessibility.csv', 'accessibility.csv']:
+        if os.path.exists(acc_path):
+            acc_df = pd.read_csv(acc_path)
+            break
+    acc_id = next((c for c in ['zone_id', 'ORDER', 'zone'] if c in acc_df.columns), None) if not acc_df.empty else None
+    if not acc_df.empty and acc_id:
+        acc_df[acc_id] = pd.to_numeric(acc_df[acc_id], errors='coerce')
+        acc_dict = acc_df.set_index(acc_id).to_dict('index')
+    else:
+        acc_dict = {}
+
+    # ── Load safety penalty from existing dashboard JSON ──────────────────────
+    dash_json_path = os.path.join(out_dir, 'safety_dashboard_data.json')
+    crash_by_zone  = {}
+    if os.path.exists(dash_json_path):
+        try:
+            with open(dash_json_path, encoding='utf-8') as _jf:
+                _dash = json.load(_jf)
+            for feat in _dash.get('geojson', {}).get('features', []):
+                p = feat.get('properties', {})
+                z = p.get('ORDER')
+                if z is not None:
+                    crash_by_zone[int(z)] = {
+                        'crash_total': p.get('inbound_crash_total'),
+                        'safety_penalty': p.get('max_dest_safety_penalty'),
+                        'crash_log_mean': p.get('inbound_crash_log_mean'),
+                    }
+        except Exception as _je:
+            logger.debug(f"Could not load safety dashboard JSON: {_je}")
+
+    # ── Aggregate per destination zone ────────────────────────────────────────
+    def _safe_vc(series, normalize=False):
+        if series.dropna().empty:
+            return {}
+        vc = series.dropna().value_counts(normalize=normalize)
+        if normalize:
+            return {str(k): round(float(v)*100, 1) for k, v in vc.items()}
+        return {str(k): int(v) for k, v in vc.items()}
+
+    zone_detail = {}
+    for dtaz, grp in obs.groupby('DTAZ'):
+        dtaz_int = int(dtaz)
+        top_origins = (
+            grp.groupby('OTAZ').size()
+            .nlargest(8)
+            .reset_index(name='count')
+            .assign(name=lambda d: d['OTAZ'].apply(_zone_name))
+            .to_dict('records')
+        )
+        vd = zone_val_dict.get(dtaz, {})
+        ad = acc_dict.get(dtaz_int, {})
+        cd = crash_by_zone.get(dtaz_int, {})
+
+        record = {
+            'name':          _zone_name(dtaz_int),
+            'obs_tours':     len(grp),
+            'mean_dist':     round(float(grp['trip_dist'].dropna().mean()), 2) if not grp['trip_dist'].dropna().empty else None,
+            'mode_share':    _safe_vc(grp['_mode_name'], normalize=True),
+            'purpose_share': _safe_vc(grp['purpose'],    normalize=True),
+            'segment_share': _safe_vc(grp['segment'],    normalize=True),
+            'top_origins':   top_origins,
+            'obs_share_mean':  round(float(vd.get('obs_share_mean', 0)), 5) if vd else None,
+            'pred_share_mean': round(float(vd.get('pred_share_mean', 0)), 5) if vd else None,
+            'delta_share':     round(float(vd.get('delta_share', 0)), 5) if vd else None,
+            'crash_total':   cd.get('crash_total'),
+            'safety_penalty':cd.get('safety_penalty'),
+            'crash_log_mean':cd.get('crash_log_mean'),
+            'acc_auto_work': ad.get('auto_work_acc'),
+            'acc_walk':      ad.get('walk_acc'),
+            'acc_transit':   ad.get('transit_acc'),
+            'acc_bike':      ad.get('bike_acc'),
+        }
+        record['traveller_type'] = _safe_vc(grp['_traveller_type'])
+        record['mobility_type']  = _safe_vc(grp['_mobility_type'])
+        record['study_level']    = _safe_vc(grp['_study_level'])
+        zone_detail[dtaz_int] = record
+
+    # ── Build OD flow network (top 600 pairs) ─────────────────────────────────
+    od_grp = obs.groupby(['OTAZ', 'DTAZ', '_mode_name', 'segment']).size().reset_index(name='flow')
+    od_top = od_grp.nlargest(600, 'flow')
+    od_flows = []
+    max_flow = float(od_top['flow'].max()) if len(od_top) else 1.0
+    for _, r in od_top.iterrows():
+        o, d = int(r['OTAZ']), int(r['DTAZ'])
+        if o not in zone_centroids.index or d not in zone_centroids.index:
+            continue
+        od_flows.append({
+            'o': o, 'd': d,
+            'oLat': float(zone_centroids.at[o, 'latitude']),
+            'oLon': float(zone_centroids.at[o, 'longitude']),
+            'dLat': float(zone_centroids.at[d, 'latitude']),
+            'dLon': float(zone_centroids.at[d, 'longitude']),
+            'flow': int(r['flow']),
+            'mode': str(r['_mode_name']),
+            'segment': str(r['segment']),
+            'w': round(max(0.6, float(r['flow']) / max_flow * 8), 2),
+        })
+
+    # ── Build GeoJSON with all zone attributes ────────────────────────────────
+    shp_path = os.path.join('saved_data', 'SA2_2021_AUST_SHP_GDA2020', 'SA2_2021_AUST_GDA2020.shp')
+    if not os.path.exists(shp_path):
+        logger.warning(f"Spatial dashboard: shapefile not found at {shp_path}")
+        return None
+    geo = gpd.read_file(shp_path).to_crs(epsg=4326)
+    geo_code = next((c for c in ['SA2_MAIN16','SA2_CODE16','SA2_MAIN21','SA2_CODE21'] if c in geo.columns), None)
+    zmap = zone_centroids.reset_index()[['ORDER', 'SA2_CODE'] if 'SA2_CODE' in zone_centroids.columns
+                                        else ['ORDER']].copy()
+    # Build ORDER → SA2_CODE lookup
+    zmap2 = pd.read_csv('seq_zone_ids_.csv')
+    zmap2['ORDER'] = pd.to_numeric(zmap2['ORDER'], errors='coerce')
+    sa2_col = next((c for c in ['SA2_MAIN16','SA2_CODE16','SA2_MAIN21'] if c in zmap2.columns), None)
+    if sa2_col:
+        zmap2['_SA2_KEY'] = zmap2[sa2_col].astype(str).str.strip().str.replace(r'\.0$','',regex=True)
+        order_to_sa2 = zmap2.set_index('ORDER')['_SA2_KEY'].to_dict()
+    else:
+        order_to_sa2 = {}
+
+    if geo_code:
+        geo['_SA2_KEY'] = geo[geo_code].astype(str).str.strip().str.replace(r'\.0$','',regex=True)
+        sa2_to_order = {v: k for k, v in order_to_sa2.items()}
+        geo['ORDER'] = geo['_SA2_KEY'].map(sa2_to_order)
+        geo = geo[geo['ORDER'].notna()].copy()
+        geo['ORDER'] = geo['ORDER'].astype(int)
+
+        def _merge_zone(row):
+            o = int(row['ORDER'])
+            zd = zone_detail.get(o, {})
+            vd = zone_val_dict.get(o, {})
+            ad = acc_dict.get(o, {})
+            cd = crash_by_zone.get(o, {})
+            return {
+                'ORDER': o,
+                'zone_name': zd.get('name', _zone_name(o)),
+                'obs_tours': zd.get('obs_tours', 0),
+                'mean_dist': zd.get('mean_dist'),
+                'delta_share': zd.get('delta_share'),
+                'pred_share_mean': zd.get('pred_share_mean'),
+                'obs_share_mean':  zd.get('obs_share_mean'),
+                'crash_total':   cd.get('crash_total'),
+                'safety_penalty': cd.get('safety_penalty'),
+                'acc_auto_work': ad.get('auto_work_acc'),
+                'acc_walk':      ad.get('walk_acc'),
+                'acc_transit':   ad.get('transit_acc'),
+                'pct_walk_bike': zd.get('mode_share', {}).get('Walk', 0) + zd.get('mode_share', {}).get('Bike', 0),
+                'dominant_mode': max(zd.get('mode_share', {'DA': 100}), key=zd.get('mode_share', {'DA': 100}).get) if zd.get('mode_share') else 'DA',
+                'dominant_purpose': max(zd.get('purpose_share', {'unknown': 100}), key=zd.get('purpose_share', {'unknown': 100}).get) if zd.get('purpose_share') else 'unknown',
+            }
+
+        geo_props = geo.apply(_merge_zone, axis=1, result_type='expand')
+        for col in geo_props.columns:
+            geo[col] = geo_props[col]
+        geo_json = json.loads(geo.to_json())
+    else:
+        geo_json = {'type': 'FeatureCollection', 'features': []}
+
+    # ── Payload ───────────────────────────────────────────────────────────────
+    def _clean(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return None
+        return v
+
+    def _clean_dict(d):
+        return {k: _clean(v) if not isinstance(v, dict) else _clean_dict(v) for k, v in d.items()}
+
+    zone_detail_clean = {k: _clean_dict(v) for k, v in zone_detail.items()}
+
+    payload = {
+        'geojson':     geo_json,
+        'zone_detail': zone_detail_clean,
+        'od_flows':    od_flows,
+        'run_label':   os.path.basename(baseline_dir),
+    }
+
+    # ── HTML ──────────────────────────────────────────────────────────────────
+    html_path = os.path.join(out_dir, 'spatial_destination_dashboard.html')
+    _html = _build_spatial_dashboard_html(payload)
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(_html)
+    logger.info(f"Spatial destination dashboard -> {html_path}")
+    return html_path
+
+
+def _build_spatial_dashboard_html(payload: dict) -> str:
+    """Render the full interactive spatial destination dashboard HTML."""
+    payload_json = json.dumps(payload, allow_nan=False)
+    return f"""<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Spatial Destination Dashboard — Safety Analysis</title>
+<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'>
+<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>
+<script src='https://cdn.plot.ly/plotly-2.35.2.min.js'></script>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,Arial,sans-serif;background:#1a1e2e;color:#e8eaf0;height:100vh;display:flex;flex-direction:column}}
+#topbar{{background:#242840;padding:10px 18px;display:flex;align-items:center;gap:16px;border-bottom:1px solid #353a5a;flex-shrink:0;flex-wrap:wrap}}
+#topbar h1{{font-size:1rem;font-weight:700;color:#7eb8f7;margin-right:8px;white-space:nowrap}}
+.ctrl-group{{display:flex;align-items:center;gap:6px;font-size:0.8rem;color:#9aa3c4}}
+select,input[type=range]{{background:#1a1e2e;color:#e8eaf0;border:1px solid #353a5a;border-radius:6px;padding:4px 8px;font-size:0.78rem;cursor:pointer}}
+select:focus{{outline:1px solid #7eb8f7}}
+.badge{{background:#353a5a;border-radius:12px;padding:2px 8px;font-size:0.72rem;color:#9aa3c4}}
+#layout{{display:flex;flex:1;overflow:hidden}}
+#map-wrap{{flex:1;position:relative;min-width:0}}
+#map{{height:100%;width:100%}}
+#sidebar{{width:380px;background:#242840;border-left:1px solid #353a5a;display:flex;flex-direction:column;overflow:hidden;flex-shrink:0}}
+#zone-header{{padding:12px 14px;background:#2d3250;border-bottom:1px solid #353a5a;flex-shrink:0}}
+#zone-header h2{{font-size:0.95rem;color:#7eb8f7}}
+#zone-header .meta{{font-size:0.75rem;color:#9aa3c4;margin-top:3px}}
+#charts{{flex:1;overflow-y:auto;padding:8px}}
+.chart-panel{{background:#1a1e2e;border-radius:8px;margin-bottom:8px;padding:4px;border:1px solid #353a5a}}
+.chart-panel h4{{font-size:0.73rem;color:#9aa3c4;padding:6px 8px 0;text-transform:uppercase;letter-spacing:.06em}}
+.chart-panel .plotly-chart{{height:170px}}
+#legend{{position:absolute;bottom:24px;left:10px;background:rgba(26,30,46,.88);border-radius:8px;padding:10px 14px;font-size:0.72rem;color:#9aa3c4;z-index:900;border:1px solid #353a5a;min-width:160px}}
+#legend h4{{color:#7eb8f7;font-size:0.75rem;margin-bottom:6px}}
+.leg-row{{display:flex;align-items:center;gap:7px;margin:3px 0}}
+.leg-swatch{{width:16px;height:10px;border-radius:2px;flex-shrink:0}}
+#tooltip{{position:absolute;top:10px;left:50%;transform:translateX(-50%);background:rgba(26,30,46,.94);border:1px solid #353a5a;border-radius:8px;padding:8px 14px;font-size:0.78rem;color:#e8eaf0;z-index:900;pointer-events:none;max-width:300px;text-align:center;display:none}}
+.od-legend{{position:absolute;bottom:24px;right:10px;background:rgba(26,30,46,.88);border-radius:8px;padding:8px 12px;font-size:0.71rem;color:#9aa3c4;z-index:900;border:1px solid #353a5a}}
+</style>
+</head>
+<body>
+
+<div id='topbar'>
+  <h1>Destination Spatial Dashboard</h1>
+  <div class='ctrl-group'>
+    <label>Zone colour</label>
+    <select id='metricSel'>
+      <option value='obs_tours'>Observed flows (HHTS)</option>
+      <option value='delta_share'>Safety model shift (pred − obs share)</option>
+      <option value='pred_share_mean'>Predicted destination share</option>
+      <option value='obs_share_mean'>Observed destination share</option>
+      <option value='pct_walk_bike'>Active mode share (%)</option>
+      <option value='safety_penalty'>Safety utility penalty</option>
+      <option value='crash_total'>Inbound crash exposure</option>
+      <option value='acc_walk'>Walk accessibility</option>
+      <option value='acc_transit'>Transit accessibility</option>
+      <option value='acc_auto_work'>Auto/work accessibility</option>
+    </select>
+  </div>
+  <div class='ctrl-group'>
+    <label>OD flows</label>
+    <select id='odSeg'>
+      <option value='all'>All segments</option>
+      <option value='work'>Work</option>
+      <option value='edu'>Education</option>
+      <option value='nonmand'>Non-mandatory</option>
+    </select>
+    <select id='odMode'>
+      <option value='all'>All modes</option>
+      <option value='DA'>Drive alone</option>
+      <option value='SR'>Shared ride</option>
+      <option value='Walk'>Walk</option>
+      <option value='Bike'>Bike</option>
+      <option value='Transit'>Transit</option>
+    </select>
+  </div>
+  <div class='ctrl-group'>
+    <label><input type='checkbox' id='odToggle' checked> Show OD flows</label>
+  </div>
+  <div class='ctrl-group'>
+    <label>Flow opacity <input type='range' id='odAlpha' min='10' max='90' value='45' style='width:70px'></label>
+  </div>
+  <span class='badge' id='flowCount'></span>
+</div>
+
+<div id='layout'>
+  <div id='map-wrap'>
+    <div id='map'></div>
+    <div id='tooltip'></div>
+    <div id='legend'>
+      <h4 id='leg-title'>Scale</h4>
+      <canvas id='leg-canvas' width='140' height='14' style='border-radius:3px;display:block;margin-bottom:4px'></canvas>
+      <div style='display:flex;justify-content:space-between;font-size:0.68rem'>
+        <span id='leg-min'></span><span id='leg-max'></span>
+      </div>
+    </div>
+    <div class='od-legend' id='od-legend'>
+      <div style='font-size:0.74rem;color:#7eb8f7;margin-bottom:5px;font-weight:600'>OD flow mode</div>
+    </div>
+  </div>
+  <div id='sidebar'>
+    <div id='zone-header'>
+      <h2 id='zone-title'>Click a zone to explore</h2>
+      <div class='meta' id='zone-meta'>Hover over the map to highlight a zone, click to pin details</div>
+    </div>
+    <div id='charts'>
+      <div class='chart-panel'><h4>Mode share</h4><div id='modeChart' class='plotly-chart'></div></div>
+      <div class='chart-panel'><h4>Trip purpose</h4><div id='purposeChart' class='plotly-chart'></div></div>
+      <div class='chart-panel'><h4>Traveller type (segment)</h4><div id='ageChart' class='plotly-chart'></div></div>
+      <div class='chart-panel'><h4>Mobility type (mode class)</h4><div id='incChart' class='plotly-chart'></div></div>
+      <div class='chart-panel'><h4>Study level</h4><div id='licChart' class='plotly-chart'></div></div>
+      <div class='chart-panel'><h4>Top origin zones</h4><div id='originChart' class='plotly-chart'></div></div>
+      <div class='chart-panel'><h4>Zone accessibility profile</h4><div id='accChart' class='plotly-chart'></div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const DATA = {payload_json};
+const zd   = DATA.zone_detail;
+const geo  = DATA.geojson;
+const ods  = DATA.od_flows;
+
+// ── Leaflet map ────────────────────────────────────────────────────────────
+const map = L.map('map', {{zoomSnap:0.5}}).setView([-27.5, 153.0], 9);
+L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png',{{
+  attribution:'&copy; OpenStreetMap, &copy; CartoDB', subdomains:'abcd', maxZoom:19
+}}).addTo(map);
+
+// ── Colour scales ──────────────────────────────────────────────────────────
+const METRIC_META = {{
+  obs_tours:      {{label:'Observed HHTS flows',  diverging:false, unit:'tours'}},
+  delta_share:    {{label:'Safety model shift (pred−obs)', diverging:true,  unit:'share Δ'}},
+  pred_share_mean:{{label:'Predicted share',       diverging:false, unit:'share'}},
+  obs_share_mean: {{label:'Observed share',        diverging:false, unit:'share'}},
+  pct_walk_bike:  {{label:'Active mode (%)',        diverging:false, unit:'%'}},
+  safety_penalty: {{label:'Safety penalty',        diverging:false, unit:'util'}},
+  crash_total:    {{label:'Inbound crash exposure',diverging:false, unit:'crashes'}},
+  acc_walk:       {{label:'Walk accessibility',    diverging:false, unit:'index'}},
+  acc_transit:    {{label:'Transit accessibility', diverging:false, unit:'index'}},
+  acc_auto_work:  {{label:'Auto/work accessibility',diverging:false,unit:'index'}},
+}};
+
+function lerp3(t, c0, c1, c2) {{
+  if (t <= 0.5) {{
+    const s = t*2;
+    return [c0[0]+(c1[0]-c0[0])*s, c0[1]+(c1[1]-c0[1])*s, c0[2]+(c1[2]-c0[2])*s];
+  }} else {{
+    const s = (t-0.5)*2;
+    return [c1[0]+(c2[0]-c1[0])*s, c1[1]+(c2[1]-c1[1])*s, c1[2]+(c2[2]-c1[2])*s];
+  }}
+}}
+function toHex(rgb) {{
+  return '#' + rgb.map(v=>Math.round(Math.max(0,Math.min(255,v))).toString(16).padStart(2,'0')).join('');
+}}
+function colourSeq(t) {{ return toHex(lerp3(t,[30,70,180],[0,160,130],[220,80,30]])); }}
+function colourDiv(t) {{ return toHex(lerp3(t,[220,50,50],[240,240,240],[30,120,200]])); }}
+
+let _vals, _min, _max, _diverging, odLayer=null, chorLayer=null, selectedOrder=null;
+
+function buildScale(metric) {{
+  _diverging = METRIC_META[metric]?.diverging;
+  const props = geo.features.map(f=>f.properties[metric]).filter(v=>v!=null&&isFinite(v));
+  if (!props.length) {{ _min=0; _max=1; return; }}
+  _min=Math.min(...props); _max=Math.max(...props);
+  drawLegend(metric);
+}}
+
+function getColour(val, metric) {{
+  if (val==null||!isFinite(val)) return '#2d3250';
+  const span=(_max-_min)||1;
+  const t=Math.max(0,Math.min(1,(val-_min)/span));
+  return _diverging ? colourDiv(t) : colourSeq(t);
+}}
+
+function drawLegend(metric) {{
+  const meta=METRIC_META[metric]||{{}};
+  document.getElementById('leg-title').textContent=meta.label||metric;
+  document.getElementById('leg-min').textContent=_min.toFixed(_min<0.01?4:2);
+  document.getElementById('leg-max').textContent=_max.toFixed(_max<0.01?4:2);
+  const canvas=document.getElementById('leg-canvas');
+  const ctx=canvas.getContext('2d');
+  for(let i=0;i<140;i++) {{
+    ctx.fillStyle=_diverging?colourDiv(i/139):colourSeq(i/139);
+    ctx.fillRect(i,0,1,14);
+  }}
+}}
+
+function renderChoropleth(metric) {{
+  buildScale(metric);
+  if (chorLayer) map.removeLayer(chorLayer);
+  chorLayer = L.geoJSON(geo, {{
+    style: f => {{
+      const v=f.properties[metric];
+      return {{fillColor:getColour(v,metric), fillOpacity:0.75, color:'#1a1e2e', weight:0.8}};
+    }},
+    onEachFeature: (f,lyr) => {{
+      lyr.on('mouseover', () => showTooltip(f.properties));
+      lyr.on('mouseout',  () => hideTooltip());
+      lyr.on('click',     () => selectZone(f.properties.ORDER));
+    }}
+  }}).addTo(map);
+}}
+
+// ── OD flows ───────────────────────────────────────────────────────────────
+const MODE_COLS = {{DA:'#e74c3c',SR:'#e67e22',Walk:'#27ae60',Bike:'#3498db',Transit:'#9b59b6'}};
+// Build OD legend
+const odLeg=document.getElementById('od-legend');
+Object.entries(MODE_COLS).forEach(([m,c])=>{{
+  odLeg.innerHTML+=`<div style='display:flex;align-items:center;gap:5px;margin:2px 0'>
+    <span style='width:22px;height:3px;background:${{c}};border-radius:2px;display:inline-block'></span>
+    <span>${{m}}</span></div>`;
+}});
+
+function renderOD() {{
+  if (odLayer) {{ map.removeLayer(odLayer); odLayer=null; }}
+  if (!document.getElementById('odToggle').checked) return;
+  const segF=document.getElementById('odSeg').value;
+  const modF=document.getElementById('odMode').value;
+  const alpha=document.getElementById('odAlpha').value/100;
+  const filtered=ods.filter(r=>(segF==='all'||r.segment===segF)&&(modF==='all'||r.mode===modF));
+  document.getElementById('flowCount').textContent=`${{filtered.length}} OD pairs`;
+  const lines=filtered.map(r=>L.polyline([[r.oLat,r.oLon],[r.dLat,r.dLon]],{{
+    color:MODE_COLS[r.mode]||'#888', weight:r.w, opacity:alpha
+  }}).bindTooltip(`${{r.segment}} | ${{r.mode}} | ${{r.flow}} flows`,{{sticky:true}}));
+  odLayer=L.layerGroup(lines).addTo(map);
+}}
+
+// ── Tooltip ────────────────────────────────────────────────────────────────
+const tt=document.getElementById('tooltip');
+function showTooltip(p) {{
+  const metric=document.getElementById('metricSel').value;
+  const val=p[metric];
+  const valStr=val!=null?Number(val).toFixed(val<0.01&&val>-0.01?5:2):'n/a';
+  tt.innerHTML=`<strong>${{p.zone_name||'Zone '+p.ORDER}}</strong><br>
+    ${{METRIC_META[metric]?.label||metric}}: <b>${{valStr}}</b><br>
+    HHTS tours: ${{p.obs_tours||0}} | Dominant mode: ${{p.dominant_mode||'?'}}`;
+  tt.style.display='block';
+}}
+function hideTooltip() {{ if (!selectedOrder) tt.style.display='none'; }}
+
+// ── Zone selection & sidebar ───────────────────────────────────────────────
+const PLOTLY_CFG={{responsive:true, displayModeBar:false}};
+const DARK={{paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'rgba(0,0,0,0)',
+  font:{{color:'#9aa3c4',size:10}},
+  margin:{{l:0,r:0,t:8,b:0}},
+  xaxis:{{color:'#353a5a',gridcolor:'#2d3250',tickfont:{{size:9}}}},
+  yaxis:{{color:'#353a5a',gridcolor:'#2d3250',tickfont:{{size:9}}}},
+}};
+const DARK_H={{...DARK,margin:{{l:80,r:10,t:8,b:20}}}};
+
+function barH(el, labels, vals, colours, title) {{
+  Plotly.newPlot(el, [{{x:vals,y:labels,type:'bar',orientation:'h',
+    marker:{{color:colours}},textposition:'inside',text:vals.map(v=>v>0?v.toFixed(1)+'%':'')
+  }}], {{...DARK_H, title:{{text:'',font:{{size:9}}}}}}, PLOTLY_CFG);
+}}
+
+function selectZone(order) {{
+  selectedOrder=order;
+  const d=zd[order];
+  if (!d) {{ document.getElementById('zone-title').textContent='No detail for zone '+order; return; }}
+
+  document.getElementById('zone-title').textContent=d.name||`Zone ${{order}}`;
+  const distStr=d.mean_dist!=null?`avg dist: ${{d.mean_dist}} km`:'';
+  const penStr=d.safety_penalty!=null?` | safety penalty: ${{Number(d.safety_penalty).toFixed(3)}}`:'';
+  const deltaStr=d.delta_share!=null?` | pred−obs: ${{Number(d.delta_share)>0?'+':''}}${{Number(d.delta_share).toFixed(4)}}`:'';
+  document.getElementById('zone-meta').textContent=
+    `${{d.obs_tours}} HHTS tours | ${{distStr}}${{penStr}}${{deltaStr}}`;
+
+  // Mode share
+  const ms=d.mode_share||{{}};
+  const mkeys=['DA','SR','Walk','Bike','Transit'];
+  const mvals=mkeys.map(k=>ms[k]||0);
+  const mcols=['#e74c3c','#e67e22','#27ae60','#3498db','#9b59b6'];
+  barH('modeChart', mkeys, mvals, mcols);
+
+  // Purpose share
+  const ps=d.purpose_share||{{}};
+  const pkeys=Object.keys(ps).sort((a,b)=>ps[b]-ps[a]).slice(0,8);
+  barH('purposeChart', pkeys.map(k=>k.replace(/_/g,' ')), pkeys.map(k=>ps[k]||0),
+    pkeys.map((_,i)=>['#7eb8f7','#5ec4a0','#f7c67e','#e88aaa','#b09ef7','#f78e5e','#78d4e8','#a8e8a0'][i%8]));
+
+  // Traveller type (Worker / Student / Leisure)
+  const tt=d.traveller_type||{{}};
+  const ttkeys=['Worker','Student','Leisure'];
+  barH('ageChart', ttkeys, ttkeys.map(k=>tt[k]||0),
+    ['#7eb8f7','#5ec4a0','#f7c67e']);
+
+  // Mobility type (Active / Transit / Private car)
+  const mt=d.mobility_type||{{}};
+  const mtkeys=['Active','Transit','Private car'];
+  barH('incChart', mtkeys, mtkeys.map(k=>mt[k]||0),
+    ['#27ae60','#9b59b6','#e74c3c']);
+
+  // Study level
+  const sl=d.study_level||{{}};
+  const slkeys=['Non-student','Primary','Secondary','Tertiary','Postgrad'];
+  barH('licChart', slkeys, slkeys.map(k=>sl[k]||0),
+    ['#7eb8f7','#5ec4a0','#f7c67e','#e88aaa','#b09ef7']);
+
+  // Top origin zones
+  const tops=(d.top_origins||[]).slice(0,8);
+  if (tops.length) {{
+    Plotly.newPlot('originChart', [{{
+      x:tops.map(r=>r.count), y:tops.map(r=>r.name||`Zone ${{r.OTAZ}}`),
+      type:'bar', orientation:'h', marker:{{color:'#7eb8f7'}}
+    }}], {{...DARK_H}}, PLOTLY_CFG);
+  }}
+
+  // Accessibility
+  const accKeys=['acc_auto_work','acc_walk','acc_transit','acc_bike'];
+  const accLabels=['Auto/work','Walk','Transit','Bike'];
+  const accVals=accKeys.map(k=>d[k]);
+  const hasAcc=accVals.some(v=>v!=null);
+  if (hasAcc) {{
+    Plotly.newPlot('accChart', [{{
+      r:accVals.map(v=>v??0), theta:accLabels,
+      fill:'toself', type:'scatterpolar',
+      marker:{{color:'#7eb8f7'}}, line:{{color:'#7eb8f7'}}
+    }}], {{
+      ...DARK, margin:{{l:20,r:20,t:10,b:20}},
+      polar:{{bgcolor:'rgba(0,0,0,0)',
+        angularaxis:{{color:'#353a5a',tickfont:{{size:9}}}},
+        radialaxis:{{color:'#353a5a',tickfont:{{size:8}},visible:true}}
+      }}
+    }}, PLOTLY_CFG);
+  }}
+
+  // Highlight on map
+  showTooltip({{
+    zone_name:d.name, ORDER:order,
+    obs_tours:d.obs_tours, dominant_mode:Object.keys(d.mode_share||{{}})[0]||'?',
+    [document.getElementById('metricSel').value]: d[document.getElementById('metricSel').value]
+  }});
+}}
+
+// ── Wiring ────────────────────────────────────────────────────────────────
+document.getElementById('metricSel').addEventListener('change', e=>renderChoropleth(e.target.value));
+['odSeg','odMode','odToggle','odAlpha'].forEach(id=>
+  document.getElementById(id).addEventListener('change', renderOD));
+
+renderChoropleth('obs_tours');
+renderOD();
+
+// Click blank map to deselect
+map.on('click', () => {{ selectedOrder=null; tt.style.display='none'; }});
+</script>
+</body>
+</html>"""
 
 
 def _get_model_zoo_searches() -> dict:
@@ -5784,6 +7694,7 @@ if __name__ == "__main__":
             "debug",
             "ga",
             "ga_staged",
+            "ga_stage5_smoke",
             "mcr_search",
             "safety_baseline",
             "safety_nosafety",
@@ -5825,6 +7736,8 @@ if __name__ == "__main__":
         GA_main(arg)
     elif mode == 'ga_staged':
         GA_STAGED(arg)
+    elif mode == 'ga_stage5_smoke':
+        GA_STAGE5_SMOKE(arg)
     elif mode == 'mcr_search':
         run_mcr_search(arg)
     elif mode == 'hhts_core':

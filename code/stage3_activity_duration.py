@@ -51,6 +51,13 @@ import pickle
 from typing import Optional
 from scipy.stats import norm
 
+try:
+    from SearchLibrium import MDCEVModel
+    _MDCEV_AVAILABLE = True
+except Exception:
+    MDCEVModel = None
+    _MDCEV_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -90,6 +97,48 @@ INTERCEPT_CLIP_LO = -1000.0
 INTERCEPT_CLIP_HI = 1000.0
 
 PERSON_FEATURES = ['sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING', 'incp']
+
+DEFAULT_FEATURES_BY_PURPOSE = {
+    'work': ['WORKSTAT', 'incp', 'vehrd', 'CARLICENCE', 'ptype_FullTimeWorker', 'ptype_WorkingStudent', 'n_workers_hh'],
+    'edu': ['STUDYING', 'age_child', 'age_teen', 'ptype_SchoolChild', 'ptype_UniversityStudent', 'transit_acc'],
+    'escort': ['hh_child', 'nprd', 'vehrd', 'has_vehicle', 'WORKSTAT'],
+    'shopping': ['incp', 'vehrd', 'nprd', 'has_vehicle', 'auto_shop_acc'],
+    'social': ['nprd', 'is_female', 'age_teen', 'age_older', 'walk_acc'],
+    'othmaint': ['nprd', 'has_vehicle', 'WORKSTAT', 'auto_nonmand_acc'],
+    'othdiscr': ['incp', 'vehrd', 'age_older', 'walk_acc'],
+    'eat': ['incp', 'nprd', 'age_working', 'walk_acc', 'transit_acc'],
+}
+
+
+def _duration_person_features(df: pd.DataFrame, purpose: str, feature_override=None) -> list:
+    if isinstance(feature_override, dict):
+        names = feature_override.get(purpose, feature_override.get('*', []))
+    elif feature_override is not None:
+        names = feature_override
+    else:
+        names = DEFAULT_FEATURES_BY_PURPOSE.get(purpose, PERSON_FEATURES)
+    if not names:
+        names = PERSON_FEATURES
+    return [c for c in dict.fromkeys(names) if c in df.columns]
+
+
+def _numerical_hessian(func, params: np.ndarray, eps: float = 1e-4) -> np.ndarray:
+    params = np.asarray(params, dtype=float)
+    n = len(params)
+    hess = np.zeros((n, n), dtype=float)
+    for i in range(n):
+        ei = np.zeros(n, dtype=float)
+        ei[i] = eps
+        for j in range(i, n):
+            ej = np.zeros(n, dtype=float)
+            ej[j] = eps
+            fpp = func(params + ei + ej)
+            fpm = func(params + ei - ej)
+            fmp = func(params - ei + ej)
+            fmm = func(params - ei - ej)
+            hess[i, j] = (fpp - fpm - fmp + fmm) / (4.0 * eps * eps)
+            hess[j, i] = hess[i, j]
+    return hess
 
 
 def _quantile_profile(values: pd.Series, q=None) -> dict:
@@ -368,10 +417,10 @@ class BudgetLognormal:
         self._clip_coefficients()
 
         try:
-            hess_inv = res.hess_inv.todense() if hasattr(res.hess_inv, 'todense') else np.asarray(res.hess_inv)
-            hess_inv = np.asarray(hess_inv, dtype=float)
             params = np.concatenate([[self.intercept_], self.coef_, [self.log_sigma_]])
-            self.std_err_ = np.sqrt(np.clip(np.diag(hess_inv), 0.0, None))
+            hess = _numerical_hessian(lambda p: self._neg_ll(p, Xs, log_y), params)
+            cov = np.linalg.pinv(hess)
+            self.std_err_ = np.sqrt(np.clip(np.diag(cov), 0.0, None))
             self.t_stat_ = np.divide(params, self.std_err_, out=np.full_like(params, np.nan), where=self.std_err_ > 0)
             self.p_value_ = 2.0 * norm.sf(np.abs(self.t_stat_))
         except Exception:
@@ -429,11 +478,23 @@ def _feature_cols(df: pd.DataFrame, ptypes: list,
     return base
 
 
+    def _feature_cols_for_purpose(df: pd.DataFrame, ptypes: list, purpose: str,
+                      feature_override=None) -> list:
+        person_feats = _duration_person_features(df, purpose, feature_override)
+        base = (['start_hr', 'log_dist', 'B', 'budget_per_activity_hr', 'day_span_hr',
+             'n_mandatory', 'n_discretionary'] +
+            ACTIVITY_COLS +
+            [c for c in person_feats if c in df.columns] +
+            [f'ptype_{pt}' for pt in ptypes if f'ptype_{pt}' in df.columns])
+        return list(dict.fromkeys([c for c in base if c in df.columns]))
+
+
 def estimate_duration_models(
     tours: pd.DataFrame,
     persons: pd.DataFrame,
     trips: Optional[pd.DataFrame] = None,
     min_sample: int = 50,
+    use_mdcev: bool = False,
     feature_override: list = None,
 ) -> dict:
     """
@@ -447,8 +508,6 @@ def estimate_duration_models(
     """
     data    = _augment_duration_features(prepare_duration_data(tours, persons, trips=trips))
     ptypes  = data.attrs.get('ptypes', [])
-    feats   = _feature_cols(data, ptypes, feature_override=feature_override)
-
     # ---- diagnose purpose column before fitting -------------------------
     purpose_col = None
     for candidate in ['main_purpose', 'primary_purpose', 'tour_primary_purpose']:
@@ -510,7 +569,7 @@ def estimate_duration_models(
 
         y = subset['duration'].clip(lo, hi).values.astype(float)
 
-        X_cols = [c for c in feats if c in subset.columns]
+        X_cols = _feature_cols_for_purpose(data, ptypes, purpose, feature_override)
         X = subset[X_cols].fillna(0).values.astype(float)
 
         m = BudgetLognormal()
@@ -549,6 +608,29 @@ def estimate_duration_models(
 
     print(f"Stage 3: fitted {len(models)} duration models "
           f"({', '.join(models.keys())})")
+
+    if use_mdcev and _MDCEV_AVAILABLE and not data.empty and 'person_id' in data.columns:
+        try:
+            pp = (data.groupby(['person_id', purpose_col])['duration']
+                    .sum()
+                    .unstack(fill_value=0.0)
+                    .reindex(columns=PURPOSES, fill_value=0.0))
+            if len(pp) > 0 and (pp.sum(axis=1) > 0).any():
+                mdcev = MDCEVModel(outside_good=PURPOSES.index('work') if 'work' in PURPOSES else 0)
+                if hasattr(mdcev, 'fit_mle'):
+                    mdcev.fit_mle(pp.values, labels=PURPOSES)
+                else:
+                    mdcev.fit(pp.values, labels=PURPOSES)
+                models['_mdcev'] = {
+                    'model': mdcev,
+                    'labels': PURPOSES,
+                    'n_obs': int(len(pp)),
+                    'method': 'mle' if hasattr(mdcev, 'fit_mle') else 'heuristic',
+                }
+                logger.info(f"Stage 3: fitted MDCEV allocator on {len(pp)} person-day budgets")
+        except Exception as _mdcev_e:
+            logger.warning(f"Stage 3 MDCEV fit failed, falling back to lognormal-only allocation: {_mdcev_e}")
+
     return models
 
 
@@ -605,6 +687,7 @@ def predict_activity_durations(
     models: dict,
     sample: bool = True,
     seed: int = 42,
+    use_mdcev: bool = False,
 ) -> pd.DataFrame:
     """
     Predict duration for every activity instance, then rescale per person
@@ -737,6 +820,44 @@ def predict_activity_durations(
         mask = (acts['purpose'] == purpose) & acts['predicted_duration_min'].isna()
         acts.loc[mask, 'predicted_duration_min'] = (lo + hi) / 2
 
+    pid_col = 'person_id'
+
+    # ── optional MDCEV allocation before legacy budget rescaling ───────────
+    _mdcev_entry = models.get('_mdcev') if isinstance(models, dict) else None
+    _mdcev_model = _mdcev_entry.get('model') if isinstance(_mdcev_entry, dict) else None
+    if use_mdcev and _mdcev_model is not None:
+        try:
+            _updated = []
+            _purpose_idx = {p: i for i, p in enumerate(PURPOSES)}
+            for pid, grp in acts.groupby(pid_col):
+                g = grp.copy()
+                B_hrs = float(g['B'].iloc[0])
+                B_min = B_hrs * 60 if B_hrs <= 24 else B_hrs
+                B_min = float(np.clip(B_min, 30, 960))
+
+                raw_by_p = g.groupby('purpose')['predicted_duration_min'].sum().reindex(PURPOSES, fill_value=0.0)
+                util_shift = np.log1p(raw_by_p.values)
+                util_shift = util_shift - float(np.nanmean(util_shift))
+                alloc_by_p = _mdcev_model.predict(np.array([B_min]), utility_shift=util_shift)[0]
+
+                for p in PURPOSES:
+                    pm = g['purpose'] == p
+                    if not pm.any():
+                        continue
+                    target = float(alloc_by_p[_purpose_idx[p]])
+                    raw = g.loc[pm, 'predicted_duration_min'].astype(float).values
+                    rsum = float(raw.sum())
+                    if rsum <= 1e-9:
+                        g.loc[pm, 'predicted_duration_min'] = target / max(int(pm.sum()), 1)
+                    else:
+                        g.loc[pm, 'predicted_duration_min'] = raw * (target / rsum)
+                _updated.append(g)
+
+            acts = pd.concat(_updated, axis=0).sort_index()
+            logger.info("Stage 3: applied MDCEV allocation to person-day budgets")
+        except Exception as _mdcev_pred_e:
+            logger.warning(f"Stage 3 MDCEV predict failed, using legacy rescaling: {_mdcev_pred_e}")
+
     # ── budget rescaling per person ──────────────────────────────────────────
     # ActivitySim approach: treat B as a SOFT guide, not a hard constraint.
     # Only scale down when significantly over-budget (>20%), and apply a
@@ -752,7 +873,6 @@ def predict_activity_durations(
     #  4. A ±10% tolerance band around B is accepted without any rescaling,
     #     letting the lognormal draws create natural person-to-person variation.
     acts['predicted_duration_min'] = acts['predicted_duration_min'].astype(float)
-    pid_col = 'person_id'
 
     # ── Enforce FLOORS only before rescaling ─────────────────────────────────
     # Do NOT clip the upper bound here — hard upper-bound clipping before the
@@ -989,6 +1109,7 @@ def run_stage3(
     sample: bool = True,
     seed: int = 42,
     save_path: str = 'saved_data/stage3_models.pkl',
+    use_mdcev: bool = False,
     feature_override: list = None,
 ) -> tuple:
     """Estimate duration models on HHTS, predict for Stage 2 output."""
@@ -1002,6 +1123,7 @@ def run_stage3(
 
     print("\n[1/2] Estimating duration models from HHTS...")
     models = estimate_duration_models(tours, persons, trips=trips,
+                                      use_mdcev=use_mdcev,
                                       feature_override=feature_override)
 
     if save_path:
@@ -1009,7 +1131,8 @@ def run_stage3(
 
     print("\n[2/2] Predicting activity durations for synthetic population...")
     activities = predict_activity_durations(synth_s2, models,
-                                            sample=sample, seed=seed)
+                                            sample=sample, seed=seed,
+                                            use_mdcev=use_mdcev)
 
     print("\nStage 3 complete. Pass activities to run_stage4().")
     return activities, models

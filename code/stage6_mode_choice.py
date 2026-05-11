@@ -133,6 +133,74 @@ PURPOSES = [
     'shopping', 'othmaint', 'othdiscr', 'eat',
 ]
 
+_S6_PURPOSE_PARAM_NAMES = {
+    'work': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'inc_da', 'wrk_da',
+        'lic_da', 'ft_da', 'ind_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'inc_tr', 'pt_tr', 'pub_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'age_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'age_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'edu': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'stu_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'stu_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'yng_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'escort': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'fem_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'fem_wk',
+        'asc_bk', 'ldb', 'nv_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'shopping': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'inc_da', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'fem_tr', 'inc_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'age_wk', 'fem_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'age_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'eat': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'inc_da', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'fem_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'fem_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'yng_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'social': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'inc_da', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'fem_tr', 'inc_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'age_wk', 'fem_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'age_bk', 'yng_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'othmaint': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'inc_da', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'fem_tr', 'inc_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'age_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'age_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'othdiscr': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'inc_da', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'fem_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'age_wk', 'fem_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'age_bk', 'yng_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+}
+
 # Mode labels
 MODES      = ['DA', 'SR', 'Transit', 'Walk', 'Bike']
 MODE_IDX   = {m: i for i, m in enumerate(MODES)}
@@ -221,7 +289,7 @@ def _lx_model_s6(dt):
     raise RuntimeError("No Larch compute engine available (tried jax, numba)")
 
 
-def _build_larch_nl_mode_s6(df: pd.DataFrame) -> tuple:
+def _build_larch_nl_mode_s6(df: pd.DataFrame, param_names: list, init_values: np.ndarray) -> tuple:
     """
     Build a Larch nested logit mode choice DataTree + Model.
 
@@ -278,50 +346,57 @@ def _build_larch_nl_mode_s6(df: pd.DataFrame) -> tuple:
     }
 
     # ── Utility expressions — match build_utility_matrix spec exactly ─────
+    active_params = set(param_names)
+
+    def _term(name, expr=None):
+        if name not in active_params:
+            return 0
+        return P(name) if expr is None else P(name) * X(expr)
+
     m.utility_co[_LARCH_MODE_IDS['DA']] = (
-        P('tt_da')  * X('trip.tt_h')
-        + P('ld_da') * X('trip.log_dist')
-        + P('cost')  * X('trip.cost_proxy')
-        + P('veh_da')* X('trip.has_vehicle')
-        + P('crash') * X('trip.log_crash')
-        + P('inc_da')* X('trip.inc_hi')
-        + P('wrk_da')* X('trip.worker')
-        + P('lic_da')* X('trip.licence')
-        + P('ft_da') * X('trip.full_time')
-        + P('ind_da')* X('trip.indp_industrial')
+        _term('tt_da', 'tt_h')
+        + _term('ld_da', 'log_dist')
+        + _term('cost', 'cost_proxy')
+        + _term('veh_da', 'has_vehicle')
+        + _term('crash', 'log_crash')
+        + _term('inc_da', 'inc_hi')
+        + _term('wrk_da', 'worker')
+        + _term('lic_da', 'licence')
+        + _term('ft_da', 'full_time')
+        + _term('ind_da', 'indp_industrial')
     )
     m.utility_co[_LARCH_MODE_IDS['SR']] = (
-        P('asc_sr')
-        + P('tt_sr') * X('trip.tt_h')
-        + P('ld_sr') * X('trip.log_dist')
-        + P('nv_sr') * X('trip.no_vehicle')
+        _term('asc_sr')
+        + _term('tt_sr', 'tt_h')
+        + _term('ld_sr', 'log_dist')
+        + _term('nv_sr', 'no_vehicle')
     )
     m.utility_co[_LARCH_MODE_IDS['Transit']] = (
-        P('asc_tr')
-        + P('tt_tr') * X('trip.tt_h')
-        + P('ld_tr') * X('trip.log_dist')
-        + P('acc_tr')* X('trip.accessibility')
-        + P('nv_tr') * X('trip.no_vehicle')
-        + P('stu_tr')* X('trip.student')
-        + P('fem_tr')* X('trip.female')
-        + P('inc_tr')* X('trip.inc_lo')
-        + P('pt_tr') * X('trip.part_time')
-        + P('pub_tr')* X('trip.indp_public')
+        _term('asc_tr')
+        + _term('tt_tr', 'tt_h')
+        + _term('ld_tr', 'log_dist')
+        + _term('acc_tr', 'accessibility')
+        + _term('nv_tr', 'no_vehicle')
+        + _term('stu_tr', 'student')
+        + _term('fem_tr', 'female')
+        + _term('inc_tr', 'inc_lo')
+        + _term('pt_tr', 'part_time')
+        + _term('pub_tr', 'indp_public')
     )
     m.utility_co[_LARCH_MODE_IDS['Walk']] = (
-        P('asc_wk')
-        + P('ldw')   * X('trip.ldw')
-        + P('nv_wk') * X('trip.no_vehicle')
-        + P('age_wk')* X('trip.older')
-        + P('fem_wk')* X('trip.female')
-        + P('stu_wk')* X('trip.student')
+        _term('asc_wk')
+        + _term('ldw', 'ldw')
+        + _term('nv_wk', 'no_vehicle')
+        + _term('age_wk', 'older')
+        + _term('fem_wk', 'female')
+        + _term('stu_wk', 'student')
     )
     m.utility_co[_LARCH_MODE_IDS['Bike']] = (
-        P('asc_bk')
-        + P('ldb')   * X('trip.ldb')
-        + P('nv_bk') * X('trip.no_vehicle')
-        + P('age_bk')* X('trip.older')
-        + P('yng_bk')* X('trip.young')
+        _term('asc_bk')
+        + _term('ldb', 'ldb')
+        + _term('nv_bk', 'no_vehicle')
+        + _term('age_bk', 'older')
+        + _term('yng_bk', 'young')
     )
 
     # ── Nested logit graph ────────────────────────────────────────────────
@@ -352,8 +427,7 @@ def _build_larch_nl_mode_s6(df: pd.DataFrame) -> tuple:
         pass
 
     # ── Inject NestedLogitModeModel starting values ───────────────────────
-    _pname_to_init = dict(zip(NestedLogitModeModel.PARAM_NAMES,
-                              NestedLogitModeModel.INIT))
+    _pname_to_init = dict(zip(param_names, init_values))
     for _pn, _pv in _pname_to_init.items():
         # Map scipy param names → Larch param names (identical except nest params)
         _larch_pn = _pn
@@ -368,7 +442,7 @@ def _build_larch_nl_mode_s6(df: pd.DataFrame) -> tuple:
     return dt, m
 
 
-def _extract_larch_coef_to_scipy(m) -> np.ndarray:
+def _extract_larch_coef_to_scipy(m, param_names: list, init_values: np.ndarray) -> np.ndarray:
     """
     Extract Larch model coefficients back to NestedLogitModeModel.PARAM_NAMES
     order (scipy coef_ format).
@@ -380,10 +454,10 @@ def _extract_larch_coef_to_scipy(m) -> np.ndarray:
         pf = m.pf
         larch_vals = {name: float(pf.loc[name, 'value']) for name in pf.index}
     except Exception:
-        return NestedLogitModeModel.INIT.copy()
+        return init_values.copy()
 
-    coef = NestedLogitModeModel.INIT.copy()
-    for i, pname in enumerate(NestedLogitModeModel.PARAM_NAMES):
+    coef = init_values.copy()
+    for i, pname in enumerate(param_names):
         # Map nest params: scipy 'mu_motorised' ← Larch 'Mu_Motorised'
         if pname == 'mu_motorised':
             larch_key = 'Mu_Motorised'
@@ -638,7 +712,7 @@ def prepare_mode_data(
     skim_map = {
         'tt_avg':   ['tt_avg', 'SOVTOLL_TIME__AM', 'auto_time', 'TRAVTIME'],
         'tt_am':    ['tt_am', 'SOVTOLL_TIME__AM'],
-        'dist':     ['dist', 'DIST', 'CUMDIST', 'distance_km', 'distance'],
+        'dist':     ['dist', 'DIST', 'CUMDIST', 'TRIPDIST', 'distance_km', 'distance'],
         'distwalk': ['distwalk', 'DISTWALK', 'walk_dist'],
         'distbike': ['distbike', 'DISTBIKE', 'bike_dist'],
         'crash':    ['crash', 'CRASH', 'crash_index'],
@@ -651,6 +725,8 @@ def prepare_mode_data(
             df[std] = 0.0
 
     df['log_dist']   = np.log1p(df['dist'])
+    df['log_crash']  = np.log1p(df['crash'])
+    df['tt_h']       = np.clip(df['tt_avg'] / 60.0, 0.01, 5.0)
     df['cost_proxy'] = df['dist'] * FUEL_RATE
 
     # ── zone TAZ ─────────────────────────────────────────────────────────
@@ -917,6 +993,19 @@ def build_utility_matrix(
     return np.asarray(V)
 
 
+def _s6_param_names_for_purpose(purpose: str) -> list:
+    return list(_S6_PURPOSE_PARAM_NAMES.get(purpose, NestedLogitModeModel.PARAM_NAMES))
+
+
+def _s6_param_spec(param_names: list):
+    bounds_map = dict(zip(NestedLogitModeModel.PARAM_NAMES, NestedLogitModeModel.BOUNDS))
+    init_map = dict(zip(NestedLogitModeModel.PARAM_NAMES, NestedLogitModeModel.INIT))
+    return (
+        np.array([init_map[name] for name in param_names], dtype=float),
+        [bounds_map[name] for name in param_names],
+    )
+
+
 # ---------------------------------------------------------------------------
 # 2.  NESTED LOGIT MODEL
 # ---------------------------------------------------------------------------
@@ -1021,6 +1110,9 @@ class NestedLogitModeModel:
         self.coef_         = None
         self.converged_    = False
         self.purpose_      = None
+        self.param_names_  = list(self.PARAM_NAMES)
+        self.init_         = self.INIT.copy()
+        self.bounds_       = list(self.BOUNDS)
         self.n_obs_        = 0
         self.ll_null_      = None
         self.ll_final_     = None
@@ -1032,6 +1124,10 @@ class NestedLogitModeModel:
         self.tstat_        = None
         self.pval_         = None
         self._larch_pf     = None    # Larch parameter frame (SE/tstat from Larch)
+
+    def _configure_for_purpose(self, purpose: str):
+        self.param_names_ = _s6_param_names_for_purpose(purpose)
+        self.init_, self.bounds_ = _s6_param_spec(self.param_names_)
 
     def _nested_proba(self, V: np.ndarray,
                       mu_m: float, mu_nm: float) -> np.ndarray:
@@ -1084,7 +1180,7 @@ class NestedLogitModeModel:
                 y: np.ndarray) -> float:
         mu_m  = float(params[-2])
         mu_nm = float(params[-1])
-        V     = build_utility_matrix(df, params[:-2], self.PARAM_NAMES[:-2])
+        V     = build_utility_matrix(df, params[:-2], self.param_names_[:-2])
         P     = self._nested_proba(V, mu_m, mu_nm)
         ll    = np.sum(np.log(P[np.arange(len(y)), y]))
         return -ll
@@ -1102,6 +1198,7 @@ class NestedLogitModeModel:
         and stored in self.frozen_probs_ for synthetic population transfer.
         """
         self.purpose_ = purpose
+        self._configure_for_purpose(purpose)
         self.n_obs_   = len(df)
 
         y = np.array([MODE_IDX[m] for m in df['chosen_mode']])
@@ -1147,7 +1244,7 @@ class NestedLogitModeModel:
         _larch_succeeded = False
         if _LARCH_AVAILABLE:
             try:
-                _dt, _lm = _build_larch_nl_mode_s6(df)
+                _dt, _lm = _build_larch_nl_mode_s6(df, self.param_names_, self.init_)
                 try:
                     _lm.set_cap(10)
                     _lm.doctor(repair_ch_av="+")
@@ -1169,7 +1266,7 @@ class NestedLogitModeModel:
                     )
                     _ll_larch = float(_lm_result.loglike)
 
-                self.coef_   = _extract_larch_coef_to_scipy(_lm)
+                self.coef_   = _extract_larch_coef_to_scipy(_lm, self.param_names_, self.init_)
                 self.ll_final_ = _ll_larch
                 self.converged_ = True
                 # Detect which engine was actually used
@@ -1187,12 +1284,12 @@ class NestedLogitModeModel:
                 try:
                     self._larch_pf = _lm.pf.copy()
                     _pf = self._larch_pf
-                    _k  = len(self.PARAM_NAMES)
+                    _k  = len(self.param_names_)
                     _se    = np.full(_k, np.nan)
                     _tstat = np.full(_k, np.nan)
                     _pval  = np.full(_k, np.nan)
                     from scipy.stats import norm as _snorm
-                    for _i, _pname in enumerate(self.PARAM_NAMES):
+                    for _i, _pname in enumerate(self.param_names_):
                         _lk = 'Mu_Motorised'    if _pname == 'mu_motorised' else \
                               'Mu_NonMotorised'  if _pname == 'mu_nonmotorised' else _pname
                         if _lk not in _pf.index:
@@ -1259,10 +1356,10 @@ class NestedLogitModeModel:
             try:
                 res = minimize(
                     self._neg_ll,
-                    self.INIT.copy(),
+                    self.init_.copy(),
                     args=(df, y),
                     method='L-BFGS-B',
-                    bounds=self.BOUNDS,
+                    bounds=self.bounds_,
                     options={'maxiter': 1000, 'ftol': 1e-10},
                 )
                 self.coef_      = res.x
@@ -1291,12 +1388,12 @@ class NestedLogitModeModel:
                     _n_valid = int(np.isfinite(_se).sum())
                     logger.debug(
                         f"  mode/{purpose}: scipy SEs from hess_inv — "
-                        f"{_n_valid}/{len(self.PARAM_NAMES)} valid"
+                        f"{_n_valid}/{len(self.param_names_)} valid"
                     )
                     # Warn about near-zero SEs (potential collinearity)
                     _near_bound = [
-                        self.PARAM_NAMES[i]
-                        for i in range(len(self.PARAM_NAMES))
+                        self.param_names_[i]
+                        for i in range(len(self.param_names_))
                         if np.isfinite(_se[i]) and _se[i] < 0.002
                     ]
                     if _near_bound:
@@ -1307,9 +1404,9 @@ class NestedLogitModeModel:
                         )
                 except Exception as _se_e:
                     logger.debug(f"  mode/{purpose}: scipy SE extraction failed: {_se_e}")
-                    self.se_    = np.full(len(self.PARAM_NAMES), np.nan)
-                    self.tstat_ = np.full(len(self.PARAM_NAMES), np.nan)
-                    self.pval_  = np.full(len(self.PARAM_NAMES), np.nan)
+                    self.se_    = np.full(len(self.param_names_), np.nan)
+                    self.tstat_ = np.full(len(self.param_names_), np.nan)
+                    self.pval_  = np.full(len(self.param_names_), np.nan)
                 if not res.success:
                     logger.warning(
                         f"  mode/{purpose}: scipy L-BFGS-B did not fully converge "
@@ -1325,13 +1422,13 @@ class NestedLogitModeModel:
                     f"  mode/{purpose}: scipy fallback also failed: {_scipy_e!r}\n"
                     "  Model will use INIT starting values — predictions will be uninformative."
                 )
-                self.coef_      = self.INIT.copy()
+                self.coef_      = self.init_.copy()
                 self.converged_ = False
                 self.ll_final_  = self.ll_null_
                 self._estimation_engine = 'init_fallback'
-                self.se_        = np.full(len(self.PARAM_NAMES), np.nan)
-                self.tstat_     = np.full(len(self.PARAM_NAMES), np.nan)
-                self.pval_      = np.full(len(self.PARAM_NAMES), np.nan)
+                self.se_        = np.full(len(self.param_names_), np.nan)
+                self.tstat_     = np.full(len(self.param_names_), np.nan)
+                self.pval_      = np.full(len(self.param_names_), np.nan)
 
         # ── Compute rho² ─────────────────────────────────────────────────
         if self.ll_null_ and self.ll_null_ != 0:
@@ -1395,7 +1492,7 @@ class NestedLogitModeModel:
         mu_m  = float(self.coef_[-2])
         mu_nm = float(self.coef_[-1])
         V     = build_utility_matrix(
-            df, self.coef_[:-2], self.PARAM_NAMES[:-2]
+            df, self.coef_[:-2], self.param_names_[:-2]
         )
         return self._nested_proba(V, mu_m, mu_nm)
 
@@ -1416,7 +1513,7 @@ class NestedLogitModeModel:
     def summary(self) -> pd.DataFrame:
         """Return coefficient summary table."""
         return pd.DataFrame({
-            'parameter': self.PARAM_NAMES,
+            'parameter': self.param_names_,
             'estimate':  np.round(self.coef_, 4),
         })
 
@@ -1466,7 +1563,7 @@ def estimate_mode_models(
         if m.rho2_ is not None and not np.isnan(m.rho2_) and m.rho2_ < 0.05:
             _warns.append(f"rho²={m.rho2_:.3f} — barely better than market shares")
         # Key parameter sign checks
-        _pdict = dict(zip(NestedLogitModeModel.PARAM_NAMES, m.coef_))
+        _pdict = dict(zip(m.param_names_, m.coef_))
         for _pname, _expected_sign in [('tt_da', 'neg'), ('ldw', 'neg'), ('ldb', 'neg')]:
             _v = _pdict.get(_pname, 0.0)
             if _expected_sign == 'neg' and _v > 0.001:
@@ -1982,7 +2079,7 @@ def _s6_model_table_html(purpose: str, model: 'NestedLogitModeModel') -> str:
         f'<td style="text-align:right">{_fv(pv)}</td>'
         f'</tr>'
         for p, c, s, t, pv in zip(
-            model.PARAM_NAMES, coef, se, tstat, pval
+            model.param_names_, coef, se, tstat, pval
         )
     )
     rho2_str  = f'{model.rho2_:.3f}' if model.rho2_ is not None and np.isfinite(model.rho2_) else 'n/a'
@@ -2087,7 +2184,7 @@ def _save_s6_coefficients(models: dict, path: str):
         se    = model.se_    if model.se_    is not None else np.full(len(coef), np.nan)
         tstat = model.tstat_ if model.tstat_ is not None else np.full(len(coef), np.nan)
         pval  = model.pval_  if model.pval_  is not None else np.full(len(coef), np.nan)
-        for param, c, s, t, pv in zip(model.PARAM_NAMES, coef, se, tstat, pval):
+        for param, c, s, t, pv in zip(model.param_names_, coef, se, tstat, pval):
             rows.append({
                 'purpose':   purpose,
                 'parameter': param,

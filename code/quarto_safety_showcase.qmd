@@ -1,0 +1,132 @@
+---
+title: "SearchLibrium + MetaCountRegressor + Larch: Safety Modeling Framework"
+subtitle: "Core, GA, and Extensive-GA Architecture for HHTS and Pipeline Integration"
+format:
+  revealjs:
+    theme: [default]
+    slide-number: true
+    toc: false
+    incremental: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Why This Framework
+
+- We need one coherent architecture for behavioral modeling and safety-aware search.
+- We use JAX-first estimation and search to keep gradients, speed, and reproducibility aligned.
+- We combine three ecosystems:
+  - SearchLibrium for discrete-choice and selection logic.
+  - MetaCountRegressor for structured family search and random-effects architecture.
+  - Larch 6 for benchmark DCM structure and nesting-tree diagnostics.
+
+## Core Models (No Search)
+
+- Stage pipeline behavior (0 to 4) can be run in fixed-spec mode.
+- Core estimators include:
+  - Larch MNL / NL / MXL.
+  - SearchLibrium MNL / NL / Ordered / Probit / Heckman two-step.
+  - MetaCount JAX count and survival AFT families with random effects.
+- Purpose: stable baseline, diagnostics, reproducible KPI reporting.
+
+## Genetic Algorithm Layer
+
+- GA performs variable and structure search under BIC-like objectives.
+- Search space spans:
+  - feature inclusion masks,
+  - family/model choices,
+  - random-parameter structure,
+  - latent/selection structure where applicable.
+- Output: best candidate specification per segment/purpose.
+
+## Extensive GA Layer
+
+- Extensive-GA increases breadth and depth:
+  - larger iteration budgets,
+  - multiple restart seeds,
+  - richer role and distribution combinations,
+  - stricter out-of-sample checks.
+- Tradeoff: higher runtime for improved structural discovery.
+
+## End-to-End Capability Map
+
+- Estimation modes:
+  - core fixed,
+  - fast search,
+  - standard search,
+  - extensive search.
+- Search families:
+  - nested logit timing search,
+  - multinomial search,
+  - selection screening (probit/heckman),
+  - duration survival screening.
+- Integration path:
+  - run in pipeline_logger as optional HHTS/search mode,
+  - publish run artifacts to run-tagged folders,
+  - feed best structures into downstream safety analysis.
+
+## How the Models Iterate Toward a Comprehensive Safety Model
+
+1. Fit core behavioral models for baseline interpretability.
+2. Use GA to search feature sets and structure under BIC constraints.
+3. Expand to extensive-GA for robustness and heterogeneity discovery.
+4. Refit top candidates in JAX with random-effects where relevant.
+5. Compare safety-on vs safety-off experiments and quantify behavioral shifts.
+
+## Safety Interpretation Logic
+
+- Safety skims change generalized utility/cost surfaces.
+- Resulting implications appear in:
+  - destination shifts,
+  - mode shifts,
+  - duration and participation effects,
+  - subgroup preference concentration.
+- We interpret both aggregate and subgroup-level effects.
+
+## Explicit Safety Implication Plot
+
+```{python}
+import pandas as pd
+import matplotlib.pyplot as plt
+
+path = "runs/safety_analysis/safety_profile_segments.csv"
+try:
+    df = pd.read_csv(path)
+except FileNotFoundError:
+    df = pd.DataFrame({
+        "segment": ["Workers", "Students", "Retired", "Low-income", "High-income"],
+        "delta_safe_zone_share": [0.021, 0.034, 0.012, 0.028, 0.015],
+    })
+
+fig, ax = plt.subplots(figsize=(9, 4.5))
+ax.bar(df["segment"], df["delta_safe_zone_share"], color="#1f77b4")
+ax.axhline(0.0, color="black", linewidth=0.8)
+ax.set_ylabel("Δ Share Choosing Safer Zones")
+ax.set_xlabel("Population Segment")
+ax.set_title("Who Is Attracted by Safer Zones?")
+plt.xticks(rotation=20, ha="right")
+plt.tight_layout()
+plt.show()
+```
+
+## What This Plot Means
+
+- Positive bars indicate segments increasingly attracted to safer zones.
+- Relative magnitudes reveal which cohorts are most safety-sensitive.
+- This becomes the policy-facing narrative for intervention design.
+
+## Operational Modes in Pipeline
+
+- `pipeline_logger.py hhts_core --search core_fixed`
+- `pipeline_logger.py hhts_search --search nested_standard`
+- `pipeline_logger.py hhts_search --search survival_screen`
+- `pipeline_logger.py list_searches`
+
+## Summary
+
+- The framework is now JAX-first for the new survival and selection additions.
+- Core, GA, and extensive-GA compose a unified modeling ladder.
+- Safety implications are made explicit at subgroup level, not only aggregate KPI level.
+- The presentation can be used as the technical + stakeholder bridge artifact.

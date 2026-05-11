@@ -64,6 +64,24 @@ ACTIVITY_COLS = [
 # Person-level predictors
 PERSON_FEATURES = ['sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING', 'incp']
 
+DEFAULT_FEATURES_BY_TARGET = {
+    'start': ['WORKSTAT', 'STUDYING', 'vehrd', 'wfh', 'WFHWEEK', 'sexp', 'nprd'],
+    'end': ['WORKSTAT', 'STUDYING', 'vehrd', 'sexp', 'nprd'],
+    'budget': ['WORKSTAT', 'STUDYING', 'vehrd', 'incp', 'sexp', 'nprd'],
+}
+
+
+def _stage2_person_features(feature_override, target_key: str, person_day: pd.DataFrame) -> list:
+    if isinstance(feature_override, dict):
+        names = feature_override.get(target_key, feature_override.get('*', []))
+    elif feature_override is not None:
+        names = feature_override
+    else:
+        names = DEFAULT_FEATURES_BY_TARGET.get(target_key, PERSON_FEATURES)
+    if not names:
+        names = PERSON_FEATURES
+    return [c for c in dict.fromkeys(names) if c in person_day.columns]
+
 # Plausible day window â€” TRAINING and PREDICTION bounds (minutes from midnight)
 # After filtering bad data, the HHTS shows:
 #   Workers:    start ~420-540 (7-9am),  end ~960-1080 (4-6pm)
@@ -622,7 +640,7 @@ def estimate_day_models(person_day: pd.DataFrame,
     # OLS on clipped data attenuates coefficients because obs censored at
     # MIN_START are treated as if that was their true value.  Tobit models
     # the latent departure time correctly.
-    _pf = feature_override if feature_override else PERSON_FEATURES
+    _pf = _stage2_person_features(feature_override, 'start', person_day)
     derived_feats = ['n_mandatory', 'n_discretionary', 'mandatory_share', 'escort_share', 'vehs_per_person', 'income_per_person']
     start_feats = ACTIVITY_COLS + derived_feats + _pf
     X_start, start_cols = _build_X(person_day, start_feats, ptypes)
@@ -633,7 +651,8 @@ def estimate_day_models(person_day: pd.DataFrame,
     logger.info(f"start_of_day Tobit  RMSE={m_start.rmse_:.1f} min  LL={m_start.ll_:.1f}")
 
     # â”€â”€ end_of_day â€” Tobit right-censored at MAX_END â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    end_feats = ACTIVITY_COLS + derived_feats + _pf + ['n_total', 'n_tours']
+    _pf_end = _stage2_person_features(feature_override, 'end', person_day)
+    end_feats = ACTIVITY_COLS + derived_feats + _pf_end + ['n_total', 'n_tours']
     X_end, end_cols = _build_X(person_day, end_feats, ptypes)
 
     # add predicted start as a feature (sequential dependency)
@@ -649,7 +668,8 @@ def estimate_day_models(person_day: pd.DataFrame,
     logger.info(f"end_of_day Tobit    RMSE={m_end.rmse_:.1f} min  LL={m_end.ll_:.1f}")
 
     # â”€â”€ budget B â€” lognormal OLS (soft boundaries, no censoring) â”€â”€â”€â”€â”€â”€
-    budget_feats = ACTIVITY_COLS + derived_feats + _pf + ['n_total', 'n_tours']
+    _pf_budget = _stage2_person_features(feature_override, 'budget', person_day)
+    budget_feats = ACTIVITY_COLS + derived_feats + _pf_budget + ['n_total', 'n_tours']
     X_budget, budget_cols = _build_X(person_day, budget_feats, ptypes)
     y_budget = person_day['B'].values
 

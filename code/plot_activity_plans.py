@@ -546,12 +546,17 @@ def plot_sample_plans(plan: pd.DataFrame, n: int = 8, save_path: str = None,
                               not (isinstance(raw_mn, float) and
                                    _math_module.isnan(raw_mn))) else ''
                 color   = MODE_COLORS.get(mode_n, '#CCCCCC')
+                # Distance for this trip leg (prefer haversine dist_km over skim dist)
+                _raw_d = tr.get('dist_km') if 'dist_km' in tr.index else tr.get('dist')
+                _has_d = (_raw_d is not None and
+                          not (isinstance(_raw_d, float) and _math_module.isnan(float(_raw_d))))
+                _dist_str = f' {float(_raw_d):.1f}km' if _has_d else ''
                 if t_end > t_start:
                     ax.barh(y=-0.3, width=t_end-t_start, left=t_start,
                             height=0.25, color=color, alpha=0.7, zorder=2)
-                    if (t_end - t_start) > 0.15 and mode_n:
+                    if (t_end - t_start) > 0.15 and (mode_n or _dist_str):
                         ax.text(t_start + (t_end - t_start)/2, -0.3,
-                                mode_n, ha='center', va='center',
+                                mode_n + _dist_str, ha='center', va='center',
                                 fontsize=6, color='white', fontweight='bold',
                                 zorder=3)
 
@@ -617,6 +622,17 @@ def plot_sample_plans(plan: pd.DataFrame, n: int = 8, save_path: str = None,
         t_start_str = _hm(person['STARTIME'].min()) if 'STARTIME' in person.columns else '?'
         t_end_str   = _hm(person['ENDTIME'].max())  if 'ENDTIME'  in person.columns else '?'
 
+        # Total daily distance (prefer haversine dist_km)
+        _total_km = None
+        if not trips_p.empty:
+            _d_col = 'dist_km' if 'dist_km' in trips_p.columns else \
+                     ('dist' if 'dist' in trips_p.columns else None)
+            if _d_col is not None:
+                _vals = trips_p[_d_col].dropna()
+                if len(_vals) > 0:
+                    _total_km = float(_vals.sum())
+        _dist_title = f'  ·  {_total_km:.1f}km total' if _total_km is not None else ''
+
         # Mode summary from trip rows
         if not trips_p.empty and 'mode_name' in trips_p.columns:
             mc = trips_p['mode_name'].value_counts()
@@ -627,6 +643,7 @@ def plot_sample_plans(plan: pd.DataFrame, n: int = 8, save_path: str = None,
         ax.set_title(
             f'Person {pid}  ·  {ptype}  ·  vehicles: {vehs}  ·  '
             f'{n_a} activities  ·  {t_start_str}–{t_end_str}'
+            + _dist_title
             + (f'  ·  modes: {mode_summary}' if mode_summary else ''),
             fontsize=8, pad=4
         )

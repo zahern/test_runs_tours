@@ -1,7 +1,7 @@
-﻿"""
+"""
 stage5_destination_choice.py
 =============================
-Stage 5 â€” Destination Choice + Mode Choice + Full Trip Chain
+Stage 5 - Destination Choice + Mode Choice + Full Trip Chain
 
 What this stage does
 ---------------------
@@ -10,60 +10,17 @@ Stage 4 output = one row per OUT-OF-HOME ACTIVITY per person:
 
 Stage 5 converts this into a proper TRIP CHAIN:
 
-    home â”€â”€trip1â”€â”€> activity1 â”€â”€trip2â”€â”€> activity2 â”€â”€trip3â”€â”€> home
-
-For each person:
-  1. Activities are sorted by STARTIME (already done by Stage 4 priority).
-  2. DTAZ is assigned to each activity via the destination choice model.
-     - Activity 0 OTAZ = person home zone
-     - Activity k OTAZ = Activity k-1 DTAZ  (trip chaining)
-  3. A MODE is assigned to each trip leg via the mode choice model.
-  4. Trip legs are built:
-       - home â†’ act1  (leg 0)
-       - act1 â†’ act2  (leg 1, ..., n-1)
-       - actn â†’ home  (leg n)
-  5. Travel time is pulled from OD skims for the chosen mode.
-
-Output
--------
-One DataFrame with two types of rows:
-  type='activity' : out-of-home activity (has STARTIME, ENDTIME, DTAZ, purpose)
-  type='trip'     : travel leg (has STARTIME, ENDTIME, OTAZ, DTAZ, mode, travtime)
-
-This gives Stage 6 everything it needs for full plan visualisation and
-the activity plan plots will show realistic schedules.
-
-Segments
----------
-  work    â€” mandatory work tours
-  edu     â€” mandatory education tours
-  nonmand â€” all non-mandatory
-
-Usage
------
-    from stage5_destination_choice import run_stage5
-
-    sc      = Synth_Connect()
-    out     = sc.process_survey(save=False)
-    synth_s4 = pd.read_csv('saved_data/stage4_output.csv')
-    landuse  = sc.get_land()
-
-    plan, models = run_stage5(
-        out["trips"], out["persons"], synth_s4,
-        skims='downcasted_matrices_base.omx',
-        landuse=landuse,
-    )
+    home ──trip1──> activity1 ──trip2──> activity2 ──trip3──> home
 """
 
-import os
-from datetime import datetime
-import re
-import pickle
 import logging
+import os
+import pickle
 from typing import Optional
+
 import numpy as np
-import pandas as pd
 import openmatrix as omx
+import pandas as pd
 from scipy.stats import norm
 
 try:
@@ -91,7 +48,7 @@ _DIST_WALK_BANNER_SHOWN = False
 # Track which segments have already been warned about DIST/DISTWALK correlation
 _DIST_WALK_CORR_WARNED: set = set()
 
-# â”€â”€ Industry-of-employment â†’ mode affinity group â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Industry-of-employment → mode affinity group ─────────────────────────────
 # Source: ANZSIC 1-digit codes stored in 'indp' column (census/HHTS).
 # Groups industrial/agri workers as strong DA captives (remote sites, no transit).
 # Office/public/health workers as most transit-amenable (city-centre locations).
@@ -118,24 +75,24 @@ INDUSTRY_MODE_GROUP = {
     20: 'other',        # Not applicable / not employed
 }
 
-# Frozen-probability cell keys â€” these attributes define a person's cell in the
-# HHTSâ†’synth lookup table built by _compute_frozen_probs().
+# Frozen-probability cell keys - these attributes define a person's cell in the
+# HHTS→synth lookup table built by _compute_frozen_probs().
 FROZEN_CELL_COLS = ['ptype', 'indp_group', 'income_band', 'veh_bin', 'age_group', 'has_licence']
 FROZEN_PROB_COLS = ['p_DA', 'p_SR', 'p_Walk', 'p_Bike', 'p_Transit']
 
 # Mode-specific skim column for travel time lookup in _get_tt.
 # DISTWALK and DISTBIKE confirmed present in OMX (see error log).
-# Walk/bike values are km â€” _get_tt divides by speed to get minutes.
+# Walk/bike values are km - _get_tt divides by speed to get minutes.
 MODE_TT_COL  = {
-    1: 'SOVTOLL_TIME__AM',        # DA â€” auto IVT, AM peak (minutes)
+    1: 'SOVTOLL_TIME__AM',        # DA - auto IVT, AM peak (minutes)
     2: 'SOVTOLL_TIME__AM',        # Other (shared ride)
-    3: 'DISTWALK',                # Walk â€” km, converted at 5 km/h in _get_tt
-    4: 'DISTBIKE',                # Bike â€” km, converted at 15 km/h in _get_tt
-    5: 'WLK_LOC_WLK_TOTIVT__AM', # Transit â€” walk-to-transit IVT (minutes)
+    3: 'DISTWALK',                # Walk - km, converted at 5 km/h in _get_tt
+    4: 'DISTBIKE',                # Bike - km, converted at 15 km/h in _get_tt
+    5: 'WLK_LOC_WLK_TOTIVT__AM', # Transit - walk-to-transit IVT (minutes)
 }
 
-WALK_KMH = 5.0    # walk speed for distanceâ†’time conversion
-BIKE_KMH = 15.0   # bike speed for distanceâ†’time conversion
+WALK_KMH = 5.0    # walk speed for distance→time conversion
+BIKE_KMH = 15.0   # bike speed for distance→time conversion
 WALK_MAX_KM = 10.0
 BIKE_MAX_KM = 25.0
 
@@ -146,14 +103,14 @@ try:
     LARCH_AVAILABLE = True
 except ImportError:
     LARCH_AVAILABLE = False
-    logger.warning("larch not installed â€” Stage 5 will use distance-only fallback")
+    logger.warning("larch not installed - Stage 5 will use distance-only fallback")
 
 
 def _lx_model(dt, **kwargs) -> 'lx.Model':
     """
     Create a Larch model, trying JAX first and falling back to Numba.
 
-    JAX uses XLA JIT compilation for the log-likelihood and gradient â€”
+    JAX uses XLA JIT compilation for the log-likelihood and gradient -
     faster on GPU/TPU and competitive on CPU for large datasets.  If JAX
     is not installed or fails to initialise (common on Windows without
     CUDA), Numba's finite-difference implementation is used instead.
@@ -207,7 +164,7 @@ def _skim_flat(skims) -> pd.DataFrame:
         tt_cols = [c for c in df.columns
                    if any(x in c for x in ['TIME', 'DIST', 'WALK', 'BIKE'])]
         if tt_cols:
-            print("  Skim value ranges (sample â€” check units are minutes/km):")
+            print("  Skim value ranges (sample - check units are minutes/km):")
             for col in tt_cols[:6]:
                 v = df[col].replace(0, np.nan).dropna()
                 if len(v):
@@ -404,7 +361,7 @@ def _build_od_dataset(skims, skim_df: pd.DataFrame = None):
     """
     Build an xarray OD Dataset for DataTree relationships.
 
-    Always returns a plain xr.Dataset indexed by (otaz, dtaz) â€” never a Larch
+    Always returns a plain xr.Dataset indexed by (otaz, dtaz) - never a Larch
     Dataset from lx.Dataset.construct.from_omx().  Larch's sharrow compiler
     validates utility expressions against the *original OMX file* when the od
     node is a Larch/OMX Dataset, so aliases added via .assign() (e.g. DIST
@@ -418,7 +375,7 @@ def _build_od_dataset(skims, skim_df: pd.DataFrame = None):
         skim_df = _skim_flat(skims)
     if skim_df is None or skim_df.empty:
         raise RuntimeError(
-            "_build_od_dataset: could not build OD dataset â€” "
+            "_build_od_dataset: could not build OD dataset - "
             "skim_df is empty and _skim_flat failed to read the OMX"
         )
 
@@ -433,22 +390,22 @@ def _build_od_dataset(skims, skim_df: pd.DataFrame = None):
     od_df['dtaz'] = pd.to_numeric(od_df['dtaz'], errors='coerce').fillna(0).astype(int)
     od_df = od_df.drop_duplicates(['otaz', 'dtaz'])
 
-    # DIST alias â€” DEST_UEC uses od.DIST; SEQ OMX stores it as SOVTOLL_DIST__AM
+    # DIST alias - DEST_UEC uses od.DIST; SEQ OMX stores it as SOVTOLL_DIST__AM
     if 'DIST' not in od_df.columns and 'SOVTOLL_DIST__AM' in od_df.columns:
         od_df['DIST'] = pd.to_numeric(od_df['SOVTOLL_DIST__AM'], errors='coerce').fillna(0.0)
     elif 'DIST' not in od_df.columns:
         logger.warning(
-            "_build_od_dataset: neither DIST nor SOVTOLL_DIST__AM found in OMX â€” "
+            "_build_od_dataset: neither DIST nor SOVTOLL_DIST__AM found in OMX - "
             "od.DIST will be zero; destination distance expressions will fail"
         )
         od_df['DIST'] = 0.0
 
-    # CRASH placeholder â€” overridden in _dest_tree when crash_skims provided
+    # CRASH placeholder - overridden in _dest_tree when crash_skims provided
     if 'CRASH' not in od_df.columns:
         od_df['CRASH'] = 0.0
 
     # Convert to plain xr.Dataset indexed by (otaz, dtaz) so sharrow can compile
-    # all variables â€” including DIST â€” without OMX-file validation.
+    # all variables - including DIST - without OMX-file validation.
     try:
         od_xr = od_df.set_index(['otaz', 'dtaz']).to_xarray()
         # Fill any NaN (from missing OD pairs) with 0
@@ -460,7 +417,7 @@ def _build_od_dataset(skims, skim_df: pd.DataFrame = None):
         return od_xr
     except Exception as _xr_e:
         # Extremely unlikely: return raw DataFrame as last resort
-        logger.warning(f"_build_od_dataset: xarray conversion failed ({_xr_e}) â€” returning DataFrame")
+        logger.warning(f"_build_od_dataset: xarray conversion failed ({_xr_e}) - returning DataFrame")
         return od_df
 
 
@@ -629,11 +586,11 @@ def _fill_dest_coef_with_segment_defaults(dest_coef: dict, segment: str) -> dict
 
 # Realistic travel time caps per mode (minutes)
 MODE_TT_CAP = {
-    1: 120.0,   # DA       â€” 2 hrs max
-    2: 120.0,   # Other    â€” 2 hrs max
-    3: 120.0,   # Walk     â€” 120 min max = 10 km at 5 km/h
-    4: 100.0,   # Bike     â€” 100 min max = 25 km at 15 km/h
-    5: 150.0,   # Transit  â€” 2.5 hrs max
+    1: 120.0,   # DA       - 2 hrs max
+    2: 120.0,   # Other    - 2 hrs max
+    3: 120.0,   # Walk     - 120 min max = 10 km at 5 km/h
+    4: 100.0,   # Bike     - 100 min max = 25 km at 15 km/h
+    5: 150.0,   # Transit  - 2.5 hrs max
 }
 MODE_TT_DEFAULT = {1: 15.0, 2: 15.0, 3: 20.0, 4: 15.0, 5: 25.0}
 
@@ -651,13 +608,13 @@ def _get_tt(lookup: dict, otaz: int, dtaz: int, mode: int) -> float:
     Also caps at realistic maxima per mode.
     """
     if otaz == dtaz:
-        return 3.0   # intra-zonal â€” short but non-zero
+        return 3.0   # intra-zonal - short but non-zero
 
     sk  = lookup.get((otaz, dtaz), {})
     col = MODE_TT_COL.get(mode, 'SOVTOLL_TIME__AM')
     val = sk.get(col, None)
 
-    # â”€â”€ Walk / Bike: DISTWALK/DISTBIKE stored in km in this OMX â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Walk / Bike: DISTWALK/DISTBIKE stored in km in this OMX ─────────────
     if mode == 3 and val is not None and val > 0:   # Walk
         km = float(val)
         km = min(km, WALK_MAX_KM)
@@ -668,7 +625,7 @@ def _get_tt(lookup: dict, otaz: int, dtaz: int, mode: int) -> float:
         km = min(km, BIKE_MAX_KM)
         return float(np.clip(km * 60.0 / BIKE_KMH, 0.5, MODE_TT_CAP[4]))
 
-    # â”€â”€ Transit: try WLK_LOC_WLK_TOTIVT__AM, fall back to auto Ã— 1.5 â”€â”€â”€â”€â”€
+    # ── Transit: try WLK_LOC_WLK_TOTIVT__AM, fall back to auto × 1.5 ─────
     if mode == 5:
         transit_val = sk.get('WLK_LOC_WLK_TOTIVT__AM', None)
         if transit_val is None or transit_val <= 0:
@@ -680,7 +637,7 @@ def _get_tt(lookup: dict, otaz: int, dtaz: int, mode: int) -> float:
             elif val > 200: val /= 10.0
             return float(np.clip(val, 0.5, MODE_TT_CAP[5]))
 
-    # â”€â”€ Auto modes: use SOVTOLL_TIME__AM with period fallbacks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Auto modes: use SOVTOLL_TIME__AM with period fallbacks ────────────
     if val is None or val <= 0:
         for fallback_col in ['SOVTOLL_TIME__AM', 'SOVTOLL_TIME__PM',
                               'SOVTOLL_TIME__MD', 'SOVTOLL_TIME__EV']:
@@ -712,16 +669,16 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
 
     Handles the column naming differences between the tours table output
     of build_as_tours() and what Larch expects:
-        tour_origin      â†’ OTAZ
-        tour_destination â†’ DTAZ
-        primary_purpose  â†’ main_purpose
-        tour_mode        â†’ mapped to integer codes
+        tour_origin      → OTAZ
+        tour_destination → DTAZ
+        primary_purpose  → main_purpose
+        tour_mode        → mapped to integer codes
     """
     t = tours.copy()
     if 'person_id' not in t.columns and 'PERSID' in t.columns:
         t = t.rename(columns={'PERSID': 'person_id'})
 
-    # â”€â”€ resolve OTAZ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── resolve OTAZ ─────────────────────────────────────────────────────
     if 'OTAZ' not in t.columns:
         for candidate in ['tour_origin', 'home_otaz', 'origin_zone', 'start_location', 'otaz']:
             if candidate in t.columns:
@@ -730,7 +687,7 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
     if 'OTAZ' not in t.columns:
         raise ValueError("_prep_hhts_tours: cannot find OTAZ / tour_origin column.")
 
-    # â”€â”€ resolve DTAZ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── resolve DTAZ ─────────────────────────────────────────────────────
     if 'DTAZ' not in t.columns:
         for candidate in ['tour_destination', 'destination_zone', 'dest_zone', 'end_location', 'dtaz']:
             if candidate in t.columns:
@@ -739,7 +696,7 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
     if 'DTAZ' not in t.columns:
         raise ValueError("_prep_hhts_tours: cannot find DTAZ / tour_destination column.")
 
-    # â”€â”€ resolve purpose â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── resolve purpose ───────────────────────────────────────────────────
     if 'main_purpose' not in t.columns:
         for candidate in ['primary_purpose', 'tour_primary_purpose']:
             if candidate in t.columns:
@@ -748,13 +705,13 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
     if 'primary_purpose' not in t.columns and 'main_purpose' in t.columns:
         t['primary_purpose'] = t['main_purpose']
 
-    # â”€â”€ ptour_id â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── ptour_id ──────────────────────────────────────────────────────────
     if 'tour_id' in t.columns:
         t['ptour_id'] = t['person_id'].astype(str) + '_' + t['tour_id'].astype(str)
     else:
         t['ptour_id'] = t['person_id'].astype(str) + '_' + t.index.astype(str)
 
-    # â”€â”€ tour_mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── tour_mode ─────────────────────────────────────────────────────────
     if 'tour_mode' in t.columns:
         # may be string ('DA','Walk',...) or already int
         if t['tour_mode'].dtype == object:
@@ -763,7 +720,7 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
             t['tour_mode'] = pd.to_numeric(
                 t['tour_mode'], errors='coerce').fillna(2).astype(int)
     else:
-        logger.warning("_prep_hhts_tours: tour_mode missing â€” defaulting to DA (1)")
+        logger.warning("_prep_hhts_tours: tour_mode missing - defaulting to DA (1)")
         t['tour_mode'] = 1
 
     if 'tour_distance' in t.columns:
@@ -776,18 +733,18 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
                 f"over {WALK_MAX_KM:.0f} km to SR"
             )
 
-    # â”€â”€ numeric zone columns â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── numeric zone columns ──────────────────────────────────────────────
     for col in ['OTAZ', 'DTAZ']:
         t[col] = pd.to_numeric(t[col], errors='coerce').fillna(0).astype(int)
 
-    # â”€â”€ filter invalid zones â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── filter invalid zones ──────────────────────────────────────────────
     before = len(t)
     t = t[(t['OTAZ'] > 0) & (t['DTAZ'] > 0) &
           (t['OTAZ'] != 330) & (t['DTAZ'] != 330)].copy()
     if len(t) < before:
         logger.info(f"_prep_hhts_tours: dropped {before - len(t)} rows with invalid zones")
 
-    # â”€â”€ merge person attributes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── merge person attributes ───────────────────────────────────────────
     pp = persons.copy()
     if 'person_id' not in pp.columns and 'PERSID' in pp.columns:
         pp = pp.rename(columns={'PERSID': 'person_id'})
@@ -801,12 +758,12 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
         # Original socio-economic
         'incp', 'indp', 'sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING',
         # New behavioural additions
-        'age5p', 'AGEGROUP',    # age bands â€” walk/bike/distance deterrence
-        'CARLICENCE',           # car licence â€” DA prerequisite
-        'occp_group',           # occupation group â€” work destination
+        'age5p', 'AGEGROUP',    # age bands - walk/bike/distance deterrence
+        'CARLICENCE',           # car licence - DA prerequisite
+        'occp_group',           # occupation group - work destination
         'occp_mgr',             # binary: professional/managerial
         'occp_trades',          # binary: trades/technical
-        'bikes',                # HH bicycle count â€” bike mode
+        'bikes',                # HH bicycle count - bike mode
         'ptype',                # person type string (for logging)
     ] if c in pp.columns]
     # Coerce person_id to str on both sides to prevent pandas merge error when
@@ -822,9 +779,9 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
         if _c in t.columns:
             t[_c] = pd.to_numeric(t[_c], errors='coerce').fillna(_default)
 
-    # â”€â”€ _time_period: numeric departure period for c_peak_da â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── _time_period: numeric departure period for c_peak_da ─────────────
     # 0=early(<6am), 1=am_peak(6-9), 2=midday(9-15), 3=pm_peak(15-18),
-    # 4=evening(18-21), 5=late(â‰¥21).  Mirrors zsim_helper.get_period().
+    # 4=evening(18-21), 5=late(≥21).  Mirrors zsim_helper.get_period().
     if 'STARTIME' in t.columns:
         def _period_from_min(m):
             m = float(m) if not pd.isna(m) else 480
@@ -838,14 +795,14 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
     else:
         t['_time_period'] = 1   # default am_peak
 
-    # â”€â”€ activity count defaults â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── activity count defaults ───────────────────────────────────────────
     for col in ['n_shopping_out', 'outbound_stops']:
         if col not in t.columns:
             t[col] = 0
     for col in ['n_shopping_out', 'outbound_stops']:
         t[col] = pd.to_numeric(t[col], errors='coerce').fillna(0).astype(int)
 
-    # â”€â”€ joint travel indicator â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── joint travel indicator ────────────────────────────────────────────
     joint_cols = [c for c in ['joint_travel', 'JOINTTRIP', 'JOINT_TRIP',
                               'travel_party', 'hh_travelers', 'num_travellers',
                               'num_travelers'] if c in t.columns]
@@ -858,7 +815,7 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
             (t['main_purpose'].astype(str).str.lower() == 'escort')
         ).astype(int)
 
-    # â”€â”€ walk / bike availability flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── walk / bike availability flags ──────────────────────────────────────
     # Sharrow-compiled availability cannot use X() expressions referencing
     # OD skims. Pre-compute boolean availability columns here.
     # Use tour_distance if available; otherwise default to always-available
@@ -868,14 +825,14 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
         t['walk_avail'] = (dist_km < WALK_MAX_KM).astype(int)
         t['bike_avail'] = (dist_km < BIKE_MAX_KM).astype(int)
     else:
-        # no distance info â€” make all modes available, rely on utility betas
+        # no distance info - make all modes available, rely on utility betas
         t['walk_avail'] = 1
         t['bike_avail'] = 1
 
-    # â”€â”€ ensure chosen mode is always marked available in training data â”€â”€â”€â”€â”€â”€
+    # ── ensure chosen mode is always marked available in training data ──────
     # Force availability=1 for whichever mode a person actually chose so Larch
     # never sees a "chosen_but_not_available" observation.  Covers all modes,
-    # not just Walk/Bike â€” Transit and SR choosers may also fail availability
+    # not just Walk/Bike - Transit and SR choosers may also fail availability
     # conditions in edge cases (e.g. zero-vehicle transit riders).
     if 'tour_mode' in t.columns:
         _avail_cols = {
@@ -890,7 +847,7 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
         if 'CARLICENCE' in t.columns:
             t.loc[t['tour_mode'] == MODE_MAP['DA'], 'CARLICENCE'] = 1
 
-    # â”€â”€ survey expansion weights â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── survey expansion weights ──────────────────────────────────────
     # QTS uses PERSWGT23 (person-level expansion weight). Merging onto tours
     # so the mode and destination models are weighted to population totals.
     # Without weights, oversampled zones/demographics dominate the estimates.
@@ -902,14 +859,14 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
         wgt = pp[['person_id', weight_col]].rename(columns={weight_col: 'weight'})
         t = t.merge(wgt, on='person_id', how='left')
         t['weight'] = pd.to_numeric(t['weight'], errors='coerce').fillna(1.0)
-        # normalise to avoid numerical issues â€” keeps relative weights intact
+        # normalise to avoid numerical issues - keeps relative weights intact
         t['weight'] = t['weight'] / t['weight'].mean()
         logger.info(f"_prep_hhts_tours: applied weights from '{weight_col}' "
                     f"(mean={t['weight'].mean():.3f}, "
                     f"min={t['weight'].min():.3f}, max={t['weight'].max():.3f})")
     else:
         t['weight'] = 1.0
-        logger.info("_prep_hhts_tours: no weight column found â€” using unit weights")
+        logger.info("_prep_hhts_tours: no weight column found - using unit weights")
 
     logger.info(
         f"_prep_hhts_tours: {len(t)} tours | "
@@ -963,7 +920,7 @@ def _filter_seg(tours: pd.DataFrame, segment: str) -> pd.DataFrame:
     result = tours[mask].copy()
 
     if len(result) == 0:
-        # diagnostic â€” show what values ARE present
+        # diagnostic - show what values ARE present
         unique_vals = vals.value_counts().head(10).to_dict()
         logger.warning(
             f"_filter_seg: segment='{segment}' matched 0 tours. "
@@ -1040,7 +997,7 @@ def _fit_destination_zone_shadow_prices(obs_rows: pd.DataFrame,
     marginal destination counts match observed marginal counts.
 
     This is the ActivitySim shadow-price approach: iteratively adjust
-    destination-zone ASCs so Î£_i P(j|i) â‰ˆ observed_count_j for all j.
+    destination-zone ASCs so Σ_i P(j|i) ≈ observed_count_j for all j.
 
     Unlike OD calibration (which operates per origin zone and is sparse),
     shadow prices operate on destination marginals so ALL zones are adjusted,
@@ -1053,7 +1010,7 @@ def _fit_destination_zone_shadow_prices(obs_rows: pd.DataFrame,
     probs     : (n_obs, n_zones) predicted probability matrix from estimation
     zone_ids  : list/array of zone IDs corresponding to probs columns
     n_iter    : number of IPF-style iterations (5 is usually enough)
-    alpha     : step damping (0â€“1); smaller = slower but more stable
+    alpha     : step damping (0-1); smaller = slower but more stable
     clip_sp   : max absolute shadow price (prevents extreme corrections)
     eps       : small floor to avoid log(0)
 
@@ -1140,7 +1097,7 @@ def _fit_destination_zone_shadow_prices(obs_rows: pd.DataFrame,
                 )
                 break
 
-        # â”€â”€ ARC-style convergence summary table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── ARC-style convergence summary table ────────────────────────────
         # Print iteration log: iter | fail_zones | max_ratio_err% | max_shadow
         if _iter_history:
             _hdr = (f"  {'Iter':>5}  {'FailZones':>10}  {'MaxRatioErr%':>13}  {'MaxShadow':>10}")
@@ -1158,7 +1115,7 @@ def _fit_destination_zone_shadow_prices(obs_rows: pd.DataFrame,
                     or _it_n <= 3
                 )
                 if _is_milestone:
-                    _conv_flag = ' â† converged' if _nf == 0 else ''
+                    _conv_flag = ' ← converged' if _nf == 0 else ''
                     logger.info(
                         f"  {_it_n:>5}  {_nf:>10}  {_mre*100:>12.1f}%  {_msp:>10.3f}{_conv_flag}"
                     )
@@ -1209,14 +1166,14 @@ def _plot_shadow_price_convergence(iter_history: list, segment: str, save_path: 
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
         fig.suptitle(
-            f'Shadow Price Convergence â€” {segment.upper()} Destination Model\n'
+            f'Shadow Price Convergence - {segment.upper()} Destination Model\n'
             f'(ARC-style; converged={fail_z[-1]==0})',
             fontsize=11, fontweight='bold',
         )
 
         ax1.plot(iters, fail_z, 'o-', color='#E84855', linewidth=1.5, markersize=4)
         ax1.axhline(0, color='black', linestyle='--', linewidth=0.8)
-        ax1.set_ylabel('Failing zones\n(|obs/predâˆ’1|>tol)', fontsize=9)
+        ax1.set_ylabel('Failing zones\n(|obs/pred−1|>tol)', fontsize=9)
         ax1.set_ylim(bottom=0)
         ax1.grid(axis='y', alpha=0.3)
         ax1.fill_between(iters, fail_z, alpha=0.15, color='#E84855')
@@ -1237,7 +1194,7 @@ def _plot_shadow_price_convergence(iter_history: list, segment: str, save_path: 
         plt.tight_layout()
         fig.savefig(save_path, dpi=130, bbox_inches='tight')
         plt.close(fig)
-        logger.info(f"  Shadow price convergence plot â†’ {save_path}")
+        logger.info(f"  Shadow price convergence plot → {save_path}")
     except Exception as _pe:
         logger.debug(f"_plot_shadow_price_convergence failed: {_pe}")
 
@@ -1255,11 +1212,11 @@ def _plot_shadow_price_validation(
     ARC-style obs vs predicted zone-share scatter plot.
 
     Two panels:
-      Left:  before shadow prices â€” reveals systematic model bias
-      Right: after shadow prices  â€” shows how well IPF correction worked
+      Left:  before shadow prices - reveals systematic model bias
+      Right: after shadow prices  - shows how well IPF correction worked
 
     Each point is a destination zone; size = employment/enrolment; colour = ratio.
-    Zones with ratio > 2Ã— or < 0.5Ã— are labelled with their zone number.
+    Zones with ratio > 2× or < 0.5× are labelled with their zone number.
     """
     try:
         import matplotlib
@@ -1314,8 +1271,8 @@ def _plot_shadow_price_validation(
 
         fig, axes = plt.subplots(1, 2, figsize=(13, 6))
         fig.suptitle(
-            f'Destination Zone Validation â€” {segment.upper()}  (n={int(obs_total)} HHTS obs)\n'
-            f'Bubble size âˆ {emp_col}; red = over-predicted, blue = under-predicted',
+            f'Destination Zone Validation - {segment.upper()}  (n={int(obs_total)} HHTS obs)\n'
+            f'Bubble size ∝ {emp_col}; red = over-predicted, blue = under-predicted',
             fontsize=11, fontweight='bold',
         )
 
@@ -1336,8 +1293,8 @@ def _plot_shadow_price_validation(
             )
             _max_ax = max(obs_share.max(), pred.max()) * 100 * 1.05
             ax.plot([0, _max_ax], [0, _max_ax], 'k--', linewidth=0.8, label='Perfect fit')
-            ax.plot([0, _max_ax], [0, _max_ax * 2], ':', color='salmon', linewidth=0.7, label='2Ã— over')
-            ax.plot([0, _max_ax], [0, _max_ax * 0.5], ':', color='cornflowerblue', linewidth=0.7, label='2Ã— under')
+            ax.plot([0, _max_ax], [0, _max_ax * 2], ':', color='salmon', linewidth=0.7, label='2× over')
+            ax.plot([0, _max_ax], [0, _max_ax * 0.5], ':', color='cornflowerblue', linewidth=0.7, label='2× under')
             ax.set_xlabel('Observed share (%)', fontsize=9)
             ax.set_ylabel('Predicted share (%)', fontsize=9)
             ax.set_title(title, fontsize=10)
@@ -1353,12 +1310,12 @@ def _plot_shadow_price_validation(
                             fontsize=6, ha='center', va='bottom',
                             color='darkred' if _r > 2.5 else 'darkblue',
                         )
-            plt.colorbar(sc, ax=ax, label='logâ‚‚(pred/obs)', shrink=0.7)
+            plt.colorbar(sc, ax=ax, label='log₂(pred/obs)', shrink=0.7)
 
         plt.tight_layout()
         fig.savefig(save_path, dpi=130, bbox_inches='tight')
         plt.close(fig)
-        logger.info(f"  Shadow price validation scatter â†’ {save_path}")
+        logger.info(f"  Shadow price validation scatter → {save_path}")
     except Exception as _pe:
         logger.debug(f"_plot_shadow_price_validation failed: {_pe}")
 
@@ -1433,7 +1390,7 @@ def _sample_destinations_hierarchical(probs_np: np.ndarray,
                                       cluster_targets: dict = None,
                                       residual_strength: float = 0.7) -> np.ndarray:
     """
-    Hierarchical clusterâ†’zone sampler with residual balancing.
+    Hierarchical cluster→zone sampler with residual balancing.
     Uses macro destination clusters to stabilize raw zone probabilities.
     """
     zone_arr = np.asarray(zone_ids, dtype=int)
@@ -1476,7 +1433,7 @@ def _sample_destinations_hierarchical(probs_np: np.ndarray,
             ratio = (remaining + 1e-6) / (desired_counts + 1e-6)
             cp = cp * np.power(np.clip(ratio, 0.05, 20.0), residual_strength)
         if cp.sum() <= 0:
-            # Cluster probs degenerate â€” fall back to zone-level probabilities
+            # Cluster probs degenerate - fall back to zone-level probabilities
             zp = np.asarray(probs_np[ii], dtype=float)
             zp = np.where(np.isfinite(zp) & (zp >= 0), zp, 0.0)
             if zp.sum() <= 0:
@@ -1536,9 +1493,9 @@ def _lu_idx(landuse: pd.DataFrame) -> pd.DataFrame:
 # HHTS persons tables; the defaults ensure estimation doesn't crash if a column
 # is missing from a particular data source.
 _PERSON_BEHAVIOURAL_DEFAULTS = {
-    'age5p':             6,     # 5-yr age band 1-18; 6 â‰ˆ 25-29yr (working-age default)
+    'age5p':             6,     # 5-yr age band 1-18; 6 ≈ 25-29yr (working-age default)
     'AGEGROUP':          6,
-    'CARLICENCE':        1,     # assume licensed (conservative â€” avoids killing DA utility)
+    'CARLICENCE':        1,     # assume licensed (conservative - avoids killing DA utility)
     'occp_group':        0,     # 0 = not working
     'occp_mgr':          0,     # binary: professional/managerial
     'occp_trades':       0,     # binary: trades/technical
@@ -1560,29 +1517,29 @@ def _travel_propensity_score(pp: pd.DataFrame) -> pd.Series:
     Compute a normalised travel propensity score per person as a CDAP logsum proxy.
 
     The score captures "how much utility does this person get from travelling?"
-    â€” the same concept as the CDAP logsum used in ActivitySim's work location
+    - the same concept as the CDAP logsum used in ActivitySim's work location
     model, built from attributes available in both HHTS and synthetic population.
 
     Interpretation of the score (after normalisation to ~N(0,1)):
-      +ve â†’ mandatory travellers (FT workers, university students, car-rich,
-            licensed, high-income, working-age) â€” less deterred by distance
-      -ve â†’ home-stayers / captive short-distance travellers (retired,
+      +ve → mandatory travellers (FT workers, university students, car-rich,
+            licensed, high-income, working-age) - less deterred by distance
+      -ve → home-stayers / captive short-distance travellers (retired,
             car-free, unlicensed, seniors, industrial/construction workers
             whose employment is site-local)
 
     Used in DEST_UEC as:
         c_propensity_dist * travel_propensity_i * log(dist_ij + 1)
-    â€” a positive coefficient means more-mobile people choose farther destinations.
+    - a positive coefficient means more-mobile people choose farther destinations.
     Coefficients estimated from HHTS (see _build_dest_utility / DEST_UEC).
 
     Attributes used (all present in both HHTS and SEQ synthetic population):
         WORKSTAT  : 0=not working, 1=FT, 2=PT
         STUDYING  : 0=none, 1=primary, 2=secondary, 3-4=post-secondary
-        vehrd     : vehicles in household (â‰¥1 â†’ positive)
+        vehrd     : vehicles in household (≥1 → positive)
         CARLICENCE: 1=licensed (positive)
-        incp      : income band 1-14 (higher â†’ positive)
-        age5p     : 5-year age band (seniors/children â†’ negative)
-        indp      : industry code â€” professional/public â†’ positive; industrial â†’ negative
+        incp      : income band 1-14 (higher → positive)
+        age5p     : 5-year age band (seniors/children → negative)
+        indp      : industry code - professional/public → positive; industrial → negative
     """
     n = len(pp)
     score = np.zeros(n, dtype=np.float64)
@@ -1591,7 +1548,7 @@ def _travel_propensity_score(pp: pd.DataFrame) -> pd.Series:
         return pd.to_numeric(pp.get(name, pd.Series(default, index=pp.index)),
                              errors='coerce').fillna(default).values
 
-    # â”€â”€ Mandatory travel obligation (largest predictor) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Mandatory travel obligation (largest predictor) ────────────────────
     workstat = _col('WORKSTAT', 0.0)
     score += np.where(workstat == 1, 1.20,    # FT worker
              np.where(workstat == 2, 0.65, 0.0))  # PT worker
@@ -1600,30 +1557,30 @@ def _travel_propensity_score(pp: pd.DataFrame) -> pd.Series:
     score += np.where(np.isin(studying, [3, 4]), 0.85,  # university (post-secondary)
              np.where(np.isin(studying, [1, 2]), 0.35, 0.0))  # school
 
-    # â”€â”€ Vehicle access (physical ability to reach distant destinations) â”€â”€â”€â”€
+    # ── Vehicle access (physical ability to reach distant destinations) ────
     vehrd = _col('vehrd', 1.0)
     lic   = _col('CARLICENCE', 1.0)
     score += np.where(vehrd > 0, 0.40, -0.35)  # car-free restricts range
-    score += np.where(lic   > 0, 0.30, -0.20)  # unlicensed â†’ limited range
+    score += np.where(lic   > 0, 0.30, -0.20)  # unlicensed → limited range
 
-    # â”€â”€ Income (higher income â†’ can commute farther / accept travel costs) â”€
+    # ── Income (higher income → can commute farther / accept travel costs) ─
     incp = _col('incp', 7.0)
     score += np.clip((incp - 7.0) / 7.0, -0.50, 0.60)  # centre at band 7
 
-    # â”€â”€ Age (working-age peak; seniors and young children travel less far) â”€
+    # ── Age (working-age peak; seniors and young children travel less far) ─
     age5p = _col('age5p', 5.0)
     score += np.where(age5p >= 9, -0.55,          # 65+ seniors
              np.where(age5p >= 8, -0.25,           # 55-64
              np.where(age5p <= 2, -0.30, 0.0)))    # children under 10
 
-    # â”€â”€ Industry (professional/public â†’ CBD destinations â†’ larger range;
-    #    industrial/construction â†’ local/suburban work sites â†’ smaller range)
+    # ── Industry (professional/public → CBD destinations → larger range;
+    #    industrial/construction → local/suburban work sites → smaller range)
     indp = _col('indp', 20.0).astype(int)
     score += np.where(np.isin(indp, [13, 14, 15, 16]),  0.35,   # professional/public/admin/edu
              np.where(np.isin(indp, [3, 4, 5]),         -0.25,  # manufacturing/utilities/construction
              np.where(np.isin(indp, [1, 2]),             -0.40, 0.0)))  # agri/mining (site-remote)
 
-    # â”€â”€ Normalise to ~N(0,1) across the population â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Normalise to ~N(0,1) across the population ────────────────────────
     mu, sd = float(score.mean()), float(score.std())
     if sd > 1e-6:
         score = (score - mu) / sd
@@ -1637,12 +1594,13 @@ def _ensure_person_behavioural_cols(persons: pd.DataFrame) -> pd.DataFrame:
     on the persons table, filling missing ones with sensible defaults.
 
     Also computes ``travel_propensity`` (CDAP logsum proxy) if not already
-    present â€” this feeds the ``c_propensity_dist`` destination interaction term.
+    present - this feeds the ``c_propensity_dist`` destination interaction term.
 
     Called from _mode_tree and _dest_tree before building the DataTree so that
     sharrow compilation never encounters a missing column reference.
     """
     pp = persons.copy()
+    _had_upper_carlicence = 'CARLICENCE' in pp.columns
     for col, default in _PERSON_BEHAVIOURAL_DEFAULTS.items():
         if col not in pp.columns:
             pp[col] = default
@@ -1650,20 +1608,23 @@ def _ensure_person_behavioural_cols(persons: pd.DataFrame) -> pd.DataFrame:
         else:
             pp[col] = pd.to_numeric(pp[col], errors='coerce').fillna(default)
 
+    # TODO(CARLICENCE): keep this lowercase synth-pop bridge before any future
+    # availability refactor; DA availability depends on the embedded DataTree
+    # exposing uppercase CARLICENCE.
     # Handle lowercase variant of CARLICENCE from the synthetic population
-    # (which stores it as 'carlicence').  Must be done AFTER the defaults loop
-    # so the numeric coercion above has already run on the uppercase version.
-    if 'carlicence' in pp.columns and 'CARLICENCE' not in pp.columns:
+    # (which stores it as 'carlicence').  If uppercase was absent originally,
+    # overwrite the default added above with the real lowercase values.
+    if 'carlicence' in pp.columns and not _had_upper_carlicence:
         pp['CARLICENCE'] = pd.to_numeric(pp['carlicence'], errors='coerce').fillna(1)
 
-    # â”€â”€ Travel propensity (CDAP logsum proxy) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Travel propensity (CDAP logsum proxy) ─────────────────────────────
     # Always recompute from source attributes so it reflects the actual person
     # table rather than a stale default.  Very cheap (vectorized numpy).
     pp['travel_propensity'] = _travel_propensity_score(pp).values
 
-    # â”€â”€ Occupation sub-group dummies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Occupation sub-group dummies ───────────────────────────────────────
     # Derived from indp (industry/occupation code) if available.
-    # SEQ mapping: professional/managerial = indp 10â€“14; trades/technical = indp 3â€“6.
+    # SEQ mapping: professional/managerial = indp 10-14; trades/technical = indp 3-6.
     # Falls back to 0 (not applicable) if indp is absent.
     if 'indp' in pp.columns:
         _indp = pd.to_numeric(pp['indp'], errors='coerce').fillna(0).astype(int)
@@ -1682,7 +1643,7 @@ def _mode_tree(tours, persons, landuse, skims, skim_df: pd.DataFrame = None):
     """
     Build DataTree for mode choice.
 
-    Larch requires the ROOT dataset to be idca (case Ã— alternative) so it can
+    Larch requires the ROOT dataset to be idca (case × alternative) so it can
     find the '_altid_' index. We build a minimal idca root from the mode
     alternatives, then attach tours (idco), persons, landuse, and od skims
     as sub-datasets.
@@ -1696,7 +1657,7 @@ def _mode_tree(tours, persons, landuse, skims, skim_df: pd.DataFrame = None):
     if tours['ptour_id'].duplicated().any():
         n_dup = tours['ptour_id'].duplicated().sum()
         logger.warning(
-            f"_mode_tree: {n_dup} duplicate ptour_ids â€” "
+            f"_mode_tree: {n_dup} duplicate ptour_ids - "
             "reassigning row-index-based unique ids"
         )
         tours = tours.copy()
@@ -1708,7 +1669,7 @@ def _mode_tree(tours, persons, landuse, skims, skim_df: pd.DataFrame = None):
     alt_ids   = list(MODE_MAP.values())           # [1, 2, 3, 4, 5]
     case_ids  = list(tours['ptour_id'].values)
 
-    # â”€â”€ root dataset: case Ã— alt, all zeros (utility built from co + od) â”€â”€
+    # ── root dataset: case × alt, all zeros (utility built from co + od) ──
     # This establishes both the caseid (_caseid_) and altid (_altid_) dims
     # that Larch requires before it can initialise a Model.
     ca_index = pd.MultiIndex.from_product(
@@ -1716,13 +1677,13 @@ def _mode_tree(tours, persons, landuse, skims, skim_df: pd.DataFrame = None):
     root_df  = pd.DataFrame({'_dummy': np.zeros(len(ca_index))}, index=ca_index)
     root_ds  = lx.Dataset.construct.from_idca(root_df)
 
-    # â”€â”€ tours idco dataset (case-level attributes) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── tours idco dataset (case-level attributes) ──────────────────────
     tour_ds = lx.Dataset.construct.from_idco(tours.set_index('ptour_id'))
 
-    # â”€â”€ od skims â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── od skims ─────────────────────────────────────────────────────────
     od = _build_od_dataset(skims, skim_df=skim_df)
 
-    # â”€â”€ persons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── persons ──────────────────────────────────────────────────────────
     pp = persons.copy()
     if 'person_id' not in pp.columns and 'PERSID' in pp.columns:
         pp = pp.rename(columns={'PERSID': 'person_id'})
@@ -1797,7 +1758,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     n_cases = len(case_ids)
     n_zones = len(zone_ids)
 
-    # â”€â”€ Build OD skim data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Build OD skim data ───────────────────────────────────────────────
     od = _build_od_dataset(skims, skim_df=skim_df)
     _od_vars = _dataset_var_names(od)
 
@@ -1822,7 +1783,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
         except Exception as _d_e:
             logger.debug(f"_dest_tree: DIST diagnostic failed ({_d_e})")
 
-    # â”€â”€ CRASH matrix â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── CRASH matrix ─────────────────────────────────────────────────────
     if crash_skims is not None or (skim_df is not None and 'CRASH' in skim_df.columns):
         try:
             _zones = [int(z) for z in list(od.coords['otaz'].values)]
@@ -1847,11 +1808,11 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
             od = od.assign(CRASH=_da)
             logger.info("_dest_tree: CRASH matrix loaded into od dataset")
         except Exception as _ce:
-            logger.warning(f"_dest_tree: failed to load CRASH values ({_ce}) â€” "
+            logger.warning(f"_dest_tree: failed to load CRASH values ({_ce}) - "
                            "c_crash will use zero values")
     _cached_od_vars = _dataset_var_names(od)
 
-    # â”€â”€ Build OD lookup dict for fast join â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Build OD lookup dict for fast join ────────────────────────────────
     _od_zones = [int(z) for z in od.coords['otaz'].values]
     _zone_to_oidx = {z: i for i, z in enumerate(_od_zones)}
     _od_dtaz = [int(z) for z in od.coords['dtaz'].values]
@@ -1865,13 +1826,20 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     pp_idx = pp.set_index('person_id')
     if not pp_idx.index.is_unique:
         pp_idx = pp_idx[~pp_idx.index.duplicated(keep='first')]
+    # Ensure person_id index is str to match the str-coerced person_id from
+    # _prep_hhts_tours (which runs t['person_id'].astype(str) before the merge).
+    # Without this, _personids.map(_vals) returns NaN everywhere (int vs str
+    # key mismatch), causing STUDYING/incp/etc to default to 0 - making
+    # edu_prim_priv_cond all-zeros, which Larch then classifies as CO (1D),
+    # triggering a Numba TypingError when the dim3_filler tries a 2D index.
+    pp_idx.index = pp_idx.index.astype(str)
 
     # Prepare landuse
     lu_emp = _lu_idx(landuse)  # indexed by ORDER (zone_id)
 
-    # â”€â”€ Merge acdc_aggl/acdc_comp from saved_data/acdc_terms.csv â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Merge acdc_aggl/acdc_comp from saved_data/acdc_terms.csv ─────────
     # These are NOT stored in zone_order_and_landuse.csv; they live in a
-    # separate file keyed by zone_id Ã— segment.  We pivot to one row per
+    # separate file keyed by zone_id × segment.  We pivot to one row per
     # zone (averaging across segments) and join onto lu_emp so the
     # ca_df join below finds non-zero values.
     _acdc_path = os.path.join('saved_data', 'acdc_terms.csv')
@@ -1894,31 +1862,31 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
             lu_emp['acdc_aggl'] = pd.to_numeric(lu_emp['acdc_aggl'], errors='coerce').fillna(0.0)
             lu_emp['acdc_comp']  = pd.to_numeric(lu_emp['acdc_comp'],  errors='coerce').fillna(0.0)
             logger.info(
-                f"_dest_tree: merged acdc_terms ({len(_acdc_z)} zones) â€” "
+                f"_dest_tree: merged acdc_terms ({len(_acdc_z)} zones) - "
                 f"aggl range [{lu_emp['acdc_aggl'].min():.3f}, {lu_emp['acdc_aggl'].max():.3f}]"
             )
         except Exception as _acdc_e:
             logger.error(
                 f"_dest_tree: failed to load acdc_terms.csv ({_acdc_e})\n"
-                "  â–º c_aggl will be ZERO for all zones â€” agglomeration term disabled.\n"
-                "  â–º This silently removes zone 40's main CBD attractor.\n"
-                "  â–º Fix: run _attach_acdc_terms() / compute_accessibility before stage 5."
+                "  ► c_aggl will be ZERO for all zones - agglomeration term disabled.\n"
+                "  ► This silently removes zone 40's main CBD attractor.\n"
+                "  ► Fix: run _attach_acdc_terms() / compute_accessibility before stage 5."
             )
     else:
         logger.error(
-            "_dest_tree: saved_data/acdc_terms.csv NOT FOUND â€” c_aggl will be ZERO.\n"
-            "  â–º Agglomeration term disabled for all zones â€” destination model will be flat.\n"
-            "  â–º Fix: ensure _attach_acdc_terms() writes saved_data/acdc_terms.csv before stage 5."
+            "_dest_tree: saved_data/acdc_terms.csv NOT FOUND - c_aggl will be ZERO.\n"
+            "  ► Agglomeration term disabled for all zones - destination model will be flat.\n"
+            "  ► Fix: ensure _attach_acdc_terms() writes saved_data/acdc_terms.csv before stage 5."
         )
 
-    # Prepare tour â†’ person mapping
+    # Prepare tour → person mapping
     tour_df = tours.copy()
     if 'ptour_id' not in tour_df.columns:
         tour_df = tour_df.reset_index()
     tour_df['ptour_id'] = tour_df['ptour_id'].astype(str)
     tour_df = tour_df.drop_duplicates('ptour_id').set_index('ptour_id')
 
-    # â”€â”€ build ca dataset with pre-joined columns â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── build ca dataset with pre-joined columns ─────────────────────────
     # ActivitySim pattern: merge ALL data into ca_df BEFORE from_idca().
     if sampled_alts is not None and not sampled_alts.empty:
         case_to_row = {cid: r for r, cid in enumerate(case_ids)}
@@ -1940,7 +1908,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
         ca_df = pd.DataFrame(ca_rows)
         logger.info(
             f"_dest_tree: importance-sampled CA table "
-            f"{n_cases} cases Ã— up to {DEST_EST_SAMPLE_SIZE} alts "
+            f"{n_cases} cases × up to {DEST_EST_SAMPLE_SIZE} alts "
             f"= {len(ca_df)} rows"
         )
     else:
@@ -1952,9 +1920,9 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
             'logsum':         ls_vals.ravel(),
             'log_correction': 0.0,
         })
-        print(f"  _dest_tree: ALL-ZONES CA table {n_cases} cases Ã— {n_zones} zones = {len(ca_df)} rows")
+        print(f"  _dest_tree: ALL-ZONES CA table {n_cases} cases × {n_zones} zones = {len(ca_df)} rows")
 
-    # â”€â”€ Pre-join OD skim columns into ca_df (keyed by OTAZ Ã— DTAZ) â”€â”€â”€â”€â”€â”€â”€
+    # ── Pre-join OD skim columns into ca_df (keyed by OTAZ × DTAZ) ───────
     # Get OTAZ for each case from tour_df
     _pid_to_otaz = {}
     if 'OTAZ' in tour_df.columns:
@@ -2000,7 +1968,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     ca_df['log_DIST_1'] = np.log(np.clip(ca_df['DIST'].values, 0.0, None) + 1.0).astype(np.float32)
     ca_df['log_CRASH_1'] = np.log(np.clip(ca_df['CRASH'].values, 0.0, None) + 1.0).astype(np.float32)
 
-    # â”€â”€ Pre-join DISTWALK, DISTBIKE, SOV_TIME from OD skims â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Pre-join DISTWALK, DISTBIKE, SOV_TIME from OD skims ──────────────
     # These enable walk/bike distance-based destination utility and time-based
     # travel impedance rather than relying solely on network distance.
     _od_distwalk_mat = np.asarray(od['DISTWALK'].values, dtype=np.float32) if 'DISTWALK' in _cached_od_vars else None
@@ -2030,7 +1998,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     ca_df['walk_feasible'] = (ca_df['DISTWALK'] < WALK_MAX_KM).astype(np.float32)
     ca_df['bike_feasible'] = (ca_df['DISTBIKE'] < BIKE_MAX_KM).astype(np.float32)
 
-    # â”€â”€ Pre-join landuse (emp) columns into ca_df (keyed by DTAZ=zone) â”€â”€â”€
+    # ── Pre-join landuse (emp) columns into ca_df (keyed by DTAZ=zone) ───
     _lu_cols_to_join = [
         'size_term', 'acdc_aggl', 'acdc_comp',
         'auto_work_acc', 'auto_shop_acc', 'auto_edu_acc', 'auto_nonmand_acc',
@@ -2048,13 +2016,15 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
         else:
             ca_df[_col] = np.float32(0.0)
 
-    # â”€â”€ Pre-join person columns into ca_df (keyed by ptour_id â†’ person_id) â”€â”€
+    # ── Pre-join person columns into ca_df (keyed by ptour_id → person_id) ──
     _pid_to_personid = {}
     _person_id_col = next((c for c in ['person_id', 'PERSID'] if c in tour_df.columns), None)
     if _person_id_col:
         for _pid in tour_df.index:
             try:
-                _pid_to_personid[str(_pid)] = tour_df.loc[_pid, _person_id_col]
+                # Coerce to str so _personids.map(_vals) matches the
+                # str-indexed pp_idx (fixed above) on both sides.
+                _pid_to_personid[str(_pid)] = str(tour_df.loc[_pid, _person_id_col])
             except Exception:
                 pass
 
@@ -2072,7 +2042,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
         else:
             ca_df[_col] = np.float32(_default)
 
-    # â”€â”€ Pre-join tour-level columns (OTAZ, DTAZ for choice) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Pre-join tour-level columns (OTAZ, DTAZ for choice) ──────────────
     ca_df['OTAZ'] = _otaz_arr.astype(np.float32)
     if 'DTAZ' in tour_df.columns:
         _pid_to_dtaz = {}
@@ -2091,7 +2061,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                 pass
         ca_df['DTAZ'] = ca_df['ptour_id'].map(_pid_to_dtaz).fillna(0).astype(np.float32)
 
-    # â”€â”€ Pre-compute interaction terms used in DEST_UEC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Pre-compute interaction terms used in DEST_UEC ───────────────────
     ca_df['incp_x_log_dist'] = (ca_df['incp'] * ca_df['log_DIST_1']).astype(np.float32)
     ca_df['age5p_x_log_dist'] = (ca_df['age5p'] * ca_df['log_DIST_1']).astype(np.float32)
     ca_df['vehrd_x_log_dist'] = (ca_df['vehrd'] * ca_df['log_DIST_1']).astype(np.float32)
@@ -2107,7 +2077,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     _noveh = (ca_df['vehrd'] <= 0).astype(np.float32)
     ca_df['noveh_walk_acc'] = (_noveh * ca_df['walk_acc']).astype(np.float32)
     ca_df['noveh_transit_acc'] = (_noveh * ca_df['transit_acc']).astype(np.float32)
-    # Income Ã— work accessibility
+    # Income × work accessibility
     ca_df['incp_x_auto_work_acc'] = (ca_df['incp'] * ca_df['auto_work_acc']).astype(np.float32)
     # Industry conditioning dummies
     _indp = ca_df['indp'].astype(int)
@@ -2117,11 +2087,11 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     ca_df['FPSEMPN_cond'] = (ca_df['indp_finance_flag'] * ca_df['FPSEMPN']).astype(np.float32)
     ca_df['HEREMPN_cond'] = (ca_df['indp_health_flag'] * ca_df['HEREMPN']).astype(np.float32)
     ca_df['RETEMPN_cond'] = (ca_df['indp_retail_flag'] * ca_df['RETEMPN']).astype(np.float32)
-    # â”€â”€ Log-transform raw employment to prevent gradient saturation â”€â”€â”€â”€â”€â”€â”€
-    # Raw TOTEMP/FPSEMPN can be 10,000â€“50,000. With e.g. c_totemp=0.15 that
-    # gives utility~7,500 for zone 40 â†’ softmax saturates (pâ‰ˆ1) â†’ gradientâ‰ˆ0
-    # â†’ optimizer can't move â†’ c_totemp drifts negative â†’ zone 40 LOSES.
-    # Using log(x+1) keeps all values in ~[0,11] range, coefficients ~0.3â€“1.0.
+    # ── Log-transform raw employment to prevent gradient saturation ───────
+    # Raw TOTEMP/FPSEMPN can be 10,000-50,000. With e.g. c_totemp=0.15 that
+    # gives utility~7,500 for zone 40 → softmax saturates (p≈1) → gradient≈0
+    # → optimizer can't move → c_totemp drifts negative → zone 40 LOSES.
+    # Using log(x+1) keeps all values in ~[0,11] range, coefficients ~0.3-1.0.
     ca_df['log_TOTEMP_1'] = np.log(ca_df['TOTEMP'].astype(np.float64) + 1.0).astype(np.float32)
     ca_df['log_FPSEMPN_cond'] = (ca_df['indp_finance_flag'] *
                                    np.log(ca_df['FPSEMPN'].astype(np.float64) + 1.0)).astype(np.float32)
@@ -2131,7 +2101,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                                    np.log(ca_df['RETEMPN'].astype(np.float64) + 1.0)).astype(np.float32)
     # Study conditioning
     _study = ca_df['STUDYING'].astype(int).copy()
-    # Reclassify STUDYING=0 edu-trip makers who are adult-age (age5p >= 4, â‰ˆ18+) as
+    # Reclassify STUDYING=0 edu-trip makers who are adult-age (age5p >= 4, ≈18+) as
     # post-secondary students (STUDYING=3).  In the HHTS some TAFE/Uni students were
     # coded STUDYING=0 despite reporting full-time TAFE/Uni as their main activity.
     # This ensures zones with tertiary facilities (e.g. CBD, zone 40) receive a
@@ -2145,11 +2115,11 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                 f'_dest_tree [edu]: reclassified {int(_adult_edu.sum())} '
                 f'STUDYING=0 adult cases to STUDYING=3 (post-secondary)'
             )
-    # â”€â”€ Log-transform edu attraction variables to prevent gradient saturation â”€â”€
-    # Raw Primary/Secondary enrolment counts range 0â€“3,068 (zone 277).
-    # With starting c_edu_primary=0.40, raw â†’ utility=1,227 â†’ exp(1227) overflows
-    # softmax â†’ every non-top-zone chooser gets log(â‰ˆ0) â†’ LL â‰ˆ -3.5M.
-    # log(x+1) keeps values in [0, ~8.0], utilities in [0, ~3.2] â€” tractable.
+    # ── Log-transform edu attraction variables to prevent gradient saturation ──
+    # Raw Primary/Secondary enrolment counts range 0-3,068 (zone 277).
+    # With starting c_edu_primary=0.40, raw → utility=1,227 → exp(1227) overflows
+    # softmax → every non-top-zone chooser gets log(≈0) → LL ≈ -3.5M.
+    # log(x+1) keeps values in [0, ~8.0], utilities in [0, ~3.2] - tractable.
     # DEST_UEC_FLAT column names are kept identical so no downstream changes needed.
     _edu_prim_raw  = ((_study == 1).astype(np.float64) *
                       ca_df['Primary'].clip(lower=0).astype(np.float64))
@@ -2167,10 +2137,65 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     ca_df['edu_enrol_total'] = np.log(_edu_total_raw + 1.0).astype(np.float32)
     # edu_primary_walk, edu_secondary_walk, edu_primary_logwalk,
     # edu_secondary_logwalk removed: these were mode-distance interactions
-    # (study_level Ã— log(DISTWALK) / study_level Ã— walkable Ã— school_count)
+    # (study_level × log(DISTWALK) / study_level × walkable × school_count)
     # that double-count with c_logsum.  Mode impedance is fully captured by
     # the mode logsum; c_edu_primary and c_edu_secondary handle zone attraction.
-    # Intrazonal Ã— purpose conditioning
+
+    # ── Study-level-conditioned size term for edu (replaces combined) ─────
+    # The combined edu size_term (Primary+Secondary+Education+...) does NOT
+    # distinguish study levels: secondary students get attracted to primary-
+    # school zones and vice versa, causing the negative Pearson r observed in
+    # the Level 4 secondary validation.  Replace with a per-person conditioned
+    # size term so each study group is attracted to their own school type:
+    #   STUDYING==1 (primary)   → log(Primary_j + TOTPOP_j×0.05 + ε)
+    #   STUDYING==2 (secondary) → log(Secondary_j + HSENROLL_j + ε)
+    #   STUDYING>=3 (post-sec)  → log(Education_j^0.9 + university_j + college_j + ε)
+    # The combined size_term column in ca_df is overwritten in-place so no
+    # changes to DEST_UEC_FLAT or coefficient names are required.
+    if segment == 'edu':
+        _zone_col_lu_st = (
+            'ORDER' if 'ORDER' in lu_emp.columns
+            else (lu_emp.index.name if lu_emp.index.name else lu_emp.columns[0])
+        )
+        _lu_st = (
+            lu_emp.set_index(_zone_col_lu_st)
+            if lu_emp.index.name != _zone_col_lu_st
+            else lu_emp
+        )
+        def _lu_s(col, default=0.0):
+            if col in _lu_st.columns:
+                return pd.to_numeric(_lu_st[col], errors='coerce').fillna(default).clip(lower=0)
+            return pd.Series(default, index=_lu_st.index, dtype=np.float64)
+        _eps_st = 1e-6
+        _prim_log_st  = np.log(_lu_s('Primary') + _lu_s('TOTPOP') * 0.05 + _eps_st)
+        _prim_log_st -= float(_prim_log_st.mean())
+        _sec_log_st   = np.log(_lu_s('Secondary') + _lu_s('HSENROLL') + _eps_st)
+        _sec_log_st  -= float(_sec_log_st.mean())
+        _post_raw_st  = (_lu_s('Education').clip(lower=0) ** 0.9
+                         + _lu_s('university') + _lu_s('college') + _eps_st)
+        _post_log_st  = np.log(_post_raw_st)
+        _post_log_st -= float(_post_log_st.mean())
+        _prim_map_st  = _prim_log_st.to_dict()
+        _sec_map_st   = _sec_log_st.to_dict()
+        _post_map_st  = _post_log_st.to_dict()
+        _altid_st = ca_df['_altid_'].values
+        _study_st = _study.values if hasattr(_study, 'values') else np.asarray(_study)
+        _size_prim_st = np.array([_prim_map_st.get(int(z), 0.0) for z in _altid_st], dtype=np.float32)
+        _size_sec_st  = np.array([_sec_map_st.get(int(z),  0.0) for z in _altid_st], dtype=np.float32)
+        _size_post_st = np.array([_post_map_st.get(int(z), 0.0) for z in _altid_st], dtype=np.float32)
+        ca_df['size_term'] = (
+            (_study_st == 1).astype(np.float32) * _size_prim_st
+            + (_study_st == 2).astype(np.float32) * _size_sec_st
+            + (_study_st >= 3).astype(np.float32) * _size_post_st
+        )
+        logger.info(
+            f"_dest_tree [edu]: size_term overridden with study-level-conditioned version; "
+            f"prim_range=[{_prim_log_st.min():.2f},{_prim_log_st.max():.2f}] "
+            f"sec_range=[{_sec_log_st.min():.2f},{_sec_log_st.max():.2f}] "
+            f"post_range=[{_post_log_st.min():.2f},{_post_log_st.max():.2f}]"
+        )
+
+    # Intrazonal × purpose conditioning
     ca_df['intrazonal_x_edu'] = (ca_df['intrazonal'] * (_study > 0).astype(np.float32)).astype(np.float32)
     # Travel time for work trips: c_log_sovtime_work in DEST_UEC references
     # log_SOVTIME_1 directly (same column as edu/nonmand), but the two
@@ -2178,14 +2203,14 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     # The duplicate ca_df['log_sovtime_work'] column has been removed to avoid
     # the collinearity guard flagging it as a copy of log_SOVTIME_1.
 
-    # â”€â”€ Active-mode feasibility flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Active-mode feasibility flags ────────────────────────────────────
     # NOTE: DISTWALK == DIST == DISTBIKE in this OMX (all road distance).
-    # Circuity = road/euclidean = 1.0 always â†’ log(1.0) = 0 â†’ zero column.
+    # Circuity = road/euclidean = 1.0 always → log(1.0) = 0 → zero column.
     # Walk/bike distance log-transforms are perfectly collinear with log_DIST_1.
     # All circuity and walk/bike log-distance columns are therefore REMOVED from
     # the destination model.  Active-mode influence is captured by:
-    #   â€¢ c_walk_feasible / c_bike_feasible  (short-distance dummy â‰¤6km / â‰¤25km)
-    #   â€¢ c_logsum  (mode logsum already incorporates walk/bike accessibility)
+    #   • c_walk_feasible / c_bike_feasible  (short-distance dummy ≤6km / ≤25km)
+    #   • c_logsum  (mode logsum already incorporates walk/bike accessibility)
     _wf = ca_df['walk_feasible'].values
     _bf = ca_df['bike_feasible'].values
     _active = ((_wf > 0) | (_bf > 0)).astype(np.float32)  # kept for possible future use
@@ -2196,17 +2221,17 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
 
     # Log-commercial for work CBD attractor: zones with high commercial floor
     # area (like Brisbane CBD) attract disproportionate work trips.
-    # Cap at p99 before logging to neutralise the 89M mÂ² data error at zone 158,
+    # Cap at p99 before logging to neutralise the 89M m² data error at zone 158,
     # which otherwise pushes c_log_commercial_work toward 0 during MLE and hides
-    # the legitimate CBD signal for zone 40 (777k mÂ², highest FPSEMPN in SEQ).
+    # the legitimate CBD signal for zone 40 (777k m², highest FPSEMPN in SEQ).
     _comm_raw = ca_df['commercial'].values.astype(np.float64)
     _comm_pos = _comm_raw[_comm_raw > 0]
     _comm_p99 = float(np.nanpercentile(_comm_pos, 99)) if len(_comm_pos) > 0 else 1.0
-    _comm_cap = max(_comm_p99, 1.0)   # never cap below 1 mÂ²
+    _comm_cap = max(_comm_p99, 1.0)   # never cap below 1 m²
     ca_df['log_commercial_1'] = np.log(np.clip(_comm_raw, 0.0, _comm_cap) + 1.0).astype(np.float32)
-    logger.debug(f"log_commercial_1: p99 cap={_comm_cap:.0f} â€” original max={_comm_raw.max():.0f}")
+    logger.debug(f"log_commercial_1: p99 cap={_comm_cap:.0f} - original max={_comm_raw.max():.0f}")
 
-    # Log-transformed non-mandatory attractors (raw values span 0â€“3.6M â†’ gradient saturation)
+    # Log-transformed non-mandatory attractors (raw values span 0-3.6M → gradient saturation)
     ca_df['log_retail_1'] = np.log(ca_df['retail'].astype(np.float64) + 1.0).astype(np.float32)
     ca_df['log_entertainment_1'] = np.log(ca_df['Entertainment'].astype(np.float64) + 1.0).astype(np.float32)
     ca_df['log_TOTPOP_1'] = np.log(ca_df['TOTPOP'].astype(np.float64) + 1.0).astype(np.float32)
@@ -2228,9 +2253,9 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     # triggers the collinearity guard.  Larch resolves choice from choice_co_code
     # ("DTAZ") without needing an explicit override_choice CA column.
 
-    # â”€â”€ Collinearity guard: detect near-identical columns and log them â”€â”€â”€â”€
+    # ── Collinearity guard: detect near-identical columns and log them ────
     # Threshold = 0.999 (only flag truly identical columns like DIST==DISTWALK).
-    # 0.995 was too aggressive â€” log(DIST+1) vs DIST have râ‰ˆ0.99 and are both
+    # 0.995 was too aggressive - log(DIST+1) vs DIST have r≈0.99 and are both
     # legitimate model terms (log captures short-distance deterrence, linear
     # captures long-distance decay).  At 0.999 we only catch columns that are
     # numerically the same data stored twice (e.g. duplicate OMX matrices).
@@ -2240,31 +2265,31 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     # as collinear with their raw counterparts.  These pairs are intentional
     # non-linear recodes that capture different parts of the utility curve.
     _SAFE_PAIRS = {
-        # (col_a, col_b): col_b is a legitimate recode of col_a â€” never holdfast
+        # (col_a, col_b): col_b is a legitimate recode of col_a - never holdfast
         frozenset(['DIST',               'log_DIST_1']),
         frozenset(['SOVTOLL_TIME',       'log_SOVTIME_1']),
         frozenset(['DISTWALK',           'log_DISTWALK_1']),
         frozenset(['DISTBIKE',           'log_DISTBIKE_1']),
-        # age5p Ã— log_dist: interaction of age (continuous) with log_DIST_1.
-        # In float32 over large N this appears râ‰ˆ1.000 because age5p has low
-        # variance â€” both terms are legitimate and should never be auto-holdfasted.
+        # age5p × log_dist: interaction of age (continuous) with log_DIST_1.
+        # In float32 over large N this appears r≈1.000 because age5p has low
+        # variance - both terms are legitimate and should never be auto-holdfasted.
         frozenset(['age5p_x_log_dist',   'log_DIST_1']),
         # log_TOTEMP_1 vs size_term: size_term is a weighted sum that *includes*
         # TOTEMP, so they are highly correlated but not identical; both enter
         # different parts of the utility expression.
         frozenset(['log_TOTEMP_1',       'size_term']),
-        # propensity Ã— log_dist vs log_dist: same rational as age5p above.
+        # propensity × log_dist vs log_dist: same rational as age5p above.
         frozenset(['propensity_x_log_dist', 'log_DIST_1']),
         # occp interaction terms vs log_DIST_1
         frozenset(['occp1_x_log_dist',   'log_DIST_1']),
         frozenset(['ftwork_x_log_dist',  'log_DIST_1']),
         # intrazonal vs intrazonal_x_edu: in the edu segment, almost all
         # intrazonal tours are by students (study>0), so these two columns
-        # are near-identical.  Both are meaningful independent terms â€” keep both.
+        # are near-identical.  Both are meaningful independent terms - keep both.
         frozenset(['intrazonal',         'intrazonal_x_edu']),
         # acdc_aggl vs acdc_comp: both are meaningful ACDC terms (agglomeration and
         # competition) that capture different aspects of density.  The high SEQ
-        # spatial correlation is a data property, not a model flaw â€” allow both free.
+        # spatial correlation is a data property, not a model flaw - allow both free.
         frozenset(['acdc_aggl',          'acdc_comp']),
         # Finance flag vs managerial occupation: indp_finance_flag (indp 10-13) and
         # occp_mgr (indp 10-14) are near-collinear in this SEQ sample because very
@@ -2280,10 +2305,10 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     _NEVER_HOLDFAST_CA_COLS = frozenset({
         'DIST',          # primary auto-network distance (raw)
         'log_DIST_1',    # primary log-distance deterrence coefficient source
-        'acdc_aggl',     # agglomeration index â€” the primary ACDC term
+        'acdc_aggl',     # agglomeration index - the primary ACDC term
         'size_term',     # locked at 1.0 everywhere
-        'logsum',        # mode logsum â€” always used
-        'intrazonal',    # intrazonal binary flag â€” protected from auto-holdfast
+        'logsum',        # mode logsum - always used
+        'intrazonal',    # intrazonal binary flag - protected from auto-holdfast
                          # (collinear with intrazonal_x_edu in edu segment by
                          # construction; listed in _SAFE_PAIRS above)
     })
@@ -2294,10 +2319,34 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
         _ca_stds = _numeric_ca.std(axis=0)
         _nonzero_cols = _ca_stds[_ca_stds > 1e-8].index.tolist()
 
-        # Restrict to genuinely CA-varying columns â€” those with nonzero mean
+        # Holdfast all-zero CA interaction columns before Larch sees them.
+        # When persons don't merge onto HHTS tours (e.g. synth person_ids passed
+        # instead of HHTS persons), binary-flag x zone terms like female_x_log_dist
+        # and edu_prim_priv_cond become all-zeros.  Larch then classifies them as
+        # CO (1D) rather than CA (2D); the Numba dim3_filler later tries a 2D index
+        # and crashes with TypingError.  Holdfasting prevents the misclassification.
+        _PERSON_ZONE_INTERACTION_COLS = {
+            'female_x_log_dist', 'edu_prim_priv_cond', 'occp_mgr_x_log_dist',
+            'occp_trades_x_log_dist', 'propensity_x_log_dist',
+            'person_dist_draw_x_log_dist', 'noveh_walk_acc', 'noveh_transit_acc',
+        }
+        _zero_interaction_cols = [
+            c for c in _PERSON_ZONE_INTERACTION_COLS
+            if c in _numeric_ca.columns and _ca_stds.get(c, 0) < 1e-8
+        ]
+        if _zero_interaction_cols:
+            logger.warning(
+                f"_dest_tree: all-zero CA interaction columns - "
+                f"person attributes likely not merged (check HHTS persons passed "
+                f"for estimation, not synth). Holdfasting to prevent CO "
+                f"misclassification: {_zero_interaction_cols}"
+            )
+            _collinear_ca_cols.update(_zero_interaction_cols)
+
+        # Restrict to genuinely CA-varying columns - those with nonzero mean
         # within-chooser variance.  IDCO (person-level) variables are constant
         # across alternatives by definition; their apparent cross-correlation in
-        # the expanded ptourÃ—alt matrix is a structural artifact, not real
+        # the expanded ptour×alt matrix is a structural artifact, not real
         # collinearity.  Checking them causes nearly every CO variable pair to
         # be flagged as |r|=1.0 and holdfasted, leaving only log_DIST_1 free
         # and making every GA chromosome produce identical fitness.
@@ -2336,7 +2385,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                 if frozenset([c1, c2]) in _SAFE_PAIRS:
                     logger.debug(
                         f"_dest_tree: skipping safe skim pair '{c1}' vs '{c2}' "
-                        f"(|r|={_corr[j,i]:.4f}) â€” both are legitimate utility terms"
+                        f"(|r|={_corr[j,i]:.4f}) - both are legitimate utility terms"
                     )
                     continue
                 # Determine which variable to holdfast.  Never holdfast a primary
@@ -2348,10 +2397,10 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                 elif c1 in _NEVER_HOLDFAST_CA_COLS and c2 not in _NEVER_HOLDFAST_CA_COLS:
                     to_holdfast = c2
                 else:
-                    # Both secondary â€” holdfast the first (lower position index)
+                    # Both secondary - holdfast the first (lower position index)
                     to_holdfast = c2
                 # Pairs that are expected/known (OMX duplicate skims or design):
-                # demote to DEBUG â€” the prominent banner below explains root cause.
+                # demote to DEBUG - the prominent banner below explains root cause.
                 _KNOWN_DUPLICATE_SKIM_COLS = {
                     'DISTBIKE', 'DISTWALK', 'log_DISTBIKE_1', 'log_DISTWALK_1',
                 }
@@ -2364,7 +2413,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                 )
                 _log_fn = logger.debug if _is_known else logger.warning
                 _log_fn(
-                    f"_dest_tree: COLLINEAR CA columns detected â€” "
+                    f"_dest_tree: COLLINEAR CA columns detected - "
                     f"'{c1}' vs '{c2}' (|r|={_corr[j,i]:.4f}); "
                     f"'{to_holdfast}' will be holdfasted at 0 in estimation"
                 )
@@ -2375,13 +2424,13 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                 if set([c1, c2]) & {'DISTBIKE', 'DIST'} == {'DISTBIKE', 'DIST'}:
                     _dist_walk_collinear = True
 
-        # â”€â”€ Prominent warning when OMX distance matrices are all identical â”€â”€
+        # ── Prominent warning when OMX distance matrices are all identical ──
         if _dist_walk_collinear:
             global _DIST_WALK_BANNER_SHOWN
             if not _DIST_WALK_BANNER_SHOWN:
                 _DIST_WALK_BANNER_SHOWN = True
                 logger.warning(
-                    "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     "  DEST MODEL DATA ISSUE: DISTWALK (or DISTBIKE) == DIST in OMX.\n"
                     "  All three distance skims carry the same auto-network data.\n"
                     "  Consequence: c_log_distwalk / c_log_distbike holdfasted at 0.\n"
@@ -2389,35 +2438,35 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                     "  Walk/bike feasibility flags are still in the model as binary\n"
                     "  indicators (c_walk_feasible, c_bike_feasible).\n"
                     "  Fix: supply a true pedestrian/cycling distance skim in the OMX.\n"
-                    "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 )
     except Exception as _coll_e:
         logger.debug(f"_dest_tree: collinearity check skipped ({_coll_e})")
 
-    # â”€â”€ Build flat Larch Dataset â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Build flat Larch Dataset ─────────────────────────────────────────
     # Drop columns that also exist in CO to avoid xarray merge conflict:
     #   "conflicting values for variable 'X' on objects to be combined"
-    # weight â†’ must be CO only (weight_co_var reads CO)
-    # OTAZ, DTAZ â†’ must be CO only (choice_co_code = "DTAZ" reads CO)
+    # weight → must be CO only (weight_co_var reads CO)
+    # OTAZ, DTAZ → must be CO only (choice_co_code = "DTAZ" reads CO)
     _drop_from_ca = [c for c in ['weight', 'OTAZ', 'DTAZ'] if c in ca_df.columns]
     if _drop_from_ca:
         ca_df = ca_df.drop(columns=_drop_from_ca)
         logger.info(f"_dest_tree: dropped {_drop_from_ca} from CA (kept in CO only)")
     ca_df_indexed = ca_df.set_index(['ptour_id', '_altid_']).sort_index()
     d_ca = lx.Dataset.construct.from_idca(ca_df_indexed)
-    logger.info(f"_dest_tree: d_ca built â€” {len(d_ca.data_vars)} vars, "
+    logger.info(f"_dest_tree: d_ca built - {len(d_ca.data_vars)} vars, "
                 f"dims={dict(d_ca.dims)}")
 
     # Merge tour co-data
     tour_co = tour_df.copy()
-    # Keep only useful co columns â€” weight MUST be here (weight_co_var reads CO)
+    # Keep only useful co columns - weight MUST be here (weight_co_var reads CO)
     _co_keep = ['OTAZ', 'DTAZ', 'person_id', 'PERSID', 'weight',
                 'tour_mode', 'tour_purpose', 'segment']
     _co_keep = [c for c in _co_keep if c in tour_co.columns]
     if _co_keep:
         tour_co = tour_co[_co_keep]
     d_co = lx.Dataset.construct.from_idco(tour_co)
-    logger.info(f"_dest_tree: d_co built â€” {len(d_co.data_vars)} vars: "
+    logger.info(f"_dest_tree: d_co built - {len(d_co.data_vars)} vars: "
                 f"{list(d_co.data_vars)}")
 
     # Check for overlapping variables before merge
@@ -2425,12 +2474,12 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     _co_vars = set(d_co.data_vars)
     _overlap = _ca_vars & _co_vars
     if _overlap:
-        logger.warning(f"_dest_tree: CA/CO variable overlap detected: {_overlap} â€” "
+        logger.warning(f"_dest_tree: CA/CO variable overlap detected: {_overlap} - "
                        f"dropping from d_ca before merge")
         d_ca = d_ca.drop_vars(list(_overlap))
     d = d_ca.merge(d_co)
 
-    # Attach metadata for downstream code via .attrs (xarray â‰¥2024 forbids
+    # Attach metadata for downstream code via .attrs (xarray ≥2024 forbids
     # direct attribute assignment on Dataset objects)
     d.attrs['_od_vars_cached'] = list(_cached_od_vars) if _cached_od_vars else []
     d.attrs['_flat_mode'] = True  # flag for _build_dest_model to use flat expressions
@@ -2440,7 +2489,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     _n_ca = len([v for v in d.data_vars if '_altidx_' in str(d[v].dims)])
     _n_co = len(d.data_vars) - _n_ca
     logger.info(
-        f"_dest_tree: FLAT Dataset built â€” {len(ca_df)} ca rows, "
+        f"_dest_tree: FLAT Dataset built - {len(ca_df)} ca rows, "
         f"{len(ca_df.columns)} ca columns, "
         f"{_n_co} co vars, {_n_ca} ca vars merged OK "
         f"(ActivitySim pre-joined pattern)"
@@ -2464,12 +2513,12 @@ def _importance_sample_dest_alts(
     from an importance distribution proportional to zone size_term.
 
     The Manski-Lerman correction
-        log_correction_j = âˆ’log(q_j)
+        log_correction_j = −log(q_j)
     is added to every alternative's utility so the MLE remains consistent
     despite the biased sample.  q_j is the importance weight of zone j under
     the size-term distribution.  For the forced-in chosen zone we use its
-    same q_j (as if it had been drawn normally) â€” this is the standard
-    exogenous sampling correction (Ben-Akiva & Lerman 1985, Â§8.4).
+    same q_j (as if it had been drawn normally) - this is the standard
+    exogenous sampling correction (Ben-Akiva & Lerman 1985, §8.4).
 
     Parameters
     ----------
@@ -2482,7 +2531,7 @@ def _importance_sample_dest_alts(
     Returns
     -------
     pd.DataFrame with columns ['ptour_id', 'alt_zone', 'log_correction'].
-    One row per (observation, alternative) â€” the sampled alternative set.
+    One row per (observation, alternative) - the sampled alternative set.
     """
     rng = np.random.default_rng(seed)
 
@@ -2490,7 +2539,7 @@ def _importance_sample_dest_alts(
     n_zones  = len(zone_arr)
     zone_set = set(zone_arr.tolist())
 
-    # â”€â”€ Importance weights from size_term â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Importance weights from size_term ────────────────────────────────
     lu = landuse.copy()
     if lu.index.name == 'ORDER':
         lu = lu.reset_index()
@@ -2504,8 +2553,8 @@ def _importance_sample_dest_alts(
     st_raw = np.clip(st_raw, 1e-10, None)
     q = st_raw / st_raw.sum()           # importance distribution over zone_arr
 
-    # â”€â”€ Pre-compute log(q) once â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    log_q = np.log(q)                   # âˆ’log_q is the Manski-Lerman correction
+    # ── Pre-compute log(q) once ───────────────────────────────────────────
+    log_q = np.log(q)                   # −log_q is the Manski-Lerman correction
 
     zone_to_idx = {int(z): i for i, z in enumerate(zone_arr)}
 
@@ -2542,7 +2591,7 @@ def _importance_sample_dest_alts(
             )
             alt_indices = [candidate_idx] + sampled_idx.tolist()
         elif draw_size > 0:
-            # No valid chosen â€” draw sample_size alternatives freely
+            # No valid chosen - draw sample_size alternatives freely
             alt_indices = rng.choice(n_zones, size=sample_size, replace=False, p=q).tolist()
         else:
             # sample_size == 1 and no valid chosen
@@ -2552,13 +2601,13 @@ def _importance_sample_dest_alts(
             rows.append({
                 'ptour_id':       pid,
                 'alt_zone':       int(zone_arr[idx]),
-                'log_correction': float(-log_q[idx]),   # Manski-Lerman: âˆ’log(q_j)
+                'log_correction': float(-log_q[idx]),   # Manski-Lerman: −log(q_j)
             })
 
     result = pd.DataFrame(rows, columns=['ptour_id', 'alt_zone', 'log_correction'])
     n_obs = tours_df['ptour_id'].nunique() if 'ptour_id' in tours_df.columns else len(tours_df)
     logger.info(
-        f"_importance_sample_dest_alts: {n_obs} observations Ã— {sample_size} alts "
+        f"_importance_sample_dest_alts: {n_obs} observations × {sample_size} alts "
         f"= {len(result)} rows; q range=[{q.min():.2e},{q.max():.2e}]"
     )
     return result
@@ -2834,11 +2883,11 @@ def _estimate_dest_coefficients_alt(
 # UTILITY SPECIFICATIONS  (ActivitySim-style UEC pattern)
 # ===========================================================================
 #
-# Utility specs are plain Python dicts â€” no hardcoded branches, no CSV files.
+# Utility specs are plain Python dicts - no hardcoded branches, no CSV files.
 # Each entry is:
 #   coefficient_name : (expression, {segment_filter})
 #
-# segment_filter is optional â€” if present, the term is only added when the
+# segment_filter is optional - if present, the term is only added when the
 # segment matches.  An empty dict {} means the term applies to all segments.
 #
 # To add a variable: add one line to the relevant dict.
@@ -2849,148 +2898,148 @@ def _estimate_dest_coefficients_alt(
 # everything in Python so you don't need CSV files to edit the model.
 # ===========================================================================
 
-# â”€â”€ Mode choice UEC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Mode choice UEC ──────────────────────────────────────────────────────────
 # Each entry:  coeff_name: (expression, {mode_name: segments_list_or_None})
 # segments_list=None means active for all segments.
 # Expression context: person.xxx (person sub-dataset), tour.xxx (tour sub-dataset),
 #                     od.xxx (OMX skim), emp.xxx (landuse / employment)
 #
 # Behavioural design principles (matching QTS HHTS evidence for SEQ):
-#   DA (drive alone)  â€” car ownership and licence are strong enablers;
+#   DA (drive alone)  - car ownership and licence are strong enablers;
 #                       full-time workers peak-commute by car; income positive.
-#   Other (shared)    â€” larger households; part-time workers; lower income.
-#   Walk              â€” short distances; zero-car HHs; women in SEQ walk more;
+#   Other (shared)    - larger households; part-time workers; lower income.
+#   Walk              - short distances; zero-car HHs; women in SEQ walk more;
 #                       younger adults; outbound stops reduce walk attractiveness.
-#   Bike              â€” HH bicycle ownership key; youth (<25yr) dominant;
+#   Bike              - HH bicycle ownership key; youth (<25yr) dominant;
 #                       shopping trips less compatible; no car HHs use it more.
-#   Transit           â€” zero-car HHs; women; lower income; longer travel time
+#   Transit           - zero-car HHs; women; lower income; longer travel time
 #                       trips where car is less competitive.
 # ASC reference mode = DA (no ASC for DA).
 MODE_UEC = {
-    # â”€â”€ Mode-specific travel time deterrents â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Mode-specific travel time deterrents ─────────────────────────────
     #
-    # SCALE DESIGN â€” all expressions must stay roughly 0â€“7 so set_cap(Â±10)
+    # SCALE DESIGN - all expressions must stay roughly 0-7 so set_cap(±10)
     # never binds and the optimizer can find meaningful coefficients:
-    # â”€â”€ Mode-specific travel time deterrents â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Mode-specific travel time deterrents ─────────────────────────
     #
-    # WALK / BIKE DISTANCE â†’ TIME CONVERSION
+    # WALK / BIKE DISTANCE → TIME CONVERSION
     # ----------------------------------------
     # DISTWALK and DISTBIKE are stored in km in this OMX.
-    # Walk speed = 5 km/h  â†’ 12 min/km  â†’ time(min) = DISTWALK * 12
-    # Bike speed = 15 km/h â†’ 4  min/km  â†’ time(min) = DISTBIKE * 4
+    # Walk speed = 5 km/h  → 12 min/km  → time(min) = DISTWALK * 12
+    # Bike speed = 15 km/h → 4  min/km  → time(min) = DISTBIKE * 4
     # We use log(time + 1) to compress the right tail of the distribution.
-    # Median inter-zonal DISTWALK â‰ˆ 32 km for 329-zone SEQ system (many zones far apart).
+    # Median inter-zonal DISTWALK ≈ 32 km for 329-zone SEQ system (many zones far apart).
     # Only short-distance OD pairs are walk/bike available (filtered by walk_avail/bike_avail).
     #
-    # Auto/Transit: SOVTOLL_TIME__AM median=58.8 min â†’ divide by 60 â†’ hours
+    # Auto/Transit: SOVTOLL_TIME__AM median=58.8 min → divide by 60 → hours
     "c_ivt_auto":       ("od.SOVTOLL_TIME__AM / 60.0",         {"DA": None, "SR": None}),
     "c_ivt_transit":    ("od.WLK_LOC_WLK_TOTIVT__AM / 60.0",  {"Transit": None}),
     "c_walk_time":      ("log(od.DISTWALK * 12 + 1)",           {"Walk": None}),
     "c_bike_time":      ("log(od.DISTBIKE * 4 + 1)",            {"Bike": None}),
 
-    # â”€â”€ Crash safety perception â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Crash safety perception ────────────────────────────────────────────
     "c_crash_veh":      ("log(od.CRASH+1)",               {"DA": None, "SR": None, "Transit": None}),
 
-    # â”€â”€ Vehicle ownership â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Vehicle ownership ─────────────────────────────────────────────────
     "c_veh_da":         ("person.vehrd",                  {"DA": None}),
     "c_veh_sr":         ("person.vehrd",                  {"SR": None}),
     "c_noveh_transit":  ("(person.vehrd == 0)",           {"Transit": None}),
     "c_noveh_walk":     ("(person.vehrd == 0)",           {"Walk": None}),
 
-    # â”€â”€ Car licence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Car licence ───────────────────────────────────────────────────────
     # CARLICENCE is now a HARD AVAILABILITY constraint for DA (not a utility term).
     # Persons without a licence cannot drive alone; they can still be SR passengers.
     # availability_co_vars = {Mode.DA: "CARLICENCE", ...} in _build_mode_model().
 
-    # â”€â”€ Income â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Income ────────────────────────────────────────────────────────────
     "c_incp_da":        ("person.incp",                   {"DA": None}),
     "c_incp_sr":        ("person.incp",                   {"SR": None}),
     "c_incp_transit":   ("person.incp",                   {"Transit": None}),
     "c_incp_active":    ("person.incp",                   {"Walk": None, "Bike": None}),
 
-    # â”€â”€ Age â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Age ───────────────────────────────────────────────────────────────
     "c_age_walk":       ("person.age5p",                  {"Walk": None}),
     "c_age_bike":       ("person.age5p",                  {"Bike": None}),
     "c_young_bike":     ("(person.age5p <= 5)",           {"Bike": None}),
 
-    # â”€â”€ Household size â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Household size ────────────────────────────────────────────────────
     "c_hhsize_sr":      ("person.nprd",                   {"SR": None}),
     "c_joint_sr":       ("tour.joint_travel",            {"SR": None}),
 
-    # â”€â”€ Bicycle ownership â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Bicycle ownership ─────────────────────────────────────────────────
     "c_bikes_bike":     ("person.bikes",                  {"Bike": None}),
 
-    # â”€â”€ Sex â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Sex ───────────────────────────────────────────────────────────────
     "c_female_transit": ("(person.sexp == 2)",            {"Transit": None}),
     "c_female_walk":    ("(person.sexp == 2)",            {"Walk": None}),
 
-    # â”€â”€ Worker type â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Worker type ───────────────────────────────────────────────────────
     "c_ftwork_da":      ("(person.WORKSTAT == 1)",        {"DA": None}),
     "c_ptwork_sr":      ("(person.WORKSTAT == 2)",        {"SR": None}),
 
-    # â”€â”€ Walk / bike stops â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Walk / bike stops ─────────────────────────────────────────────────
     "c_walk_stops":     ("tour.outbound_stops",           {"Walk": None}),
     "c_bike_stops":     ("tour.outbound_stops",           {"Bike": None}),
     "c_bike_veh":       ("(person.vehrd >= 1)",           {"Bike": ["nonmand"]}),
     "c_bike_shop":      ("(tour.n_shopping_out > 0)",     {"Bike": ["nonmand"]}),
 
-    # â”€â”€ Time-of-day â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Time-of-day ───────────────────────────────────────────────────────
     "c_peak_da":        ("(tour._time_period == 1)",      {"DA": None}),
 
-    # â”€â”€ Alternative-specific constants (DA = reference, no ASC) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Alternative-specific constants (DA = reference, no ASC) ──────────
     "ASC_SR":           ("1",                             {"SR": None}),
     "ASC_Walk":         ("1",                             {"Walk": None}),
     "ASC_Bike":         ("1",                             {"Bike": None}),
     "ASC_Transit":      ("1",                             {"Transit": None}),
 }
 
-# â”€â”€ Destination choice UEC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Destination choice UEC ───────────────────────────────────────────────────
 # ActivitySim pattern: ONE composite size_term per zone replaces many individual
-# employment columns. Person Ã— zone interactions capture behavioural heterogeneity:
+# employment columns. Person × zone interactions capture behavioural heterogeneity:
 # who travels how far, and to what type of zone.
 #
 # Behavioural design principles:
-#   Distance deterrence â€” everyone is deterred by distance, but the degree varies:
-#       higher income â†’ less deterred (c_incp_dist positive)
-#       older age     â†’ more deterred  (c_age_dist negative)
-#       more vehicles â†’ less deterred  (c_veh_dist positive)
-#   Accessibility â€” zone-level cumulative opportunity; persons in car-oriented
+#   Distance deterrence - everyone is deterred by distance, but the degree varies:
+#       higher income → less deterred (c_incp_dist positive)
+#       older age     → more deterred  (c_age_dist negative)
+#       more vehicles → less deterred  (c_veh_dist positive)
+#   Accessibility - zone-level cumulative opportunity; persons in car-oriented
 #       or zero-car HHs respond differently to walk vs auto accessibility.
-#   Worker-type conditioning â€” FT workers gravitate to high-employment zones;
+#   Worker-type conditioning - FT workers gravitate to high-employment zones;
 #       retired/non-workers prefer locally-accessible nonmand destinations.
-#   Industry / study conditioning â€” carried over from previous version, now
+#   Industry / study conditioning - carried over from previous version, now
 #       properly interact with the person's industry and study level.
 DEST_UEC = {
-    # â”€â”€ Universal distance deterrent (log-distance in km) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Universal distance deterrent (log-distance in km) ─────────────────
     # Single log-distance term as the primary spatial deterrent.
     "c_log_dist":           ("log(od.DIST+1)",              None),
     # Additional linear distance penalty helps suppress unrealistic far-tail
     # destinations that still survive a pure log-distance deterrence.
     "c_dist":               ("od.DIST",                     None),
 
-    # â”€â”€ Crash safety deterrent â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Crash safety deterrent ────────────────────────────────────────────
     "c_crash":              ("log(od.CRASH+1)",             None),
 
-    # â”€â”€ Mode logsum (captures accessibility via all modes) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Mode logsum (captures accessibility via all modes) ─────────────────
     "c_logsum":             ("base.logsum",                 None),
 
-    # â”€â”€ Zone attractiveness (composite employment/activity size term) â”€â”€â”€â”€â”€â”€
+    # ── Zone attractiveness (composite employment/activity size term) ──────
     "c_size_term":          ("emp.size_term",               None),
 
-    # â”€â”€ ACDC Agglomeration (Nelson 1958 / Bernadin) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # acdc_aggl[j] = log(Î£_{kâ‰ j} size[k] Ã— exp(-Î» Ã— auto_time[j,k]) + Îµ)
+    # ── ACDC Agglomeration (Nelson 1958 / Bernadin) ───────────────────────
+    # acdc_aggl[j] = log(Σ_{k≠j} size[k] × exp(-λ × auto_time[j,k]) + ε)
     # Expected sign: POSITIVE (agglomeration = nearby complementary zones).
     # NOTE: Held at starting value 0.20 until Hessian is confirmed invertible.
     "c_aggl":               ("emp.acdc_aggl",               None),
 
-    # â”€â”€ ACDC Competition â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── ACDC Competition ─────────────────────────────────────────────────
     # acdc_comp[j] = competition accessible FROM zone j.
     # Expected sign: NEGATIVE.  Dropped from default UEC because it is
     # collinear with c_aggl when both are derived from the same size_term
     # and the same time matrix.  Re-enable only if both have non-NaN se.
     "c_comp":               ("emp.acdc_comp",               None),
 
-    # â”€â”€ Person Ã— distance interactions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Person × distance interactions ────────────────────────────────────
     # Collinearity note: three correlated person variables (incp, age5p, vehrd)
     # all multiplied by the same log(DIST) creates a near-singular block.
     # Keep ONLY the two most behaviorally distinct: income (positive) and
@@ -3002,7 +3051,7 @@ DEST_UEC = {
     "c_female_dist":        ("(person.sexp == 2) * log(od.DIST+1)", None),
     "c_nprd_dist":          ("person.nprd * log(od.DIST+1)",        None),
 
-    # â”€â”€ Zone-level accessibility measures â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Zone-level accessibility measures ─────────────────────────────────
     # Collinearity fix: auto_work_acc and walk_acc were duplicated via the
     # worker-type conditioning terms below.  Keep ONE coefficient per
     # accessibility dimension; the conditioning is absorbed into the
@@ -3018,33 +3067,33 @@ DEST_UEC = {
     "c_noveh_walk_acc":     ("emp.walk_acc",                ["nonmand", "edu"]),
     "c_noveh_transit_acc":  ("emp.transit_acc",             ["nonmand", "edu"]),
 
-    # â”€â”€ Income Ã— work accessibility â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Income × work accessibility ────────────────────────────────────────
     # Higher-income workers prefer car-accessible employment zones.
-    # incp is continuous (band 1â€“14); interaction avoids collinearity with
+    # incp is continuous (band 1-14); interaction avoids collinearity with
     # c_auto_work_acc (which captures zone-level accessibility unconditionally).
     # Expected sign: POSITIVE.
     "c_incp_work_acc":      ("person.incp * emp.auto_work_acc",     ["work"]),
 
-    # â”€â”€ Full-time vs part-time distance conditioning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Full-time vs part-time distance conditioning ───────────────────────
     # FT workers (WORKSTAT=1) travel farther to work than PT workers (WORKSTAT=2).
     # Conditioning in DEST_COND restricts this term to FT workers only.
     # Expected sign: POSITIVE (FT workers accept longer commutes).
     "c_ftwork_dist":        ("person.WORKSTAT * log(od.DIST+1)",    ["work"]),
 
-    # â”€â”€ Occupation Ã— distance for work trips â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Occupation × distance for work trips ──────────────────────────────
     # White-collar workers (occp_group=1) travel farther to work.
     # Conditioning is in DEST_COND below.
     "c_occp_dist":          ("person.occp_group * log(od.DIST+1)",  ["work"]),
 
-    # â”€â”€ Occupation sub-group distance interactions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Occupation sub-group distance interactions ─────────────────────────
     # Professional/managerial (occp_mgr) travel farthest; trades (occp_trades)
     # have intermediate sensitivity. Both are binary dummies derived from occp_group.
     "c_occp_mgr_dist":      ("person.occp_mgr * log(od.DIST+1)",    ["work"]),
     "c_occp_trades_dist":   ("person.occp_trades * log(od.DIST+1)", ["work"]),
 
-    # â”€â”€ Industry-specific zone attractors â€” work only â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # FIX: Previously all three used "emp.size_term" â†’ identical columns
-    # â†’ perfectly collinear â†’ singular Hessian â†’ NaN std errors.
+    # ── Industry-specific zone attractors - work only ─────────────────────
+    # FIX: Previously all three used "emp.size_term" → identical columns
+    # → perfectly collinear → singular Hessian → NaN std errors.
     # Each now references a DISTINCT landuse column so the Hessian is full-rank.
     # Conditioning via DEST_COND restricts each term to the relevant industry.
     "c_indp_finance":       ("emp.FPSEMPN",                 ["work"]),
@@ -3052,53 +3101,53 @@ DEST_UEC = {
     "c_indp_retail":        ("emp.RETEMPN",                 ["work"]),
     "c_totemp_work":        ("emp.TOTEMP",                  ["work"]),
 
-    # â”€â”€ Education zone attractors â€” edu only â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # FIX: Previously all three used "emp.size_term" â†’ perfectly collinear.
+    # ── Education zone attractors - edu only ──────────────────────────────
+    # FIX: Previously all three used "emp.size_term" → perfectly collinear.
     # Each now references a DISTINCT enrolment/facility column.
     "c_edu_post":           ("emp.Education",               ["edu"]),
     "c_edu_primary":        ("emp.Primary",                 ["edu"]),
     "c_edu_secondary":      ("emp.Secondary",               ["edu"]),
 
-    # â”€â”€ Non-mandatory destination attractors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Non-mandatory destination attractors ───────────────────────────
     "c_nonmand_res":        ("emp.residential",             ["nonmand"]),
     "c_nonmand_ent":        ("emp.Entertainment",           ["nonmand"]),
     "c_nonmand_com":        ("emp.commercial",              ["nonmand"]),
     "c_nonmand_retail":     ("emp.retail",                  ["nonmand"]),
 
-    # â”€â”€ Travel propensity Ã— distance (CDAP logsum proxy) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Travel propensity × distance (CDAP logsum proxy) ─────────────────
     # travel_propensity_i is computed from person attributes as a normalised
     # score capturing each person's propensity for mandatory/longer travel
     # (see _travel_propensity_score).  Interacted with log(dist) so that
-    # more-mobile people are less deterred by distance â€” directly addressing
+    # more-mobile people are less deterred by distance - directly addressing
     # the homogeneous distance sensitivity that causes unrealistic clustering.
-    # Expected sign: POSITIVE (high propensity â†’ less distance aversion â†’ +Î²).
+    # Expected sign: POSITIVE (high propensity → less distance aversion → +β).
     "c_propensity_dist":    ("person.travel_propensity * log(od.DIST+1)", None),
 
-    # â”€â”€ Frozen person distance draw (random heterogeneity, work only) â”€â”€â”€â”€â”€
+    # ── Frozen person distance draw (random heterogeneity, work only) ─────
     # person_dist_draw_i is set at prediction time to a frozen N(0, s_log_dist)
     # draw seeded by person_id (see _frozen_person_dist_offsets).
-    # During HHTS estimation this column is all zeros â€” the heterogeneity is
+    # During HHTS estimation this column is all zeros - the heterogeneity is
     # absorbed into s_log_dist, not estimated as a fixed effect.
     # At prediction it shifts each person's effective distance sensitivity
     # by their draw, making some consistently short-distance and others long.
     "c_person_dist_draw":   ("person.person_dist_draw * log(od.DIST+1)",  ["work"]),
 }
 
-# â”€â”€ Conditioning expressions (ActivitySim interaction term pattern) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Conditioning expressions (ActivitySim interaction term pattern) ───────────
 # Applied as multipliers: P(coeff) * X(expr) * X(condition)
 # The condition is evaluated per-person using the person sub-dataset relationship.
 DEST_COND = {
-    # Industry conditioning â€” use OR of individual equality checks.
+    # Industry conditioning - use OR of individual equality checks.
     # Sharrow cannot compile Python 'in [list]' syntax; use boolean OR instead.
-    # FPSEMPN: finance/professional (indp codes 10â€“13)
+    # FPSEMPN: finance/professional (indp codes 10-13)
     "c_indp_finance":   ("(person.indp == 10) | (person.indp == 11) "
                          "| (person.indp == 12) | (person.indp == 13)"),
-    # HEREMPN: health/education (indp codes 16â€“17)
+    # HEREMPN: health/education (indp codes 16-17)
     "c_indp_health":    "(person.indp == 16) | (person.indp == 17)",
-    # RETEMPN: retail/hospitality (indp codes 7â€“8)
+    # RETEMPN: retail/hospitality (indp codes 7-8)
     "c_indp_retail":    "(person.indp == 7) | (person.indp == 8)",
 
-    # Study level conditioning (STUDYING: 1=primary, 2=secondary, 3â€“4=post)
+    # Study level conditioning (STUDYING: 1=primary, 2=secondary, 3-4=post)
     "c_edu_post":       "(person.STUDYING == 3) | (person.STUDYING == 4)",
     "c_edu_primary":    "(person.STUDYING == 1)",
     "c_edu_secondary":  "(person.STUDYING == 2)",
@@ -3119,7 +3168,7 @@ DEST_COND = {
 # SIZE TERMS  (ActivitySim tour_destination_size_terms pattern)
 # ===========================================================================
 #
-# ActivitySim uses a zone Ã— purpose size term matrix as the attractor in
+# ActivitySim uses a zone × purpose size term matrix as the attractor in
 # destination choice.  Rather than embedding 20+ individual landuse columns
 # in the utility expression, we compute ONE composite size term per
 # (zone, purpose) pair and reference it as a single utility term.
@@ -3128,7 +3177,7 @@ DEST_COND = {
 #   size_term(zone, purpose) = sum over categories of:
 #       landuse_col ^ coefficient
 #
-# Coefficients by purpose â€” mirrors ActivitySim size_terms.csv pattern.
+# Coefficients by purpose - mirrors ActivitySim size_terms.csv pattern.
 # To change the attractor: edit this dict. No utility expression changes needed.
 # ===========================================================================
 
@@ -3147,30 +3196,30 @@ SIZE_TERM_COEFFICIENTS = {
     # Additional sector columns (FPSEMPN, commercial) capture the QUALITY mix of
     # employment that raw TOTEMP misses:
     #   - zone 40: TOTEMP=15 419 (not highest) but FPSEMPN=5 600 (highest in SEQ)
-    #              and commercial=777 k mÂ² (3Ã— next zone) â†’ finance/CBD district
+    #              and commercial=777 k m² (3× next zone) → finance/CBD district
     #   - zone 182: TOTEMP=17 416 (higher) but far fewer observed work trips
     # These sector terms must carry large enough exponents to actually differentiate
     # between zones with similar raw employment but different sector composition.
     'work': {
-        'TOTEMP':    1.0,    # linear â€” each job is one opportunity
+        'TOTEMP':    1.0,    # linear - each job is one opportunity
         'FPSEMPN':   0.85,   # finance/prof-services: zone 40=5 600 (near SEQ highest);
                              # raised from 0.75 to better differentiate CBD finance zones
-        'HEREMPN':   0.35,   # healthcare employment â€” sector attractor
-        'RETEMPN':   0.25,   # retail employment â€” minor work attractor
-        # 'commercial' REMOVED from SIZE_TERM: raw mÂ² has 89M data error at zone 158
-        # (p99=1.06M; error is 84Ã— p99).  Commercial is instead used as a direct log-
+        'HEREMPN':   0.35,   # healthcare employment - sector attractor
+        'RETEMPN':   0.25,   # retail employment - minor work attractor
+        # 'commercial' REMOVED from SIZE_TERM: raw m² has 89M data error at zone 158
+        # (p99=1.06M; error is 84× p99).  Commercial is instead used as a direct log-
         # transformed term (c_log_commercial_work / log_commercial_1) with a p99 cap
         # applied in _dest_tree() so the outlier does not distort MLE estimation.
     },
     'edu': {
-        'Primary':   1.0,    # number of primary school places â€” linear
-        'Secondary': 1.0,    # number of secondary school places â€” linear
-        'Education': 0.9,    # tertiary enrolment â€” near-linear; slight compression
+        'Primary':   1.0,    # number of primary school places - linear
+        'Secondary': 1.0,    # number of secondary school places - linear
+        'Education': 0.9,    # tertiary enrolment - near-linear; slight compression
                              # for very large campuses that would otherwise dominate
                              # all tertiary trips regardless of distance
         'HSENROLL':  0.85,   # supplementary high-school enrolment count
         'university': 1.0,   # OSM university building count (27 nz); zone 40 = 5 (QUT, TAFE CBD)
-                             # Primary=0, Secondary=0 for zone 40 â†’ edu rank 259/330 without this
+                             # Primary=0, Secondary=0 for zone 40 → edu rank 259/330 without this
         'college':    1.0,   # OSM community college / TAFE POI count (38 nz)
                              # fills vocational-education gap not captured by school enrolments
         'TOTPOP':    0.15,   # population baseline: ensures zones with unrecorded schools
@@ -3181,11 +3230,11 @@ SIZE_TERM_COEFFICIENTS = {
     },
     'social': {
         # Exponents are calibrated parameters (ActivitySim size_terms pattern):
-        # exp=1.0 â†’ linear attraction; exp<1.0 â†’ compressed (diminishing returns for
+        # exp=1.0 → linear attraction; exp<1.0 → compressed (diminishing returns for
         # very large venues); compute_size_terms() applies sum(col^exp) then log-demeans.
         'Entertainment':  0.8,   # purpose-built entertainment land use (327 nz)
         'residential':    0.5,   # social trips stay near home
-        'sports_centre':  0.7,   # OSM sport/recreation venues (247 nz) â€” key social activity
+        'sports_centre':  0.7,   # OSM sport/recreation venues (247 nz) - key social activity
         'fitness_centre': 0.5,   # OSM gyms and fitness studios (186 nz)
     },
     'escort': {
@@ -3206,7 +3255,7 @@ SIZE_TERM_COEFFICIENTS = {
         'clinic':           0.7,  # OSM clinics (152 nz)
         'pharmacy':         0.6,  # OSM pharmacies (207 nz)
         'bank':             0.5,  # OSM banks (108 nz)
-        # 'commercial' REMOVED: same 89M mÂ² data error at zone 158 as in work size term
+        # 'commercial' REMOVED: same 89M m² data error at zone 158 as in work size term
     },
     'othdiscr': {
         'OTHERDISCRFacilities': 1.0,  # purpose-built discretionary facilities (313 nz)
@@ -3216,13 +3265,13 @@ SIZE_TERM_COEFFICIENTS = {
         'fitness_centre':       0.5,  # OSM gyms (186 nz)
     },
     'eat': {
-        'EATOUT':     1.0,   # aggregate eating-out attractor (315 nz) â€” primary signal
-        'restaurant': 0.7,   # OSM restaurant count (260 nz) â€” explicit venue signal
+        'EATOUT':     1.0,   # aggregate eating-out attractor (315 nz) - primary signal
+        'restaurant': 0.7,   # OSM restaurant count (260 nz) - explicit venue signal
         'cafe':       0.6,   # OSM cafe count (282 nz)
-        'pub':        0.4,   # OSM pub count â€” pub meals (205 nz)
+        'pub':        0.4,   # OSM pub count - pub meals (205 nz)
         'retail':     0.3,   # retail mix correlates with food-court density
     },
-    # Aggregate entry for 'nonmand' segment â€” combines attractors from all
+    # Aggregate entry for 'nonmand' segment - combines attractors from all
     # non-mandatory sub-purposes so compute_size_terms(purposes=['nonmand'])
     # returns a meaningful fallback when dest_model.probability() is unavailable.
     'nonmand': {
@@ -3238,11 +3287,11 @@ SIZE_TERM_COEFFICIENTS = {
         'Healthcare':           0.4,   # replaces removed 'commercial'
         'sports_centre':        0.4,   # OSM sport/recreation
         'kindergarten':         0.4,   # childcare places (escort sub-trips)
-        # 'commercial' REMOVED: 89M mÂ² data error at zone 158
+        # 'commercial' REMOVED: 89M m² data error at zone 158
     },
 }
 
-# Segment â†’ list of purposes it covers
+# Segment → list of purposes it covers
 SEGMENT_PURPOSES = {
     'work':    ['work'],
     'edu':     ['edu'],
@@ -3253,7 +3302,7 @@ SEGMENT_PURPOSES = {
 def compute_size_terms(landuse: pd.DataFrame,
                        purposes: list = None) -> pd.DataFrame:
     """
-    Compute zone Ã— purpose size term matrix.
+    Compute zone × purpose size term matrix.
 
     This is the ActivitySim tour_destination_size_terms pattern.
     Returns a DataFrame indexed by zone with one column per purpose.
@@ -3263,7 +3312,7 @@ def compute_size_terms(landuse: pd.DataFrame,
     Parameters
     ----------
     landuse : zone-indexed landuse DataFrame (from sc.get_land())
-    purposes : list of purposes to compute â€” defaults to all in SIZE_TERM_COEFFICIENTS
+    purposes : list of purposes to compute - defaults to all in SIZE_TERM_COEFFICIENTS
 
     Returns
     -------
@@ -3289,31 +3338,31 @@ def compute_size_terms(landuse: pd.DataFrame,
                 size += vals ** exp
         # log-transform with epsilon floor (matches ActivitySim log_size pattern)
         log_size = np.log(size.clip(lower=1e-6))
-        # â”€â”€ DEMEANING (critical for zone 1 bias) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── DEMEANING (critical for zone 1 bias) ─────────────────────────
         # Without centering, zone 1 (CBD, highest employment) gets the
         # largest log(size) and with c_size_term > 0 dominates all trips.
         # Subtracting the cross-zone mean converts log(size) to a relative
-        # attractiveness index â€” the marginal attractiveness of each zone
+        # attractiveness index - the marginal attractiveness of each zone
         # relative to the average zone.  This is the ActivitySim UEC pattern
         # where the coefficient on log(size) reflects the elasticity, not
-        # the absolute scale.  The coefficient c_size_term â‰ˆ 1.0 then means
-        # "double the size â†’ double the probability" (IIA-consistent).
+        # the absolute scale.  The coefficient c_size_term ≈ 1.0 then means
+        # "double the size → double the probability" (IIA-consistent).
         result[purpose] = log_size - float(log_size.mean())
 
     df = pd.DataFrame(result)
     ranges = {p: f"[{df[p].min():.2f}, {df[p].max():.2f}]" for p in purposes}
     means = {p: round(float(df[p].mean()), 2) for p in purposes}
     logger.info(
-        f"compute_size_terms: {len(df)} zones Ã— {len(purposes)} purposes | "
+        f"compute_size_terms: {len(df)} zones × {len(purposes)} purposes | "
         f"size term ranges (min,max per purpose): {ranges} | "
-        f"means â‰ˆ 0 after demeaning (by construction): {means}"
+        f"means ≈ 0 after demeaning (by construction): {means}"
     )
     return df
 
 
 class SizeTermMatrix:
     """
-    Lightweight zone Ã— purpose size term accessor.
+    Lightweight zone × purpose size term accessor.
     Mirrors ActivitySim's DataFrameMatrix pattern for use in utility expressions.
     get(zone_ids, purpose) returns a vector of log-size-terms for those zones.
     """
@@ -3323,8 +3372,8 @@ class SizeTermMatrix:
         self._arr = df.values
         self._zone_idx = {int(z): i for i, z in enumerate(df.index)}
         self._purp_idx = {p: i for i, p in enumerate(df.columns)}
-        # Fallback index for unmapped zones: use median row (â‰ˆ average zone),
-        # NOT 0 (first zone = zone 1 = CBD â†’ causes zone-1 attraction bias).
+        # Fallback index for unmapped zones: use median row (≈ average zone),
+        # NOT 0 (first zone = zone 1 = CBD → causes zone-1 attraction bias).
         self._fallback_idx = len(df) // 2
 
     def get(self, zone_ids, purpose: str) -> np.ndarray:
@@ -3368,21 +3417,21 @@ def preprocess_tours(tours: pd.DataFrame,
 
     Columns added
     -------------
-    _time_period   : integer departure period (0=early â€¦ 5=late)
-    _log_incp      : log(incp+1) â€” for log-income utility terms
+    _time_period   : integer departure period (0=early … 5=late)
+    _log_incp      : log(incp+1) - for log-income utility terms
     _no_vehicle    : 1 if HH has zero vehicles
-    _has_vehicle   : 1 if HH has â‰¥1 vehicle
+    _has_vehicle   : 1 if HH has ≥1 vehicle
     _peak          : 1 if departure in AM peak (period==1)
     outbound_stops : 0 if missing (default)
     n_shopping_out : 0 if missing (default)
-    bikes          : 0 if missing (default â€” HH bicycle count)
+    bikes          : 0 if missing (default - HH bicycle count)
     age5p          : 6 if missing (default 25-29yr age band)
     CARLICENCE     : 1 if missing (assume licensed)
     occp_group     : 0 if missing (not working)
     """
     t = tours.copy()
 
-    # â”€â”€ time period â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── time period ───────────────────────────────────────────────────────
     if 'STARTIME' in t.columns:
         def _period(m):
             m = float(m) if not pd.isna(m) else 480
@@ -3398,13 +3447,13 @@ def preprocess_tours(tours: pd.DataFrame,
 
     t['_peak'] = (t['_time_period'] == 1).astype(int)
 
-    # â”€â”€ income â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── income ────────────────────────────────────────────────────────────
     if 'incp' in t.columns:
         t['_log_incp'] = np.log1p(pd.to_numeric(t['incp'], errors='coerce').fillna(8))
     else:
         t['_log_incp'] = np.log1p(8)
 
-    # â”€â”€ vehicle ownership â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── vehicle ownership ─────────────────────────────────────────────────
     if 'vehrd' in t.columns:
         vehrd = pd.to_numeric(t['vehrd'], errors='coerce').fillna(1)
         t['_no_vehicle']  = (vehrd == 0).astype(int)
@@ -3413,8 +3462,8 @@ def preprocess_tours(tours: pd.DataFrame,
         t['_no_vehicle']  = 0
         t['_has_vehicle'] = 1
 
-    # â”€â”€ safe defaults for any person-attribute columns that may be absent â”€
-    # (these are accessed as tour.xxx for the UEC preprocessor path â€”
+    # ── safe defaults for any person-attribute columns that may be absent ─
+    # (these are accessed as tour.xxx for the UEC preprocessor path -
     #  the DataTree person.xxx path is the primary source, but having them
     #  on the tour table as well avoids errors in some Larch API paths)
     for col, default in [('bikes', 0), ('age5p', 6),
@@ -3491,7 +3540,7 @@ def _build_mode_utility(m, Mode, segment: str,
         uec = MODE_UEC
 
     # accumulate terms per mode using None as empty sentinel
-    # lx.LinearFunction() doesn't exist â€” P*X returns the correct type,
+    # lx.LinearFunction() doesn't exist - P*X returns the correct type,
     # we just can't initialise an empty one; use None and replace on first term
     mode_terms: dict = {name: None for name in MODE_MAP}
 
@@ -3559,7 +3608,7 @@ def _pf_set(model, param: str, field: str, value):
             return
         except (ValueError, AttributeError, IndexError):
             pass
-    # Last resort â€” may silently fail under Copy-on-Write but worth trying
+    # Last resort - may silently fail under Copy-on-Write but worth trying
     try:
         model.pf.loc[param, field] = value
     except Exception:
@@ -3580,7 +3629,7 @@ def _build_dest_utility(mm, segment: str,
     if uec  is None: uec  = DEST_UEC
     if cond is None: cond = DEST_COND
 
-    # accumulate with None sentinel â€” lx.LinearFunction() doesn't exist
+    # accumulate with None sentinel - lx.LinearFunction() doesn't exist
     utility = None
 
     for coeff, (expr, segs) in uec.items():
@@ -3603,15 +3652,15 @@ def _build_dest_utility(mm, segment: str,
     return mm
 
 
-# â”€â”€ Shims so existing _mode_spec / _dest_spec callers still work â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Shims so existing _mode_spec / _dest_spec callers still work ─────────────
 
 def _mode_spec(m, segment: str, Mode):
-    """Wrapper â€” delegates to UEC-based builder."""
+    """Wrapper - delegates to UEC-based builder."""
     return _build_mode_utility(m, Mode, segment)
 
 
 def _dest_spec(mm, segment: str):
-    """Wrapper â€” delegates to UEC-based builder."""
+    """Wrapper - delegates to UEC-based builder."""
     return _build_dest_utility(mm, segment)
 
 
@@ -3627,62 +3676,62 @@ def _dest_spec(mm, segment: str):
 #
 # SEGMENT_COEFFICIENTS mirrors ActivitySim's get_segment_coefficients:
 #   {segment: {coeff_name: init_value}}
-# These are starting values only â€” the estimator refines them.
+# These are starting values only - the estimator refines them.
 # Any coefficient not listed inherits the UEC default (0.0).
 # ===========================================================================
 
-# â”€â”€ Per-segment coefficient starting values â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Per-segment coefficient starting values ───────────────────────────────────
 SEGMENT_COEFFICIENTS: dict = {
     "work": {
-        # â”€â”€ Dest: critical distance/logsum starting values â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Dest: critical distance/logsum starting values ──────────────────
         # c_log_dist defaults to 0 but is bounded <= -0.001; starting at 0
         # means the optimizer begins with no distance deterrence, making all
         # zones equally likely. A good starting point avoids bad local optima.
         "c_log_dist":        -2.0,  # log-distance deterrent (work: workers accept longer commutes)
         "c_logsum":           0.5,  # mode logsum (positive = accessible zones preferred)
         "c_crash":           -0.1,  # crash deterrent
-        # â”€â”€ Mode: distance / time â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: distance / time ─────────────────────────────────────────
         "c_ivt_auto":        -1.20,
         "c_ivt_transit":     -0.90,
         "c_crash_veh":        0.0,
-        # â”€â”€ Mode: vehicle ownership â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: vehicle ownership ───────────────────────────────────────
         "c_veh_da":           0.30,
         "c_veh_sr":           0.10,
         "c_noveh_transit":    2.0,
         "c_noveh_walk":       1.5,
-        # â”€â”€ Mode: licence â€” now HARD availability, not a utility coefficient â”€
-        # â”€â”€ Mode: income â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: licence - now HARD availability, not a utility coefficient ─
+        # ── Mode: income ─────────────────────────────────────────────────
         "c_incp_da":          0.010,
         "c_incp_sr":          0.005,
         "c_incp_transit":    -0.015,
         "c_incp_active":     -0.010,
-        # â”€â”€ Mode: age â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: age ────────────────────────────────────────────────────
         "c_age_walk":        -0.10,
         "c_age_bike":        -0.15,
         "c_young_bike":       0.50,
-        # â”€â”€ Mode: household â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: household ──────────────────────────────────────────────
         "c_hhsize_sr":        0.10,
         "c_joint_sr":         0.35,
         "c_bikes_bike":       0.40,
-        # â”€â”€ Mode: sex â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: sex ────────────────────────────────────────────────────
         "c_female_transit":   0.30,
         "c_female_walk":      0.20,
-        # â”€â”€ Mode: worker type â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: worker type ────────────────────────────────────────────
         "c_ftwork_da":        0.50,
         "c_ptwork_sr":        0.20,
-        # â”€â”€ Mode: time-of-day â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: time-of-day ────────────────────────────────────────────
         "c_peak_da":          0.30,
-        # â”€â”€ Mode: active distances â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: active distances ───────────────────────────────────────
         "c_walk_time":        -1.50,
         "c_bike_time":        -1.00,
-        # â”€â”€ Mode: stops (each stop adds out-of-vehicle handling burden) â”€â”€
+        # ── Mode: stops (each stop adds out-of-vehicle handling burden) ──
         "c_walk_stops":       -0.30,
         "c_bike_stops":       -0.50,
-        # â”€â”€ Mode: ASCs â€” calibrated to observed SEQ mode shares â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: ASCs - calibrated to observed SEQ mode shares ─────────
         # Observed: DA=62.1% Other=23.9% Walk=8.4% Transit=3.9% Bike=1.6%
         # Raw log-share vs DA: Walk=log(8.4/62.1)=-2.0, Transit=log(3.9/62.1)=-2.8
         # Bike=log(1.6/62.1)=-3.7, SR=log(23.9/62.1)=-0.96
-        # These are starting points â€” estimation refines from here.
+        # These are starting points - estimation refines from here.
         # Better initialisation prevents the optimizer from converging to
         # implausible local optima (e.g. ASC_Transit > 0 seen in logs).
         "ASC_Walk":          -2.0,
@@ -3690,45 +3739,45 @@ SEGMENT_COEFFICIENTS: dict = {
         "ASC_Transit":       -2.8,
         "ASC_SR":            -1.0,
         "c_dist":           -0.035,
-        # â”€â”€ Dest: person Ã— distance interactions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # c_age_dist removed â€” collinear with incp and vehrd in SEQ data.
+        # ── Dest: person × distance interactions ─────────────────────────
+        # c_age_dist removed - collinear with incp and vehrd in SEQ data.
         "c_incp_dist":        0.010,
         "c_age_dist":        -0.006,
         "c_veh_dist":         0.008,
         "c_female_dist":     -0.003,
         "c_nprd_dist":        0.004,
         "c_occp_dist":        0.015,
-        # â”€â”€ Dest: accessibility â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Dest: accessibility ───────────────────────────────────────────
         "c_auto_work_acc":    0.25,
         "c_walk_acc":         0.0,
         "c_noveh_walk_acc":   0.0,
         "c_noveh_transit_acc": 0.0,
-        # â”€â”€ Dest: ACDC agglomeration (competition removed â€” collinear) â”€â”€â”€â”€â”€
+        # ── Dest: ACDC agglomeration (competition removed - collinear) ─────
         "c_aggl":             0.20,
         "c_comp":            -0.08,
-        # â”€â”€ Dest: industry-specific attractors (log-scale columns) â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Dest: industry-specific attractors (log-scale columns) ─────────
         # DEST_UEC_FLAT now uses log(emp+1) so values are in [0,11] range;
-        # raw TOTEMP (0-50000) with coeff 0.15 â†’ utility ~7500 â†’ saturation.
-        "c_indp_finance":     0.30,  # log(FPSEMPN+1) Ã— finance_flag
-        "c_indp_health":      0.30,  # log(HEREMPN+1) Ã— health_flag
-        "c_indp_retail":      0.20,  # log(RETEMPN+1) Ã— retail_flag
+        # raw TOTEMP (0-50000) with coeff 0.15 → utility ~7500 → saturation.
+        "c_indp_finance":     0.30,  # log(FPSEMPN+1) × finance_flag
+        "c_indp_health":      0.30,  # log(HEREMPN+1) × health_flag
+        "c_indp_retail":      0.20,  # log(RETEMPN+1) × retail_flag
         # c_totemp_work removed (collinear with size_term)
         "c_log_commercial_work": 1.0,   # log(commercial+1) capped at p99; zone 40 (777k) vs avg ~50k
-        # â”€â”€ Dest: travel propensity Ã— distance (CDAP logsum proxy) â”€â”€â”€â”€â”€â”€
+        # ── Dest: travel propensity × distance (CDAP logsum proxy) ──────
         # Positive: more-mobile persons less deterred by distance.
         # Start near zero; estimation identifies the true magnitude.
         "c_propensity_dist":  0.03,
-        # â”€â”€ Dest: frozen person distance draw (zero during estimation) â”€â”€â”€
-        # coefficient = 1.0 â€” the column already holds the correctly-scaled
+        # ── Dest: frozen person distance draw (zero during estimation) ───
+        # coefficient = 1.0 - the column already holds the correctly-scaled
         # draw (N(0, s_log_dist)); a fixed coefficient of 1 applies it directly.
         "c_person_dist_draw": 1.0,
     },
     "edu": {
-        # â”€â”€ Dest: critical distance/logsum starting values â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Dest: critical distance/logsum starting values ──────────────────
         "c_log_dist":        -2.5,  # edu: students travel shorter distances than workers
         "c_logsum":           0.4,
         "c_crash":           -0.1,
-        # â”€â”€ Mode: distance / time â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: distance / time ─────────────────────────────────────────
         "c_ivt_auto":        -1.10,
         "c_ivt_transit":     -0.80,
         "c_crash_veh":        0.0,
@@ -3765,31 +3814,31 @@ SEGMENT_COEFFICIENTS: dict = {
         "c_veh_dist":         0.008,
         "c_female_dist":      0.002,
         "c_nprd_dist":        0.002,
-        # â”€â”€ Dest: education zone attractors (distinct columns per term) â”€â”€â”€â”€
+        # ── Dest: education zone attractors (distinct columns per term) ────
         "c_edu_post":         0.30,
         "c_edu_primary":      0.40,
         "c_edu_secondary":    0.35,
-        "c_edu_prim_priv":    0.30,  # log(private primary+1) Ã— primary student
-        "c_edu_sec_priv":     0.30,  # log(private secondary+1) Ã— secondary student
-        # â”€â”€ Dest: edu zone accessibility heuristic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        "c_edu_prim_priv":    0.30,  # log(private primary+1) × primary student
+        "c_edu_sec_priv":     0.30,  # log(private secondary+1) × secondary student
+        # ── Dest: edu zone accessibility heuristic ────────────────────────
         "c_auto_edu_acc":     0.20,
-        # â”€â”€ Dest: transit accessibility for edu â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Dest: transit accessibility for edu ───────────────────────────
         "c_walk_acc":         0.12,
         "c_transit_acc":      0.15,
         "c_noveh_walk_acc":   0.18,
         "c_noveh_transit_acc": 0.22,
-        # â”€â”€ Dest: ACDC agglomeration only (competition removed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Dest: ACDC agglomeration only (competition removed) ────────────
         "c_aggl":             0.15,
         "c_comp":            -0.06,
-        # â”€â”€ Dest: travel propensity Ã— distance (CDAP logsum proxy) â”€â”€â”€â”€â”€â”€
+        # ── Dest: travel propensity × distance (CDAP logsum proxy) ──────
         "c_propensity_dist":  0.03,
     },
     "nonmand": {
-        # â”€â”€ Dest: critical distance/logsum starting values â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Dest: critical distance/logsum starting values ──────────────────
         "c_log_dist":        -2.5,  # nonmand: shorter trips, more distance-sensitive
         "c_logsum":           0.3,
         "c_crash":           -0.1,
-        # â”€â”€ Mode: distance / time â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: distance / time ─────────────────────────────────────────
         "c_ivt_auto":        -1.00,
         "c_ivt_transit":     -0.70,
         "c_crash_veh":        0.0,
@@ -3797,8 +3846,8 @@ SEGMENT_COEFFICIENTS: dict = {
         "c_veh_sr":           0.15,
         "c_noveh_transit":    2.0,
         "c_noveh_walk":       1.8,
-        # Income: only DA and Transit â€” SR and active are collinear in nonmand data
-        # (all four came out â‰ˆ âˆ’3.46 in test runs â†’ multicollinearity, inflated ASCs)
+        # Income: only DA and Transit - SR and active are collinear in nonmand data
+        # (all four came out ≈ −3.46 in test runs → multicollinearity, inflated ASCs)
         "c_incp_da":          0.008,
         "c_incp_sr":          0.0,     # held fixed at zero for nonmand
         "c_incp_transit":    -0.010,
@@ -3818,7 +3867,7 @@ SEGMENT_COEFFICIENTS: dict = {
         "c_bike_time":        -0.80,
         "c_walk_stops":       -0.30,
         "c_bike_stops":       -0.50,
-        # â”€â”€ Mode: bike-specific nonmand deterrents â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: bike-specific nonmand deterrents ─────────────────────
         "c_bike_veh":        -0.20,    # car ownership reduces biking for errands
         "c_bike_shop":       -0.80,    # carrying shopping strongly deters biking
         "ASC_Walk":          -2.0,
@@ -3831,7 +3880,7 @@ SEGMENT_COEFFICIENTS: dict = {
         "c_veh_dist":         0.010,
         "c_female_dist":      0.003,
         "c_nprd_dist":        0.005,
-        # â”€â”€ Dest: accessibility â€” nonmand uses shopping + transit â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Dest: accessibility - nonmand uses shopping + transit ─────────
         "c_auto_shop_acc":    0.20,
         "c_auto_nonmand_acc": 0.20,  # zone nonmand accessibility heuristic
         "c_walk_acc":         0.10,
@@ -3839,17 +3888,17 @@ SEGMENT_COEFFICIENTS: dict = {
         "c_noveh_walk_acc":   0.22,
         "c_noveh_transit_acc": 0.25,
         # Log-transformed attractors: coefficients now in ~[0.1, 0.5] range
-        # (raw residential/commercial â†’ utility > 7000 â†’ softmax saturation, gradient â‰ˆ 0)
+        # (raw residential/commercial → utility > 7000 → softmax saturation, gradient ≈ 0)
         "c_nonmand_res":      0.30,  # log(residential+1)
         "c_nonmand_ent":      0.40,  # log(Entertainment+1)
         "c_nonmand_com":      0.35,  # log(commercial+1)
         "c_nonmand_retail":   0.40,  # log(retail+1)
-        "c_nonmand_totpop":   0.30,  # log(TOTPOP+1) â€” social/population-based trips
-        "c_nonmand_eatout":   0.50,  # log(EATOUT+1) â€” eat-out venue count
-        # â”€â”€ Dest: ACDC agglomeration only â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        "c_nonmand_totpop":   0.30,  # log(TOTPOP+1) - social/population-based trips
+        "c_nonmand_eatout":   0.50,  # log(EATOUT+1) - eat-out venue count
+        # ── Dest: ACDC agglomeration only ─────────────────────────────────
         "c_aggl":             0.25,
         "c_comp":            -0.10,
-        # â”€â”€ Dest: travel propensity Ã— distance (CDAP logsum proxy) â”€â”€â”€â”€â”€â”€
+        # ── Dest: travel propensity × distance (CDAP logsum proxy) ──────
         "c_propensity_dist":  0.03,
     },
 }
@@ -3870,7 +3919,7 @@ def _apply_segment_coefficients(model, segment: str,
     return model
 
 
-# â”€â”€ Skim variable â†’ UEC expression mapping (for GA variable search) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Skim variable → UEC expression mapping (for GA variable search) ──────────
 # Available OMX skims: SOVTOLL_TIME__AM/PM/EV/MD, SOVTOLL_TOLL__AM/PM/EV/MD
 # WLK_LOC_WLK/DRV variants (transit), no DIST/DISTWALK/DISTBIKE
 SKIM_TO_EXPR = {
@@ -3890,7 +3939,7 @@ SKIM_TO_EXPR = {
 
 def _mode_spec_custom(m, Mode, custom_vars: list):
     """
-    GA-restricted mode spec â€” only includes UEC terms whose skim variable
+    GA-restricted mode spec - only includes UEC terms whose skim variable
     is in custom_vars.  Delegates to _build_mode_utility with a filtered UEC.
     """
     if isinstance(custom_vars, dict):
@@ -3915,7 +3964,7 @@ def _mode_spec_custom(m, Mode, custom_vars: list):
 
 def _dest_spec_custom(mm, segment: str, custom_vars: list):
     """
-    GA-restricted destination spec â€” only includes UEC terms whose
+    GA-restricted destination spec - only includes UEC terms whose
     landuse/skim variable is in custom_vars.
     Delegates to _build_dest_utility with a filtered DEST_UEC.
     """
@@ -3971,7 +4020,7 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
     # if JAX is unavailable or fails to initialize.
     m    = _lx_model(dt)
     m.choice_co_code = "tour.tour_mode"
-    # apply expansion weights via weight_co_var (Larch â‰¥6 attribute name)
+    # apply expansion weights via weight_co_var (Larch ≥6 attribute name)
     # gracefully skip if this version of Larch doesn't support it
     try:
         m.weight_co_var = "weight"
@@ -3991,7 +4040,7 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
     m.graph.new_node(parameter="Mu_Root", children=[Motor, NonMotor])
 
     # Mu_Root = 1 is the normalisation constraint for the nested logit.
-    # It must be locked (holdfast=True) â€” if it's free, the hessian is
+    # It must be locked (holdfast=True) - if it's free, the hessian is
     # singular because the root scale is not separately identified.
     # Nesting params (Mu_Car, Mu_Motor, Mu_NonMotor) must be in (0, 1].
     m.set_value("Mu_Root",     1.0)
@@ -4045,7 +4094,7 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
 
     m.availability_co_vars = {
         Mode.DA:      _da_avail,   # licence required when CARLICENCE is available
-        Mode.SR:      1,           # SR â€” passenger, no licence required
+        Mode.SR:      1,           # SR - passenger, no licence required
         Mode.Walk:    _walk_avail,
         Mode.Bike:    _bike_avail,
         Mode.Transit: 1,
@@ -4054,8 +4103,8 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
     # apply per-segment coefficient starting values (ActivitySim: get_segment_coefficients)
     m = _apply_segment_coefficients(m, segment)
 
-    # â”€â”€ Holdfast collinear income parameters for nonmand â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # In test runs all four c_incp_* collapsed to â‰ˆ âˆ’3.46 for nonmand,
+    # ── Holdfast collinear income parameters for nonmand ─────────────
+    # In test runs all four c_incp_* collapsed to ≈ −3.46 for nonmand,
     # indicating collinearity.  We keep only DA and Transit free; SR and
     # active are fixed at 0 so the ASCs absorb only the genuine mode bias.
     if segment == 'nonmand':
@@ -4066,7 +4115,7 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
             except Exception:
                 pass
 
-    # Constrain bike time to be non-positive for all segments â€” a positive
+    # Constrain bike time to be non-positive for all segments - a positive
     # c_bike_time (longer bike trips more attractive) is theoretically wrong.
     # Observed in edu and nonmand segments due to short-trip selection bias
     # in the HHTS sample (short trips dominate bike choices, pushing c_bike_time up).
@@ -4091,7 +4140,7 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
     return m
 
 
-# â”€â”€ Flat UEC for pre-joined datasets (ActivitySim pattern) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Flat UEC for pre-joined datasets (ActivitySim pattern) ───────────────
 # Maps coefficient names to flat column names in the pre-joined ca dataset.
 # These are the SAME coefficients as DEST_UEC but with node-qualified paths
 # replaced by the flat column names created in _dest_tree().
@@ -4109,7 +4158,12 @@ DEST_UEC_FLAT = {
     "c_veh_dist":           ("vehrd_x_log_dist",        None),
     "c_female_dist":        ("female_x_log_dist",       None),
     "c_nprd_dist":          ("nprd_x_log_dist",         None),
-    "c_auto_work_acc":      ("auto_work_acc",           ["work"]),
+    # c_auto_work_acc REMOVED - collinear with size_term (auto_work_acc ≈ log-sum of
+    # neighbourhood TOTEMP), causing negative estimated coefficient (-0.84) that
+    # suppresses major employment centres (zone 40 CBD: obs=4.6%, pred=0.9%).
+    # Accessibility is already captured via c_logsum + c_aggl.
+    # c_incp_work_acc (income × auto_work_acc) RETAINED: at positive incp it
+    # correctly draws high-income workers toward accessible employment centres.
     "c_auto_shop_acc":      ("auto_shop_acc",           ["nonmand"]),
     "c_walk_acc":           ("walk_acc",                ["nonmand", "edu"]),
     "c_transit_acc":        ("transit_acc",              ["nonmand", "edu"]),
@@ -4123,18 +4177,20 @@ DEST_UEC_FLAT = {
     "c_indp_finance":       ("log_FPSEMPN_cond",        ["work"]),  # log-scale avoids gradient saturation
     "c_indp_health":        ("log_HEREMPN_cond",         ["work"]),  # log-scale
     "c_indp_retail":        ("log_RETEMPN_cond",         ["work"]),  # log-scale
-    # c_totemp_work REMOVED â€” collinear with size_term (both derived from TOTEMP),
+    # c_totemp_work REMOVED - collinear with size_term (both derived from TOTEMP),
     # causing negative estimated coefficient that penalises large employment zones.
     "c_log_commercial_work": ("log_commercial_1",       ["work"]),
     "c_edu_post":           ("edu_post_cond",           ["edu"]),
     "c_edu_primary":        ("edu_primary_cond",        ["edu"]),
     "c_edu_secondary":      ("edu_secondary_cond",      ["edu"]),
-    "c_edu_prim_priv":      ("edu_prim_priv_cond",      ["edu"]),   # log(private primary+1) Ã— primary student
-    "c_edu_sec_priv":       ("edu_sec_priv_cond",       ["edu"]),   # log(private secondary+1) Ã— secondary student
-    "c_auto_edu_acc":       ("auto_edu_acc",            ["edu"]),   # zone edu accessibility heuristic
+    "c_edu_prim_priv":      ("edu_prim_priv_cond",      ["edu"]),   # log(private primary+1) × primary student
+    "c_edu_sec_priv":       ("edu_sec_priv_cond",       ["edu"]),   # log(private secondary+1) × secondary student
+    # c_auto_edu_acc REMOVED - same collinearity with edu size_term; estimated at
+    # -2.04 in main run, massively suppressing university zones (Pearson r=0.152).
+    # Education accessibility is captured via size_term (log Education seats) + c_logsum.
     "c_auto_nonmand_acc":   ("auto_nonmand_acc",        ["nonmand"]),  # zone nonmand accessibility heuristic
     # Non-mandatory attractors: log-transformed to prevent gradient saturation
-    # (raw residential=3.6M, commercial=337K â†’ utility >> 7000 â†’ softmax saturates)
+    # (raw residential=3.6M, commercial=337K → utility >> 7000 → softmax saturates)
     "c_nonmand_res":        ("log_residential_1",       ["nonmand"]),
     "c_nonmand_ent":        ("log_entertainment_1",     ["nonmand"]),
     "c_nonmand_com":        ("log_commercial_1",        ["nonmand"]),
@@ -4143,38 +4199,38 @@ DEST_UEC_FLAT = {
     "c_nonmand_eatout":     ("log_EATOUT_1",            ["nonmand"]),  # eat-out venues for eat trips
     "c_propensity_dist":    ("propensity_x_log_dist",   None),
     "c_person_dist_draw":   ("person_dist_draw_x_log_dist", ["work"]),
-    # â”€â”€ Travel time impedance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Travel time impedance ────────────────────────────────────────────
     # REMOVED: c_log_sovtime and c_log_sovtime_work.
     # The mode logsum (c_logsum) already incorporates SOV travel time as part
-    # of the mode utility sum: logsum = log(Î£ exp(V_mode)).  Adding raw SOV time
+    # of the mode utility sum: logsum = log(Σ exp(V_mode)).  Adding raw SOV time
     # on top double-counts auto impedance and competes with c_logsum for the
     # same gradient signal.  Distance deterrence is captured by c_log_dist + c_dist.
-    # â”€â”€ Circuity / walk-distance columns REMOVED â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Circuity / walk-distance columns REMOVED ─────────────────────────
     # DISTWALK == DIST == DISTBIKE in this OMX (all road distance).
-    # circuity = road/euclidean = 1.0 everywhere â†’ log(1.0) = 0 â†’ zero column.
+    # circuity = road/euclidean = 1.0 everywhere → log(1.0) = 0 → zero column.
     # Columns log_circuity, log_active_circ, log_distwalk_masked, etc. are not
     # created in ca_df and are not in the UEC.  Active-mode effects are instead
     # captured by c_walk_feasible / c_bike_feasible and c_logsum.
-    # â”€â”€ Intrazonal preference â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Intrazonal preference ────────────────────────────────────────────
     "c_intrazonal":         ("intrazonal",              None),
     "c_intrazonal_edu":     ("intrazonal_x_edu",        ["edu"]),
-    # â”€â”€ Walk/bike zone accessibility â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Walk/bike zone accessibility ─────────────────────────────────────
     # Binary flags: is this destination zone walkable / bikeable from origin?
     # These are zone-level accessibility indicators that complement the mode
-    # logsum â€” the logsum captures IMPEDANCE (time/cost), these capture
+    # logsum - the logsum captures IMPEDANCE (time/cost), these capture
     # FEASIBILITY (binary: can you even walk/bike there?).
     "c_walk_feasible":      ("walk_feasible",           None),
     "c_bike_feasible":      ("bike_feasible",           None),
     # REMOVED: c_edu_prim_walk, c_edu_sec_walk, c_edu_prim_logwalk, c_edu_sec_logwalk
     # These were mode-distance interaction terms in the destination model that
     # double-count with the mode logsum.  Specifically:
-    #   c_edu_prim_logwalk = study==1 Ã— log(DISTWALK)
-    #   c_edu_sec_logwalk  = study==2 Ã— log(DISTWALK)
-    # Since DISTWALK==DIST in this OMX, these equal study_level Ã— log(DIST),
+    #   c_edu_prim_logwalk = study==1 × log(DISTWALK)
+    #   c_edu_sec_logwalk  = study==2 × log(DISTWALK)
+    # Since DISTWALK==DIST in this OMX, these equal study_level × log(DIST),
     # which is already captured by c_log_dist acting on all tours.  The logsum
     # (c_logsum) handles mode-specific impedance for walk/bike trips.
-    # c_edu_prim_walk / c_edu_sec_walk were triple interactions (student Ã—
-    # walkable Ã— school count) â€” redundant with c_edu_primary + c_logsum.
+    # c_edu_prim_walk / c_edu_sec_walk were triple interactions (student ×
+    # walkable × school count) - redundant with c_edu_primary + c_logsum.
 }
 
 
@@ -4191,7 +4247,7 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
     """
     _is_flat = dt.attrs.get('_flat_mode', False) if hasattr(dt, 'attrs') else getattr(dt, '_flat_mode', False)
 
-    # Use _lx_model for engine selection â€” tries jax first on Linux (faster),
+    # Use _lx_model for engine selection - tries jax first on Linux (faster),
     # numba first on Windows.  Previous hardcoded numba caused issues on HPC.
     mm = _lx_model(dt)
 
@@ -4203,13 +4259,13 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
     # Do NOT use survey expansion weights for destination model estimation.
     # HHTS expansion weights (PERSWGT23 ~ 200,000 after normalization to mean=1)
     # make the weighted LL ~200,000x larger than the unweighted LL, causing
-    # SLSQP to treat any gradient step as negligible â†’ optimizer stalls at
+    # SLSQP to treat any gradient step as negligible → optimizer stalls at
     # initial values. Unweighted MLE remains consistent for MNL parameters.
 
     # Build utility from flat UEC (pre-joined columns) or legacy DataTree UEC
     _built_uec_keys = []   # track which params we expect in pf
     if _is_flat:
-        # Use the flat UEC â€” all columns are pre-joined into the ca dataset
+        # Use the flat UEC - all columns are pre-joined into the ca dataset
         _uec = DEST_UEC_FLAT
         if custom_dest_vars is not None and isinstance(custom_dest_vars, dict):
             # Map custom DEST_UEC entries to their flat equivalents
@@ -4231,7 +4287,7 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
         mm = _build_dest_utility(mm, segment, uec=_seg_uec, cond={})
         logger.info(f"_build_dest_model [{segment}]: FLAT utility with {len(_seg_uec)} terms")
 
-        # â”€â”€ Diagnostic: check pf immediately after utility assignment â”€â”€â”€â”€
+        # ── Diagnostic: check pf immediately after utility assignment ────
         try:
             _pf_after_util = len(mm.pf)
             logger.info(f"_build_dest_model [{segment}]: pf len after utility_ca = {_pf_after_util}")
@@ -4240,11 +4296,11 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
                            f"{type(_pf_diag_e).__name__}: {_pf_diag_e}")
             _pf_after_util = 0
 
-        # â”€â”€ Robust pf population: if Larch failed to discover parameters â”€â”€
+        # ── Robust pf population: if Larch failed to discover parameters ──
         # from the LinearFunction, manually inject them via set_value.
         if _pf_after_util == 0 and _built_uec_keys:
             logger.warning(f"_build_dest_model [{segment}]: pf empty despite {len(_built_uec_keys)} "
-                           "utility terms â€” attempting manual parameter injection")
+                           "utility terms - attempting manual parameter injection")
             # Rebuild utility term-by-term and check after each
             utility = None
             for coeff, (expr, segs) in _seg_uec.items():
@@ -4280,7 +4336,7 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
             except Exception as _mm2_e:
                 logger.warning(f"_build_dest_model [{segment}]: fresh Model fallback failed: {_mm2_e}")
     else:
-        # Legacy DataTree path â€” kept for backward compatibility
+        # Legacy DataTree path - kept for backward compatibility
         if custom_dest_vars is not None and not isinstance(custom_dest_vars, dict):
             mm = _dest_spec_custom(mm, segment, custom_dest_vars)
         else:
@@ -4300,7 +4356,7 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
             _safe_uec['log_correction'] = ('base.log_correction', None)
             mm = _build_dest_utility(mm, segment, uec=_safe_uec)
 
-    # â”€â”€ log_correction holdfast: fix at 1.0 for Manski-Lerman correction â”€â”€
+    # ── log_correction holdfast: fix at 1.0 for Manski-Lerman correction ──
     # log_correction was added to the UEC above, not via +=
     try:
         if 'log_correction' in mm.pf.index:
@@ -4331,31 +4387,37 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
 
     mm = _apply_segment_coefficients(mm, segment)
 
-    # â”€â”€ Logsum bounds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Logsum bounds ─────────────────────────────────────────────────
     if 'c_logsum' in mm.pf.index:
         _pf_set(mm, 'c_logsum', 'minimum', -5.0)
         _pf_set(mm, 'c_logsum', 'maximum', 15.0)
 
-    # â”€â”€ Sign constraints â€” enforce theoretical expectations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Sign constraints - enforce theoretical expectations ────────────
     if 'c_log_dist' in mm.pf.index:
         _pf_set(mm, 'c_log_dist', 'maximum', -0.001)
     if 'c_size_term' in mm.pf.index:
         _pf_set(mm, 'c_size_term', 'minimum', 0.001)
-    # c_aggl: no lower bound â€” allowing negative values lets the optimizer
+    # c_aggl: no lower bound - allowing negative values lets the optimizer
     # move freely.  A minimum=0.0 causes L-BFGS-B to stall when warm-started
     # from a near-zero (previously holdfasted) value: the projected gradient
     # is zero at the boundary, so the parameter never updates.
     if 'c_comp' in mm.pf.index:
         _pf_set(mm, 'c_comp', 'maximum', -0.001)
+    # c_edu_secondary: secondary students prefer zones with secondary schools (≥0)
+    if 'c_edu_secondary' in mm.pf.index:
+        _pf_set(mm, 'c_edu_secondary', 'minimum', 0.0)
+    # c_noveh_transit_acc: car-free travellers should prefer transit-accessible zones (≥0)
+    if 'c_noveh_transit_acc' in mm.pf.index:
+        _pf_set(mm, 'c_noveh_transit_acc', 'minimum', 0.0)
 
-    # â”€â”€ c_size_term: holdfast at 1.0 (ActivitySim offset pattern) â”€â”€â”€â”€â”€â”€â”€â”€
-    # The log(size) term is a pure attractor offset â€” its coefficient should
+    # ── c_size_term: holdfast at 1.0 (ActivitySim offset pattern) ────────
+    # The log(size) term is a pure attractor offset - its coefficient should
     # be 1.0 so the model captures RELATIVE zone attractiveness (centred by
     # compute_size_terms demeaning).  Estimating c_size_term freely inflates
     # any zone with above-average employment (esp. zone 1 = CBD) because the
     # optimizer amplifies the size differences.  Fixing at 1.0:
     #   (a) eliminates zone-1 over-prediction driven by scale amplification
-    #   (b) removes one free parameter â†’ smaller Hessian â†’ no NaN std errors
+    #   (b) removes one free parameter → smaller Hessian → no NaN std errors
     #   (c) matches ActivitySim tour_destination_size_terms semantics
     if 'c_size_term' in mm.pf.index:
         try:
@@ -4363,16 +4425,16 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
         except Exception:
             pass
 
-    # â”€â”€ c_comp: free to estimate alongside c_aggl â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── c_comp: free to estimate alongside c_aggl ─────────────────────────
     # acdc_aggl (agglomeration) and acdc_comp (competition) capture different
     # urban economics: agglomeration measures destination-zone employment density
     # while competition measures how many origins compete for it.  Both are added
     # to _SAFE_PAIRS so the generic collinearity guard does not auto-holdfast
-    # either â€” if they remain highly correlated in a given segment, L-BFGS will
+    # either - if they remain highly correlated in a given segment, L-BFGS will
     # jointly shrink both toward zero (an acceptable outcome).
 
-    # â”€â”€ Holdfast only zero-variance columns in phase-1 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # c_edu_primary is NOT holdfasted â€” it's free from phase 1 so the
+    # ── Holdfast only zero-variance columns in phase-1 ───────────────
+    # c_edu_primary is NOT holdfasted - it's free from phase 1 so the
     # optimizer can find the school-zone attractor in a single pass.
     # Previously holding it caused edu coefficients to stay at 0 because
     # phase-2 release via _parameter_bucket is fragile across Larch versions.
@@ -4380,7 +4442,7 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
         # c_person_dist_draw: the column is all-zero during estimation
         # (person_dist_draw_x_log_dist is set to 0.0 by default and filled only
         # at prediction time with per-person random draws).
-        # A zero-variance column makes the Hessian singular â†’ ALL std errors
+        # A zero-variance column makes the Hessian singular → ALL std errors
         # become NaN.  Holdfast at 1.0 (fixed scaling coefficient).
         'c_person_dist_draw',
         # NOTE: c_log_distbike, c_log_distbike_nm, c_log_distwalk, c_log_distwalk_nm
@@ -4390,15 +4452,15 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
     }
 
     # c_aggl / c_comp collinearity:
-    # acdc_aggl and acdc_comp are highly correlated (|r|â‰ˆ0.9998) so only ONE
+    # acdc_aggl and acdc_comp are highly correlated (|r|≈0.9998) so only ONE
     # should be free at a time.  c_comp is already locked at 0.0 above (line
-    # ~3978), so c_aggl is FREE to estimate â€” no additional holdfast needed.
+    # ~3978), so c_aggl is FREE to estimate - no additional holdfast needed.
     # (Previously this block incorrectly holdfasted c_aggl too, leaving both
     # frozen at their starting values and contributing nothing to model fit.)
 
     # Also holdfast any UEC coefficient whose source CA column was flagged
-    # as collinear during _dest_tree (|r| â‰¥ 0.995 with another column).
-    # Build reverse map: flat_col â†’ coeff_name from DEST_UEC_FLAT
+    # as collinear during _dest_tree (|r| ≥ 0.995 with another column).
+    # Build reverse map: flat_col → coeff_name from DEST_UEC_FLAT
     _col_to_coeff = {expr: coeff for coeff, (expr, _) in DEST_UEC_FLAT.items()}
     _dt_collinear = set(getattr(dt, 'attrs', {}).get('_collinear_cols', []))
     for _cc in _dt_collinear:
@@ -4483,12 +4545,12 @@ def _minimal_dest_uec(dt, segment: str) -> dict:
 def _print_model_table(model, label: str):
     """Print a clean parameter table to stdout from model.pf.
 
-    Robust to mangled/stripped Larch models â€” falls back to _coef_cache when
+    Robust to mangled/stripped Larch models - falls back to _coef_cache when
     pf access fails, and uses loop-based SE retrieval to avoid the pandas
     Series.get() NaN-leak bug (where .get() returns NaN even when a fallback
     column exists, because the key is present but its value is NaN).
     """
-    # â”€â”€ Get parameter frame â€” try pf first, fall back to _coef_cache â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Get parameter frame - try pf first, fall back to _coef_cache ─────────
     pf = None
     try:
         pf = model.pf
@@ -4513,15 +4575,15 @@ def _print_model_table(model, label: str):
         # Degrade gracefully: print from _coef_cache only (no SEs)
         coef_cache = getattr(model, '_coef_cache', {})
         if not coef_cache:
-            print(f"\n  â”Œâ”€ {label}  LL={ll:.1f}  [no parameter frame available] â”€")
+            print(f"\n  ┌─ {label}  LL={ll:.1f}  [no parameter frame available] ─")
             return
-        print(f"\n  â”Œâ”€ {label}  LL={ll:.1f}  ÏÂ²={rho2:.3f}  "
-              f"n_params={len(coef_cache)}  [coef_cache â€” no SEs] â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+        print(f"\n  ┌─ {label}  LL={ll:.1f}  ρ²={rho2:.3f}  "
+              f"n_params={len(coef_cache)}  [coef_cache - no SEs] ─────────────")
         print(f"  {'Parameter':<30} {'Value':>9}  {'Std Err':>8}  {'t-stat':>7}  Sig")
-        print(f"  {'â”€'*65}")
+        print(f"  {'─'*65}")
         for name, val in sorted(coef_cache.items()):
             print(f"  {str(name):<30} {val:>9.4f}  {'n/a':>8}  {'n/a':>7}")
-        print(f"  â””{'â”€'*65}")
+        print(f"  └{'─'*65}")
         return
 
     # Detect best SE source
@@ -4530,9 +4592,9 @@ def _print_model_table(model, label: str):
     se_note    = '' if hessian_ok else ' [OPG se]' if opg_ok else ' [se=proxy/nan]'
 
     n = len(pf)
-    print(f"\n  â”Œâ”€ {label}  LL={ll:.1f}  ÏÂ²={rho2:.3f}  n_params={n}{se_note} â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+    print(f"\n  ┌─ {label}  LL={ll:.1f}  ρ²={rho2:.3f}  n_params={n}{se_note} ─────────────────")
     print(f"  {'Parameter':<30} {'Value':>9}  {'Std Err':>8}  {'t-stat':>7}  Sig")
-    print(f"  {'â”€'*65}")
+    print(f"  {'─'*65}")
     for name in pf.index:
         row = pf.loc[name]
         val = float('nan')
@@ -4541,7 +4603,7 @@ def _print_model_table(model, label: str):
         except Exception:
             pass
 
-        # Loop-based SE retrieval â€” avoids .get() returning NaN when key exists but value is NaN
+        # Loop-based SE retrieval - avoids .get() returning NaN when key exists but value is NaN
         se = float('nan')
         for _sc in ('std_err', 'std_err_opg', 'se', 'stderr'):
             if _sc in row.index:
@@ -4588,18 +4650,18 @@ def _print_model_table(model, label: str):
         se_str = f'{se:>8.4f}' if np.isfinite(se) else '     n/a'
         t_str  = f'{t:>7.2f}'  if np.isfinite(t)  else '    n/a'
         print(f"  {str(name):<30} {val:>9.4f}  {se_str}  {t_str}  {sig}{hf}")
-    print(f"  â””{'â”€'*65}")
+    print(f"  └{'─'*65}")
 
 
 def _opg_stderr(model) -> 'pd.Series':
     """
     Outer Product of Gradients (BHHH) standard errors.
 
-    Always computes â€” does not require Hessian inversion.  Used as a
+    Always computes - does not require Hessian inversion.  Used as a
     fallback when calculate_parameter_covariance() fails (singular Hessian).
 
-    The OPG estimator is:  Var(Î¸) â‰ˆ Bâ»Â¹  where  B = Î£áµ¢ sáµ¢sáµ¢áµ€
-    with sáµ¢ = âˆ‚ log L_i / âˆ‚Î¸ (per-observation score vector).
+    The OPG estimator is:  Var(θ) ≈ B⁻¹  where  B = Σᵢ sᵢsᵢᵀ
+    with sᵢ = ∂ log L_i / ∂θ (per-observation score vector).
 
     Notes
     -----
@@ -4617,31 +4679,31 @@ def _opg_stderr(model) -> 'pd.Series':
                      f"nonzero rows={int((np.abs(scores).sum(axis=1) > 0).sum())}")
         if scores.ndim != 2 or scores.shape[1] == 0:
             # Numba engine returns flat gradient vector (n_params,) not per-case (n_obs, n_params)
-            # â€” expected behaviour; sandwich Hessian fallback will handle it
-            logger.debug("_opg_stderr: scores matrix is 1-D or empty â€” numba engine returns "
+            # - expected behaviour; sandwich Hessian fallback will handle it
+            logger.debug("_opg_stderr: scores matrix is 1-D or empty - numba engine returns "
                          "aggregate gradient, not per-case; sandwich fallback will be used")
             return pd.Series(np.nan, index=model.pf.index)
         # Replace non-finite scores (overflow / underflow) with zero
         scores = np.where(np.isfinite(scores), scores, 0.0)
-        # If all scores are zero the model has a flat gradient â€” degenerate
+        # If all scores are zero the model has a flat gradient - degenerate
         if np.abs(scores).max() < 1e-14:
-            logger.warning("_opg_stderr: all gradient scores â‰ˆ 0 â€” model may be at a "
+            logger.warning("_opg_stderr: all gradient scores ≈ 0 - model may be at a "
                            "boundary or DataTree was stripped before OPG computed")
             return pd.Series(np.nan, index=model.pf.index)
         B = scores.T @ scores          # (n_params, n_params) outer product sum
         # Ridge regularization prevents degenerate B from singular Hessian.
-        # Ridge = 1e-6 Ã— trace(B) / n_params keeps scale-appropriate damping.
+        # Ridge = 1e-6 × trace(B) / n_params keeps scale-appropriate damping.
         ridge_scale = max(1e-8, 1e-6 * np.trace(B) / max(B.shape[0], 1))
         B_reg = B + ridge_scale * np.eye(B.shape[0])
         try:
             B_inv = np.linalg.inv(B_reg)
         except np.linalg.LinAlgError:
-            logger.debug("_opg_stderr: matrix inversion failed â€” using pseudoinverse")
+            logger.debug("_opg_stderr: matrix inversion failed - using pseudoinverse")
             B_inv = np.linalg.pinv(B_reg)   # fallback if even ridge fails
         diag  = np.diag(B_inv)
         n_neg = int((diag <= 0).sum())
         if n_neg:
-            logger.debug(f"_opg_stderr: {n_neg} negative diagonal entries â€” "
+            logger.debug(f"_opg_stderr: {n_neg} negative diagonal entries - "
                          "those parameters will have NaN SE")
         se    = np.where(diag > 0, np.sqrt(diag), np.nan)
         n_ok  = int(np.isfinite(se).sum())
@@ -4708,14 +4770,14 @@ def _scipy_sandwich_stderr(model) -> 'pd.Series':
 
     Estimator
     ---------
-    Std err(Î¸áµ¢) = sqrt( [Hâ»Â¹]áµ¢áµ¢ )
-    where  H = âˆ‚Â²â„“/âˆ‚Î¸âˆ‚Î¸áµ€  computed via central finite differences.
-    Ridge regularisation (1e-5 Ã— diag) prevents exact singularity.
+    Std err(θᵢ) = sqrt( [H⁻¹]ᵢᵢ )
+    where  H = ∂²ℓ/∂θ∂θᵀ  computed via central finite differences.
+    Ridge regularisation (1e-5 × diag) prevents exact singularity.
 
     Notes
     -----
     - Only free (non-holdfasted) parameters are perturbed.
-    - Step size: max(1e-4, |Î¸| Ã— 1e-3) per parameter â€” same as diag fallback.
+    - Step size: max(1e-4, |θ| × 1e-3) per parameter - same as diag fallback.
     - The full Hessian captures cross-parameter curvature that the diagonal
       fallback misses, giving more accurate std errors for correlated params.
     """
@@ -4750,7 +4812,7 @@ def _scipy_sandwich_stderr(model) -> 'pd.Series':
         # Build full Hessian column by column via central differences
         H = np.zeros((n_free, n_free))
         for j in range(n_free):
-            # Gradient at Î¸ + h_jÂ·eâ±¼ and Î¸ - h_jÂ·eâ±¼ using approx_fprime
+            # Gradient at θ + h_j·eⱼ and θ - h_j·eⱼ using approx_fprime
             h = steps[j]
             ep = np.zeros(n_free); ep[j] = h
             em = np.zeros(n_free); em[j] = -h
@@ -4790,6 +4852,251 @@ def _scipy_sandwich_stderr(model) -> 'pd.Series':
         return pd.Series(np.nan, index=model.pf.index)
 
 
+def _prefit_mode_model(mode_mdl, seg_df, persons_df, skims, segment):
+    """Pre-condition NL mode model starting values before gradient estimation.
+
+    Step 1 — Mu interior initialization:
+      Reset any Mu_Car / Mu_Motor / Mu_NonMotor that sits at or near its
+      bound (≥ 0.95 or ≤ 0.05) to 0.7.  Starting at Mu=1 immediately
+      collapses the nest gradient to zero; BFGS then stays on the boundary
+      for the entire optimisation, blowing up all standard errors.
+
+    Step 2 — ASC log-share pre-calibration:
+      Iteratively adjust ASC starting values using the log-share correction:
+          ASC_m  +=  log( obs_share_m / pred_share_m )
+      until the predicted aggregate shares (computed via _mode_probs_numpy —
+      pure numpy, no JAX/Larch loglike compilation overhead) match observed
+      shares from seg_df.  Five iterations are almost always sufficient.
+
+      Starting estimation from matching aggregate shares prevents the gradient
+      from spending early iterations purely on ASC correction, which is the
+      mechanism by which Mu parameters get pulled to 1.0: when ASCs are far
+      from their calibrated values the steepest-ascent direction at t=0 is
+      dominated by ASC moves that simultaneously relax nest compression.
+
+    Step 3 — Differential Evolution (DE) pre-search over ASC + Mu:
+      Runs a lightweight DE over the 7-dimensional subspace of the four free
+      ASC parameters and the three Mu nest parameters, using the model's own
+      loglike() as the objective.  This explores the joint ASC-Mu space with
+      the TRUE nested-logit objective (not the flat-MNL approximation used in
+      Step 2), finding a basin-of-attraction that gradient-based optimisation
+      can then refine reliably.
+
+      The DE uses a small budget (popsize=4, maxiter=10 → ~280 evaluations)
+      so the overhead is roughly one initial JAX/Numba compile + 280 fast
+      re-evaluations — typically 1-3 minutes per segment.  If the DE result
+      does not improve on the starting LL, the pre-Step-2 values are kept.
+
+    Controlled by env var STAGE5_MODE_DE_PREFIT (default "1", set "0" to skip
+    DE while keeping Steps 1+2).
+    """
+    # ── Step 1: Mu interior initialization ────────────────────────────────
+    try:
+        for _mu_p in ('Mu_Car', 'Mu_Motor', 'Mu_NonMotor'):
+            if _mu_p not in mode_mdl.pf.index:
+                continue
+            _is_hf = bool(mode_mdl.pf.loc[_mu_p].get('holdfast', False))
+            if _is_hf:
+                continue
+            _v = float(mode_mdl.pf.loc[_mu_p, 'value'])
+            if not np.isfinite(_v) or _v >= 0.95 or _v <= 0.05:
+                _safe_start = 0.7
+                try:
+                    mode_mdl.set_value(_mu_p, _safe_start)
+                except Exception:
+                    mode_mdl.pf.loc[_mu_p, 'value'] = _safe_start
+                logger.debug(
+                    f"[{segment}] Pre-fit: {_mu_p} start {_v:.4f} → {_safe_start} "
+                    "(reset to interior to avoid degenerate NL start)"
+                )
+    except Exception as _mu_e:
+        logger.debug(f"[{segment}] Pre-fit Mu interior reset failed: {_mu_e}")
+
+    # ── Step 2: ASC log-share pre-calibration ─────────────────────────────
+    try:
+        _mode_col = 'tour_mode' if 'tour_mode' in seg_df.columns else None
+        if _mode_col is not None and len(seg_df) > 0:
+            _obs_total = float(len(seg_df))
+            _obs_counts = seg_df[_mode_col].value_counts()
+            _obs_shares = {int(k): float(v) / _obs_total for k, v in _obs_counts.items()}
+
+            _asc_map = {
+                'ASC_SR':      MODE_MAP['SR'],
+                'ASC_Walk':    MODE_MAP['Walk'],
+                'ASC_Bike':    MODE_MAP['Bike'],
+                'ASC_Transit': MODE_MAP['Transit'],
+            }
+            _col_to_code = {
+                0: MODE_MAP['DA'], 1: MODE_MAP['SR'],
+                2: MODE_MAP['Walk'], 3: MODE_MAP['Bike'], 4: MODE_MAP['Transit'],
+            }
+
+            for _it in range(6):
+                mode_mdl._coef_cache = {}
+                _probs = _mode_probs_numpy(mode_mdl, seg_df, persons_df, skims,
+                                           coef_override=None)
+                if _probs is None or _probs.shape[0] == 0:
+                    break
+                _pred_arr = np.asarray(_probs).mean(axis=0)
+                _pred_dict = {_col_to_code[ci]: float(_pred_arr[ci])
+                              for ci in range(len(_pred_arr))}
+
+                _any_adj = False
+                for _asc_p, _mc in _asc_map.items():
+                    if _asc_p not in mode_mdl.pf.index:
+                        continue
+                    _is_hf = bool(mode_mdl.pf.loc[_asc_p].get('holdfast', False))
+                    if _is_hf:
+                        continue
+                    _obs_s  = _obs_shares.get(_mc, 0.0)
+                    _pred_s = _pred_dict.get(_mc, 0.0)
+                    if _obs_s > 0.001 and _pred_s > 0.001:
+                        _delta = float(np.log((_obs_s + 1e-8) / (_pred_s + 1e-8)))
+                        if abs(_delta) > 0.005:
+                            _cur = float(mode_mdl.pf.loc[_asc_p, 'value'])
+                            try:
+                                mode_mdl.set_value(_asc_p, _cur + _delta)
+                            except Exception:
+                                mode_mdl.pf.loc[_asc_p, 'value'] = _cur + _delta
+                            _any_adj = True
+                mode_mdl._coef_cache = {}
+                if not _any_adj:
+                    logger.debug(f"[{segment}] Pre-fit ASC converged in {_it + 1} iter")
+                    break
+    except Exception as _asc_e:
+        logger.debug(f"[{segment}] Pre-fit ASC log-share correction failed: {_asc_e}")
+
+    # ── Step 3: Differential Evolution over ASC + Mu (true NL objective) ──
+    # The log-share correction above (Step 2) uses the flat-MNL approximation
+    # and cannot see the nest structure.  This DE uses model.loglike() — the
+    # actual nested-logit log-likelihood — to jointly optimise the 4 ASC and
+    # 3 Mu parameters (7-D search) using a small population budget.
+    # popsize=4 × 7 params = 28 individuals; 10 generations → ~280 evaluations.
+    # Skip if STAGE5_MODE_DE_PREFIT=0.
+    _de_enabled = os.environ.get('STAGE5_MODE_DE_PREFIT', '1').strip() not in ('0', 'false', 'False', 'no')
+    if _de_enabled:
+        try:
+            from scipy.optimize import differential_evolution as _scipy_de
+
+            # Candidate params for DE: free ASC + Mu params only.
+            # Behavioural params (travel time, cost, demographics) keep their
+            # starting values from _apply_segment_coefficients / warm-start.
+            _de_candidates = {
+                'ASC_SR':      (-5.0, 3.0),
+                'ASC_Walk':    (-6.0, 3.0),
+                'ASC_Bike':    (-7.0, 2.0),
+                'ASC_Transit': (-5.0, 3.0),
+                'Mu_Car':      (0.10, 0.95),
+                'Mu_Motor':    (0.10, 0.95),
+                'Mu_NonMotor': (0.10, 0.95),
+            }
+            _de_params = []
+            _de_bounds = []
+            for _p, (_lo, _hi) in _de_candidates.items():
+                if _p not in mode_mdl.pf.index:
+                    continue
+                _is_hf = bool(mode_mdl.pf.loc[_p].get('holdfast', False))
+                if _is_hf:
+                    continue
+                # Respect tighter model-defined bounds
+                _model_lo = float(mode_mdl.pf.loc[_p].get('minimum', _lo))
+                _model_hi = float(mode_mdl.pf.loc[_p].get('maximum', _hi))
+                _lo_eff = max(_lo, _model_lo + 1e-4)
+                _hi_eff = min(_hi, _model_hi - 1e-4)
+                if _lo_eff >= _hi_eff:
+                    continue
+                _de_params.append(_p)
+                _de_bounds.append((_lo_eff, _hi_eff))
+
+            if len(_de_params) >= 2:
+                # Snapshot starting values so we can restore on failure / no-improve
+                _de_orig = {p: float(mode_mdl.pf.loc[p, 'value']) for p in _de_params}
+
+                # Compute initial LL at the Step-2-calibrated starting point
+                try:
+                    _ll_init = float(mode_mdl.loglike())
+                except Exception as _ll_e:
+                    logger.debug(f"[{segment}] DE pre-fit: initial loglike failed ({_ll_e}); skipping DE")
+                    _ll_init = float('nan')
+
+                if np.isfinite(_ll_init):
+                    _de_call_count = [0]
+
+                    def _neg_ll(x):
+                        _de_call_count[0] += 1
+                        for _p, _v in zip(_de_params, x):
+                            try:
+                                mode_mdl.set_value(_p, float(np.clip(_v,
+                                    mode_mdl.pf.loc[_p].get('minimum', -10),
+                                    mode_mdl.pf.loc[_p].get('maximum',  10))))
+                            except Exception:
+                                mode_mdl.pf.loc[_p, 'value'] = float(_v)
+                        mode_mdl._coef_cache = {}
+                        try:
+                            _ll = float(mode_mdl.loglike())
+                            return -_ll if np.isfinite(_ll) else 1e9
+                        except Exception:
+                            return 1e9
+
+                    print(f"  [{segment}] DE pre-fit: searching {len(_de_params)}-D ASC+Mu space "
+                          f"(pop=4×{len(_de_params)}={4*len(_de_params)}, maxiter=10) ...")
+                    _de_result = _scipy_de(
+                        _neg_ll,
+                        bounds=_de_bounds,
+                        maxiter=10,
+                        popsize=4,
+                        seed=42,
+                        tol=0.005,
+                        mutation=(0.5, 1.5),
+                        recombination=0.7,
+                        polish=False,     # gradient polish = maximize_loglike's job
+                        workers=1,        # serial (parallelised at segment level)
+                        updating='immediate',
+                        init='sobol',     # better space-filling than random
+                    )
+
+                    _ll_de = -float(_de_result.fun)
+                    if _ll_de > _ll_init + 0.1:
+                        # DE improved the starting point → keep its values
+                        for _p, _v in zip(_de_params, _de_result.x):
+                            try:
+                                mode_mdl.set_value(_p, float(_v))
+                            except Exception:
+                                mode_mdl.pf.loc[_p, 'value'] = float(_v)
+                        mode_mdl._coef_cache = {}
+                        logger.info(
+                            f"[{segment}] DE pre-fit: LL init={_ll_init:.1f} → "
+                            f"DE={_ll_de:.1f} (+{_ll_de - _ll_init:.1f}) "
+                            f"in {_de_result.nit} gen × {_de_call_count[0]} evals; "
+                            "params: " + ", ".join(
+                                f"{p}={v:.3f}" for p, v in zip(_de_params, _de_result.x))
+                        )
+                    else:
+                        # DE did not improve — restore Step-2-calibrated values
+                        for _p, _v in _de_orig.items():
+                            try:
+                                mode_mdl.set_value(_p, _v)
+                            except Exception:
+                                mode_mdl.pf.loc[_p, 'value'] = _v
+                        mode_mdl._coef_cache = {}
+                        logger.debug(
+                            f"[{segment}] DE pre-fit: no improvement "
+                            f"(init={_ll_init:.1f}, DE={_ll_de:.1f}); "
+                            "keeping log-share-calibrated starting values"
+                        )
+        except Exception as _de_e:
+            logger.warning(f"[{segment}] DE pre-fit failed ({_de_e}); continuing with Step-2 values")
+            # Ensure we don't leave model in a half-updated state
+            try:
+                for _p, _v in _de_orig.items():
+                    mode_mdl.set_value(_p, _v)
+                mode_mdl._coef_cache = {}
+            except Exception:
+                pass
+
+    return mode_mdl
+
+
 def _estimate(model, two_phase: bool = False):
     """
     Estimate a Larch model.
@@ -4797,9 +5104,9 @@ def _estimate(model, two_phase: bool = False):
     Parameters
     ----------
     two_phase : if True, run a two-phase estimation:
-                Phase 1 â€” estimate with industry/edu terms holdfasted so the
+                Phase 1 - estimate with industry/edu terms holdfasted so the
                           core distance, logsum, and size_term converge first.
-                Phase 2 â€” release holdfasted terms and re-estimate to full optimum.
+                Phase 2 - release holdfasted terms and re-estimate to full optimum.
                 This dramatically improves Hessian conditioning and eliminates
                 NaN std errors that arise from near-collinear sparse columns.
     """
@@ -4843,17 +5150,17 @@ def _estimate(model, two_phase: bool = False):
     except Exception:
         pass
 
-    # â”€â”€ Pre-estimation guard: verify pf is non-empty â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Pre-estimation guard: verify pf is non-empty ─────────────────────────
     # If pf is empty it means Larch failed to compile the utility function
-    # (most often because a DataTree variable referenced in the UEC â€” e.g.
-    # od.DIST â€” does not exist in the underlying OMX/dataset).  Calling
+    # (most often because a DataTree variable referenced in the UEC - e.g.
+    # od.DIST - does not exist in the underlying OMX/dataset).  Calling
     # maximize_loglike with an empty parameter frame raises a cryptic
     # "zero-size array" ValueError from numpy inside Larch's optimization.py.
     # Detecting it here gives an actionable error message instead.
     try:
         _pf_pre = model.pf
     except Exception as _pf_e:
-        logger.error(f"_estimate: cannot access model.pf ({_pf_e}) â€” returning initial values")
+        logger.error(f"_estimate: cannot access model.pf ({_pf_e}) - returning initial values")
         model._cached_ll = float('nan')
         return model
 
@@ -4874,14 +5181,14 @@ def _estimate(model, two_phase: bool = False):
     if _n_free == 0:
         logger.warning(
             f"_estimate: pf has {_n_total} params but ALL are holdfasted "
-            f"({_n_total} fixed). Nothing to optimize â€” returning initial values."
+            f"({_n_total} fixed). Nothing to optimize - returning initial values."
         )
     else:
-        logger.debug(f"_estimate: pf OK â€” {_n_free} free / {_n_total} total params")
+        logger.debug(f"_estimate: pf OK - {_n_free} free / {_n_total} total params")
 
-    # â”€â”€ Pre-estimation: detect zero-variance utility columns â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Pre-estimation: detect zero-variance utility columns ─────────────
     # A free parameter whose utility column has zero variance produces a
-    # zero-gradient row, making the Hessian singular â†’ ALL std errors become
+    # zero-gradient row, making the Hessian singular → ALL std errors become
     # NaN.  Auto-holdfast such parameters to keep the Hessian invertible.
     try:
         _dt = model.datatree if hasattr(model, 'datatree') else None
@@ -4914,7 +5221,7 @@ def _estimate(model, two_phase: bool = False):
                                     _pf_set(model, _p, 'holdfast', True)
                                 _auto_holdfasted.append(_p)
                                 logger.warning(
-                                    f"_estimate: auto-holdfast {_p} â€” "
+                                    f"_estimate: auto-holdfast {_p} - "
                                     f"utility column '{_cn}' has zero variance"
                                 )
                             break
@@ -4926,8 +5233,8 @@ def _estimate(model, two_phase: bool = False):
     except Exception as _zv_e:
         logger.debug(f"_estimate: zero-variance detection failed: {_zv_e}")
 
-    # â”€â”€ Phase 1: core terms only (industry/edu holdfasted if two_phase) â”€â”€â”€
-    # tighter gtol â†’ optimizer walks further from the boundary so the Hessian
+    # ── Phase 1: core terms only (industry/edu holdfasted if two_phase) ───
+    # tighter gtol → optimizer walks further from the boundary so the Hessian
     # at convergence is better conditioned and std errors less likely to be NaN.
     est_options = {'maxiter': 2000, 'ftol': 1e-9, 'gtol': 1e-6}
     _n_free_now = sum(1 for p in model.pf.index
@@ -4946,7 +5253,7 @@ def _estimate(model, two_phase: bool = False):
                 options={'maxiter': 600, 'ftol': 1e-6, 'gtol': 1e-4}
             )
         except Exception as _mll_e2:
-            # â”€â”€ Emit detailed diagnostics so the failure can be diagnosed â”€â”€
+            # ── Emit detailed diagnostics so the failure can be diagnosed ──
             # Common causes: near-constant utility columns (zero variance),
             # insufficient choice variation (all choices the same mode),
             # collinear predictors, or NaN/Inf in the data.
@@ -4977,20 +5284,20 @@ def _estimate(model, two_phase: bool = False):
                         _mode_counts = _tour['tour_mode'].value_counts().to_dict()
                         _fail_reason.append(f"mode_counts={_mode_counts}")
                         if len(_mode_counts) < 2:
-                            _fail_reason.append("ONLY 1 MODE IN DATA â€” NL cannot estimate")
+                            _fail_reason.append("ONLY 1 MODE IN DATA - NL cannot estimate")
             except Exception as _diag_e:
                 _fail_reason.append(f"diagnostic failed: {_diag_e}")
             logger.error(
                 f"_estimate phase-1 fallback also failed: {_mll_e2!r}\n"
                 f"  Diagnosis: {'; '.join(_fail_reason)}\n"
-                "  Model will have initial values only â€” predictions will be weak.\n"
-                "  To fix: check that HHTS estimation data has â‰¥2 modes, no zero-variance\n"
+                "  Model will have initial values only - predictions will be weak.\n"
+                "  To fix: check that HHTS estimation data has ≥2 modes, no zero-variance\n"
                 "  columns, and that skim values are non-zero for a reasonable fraction of OD pairs."
             )
-            # Don't raise â€” return model with initial values so pipeline continues
+            # Don't raise - return model with initial values so pipeline continues
             result = type('_FakeResult', (), {'loglike': float('nan')})()
 
-    # â”€â”€ Phase 2 (dest model only): release holdfasted attractor terms â”€â”€â”€â”€â”€
+    # ── Phase 2 (dest model only): release holdfasted attractor terms ─────
     if two_phase:
         _RELEASE = {
             'c_indp_finance', 'c_indp_health', 'c_indp_retail',
@@ -5005,7 +5312,7 @@ def _estimate(model, two_phase: bool = False):
         for _p in _RELEASE:
             if _p in model.pf.index:
                 _released_ok = False
-                # Method A: direct _parameter_bucket access (preferred, Larch â‰¥5.5)
+                # Method A: direct _parameter_bucket access (preferred, Larch ≥5.5)
                 try:
                     model.unmangle()
                     bucket = model._parameter_bucket
@@ -5026,7 +5333,7 @@ def _estimate(model, two_phase: bool = False):
                         _released_ok = True
                     except Exception:
                         pass
-                # Method C: set_value with bounds â€” at least un-freezes the value
+                # Method C: set_value with bounds - at least un-freezes the value
                 if not _released_ok:
                     try:
                         _cur = float(model.pf.loc[_p, 'value'])
@@ -5037,18 +5344,18 @@ def _estimate(model, two_phase: bool = False):
                 if _released_ok:
                     released.append(_p)
         if released:
-            logger.info(f"_estimate phase-2: released {released} â€” re-estimating")
+            logger.info(f"_estimate phase-2: released {released} - re-estimating")
             print(f"    _estimate phase-2: released {released}, re-estimating ...")
             try:
                 result = model.maximize_loglike(options=est_options)
                 print(f"    _estimate phase-2 done: LL={getattr(result, 'loglike', '?')}")
             except Exception as _ph2_e:
                 logger.warning(
-                    f"_estimate phase-2 maximize_loglike failed: {_ph2_e!r} â€” "
+                    f"_estimate phase-2 maximize_loglike failed: {_ph2_e!r} - "
                     "keeping phase-1 values"
                 )
 
-    # â”€â”€ Post-estimation sign enforcement â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Post-estimation sign enforcement ─────────────────────────────────────
     # If the optimizer escaped the bounds for travel-time parameters (can happen
     # when L-BFGS-B bounds are not propagated correctly through set_cap), clip
     # them here so downstream validity checks don't fire false alarms.
@@ -5064,13 +5371,13 @@ def _estimate(model, two_phase: bool = False):
                     except Exception:
                         _pf_set(model, _sn, 'value', -0.001)
                     logger.debug(
-                        f"_estimate: post-clip {_sn}={_sv:.4f} â†’ -0.001 "
+                        f"_estimate: post-clip {_sn}={_sv:.4f} → -0.001 "
                         "(sign constraint enforced after optimization)"
                     )
     except Exception as _sc_e:
         logger.debug(f"_estimate: post-clip sign constraint failed: {_sc_e}")
 
-    # â”€â”€ Snapshot estimated coefficients BEFORE any JAX JIT side-effects â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Snapshot estimated coefficients BEFORE any JAX JIT side-effects ────────
     # model.pf is a Larch property that reconstructs from internal parameter
     # storage.  After JAX JIT compiles the log-likelihood gradient, the internal
     # storage can be clobbered (all values become NaN on next access).  We grab
@@ -5094,7 +5401,7 @@ def _estimate(model, two_phase: bool = False):
     except Exception as _snap_e:
         logger.debug(f"_estimate: coefficient snapshot failed: {_snap_e}")
 
-    # â”€â”€ Pre-compute OPG scores while DataTree is still attached â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Pre-compute OPG scores while DataTree is still attached ──────────────
     # _opg_stderr calls model.d_loglike_casewise() which requires an active
     # DataTree.  If we wait until _compute_inference() the DataTree may have
     # been stripped, causing OPG to silently return all-NaN and forcing the
@@ -5125,7 +5432,7 @@ def _estimate(model, two_phase: bool = False):
         try:
             model.calculate_parameter_covariance()
         except Exception as e:
-            logger.warning(f"Covariance calculation failed ({e}) â€” trying OPG fallback")
+            logger.warning(f"Covariance calculation failed ({e}) - trying OPG fallback")
 
         try:
             needs_opg = (
@@ -5137,10 +5444,10 @@ def _estimate(model, two_phase: bool = False):
                 # Use pre-cached OPG SE if available, otherwise re-try live
                 se_opg = _opg_se_early if _opg_se_early.notna().any() else _opg_stderr(model)
                 if se_opg.isna().all():
-                    logger.debug("OPG std errors unavailable â€” trying diagonal-curvature fallback")
+                    logger.debug("OPG std errors unavailable - trying diagonal-curvature fallback")
                     se_opg = _diag_hessian_stderr(model, ll0=getattr(model, '_cached_ll', np.nan))
                 if se_opg.isna().all():
-                    logger.debug("Diagonal fallback also failed â€” trying scipy sandwich Hessian")
+                    logger.debug("Diagonal fallback also failed - trying scipy sandwich Hessian")
                     se_opg = _scipy_sandwich_stderr(model)
                 model.pf['std_err_opg'] = se_opg.reindex(model.pf.index).values
                 with np.errstate(divide='ignore', invalid='ignore'):
@@ -5187,7 +5494,7 @@ def _estimate(model, two_phase: bool = False):
             bad = pf.index[(pf['std_err'].isna() | (pf['std_err'] <= 0))]
             to_fix = [name for name in bad if name in sparse_terms]
             if to_fix:
-                logger.warning(f"Destination inference unstable for {to_fix} â€” refitting with those terms fixed at 0")
+                logger.warning(f"Destination inference unstable for {to_fix} - refitting with those terms fixed at 0")
                 for name in to_fix:
                     model.lock_value(name, 0.0)
                 result = model.maximize_loglike(options=est_options)
@@ -5195,15 +5502,15 @@ def _estimate(model, two_phase: bool = False):
     except Exception as _e:
         logger.debug(f"Destination stabilization refit skipped: {_e}")
 
-    # â”€â”€ Build definitive parameter frame (nuclear guarantee + final cache) â”€â”€â”€â”€â”€â”€
+    # ── Build definitive parameter frame (nuclear guarantee + final cache) ──────
     #
     # IMPORTANT: in Larch 6.x + pandas 2.x, model.pf is a PROPERTY that
     # reconstructs a DataFrame from internal Larch parameter storage on each
     # access.  Assignments like:
     #
-    #     model.pf.loc[mask, 'std_err'] = values   # â† DOES NOT PERSIST
+    #     model.pf.loc[mask, 'std_err'] = values   # ← DOES NOT PERSIST
     #
-    # only modify the temporary DataFrame returned by the property â€” the
+    # only modify the temporary DataFrame returned by the property - the
     # underlying Larch parameter store is unchanged, and the next call to
     # model.pf returns fresh NaN values again.
     #
@@ -5211,7 +5518,7 @@ def _estimate(model, two_phase: bool = False):
     # apply all fills to _pf, then store _pf as model._final_pf.
     # All downstream code (CSV, HTML, validation) uses _final_pf exclusively.
     try:
-        _pf = model.pf.copy()   # snapshot â€” safe to modify in-place
+        _pf = model.pf.copy()   # snapshot - safe to modify in-place
 
         # Ensure required columns exist
         for _col in ('std_err', 't_stat', 'pval'):
@@ -5265,13 +5572,13 @@ def _estimate(model, two_phase: bool = False):
                 f"SE proxy fill for {int(_bad.sum())} params "
                 f"({list(_pf.index[_bad])}): "
                 f"proxy_base={_proxy_base:.3f}. "
-                "These SEs are NOT from the Hessian â€” model may be unidentified."
+                "These SEs are NOT from the Hessian - model may be unidentified."
             )
 
         # Cache definitive frame on the model object so it survives pickle/reload
         model._final_pf = _pf
 
-        # â”€â”€ SE diagnostic summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── SE diagnostic summary ──────────────────────────────────────────
         _n_nan  = int(_pf.loc[_free, 'std_err'].isna().sum())
         _n_prx  = int((_pf.loc[_free, 'std_err_source'] == 'proxy').sum())
         _n_opg  = int((_pf.loc[_free, 'std_err_source'] == 'opg').sum())
@@ -5279,22 +5586,22 @@ def _estimate(model, two_phase: bool = False):
         _ll_val = getattr(model, '_cached_ll', float('nan'))
         _src_counts = _pf.loc[_free, 'std_err_source'].value_counts().to_dict()
         print(
-            f"\n  â”Œâ”€ SE diagnostic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n"
-            f"  â”‚  LL = {_ll_val:.2f}\n"
-            f"  â”‚  Free params: {int(_free.sum())} "
+            f"\n  ┌─ SE diagnostic ─────────────────────────────────────────\n"
+            f"  │  LL = {_ll_val:.2f}\n"
+            f"  │  Free params: {int(_free.sum())} "
             f"(Hessian: {_n_hess}, OPG: {_n_opg}, proxy: {_n_prx}, NaN: {_n_nan})\n"
-            f"  â”‚  SE sources: {_src_counts}\n"
-            f"  â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€"
+            f"  │  SE sources: {_src_counts}\n"
+            f"  └─────────────────────────────────────────────────────────"
         )
         if _n_nan:
             logger.error(
                 f"_estimate: {_n_nan} free parameter(s) still have NaN std_err "
-                f"in _final_pf â€” this should never happen; report as a bug."
+                f"in _final_pf - this should never happen; report as a bug."
             )
         if _n_prx > 0:
             logger.warning(
                 f"  Proxy SEs for: {list(_pf.index[_free & (_pf['std_err_source']=='proxy')])} "
-                "â€” parameters not identified from Hessian/OPG. "
+                "- parameters not identified from Hessian/OPG. "
                 "Consider holding them fast or reviewing data coverage."
             )
     except Exception as _nuke_e:
@@ -5315,12 +5622,12 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
     Compute mode choice logsums across all destination zones.
 
     The mode model has 5 mode alternatives as its alts dimension.
-    We need a (n_tours Ã— n_zones) logsum matrix â€” one logsum per tour
+    We need a (n_tours × n_zones) logsum matrix - one logsum per tour
     per potential destination zone.
 
     For each zone:
       1. Set DTAZ = that zone for all tours (xarray broadcast)
-      2. Evaluate mode model â†’ get log-sum-of-exponentials across modes
+      2. Evaluate mode model → get log-sum-of-exponentials across modes
       3. Store as a column in the output DataArray
 
     ActivitySim pattern from trip_destination.compute_logsums:
@@ -5350,7 +5657,7 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
 
     # If the DataTree only has one unique DTAZ (e.g. work/edu batch where all
     # persons share the same usual-location zone) the logsum matrix would be
-    # (n_cases Ã— 1) â€” that's a scalar per person, not a distribution over zones.
+    # (n_cases × 1) - that's a scalar per person, not a distribution over zones.
     # Fall back to the full zone list so Sharrow sees the same DataTree shape
     # across all batches and reuses the compiled JIT flow.
     if len(zone_ids) < 10:
@@ -5365,23 +5672,23 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
                     zone_ids = full_zones
         except Exception:
             pass
-        # Final fallback: sequential 1â€“329
+        # Final fallback: sequential 1-329
         if len(zone_ids) < 10:
             zone_ids = list(range(1, 330))
-        logger.debug(f"_logsums: zone list was <10 â€” expanded to {len(zone_ids)} zones")
+        logger.debug(f"_logsums: zone list was <10 - expanded to {len(zone_ids)} zones")
 
     if verbose:
-        print(f"    Computing logsums: {len(case_ids)} cases Ã— {len(zone_ids)} zones")
+        print(f"    Computing logsums: {len(case_ids)} cases × {len(zone_ids)} zones")
 
     import numpy as np
     ls_array = None
 
-    # â”€â”€ Attempt 1: vectorised Larch logsums over all zones at once â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # Larch â‰¥ 5.7 supports logsums() called once on the fitted DataTree and
+    # ── Attempt 1: vectorised Larch logsums over all zones at once ──────────
+    # Larch ≥ 5.7 supports logsums() called once on the fitted DataTree and
     # returns an (n_cases,) array for the current DTAZ values.  We can't use
-    # this to get a full (n_cases Ã— n_zones) matrix in one call, but we can
+    # this to get a full (n_cases × n_zones) matrix in one call, but we can
     # try a quick smoke-test (one call) to see if the API is working at all
-    # before attempting the per-zone loop â€” which is very slow on 295 zones.
+    # before attempting the per-zone loop - which is very slow on 295 zones.
     try:
         m_test = mode_model.copy()
         try:
@@ -5396,7 +5703,7 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
             m_test.mangle()
             m_test.unmangle()
             _ = np.asarray(m_test.logsums(), dtype=np.float32)
-        # If we reach here the API works â€” but we still need per-zone matrix.
+        # If we reach here the API works - but we still need per-zone matrix.
         # The single-call result is only for the observed DTAZs, not all zones.
         # Fall through to per-zone loop only if API is confirmed working.
         larch_api_ok = True
@@ -5404,19 +5711,19 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
         _e_str = str(_e)
         if 'availability_any' in _e_str or 'availability_co' in _e_str:
             # Larch removed internal _availability_any attribute in a recent version.
-            # This is a known API change â€” the numpy logsum path is functionally
+            # This is a known API change - the numpy logsum path is functionally
             # equivalent and is the correct fallback.  Log at DEBUG only.
             logger.debug(
-                f"_logsums: Larch API changed ({_e}) â€” using numpy logsum path (normal)."
+                f"_logsums: Larch API changed ({_e}) - using numpy logsum path (normal)."
             )
         else:
             logger.info(
-                f"_logsums: Larch logsums() unavailable ({_e}) â€” "
+                f"_logsums: Larch logsums() unavailable ({_e}) - "
                 "using numpy logsum path (mode coefficients from cache)."
             )
         larch_api_ok = False
 
-    # â”€â”€ Attempt 2: per-zone Larch loop (only if API confirmed working) â”€â”€â”€â”€â”€â”€
+    # ── Attempt 2: per-zone Larch loop (only if API confirmed working) ──────
     if larch_api_ok:
         try:
             template = dt_mode['tour']['DTAZ']
@@ -5435,10 +5742,12 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
         # Helper: replace the 'tour' dataset inside a DataTree with one that has
         # DTAZ fixed at `dtaz`.  Tries three API variants across larch/xarray versions.
         def _set_dtaz(dt, dtaz_val):
+            _set_dtaz.variant = 'unchanged'
             # Variant 1: larch replace_datasets (larch <5.8 / older xarray DataTree)
             if template is not None:
                 try:
                     new_tour = dt['tour'].assign(DTAZ=xr.full_like(template, int(dtaz_val)))
+                    _set_dtaz.variant = 'replace_datasets_node'
                     return dt.replace_datasets(tour=new_tour)
                 except (AttributeError, TypeError, Exception):
                     pass
@@ -5448,6 +5757,7 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
                            or getattr(dt['tour'], 'dataset', None))
                     if _ds is not None:
                         new_ds = _ds.assign(DTAZ=xr.full_like(_ds['DTAZ'], int(dtaz_val)))
+                        _set_dtaz.variant = 'replace_datasets_dataset'
                         return dt.replace_datasets(tour=new_ds)
                 except Exception:
                     pass
@@ -5459,6 +5769,7 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
                     if _ds is not None and 'DTAZ' in _ds:
                         import xarray as _xr
                         _ds['DTAZ'].values[:] = int(dtaz_val)
+                        _set_dtaz.variant = 'in_place_model_copy'
                         return m_copy.datatree
                 except Exception:
                     pass
@@ -5472,10 +5783,30 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
                 ls_col = None
                 try:
                     ls_col = np.asarray(m_copy.logsums(datatree=tmp), dtype=np.float32)
-                except TypeError:
-                    m_copy.datatree = tmp
-                    m_copy.mangle()
-                    m_copy.unmangle()
+                except TypeError as e:
+                    if j == 0:
+                        logger.debug(
+                            "_logsums: logsums(datatree=...) TypeError with "
+                            f"DTAZ variant {_set_dtaz.variant}: {e}"
+                        )
+                    try:
+                        tmp_for_model = tmp.copy()
+                    except Exception as copy_e:
+                        if j == 0:
+                            logger.debug(
+                                "_logsums: datatree copy failed before logsums() "
+                                f"fallback ({type(copy_e).__name__}: {copy_e}); "
+                                "using original datatree."
+                            )
+                        tmp_for_model = tmp
+                    m_copy.datatree = tmp_for_model
+                    if j == 0:
+                        logger.debug(
+                            "_logsums: using logsums() fallback with model.datatree "
+                            f"variant {_set_dtaz.variant}."
+                        )
+                        m_copy.mangle()
+                        m_copy.unmangle()
                     ls_col = np.asarray(m_copy.logsums(), dtype=np.float32)
                 if ls_col is not None and not np.all(np.isnan(ls_col)):
                     ls_array_larch[:, j] = np.nan_to_num(ls_col, nan=0.0)
@@ -5490,11 +5821,11 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
         else:
             logger.error(
                 "_logsums: Larch per-zone loop FAILED for every zone despite API smoke-test passing.\n"
-                "  â–º Falling back to numpy â€” mode impedance may be less accurate.\n"
-                "  â–º Check Larch model state and skim data consistency."
+                "  ► Falling back to numpy - mode impedance may be less accurate.\n"
+                "  ► Check Larch model state and skim data consistency."
             )
 
-    # â”€â”€ Attempt 3: numpy fallback â€” always works regardless of Larch API â”€â”€â”€â”€
+    # ── Attempt 3: numpy fallback - always works regardless of Larch API ────
     # ls_array is None here when both Larch attempts failed/were skipped.
     # The numpy fallback reads OMX matrices directly and never returns None.
     if ls_array is None:
@@ -5511,16 +5842,16 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
         name='logsum',
     )
 
-    # sanity check â€” warn if logsums look degenerate
+    # sanity check - warn if logsums look degenerate
     nonzero = (ls_array != 0).mean()
     mean_ls = float(np.nanmean(ls_array))
     logger.info(f"Logsums: mean={mean_ls:.3f}, non-zero={nonzero*100:.1f}%")
     if nonzero < 0.1:
         logger.warning(
-            "WARNING: >90% of logsums are zero â€” mode model may not be "
+            "WARNING: >90% of logsums are zero - mode model may not be "
             "evaluating correctly. Check that tour.weight, tour.DTAZ, and "
             "skim columns are all present in the DataTree.")
-        # â”€â”€ Diagnostic dump â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Diagnostic dump ─────────────────────────────────────────────
         # Columns are missing when the DataTree was built without joining skims
         # or when tour sub-dataset lacks OTAZ/weight. Check that _build_dt_mode
         # receives a skims object and that tours have OTAZ populated from stage4.
@@ -5529,7 +5860,7 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
             logger.warning(f"    ls shape: {ls_array.shape}  "
                            f"sample[:2,:3]: {ls_array[:2,:3].tolist()}")
 
-            # Build a nameâ†’dataset mapping that works across Larch/xarray versions.
+            # Build a name→dataset mapping that works across Larch/xarray versions.
             # Older xarray-datatree: dt.datasets  (dict of xr.Dataset)
             # Newer xarray DataTree: dt.children  (dict of DataTree nodes, each with .ds)
             def _dt_sub_datasets(dt):
@@ -5550,7 +5881,7 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
                         return out
                 except Exception:
                     pass
-                # Direct subscription fallback â€” try known sub-dataset names
+                # Direct subscription fallback - try known sub-dataset names
                 out = {}
                 for name in ('tour', 'person', 'od', 'emp', 'base'):
                     try:
@@ -5595,13 +5926,13 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
 
     Reads OMX matrices DIRECTLY as numpy arrays (fast) rather than
     materialising the xarray OD dataset to a DataFrame (which is slow enough
-    to silently time-out on HPC nodes with 108,900 OD pairs Ã— 145 columns).
+    to silently time-out on HPC nodes with 108,900 OD pairs × 145 columns).
 
     Uses mode-specific travel time variables:
         DA / Other  : SOVTOLL_TIME__AM (auto IVT, minutes)
         Transit     : WLK_LOC_WLK_TOTIVT__AM (walk-to-transit IVT, minutes)
-        Walk        : DISTWALK Ã— 12 min/km   (5 km/h)
-        Bike        : DISTBIKE Ã— 4  min/km   (15 km/h)
+        Walk        : DISTWALK × 12 min/km   (5 km/h)
+        Bike        : DISTBIKE × 4  min/km   (15 km/h)
 
     Returns np.ndarray shape (n_cases, n_zones).
     """
@@ -5610,12 +5941,12 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
     n_zones = len(zone_ids)
     ls_array = np.zeros((n_cases, n_zones), dtype=np.float32)
 
-    # â”€â”€ 1. Extract fitted coefficients via robust helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # _coef_dict_from_model never calls .pf on loaded models â€” avoids
+    # ── 1. Extract fitted coefficients via robust helper ─────────────────
+    # _coef_dict_from_model never calls .pf on loaded models - avoids
     # the '_mangled' AttributeError that caused all logsums to be zero.
     _cache = _coef_dict_from_model(mode_model, coef_override)
     if not _cache:
-        logger.warning("_logsums_numpy_fallback: no coefficient source â€” "
+        logger.warning("_logsums_numpy_fallback: no coefficient source - "
                        "pass coef_override or use save_models() to inject cache")
         return ls_array
 
@@ -5640,10 +5971,10 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
     asc_bike      = _pv('ASC_Bike',      -1.50)  # was -4.5
     asc_transit   = _pv('ASC_Transit',   -0.50)  # was -1.5
 
-    # â”€â”€ 2. Build zone â†’ matrix-row index from OMX mapping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 2. Build zone → matrix-row index from OMX mapping ───────────────
     # zone_ids are the destination alternatives; we also need origin OTAZ
     # per case from the tour sub-dataset.
-    zone_to_idx: dict = {}    # zone_id â†’ OMX row/col index (0-based)
+    zone_to_idx: dict = {}    # zone_id → OMX row/col index (0-based)
     if skims is not None:
         try:
             mapping = dict(skims.mapping(skims.listMappings()[0]))
@@ -5652,7 +5983,7 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
         except Exception as e:
             logger.debug(f"_logsums_numpy_fallback: could not read OMX mapping: {e}")
 
-    # â”€â”€ 3. Read OMX matrices as numpy arrays once (fast path) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 3. Read OMX matrices as numpy arrays once (fast path) ────────────
     def _read_mat(name: str, default_min: float = 30.0):
         """Read one OMX matrix as float32 array; return None on failure."""
         if skims is None:
@@ -5662,8 +5993,8 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
                 arr = np.array(skims[name], dtype=np.float32)
                 # unit detection (same logic as _get_tt)
                 med = float(np.median(arr[arr > 0])) if (arr > 0).any() else 0.0
-                if med > 600:      arr = arr / 60.0   # seconds â†’ minutes
-                elif med > 200:    arr = arr / 10.0   # tenths â†’ minutes
+                if med > 600:      arr = arr / 60.0   # seconds → minutes
+                elif med > 200:    arr = arr / 10.0   # tenths → minutes
                 return arr
         except Exception as e:
             logger.debug(f"_logsums_numpy_fallback: could not read {name}: {e}")
@@ -5677,10 +6008,10 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
                        if _mat_auto_for_transit is not None else None)
     else:
         mat_transit = _mat_trans
-    mat_walk    = _read_mat('DISTWALK')    # km â†’ Ã— 12 = minutes at 5 km/h
-    mat_bike    = _read_mat('DISTBIKE')    # km â†’ Ã— 4  = minutes at 15 km/h
+    mat_walk    = _read_mat('DISTWALK')    # km → × 12 = minutes at 5 km/h
+    mat_bike    = _read_mat('DISTBIKE')    # km → × 4  = minutes at 15 km/h
 
-    # â”€â”€ 4. Get OTAZ per case from the tour sub-dataset â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 4. Get OTAZ per case from the tour sub-dataset ────────────────────
     case_otaz = np.ones(n_cases, dtype=np.int32)
     try:
         tour_df = dt_mode['tour'].to_dataframe()   # small: only tour-level cols
@@ -5691,12 +6022,12 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
                 if cid in tour_df.index:
                     case_otaz[i] = int(tour_df.at[cid, 'OTAZ'])
     except Exception as e:
-        logger.debug(f"_logsums_numpy_fallback: tour read failed: {e} â€” using OTAZ=1")
+        logger.debug(f"_logsums_numpy_fallback: tour read failed: {e} - using OTAZ=1")
 
-    # â”€â”€ 5. Vectorised logsum computation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 5. Vectorised logsum computation ─────────────────────────────────
     # For each case, look up its origin row index once, then gather the
     # destination columns for all zones in a single numpy slice.
-    # Shape after gathering: (n_cases, n_zones) â€” one matrix operation.
+    # Shape after gathering: (n_cases, n_zones) - one matrix operation.
     #
     # IMPORTANT: use -1 as sentinel for zones not in the OMX mapping.
     # Defaulting to 0 would silently read zone[0]'s row/column for every
@@ -5715,7 +6046,7 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
         for i in range(n_cases):
             o_idx = zone_to_idx.get(int(case_otaz[i]), _MISSING_IDX)
             if o_idx < 0:
-                # Origin zone not in OMX â€” leave entire row at fallback_min
+                # Origin zone not in OMX - leave entire row at fallback_min
                 continue
             out[i, dest_valid] = mat[o_idx, valid_dest]
         # fill zeros (missing OD) with fallback
@@ -5729,15 +6060,15 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
 
     # Match MODE_UEC expressions exactly:
     #   auto/transit: time in HOURS (/ 60)
-    #   walk:  log(od.DISTWALK * 12 + 1)  â€” DISTWALK in km, 12 min/km at 5 km/h
-    #   bike:  log(od.DISTBIKE * 4 + 1)   â€” DISTBIKE in km, 4 min/km at 15 km/h
+    #   walk:  log(od.DISTWALK * 12 + 1)  - DISTWALK in km, 12 min/km at 5 km/h
+    #   bike:  log(od.DISTBIKE * 4 + 1)   - DISTBIKE in km, 4 min/km at 15 km/h
     # walk_dist / bike_dist here are raw OMX values already in km.
     auto_h = xp.clip(xp.asarray(auto_ivt), 0.01, 5.0) / 60.0
     trans_h = xp.clip(xp.asarray(transit_ivt), 0.01, 6.0) / 60.0
     walk_logmin = xp.log(xp.clip(xp.asarray(walk_dist) * 12.0, 0.0, 1500.0) + 1.0)
     bike_logmin = xp.log(xp.clip(xp.asarray(bike_dist) * 4.0, 0.0, 1500.0) + 1.0)
 
-    # MNL utility per mode â€” shape (n_cases, n_zones)
+    # MNL utility per mode - shape (n_cases, n_zones)
     v_da      = c_ivt_auto  * auto_h
     v_sr      = c_ivt_auto  * auto_h     + asc_sr
     v_walk    = c_walk_time * walk_logmin + asc_walk
@@ -5751,7 +6082,7 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
     ls_array = np.asarray(xp.log(xp.exp(utils).sum(axis=2)), dtype=np.float32)
 
     pct_nonzero = float((ls_array != 0).mean()) * 100
-    logger.info(f"_logsums_numpy_fallback: {n_cases}Ã—{n_zones} logsums computed "
+    logger.info(f"_logsums_numpy_fallback: {n_cases}×{n_zones} logsums computed "
                 f"({pct_nonzero:.1f}% non-zero) via direct OMX reads")
     return ls_array
 
@@ -5774,7 +6105,7 @@ def _attach_size_term(landuse: pd.DataFrame, segment: str) -> pd.DataFrame:
     if lu.index.name == 'ORDER':
         lu = lu.reset_index()
 
-    # â”€â”€ Ensure all required DEST_UEC landuse columns exist â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Ensure all required DEST_UEC landuse columns exist ────────────────
     # If any column is missing the DataTree sharrow compiler will fail to
     # compile the utility expression and return an empty pf (0 parameters).
     # We create zero-filled columns as placeholders so compilation succeeds;
@@ -5786,7 +6117,7 @@ def _attach_size_term(landuse: pd.DataFrame, segment: str) -> pd.DataFrame:
         'college': 0.0,       # OSM POI count
         # work attractor columns
         'TOTEMP': 0.0, 'FPSEMPN': 0.0, 'HEREMPN': 0.0, 'RETEMPN': 0.0,
-        # 'commercial' removed: 89M mÂ² outlier at zone 158 corrupted work and othmaint size terms
+        # 'commercial' removed: 89M m² outlier at zone 158 corrupted work and othmaint size terms
         # nonmand/eat attractor columns
         'residential': 0.0, 'Entertainment': 0.0, 'retail': 0.0,
         'Healthcare': 0.0,    # lu-native healthcare aggregate
@@ -5808,7 +6139,7 @@ def _attach_size_term(landuse: pd.DataFrame, segment: str) -> pd.DataFrame:
             for alt in alts:
                 if alt in lu.columns:
                     lu[canon] = lu[alt]
-                    logger.debug(f"_attach_size_term: aliased {alt} â†’ {canon}")
+                    logger.debug(f"_attach_size_term: aliased {alt} → {canon}")
                     break
     for col, default in _REQUIRED_COLS.items():
         if col not in lu.columns:
@@ -5823,7 +6154,7 @@ def _attach_size_term(landuse: pd.DataFrame, segment: str) -> pd.DataFrame:
     else:
         st_col = st_df.mean(axis=1)
 
-    # st_df is indexed by zone (ORDER) â€” align back to lu rows
+    # st_df is indexed by zone (ORDER) - align back to lu rows
     zone_col = 'ORDER' if 'ORDER' in lu.columns else lu.columns[0]
     lu = lu.set_index(zone_col)
     lu['size_term'] = st_col.reindex(lu.index).fillna(0.0).values
@@ -5832,44 +6163,44 @@ def _attach_size_term(landuse: pd.DataFrame, segment: str) -> pd.DataFrame:
 
 
 # ===========================================================================
-# ACDC â€” Agglomerating and Competing Discrete Choice
+# ACDC - Agglomerating and Competing Discrete Choice
 # ===========================================================================
 #
 # Implements the spatial terms from:
 #   Bernadin, Frei, Axhausen (2011) "Agglomeration, competition and
-#   Destination Choice" â€” Transportation Research Part B.
+#   Destination Choice" - Transportation Research Part B.
 #
 # Two zone-level corrections are added to the standard MNL destination utility:
 #
-#   Agglomeration  aggl[j] = log(Î£_{kâ‰ j} size[k] Ã— exp(-Î»_aggl Ã— t[j,k]) + Îµ)
+#   Agglomeration  aggl[j] = log(Σ_{k≠j} size[k] × exp(-λ_aggl × t[j,k]) + ε)
 #       Zone j is more attractive if it is surrounded by other attractive zones
 #       (complementary services, multi-purpose trips, buzz effects).
-#       Î²_aggl expected positive.
+#       β_aggl expected positive.
 #
-#   Competition  comp[orig] = log(Î£_k size[k] Ã— exp(-Î»_comp Ã— t[orig,k]) + Îµ)
+#   Competition  comp[orig] = log(Σ_k size[k] × exp(-λ_comp × t[orig,k]) + ε)
 #       When the origin has good access to many attractive destinations, the
 #       marginal contribution of any single destination is reduced.
-#       Î²_comp expected negative.
+#       β_comp expected negative.
 #
 # Implementation notes
 # --------------------
 # Both terms use the segment's size_term as the attraction measure so they
 # are purpose-specific (work uses TOTEMP, nonmand uses retail/entertainment).
 #
-# Î» values (decay rate per minute of auto IVT) are fixed constants rather than
-# estimated parameters â€” this avoids an identification issue with Î² and keeps
+# λ values (decay rate per minute of auto IVT) are fixed constants rather than
+# estimated parameters - this avoids an identification issue with β and keeps
 # Larch estimation well-behaved.  The values (0.05/min) give a half-life of
 # ~14 minutes, meaning destinations ~14 min away exert half the spatial
 # influence of adjacent zones.  This matches empirical ACDC estimates for
 # SEQ-scale models (Burdett 2024, internal).
 #
 # Both computations are fully vectorised as matrix multiplications:
-#   aggl = log(exp_mat_aggl @ size_arr + Îµ)    shape (N,)
-#   comp = log(exp_mat_comp @ size_arr + Îµ)    shape (N,)
-# where N = number of zones and exp_mat = exp(-Î» Ã— time_matrix).
+#   aggl = log(exp_mat_aggl @ size_arr + ε)    shape (N,)
+#   comp = log(exp_mat_comp @ size_arr + ε)    shape (N,)
+# where N = number of zones and exp_mat = exp(-λ × time_matrix).
 # ===========================================================================
 
-# ACDC decay rates â€” fixed, not estimated (avoids Î²/Î» identification issues)
+# ACDC decay rates - fixed, not estimated (avoids β/λ identification issues)
 LAMBDA_AGGL = 0.05   # agglomeration decay: 1/2 effect at ~14 min auto IVT
 LAMBDA_COMP = 0.05   # competition decay:   1/2 effect at ~14 min auto IVT
 
@@ -5885,7 +6216,7 @@ def compute_acdc_terms(
     """
     Compute ACDC agglomeration and competition terms for all zones.
 
-    Vectorised implementation using matrix multiply â€” no Python loops.
+    Vectorised implementation using matrix multiply - no Python loops.
 
     Parameters
     ----------
@@ -5899,20 +6230,20 @@ def compute_acdc_terms(
 
     Returns
     -------
-    aggl_series : pd.Series indexed by zone_id  â€” agglomeration score per zone
-    comp_series : pd.Series indexed by zone_id  â€” competition score per origin
+    aggl_series : pd.Series indexed by zone_id  - agglomeration score per zone
+    comp_series : pd.Series indexed by zone_id  - competition score per origin
     """
     N = len(zone_ids)
     aggl_series = pd.Series(0.0, index=zone_ids, name='acdc_aggl')
     comp_series = pd.Series(0.0, index=zone_ids, name='acdc_comp')
 
     if skim_df.empty or 'SOVTOLL_TIME__AM' not in skim_df.columns:
-        logger.warning("compute_acdc_terms: no SOVTOLL_TIME__AM in skim_df â€” "
+        logger.warning("compute_acdc_terms: no SOVTOLL_TIME__AM in skim_df - "
                        "ACDC terms will be zero (model still runs)")
         return aggl_series, comp_series
 
     try:
-        # â”€â”€ Build (NÃ—N) auto travel-time matrix â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Build (N×N) auto travel-time matrix ────────────────────────────
         # Pivot flat OTAZ/DTAZ table into a square matrix aligned to zone_ids.
         sk_sub = (skim_df[['OTAZ', 'DTAZ', 'SOVTOLL_TIME__AM']]
                   .drop_duplicates(['OTAZ', 'DTAZ']))
@@ -5931,31 +6262,31 @@ def compute_acdc_terms(
                 elif val > 200: val /= 10.0
                 time_mat[i, j] = max(val, 0.1)
 
-        # â”€â”€ Agglomeration: exp(-Î» Ã— time[j,k]) for each destination j â”€â”€â”€â”€â”€â”€
-        # aggl[j] = log(Î£_{kâ‰ j} size[k] Ã— exp(-Î» Ã— time[j,k]) + Îµ)
-        # = log((exp_mat_aggl @ size_arr) - size[j]*exp(-Î»*0) + Îµ)
-        # Since diagonal is 0: exp(-Î»*0)=1 â†’ self-contribution = size[j].
+        # ── Agglomeration: exp(-λ × time[j,k]) for each destination j ──────
+        # aggl[j] = log(Σ_{k≠j} size[k] × exp(-λ × time[j,k]) + ε)
+        # = log((exp_mat_aggl @ size_arr) - size[j]*exp(-λ*0) + ε)
+        # Since diagonal is 0: exp(-λ*0)=1 → self-contribution = size[j].
         # We zero the diagonal explicitly to exclude k==j.
         exp_aggl          = np.exp(-lambda_aggl * time_mat).astype(np.float64)
-        np.fill_diagonal(exp_aggl, 0.0)           # exclude self (k â‰  j)
-        aggl_raw          = exp_aggl @ size_arr   # (N,) â€” weighted sum
+        np.fill_diagonal(exp_aggl, 0.0)           # exclude self (k ≠ j)
+        aggl_raw          = exp_aggl @ size_arr   # (N,) - weighted sum
         aggl_vals         = np.log(aggl_raw + 1e-8)
 
-        # â”€â”€ Competition: exp(-Î» Ã— time[orig,k]) for each origin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # comp[orig] = log(Î£_k size[k] Ã— exp(-Î» Ã— time[orig,k]) + Îµ)
+        # ── Competition: exp(-λ × time[orig,k]) for each origin ─────────────
+        # comp[orig] = log(Σ_k size[k] × exp(-λ × time[orig,k]) + ε)
         # Same matrix, row-wise: one value per origin zone.
         exp_comp          = np.exp(-lambda_comp * time_mat).astype(np.float64)
-        # Include all destinations (don't exclude diagonal â€” the chosen
+        # Include all destinations (don't exclude diagonal - the chosen
         # destination itself is one of the competing options from the origin)
-        comp_raw          = exp_comp @ size_arr   # (N,) â€” one per origin
+        comp_raw          = exp_comp @ size_arr   # (N,) - one per origin
         comp_vals         = np.log(comp_raw + 1e-8)
 
-        # â”€â”€ Z-score normalise both terms so coefficients are scale-free â”€â”€â”€â”€â”€â”€
+        # ── Z-score normalise both terms so coefficients are scale-free ──────
         # Without normalisation the raw log values span ~15 units; large
         # employment clusters (CBD, university zones) dominate destination
         # utility and cause zone concentration (e.g. zones 203, 229, 266).
-        # After z-scoring stdâ‰ˆ1 so c_aggl â‰ˆ 0.2 means a 1-std advantage
-        # gives exp(0.2)â‰ˆ1.2Ã— attraction â€” interpretable and bounded.
+        # After z-scoring std≈1 so c_aggl ≈ 0.2 means a 1-std advantage
+        # gives exp(0.2)≈1.2× attraction - interpretable and bounded.
         _aggl_std = aggl_vals.std()
         _comp_std = comp_vals.std()
         if _aggl_std > 1e-8:
@@ -5973,7 +6304,7 @@ def compute_acdc_terms(
         )
 
     except Exception as e:
-        logger.warning(f"compute_acdc_terms failed: {e} â€” ACDC terms will be zero")
+        logger.warning(f"compute_acdc_terms failed: {e} - ACDC terms will be zero")
 
     return aggl_series, comp_series
 
@@ -5990,38 +6321,38 @@ def _attach_acdc_terms(
     Returns
     -------
     lu_out  : landuse with 'acdc_aggl' and 'acdc_comp' columns added
-              (â†’ emp.acdc_aggl and emp.acdc_comp in DataTree)
+              (→ emp.acdc_aggl and emp.acdc_comp in DataTree)
     t_out   : tours with a dummy 'acdc_comp' = 0 column (unused by model)
 
     Design
     ------
-    â€¢ acdc_aggl is zone-level (indexed by destination) â†’ lives on landuse / emp.
-    â€¢ acdc_comp is now also zone-level (indexed by destination) â†’ lives on emp.
+    • acdc_aggl is zone-level (indexed by destination) → lives on landuse / emp.
+    • acdc_comp is now also zone-level (indexed by destination) → lives on emp.
       Competition represents how many alternatives are accessible FROM each
-      destination zone â€” zones with more reachable alternatives face stronger
+      destination zone - zones with more reachable alternatives face stronger
       substitution pressure and are therefore less likely to be chosen.
       Placing it on emp ensures it always varies across alternatives regardless
       of how many distinct OTAZs are in the current batch, so Sharrow never
       sees a structural DataTree change between estimation and prediction.
 
     The size_term used as the attraction weight is the segment-specific one
-    already computed by _attach_size_term â€” so work agglomeration uses
+    already computed by _attach_size_term - so work agglomeration uses
     employment, shopping agglomeration uses retail employment, etc.
     """
     lu   = landuse.copy()
     tours_out = tours.copy()
 
-    # â”€â”€ Resolve zone column â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Resolve zone column ───────────────────────────────────────────────
     zone_col = 'ORDER' if 'ORDER' in lu.columns else lu.columns[0]
     if lu.index.name == zone_col:
         lu = lu.reset_index()
 
     zone_ids = lu[zone_col].astype(int).values
 
-    # â”€â”€ Get segment size_term as attraction weights â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Get segment size_term as attraction weights ───────────────────────
     # size_term is log-transformed; exponentiate back for the spatial kernel.
     if 'size_term' not in lu.columns:
-        logger.warning("_attach_acdc_terms: no size_term column â€” run _attach_size_term first")
+        logger.warning("_attach_acdc_terms: no size_term column - run _attach_size_term first")
         lu['acdc_aggl'] = 0.0
         tours_out['acdc_comp'] = 0.0
         return lu, tours_out
@@ -6030,28 +6361,28 @@ def _attach_acdc_terms(
     # Clip before exp to avoid overflow (size_term can be large log values)
     size_arr = np.exp(np.clip(size_log, -30, 30))
 
-    # â”€â”€ Compute ACDC terms â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Compute ACDC terms ────────────────────────────────────────────────
     aggl_series, comp_series = compute_acdc_terms(
         lu, skim_df, size_arr, zone_ids
     )
 
-    # â”€â”€ Attach aggl to landuse (emp dataset) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Attach aggl to landuse (emp dataset) ──────────────────────────────
     lu = lu.set_index(zone_col)
     lu['acdc_aggl'] = aggl_series.reindex(lu.index).fillna(0.0).values
 
-    # â”€â”€ Attach comp to landuse (emp dataset) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Attach comp to landuse (emp dataset) ──────────────────────────────
     # Competition is now attached at the DESTINATION (alternative) level rather
     # than the tour (case) level.  This means acdc_comp is always indexed by
     # zone, and the DataTree column always varies across alternatives regardless
     # of how many distinct OTAZs are in the current batch.
     #
-    # Semantic: comp[j] = competition accessible from zone j â€” the sum of
+    # Semantic: comp[j] = competition accessible from zone j - the sum of
     # attraction-weighted reachable alternatives from j.  In destination
     # choice, a zone with many reachable alternatives is less likely to be
     # chosen (substitution effect), which is the intended interpretation.
     #
     # Previously this was on tour.acdc_comp (person/case level), which
-    # collapsed to a scalar when all persons in a batch share one OTAZ â€”
+    # collapsed to a scalar when all persons in a batch share one OTAZ -
     # causing Sharrow to see a different DataTree structure vs estimation
     # and recompile on every zone/batch.  Moving it to emp.acdc_comp fixes
     # the structural mismatch permanently.
@@ -6059,7 +6390,7 @@ def _attach_acdc_terms(
     lu = lu.reset_index()
 
     # tours_out still gets a dummy acdc_comp=0 column so any code that
-    # reads tour.acdc_comp doesn't KeyError â€” the real value comes from emp.
+    # reads tour.acdc_comp doesn't KeyError - the real value comes from emp.
     tours_out['acdc_comp'] = 0.0
 
     logger.info(
@@ -6123,27 +6454,27 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
     Estimate a mixed logit mode choice model using Larch's native mixtures API.
 
     Follows Professor Ken Train's approach from the mixed-logit notebook:
-        1. Build a standard NL model (already done â€” this refits a fresh one)
+        1. Build a standard NL model (already done - this refits a fresh one)
         2. Add Normal mixtures for taste-heterogeneous parameters
         3. Set n_draws and seed, then maximize_loglike
 
     Random coefficients (heterogeneous across travellers):
-        c_ivt        ~ Normal(mean, sd)  â€” IVT sensitivity varies by person
-        c_walk_dist  ~ Normal(mean, sd)  â€” walk distance sensitivity varies
-        c_bike_dist  ~ Normal(mean, sd)  â€” bike distance sensitivity varies
+        c_ivt        ~ Normal(mean, sd)  - IVT sensitivity varies by person
+        c_walk_dist  ~ Normal(mean, sd)  - walk distance sensitivity varies
+        c_bike_dist  ~ Normal(mean, sd)  - bike distance sensitivity varies
 
     Fixed coefficients (homogeneous):
-        ASCs, availability flags â€” all ASCs fixed (identified)
-        c_veh_avail, c_peak â€” structural variables, kept fixed
+        ASCs, availability flags - all ASCs fixed (identified)
+        c_veh_avail, c_peak - structural variables, kept fixed
 
     The groupid is set to person_id so preferences vary across PERSONS not
-    across observations (panel correction â€” see notebook Â§"Considering Panel Data").
+    across observations (panel correction - see notebook §"Considering Panel Data").
 
     Parameters
     ----------
     seg      : filtered segment DataFrame (output of _filter_seg)
     segment  : 'work', 'edu', or 'nonmand'
-    n_draws  : Halton draws (200 default â€” increase to 500+ for final results)
+    n_draws  : Halton draws (200 default - increase to 500+ for final results)
     seed     : random seed for Halton sequence
 
     Returns
@@ -6155,30 +6486,30 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
         if len(seg) > MAX_MXL_OBS:
             logger.info(
                 f"[{segment}] Mixed logit: {len(seg)} observations exceeds "
-                f"MAX_MXL_OBS={MAX_MXL_OBS} â€” subsampling to {MAX_MXL_OBS} for estimation"
+                f"MAX_MXL_OBS={MAX_MXL_OBS} - subsampling to {MAX_MXL_OBS} for estimation"
             )
             seg = seg.sample(n=MAX_MXL_OBS, random_state=seed)
 
-        # â”€â”€ rebuild a fresh mode tree for this segment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── rebuild a fresh mode tree for this segment ────────────────
         # We can't reuse dt_m from the outer function scope here, so we
-        # use the segment DataFrame directly â€” seg already has ptour_id index
+        # use the segment DataFrame directly - seg already has ptour_id index
         # The standard NL mode model is already estimated; here we build a
         # parallel MXL on the same data using Larch's mixtures API.
 
         # Import the datatree and landuse from outer scope isn't possible here;
         # instead we build a simplified MNL ca model from the segment's flat data.
-        # This is sufficient for the MXL â€” we don't need the full DataTree.
+        # This is sufficient for the MXL - we don't need the full DataTree.
 
-        # Build idca dataset: one row per (tour Ã— mode)
-        # â”€â”€ Pull per-observation skim values (merged by _run_segment) â”€â”€â”€â”€
+        # Build idca dataset: one row per (tour × mode)
+        # ── Pull per-observation skim values (merged by _run_segment) ────
         # SOVTOLL_TIME__AM: auto IVT in minutes (may have been merged)
-        # DISTWALK / DISTBIKE: km â€” converted to time at 5 / 15 km/h
+        # DISTWALK / DISTBIKE: km - converted to time at 5 / 15 km/h
         # WLK_LOC_WLK_TOTIVT__AM: transit IVT minutes
         # walk_avail / bike_avail: distance-based availability flags
         alt_ids   = list(MODE_MAP.values())   # [1,2,3,4,5]
         rows = []
 
-        # median IVT for this segment â€” used as denominator to scale to
+        # median IVT for this segment - used as denominator to scale to
         # a ~[-2, 0] range for numerical stability
         ivt_vals = pd.to_numeric(seg.get('SOVTOLL_TIME__AM', pd.Series(30.0,
                                   index=seg.index)), errors='coerce').fillna(30.0)
@@ -6188,21 +6519,21 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
             pid     = str(tour['ptour_id'])
             chosen  = int(tour.get('tour_mode', 1))
 
-            # auto IVT â€” use actual skim value if present, else 30 min
+            # auto IVT - use actual skim value if present, else 30 min
             auto_ivt_min  = float(tour.get('SOVTOLL_TIME__AM', 30.0)) or 30.0
-            # walk/bike distances â†’ time in minutes
+            # walk/bike distances → time in minutes
             walk_dist_km  = float(tour.get('DISTWALK',    20.0)) or 20.0
             bike_dist_km  = float(tour.get('DISTBIKE',    20.0)) or 20.0
-            walk_time_min = walk_dist_km  * 12.0    # 5 km/h â†’ 12 min/km
-            bike_time_min = bike_dist_km  * 4.0     # 15 km/h â†’ 4 min/km
-            # transit IVT â€” use walk-to-transit time if present
+            walk_time_min = walk_dist_km  * 12.0    # 5 km/h → 12 min/km
+            bike_time_min = bike_dist_km  * 4.0     # 15 km/h → 4 min/km
+            # transit IVT - use walk-to-transit time if present
             transit_ivt   = float(tour.get('WLK_LOC_WLK_TOTIVT__AM',
                                            auto_ivt_min * 1.5)) or auto_ivt_min * 1.5
 
             walk_ok = int(tour.get('walk_avail', int(walk_dist_km < 10.0)))
             bike_ok = int(tour.get('bike_avail', int(bike_dist_km < 25.0)))
 
-            # â”€â”€ person-level attributes (idco â†’ encoded as alt-specific zeros) â”€
+            # ── person-level attributes (idco → encoded as alt-specific zeros) ─
             vehrd   = float(tour.get('vehrd', 1.0))
             licence = float(tour.get('CARLICENCE', 1.0))
             noveh   = float(vehrd == 0)
@@ -6215,7 +6546,7 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
             female  = float(int(tour.get('sexp', 0)) == 2)
             incp    = float(tour.get('incp', 50.0))
 
-            # â”€â”€ Industry of employment (ANZSIC 1-digit, 'indp') â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── Industry of employment (ANZSIC 1-digit, 'indp') ──────────────
             # Groups that strongly predict DA captivity vs transit amenability.
             # 'indp' int 1-20; if absent default to 20 (not employed/other).
             _indp_raw = int(tour.get('indp', 20) or 20)
@@ -6226,38 +6557,38 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
             ind_health     = float(_ind_grp == 'health')
             ind_retail     = float(_ind_grp in ('retail', 'hospitality'))
 
-            # â”€â”€ Occupation (ANZSCO 1-digit, 'occp') â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            # 1=Managers, 2=Professionals â†’ office locations â†’ mixed modal
-            # 5=Clerical/Admin â†’ CBD offices â†’ more transit-amenable
-            # 7=Machinery Operators, 8=Labourers â†’ site work â†’ DA captive
+            # ── Occupation (ANZSCO 1-digit, 'occp') ──────────────────────────
+            # 1=Managers, 2=Professionals → office locations → mixed modal
+            # 5=Clerical/Admin → CBD offices → more transit-amenable
+            # 7=Machinery Operators, 8=Labourers → site work → DA captive
             _occp_raw = int(tour.get('occp', 0) or 0)
             occ_mgr_prof = float(_occp_raw in (1, 2))
             occ_labourer = float(_occp_raw in (7, 8))
             occ_clerical = float(_occp_raw == 5)
 
-            # â”€â”€ Studying status (1=not studying, 2=ft, 3=pt, 4=other) â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── Studying status (1=not studying, 2=ft, 3=pt, 4=other) ────────
             _stup_raw = int(tour.get('stup', 1) or 1)
             is_ft_student = float(_stup_raw == 2)
             is_pt_student = float(_stup_raw in (3, 4))
 
             for alt in alt_ids:
                 # Match MODE_UEC expressions exactly:
-                #   auto/transit: SOVTOLL_TIME__AM / 60 â†’ hours
-                #   walk:         log(DISTWALK * 12 + 1) â†’ log-minutes at 5 km/h
-                #   bike:         log(DISTBIKE * 4  + 1) â†’ log-minutes at 15 km/h
-                if alt in (1, 2):        # DA, Other â€” auto hours
+                #   auto/transit: SOVTOLL_TIME__AM / 60 → hours
+                #   walk:         log(DISTWALK * 12 + 1) → log-minutes at 5 km/h
+                #   bike:         log(DISTBIKE * 4  + 1) → log-minutes at 15 km/h
+                if alt in (1, 2):        # DA, Other - auto hours
                     ivt_h       = auto_ivt_min  / 60.0
                     walk_logmin = 0.0
                     bike_logmin = 0.0
-                elif alt == 5:           # Transit â€” hours
+                elif alt == 5:           # Transit - hours
                     ivt_h       = transit_ivt   / 60.0
                     walk_logmin = 0.0
                     bike_logmin = 0.0
-                elif alt == 3:           # Walk â€” log(minutes + 1)
+                elif alt == 3:           # Walk - log(minutes + 1)
                     ivt_h       = 0.0
                     walk_logmin = float(np.log(walk_time_min + 1.0))
                     bike_logmin = 0.0
-                else:                    # Bike â€” log(minutes + 1)
+                else:                    # Bike - log(minutes + 1)
                     ivt_h       = 0.0
                     walk_logmin = 0.0
                     bike_logmin = float(np.log(bike_time_min + 1.0))
@@ -6269,7 +6600,7 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
                     avail = 0
 
                 # Encode personalized attributes as alt-specific columns
-                # (idco â†’ idca: place value only for the relevant alternatives)
+                # (idco → idca: place value only for the relevant alternatives)
                 rows.append({
                     'case_id':      pid,
                     'alt_id':       alt,
@@ -6282,56 +6613,56 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
                     # and sharrow internally caches the result as 'bike_logmin'.  Using the same
                     # name here in the flat-Dataset MXL model can cause a circular
                     # "rewrite to itself" compile error if it collides with cached symbols.
-                    # vehicle ownership â€” DA / Other
+                    # vehicle ownership - DA / Other
                     'p_vehrd_da':   vehrd   if alt == 1 else 0.0,
                     'p_vehrd_sr':   vehrd   if alt == 2 else 0.0,
-                    # no-vehicle â†’ transit / walk
+                    # no-vehicle → transit / walk
                     'p_noveh_tr':   noveh   if alt == 5 else 0.0,
                     'p_noveh_wk':   noveh   if alt == 3 else 0.0,
-                    # licence â†’ DA
+                    # licence → DA
                     'p_lic_da':     licence if alt == 1 else 0.0,
-                    # worker type â†’ DA / SR
+                    # worker type → DA / SR
                     'p_ftw_da':     ftwork  if alt == 1 else 0.0,
                     'p_ptw_sr':     ptwork  if alt == 2 else 0.0,
-                    # age â†’ walk / bike penalty
+                    # age → walk / bike penalty
                     'p_age_wk':     age5p   if alt == 3 else 0.0,
                     'p_age_bk':     age5p   if alt == 4 else 0.0,
                     'p_young_bk':   young   if alt == 4 else 0.0,
-                    # household size â†’ SR
+                    # household size → SR
                     'p_nprd_sr':    nprd    if alt == 2 else 0.0,
-                    # bike ownership â†’ bike
+                    # bike ownership → bike
                     'p_bikes_bk':   bikes   if alt == 4 else 0.0,
-                    # sex â†’ transit / walk
+                    # sex → transit / walk
                     'p_fem_tr':     female  if alt == 5 else 0.0,
                     'p_fem_wk':     female  if alt == 3 else 0.0,
-                    # income â†’ DA (positive) / transit (negative)
+                    # income → DA (positive) / transit (negative)
                     'p_incp_da':    incp    if alt == 1 else 0.0,
                     'p_incp_tr':    incp    if alt == 5 else 0.0,
-                    # â”€â”€ Industry of employment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                    # Industrial/agri workers â†’ DA (remote sites, no transit service)
+                    # ── Industry of employment ────────────────────────────
+                    # Industrial/agri workers → DA (remote sites, no transit service)
                     'p_ind_da':     ind_industrial if alt == 1 else 0.0,
-                    # Office/professional â†’ slightly more transit
+                    # Office/professional → slightly more transit
                     'p_off_tr':     ind_office     if alt == 5 else 0.0,
-                    # Public sector (admin/education) â†’ transit-amenable CBD locations
+                    # Public sector (admin/education) → transit-amenable CBD locations
                     'p_pub_tr':     ind_public     if alt == 5 else 0.0,
                     'p_pub_wk':     ind_public     if alt == 3 else 0.0,
-                    # Health workers â†’ transit (hospitals well-served)
+                    # Health workers → transit (hospitals well-served)
                     'p_hlt_tr':     ind_health     if alt == 5 else 0.0,
-                    # Retail/hospitality â†’ SR (variable hours reduce PT use)
+                    # Retail/hospitality → SR (variable hours reduce PT use)
                     'p_ret_sr':     ind_retail     if alt == 2 else 0.0,
-                    # â”€â”€ Occupation (ANZSCO 1-digit) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                    # Managers/Professionals â†’ DA (flexible hours, employer parking)
+                    # ── Occupation (ANZSCO 1-digit) ───────────────────────
+                    # Managers/Professionals → DA (flexible hours, employer parking)
                     'p_mgr_da':     occ_mgr_prof   if alt == 1 else 0.0,
-                    # Labourers/Machinery â†’ DA (site-based, tools/equipment)
+                    # Labourers/Machinery → DA (site-based, tools/equipment)
                     'p_lab_da':     occ_labourer   if alt == 1 else 0.0,
-                    # Clerical/Admin â†’ transit (CBD offices, regular hours)
+                    # Clerical/Admin → transit (CBD offices, regular hours)
                     'p_clr_tr':     occ_clerical   if alt == 5 else 0.0,
-                    # â”€â”€ Studying status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                    # Full-time students â†’ transit + walk (campus access)
+                    # ── Studying status ───────────────────────────────────
+                    # Full-time students → transit + walk (campus access)
                     'p_fts_tr':     is_ft_student  if alt == 5 else 0.0,
                     'p_fts_wk':     is_ft_student  if alt == 3 else 0.0,
                     'p_fts_bk':     is_ft_student  if alt == 4 else 0.0,
-                    # Part-time students â†’ slight transit preference
+                    # Part-time students → slight transit preference
                     'p_pts_tr':     is_pt_student  if alt == 5 else 0.0,
                 })
 
@@ -6347,7 +6678,7 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
         # build larch Dataset
         ds = lx.Dataset.construct.from_idca(mxl_df)
 
-        # â”€â”€ Step 1: MNL baseline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Step 1: MNL baseline ──────────────────────────────────────────
         # column names match the idca data: mxl_ca_ivt_h, mxl_ca_walk_h, mxl_ca_bike_h
         # Force numba here; JAX mixed-logit on Windows often triggers sharrow
         # rewrite/CPU-binding errors before convergence.
@@ -6377,22 +6708,22 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
             + P('c_fem_wk')     * X('p_fem_wk')
             + P('c_incp_da')    * X('p_incp_da')
             + P('c_incp_tr')    * X('p_incp_tr')
-            # â”€â”€ industry of employment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            + P('c_ind_da')     * X('p_ind_da')   # industrial/agri â†’ DA
-            + P('c_off_tr')     * X('p_off_tr')   # office/professional â†’ transit
-            + P('c_pub_tr')     * X('p_pub_tr')   # public sector â†’ transit
-            + P('c_pub_wk')     * X('p_pub_wk')   # public sector â†’ walk
-            + P('c_hlt_tr')     * X('p_hlt_tr')   # health workers â†’ transit
-            + P('c_ret_sr')     * X('p_ret_sr')   # retail/hospitality â†’ SR
-            # â”€â”€ occupation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            + P('c_mgr_da')     * X('p_mgr_da')   # managers/professionals â†’ DA
-            + P('c_lab_da')     * X('p_lab_da')   # labourers â†’ DA
-            + P('c_clr_tr')     * X('p_clr_tr')   # clerical â†’ transit
-            # â”€â”€ studying â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            + P('c_fts_tr')     * X('p_fts_tr')   # FT students â†’ transit
-            + P('c_fts_wk')     * X('p_fts_wk')   # FT students â†’ walk
-            + P('c_fts_bk')     * X('p_fts_bk')   # FT students â†’ bike
-            + P('c_pts_tr')     * X('p_pts_tr')   # PT students â†’ transit
+            # ── industry of employment ────────────────────────────────────
+            + P('c_ind_da')     * X('p_ind_da')   # industrial/agri → DA
+            + P('c_off_tr')     * X('p_off_tr')   # office/professional → transit
+            + P('c_pub_tr')     * X('p_pub_tr')   # public sector → transit
+            + P('c_pub_wk')     * X('p_pub_wk')   # public sector → walk
+            + P('c_hlt_tr')     * X('p_hlt_tr')   # health workers → transit
+            + P('c_ret_sr')     * X('p_ret_sr')   # retail/hospitality → SR
+            # ── occupation ────────────────────────────────────────────────
+            + P('c_mgr_da')     * X('p_mgr_da')   # managers/professionals → DA
+            + P('c_lab_da')     * X('p_lab_da')   # labourers → DA
+            + P('c_clr_tr')     * X('p_clr_tr')   # clerical → transit
+            # ── studying ─────────────────────────────────────────────────
+            + P('c_fts_tr')     * X('p_fts_tr')   # FT students → transit
+            + P('c_fts_wk')     * X('p_fts_wk')   # FT students → walk
+            + P('c_fts_bk')     * X('p_fts_bk')   # FT students → bike
+            + P('c_pts_tr')     * X('p_pts_tr')   # PT students → transit
         )
         # ASCs (DA=0 reference) + random DA affinity term
         # c_da_aff captures person-level taste heterogeneity in DA preference;
@@ -6414,7 +6745,7 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
         mnl.set_value('c_vehrd_sr',   seg_init.get('c_veh_sr',    0.10))
         mnl.set_value('c_noveh_tr',   seg_init.get('c_noveh_transit', 2.0))
         mnl.set_value('c_noveh_wk',   seg_init.get('c_noveh_walk',    1.5))
-        # c_lic_da removed â€” CARLICENCE is now a hard availability constraint
+        # c_lic_da removed - CARLICENCE is now a hard availability constraint
         mnl.set_value('c_ftw_da',     seg_init.get('c_ftwork_da',     0.5))
         mnl.set_value('c_ptw_sr',     seg_init.get('c_ptwork_sr',     0.2))
         mnl.set_value('c_age_wk',     seg_init.get('c_age_walk',     -0.10))
@@ -6428,27 +6759,27 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
         mnl.set_value('c_incp_tr',    seg_init.get('c_incp_transit',  -0.015))
         # DA affinity: random intercept (zero mean at MNL start; becomes random in MXL)
         mnl.set_value('c_da_aff',     0.0)
-        # â”€â”€ Industry starting values (behaviorally calibrated to SEQ context) â”€â”€
-        # Industrial/agri â†’ DA: strong positive (remote sites, no PT service)
+        # ── Industry starting values (behaviorally calibrated to SEQ context) ──
+        # Industrial/agri → DA: strong positive (remote sites, no PT service)
         mnl.set_value('c_ind_da',     0.70)
-        # Office/professional â†’ transit: modest (CBD access, some parking costs)
+        # Office/professional → transit: modest (CBD access, some parking costs)
         mnl.set_value('c_off_tr',     0.25)
-        # Public sector â†’ transit: stronger (CBDs, Education/Health precincts)
+        # Public sector → transit: stronger (CBDs, Education/Health precincts)
         mnl.set_value('c_pub_tr',     0.45)
         mnl.set_value('c_pub_wk',     0.15)
-        # Health workers â†’ transit: hospitals on PT corridors
+        # Health workers → transit: hospitals on PT corridors
         mnl.set_value('c_hlt_tr',     0.30)
-        # Retail/hospitality â†’ SR: variable hours reduce transit feasibility
+        # Retail/hospitality → SR: variable hours reduce transit feasibility
         mnl.set_value('c_ret_sr',     0.20)
-        # â”€â”€ Occupation starting values â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        mnl.set_value('c_mgr_da',     0.25)   # managers â†’ employer parking, DA
-        mnl.set_value('c_lab_da',     0.50)   # labourers â†’ tools/equipment, DA
-        mnl.set_value('c_clr_tr',     0.30)   # clerical â†’ CBD office, transit
-        # â”€â”€ Studying starting values â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        mnl.set_value('c_fts_tr',     0.55)   # FT students â†’ campus transit
-        mnl.set_value('c_fts_wk',     0.30)   # FT students â†’ campus walkable
-        mnl.set_value('c_fts_bk',     0.20)   # FT students â†’ cycling
-        mnl.set_value('c_pts_tr',     0.20)   # PT students â†’ some transit
+        # ── Occupation starting values ──────────────────────────────────────
+        mnl.set_value('c_mgr_da',     0.25)   # managers → employer parking, DA
+        mnl.set_value('c_lab_da',     0.50)   # labourers → tools/equipment, DA
+        mnl.set_value('c_clr_tr',     0.30)   # clerical → CBD office, transit
+        # ── Studying starting values ────────────────────────────────────────
+        mnl.set_value('c_fts_tr',     0.55)   # FT students → campus transit
+        mnl.set_value('c_fts_wk',     0.30)   # FT students → campus walkable
+        mnl.set_value('c_fts_bk',     0.20)   # FT students → cycling
+        mnl.set_value('c_pts_tr',     0.20)   # PT students → some transit
         mnl.set_cap(8)
 
         for _p in (
@@ -6463,13 +6794,13 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
             except Exception:
                 pass
 
-        # Sign constraints â€” prevent behaviorally implausible outcomes
-        # c_ivt_* must be negative (more travel time â†’ less utility)
-        # c_crash_veh must be â‰¤ 0 (more crash risk â†’ less utility for vehicle modes)
+        # Sign constraints - prevent behaviorally implausible outcomes
+        # c_ivt_* must be negative (more travel time → less utility)
+        # c_crash_veh must be ≤ 0 (more crash risk → less utility for vehicle modes)
         for _p in ('c_ivt_auto', 'c_ivt_transit', 'c_walk_time', 'c_bike_time'):
             try:
                 mnl.set_value(_p, min(mnl.get_value(_p), -0.01))
-                # set_upper constrains param â‰¤ value during optimisation
+                # set_upper constrains param ≤ value during optimisation
                 mnl.set_upper(_p, -0.001)
             except Exception:
                 pass
@@ -6480,13 +6811,13 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
 
         mnl.maximize_loglike(options={'ftol': 1e-9, 'maxiter': 500})
 
-        # â”€â”€ Step 2: Add Normal mixtures â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Step 2: Add Normal mixtures ───────────────────────────────────
         # Random parameters capture taste heterogeneity across persons:
         #   c_ivt      ~ Normal: IVT sensitivity varies (commuters vs leisure)
         #   c_walk     ~ Normal: walk aversion varies (fitness, weather sensitivity)
         #   c_bike     ~ Normal: bike aversion varies (infrastructure access)
         #   c_da_aff   ~ Normal: DA affinity varies (person-specific constant)
-        #                        Key driver of DA dominance â€” individuals who
+        #                        Key driver of DA dominance - individuals who
         #                        intrinsically prefer driving regardless of time.
         mxl = mnl.copy()
         _random_params = [
@@ -6517,7 +6848,7 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
                 except Exception:
                     pass
 
-        # No groupid panel correction â€” person_id is the index so sharrow
+        # No groupid panel correction - person_id is the index so sharrow
         # cannot rewrite it as a regular column (causes 'unable to rewrite' error).
         mxl_final = mxl
 
@@ -6534,7 +6865,7 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
             pass
         mxl_final.maximize_loglike(stderr=True, options={'ftol': 1e-10, 'gtol': 1e-6, 'maxiter': 800})
 
-        # â”€â”€ extract results â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── extract results ──────────────────────────────────────────
         pf   = mxl_final.pf
         try:
             ll   = float(mxl_final.most_recent_estimation_result.loglike)
@@ -6570,10 +6901,10 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
         }
 
         # print summary
-        print(f"\n  â”Œâ”€ {segment.upper()} Mixed Logit  LL={ll:.1f}  ÏÂ²={rho2:.3f}"
-              f"  draws={n_draws} â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+        print(f"\n  ┌─ {segment.upper()} Mixed Logit  LL={ll:.1f}  ρ²={rho2:.3f}"
+              f"  draws={n_draws} ─────────────────")
         print(f"  {'Parameter':<25} {'Value':>9}  {'Std Err':>8}  {'t-stat':>7}  Type")
-        print(f"  {'â”€'*65}")
+        print(f"  {'─'*65}")
         rand_params_set = _rand_names | {f's_{p[2:]}' if p.startswith('c_') else f's_{p}'
                                          for p in _rand_names}
         for name in pf.index:
@@ -6582,13 +6913,13 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
             kind = ('random~N' if name in _rand_names else
                     'std dev'  if name.startswith('s_') else 'fixed')
             print(f"  {str(name):<25} {v:>9.4f}  {se:>8.4f}  {t:>7.2f}  {sig:<4} {kind}")
-        print(f"  â””{'â”€'*65}")
+        print(f"  └{'─'*65}")
 
-        # â”€â”€ Compute frozen cell probabilities from HHTS data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Compute frozen cell probabilities from HHTS data ──────────────
         # After estimation we evaluate the model at the MEAN coefficients
         # (no random draws) for each HHTS person, then aggregate to person-
         # type cells.  These cells are applied directly to the synthetic
-        # population â€” no re-estimation or MC noise at prediction time.
+        # population - no re-estimation or MC noise at prediction time.
         frozen_probs = _compute_frozen_probs(seg, result, segment)
         if frozen_probs is not None:
             result['frozen_probs'] = frozen_probs
@@ -6601,7 +6932,7 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
                 f"Transit={frozen_probs['p_Transit'].mean():.1%}"
             )
         else:
-            logger.warning(f"[{segment}] Frozen probability computation failed â€” "
+            logger.warning(f"[{segment}] Frozen probability computation failed - "
                            "falling back to numpy model at prediction time")
 
         # Inject coefficient cache so _coef_dict_from_model can find coefficients
@@ -6614,7 +6945,7 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
             logger.debug(f"[{segment}] MXL _coef_cache injected with "
                          f"{len(_valid_coefs)} params")
         else:
-            logger.warning(f"[{segment}] MXL coefs all NaN â€” _coef_cache not set; "
+            logger.warning(f"[{segment}] MXL coefs all NaN - _coef_cache not set; "
                            "logsums will use NL model coefficients")
 
         return result, mxl_final
@@ -6630,12 +6961,12 @@ def _compute_frozen_probs(seg_df: pd.DataFrame, mxl_result: dict,
     """
     Compute cell-level frozen mode probabilities from HHTS observations.
 
-    Evaluates the MXL model at its MEAN coefficients (deterministic â€” no Monte
+    Evaluates the MXL model at its MEAN coefficients (deterministic - no Monte
     Carlo draws) for each HHTS observation, then aggregates to person-type cells
     defined by ``FROZEN_CELL_COLS``.  These cells are stored and applied directly
     to the synthetic population, ensuring:
       - Stable, reproducible predictions (zero MC noise across runs)
-      - Full transferability: HHTS attributes â†’ identical cell keys in synth pop
+      - Full transferability: HHTS attributes → identical cell keys in synth pop
       - DA dominance corrected by industry/occupation/studying heterogeneity
 
     The utility formula mirrors ``_mode_probs_numpy`` with the additional
@@ -6668,7 +6999,7 @@ def _compute_frozen_probs(seg_df: pd.DataFrame, mxl_result: dict,
             return pd.to_numeric(df.get(name, pd.Series(default, index=df.index)),
                                  errors='coerce').fillna(default).values
 
-        # â”€â”€ Skim values â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Skim values ────────────────────────────────────────────────────
         ivt_auto_min   = _col('SOVTOLL_TIME__AM', 30.0)
         ivt_transit_min = _col('WLK_LOC_WLK_TOTIVT__AM', 45.0)
         dist_walk_km   = _col('DISTWALK', 5.0)
@@ -6679,7 +7010,7 @@ def _compute_frozen_probs(seg_df: pd.DataFrame, mxl_result: dict,
         walk_t = np.log(np.clip(dist_walk_km, 0, None) * 12.0 + 1.0)
         bike_t = np.log(np.clip(dist_bike_km, 0, None) * 4.0  + 1.0)
 
-        # â”€â”€ Person attributes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Person attributes ──────────────────────────────────────────────
         vehrd   = _col('vehrd', 1.0)
         licence = _col('CARLICENCE', 1.0)
         incp    = _col('incp', 7.0)
@@ -6693,7 +7024,7 @@ def _compute_frozen_probs(seg_df: pd.DataFrame, mxl_result: dict,
         is_worker  = np.clip(workstat, 0, 1).astype(float)
         is_student = (studying > 0).astype(float)
 
-        # â”€â”€ Industry of employment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Industry of employment ─────────────────────────────────────────
         indp_raw = _col('indp', 20.0).astype(int)
         _indp_groups = np.array([INDUSTRY_MODE_GROUP.get(int(v), 'other') for v in indp_raw])
         ind_industrial = np.isin(_indp_groups, ['industrial', 'agri']).astype(float)
@@ -6702,23 +7033,23 @@ def _compute_frozen_probs(seg_df: pd.DataFrame, mxl_result: dict,
         ind_health     = (_indp_groups == 'health').astype(float)
         ind_retail     = np.isin(_indp_groups, ['retail', 'hospitality']).astype(float)
 
-        # â”€â”€ Occupation (ANZSCO 1-digit) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Occupation (ANZSCO 1-digit) ────────────────────────────────────
         occp_raw    = _col('occp', 0.0).astype(int)
         occ_mgr_prof = np.isin(occp_raw, [1, 2]).astype(float)
         occ_labourer = np.isin(occp_raw, [7, 8]).astype(float)
         occ_clerical = (occp_raw == 5).astype(float)
 
-        # â”€â”€ Studying status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Studying status ────────────────────────────────────────────────
         stup_raw = _col('stup', 1.0).astype(int)
         is_ft_student = (stup_raw == 2).astype(float)
         is_pt_student = np.isin(stup_raw, [3, 4]).astype(float)
 
-        # â”€â”€ Availability â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Availability ───────────────────────────────────────────────────
         walk_avail_arr    = _col('walk_avail', 1.0)
         bike_avail_arr    = _col('bike_avail', 1.0)
         transit_avail_arr = ((ivt_transit_min > 0) & (ivt_transit_min < 90.0)).astype(float)
 
-        # â”€â”€ Utility at MEAN coefficients â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Utility at MEAN coefficients ───────────────────────────────────
         V_DA = (pv('c_ivt') * ivt_auto_h
               + pv('c_vehrd_da') * vehrd
               + pv('c_incp_da') * incp
@@ -6773,16 +7104,16 @@ def _compute_frozen_probs(seg_df: pd.DataFrame, mxl_result: dict,
               + pv('c_fts_bk', 0.0) * is_ft_student)
         V_BK = np.where(bike_avail_arr > 0, V_BK, -1e9)
 
-        # â”€â”€ Softmax â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Softmax ────────────────────────────────────────────────────────
         V = np.stack([V_DA, V_SR, V_WK, V_BK, V_TR], axis=1)  # (n, 5)
         row_max = np.max(np.where(V > -1e8, V, -np.inf), axis=1, keepdims=True)
         row_max = np.where(np.isfinite(row_max), row_max, 0.0)
         exp_V   = np.exp(np.clip(V - row_max, -500, 0))
         totals  = exp_V.sum(axis=1, keepdims=True)
         totals  = np.where(totals > 0, totals, 1.0)
-        probs   = exp_V / totals  # (n, 5) â€” DA, SR, Walk, Bike, Transit
+        probs   = exp_V / totals  # (n, 5) - DA, SR, Walk, Bike, Transit
 
-        # â”€â”€ Cell membership â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Cell membership ────────────────────────────────────────────────
         out = df.copy()
         out['p_DA']      = probs[:, 0]
         out['p_SR']      = probs[:, 1]
@@ -6796,7 +7127,7 @@ def _compute_frozen_probs(seg_df: pd.DataFrame, mxl_result: dict,
         else:
             out['ptype'] = out['ptype'].fillna('Unknown').astype(str)
 
-        # indp_group: from ANZSIC code â†’ mode group string
+        # indp_group: from ANZSIC code → mode group string
         out['indp_group'] = pd.Series(_indp_groups, index=out.index).fillna('other')
 
         # income_band: quartiles of incp scale (1-14 bands in HHTS)
@@ -6818,7 +7149,7 @@ def _compute_frozen_probs(seg_df: pd.DataFrame, mxl_result: dict,
         # has_licence
         out['has_licence'] = np.where(licence > 0, 'yes', 'no')
 
-        # â”€â”€ Aggregate to cells â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Aggregate to cells ─────────────────────────────────────────────
         cell_df = (out.groupby(FROZEN_CELL_COLS, observed=True)
                    .agg(p_DA=('p_DA', 'mean'), p_SR=('p_SR', 'mean'),
                         p_Walk=('p_Walk', 'mean'), p_Bike=('p_Bike', 'mean'),
@@ -6856,7 +7187,7 @@ def _assign_frozen_cells(persons_df: pd.DataFrame,
     Parameters
     ----------
     persons_df : person-level attributes (synthetic population)
-    tour_rows  : tour-level rows â€” used to join person_id â†’ person attributes
+    tour_rows  : tour-level rows - used to join person_id → person attributes
 
     Returns
     -------
@@ -6895,7 +7226,7 @@ def _assign_frozen_cells(persons_df: pd.DataFrame,
     age5p   = _pa('age5p', 4.0)
     indp_raw = _pa('indp', 20.0).astype(int)
 
-    # ptype â€” try tour_rows first, then persons
+    # ptype - try tour_rows first, then persons
     if 'ptype' in tour_rows.columns:
         ptype_arr = tour_rows['ptype'].fillna('Unknown').astype(str).values
     elif pid_col and 'ptype' in pp_idx.columns:
@@ -6938,7 +7269,7 @@ def _mode_probs_frozen(frozen_probs: pd.DataFrame,
 
     Returns
     -------
-    np.ndarray of shape (n_tours, 5) â€” columns [DA, SR, Walk, Bike, Transit]
+    np.ndarray of shape (n_tours, 5) - columns [DA, SR, Walk, Bike, Transit]
     or None if frozen_probs is empty / malformed.
     """
     if frozen_probs is None or len(frozen_probs) == 0:
@@ -6960,7 +7291,7 @@ def _mode_probs_frozen(frozen_probs: pd.DataFrame,
                 if len(row):
                     merged.loc[idx, FROZEN_PROB_COLS] = row[FROZEN_PROB_COLS].values[0]
 
-        # Remaining unmatched â†’ global mean
+        # Remaining unmatched → global mean
         still_unmatched = merged[FROZEN_PROB_COLS].isna().any(axis=1)
         if still_unmatched.any():
             gmean = frozen_probs[FROZEN_PROB_COLS].mean().values
@@ -6976,13 +7307,96 @@ def _mode_probs_frozen(frozen_probs: pd.DataFrame,
         n_unmatched = int(unmatched.sum())
         if n_unmatched:
             logger.debug(f"_mode_probs_frozen: {n_unmatched}/{len(tour_rows)} "
-                         "tours unmatched â†’ ptype/global fallback used")
+                         "tours unmatched → ptype/global fallback used")
         return probs
 
     except Exception as e:
         logger.warning(f"_mode_probs_frozen failed: {e}")
         import traceback; logger.debug(traceback.format_exc())
         return None
+
+
+def _stabilize_mode_probs_stage5(
+    mode_probs: np.ndarray,
+    alt_ids: list,
+    target_shares,
+    seg: str = '',
+) -> np.ndarray:
+    """
+    Stabilize predicted mode probabilities toward segment target shares.
+
+    Prevents DA-collapse in fallback paths (e.g., missing/weak coefficients) while
+    preserving row-wise probabilistic choice behavior.
+    """
+    try:
+        if mode_probs is None or len(mode_probs) == 0 or target_shares is None:
+            return mode_probs
+
+        arr = np.asarray(mode_probs, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] != len(alt_ids):
+            return mode_probs
+
+        # Build target vector in alt_ids order.
+        tv = np.zeros(len(alt_ids), dtype=float)
+        if not hasattr(target_shares, 'get'):
+            return mode_probs
+        for j, aid in enumerate(alt_ids):
+            v = target_shares.get(aid, None)
+            if v is None:
+                v = target_shares.get(str(aid), None)
+            if v is None:
+                _name_map = {1: 'DA', 2: 'SR', 3: 'Walk', 4: 'Bike', 5: 'Transit'}
+                v = target_shares.get(_name_map.get(int(aid), ''), None)
+            try:
+                tv[j] = float(v) if v is not None else 0.0
+            except Exception:
+                tv[j] = 0.0
+
+        if not np.isfinite(tv).all() or tv.sum() <= 0:
+            return mode_probs
+        tv = tv / tv.sum()
+
+        pred = np.clip(arr.mean(axis=0), 1e-12, None)
+        pred = pred / pred.sum()
+
+        # Severe collapse trigger focused on DA (alt code 1).
+        if 1 in alt_ids:
+            i_da = alt_ids.index(1)
+            pred_da = float(pred[i_da])
+            targ_da = float(tv[i_da])
+        else:
+            pred_da = 0.0
+            targ_da = 0.0
+
+        severe = (pred_da > 0.90 and targ_da < 0.82)
+        max_gap = float(np.max(np.abs(pred - tv)))
+        if not severe and max_gap < 0.06:
+            return mode_probs
+
+        alpha = 0.45 if severe else 0.22
+        target = (1.0 - alpha) * pred + alpha * tv
+        floor = np.minimum(tv * 0.55, tv)
+        target = np.maximum(target, floor)
+        target = target / target.sum()
+
+        adj = np.clip(arr, 1e-12, 1.0)
+        for _ in range(4):
+            cur = np.clip(adj.mean(axis=0), 1e-12, None)
+            scale = target / cur
+            adj *= scale[None, :]
+            adj = np.clip(adj, 1e-12, 1.0)
+            adj /= adj.sum(axis=1, keepdims=True)
+
+        if 1 in alt_ids:
+            nda = float(adj.mean(axis=0)[alt_ids.index(1)])
+            logger.info(
+                f"_predict_batch [{seg}] mode-share stabilisation: "
+                f"DA {pred_da:.1%}->{nda:.1%} (target {targ_da:.1%})"
+            )
+        return adj
+    except Exception as _e:
+        logger.debug(f"_stabilize_mode_probs_stage5 skipped [{seg}]: {_e}")
+        return mode_probs
 
 
 def _estimate_dest_dist_heterogeneity(seg_df: pd.DataFrame,
@@ -6997,7 +7411,7 @@ def _estimate_dest_dist_heterogeneity(seg_df: pd.DataFrame,
 
     Returns
     -------
-    dict with key ``s_log_dist`` (float) â€” the std dev used to scale frozen draws.
+    dict with key ``s_log_dist`` (float) - the std dev used to scale frozen draws.
     Falls back to 0.5 if data is insufficient.
     """
     try:
@@ -7006,7 +7420,7 @@ def _estimate_dest_dist_heterogeneity(seg_df: pd.DataFrame,
             None
         )
         if dist_col is None:
-            logger.debug(f"_estimate_dest_dist_heterogeneity [{segment}]: no dist col â€” using default 0.5")
+            logger.debug(f"_estimate_dest_dist_heterogeneity [{segment}]: no dist col - using default 0.5")
             return {'s_log_dist': 0.5}
 
         log_dist = np.log(
@@ -7039,7 +7453,7 @@ def _frozen_person_dist_offsets(person_ids, s_log_dist: float) -> pd.Series:
     Deterministic Normal(0, s_log_dist) draws seeded by MD5 hash of person_id.
 
     Each person receives a reproducible, run-stable distance-sensitivity offset
-    that transfers identically from HHTS estimation to the synthetic population â€”
+    that transfers identically from HHTS estimation to the synthetic population -
     as long as person_id values are consistent between the two datasets.
 
     The MD5 approach avoids NumPy's global RNG state so results are independent
@@ -7048,7 +7462,7 @@ def _frozen_person_dist_offsets(person_ids, s_log_dist: float) -> pd.Series:
     Parameters
     ----------
     person_ids : array-like of person IDs (int or str)
-    s_log_dist : float â€” std dev from _estimate_dest_dist_heterogeneity
+    s_log_dist : float - std dev from _estimate_dest_dist_heterogeneity
 
     Returns
     -------
@@ -7098,7 +7512,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
       4. Compute logsums once (ActivitySim: compute_logsums in trip_destination)
       5. Estimate destination model (logsum as ca variable)
     """
-    print(f"\n  â”€â”€ Segment: {segment} â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+    print(f"\n  ── Segment: {segment} ──────────────────────────────")
     print(f"  [{segment}] INPUT: {len(tours)} tours, {len(persons)} persons, {len(landuse)} landuse zones")
     if 'OTAZ' in tours.columns and 'DTAZ' in tours.columns:
         print(f"  [{segment}] OTAZ range: {tours['OTAZ'].min()}-{tours['OTAZ'].max()}, "
@@ -7107,7 +7521,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     if 'weight' in tours.columns:
         _w = tours['weight']
         print(f"  [{segment}] tour weights: mean={_w.mean():.3f} std={_w.std():.3f} "
-              f"min={_w.min():.3f} max={_w.max():.3f} â€” NOTE: dest model uses weight=1")
+              f"min={_w.min():.3f} max={_w.max():.3f} - NOTE: dest model uses weight=1")
 
     # Exclude safety skims when SAFETY_EXPERIMENT_MODE=nosafety
     _nosafety = os.environ.get('SAFETY_EXPERIMENT_MODE', 'baseline') == 'nosafety'
@@ -7142,11 +7556,11 @@ def _run_segment(segment: str, tours: pd.DataFrame,
         _dest_skim_df = _dest_skim_df.drop(columns=['CRASH'])
 
     if _nosafety:
-        logger.info(f"  [{segment}] nosafety mode â€” excluded crash params")
+        logger.info(f"  [{segment}] nosafety mode - excluded crash params")
 
     seg = _filter_seg(tours, segment)
 
-    # â”€â”€ Zone 330 exclusion for edu segment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Zone 330 exclusion for edu segment ────────────────────────────────
     # Zone 330 is a peripheral/external zone with all-zero education data
     # (Primary=0, Secondary=0, Education=NaN, HSENROLL=0).  The ~312 observed
     # HHTS tours with DTAZ=330 are data artefacts (zone assignment errors or
@@ -7162,21 +7576,21 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                 seg = seg[~_z330_mask].copy()
                 logger.warning(
                     f"_run_segment [edu]: excluded {n_z330} tours with DTAZ=330 "
-                    "(zone 330 has no education data â€” likely zone-assignment artefact). "
+                    "(zone 330 has no education data - likely zone-assignment artefact). "
                     f"{len(seg)} edu tours remain for estimation."
                 )
 
     MIN_TOURS = int(os.environ.get('STAGE5_MIN_TOURS', '30'))
     print(f"  [{segment}] filtered segment: {len(seg)} tours "
-          f"(need â‰¥ {MIN_TOURS} to estimate)")
+          f"(need ≥ {MIN_TOURS} to estimate)")
     if len(seg) < MIN_TOURS:
-        print(f"  WARNING: only {len(seg)} tours for segment='{segment}' â€” skipping.")
+        print(f"  WARNING: only {len(seg)} tours for segment='{segment}' - skipping.")
         print(f"           Set STAGE5_MIN_TOURS={max(len(seg)//2, 10)} env var to lower threshold.")
         if len(seg) > 0:
             print(f"           Purpose column values: {seg[next((c for c in ['primary_purpose','main_purpose','purpose'] if c in seg.columns), seg.columns[0])].value_counts().head(10).to_dict()}")
         return {}
 
-    # â”€â”€ merge OD skim values onto seg for the mixed logit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── merge OD skim values onto seg for the mixed logit ─────────────────
     # _estimate_mixed_logit needs per-observation IVT/distance values.
     # The HHTS tour table has OTAZ/DTAZ but no skim columns.  We merge the
     # key columns here so the MXL baseline gets real variation to estimate.
@@ -7202,7 +7616,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                 f"_run_segment [{segment}]: merged {len(avail_merge)} skim cols; "
                 f"IVT median={seg['SOVTOLL_TIME__AM'].median():.1f} min")
 
-            # â”€â”€ recompute walk/bike availability from actual distances â”€â”€â”€â”€
+            # ── recompute walk/bike availability from actual distances ────
             # Use DISTWALK/DISTBIKE directly with realistic zone-level thresholds.
             # Estimation availability must match prediction thresholds (WALK_MAX_KM=6.0,
             # BIKE_MAX_KM=25.0 in _predict_batch) so that frozen probability cells
@@ -7239,7 +7653,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             )
     # Guarantee walk_avail / bike_avail are always present in seg so that
     # avail_vars_hint always includes them regardless of whether skim_df had
-    # DISTWALK/DISTBIKE.  Default to fully available (1) â€” the distance-based
+    # DISTWALK/DISTBIKE.  Default to fully available (1) - the distance-based
     # computation above has already set tighter thresholds when data was present.
     if 'walk_avail' not in seg.columns:
         seg['walk_avail'] = 1
@@ -7264,9 +7678,9 @@ def _run_segment(segment: str, tours: pd.DataFrame,
           f"segment coefficients: {list(seg_coeffs.keys())[:5]}"
           f"{'...' if len(seg_coeffs) > 5 else ''}")
 
-    # â”€â”€ Skim diagnostic: verify DIST and DISTWALK are genuinely different â”€â”€
+    # ── Skim diagnostic: verify DIST and DISTWALK are genuinely different ──
     # If these are collinear (r > 0.99) or DISTWALK is all-constant, the
-    # destination model cannot distinguish their coefficients â†’ both converge
+    # destination model cannot distinguish their coefficients → both converge
     # to the same value.  This diagnostic flags the problem early.
     if skim_df is not None and not skim_df.empty:
         _dist_ok = 'DIST' in skim_df.columns or 'SOVTOLL_DIST__AM' in skim_df.columns
@@ -7289,14 +7703,14 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                     _DIST_WALK_CORR_WARNED.add(segment)
                     logger.info(
                         f"_run_segment [{segment}]: DIST vs DISTWALK correlation = {_corr:.3f} "
-                        "(known OMX issue â€” same road-network data in both matrices). "
+                        "(known OMX issue - same road-network data in both matrices). "
                         "DISTWALK terms holdfasted; walk accessibility captured via mode logsum."
                     )
             if _pct_30 > 70:
                 logger.warning(
-                    f"_run_segment [{segment}]: {_pct_30:.0f}% of DISTWALK values are â‰¥30 km "
+                    f"_run_segment [{segment}]: {_pct_30:.0f}% of DISTWALK values are ≥30 km "
                     "(fallback fill). Walk-distance term c_log_distwalk will be near-constant "
-                    "for most OD pairs â†’ coefficient degenerate. Walk accessibility is "
+                    "for most OD pairs → coefficient degenerate. Walk accessibility is "
                     "captured via mode logsum; c_log_distwalk only meaningful for walkable "
                     "zone pairs (DISTWALK < 6 km, walk_feasible_ij=1)."
                 )
@@ -7304,7 +7718,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             logger.warning(
                 f"_run_segment [{segment}]: DISTWALK not found in skim_df columns "
                 f"({list(skim_df.columns[:10])}). Walk-distance destination terms will "
-                "use 30 km default â€” holdfast c_log_distwalk to avoid degenerate estimates."
+                "use 30 km default - holdfast c_log_distwalk to avoid degenerate estimates."
             )
 
     # Ensure ptour_id is unique before building DataTree.
@@ -7313,7 +7727,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     # when case_ids are not unique.  Reset with a guaranteed-unique id.
     if seg['ptour_id'].duplicated().any():
         n_dup = seg['ptour_id'].duplicated().sum()
-        logger.warning(f"_run_segment [{segment}]: {n_dup} duplicate ptour_ids â€” "
+        logger.warning(f"_run_segment [{segment}]: {n_dup} duplicate ptour_ids - "
                        "resetting to row-index-based unique ids")
         seg = seg.copy()
         seg['ptour_id'] = (seg['person_id'].astype(str) + '_'
@@ -7335,7 +7749,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     except Exception:
         pass
 
-    # â”€â”€ Inject warm-start coefficients (from GA / previous run) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Inject warm-start coefficients (from GA / previous run) ──────────
     # coef_warm_start is a flat dict {param_name: value} covering mode + dest params.
     # We apply any mode-model params here so estimation starts from a better point.
     if coef_warm_start:
@@ -7353,6 +7767,11 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                         f"{_n_mode_warm}/{len(coef_warm_start)} params")
 
     print("  Estimating mode model (nested logit)...")
+    # Pre-fit: align ASC starting values with observed shares and reset any
+    # Mu parameter that is at or near its boundary to a safe interior value.
+    # This prevents the gradient from pulling Mu→1 during early iterations
+    # before the behavioural parameters have a chance to converge.
+    mode_mdl = _prefit_mode_model(mode_mdl, seg, persons, skims, segment)
     mode_mdl = _estimate(mode_mdl)
 
     # Enforce theoretically-correct bike-time sign post-estimation.
@@ -7376,10 +7795,163 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     except Exception:
         pass
 
+    # ── Post-estimation: fix degenerate Mu and collinear income parameters ────
+    # Two known sources of Hessian ill-conditioning in the nested logit:
+    #
+    # (A) Mu boundary: When Mu_Car or Mu_NonMotor reaches its upper bound (1.0)
+    #     the NL nest degenerates to flat MNL. At Mu=1 the cross-derivatives
+    #     vanish → ill-conditioned Hessian → all SEs explode. Fix: holdfast the
+    #     degenerate Mu at its boundary value and re-estimate so the Hessian
+    #     conditions on the remaining free parameters.
+    #
+    # (B) Income collinearity: if c_incp_da/sr/transit/active all converge to
+    #     nearly identical values (spread < 30 % of |mean|), they form a
+    #     near-rank-deficient block in the Hessian. Fix: holdfast all except
+    #     c_incp_da to the mean and re-estimate with one generic income param.
+    _mode_reestimate_needed = False
+    try:
+        for _mu_p in ('Mu_Car', 'Mu_Motor', 'Mu_NonMotor'):
+            if _mu_p in mode_mdl.pf.index:
+                _is_hf = bool(mode_mdl.pf.loc[_mu_p].get('holdfast', False))
+                _mu_v  = float(mode_mdl.pf.loc[_mu_p, 'value'])
+                if not _is_hf and np.isfinite(_mu_v) and (_mu_v >= 0.99 or _mu_v <= 0.011):
+                    mode_mdl.lock_value(_mu_p, _mu_v)
+                    logger.info(
+                        f"[{segment}] Holdfasting {_mu_p}={_mu_v:.4f} "
+                        "(at boundary → nest degenerates to MNL; fixes Hessian)"
+                    )
+                    _mode_reestimate_needed = True
+    except Exception as _mu_e:
+        logger.debug(f"[{segment}] Mu boundary check failed: {_mu_e}")
+
+    try:
+        _incp_pnames = ['c_incp_da', 'c_incp_sr', 'c_incp_transit', 'c_incp_active']
+        _incp_free = {}
+        for _p in _incp_pnames:
+            if _p in mode_mdl.pf.index:
+                _is_hf = bool(mode_mdl.pf.loc[_p].get('holdfast', False))
+                _v = float(mode_mdl.pf.loc[_p, 'value'])
+                if not _is_hf and np.isfinite(_v):
+                    _incp_free[_p] = _v
+        if len(_incp_free) >= 3:
+            _vals = list(_incp_free.values())
+            _mean_v = float(np.mean(_vals))
+            _spread = float(max(_vals) - min(_vals))
+            # Collinear: all params within 30% of mean (and mean non-trivial)
+            _collinear = abs(_mean_v) > 0.05 and _spread < 0.30 * abs(_mean_v)
+            if _collinear:
+                _keep_free = 'c_incp_da' if 'c_incp_da' in _incp_free else list(_incp_free)[0]
+                for _p, _v in _incp_free.items():
+                    if _p != _keep_free:
+                        try:
+                            mode_mdl.lock_value(_p, _mean_v)
+                        except Exception:
+                            pass
+                logger.info(
+                    f"[{segment}] Income params collinear (spread={_spread:.4f} "
+                    f"< 30% × |mean|={abs(_mean_v):.4f}) → holdfasting all at "
+                    f"{_mean_v:.4f} except {_keep_free}; re-estimating"
+                )
+                _mode_reestimate_needed = True
+    except Exception as _ie:
+        logger.debug(f"[{segment}] Income collinearity check failed: {_ie}")
+
+    if _mode_reestimate_needed:
+        print(f"  [{segment}] Re-estimating mode model after fixing degenerate parameters...")
+        mode_mdl = _estimate(mode_mdl)
+
+    # ── Post-estimation: ASC calibration for SR and Walk ─────────────────────
+    # Iteratively adjust mode ASCs so that predicted shares match observed shares
+    # in the estimation data. Uses the log-share correction:
+    #   ASC_mode += log(obs_share / pred_share)
+    # This does NOT change the model's fit (LL stays the same) but ensures that
+    # the aggregate predicted shares exactly reproduce the observed proportions.
+    # Up to 8 iterations; convergence when all |delta| < 0.002.
+    # We calibrate SR, Walk, Bike, and Transit (DA is reference / always implied).
+    try:
+        _asc_mode_map = {
+            'ASC_SR':      MODE_MAP['SR'],
+            'ASC_Walk':    MODE_MAP['Walk'],
+            'ASC_Bike':    MODE_MAP['Bike'],
+            'ASC_Transit': MODE_MAP['Transit'],
+        }
+        _mode_col = 'tour_mode' if 'tour_mode' in seg.columns else None
+        if _mode_col is not None and len(seg) > 0:
+            _obs_total = float(len(seg))
+            _obs_counts = seg[_mode_col].value_counts()
+            _obs_shares = {int(k): float(v) / _obs_total for k, v in _obs_counts.items()}
+
+            _col_to_code = {0: MODE_MAP['DA'], 1: MODE_MAP['SR'],
+                            2: MODE_MAP['Walk'], 3: MODE_MAP['Bike'],
+                            4: MODE_MAP['Transit']}
+
+            for _calib_iter in range(8):
+                try:
+                    # Use _mode_probs_numpy with coef_override=None so it
+                    # reads fresh values from _final_pf / pf after set_value().
+                    _probs = _mode_probs_numpy(mode_mdl, seg, persons, skims,
+                                               coef_override=None)
+                    if _probs is None or _probs.shape[0] == 0:
+                        break
+                    _pred_shares_arr = np.asarray(_probs).mean(axis=0)  # (5,)
+                    _pred_dict = {_col_to_code[ci]: float(_pred_shares_arr[ci])
+                                  for ci in range(len(_pred_shares_arr))}
+
+                    _any_delta = False
+                    for _asc_p, _mc in _asc_mode_map.items():
+                        if _asc_p not in mode_mdl.pf.index:
+                            continue
+                        _is_hf = bool(mode_mdl.pf.loc[_asc_p].get('holdfast', False))
+                        if _is_hf:
+                            continue
+                        _obs_s  = _obs_shares.get(_mc, 0.0)
+                        _pred_s = _pred_dict.get(_mc, 0.0)
+                        if _obs_s > 0.001 and _pred_s > 0.001:
+                            _delta = float(np.log((_obs_s + 1e-8) / (_pred_s + 1e-8)))
+                            if abs(_delta) > 0.002:
+                                _cur = float(mode_mdl.pf.loc[_asc_p, 'value'])
+                                _new_val = _cur + _delta
+                                try:
+                                    mode_mdl.set_value(_asc_p, _new_val)
+                                except Exception:
+                                    mode_mdl.pf.loc[_asc_p, 'value'] = _new_val
+                                # Sync _final_pf so coef cache stays consistent
+                                if (hasattr(mode_mdl, '_final_pf') and
+                                        isinstance(mode_mdl._final_pf, pd.DataFrame) and
+                                        _asc_p in mode_mdl._final_pf.index):
+                                    mode_mdl._final_pf.loc[_asc_p, 'value'] = _new_val
+                                _any_delta = True
+                    # Invalidate coef cache so next iteration reads fresh values
+                    mode_mdl._coef_cache = {}
+                    if not _any_delta:
+                        break
+                except Exception as _ci_e:
+                    logger.debug(f"[{segment}] ASC calibration iter {_calib_iter}: {_ci_e}")
+                    break
+
+            # Log final calibrated shares
+            try:
+                _cal_probs = _mode_probs_numpy(mode_mdl, seg, persons, skims,
+                                               coef_override=None)
+                if _cal_probs is not None:
+                    _cal_arr = np.asarray(_cal_probs).mean(axis=0)
+                    _cal_pred = {_col_to_code[ci]: _cal_arr[ci] for ci in range(len(_cal_arr))}
+                    _sr_obs = _obs_shares.get(MODE_MAP['SR'], 0.0)
+                    _wk_obs = _obs_shares.get(MODE_MAP['Walk'], 0.0)
+                    logger.info(
+                        f"[{segment}] Mode ASC calibration complete: "
+                        f"SR obs={_sr_obs:.3f} pred={_cal_pred.get(MODE_MAP['SR'],0):.3f} | "
+                        f"Walk obs={_wk_obs:.3f} pred={_cal_pred.get(MODE_MAP['Walk'],0):.3f}"
+                    )
+            except Exception:
+                pass
+    except Exception as _asc_cal_e:
+        logger.debug(f"[{segment}] ASC calibration failed: {_asc_cal_e}")
+
     _print_model_table(mode_mdl, f"{segment.upper()} mode model (NL)")
 
-    # â”€â”€ Post-estimation validity check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # Checks rhoÂ², key parameter signs, and mode share alignment.
+    # ── Post-estimation validity check ─────────────────────────────────
+    # Checks rho², key parameter signs, and mode share alignment.
     # Failures are logged as warnings so the pipeline continues but the
     # output log makes the problem visible for debugging.
     try:
@@ -7394,25 +7966,25 @@ def _run_segment(segment: str, tours: pd.DataFrame,
 
         if not np.isnan(_rho2_check) and _rho2_check < 0.05:
             _validity_warnings.append(
-                f"rhoÂ²={_rho2_check:.3f} â€” model barely improves on market shares; "
+                f"rho²={_rho2_check:.3f} - model barely improves on market shares; "
                 "check estimation data quality and sample size"
             )
 
         # Sign checks on key utility parameters
         _sign_checks = {
-            'c_ivt':       ('should be < 0 â€” auto IVT increases deterrence', lambda v: v > 0),
-            'c_walk':      ('should be < 0 â€” walk time increases deterrence', lambda v: v > 0),
-            'c_bike':      ('should be < 0 â€” bike time increases deterrence', lambda v: v > 0),
-            'c_walk_time': ('should be < 0 â€” walk time increases deterrence', lambda v: v > 0),
-            'c_bike_time': ('should be < 0 â€” bike time increases deterrence', lambda v: v > 0),
-            'c_log_dist':  ('should be < 0 â€” distance deters destination choice', lambda v: v > 0.01),
+            'c_ivt':       ('should be < 0 - auto IVT increases deterrence', lambda v: v > 0),
+            'c_walk':      ('should be < 0 - walk time increases deterrence', lambda v: v > 0),
+            'c_bike':      ('should be < 0 - bike time increases deterrence', lambda v: v > 0),
+            'c_walk_time': ('should be < 0 - walk time increases deterrence', lambda v: v > 0),
+            'c_bike_time': ('should be < 0 - bike time increases deterrence', lambda v: v > 0),
+            'c_log_dist':  ('should be < 0 - distance deters destination choice', lambda v: v > 0.01),
         }
         for _pname, (_msg, _bad) in _sign_checks.items():
             if _pname in _pf_check.index:
                 _pval = float(_pf_check.loc[_pname, 'value'])
                 if not np.isnan(_pval) and _bad(_pval):
                     _validity_warnings.append(
-                        f"param '{_pname}'={_pval:.4f} has unexpected sign â€” {_msg}"
+                        f"param '{_pname}'={_pval:.4f} has unexpected sign - {_msg}"
                     )
 
         # Active-mode share check: if DA > 95% after estimation something is wrong
@@ -7425,12 +7997,12 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                 _active   = float((_mp_check[:, 2:4]).sum(axis=1).mean())  # Walk+Bike cols 2,3
                 if _da_share > 0.95:
                     _validity_warnings.append(
-                        f"DA share={_da_share:.1%} on HHTS sample â€” "
+                        f"DA share={_da_share:.1%} on HHTS sample - "
                         "walk/bike/transit may be suppressed; check ASC defaults and availability flags"
                     )
                 if _active < 0.02:
                     _validity_warnings.append(
-                        f"Walk+Bike share={_active:.1%} on HHTS â€” active modes near-zero; "
+                        f"Walk+Bike share={_active:.1%} on HHTS - active modes near-zero; "
                         "verify DISTWALK/DISTBIKE skim values and walk_avail/bike_avail counts above"
                     )
         except Exception as _share_e:
@@ -7440,11 +8012,11 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             for _w in _validity_warnings:
                 logger.warning(f"[{segment}] Mode model validity: {_w}")
         else:
-            logger.info(f"[{segment}] Mode model validity: OK (rhoÂ²={_rho2_check:.3f})")
+            logger.info(f"[{segment}] Mode model validity: OK (rho²={_rho2_check:.3f})")
     except Exception as _val_e:
         logger.debug(f"[{segment}] Post-estimation validity check failed: {_val_e}")
 
-    # â”€â”€ Mixed logit on mode (optional; default disabled for stability) â”€
+    # ── Mixed logit on mode (optional; default disabled for stability) ─
     mxl_result, mxl_model = (None, None)
     if STAGE5_ENABLE_MXL:
         mxl_result, mxl_model = _estimate_mixed_logit(seg, segment, n_draws=500)
@@ -7466,13 +8038,13 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     # Extract mode coefficients NOW, before computing logsums, so they can be
     # passed as coef_override.  This ensures _logsums_numpy_fallback always has
     # a coefficient source even when model.pf is inaccessible after JAX JIT.
-    # Priority: _coef_cache â†’ _final_pf â†’ pf (pf may return NaN after JAX JIT)
+    # Priority: _coef_cache → _final_pf → pf (pf may return NaN after JAX JIT)
     def _extract_coef_early(m):
         try:
             if hasattr(m, '_coef_cache') and m._coef_cache:
                 return dict(m._coef_cache)
             # _final_pf is a plain-DataFrame snapshot saved by _estimate()
-            # â€” it is immune to JAX JIT corruption of the live pf property.
+            # - it is immune to JAX JIT corruption of the live pf property.
             if hasattr(m, '_final_pf') and isinstance(m._final_pf, pd.DataFrame):
                 pf = m._final_pf
                 if 'value' in pf.columns:
@@ -7498,15 +8070,15 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                      f"{len(_mode_coef_early)} params before logsum computation")
     else:
         logger.warning(f"[{segment}] _extract_coef_early: NO coefficients found "
-                       f"in _coef_cache/_final_pf/pf â€” logsums will be zero. "
+                       f"in _coef_cache/_final_pf/pf - logsums will be zero. "
                        f"Check that _estimate() completed and saved _final_pf.")
     ls = _logsums(mode_mdl, dt_m, skims=skims, verbose=verbose,
                   coef_override=_mode_coef_early if _mode_coef_early else None)
     _ls_n_zones = len(ls.coords['zones'].values) if hasattr(ls, 'coords') and 'zones' in ls.coords else '?'
     _ls_n_cases = len(ls.coords['cases'].values) if hasattr(ls, 'coords') and 'cases' in ls.coords else '?'
-    print(f"  [{segment}] Logsums built: {_ls_n_cases} cases Ã— {_ls_n_zones} zones")
+    print(f"  [{segment}] Logsums built: {_ls_n_cases} cases × {_ls_n_zones} zones")
 
-    # â”€â”€ Rescale logsums to unit variance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Rescale logsums to unit variance ─────────────────────────────
     # The raw logsum scale depends on the mode model's IVT coefficient and
     # the skim units.  When the scale is very different from the dest model
     # utility scale, c_logsum hits its bound (e.g. edu c_logsum=10.0 in
@@ -7528,30 +8100,30 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                 f"(mean={_ls_mean:.4f}, std={_ls_std:.4f})"
             )
     except Exception as _e:
-        logger.debug(f"Logsum rescaling failed ({_e}) â€” using raw values")
+        logger.debug(f"Logsum rescaling failed ({_e}) - using raw values")
 
-    # â”€â”€ attach size_term to landuse for this segment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # sharrow requires plain column names â€” no leading underscore.
-    # compute_size_terms returns a zoneÃ—purpose DataFrame;
+    # ── attach size_term to landuse for this segment ─────────────────
+    # sharrow requires plain column names - no leading underscore.
+    # compute_size_terms returns a zone×purpose DataFrame;
     # we take the segment's canonical purpose (or mean across purposes)
     # and add it as 'size_term' to landuse.
     lu_with_st = _ensure_destination_clusters(_attach_size_term(landuse, segment))
 
-    # â”€â”€ ACDC spatial terms â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # Agglomerationâ€“Competition Destination Choice (ACDC) terms:
+    # ── ACDC spatial terms ────────────────────────────────────────────────
+    # Agglomeration-Competition Destination Choice (ACDC) terms:
     #
     #   acdc_aggl  (zone-level, destination-side):
-    #     = log( Î£_{kâ‰ j} size[k] Ã— exp(âˆ’Î» Ã— time[j,k]) )
+    #     = log( Σ_{k≠j} size[k] × exp(−λ × time[j,k]) )
     #     Measures clustering: how many attractive nearby zones surround j.
     #     Expected coefficient c_aggl > 0  (positive agglomeration effect).
     #
     #   acdc_comp  (zone-level, destination-side in this implementation):
-    #     = log( Î£_k size[k] Ã— exp(âˆ’Î» Ã— time[j,k]) )
+    #     = log( Σ_k size[k] × exp(−λ × time[j,k]) )
     #     Measures competition: total attractiveness reachable from zone j's
     #     typical origin set.  Expected coefficient c_comp < 0.
     #     NOTE: c_comp is held at 0.0 by default (collinear with c_aggl).
     #
-    #   These are NOT separate sub-models â€” both are continuous covariates
+    #   These are NOT separate sub-models - both are continuous covariates
     #   fed into the single destination MNL alongside distance, logsum etc.
     #   Both are computed in compute_acdc_terms() and attached to the emp
     #   (landuse) DataTree node so they vary across destination zones.
@@ -7562,12 +8134,12 @@ def _run_segment(segment: str, tours: pd.DataFrame,
         segment
     )
 
-    # â”€â”€ Merge accessibility measures from saved_data/accessibility.csv â”€â”€â”€â”€â”€â”€â”€
+    # ── Merge accessibility measures from saved_data/accessibility.csv ───────
     # These columns (auto_work_acc, walk_acc, etc.) are NOT in the raw
-    # zone_order_and_landuse.csv â€” they are pre-computed gravity integrals
+    # zone_order_and_landuse.csv - they are pre-computed gravity integrals
     # saved by compute_accessibility.run_accessibility().
     # Without them, every accessibility term in DEST_UEC_FLAT is zero-variance
-    # â†’ coefficient estimated at exactly 0.0 â†’ no zone-level accessibility
+    # → coefficient estimated at exactly 0.0 → no zone-level accessibility
     # differentiation in the destination model.
     _ACC_COLS = ['auto_work_acc', 'auto_shop_acc', 'auto_edu_acc',
                  'auto_nonmand_acc', 'walk_acc', 'transit_acc']
@@ -7599,7 +8171,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                 logger.warning(f"_run_segment [{segment}]: accessibility merge failed: {_acc_e}")
         else:
             logger.warning(
-                f"_run_segment [{segment}]: accessibility file missing at {_acc_path} â€” "
+                f"_run_segment [{segment}]: accessibility file missing at {_acc_path} - "
                 f"run compute_accessibility.run_accessibility() to pre-compute. "
                 f"All accessibility terms will be zero in this run."
             )
@@ -7615,7 +8187,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             _acdc_path = 'saved_data/acdc_terms.csv'
             _write_hdr = not _os.path.exists(_acdc_path)
             _acdc_out.to_csv(_acdc_path, mode='a', header=_write_hdr)
-            logger.info(f"ACDC terms saved â†’ {_acdc_path} (segment={segment})")
+            logger.info(f"ACDC terms saved → {_acdc_path} (segment={segment})")
     except Exception as _acdc_save_e:
         logger.debug(f"ACDC save skipped: {_acdc_save_e}")
 
@@ -7624,9 +8196,9 @@ def _run_segment(segment: str, tours: pd.DataFrame,
         seg_acdc = seg_acdc.copy()
         seg_acdc['ptour_id'] = seg['ptour_id'].values
 
-    # â”€â”€ Alternative set: all zones or importance-sampled subset â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # DEST_EST_SAMPLE_SIZE == 0  â†’  use ALL zones (no sampling, log_correction=0)
-    # DEST_EST_SAMPLE_SIZE  > 0  â†’  Manski-Lerman importance sampling
+    # ── Alternative set: all zones or importance-sampled subset ─────────
+    # DEST_EST_SAMPLE_SIZE == 0  →  use ALL zones (no sampling, log_correction=0)
+    # DEST_EST_SAMPLE_SIZE  > 0  →  Manski-Lerman importance sampling
     _zone_ids_for_is = (
         [int(z) for z in ls.coords['zones'].values]
         if hasattr(ls, 'coords') and 'zones' in ls.coords
@@ -7650,21 +8222,21 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                 f"{_n_obs_seg} observations"
             )
             print(f"  [{segment}] ESTIMATION: importance-sampled {DEST_EST_SAMPLE_SIZE}/{_n_zone_ids} zones "
-                  f"Ã— {_n_obs_seg} obs = {len(_sampled_alts)} rows")
+                  f"× {_n_obs_seg} obs = {len(_sampled_alts)} rows")
         except Exception as _is_e:
             logger.warning(f"_run_segment [{segment}]: importance sampling failed ({_is_e}) "
-                           "â€” falling back to full zone set")
+                           "- falling back to full zone set")
             _sampled_alts = None
     else:
-        _sampled_alts = None   # ALL zones â€” no sampling, log_correction=0
+        _sampled_alts = None   # ALL zones - no sampling, log_correction=0
         logger.info(
             f"_run_segment [{segment}]: using ALL {_n_zone_ids} zones as alternatives "
             f"(DEST_EST_SAMPLE_SIZE=0, no importance sampling)"
         )
-        print(f"  [{segment}] ESTIMATION: ALL {_n_zone_ids} zones Ã— {_n_obs_seg} obs = "
+        print(f"  [{segment}] ESTIMATION: ALL {_n_zone_ids} zones × {_n_obs_seg} obs = "
               f"{_n_zone_ids * _n_obs_seg} rows (no sampling)")
 
-    # â”€â”€ CHECK: does landuse have expected columns? â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── CHECK: does landuse have expected columns? ────────────────────────
     _lu_check_cols = ['size_term', 'acdc_aggl', 'acdc_comp']
     _lu_missing = [c for c in _lu_check_cols if c not in lu_with_st.columns]
     if _lu_missing:
@@ -7681,13 +8253,13 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                           crash_skims=_dest_crash_skims, segment=segment)
     print(f"  [{segment}] _dest_tree built: flat_mode={dt_d.attrs.get('_flat_mode', False) if hasattr(dt_d, 'attrs') else '?'}")
 
-    # â”€â”€ DataTree variable audit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── DataTree variable audit ────────────────────────────────────────────
     _dest_compile_unreliable = False
     _is_flat = dt_d.attrs.get('_flat_mode', False) if hasattr(dt_d, 'attrs') else getattr(dt_d, '_flat_mode', False)
     if _is_flat:
         # Flat mode: all columns are pre-joined in the ca dataset.
-        # No DataTree node introspection needed â€” _dest_tree validated everything.
-        logger.info(f"_run_segment [{segment}]: flat Dataset mode â€” skipping DataTree audit")
+        # No DataTree node introspection needed - _dest_tree validated everything.
+        logger.info(f"_run_segment [{segment}]: flat Dataset mode - skipping DataTree audit")
     else:
         try:
             _required_od  = {'DIST', 'SOVTOLL_TIME__AM', 'SOVTOLL_DIST__AM'}
@@ -7705,7 +8277,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             if _missing_od and not _od_source_has:
                 logger.warning(
                     f"_run_segment [{segment}]: od DataTree missing variables: "
-                    f"{sorted(_missing_od)} â€” destination utility expressions will fail. "
+                    f"{sorted(_missing_od)} - destination utility expressions will fail. "
                     f"Available od vars (first 15): {sorted(_od_avail)[:15]}"
                 )
             if _missing_emp and not _emp_source_has:
@@ -7730,10 +8302,10 @@ def _run_segment(segment: str, tours: pd.DataFrame,
 
     if _is_flat:
         # Flat mode: _build_dest_model uses DEST_UEC_FLAT directly.
-        # No need for _filter_dest_uec_by_source_columns â€” columns are pre-joined.
+        # No need for _filter_dest_uec_by_source_columns - columns are pre-joined.
         _dest_safe = None
         logger.info(
-            f"_run_segment [{segment}]: flat mode â€” using DEST_UEC_FLAT "
+            f"_run_segment [{segment}]: flat mode - using DEST_UEC_FLAT "
             f"({sum(1 for _, (_, s) in DEST_UEC_FLAT.items() if s is None or segment in s)} terms for segment)"
         )
     else:
@@ -7784,6 +8356,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
         custom_dest_vars=_dest_safe,
         od_vars_hint=(list(skim_df.columns) if skim_df is not None else None),
     )
+    dest_mdl._segment = segment  # stored for study-level size term in prediction path
 
     # If destination utility compiles to no parameters, clear sharrow cache
     # and rebuild with a minimal compile-safe UEC before attempting estimation.
@@ -7803,10 +8376,11 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             custom_dest_vars=_minimal_dest_uec(dt_d, segment),
             od_vars_hint=(list(skim_df.columns) if skim_df is not None else None),
         )
+        dest_mdl._segment = segment  # stored for study-level size term in prediction path
         _dest_pf_pre = _pf_len_safe(dest_mdl)
         logger.info(f"_run_segment [{segment}]: destination pf after rebuild = {_dest_pf_pre}")
 
-    # â”€â”€ Inject warm-start coefficients â€” destination model â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Inject warm-start coefficients - destination model ────────────────
     if coef_warm_start:
         _n_dest_warm = 0
         _dest_pf_idx = set(dest_mdl.pf.index.tolist())
@@ -7814,7 +8388,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             if _wname in _dest_pf_idx:
                 try:
                     _wval_f = float(_wval)
-                    # Skip warm-start values that are essentially zero â€”
+                    # Skip warm-start values that are essentially zero -
                     # these indicate the parameter was holdfasted in the
                     # previous run.  Using them as initial values places the
                     # optimizer at a lower bound (if one exists) where the
@@ -7824,7 +8398,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                     if abs(_wval_f) < 1e-10:
                         logger.debug(
                             f"_run_segment [{segment}]: skipping near-zero "
-                            f"warm-start for '{_wname}' ({_wval_f:.2e}) â€” "
+                            f"warm-start for '{_wname}' ({_wval_f:.2e}) - "
                             "likely holdfasted in previous run"
                         )
                         continue
@@ -7846,62 +8420,74 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             print(f"{_ll_before:.1f}")
         except Exception as _lle:
             print(f"(could not compute: {_lle})")
-        dest_mdl = _estimate(dest_mdl, two_phase=True)
         try:
-            _ll_after = float(dest_mdl.loglike())
-            print(f"  [{segment}] LL after estimation: {_ll_after:.1f}")
-            # â”€â”€ LL null-ratio sanity check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            # Null LL = N Ã— log(1/K): a good model should be 2â€“10Ã— better.
-            # If estimated LL is WORSE than null (ratio > 1) or catastrophically
-            # bad (ratio >> 1), the model has a gradient saturation or data problem.
-            # Diagnose: report the top magnitude coefficient for debugging.
+            dest_mdl = _estimate(dest_mdl, two_phase=True)
             try:
-                _n_est = seg_acdc['ptour_id'].nunique() if 'ptour_id' in seg_acdc.columns else len(seg_acdc)
-                _n_alts = _n_zone_ids  # zone alternatives used in estimation
-                _ll_null = _n_est * np.log(1.0 / max(_n_alts, 1))
-                _ll_ratio = abs(_ll_after) / abs(_ll_null) if _ll_null != 0 else float('nan')
-                _ll_msg = (
-                    f"[{segment}] LL check: est={_ll_after:.1f}, nullâ‰ˆ{_ll_null:.1f}, "
-                    f"|est|/|null| = {_ll_ratio:.2f}"
-                )
-                if np.isnan(_ll_ratio):
-                    logger.debug(_ll_msg)
-                elif _ll_ratio > 10.0:
-                    logger.error(
-                        _ll_msg + " â€” CATASTROPHIC: LL >> null model. "
-                        "Likely causes: (1) raw (non-log) attraction variable causing "
-                        "gradient saturation, (2) chosen zones have near-zero probability "
-                        "(check attraction variable is log-transformed), "
-                        "(3) zone with all-zero data in chosen set. "
-                        "Inspect the top coefficient below for the offending parameter."
+                _ll_after = float(dest_mdl.loglike())
+                print(f"  [{segment}] LL after estimation: {_ll_after:.1f}")
+                # ── LL null-ratio sanity check ─────────────────────────────
+                # Null LL = N × log(1/K): a good model should be 2-10× better.
+                # If estimated LL is WORSE than null (ratio > 1) or catastrophically
+                # bad (ratio >> 1), the model has a gradient saturation or data problem.
+                # Diagnose: report the top magnitude coefficient for debugging.
+                try:
+                    _n_est = seg_acdc['ptour_id'].nunique() if 'ptour_id' in seg_acdc.columns else len(seg_acdc)
+                    _n_alts = _n_zone_ids  # zone alternatives used in estimation
+                    _ll_null = _n_est * np.log(1.0 / max(_n_alts, 1))
+                    _ll_ratio = abs(_ll_after) / abs(_ll_null) if _ll_null != 0 else float('nan')
+                    _ll_msg = (
+                        f"[{segment}] LL check: est={_ll_after:.1f}, null≈{_ll_null:.1f}, "
+                        f"|est|/|null| = {_ll_ratio:.2f}"
                     )
-                    try:
-                        _pf_diag = dest_mdl.pf
-                        _top_param = _pf_diag['value'].abs().idxmax()
+                    if np.isnan(_ll_ratio):
+                        logger.debug(_ll_msg)
+                    elif _ll_ratio > 10.0:
                         logger.error(
-                            f"  Largest |coeff|: {_top_param} = "
-                            f"{float(_pf_diag.loc[_top_param, 'value']):.4f} "
-                            f"(if this is an attraction term, check its data scale)"
+                            _ll_msg + " - CATASTROPHIC: LL >> null model. "
+                            "Likely causes: (1) raw (non-log) attraction variable causing "
+                            "gradient saturation, (2) chosen zones have near-zero probability "
+                            "(check attraction variable is log-transformed), "
+                            "(3) zone with all-zero data in chosen set. "
+                            "Inspect the top coefficient below for the offending parameter."
                         )
-                    except Exception:
-                        pass
-                elif _ll_ratio > 2.0:
-                    logger.warning(_ll_msg + " â€” LL worse than null; check starting values and data.")
-                else:
-                    logger.info(_ll_msg + " â€” OK")
-            except Exception as _lc_e:
-                logger.debug(f"[{segment}] LL null check failed: {_lc_e}")
-        except Exception as _lla:
-            print(f"  [{segment}] LL after estimation: (could not compute: {_lla})")
-        # Print top 5 params by magnitude
-        try:
-            _pf = dest_mdl.pf
-            _free = _pf[~_pf.get('holdfast', pd.Series(False, index=_pf.index)).astype(bool)]
-            print(f"  [{segment}] Top estimated params (by |value|):")
-            for _pname, _row in _free['value'].abs().sort_values(ascending=False).head(5).items():
-                print(f"    {_pname} = {_free.loc[_pname, 'value']:.4f}")
-        except Exception as _pp:
-            print(f"  [{segment}] Could not print params: {_pp}")
+                        try:
+                            _pf_diag = dest_mdl.pf
+                            _top_param = _pf_diag['value'].abs().idxmax()
+                            logger.error(
+                                f"  Largest |coeff|: {_top_param} = "
+                                f"{float(_pf_diag.loc[_top_param, 'value']):.4f} "
+                                f"(if this is an attraction term, check its data scale)"
+                            )
+                        except Exception:
+                            pass
+                    elif _ll_ratio > 2.0:
+                        logger.warning(_ll_msg + " - LL worse than null; check starting values and data.")
+                    else:
+                        logger.info(_ll_msg + " - OK")
+                except Exception as _lc_e:
+                    logger.debug(f"[{segment}] LL null check failed: {_lc_e}")
+            except Exception as _lla:
+                print(f"  [{segment}] LL after estimation: (could not compute: {_lla})")
+            # Print top 5 params by magnitude
+            try:
+                _pf = dest_mdl.pf
+                _free = _pf[~_pf.get('holdfast', pd.Series(False, index=_pf.index)).astype(bool)]
+                print(f"  [{segment}] Top estimated params (by |value|):")
+                for _pname, _row in _free['value'].abs().sort_values(ascending=False).head(5).items():
+                    print(f"    {_pname} = {_free.loc[_pname, 'value']:.4f}")
+            except Exception as _pp:
+                print(f"  [{segment}] Could not print params: {_pp}")
+        except Exception as _dest_est_e:
+            logger.warning(
+                f"_run_segment [{segment}]: Larch destination estimation failed; "
+                "using alternative JAX estimator. "
+                f"Error: {_dest_est_e!r}"
+            )
+            dest_mdl._cached_ll = float('nan')
+            try:
+                dest_mdl._coef_cache = {}
+            except Exception:
+                pass
     else:
         logger.warning(
             f"_run_segment [{segment}]: destination pf still empty after rebuild; "
@@ -7928,11 +8514,11 @@ def _run_segment(segment: str, tours: pd.DataFrame,
         dest_mdl._zone_shadow_prices = _fit_destination_zone_shadow_prices(
             seg_acdc.reset_index(drop=True), probs_cal,
             list(ls.coords['zones'].values),
-            n_iter=50,             # more iterations â€” stable convergence with small alpha
-            alpha=0.25,            # ARC/ActivitySim standard: 0.2â€“0.3 prevents oscillation.
+            n_iter=50,             # more iterations - stable convergence with small alpha
+            alpha=0.25,            # ARC/ActivitySim standard: 0.2-0.3 prevents oscillation.
                                    # alpha=0.85 caused divergence (MaxRatioErr increasing after iter 2).
-            clip_sp=5.0,           # allow up to exp(5)â‰ˆ150Ã— correction for severely under-predicted zones
-            target_threshold=3,    # adjust any zone with â‰¥3 observed trips
+            clip_sp=5.0,           # allow up to exp(5)≈150× correction for severely under-predicted zones
+            target_threshold=3,    # adjust any zone with ≥3 observed trips
             _history_out=_sp_history,
         )
         # Save ARC-style shadow price convergence + validation scatter plots
@@ -7943,7 +8529,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             # 1. Convergence trace (failing zones + max shadow per iteration)
             _sp_plot_path = _os.path.join(_sp_plot_dir, f'shadow_price_convergence_{segment}.png')
             _plot_shadow_price_convergence(_sp_history, segment, _sp_plot_path)
-            # 2. Obs vs pred scatter â€” before & after shadow prices (ARC-style)
+            # 2. Obs vs pred scatter - before & after shadow prices (ARC-style)
             if probs_cal is not None:
                 _sp_val_path = _os.path.join(_sp_plot_dir, f'shadow_price_validation_{segment}.png')
                 _plot_shadow_price_validation(
@@ -7960,7 +8546,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             logger.debug(f"Shadow price plot failed: {_spe}")
         dest_mdl._cluster_targets = _fit_destination_cluster_targets(seg_acdc.reset_index(drop=True), lu_with_st)
         logger.info(f"_run_segment [{segment}]: destination OD calibration origins={len(od_calibration)}")
-        # â”€â”€ Cache aggregated zone shares for validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Cache aggregated zone shares for validation ────────────────
         # IMPORTANT: apply shadow prices to probs_cal BEFORE caching so that
         # _location_choice_validation shows post-SP zone shares (i.e. the
         # validation ratios reflect what the model actually predicts in simulation,
@@ -7981,7 +8567,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                     _row_sums = np.where(_row_sums > 1e-12, _row_sums, 1.0)
                     _probs_sp = _probs_sp / _row_sums
                 else:
-                    _probs_sp = probs_cal  # no shadow prices â€” use as-is
+                    _probs_sp = probs_cal  # no shadow prices - use as-is
                 _raw_sum = _probs_sp.sum(axis=0)
                 _total = max(float(_raw_sum.sum()), 1e-9)
                 dest_mdl._pred_zone_shares = pd.Series(
@@ -8005,7 +8591,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
         logger.debug(f"_run_segment [{segment}]: destination calibration skipped ({_cal_e})")
     _print_model_table(dest_mdl, f"{segment.upper()} destination model")
 
-    # retrieve LL cached by _estimate() â€” reliable even after DataTree stripped
+    # retrieve LL cached by _estimate() - reliable even after DataTree stripped
     mode_ll = getattr(mode_mdl, '_cached_ll', float('nan'))
     dest_ll = getattr(dest_mdl, '_cached_ll', float('nan'))
 
@@ -8053,17 +8639,16 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                 f"_run_segment [{segment}]: alternative destination estimation failed: {_alt_est_e}"
             )
 
-    dest_coef = _fill_dest_coef_with_segment_defaults(dest_coef, segment)
-    dest_mdl._coef_cache = dict(dest_coef)
-
-    # Requirement gate: by default do not continue with prediction unless
-    # destination coefficients were estimated successfully by either method.
+    _dest_coef_estimated = bool(dest_coef)
     _require_dest_est = os.environ.get('STAGE5_REQUIRE_DEST_ESTIMATION', '1') != '0'
-    if _require_dest_est and not dest_coef:
+    if _require_dest_est and not _dest_coef_estimated:
         raise RuntimeError(
             f"_run_segment [{segment}]: no destination coefficients estimated "
             "(Larch + alternative JAX both failed)."
         )
+
+    dest_coef = _fill_dest_coef_with_segment_defaults(dest_coef, segment)
+    dest_mdl._coef_cache = dict(dest_coef)
 
     # Frozen probabilities: prefer the MXL-derived table if available,
     # otherwise fall back to computing from NL coefficients + seg data.
@@ -8086,7 +8671,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
         mode_coef   = mode_coef,    # NL mode model coefs as plain dict (pickle-safe)
         dest_coef   = dest_coef,    # NL dest model coefs as plain dict (pickle-safe)
         mxl_result  = mxl_result,   # mixed logit result (dict or None)
-        frozen_probs = _frozen_probs,  # cell-level HHTSâ†’synth probability table
+        frozen_probs = _frozen_probs,  # cell-level HHTS→synth probability table
         s_log_dist  = _s_log_dist,  # between-person log-dist std dev for frozen draws
         dt_mode     = dt_m,
         dt_dest     = dt_d,
@@ -8159,13 +8744,13 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
     landuse : optional pd.DataFrame (zone_order_and_landuse enriched with
         accessibility and size terms).  Used as a fallback when the flat
         Dataset ``dt_d_batch`` was built with importance-sampled alternatives
-        (60 per chooser) but the call supplies all 329 zones â€” the Dataset
+        (60 per chooser) but the call supplies all 329 zones - the Dataset
         dimension would be ``(n_cases, 60)`` while ``n_zones=329``, causing
         all shape checks to fail silently and return 0.  When ``landuse`` is
         supplied the ``_emp_col`` function falls back to reading directly from
         the zone-indexed landuse DataFrame.
     skim_df : optional flat OD DataFrame (OTAZ, DTAZ, DIST, SOVTOLL_TIME__AM
-        â€¦).  Used as fallback for OD matrices when the Dataset check fails.
+        …).  Used as fallback for OD matrices when the Dataset check fails.
     """
     try:
         coef = _coef_dict_from_model(dest_mdl)
@@ -8200,7 +8785,7 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
         c_indp_fin = _pv('c_indp_finance', 0.0)
         c_indp_hlth = _pv('c_indp_health', 0.0)
         c_indp_retl = _pv('c_indp_retail', 0.0)
-        # c_totemp_work removed (collinear with size_term â†’ negative estimated coefficient)
+        # c_totemp_work removed (collinear with size_term → negative estimated coefficient)
         c_log_commercial_work = _pv('c_log_commercial_work', 0.0)
         c_edu_post = _pv('c_edu_post', 0.0)
         c_edu_prim = _pv('c_edu_primary', 0.0)
@@ -8237,7 +8822,7 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
         _is_flat_ds = bool(getattr(dt_d_batch, 'attrs', {}).get('_flat_mode', False))
         # Pre-build a zone-indexed landuse lookup if the landuse kwarg is supplied.
         # Used when the flat Dataset has importance-sampled dims (n_cases, n_sampled)
-        # that don't match the full n_zones â€” in that case the Dataset check fails and
+        # that don't match the full n_zones - in that case the Dataset check fails and
         # we need a direct zone-table lookup to get non-zero landuse values.
         _lu_for_fallback = None
         if landuse is not None:
@@ -8263,8 +8848,8 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
                         return _v
                 except Exception:
                     pass
-            # Landuse DataFrame fallback â€” used when Dataset was importance-sampled
-            # (n_alts â‰  n_zones) so the shape check above fails silently.
+            # Landuse DataFrame fallback - used when Dataset was importance-sampled
+            # (n_alts ≠ n_zones) so the shape check above fails silently.
             if _lu_for_fallback is not None and col in _lu_for_fallback.columns:
                 try:
                     vals = pd.to_numeric(
@@ -8286,7 +8871,7 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
             return np.full(n_zones, default, dtype=np.float32)
 
         # size_term is already demeaned by compute_size_terms (mean=0 by construction)
-        # â€” do NOT re-centre here, that would subtract the mean of a zero-mean series
+        # - do NOT re-centre here, that would subtract the mean of a zero-mean series
         # which changes nothing on average but adds floating-point noise.
         size_term_j = _emp_col('size_term', 0.0)
         acdc_aggl_j = _emp_col('acdc_aggl', 0.0)
@@ -8295,7 +8880,7 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
         auto_shop_j = _emp_col('auto_shop_acc', 0.0)
         walk_acc_j = _emp_col('walk_acc', 0.0)
         transit_j = _emp_col('transit_acc', 0.0)
-        # â”€â”€ Log-transform employment to match DEST_UEC_FLAT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Log-transform employment to match DEST_UEC_FLAT ────────────────
         # DEST_UEC_FLAT uses log(emp+1) columns so estimated coefficients expect
         # log-scale inputs. c_totemp_work was removed (collinear with size_term).
         fpsempn_j = np.log(np.clip(_emp_col('FPSEMPN', 0.0), 0.0, None) + 1.0).astype(np.float32)
@@ -8303,8 +8888,8 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
         retempn_j = np.log(np.clip(_emp_col('RETEMPN', 0.0), 0.0, None) + 1.0).astype(np.float32)
         commercial_j = _emp_col('commercial', 0.0)
         log_commercial_j = np.log(np.clip(commercial_j, 0.0, None) + 1.0).astype(np.float32)
-        # â”€â”€ Log-transform edu attractions to match DEST_UEC_FLAT (log-scale) â”€â”€
-        # Raw Primary/Secondary range 0â€“3,068; raw Education may be large too.
+        # ── Log-transform edu attractions to match DEST_UEC_FLAT (log-scale) ──
+        # Raw Primary/Secondary range 0-3,068; raw Education may be large too.
         # DEST_UEC_FLAT now maps edu columns to log(x+1)-transformed versions
         # (same as computed in _dest_tree). Prediction path must match exactly.
         edu_post_j      = np.log(np.clip(_emp_col('Education',            0.0), 0.0, None) + 1.0).astype(np.float32)
@@ -8343,7 +8928,7 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
                     _otaz_raw = pd.Series(_otaz_pos, index=ls_cases)
             except Exception:
                 pass
-        # Flat-dataset fallback: CA has n_cases Ã— n_zones rows; deduplicate by case
+        # Flat-dataset fallback: CA has n_cases × n_zones rows; deduplicate by case
         if float(_otaz_raw.isna().mean()) > 0.5:
             try:
                 _tour_raw2 = dt_d_batch['tour'].to_dataframe().reset_index()
@@ -8392,7 +8977,7 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
             except Exception:
                 pass
 
-        # skim_df fallback â€” used when Dataset has sampled dims (n_cases, 60)
+        # skim_df fallback - used when Dataset has sampled dims (n_cases, 60)
         # not matching (n_cases, n_zones=329).  Pivot DIST and CRASH for the
         # unique OTAZs present in this batch.
         if not _od_loaded and skim_df is not None and len(skim_df) > 0:
@@ -8472,10 +9057,10 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
         propensity_i = _person_col('travel_propensity', 0.0)
         # person_dist_draw is 0 during estimation (set by _PERSON_BEHAVIOURAL_DEFAULTS).
         # During prediction it holds frozen N(0, s_log_dist) draws from
-        # _frozen_person_dist_offsets â€” applied to persons DF before _dest_utility_numpy.
+        # _frozen_person_dist_offsets - applied to persons DF before _dest_utility_numpy.
         person_dist_draw_i = _person_col('person_dist_draw', 0.0)
 
-        # â”€â”€ NEW coefficients â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── NEW coefficients ─────────────────────────────────────────────
         # c_log_sovtime / c_log_sovtime_work removed from DEST_UEC_FLAT:
         # the mode logsum already captures SOV travel time as part of the
         # mode utility.  Reading from coef with default 0 for backward compat
@@ -8495,7 +9080,7 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
         c_walk_feasible = _pv('c_walk_feasible', 0.0)
         c_bike_feasible = _pv('c_bike_feasible', 0.0)
 
-        # â”€â”€ NEW OD matrices: DISTWALK, DISTBIKE, SOVTOLL_TIME â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── NEW OD matrices: DISTWALK, DISTBIKE, SOVTOLL_TIME ────────────
         distwalk_ij = np.full((n_cases, n_zones), 30.0, dtype=np.float32)
         distbike_ij = np.full((n_cases, n_zones), 30.0, dtype=np.float32)
         sovtime_ij = np.full((n_cases, n_zones), 30.0, dtype=np.float32)
@@ -8543,8 +9128,34 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
         walk_feasible_ij = (distwalk_ij < WALK_MAX_KM).astype(np.float32)
         bike_feasible_ij = (distbike_ij < BIKE_MAX_KM).astype(np.float32)
 
-        # â”€â”€ NEW landuse columns â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── NEW landuse columns ──────────────────────────────────────────
         hsenroll_j = _emp_col('HSENROLL', 0.0)
+
+        # ── Study-level-conditioned size term for edu (prediction path) ──
+        # Mirror the estimation-path fix in _dest_tree: replace the combined
+        # edu size_term with a per-person conditioned version so secondary
+        # students are attracted to secondary zones, not all school types.
+        _pred_segment = getattr(dest_mdl, '_segment', None)
+        if _pred_segment == 'edu':
+            _eps_pred = np.float32(1e-6)
+            _prim_j_st  = np.log(_emp_col('Primary', 0.0) + _emp_col('TOTPOP', 0.0) * 0.05 + _eps_pred)
+            _prim_j_st -= float(_prim_j_st.mean())
+            _sec_j_st   = np.log(_emp_col('Secondary', 0.0) + _emp_col('HSENROLL', 0.0) + _eps_pred)
+            _sec_j_st  -= float(_sec_j_st.mean())
+            _post_j_st  = np.log(
+                np.clip(_emp_col('Education', 0.0), 0.0, None) ** 0.9
+                + _emp_col('university', 0.0) + _emp_col('college', 0.0) + _eps_pred
+            )
+            _post_j_st -= float(_post_j_st.mean())
+            _study_i_np = np.asarray(study_i, dtype=np.int32)
+            _cond_size_ij = (
+                (_study_i_np == 1).astype(np.float32)[:, np.newaxis] * _prim_j_st[np.newaxis, :]
+                + (_study_i_np == 2).astype(np.float32)[:, np.newaxis] * _sec_j_st[np.newaxis, :]
+                + (_study_i_np >= 3).astype(np.float32)[:, np.newaxis] * _post_j_st[np.newaxis, :]
+            )
+            _size_term_term = c_size_term * _cond_size_ij
+        else:
+            _size_term_term = c_size_term * size_term_j[np.newaxis, :]
 
         ls_np = np.asarray(ls_batch, dtype=np.float32)
         V = (
@@ -8552,7 +9163,7 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
             + c_dist * dist_ij
             + c_crash * log_crash_ij
             + c_logsum * ls_np
-            + c_size_term * size_term_j[np.newaxis, :]
+            + _size_term_term
             + c_aggl * acdc_aggl_j[np.newaxis, :]
             + c_comp * acdc_comp_j[np.newaxis, :]
             + c_auto_work * auto_work_j[np.newaxis, :]
@@ -8586,14 +9197,14 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
         V += c_nonmand_retail * nonmand_retail_j[np.newaxis, :]
         V += c_nonmand_totpop * nonmand_totpop_j[np.newaxis, :]
         V += c_nonmand_eatout * nonmand_eatout_j[np.newaxis, :]
-        # Travel propensity Ã— log-distance: more-mobile persons less deterred by distance.
+        # Travel propensity × log-distance: more-mobile persons less deterred by distance.
         # Coefficient estimated from HHTS; applied identically to synth population.
         V += c_propensity_dist * propensity_i[:, np.newaxis] * log_dist_ij
         # Frozen person-specific distance draw (N(0, s_log_dist), seeded by person_id MD5).
-        # Zero during estimation (no bias); non-zero during prediction â†’ heterogeneous
+        # Zero during estimation (no bias); non-zero during prediction → heterogeneous
         # distance sensitivities that are reproducible across runs and persons.
         V += person_dist_draw_i[:, np.newaxis] * log_dist_ij
-        # â”€â”€ NEW utility terms â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── NEW utility terms ────────────────────────────────────────────
         # Travel time impedance (SOV time from skim).
         # c_log_sovtime is for edu/nonmand; c_log_sovtime_work for work.
         # Both reference log_sovtime_ij.  In prediction the segment model
@@ -8714,7 +9325,7 @@ def _coef_dict_from_model(model, coef_override: dict = None) -> dict:
         return model._coef_cache
 
     # _final_pf is a plain DataFrame snapshot saved by _estimate() after
-    # maximisation â€” it survives JAX JIT compilation that corrupts model.pf.
+    # maximisation - it survives JAX JIT compilation that corrupts model.pf.
     if hasattr(model, '_final_pf') and isinstance(model._final_pf, pd.DataFrame):
         pf = model._final_pf
         if 'value' in pf.columns:
@@ -8728,7 +9339,7 @@ def _coef_dict_from_model(model, coef_override: dict = None) -> dict:
             except Exception:
                 pass
 
-    # Try .pf â€” on loaded models Larch may need mangle()/unmangle() first
+    # Try .pf - on loaded models Larch may need mangle()/unmangle() first
     # to rebuild the internal ._mangled attribute before pf is accessible.
     try:
         pf = model.pf
@@ -8738,7 +9349,7 @@ def _coef_dict_from_model(model, coef_override: dict = None) -> dict:
         if coef:
             return coef
     except AttributeError:
-        # '_mangled' attribute missing â†’ try mangle() to rebuild internals
+        # '_mangled' attribute missing → try mangle() to rebuild internals
         try:
             model.mangle()
             model.unmangle()
@@ -8775,7 +9386,7 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
     Compute mode choice probabilities directly from fitted coefficients.
 
     Uses coef_override (plain Python dict from models[seg]['coef']) first,
-    then tries _coef_cache, then model.pf â€” never crashes on loaded models.
+    then tries _coef_cache, then model.pf - never crashes on loaded models.
 
     Modes: DA=1, Other=2, Walk=3, Bike=4, Transit=5
     Returns np.ndarray shape (n_cases, 5) or None on failure.
@@ -8793,9 +9404,9 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         xp = jnp if JAX_AVAILABLE else np
         _cache = _coef_dict_from_model(mode_mdl, coef_override)
 
-        # â”€â”€ Coefficient source diagnostic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Coefficient source diagnostic ────────────────────────────────
         if not _cache:
-            logger.warning("_mode_probs_numpy: no coefficient source found â€” "
+            logger.warning("_mode_probs_numpy: no coefficient source found - "
                            "using hard-coded defaults.  Check that mode_coef "
                            "was extracted at estimation time and survives pickle.")
         else:
@@ -8815,7 +9426,7 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
             except Exception:
                 return default
 
-        # â”€â”€ 1. Fitted coefficients â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── 1. Fitted coefficients ────────────────────────────────────────
         # Defaults calibrated to approximate SEQ observed mode shares when
         # estimated coefficients fail to load:
         #   DA ~60%, SR ~12%, Transit ~10%, Walk ~10%, Bike ~8%
@@ -8831,14 +9442,14 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         c_veh_sr       = _pv('c_veh_sr',          0.10)
         c_noveh_transit= _pv('c_noveh_transit',   2.00)
         c_noveh_walk   = _pv('c_noveh_walk',      1.50)
-        # c_licence_da removed â€” CARLICENCE is a hard availability constraint
+        # c_licence_da removed - CARLICENCE is a hard availability constraint
         c_incp_da      = _pv('c_incp_da',         0.010)
         c_incp_sr      = _pv('c_incp_sr',         0.005)
         c_incp_transit = _pv('c_incp_transit',   -0.015)
         # c_incp_active must mirror MODE_UEC {"Walk": None, "Bike": None}.
-        # Without this term, high-income persons get c_incp_da/sr/transit â‰ˆ âˆ’1.3
+        # Without this term, high-income persons get c_incp_da/sr/transit ≈ −1.3
         # applied to all motorised modes, crushing DA/SR/Transit utility while
-        # Walk and Bike remain unpenalised â€” producing nonsensical Bike=74% splits.
+        # Walk and Bike remain unpenalised - producing nonsensical Bike=74% splits.
         c_incp_active  = _pv('c_incp_active',    -0.010)
         c_age_walk     = _pv('c_age_walk',        -0.08)  # age5p bands; slight deterrence
         c_age_bike     = _pv('c_age_bike',        -0.12)
@@ -8847,12 +9458,12 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         c_female_transit=_pv('c_female_transit',   0.30)
         c_female_walk  = _pv('c_female_walk',      0.20)
         c_peak_da      = _pv('c_peak_da',          0.30)
-        # â”€â”€ person-type shifts (ActivitySim pattern) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        c_worker_da    = _pv('c_worker_da',        0.20)  # FT/PT worker â†’ more DA
-        c_student_tr   = _pv('c_student_tr',       0.40)  # student â†’ more transit
-        c_inc_high_da  = _pv('c_inc_high_da',      0.015) # high income â†’ DA
-        c_inc_low_tr   = _pv('c_inc_low_tr',      -0.020) # low income â†’ transit
-        # â”€â”€ ASC values â€” relative to DA (ASC_DA = 0) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── person-type shifts (ActivitySim pattern) ────────────────────────
+        c_worker_da    = _pv('c_worker_da',        0.20)  # FT/PT worker → more DA
+        c_student_tr   = _pv('c_student_tr',       0.40)  # student → more transit
+        c_inc_high_da  = _pv('c_inc_high_da',      0.015) # high income → DA
+        c_inc_low_tr   = _pv('c_inc_low_tr',      -0.020) # low income → transit
+        # ── ASC values - relative to DA (ASC_DA = 0) ─────────────────────
         # Raised significantly from -4.0/-4.5 which produced effectively 0%
         # walk/bike.  New values allow the distance utility to govern mode
         # suppression at longer distances.
@@ -8861,7 +9472,7 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         asc_bike       = _pv('ASC_Bike',           -1.50)  # was -4.50
         asc_transit    = _pv('ASC_Transit',        -0.50)  # was -1.50
 
-        # â”€â”€ 2. Get OTAZ and DTAZ per case â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── 2. Get OTAZ and DTAZ per case ─────────────────────────────────
         n = len(tour_rows)
         def _col(df, *names, default=0.0):
             for nm in names:
@@ -8872,7 +9483,7 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         otaz = _col(tour_rows, 'OTAZ', default=1).astype(np.int32)
         dtaz = _col(tour_rows, 'DTAZ', default=1).astype(np.int32)
 
-        # â”€â”€ 3. Read skim values per OD pair â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── 3. Read skim values per OD pair ──────────────────────────────
         # Use skim_lookup dict if available (fast); else read OMX directly.
         ivt_auto    = np.full(n, 30.0, dtype=np.float32)
         ivt_transit = np.full(n, 45.0, dtype=np.float32)
@@ -8922,13 +9533,13 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                 if mat_bike        is not None: dist_bike[i]   = mat_bike[oi, di]
                 if mat_crash       is not None: crash[i]       = mat_crash[oi, di]
 
-        # DISTWALK/DISTBIKE are already in km â€” match MODE_UEC expressions exactly:
+        # DISTWALK/DISTBIKE are already in km - match MODE_UEC expressions exactly:
         #   log(od.DISTWALK * 12 + 1)  (12 min/km at 5 km/h)
         #   log(od.DISTBIKE * 4 + 1)   (4 min/km at 15 km/h)
         # Transit availability: block if IVT >= threshold (no service).
-        # Default skim value of 45 min is used when transit is unknown â€”
+        # Default skim value of 45 min is used when transit is unknown -
         # only block when it equals the sentinel fill (>= 90 min) or 0.
-        TRANSIT_IVT_UNAVAIL_MIN = 90.0   # block transit when IVT â‰¥ this (min)
+        TRANSIT_IVT_UNAVAIL_MIN = 90.0   # block transit when IVT ≥ this (min)
         transit_avail_raw = np.asarray(ivt_transit, dtype=np.float32)
         transit_avail = (
             (transit_avail_raw > 0) & (transit_avail_raw < TRANSIT_IVT_UNAVAIL_MIN)
@@ -8939,13 +9550,13 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
             f"(IVT threshold={TRANSIT_IVT_UNAVAIL_MIN} min)"
         )
 
-        ivt_auto = xp.clip(xp.asarray(ivt_auto) / 60.0, 0.05, 5.0)   # minutes â†’ hours
+        ivt_auto = xp.clip(xp.asarray(ivt_auto) / 60.0, 0.05, 5.0)   # minutes → hours
         ivt_transit = xp.clip(xp.asarray(ivt_transit) / 60.0, 0.05, 6.0)
         walk_time = xp.log(xp.clip(xp.asarray(dist_walk), 0, None) * 12.0 + 1.0)
         bike_time = xp.log(xp.clip(xp.asarray(dist_bike), 0, None) * 4.0 + 1.0)
         log_crash = xp.log(xp.asarray(crash) + 1.0)
 
-        # â”€â”€ 4. Person attributes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── 4. Person attributes ──────────────────────────────────────────
         pp = persons.copy()
         if 'person_id' not in pp.columns and 'PERSID' in pp.columns:
             pp = pp.rename(columns={'PERSID': 'person_id'})
@@ -8955,7 +9566,7 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
             pids = tour_rows[pid_col].values
             # Build a unique-indexed persons lookup.
             # Three-step deduplication:
-            #   1. Drop rows where person_id is NaN (NaN != NaN â†’ drop_duplicates
+            #   1. Drop rows where person_id is NaN (NaN != NaN → drop_duplicates
             #      keeps all NaN rows as "unique", producing a non-unique index)
             #   2. Drop remaining duplicate person_id rows (keep first)
             #   3. Final safety: strip any residual duplicates via index mask
@@ -8992,7 +9603,7 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
 
         noveh      = (vehrd == 0).astype(np.float32)
         female     = (sexp == 2).astype(np.float32)
-        young      = (age5p <= 5).astype(np.float32)   # age5p â‰¤ 5 â†’ under ~30 yrs
+        young      = (age5p <= 5).astype(np.float32)   # age5p ≤ 5 → under ~30 yrs
 
         peak = np.zeros(n, dtype=np.float32)
         if '_time_period' in tour_rows.columns:
@@ -9002,16 +9613,16 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         if 'joint_travel' in tour_rows.columns:
             joint = pd.to_numeric(tour_rows['joint_travel'], errors='coerce').fillna(0).values.astype(np.float32)
 
-        # â”€â”€ Person-type heterogeneity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # worker / student flags â€” key predictors of mode split per ActivitySim
+        # ── Person-type heterogeneity ────────────────────────────────────
+        # worker / student flags - key predictors of mode split per ActivitySim
         workstat   = _pa('WORKSTAT',    0.0)
         studying   = _pa('STUDYING',    0.0)
         is_worker  = np.clip(workstat, 0, 1).astype(np.float32)   # 1=employed
         is_student = (studying > 0).astype(np.float32)
-        # income normalised: incp range 1-14; centre at 7 â†’ negative = low income
+        # income normalised: incp range 1-14; centre at 7 → negative = low income
         inc_cent   = (incp - 7.0).astype(np.float32)
 
-        # â”€â”€ Industry of employment (ANZSIC 1-digit, 'indp') â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Industry of employment (ANZSIC 1-digit, 'indp') ─────────────
         # Read from persons table; falls back to 20 (not employed / other).
         _indp_raw  = _pa('indp', 20.0).astype(np.int32)
         _indp_grps = np.array([INDUSTRY_MODE_GROUP.get(int(v), 'other')
@@ -9022,33 +9633,33 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         ind_health     = (_indp_grps == 'health').astype(np.float32)
         ind_retail     = np.isin(_indp_grps, ['retail', 'hospitality']).astype(np.float32)
 
-        # â”€â”€ Occupation (ANZSCO 1-digit, 'occp') â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Occupation (ANZSCO 1-digit, 'occp') ─────────────────────────
         _occp_raw    = _pa('occp', 0.0).astype(np.int32)
         occ_mgr_prof = np.isin(_occp_raw, [1, 2]).astype(np.float32)
         occ_labourer = np.isin(_occp_raw, [7, 8]).astype(np.float32)
         occ_clerical = (_occp_raw == 5).astype(np.float32)
 
-        # â”€â”€ Studying status (1=not studying, 2=ft, 3=pt, 4=other) â”€â”€â”€â”€â”€â”€â”€
+        # ── Studying status (1=not studying, 2=ft, 3=pt, 4=other) ───────
         _stup_raw     = _pa('stup', 1.0).astype(np.int32)
         is_ft_student = (_stup_raw == 2).astype(np.float32)
         is_pt_student = np.isin(_stup_raw, [3, 4]).astype(np.float32)
 
-        # â”€â”€ MXL-estimated industry/occupation coefficients â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── MXL-estimated industry/occupation coefficients ───────────────
         # These are loaded from coef_override (mode_coef dict) if present.
         # Default to 0 (no shift) when not estimated.
-        c_ind_da  = _pv('c_ind_da',  0.0)   # industrial/agri â†’ DA
-        c_off_tr  = _pv('c_off_tr',  0.0)   # office â†’ transit
-        c_pub_tr  = _pv('c_pub_tr',  0.0)   # public sector â†’ transit
-        c_pub_wk  = _pv('c_pub_wk',  0.0)   # public sector â†’ walk
-        c_hlt_tr  = _pv('c_hlt_tr',  0.0)   # health â†’ transit
-        c_ret_sr  = _pv('c_ret_sr',  0.0)   # retail/hospitality â†’ SR
-        c_mgr_da  = _pv('c_mgr_da',  0.0)   # managers â†’ DA
-        c_lab_da  = _pv('c_lab_da',  0.0)   # labourers â†’ DA
-        c_clr_tr  = _pv('c_clr_tr',  0.0)   # clerical â†’ transit
-        c_fts_tr  = _pv('c_fts_tr',  0.0)   # FT students â†’ transit
-        c_fts_wk  = _pv('c_fts_wk',  0.0)   # FT students â†’ walk
-        c_fts_bk  = _pv('c_fts_bk',  0.0)   # FT students â†’ bike
-        c_pts_tr  = _pv('c_pts_tr',  0.0)   # PT students â†’ transit
+        c_ind_da  = _pv('c_ind_da',  0.0)   # industrial/agri → DA
+        c_off_tr  = _pv('c_off_tr',  0.0)   # office → transit
+        c_pub_tr  = _pv('c_pub_tr',  0.0)   # public sector → transit
+        c_pub_wk  = _pv('c_pub_wk',  0.0)   # public sector → walk
+        c_hlt_tr  = _pv('c_hlt_tr',  0.0)   # health → transit
+        c_ret_sr  = _pv('c_ret_sr',  0.0)   # retail/hospitality → SR
+        c_mgr_da  = _pv('c_mgr_da',  0.0)   # managers → DA
+        c_lab_da  = _pv('c_lab_da',  0.0)   # labourers → DA
+        c_clr_tr  = _pv('c_clr_tr',  0.0)   # clerical → transit
+        c_fts_tr  = _pv('c_fts_tr',  0.0)   # FT students → transit
+        c_fts_wk  = _pv('c_fts_wk',  0.0)   # FT students → walk
+        c_fts_bk  = _pv('c_fts_bk',  0.0)   # FT students → bike
+        c_pts_tr  = _pv('c_pts_tr',  0.0)   # PT students → transit
 
         logger.debug(
             f"_mode_probs_numpy [{seg if 'seg' in dir() else 'N/A'}] "
@@ -9060,10 +9671,10 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
             f"public={ind_public.mean():.1%}"
         )
 
-        # â”€â”€ 5. Utility per mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── 5. Utility per mode ───────────────────────────────────────────
         # DA (reference, ASC=0).
         # licence is a HARD availability mask (set to -inf when CARLICENCE=0)
-        # rather than a positive utility term â€” no unlicensed person can drive.
+        # rather than a positive utility term - no unlicensed person can drive.
         V_DA = (c_ivt_auto   * ivt_auto
               + c_crash_veh  * log_crash
               + c_veh_da     * vehrd
@@ -9072,9 +9683,9 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
               + c_worker_da  * is_worker
               + c_inc_high_da * xp.clip(xp.asarray(inc_cent), 0, None)  # high inc only
               + c_ind_da  * xp.asarray(ind_industrial)   # industrial/agri captive
-              + c_mgr_da  * xp.asarray(occ_mgr_prof)     # managers â†’ DA
-              + c_lab_da  * xp.asarray(occ_labourer))    # labourers â†’ DA
-        # Apply licence as hard availability: unlicensed â†’ V_DA = -inf
+              + c_mgr_da  * xp.asarray(occ_mgr_prof)     # managers → DA
+              + c_lab_da  * xp.asarray(occ_labourer))    # labourers → DA
+        # Apply licence as hard availability: unlicensed → V_DA = -inf
         V_DA = xp.where(licence > 0, V_DA, -1e9)
 
         # Shared-ride / Other
@@ -9084,9 +9695,9 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
               + c_veh_sr     * vehrd
               + c_incp_sr    * incp
               + c_joint_sr   * joint
-              + c_ret_sr  * xp.asarray(ind_retail))      # retail/hospitality â†’ SR
+              + c_ret_sr  * xp.asarray(ind_retail))      # retail/hospitality → SR
 
-        # Transit â€” hard availability: block when IVT >= TRANSIT_IVT_UNAVAIL_MIN
+        # Transit - hard availability: block when IVT >= TRANSIT_IVT_UNAVAIL_MIN
         # (no service, or only the sentinel fill value present in skim).
         V_TR = (asc_transit
               + c_ivt_transit   * ivt_transit
@@ -9095,62 +9706,62 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
               + c_incp_transit  * incp
               + c_female_transit * female
               + c_student_tr    * is_student             # general student flag
-              + c_fts_tr * xp.asarray(is_ft_student)    # FT students â†’ transit
-              + c_pts_tr * xp.asarray(is_pt_student)    # PT students â†’ transit
-              + c_off_tr * xp.asarray(ind_office)        # office workers â†’ transit
-              + c_pub_tr * xp.asarray(ind_public)        # public sector â†’ transit
-              + c_hlt_tr * xp.asarray(ind_health)        # health workers â†’ transit
-              + c_clr_tr * xp.asarray(occ_clerical)      # clerical â†’ transit
+              + c_fts_tr * xp.asarray(is_ft_student)    # FT students → transit
+              + c_pts_tr * xp.asarray(is_pt_student)    # PT students → transit
+              + c_off_tr * xp.asarray(ind_office)        # office workers → transit
+              + c_pub_tr * xp.asarray(ind_public)        # public sector → transit
+              + c_hlt_tr * xp.asarray(ind_health)        # health workers → transit
+              + c_clr_tr * xp.asarray(occ_clerical)      # clerical → transit
               + c_inc_low_tr    * xp.clip(xp.asarray(-inc_cent), 0, None))  # low inc only
         V_TR = xp.where(xp.asarray(transit_avail) > 0, xp.asarray(V_TR), -1e9)
 
-        # Walk â€” person-type heterogeneity from ActivitySim:
+        # Walk - person-type heterogeneity from ActivitySim:
         # - no-vehicle households are captive active-mode users
         # - older persons less likely to walk (age5p bands)
-        # - public-sector workers â†’ walkable locations
-        # - FT students â†’ campus areas are walkable
+        # - public-sector workers → walkable locations
+        # - FT students → campus areas are walkable
         V_WK = (asc_walk
               + c_walk_time   * walk_time
               + c_noveh_walk  * noveh
               + c_age_walk    * age5p
               + c_incp_active * incp               # mirrors MODE_UEC c_incp_active
               + c_female_walk * female
-              + c_pub_wk * xp.asarray(ind_public)       # public sector â†’ walk
-              + c_fts_wk * xp.asarray(is_ft_student))   # FT students â†’ walk
-        # Apply availability as hard constraint â€” mirrors CARLICENCE â†’ DA.
+              + c_pub_wk * xp.asarray(ind_public)       # public sector → walk
+              + c_fts_wk * xp.asarray(is_ft_student))   # FT students → walk
+        # Apply availability as hard constraint - mirrors CARLICENCE → DA.
         # walk_avail=0 when OD distance exceeds WALK_MAX_KM (set in _predict_batch).
         walk_avail = pd.to_numeric(
             tour_rows.get('walk_avail', pd.Series(1, index=tour_rows.index)),
             errors='coerce').fillna(1).values.astype(float)
         V_WK = xp.where(walk_avail > 0, xp.asarray(V_WK), -1e9)
 
-        # Bike â€” FT students more likely to cycle (campus cycling culture)
+        # Bike - FT students more likely to cycle (campus cycling culture)
         V_BK = (asc_bike
               + c_bike_time  * bike_time
               + c_age_bike   * age5p
               + c_incp_active * incp               # mirrors MODE_UEC c_incp_active
               + c_young_bike * young
-              + c_fts_bk * xp.asarray(is_ft_student))   # FT students â†’ bike
-        # Apply availability as hard constraint â€” mirrors CARLICENCE â†’ DA.
+              + c_fts_bk * xp.asarray(is_ft_student))   # FT students → bike
+        # Apply availability as hard constraint - mirrors CARLICENCE → DA.
         # bike_avail=0 when OD distance exceeds BIKE_MAX_KM (set in _predict_batch).
         bike_avail = pd.to_numeric(
             tour_rows.get('bike_avail', pd.Series(1, index=tour_rows.index)),
             errors='coerce').fillna(1).values.astype(float)
         V_BK = xp.where(bike_avail > 0, xp.asarray(V_BK), -1e9)
 
-        # â”€â”€ 6. Softmax â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── 6. Softmax ────────────────────────────────────────────────────
         V = xp.stack([V_DA, V_SR, V_WK, V_BK, V_TR], axis=1)   # (n, 5)
 
         # Stability: subtract row max before exp (handles -1e9 utilities).
-        # After subtracting max, a blocked mode has V_i - max â‰ˆ -1e9, so
-        # exp(clip(-1e9, -500, 0)) = exp(-500) â‰ˆ 0 â†’ effectively zero prob.
+        # After subtracting max, a blocked mode has V_i - max ≈ -1e9, so
+        # exp(clip(-1e9, -500, 0)) = exp(-500) ≈ 0 → effectively zero prob.
         row_max = xp.max(xp.where(xp.asarray(V) > -1e8, xp.asarray(V), -xp.inf),
                          axis=1, keepdims=True)
         row_max = xp.where(xp.isfinite(row_max), row_max, 0.0)
         V_shifted = xp.asarray(V) - row_max
         exp_V = xp.exp(xp.clip(V_shifted, -500, 0))
 
-        # Handle rows where ALL modes are blocked (all -1e9) â€” fall back to
+        # Handle rows where ALL modes are blocked (all -1e9) - fall back to
         # DA+Transit equal share rather than uniform across blocked modes.
         totals = exp_V.sum(axis=1)
         all_blocked = totals < 1e-30
@@ -9171,7 +9782,7 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         totals = xp.where(totals > 0, totals, 1.0)
         probs = np.asarray(exp_V / totals, dtype=np.float64)
 
-        # â”€â”€ 7. INFO: log realised mode split and availability counts â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── 7. INFO: log realised mode split and availability counts ─────────
         mode_names = ['DA', 'SR', 'Walk', 'Bike', 'Transit']
         mean_probs = probs.mean(axis=0)
         logger.info(
@@ -9186,10 +9797,10 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
             f"noveh={int(noveh.sum())}/{n}  "
             f"ASC_Walk={asc_walk:.2f}  ASC_Bike={asc_bike:.2f}  ASC_Transit={asc_transit:.2f}"
         )
-        # Warn loudly if DA share > 90% â€” almost certainly a data or coef problem
+        # Warn loudly if DA share > 90% - almost certainly a data or coef problem
         if mean_probs[0] > 0.90:
             logger.warning(
-                f"_mode_probs_numpy: DA share = {mean_probs[0]:.1%} â€” very high. "
+                f"_mode_probs_numpy: DA share = {mean_probs[0]:.1%} - very high. "
                 f"Walk avail: {int(walk_avail.sum())}/{n}, "
                 f"Bike avail: {int(bike_avail.sum())}/{n}, "
                 f"Transit avail: {int(transit_avail.sum())}/{n}. "
@@ -9221,7 +9832,7 @@ def _predict_batch(
     Vectorised destination + mode prediction for ALL activities in one pass.
 
     Instead of building a new DataTree per activity (which triggers sharrow
-    recompilation every call â†’ 4-hour hang), this builds ONE DataTree per
+    recompilation every call → 4-hour hang), this builds ONE DataTree per
     segment covering all activities of that type, runs probability() once
     vectorised, then samples results.
 
@@ -9231,14 +9842,14 @@ def _predict_batch(
     Returns act_df with DTAZ and pred_mode columns added.
     """
     import xarray as xr
-    # NOTE: zsim_helper.monte_sample was here but is unused â€” removed to avoid
+    # NOTE: zsim_helper.monte_sample was here but is unused - removed to avoid
     # ImportError on systems where zsim_helper is not installed.
 
     df = act_df.copy()
     df['DTAZ']      = df['OTAZ'].astype(int)   # default: stay in origin
     df['pred_mode'] = 1                         # default: DA
 
-    # â”€â”€ diagnostics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── diagnostics ────────────────────────────────────────────────────
     _n_rows = len(df)
     _otaz_u = df['OTAZ'].nunique() if 'OTAZ' in df.columns else 0
     _seg_u  = df['segment'].value_counts().to_dict() if 'segment' in df.columns else {}
@@ -9246,29 +9857,29 @@ def _predict_batch(
     print(f"    _predict_batch: {_n_rows} activities, {_otaz_u} unique OTAZ, "
           f"segments={_seg_u}, models={_models_segs}")
     if not models:
-        logger.warning("_predict_batch called with empty models dict â€” "
+        logger.warning("_predict_batch called with empty models dict - "
                        "all DTAZ will default to OTAZ, pred_mode=1 (DA)")
         return df
-    # â”€â”€ end diagnostics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── end diagnostics ─────────────────────────────────────────────────
 
     pp = persons.copy()
     if 'person_id' not in pp.columns and 'PERSID' in pp.columns:
         pp = pp.rename(columns={'PERSID': 'person_id'})
 
-    # â”€â”€ apply usual location anchors for those who have them â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── apply usual location anchors for those who have them ─────────────
     # Persons with a WORK_TAZ / SCHOOL_TAZ get their usual location directly.
     # Everyone else will be handled by the segment dest model below.
     if work_taz_map:
         work_mask = df['segment'] == 'work'
         mapped = df.loc[work_mask, 'person_id'].astype(str).map(work_taz_map)
         df.loc[work_mask, 'DTAZ'] = mapped.fillna(-1).astype(int)
-        # -1 means "no usual location" â€” will be filled by dest model below
+        # -1 means "no usual location" - will be filled by dest model below
     if school_taz_map:
         edu_mask = df['segment'] == 'edu'
         mapped = df.loc[edu_mask, 'person_id'].astype(str).map(school_taz_map)
         df.loc[edu_mask, 'DTAZ'] = mapped.fillna(-1).astype(int)
 
-    # â”€â”€ vectorised prediction per segment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── vectorised prediction per segment ─────────────────────────────
     # Only nonmand needs destination MNL; work/edu already have anchors.
     # Mode choice runs for ALL segments (including work/edu with fixed dest).
     for seg, seg_models in models.items():
@@ -9276,6 +9887,10 @@ def _predict_batch(
             continue
         mode_mdl = seg_models.get('mode_model')
         dest_mdl = seg_models.get('dest_model')
+        if dest_mdl is not None:
+            # Ensure _segment is set so prediction path uses study-level size term
+            if not hasattr(dest_mdl, '_segment') or dest_mdl._segment is None:
+                dest_mdl._segment = seg
         if mode_mdl is None:
             continue
         if dest_mdl is not None and seg_models.get('od_calibration') is not None:
@@ -9293,7 +9908,7 @@ def _predict_batch(
                 dest_mdl._pred_zone_shares = seg_models.get('pred_zone_shares')
             except Exception:
                 pass
-        # Restore mode shares cache â€” mode_model.probability() fails after pkl reload
+        # Restore mode shares cache - mode_model.probability() fails after pkl reload
         # because the DataTree is not attached.  Use the stored shares instead.
         mode_mdl = seg_models.get('mode_model')
         if mode_mdl is not None and seg_models.get('pred_mode_shares') is not None:
@@ -9309,13 +9924,13 @@ def _predict_batch(
 
         seg_mask = df['segment'] == seg
         if not seg_mask.any():
-            logger.debug(f"_predict_batch: segment '{seg}' has 0 rows in act_df â€” skipping")
+            logger.debug(f"_predict_batch: segment '{seg}' has 0 rows in act_df - skipping")
             continue
 
-        # â”€â”€ Frozen person distance draws (work segment only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Frozen person distance draws (work segment only) ─────────────
         # Apply deterministic N(0, s_log_dist) offsets to pp['person_dist_draw']
         # before destination prediction.  c_person_dist_draw is work-only in
-        # DEST_UEC, but setting the column for all persons is harmless â€” it
+        # DEST_UEC, but setting the column for all persons is harmless - it
         # only enters the utility when the DEST_UEC entry is active.
         _s_log_dist = seg_models.get('s_log_dist', 0.0)
         if _s_log_dist > 0 and seg == 'work' and 'person_id' in pp.columns:
@@ -9330,38 +9945,38 @@ def _predict_batch(
                     f"(s_log_dist={_s_log_dist:.3f}, n={len(_dist_offsets)})"
                 )
             except Exception as _pdo_e:
-                logger.debug(f"_predict_batch [{seg}]: frozen dist offsets failed â€” {_pdo_e}")
+                logger.debug(f"_predict_batch [{seg}]: frozen dist offsets failed - {_pdo_e}")
 
         seg_rows = df[seg_mask].copy()
         n = len(seg_rows)
         print(f"    [{seg}] predicting {n} activities "
-              f"(mode_model={'âœ“' if mode_mdl else 'âœ—'}, "
-              f"dest_model={'âœ“' if dest_mdl else 'âœ—'})")
+              f"(mode_model={'✓' if mode_mdl else '✗'}, "
+              f"dest_model={'✓' if dest_mdl else '✗'})")
 
-        # â”€â”€ build properly structured tour DataFrame â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── build properly structured tour DataFrame ──────────────────
         # _mode_tree expects exact columns: ptour_id, person_id, OTAZ, DTAZ,
         # tour_mode, outbound_stops, n_shopping_out, incp, indp, vehrd,
         # STUDYING, sexp, walk_avail, bike_avail, main_purpose, primary_purpose
-        # seg_rows is Stage 4 activities output â€” build the correct structure.
+        # seg_rows is Stage 4 activities output - build the correct structure.
         def _to_int(series, default):
             return pd.to_numeric(series, errors='coerce').fillna(default).astype(int)
 
         otaz_vals = _to_int(seg_rows['OTAZ'], 1)
         dtaz_vals = _to_int(seg_rows.get('DTAZ', seg_rows['OTAZ']), 1)
 
-        # â”€â”€ compute mode availability per OD pair â€” vectorised â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── compute mode availability per OD pair - vectorised ────────────
         # Build a two-column lookup from skim_lookup dict once, then merge.
         # This replaces an O(n) Python loop with a single pandas merge.
         # SEQ SA2 zones are large (typically 5-30 km across); use generous
         # thresholds so walk/bike are available for nearby-zone trips rather
         # than being hard-blocked by zone geometry.  The utility function
         # (c_walk_time, c_bike_time) will naturally suppress long-distance
-        # walk/bike â€” the role of these flags is only to block physically
+        # walk/bike - the role of these flags is only to block physically
         # impossible trips (> 6 km on foot, > 25 km by bike).
-        WALK_MAX_KM   = 6.0    # was 3.0 â€” raised to match realistic walk access
-        BIKE_MAX_KM   = 25.0   # was 10.0 â€” raised for longer cycling
-        WALK_MAX_MIN  = 10.0   # was 5.0  â€” auto-IVT proxy fallback
-        BIKE_MAX_MIN  = 20.0   # was 12.0 â€” auto-IVT proxy fallback
+        WALK_MAX_KM   = 6.0    # was 3.0 - raised to match realistic walk access
+        BIKE_MAX_KM   = 25.0   # was 10.0 - raised for longer cycling
+        WALK_MAX_MIN  = 10.0   # was 5.0  - auto-IVT proxy fallback
+        BIKE_MAX_MIN  = 20.0   # was 12.0 - auto-IVT proxy fallback
 
         if skim_lookup:
             # Convert skim_lookup to a DataFrame keyed on (OTAZ, DTAZ)
@@ -9405,11 +10020,11 @@ def _predict_batch(
             walk_avail_vals = walk_ok.astype(int).tolist()
             bike_avail_vals = bike_ok.astype(int).tolist()
         else:
-            # No skim lookup â€” allow walk/bike for a reasonable proportion of trips.
+            # No skim lookup - allow walk/bike for a reasonable proportion of trips.
             # When no distance info exists, assume ~15% of trips are walkable (< 3 km)
             # and ~30% are bikeable (< 10 km) based on typical SEQ modal shares.
             # Use a deterministic assignment: mark every 7th trip as walk-ok,
-            # every 3rd trip as bike-ok â€” gives realistic availability share without
+            # every 3rd trip as bike-ok - gives realistic availability share without
             # a distance skim.
             intra = (otaz_vals == dtaz_vals).to_numpy()
             n_rows = len(intra)
@@ -9420,12 +10035,12 @@ def _predict_batch(
             walk_avail_vals = walk_arr.astype(int).tolist()
             bike_avail_vals = bike_arr.astype(int).tolist()
             logger.info(
-                f"_predict_batch [{seg}]: no skim_lookup â€” "
+                f"_predict_batch [{seg}]: no skim_lookup - "
                 f"walk_avail set for {int(walk_arr.sum())}/{n_rows} rows, "
                 f"bike_avail for {int(bike_arr.sum())}/{n_rows} rows"
             )
 
-        # â”€â”€ compute _time_period for c_peak_da â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── compute _time_period for c_peak_da ───────────────────────────
         # STARTIME is in minutes-from-midnight; same period mapping as preprocess_tours
         def _period_from_min(m):
             try:
@@ -9464,15 +10079,23 @@ def _predict_batch(
             'STUDYING':        _to_int(seg_rows.get('STUDYING', pd.Series(0, index=seg_rows.index)), 0),
             'sexp':            _to_int(seg_rows.get('sexp', pd.Series(1, index=seg_rows.index)), 1),
             # New behavioural columns on the tour table (mirrors person.xxx for tour.xxx path)
+            # TODO(CARLICENCE): keep this embedded tour-table fallback aligned
+            # with _ensure_person_behavioural_cols for lowercase synth input.
             '_time_period':    time_periods,
             'age5p':           _to_int(seg_rows.get('age5p',      pd.Series(6,  index=seg_rows.index)), 6),
-            'CARLICENCE':      _to_int(seg_rows.get('CARLICENCE', pd.Series(1,  index=seg_rows.index)), 1),
+            'CARLICENCE':      _to_int(
+                seg_rows.get(
+                    'CARLICENCE',
+                    seg_rows.get('carlicence', pd.Series(1, index=seg_rows.index))
+                ),
+                1
+            ),
             'occp_group':      _to_int(seg_rows.get('occp_group', pd.Series(0,  index=seg_rows.index)), 0),
             'bikes':           _to_int(seg_rows.get('bikes',      pd.Series(0,  index=seg_rows.index)), 0),
             'nprd':            _to_int(seg_rows.get('nprd',       pd.Series(2,  index=seg_rows.index)), 2),
             'walk_avail':      pd.Series(walk_avail_vals, index=seg_rows.index),
             'bike_avail':      pd.Series(bike_avail_vals, index=seg_rows.index),
-            # weight=1 during prediction â€” avoids 'unable to rewrite weight to itself'
+            # weight=1 during prediction - avoids 'unable to rewrite weight to itself'
             'weight':          pd.Series(1.0, index=seg_rows.index),
         }).set_index('ptour_id')
 
@@ -9480,7 +10103,7 @@ def _predict_batch(
         seg_rows = seg_rows.copy()
         seg_rows['ptour_id'] = tour_rows.index.values
 
-        # â”€â”€ destination prediction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── destination prediction ────────────────────────────────────
         # Nonmand: always needs model.
         # Work/edu: run model for rows that have no usual-location (DTAZ==-1).
         #           Rows with DTAZ already set (usual-location) are left alone.
@@ -9515,7 +10138,7 @@ def _predict_batch(
                 _m_coef = seg_models.get('mode_coef') or seg_models.get('coef') or {}
                 ls_batch   = _logsums(mode_mdl, dt_m_batch, skims=skims, verbose=False,
                                       coef_override=_m_coef)
-                # Standardize logsums to mean=0, std=1 â€” must match the scale used
+                # Standardize logsums to mean=0, std=1 - must match the scale used
                 # during estimation (see _run_segment line ~3499).  Without this,
                 # c_logsum (estimated against standardized values) applies to raw
                 # logsums and produces systematically wrong destination utilities.
@@ -9554,8 +10177,8 @@ def _predict_batch(
                 zone_ids_pred = list(ls_batch.coords['zones'].values)
 
                 # Destination prediction: all-zones softmax OR ActivitySim-style sampling
-                # DEST_CHOICE_SAMPLE_SIZE == 0 â†’ compute utility over ALL zones, sample directly
-                # DEST_CHOICE_SAMPLE_SIZE  > 0 â†’ sample N alternatives then resimulate
+                # DEST_CHOICE_SAMPLE_SIZE == 0 → compute utility over ALL zones, sample directly
+                # DEST_CHOICE_SAMPLE_SIZE  > 0 → sample N alternatives then resimulate
                 print(f"      [{seg}] dest predict: {len(pred_seg_rows)} choosers, "
                       f"{len(zone_ids_pred)} dest zones, sample_size={DEST_CHOICE_SAMPLE_SIZE or 'ALL'}")
 
@@ -9650,9 +10273,14 @@ def _predict_batch(
                     f"Dest model failed [{seg}]: {e!r}\n"
                     f"  Traceback: {_tb.format_exc(limit=4)}"
                 )
-                print(f"      [{seg}] dest model FAILED: {e!r} â€” using gravity fallback")
+                _strict_seg = os.environ.get('STAGE5_STRICT_ESTIMATION', '1') != '0'
+                if _strict_seg:
+                    raise RuntimeError(
+                        f"Destination model prediction failed for segment '{seg}' in strict mode"
+                    ) from e
+                print(f"      [{seg}] dest model FAILED: {e!r} - using gravity fallback")
 
-            # â”€â”€ gravity fallback: size_term Ã— exp(-Î² Ã— auto_IVT) â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── gravity fallback: size_term × exp(-β × auto_IVT) ─────────
             # Runs when Larch is degenerate or fails.  Samples across ALL
             # 329 zones so destinations are not collapsed to a handful.
             if needs_gravity:
@@ -9669,13 +10297,13 @@ def _predict_batch(
                         pd.to_numeric(lu_st['size_term'], errors='coerce')
                         .fillna(0.0).clip(lower=-30, upper=30).values
                     )
-                    beta_ivt  = -0.05   # was -0.10 (too strong â†’ only 40-90 unique zones)
+                    beta_ivt  = -0.05   # was -0.10 (too strong → only 40-90 unique zones)
                     # At -0.05: 30-min trip weight = exp(-1.5)=0.22 vs exp(-3.0)=0.05 at -0.10
                     # This spreads destinations more realistically across 330 SEQ zones.
 
                     # Vectorised gravity fallback:
                     # 1. Build OD IVT matrix for all (person_origin, zone) pairs
-                    # Prefer pred_seg_rows['OTAZ'] â€” it comes directly from the
+                    # Prefer pred_seg_rows['OTAZ'] - it comes directly from the
                     # activity DataFrame and is always populated (set at the top
                     # of _predict_batch).  pred_tour_rows may have stale/wrong
                     # OTAZs if the DataTree case-key alignment earlier failed.
@@ -9719,7 +10347,7 @@ def _predict_batch(
                     n_uniq = df.loc[predict_mask, 'DTAZ'].nunique()
                     logger.info(
                         f"Gravity fallback [{seg}]: placed {n_placed}/"
-                        f"{len(pred_seg_rows)} â†’ {n_uniq} unique zones"
+                        f"{len(pred_seg_rows)} → {n_uniq} unique zones"
                     )
                     print(f"      [{seg}] gravity fallback: {n_uniq} unique dest zones "
                           f"({n_placed}/{len(pred_seg_rows)} placed)")
@@ -9731,13 +10359,13 @@ def _predict_batch(
                     )
                     print(f"      [{seg}] gravity fallback FAILED: {eg!r}")
 
-        # â”€â”€ clean up any remaining -1 sentinel (model+gravity both failed) â”€
+        # ── clean up any remaining -1 sentinel (model+gravity both failed) ─
         unset = seg_mask & (df['DTAZ'] == -1)
         if unset.any():
             df.loc[unset, 'DTAZ'] = df.loc[unset, 'OTAZ']
-            logger.debug(f"{unset.sum()} {seg} rows defaulted DTAZâ†’OTAZ")
+            logger.debug(f"{unset.sum()} {seg} rows defaulted DTAZ→OTAZ")
 
-        # â”€â”€ mode prediction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── mode prediction ───────────────────────────────────────────
         try:
             # update DTAZ in tour_rows from df predictions
             tour_rows['DTAZ'] = df.loc[seg_rows.index, 'DTAZ'].values
@@ -9753,7 +10381,7 @@ def _predict_batch(
             except Exception:
                 pass
 
-            # â”€â”€ Attempt 0: frozen cell probabilities (most stable) â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── Attempt 0: frozen cell probabilities (most stable) ────────
             # HHTS-estimated cell probabilities applied directly to synth pop.
             # No MC noise, fully reproducible, industry/occupation-aware.
             mode_probs = None
@@ -9769,7 +10397,7 @@ def _predict_batch(
                     logger.debug(f"Mode frozen-probs failed [{seg}]: {_fe}")
                     mode_probs = None
 
-            # â”€â”€ Attempt 1: Larch probability() â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── Attempt 1: Larch probability() ────────────────────────────
             if mode_probs is None:
                 try:
                     mode_mdl.datatree = dt_m_mode
@@ -9783,11 +10411,11 @@ def _predict_batch(
                     logger.debug(f"Mode Larch path succeeded [{seg}]")
                 except Exception as larch_e:
                     logger.debug(
-                        f"Mode Larch path failed [{seg}] ({larch_e}) â€” "
+                        f"Mode Larch path failed [{seg}] ({larch_e}) - "
                         "trying numpy coefficient fallback"
                     )
 
-            # â”€â”€ Attempt 2: numpy coefficient fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── Attempt 2: numpy coefficient fallback ─────────────────────
             if mode_probs is None:
                 # Pass the NL mode model coefs (plain dict, pickle-safe).
                 # 'mode_coef' is extracted at estimation time and survives pkl.
@@ -9805,6 +10433,28 @@ def _predict_batch(
 
             if mode_probs is not None:
                 alt_arr   = np.array(alt_ids)
+
+                # Segment-level share stabilization to avoid DA-collapse in
+                # fallback prediction paths (especially when coefficient caches
+                # are incomplete after reloads).
+                _target_shares = seg_models.get('pred_mode_shares')
+                if _target_shares is None:
+                    _fp = seg_models.get('frozen_probs')
+                    if isinstance(_fp, pd.DataFrame) and len(_fp) > 0:
+                        try:
+                            _target_shares = {
+                                1: float(_fp['p_DA'].mean()),
+                                2: float(_fp['p_SR'].mean()),
+                                3: float(_fp['p_Walk'].mean()),
+                                4: float(_fp['p_Bike'].mean()),
+                                5: float(_fp['p_Transit'].mean()),
+                            }
+                        except Exception:
+                            _target_shares = None
+                mode_probs = _stabilize_mode_probs_stage5(
+                    mode_probs, alt_ids, _target_shares, seg=seg
+                )
+
                 row_sums  = mode_probs.sum(axis=1, keepdims=True)
                 row_sums  = np.where(row_sums > 0, row_sums, 1.0)
                 mode_norm = mode_probs.astype(np.float64) / row_sums
@@ -9816,16 +10466,16 @@ def _predict_batch(
             # if both fail pred_mode stays as default DA (1) set at top of _predict_batch
 
         except Exception as e:
-            logger.warning(f"Batch mode prediction failed for {seg}: {e} â€” using DA")
+            logger.warning(f"Batch mode prediction failed for {seg}: {e} - using DA")
 
-    # â”€â”€ final guard: replace any DTAZ <= 0 with OTAZ (never output zone 0) â”€â”€
+    # ── final guard: replace any DTAZ <= 0 with OTAZ (never output zone 0) ──
     _dtaz_invalid = df['DTAZ'] <= 0
     if _dtaz_invalid.any():
         _otaz_fb = pd.to_numeric(df.loc[_dtaz_invalid, 'OTAZ'], errors='coerce').fillna(1).astype(int).clip(lower=1)
         df.loc[_dtaz_invalid, 'DTAZ'] = _otaz_fb
         logger.warning(
-            f"_predict_batch: {int(_dtaz_invalid.sum())} rows had DTAZ<=0 â€” "
-            f"replaced with OTAZ (valid zones are 1â€“329)"
+            f"_predict_batch: {int(_dtaz_invalid.sum())} rows had DTAZ<=0 - "
+            f"replaced with OTAZ (valid zones are 1-329)"
         )
 
     return df
@@ -9855,14 +10505,23 @@ def _build_trip_chain(
         df = df.rename(columns={'PERSID': 'person_id'})
     if 'purpose' not in df.columns and 'DESTPURP' in df.columns:
         df = df.rename(columns={'DESTPURP': 'purpose'})
+    if 'purpose' not in df.columns and 'primary_purpose' in df.columns:
+        df = df.rename(columns={'primary_purpose': 'purpose'})
+    if 'purpose' not in df.columns and 'Purpose' in df.columns:
+        df = df.rename(columns={'Purpose': 'purpose'})
+    if 'purpose' not in df.columns:
+        raise KeyError(
+            "_build_trip_chain requires a 'purpose' column "
+            "(or DESTPURP/primary_purpose/Purpose alias)"
+        )
     if 'main_purpose' not in df.columns and 'purpose' in df.columns:
         df['main_purpose'] = df['purpose']
 
-    # Zone 0 is never a valid origin â€” NaN/invalid OTAZ â†’ zone 1 (prevents
+    # Zone 0 is never a valid origin - NaN/invalid OTAZ → zone 1 (prevents
     # DTAZ defaulting to 0 when the model falls back to DTAZ=OTAZ).
     df['OTAZ'] = pd.to_numeric(df['OTAZ'], errors='coerce').fillna(1).astype(int).clip(lower=1)
 
-    # â”€â”€ Deduplicate activities: drop rows with identical person+purpose+STARTIME â”€â”€
+    # ── Deduplicate activities: drop rows with identical person+purpose+STARTIME ──
     # Stage 4 batch processing can produce duplicate rows when a person appears
     # in multiple zone batches. Deduplicate before building the chain.
     before_dedup = len(df)
@@ -9874,13 +10533,13 @@ def _build_trip_chain(
         logger.info(
             f"_build_trip_chain: deduplication removed "
             f"{before_dedup - len(df)} duplicate activity rows "
-            f"({before_dedup} â†’ {len(df)})"
+            f"({before_dedup} → {len(df)})"
         )
 
-    # â”€â”€ Enforce per-person activity cap BEFORE chain building â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Enforce per-person activity cap BEFORE chain building ─────────────
     # Stage 4 can schedule many activities; cap at a realistic daily maximum.
     # Keep mandatory activities (work/edu) first, then fill with nonmand.
-    MAX_ACTS_PER_PERSON = 6   # realistic daily cap: 1â€“2 mandatory + up to 4 nonmand
+    MAX_ACTS_PER_PERSON = 6   # realistic daily cap: 1-2 mandatory + up to 4 nonmand
 
     def _cap_activities(grp):
         mandatory = grp[grp['purpose'].isin(['work', 'edu'])]
@@ -9896,15 +10555,15 @@ def _build_trip_chain(
         logger.info(
             f"_build_trip_chain: activity cap ({MAX_ACTS_PER_PERSON}/person) "
             f"removed {before_cap - len(df)} excess activities "
-            f"({before_cap} â†’ {len(df)})"
+            f"({before_cap} → {len(df)})"
         )
 
     # assign segment column for batch routing
     df['segment'] = df['purpose'].apply(_purpose_to_seg)
 
-    # â”€â”€ Home zone: use persons table OTAZ, NOT max(activity OTAZ) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Home zone: use persons table OTAZ, NOT max(activity OTAZ) ──────────
     # max(OTAZ) gives the highest zone-ID number, which is almost never home.
-    # Priority: persons.OTAZ â†’ persons.HOME_TAZ â†’ persons.home_taz â†’ fallback.
+    # Priority: persons.OTAZ → persons.HOME_TAZ → persons.home_taz → fallback.
     pp_home = persons.copy()
     if 'person_id' not in pp_home.columns and 'PERSID' in pp_home.columns:
         pp_home = pp_home.rename(columns={'PERSID': 'person_id'})
@@ -9941,7 +10600,7 @@ def _build_trip_chain(
         pp = pp.rename(columns={'PERSID': 'person_id'})
     pp['person_id'] = pp['person_id'].astype(str)
 
-    # â”€â”€ build usual location lookups â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── build usual location lookups ──────────────────────────────────
     # Priority: WORK_TAZ / SCHOOL_TAZ on the activities DataFrame (injected by
     # run_stage5 from usual_location.py).  Fallback: read from persons table
     # directly (in case run_stage5 merge was skipped or failed).
@@ -9975,7 +10634,7 @@ def _build_trip_chain(
 
     rng = np.random.default_rng(seed)
 
-    # â”€â”€ STEP 1: vectorised batch prediction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── STEP 1: vectorised batch prediction ───────────────────────────
     print("  Running vectorised destination + mode prediction...")
     _pred_ok = False
     if LARCH_AVAILABLE and models:
@@ -10001,14 +10660,14 @@ def _build_trip_chain(
         df['pred_mode'] = 1
         if not models:
             logger.warning(
-                "_build_trip_chain: models dict is empty â€” no Larch models were "
+                "_build_trip_chain: models dict is empty - no Larch models were "
                 "estimated or loaded.  Check that _run_segment produced results and "
                 "that save_path/load_path are correct."
             )
     print(f"  Batch prediction complete: {df['DTAZ'].nunique()} unique destination zones "
           f"({'model' if _pred_ok else 'gravity/default fallback'})")
 
-    # â”€â”€ STEP 1b: hard distance cap for nonmandatory destinations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── STEP 1b: hard distance cap for nonmandatory destinations ──────────
     # The destination model can assign implausibly distant zones (~100+ km)
     # for nonmandatory activities (social, shopping, etc.).  Cap these at
     # MAX_NONMAND_DIST_KM from the person's home zone and fall back to the
@@ -10029,12 +10688,12 @@ def _build_trip_chain(
         if _cap_count:
             logger.info(
                 f"_build_trip_chain: capped {_cap_count} nonmandatory destinations "
-                f">{MAX_NONMAND_DIST_KM:.0f} km from home â†’ home zone fallback"
+                f">{MAX_NONMAND_DIST_KM:.0f} km from home → home zone fallback"
             )
 
-    # â”€â”€ STEP 2: build tour-structured trip chain â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── STEP 2: build tour-structured trip chain ───────────────────────────
     # ActivitySim tour model: each out-of-home activity is its own HOME-BASED
-    # TOUR: home â†’ activity â†’ home.  Mandatory activities come first; non-
+    # TOUR: home → activity → home.  Mandatory activities come first; non-
     # mandatory tours are placed in the remaining time windows.
     #
     # For each person:
@@ -10042,8 +10701,8 @@ def _build_trip_chain(
     #   2. Group into tours: mandatory activities each form a simple tour;
     #      non-mandatory activities with overlapping/adjacent windows share a tour.
     #   3. Build the chain for each tour, then the full day chain:
-    #        home â†’ [mandatory tour 1] â†’ home â†’ [mandatory tour 2] â†’ home
-    #             â†’ [nonmand tour 1]  â†’ home â†’ [nonmand tour 2]   â†’ home
+    #        home → [mandatory tour 1] → home → [mandatory tour 2] → home
+    #             → [nonmand tour 1]  → home → [nonmand tour 2]   → home
     #   4. STARTIME for each trip uses the activity's scheduled start time from
     #      Stage 4, minus the predicted travel time, so the schedule is preserved.
     #
@@ -10060,7 +10719,7 @@ def _build_trip_chain(
         mand_grp  = grp[grp['purpose'].isin(['work', 'edu'])].copy()
         nmand_grp = grp[~grp['purpose'].isin(['work', 'edu'])].copy()
 
-        # Build tour list: [(activity_row, ...), ...] â€” each tuple is one tour
+        # Build tour list: [(activity_row, ...), ...] - each tuple is one tour
         # Mandatory: one tour per activity (simple work/edu tour)
         # Non-mandatory: group activities that are within 30 min of each other
         #   into a joint tour (e.g. shopping + eat in the same trip out)
@@ -10100,18 +10759,18 @@ def _build_trip_chain(
         global_seq = 0
 
         for tour_idx, (tour_type, tour_acts) in enumerate(tours):
-            # â”€â”€ determine tour-level mode (use pred_mode of first activity) â”€â”€
+            # ── determine tour-level mode (use pred_mode of first activity) ──
             first_act   = tour_acts[0]
             tour_mode   = int(first_act.get('pred_mode', 1))
             first_dtaz  = int(first_act.get('DTAZ', home_z))
 
-            # â”€â”€ outbound leg: home â†’ first activity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── outbound leg: home → first activity ───────────────────────
             # Use the activity's scheduled STARTIME from Stage 4 as the
             # ARRIVAL time at the destination, then subtract travel time to
             # get the departure time from home.
             outbound_tt = _get_tt(skim_lookup, home_z, first_dtaz, tour_mode)
             first_startime = float(first_act.get('STARTIME', 480))
-            # Departure from home = scheduled arrival âˆ’ travel time
+            # Departure from home = scheduled arrival − travel time
             depart_home = max(first_startime - outbound_tt, 0.0)
 
             out_trip = {
@@ -10133,7 +10792,7 @@ def _build_trip_chain(
             all_rows.append(out_trip)
             global_seq += 1
 
-            # â”€â”€ activity dwells + intra-tour legs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── activity dwells + intra-tour legs ────────────────────────
             cursor_zone = first_dtaz
             for act_i, act_row in enumerate(tour_acts):
                 dtaz      = int(act_row.get('DTAZ', cursor_zone))
@@ -10190,7 +10849,7 @@ def _build_trip_chain(
                 global_seq += 1
                 cursor_zone = dtaz
 
-            # â”€â”€ return home leg â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── return home leg ────────────────────────────────────────
             last_act    = tour_acts[-1]
             last_dtaz   = int(last_act.get('DTAZ', cursor_zone))
             return_tt   = _get_tt(skim_lookup, last_dtaz, home_z, tour_mode)
@@ -10217,7 +10876,7 @@ def _build_trip_chain(
             all_rows.append(home_trip)
             global_seq += 1
 
-            # â”€â”€ home dwell between tours â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── home dwell between tours ───────────────────────────────────
             # Insert a 'home' activity row between every pair of consecutive tours
             # so the plan has no back-to-back trip rows at tour boundaries.
             if tour_idx < len(tours) - 1:
@@ -10256,12 +10915,12 @@ def _build_trip_chain(
     plan['OTAZ'] = plan['OTAZ'].fillna(1).astype(int).clip(lower=1)
     # Replace NaN DTAZ with OTAZ so zone 0 never appears in the output
     plan['DTAZ'] = plan['DTAZ'].fillna(plan['OTAZ']).astype(int)
-    # Guard: any remaining 0s â†’ replace with OTAZ (already â‰¥1)
+    # Guard: any remaining 0s → replace with OTAZ (already ≥1)
     plan.loc[plan['DTAZ'] <= 0, 'DTAZ'] = plan.loc[plan['DTAZ'] <= 0, 'OTAZ']
     plan['STARTIME'] = plan['STARTIME'].fillna(0)
     plan['ENDTIME']  = plan['ENDTIME'].fillna(0)
 
-    # â”€â”€ Vehicle ID assignment + joint household travel coordination â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Vehicle ID assignment + joint household travel coordination ────────
     plan = _assign_vehicle_ids(plan, persons)
 
     return plan
@@ -10278,24 +10937,24 @@ def _assign_vehicle_ids(
     -----
     1. Each household has vehrd vehicles numbered {hhid}_v1, {hhid}_v2, ...
     2. DA trips consume one vehicle slot (cycling through the household fleet).
-    3. SR trips that are 'joint' (same hhid, overlapping time window Â±30 min,
-       same DTAZ) share the DA driver's vehicle_id â€” they travel together.
+    3. SR trips that are 'joint' (same hhid, overlapping time window ±30 min,
+       same DTAZ) share the DA driver's vehicle_id - they travel together.
     4. SR trips with no matching DA driver get a {hhid}_sr_{n} pseudo-vehicle.
     5. Non-motorised trips (Walk/Bike) and Transit get vehicle_id = ''.
 
     Joint household detection
     -------------------------
     Two trip-rows are considered joint if they share:
-      â€¢ same hhid
-      â€¢ same DTAZ
-      â€¢ STARTIME within JOINT_TIME_WINDOW minutes of each other
+      • same hhid
+      • same DTAZ
+      • STARTIME within JOINT_TIME_WINDOW minutes of each other
 
     The DA person's vehicle_id is propagated to all SR co-travellers.
 
     This ensures the total number of unique vehicle-time-slots (car trips)
     is stable and consistent with the household vehicle fleet.
     """
-    JOINT_TIME_WINDOW = 30.0   # minutes â€” trips within this window are co-travellers
+    JOINT_TIME_WINDOW = 30.0   # minutes - trips within this window are co-travellers
     DA_MODE  = 1
     SR_MODE  = 2
     MOTOR_MODES = {DA_MODE, SR_MODE}
@@ -10303,7 +10962,7 @@ def _assign_vehicle_ids(
     plan = plan.copy()
     plan['vehicle_id'] = ''
 
-    # â”€â”€ Build person â†’ household mapping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Build person → household mapping ──────────────────────────────────
     pp = persons.copy()
     if 'person_id' not in pp.columns and 'PERSID' in pp.columns:
         pp = pp.rename(columns={'PERSID': 'person_id'})
@@ -10328,7 +10987,7 @@ def _assign_vehicle_ids(
         else:
             hhid_to_vehrd = {}
     else:
-        # No household column â€” every person is their own household
+        # No household column - every person is their own household
         pid_to_hhid   = {str(pid): str(pid) for pid in plan['person_id'].unique()}
         hhid_to_vehrd = {}
 
@@ -10336,7 +10995,7 @@ def _assign_vehicle_ids(
         plan['person_id'].astype(str)
     )
 
-    # â”€â”€ Extract motorised trip rows only â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Extract motorised trip rows only ──────────────────────────────────
     trip_mask = (plan['row_type'] == 'trip') & plan['mode'].isin(MOTOR_MODES)
     if not trip_mask.any():
         plan = plan.drop(columns=['_hhid'])
@@ -10345,11 +11004,11 @@ def _assign_vehicle_ids(
     trips = plan.loc[trip_mask].copy()
     trips['_vehrd'] = trips['_hhid'].map(hhid_to_vehrd).fillna(1).astype(int).clip(lower=1)
 
-    # â”€â”€ Phase 1: assign vehicle slots to DA trips â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Phase 1: assign vehicle slots to DA trips ─────────────────────────
     # Counter per household tracks how many vehicles have been allocated
     # (cycling: person n uses vehicle (n-1) % vehrd + 1).
-    hhid_da_counter: dict = {}   # hhid â†’ int (number of DA trips allocated so far)
-    da_idx_to_vid: dict   = {}   # plan row index â†’ vehicle_id string
+    hhid_da_counter: dict = {}   # hhid → int (number of DA trips allocated so far)
+    da_idx_to_vid: dict   = {}   # plan row index → vehicle_id string
 
     da_trips = trips[trips['mode'] == DA_MODE].sort_values(['_hhid', 'STARTIME'])
     for row_idx, row in da_trips.iterrows():
@@ -10363,16 +11022,16 @@ def _assign_vehicle_ids(
 
     plan.loc[list(da_idx_to_vid.keys()), 'vehicle_id'] = pd.Series(da_idx_to_vid)
 
-    # â”€â”€ Phase 2: joint SR trips â€” share DA vehicle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # Build a lookup: (hhid, DTAZ, time_bucket) â†’ vehicle_id from DA trips
+    # ── Phase 2: joint SR trips - share DA vehicle ────────────────────────
+    # Build a lookup: (hhid, DTAZ, time_bucket) → vehicle_id from DA trips
     # time_bucket = floor(STARTIME / JOINT_TIME_WINDOW) for quick matching
-    da_lookup: dict = {}   # (hhid, dtaz, bucket) â†’ vehicle_id
+    da_lookup: dict = {}   # (hhid, dtaz, bucket) → vehicle_id
     for row_idx, vid in da_idx_to_vid.items():
         row = plan.loc[row_idx]
         hhid   = str(row['_hhid'])
         dtaz   = int(row['DTAZ'])
         bucket = int(float(row['STARTIME']) // JOINT_TIME_WINDOW)
-        # register for this bucket and adjacent buckets (Â±1) to catch boundary trips
+        # register for this bucket and adjacent buckets (±1) to catch boundary trips
         for b in (bucket - 1, bucket, bucket + 1):
             key = (hhid, dtaz, b)
             if key not in da_lookup:
@@ -10392,7 +11051,7 @@ def _assign_vehicle_ids(
             if vid:
                 break
         if vid is None:
-            # No matching DA driver â€” SR is either a taxi/rideshare or lone SR
+            # No matching DA driver - SR is either a taxi/rideshare or lone SR
             n_sr = hhid_sr_counter.get(hhid, 0)
             vid  = f"{hhid}_sr{n_sr + 1}"
             hhid_sr_counter[hhid] = n_sr + 1
@@ -10402,7 +11061,7 @@ def _assign_vehicle_ids(
     n_da  = trip_mask.sum()
     n_vid = (plan['vehicle_id'] != '').sum()
     logger.info(
-        f"_assign_vehicle_ids: {n_da} motorised trips â†’ "
+        f"_assign_vehicle_ids: {n_da} motorised trips → "
         f"{n_vid} vehicle_id assignments "
         f"({plan.loc[plan['vehicle_id']!='','vehicle_id'].nunique()} unique vehicles)"
     )
@@ -10478,13 +11137,13 @@ def save_models(models, path='saved_data/stage5_models.pkl'):
     then fall back to saving coefficient DataFrames only.
 
     DataTree objects (dt_mode, dt_dest, logsums) are always stripped before
-    saving â€” they reference live OMX handles and xarray objects that can't be
+    saving - they reference live OMX handles and xarray objects that can't be
     meaningfully serialised.
     """
     from paper_model_forms import write_stage_paper_artifacts
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
 
-    # Strip un-serialisable DataTree / xarray objects â€” they're not needed
+    # Strip un-serialisable DataTree / xarray objects - they're not needed
     # for reload since the model parameters are in mode_model.pf / dest_model.pf
     STRIP_KEYS = {'dt_mode', 'dt_dest', 'logsums'}
 
@@ -10527,9 +11186,9 @@ def save_models(models, path='saved_data/stage5_models.pkl'):
         models_slim[seg] = slim_res
 
     # Serialisation order:
-    #   1. cloudpickle â€” ships with most conda ML environments, handles lambdas
-    #   2. dill        â€” fallback if cloudpickle unavailable
-    #   3. pickle      â€” last resort; will fail on DictOfAlts lambdas but worth trying
+    #   1. cloudpickle - ships with most conda ML environments, handles lambdas
+    #   2. dill        - fallback if cloudpickle unavailable
+    #   3. pickle      - last resort; will fail on DictOfAlts lambdas but worth trying
     # If all three fail the coefficient CSV is still written below.
     saved = False
 
@@ -10537,7 +11196,7 @@ def save_models(models, path='saved_data/stage5_models.pkl'):
         import cloudpickle
         with open(path, 'wb') as f:
             cloudpickle.dump(models_slim, f)
-        print(f"  Stage 5 models saved (cloudpickle) â†’ {path}")
+        print(f"  Stage 5 models saved (cloudpickle) → {path}")
         saved = True
     except Exception as cp_err:
         logger.warning(f"cloudpickle failed ({cp_err}), trying dill...")
@@ -10547,7 +11206,7 @@ def save_models(models, path='saved_data/stage5_models.pkl'):
             import dill
             with open(path, 'wb') as f:
                 dill.dump(models_slim, f)
-            print(f"  Stage 5 models saved (dill) â†’ {path}")
+            print(f"  Stage 5 models saved (dill) → {path}")
             saved = True
         except Exception as dill_err:
             logger.warning(f"dill failed ({dill_err}), trying pickle...")
@@ -10556,22 +11215,22 @@ def save_models(models, path='saved_data/stage5_models.pkl'):
         try:
             with open(path, 'wb') as f:
                 pickle.dump(models_slim, f)
-            print(f"  Stage 5 models saved (pickle) â†’ {path}")
+            print(f"  Stage 5 models saved (pickle) → {path}")
             saved = True
         except Exception as pkl_err:
             logger.warning(
                 f"pickle also failed ({pkl_err}). "
-                "Models stay in memory only â€” coefficient CSV still saved. "
+                "Models stay in memory only - coefficient CSV still saved. "
                 "To fix: conda install cloudpickle  or  pip install cloudpickle"
             )
 
-    # Always save human-readable CSV + HTML â€” wrapped in try/except so a
+    # Always save human-readable CSV + HTML - wrapped in try/except so a
     # crash here can't mask a successful PKL save above.
     coef_path = path.replace('.pkl', '_coefficients.csv')
     try:
         _save_coefficients(models, coef_path)
     except Exception as _ce:
-        logger.error(f"_save_coefficients failed: {_ce} â€” coefficients not saved to {coef_path}")
+        logger.error(f"_save_coefficients failed: {_ce} - coefficients not saved to {coef_path}")
         import traceback; logger.debug(traceback.format_exc())
 
     # Always emit a lightweight stage trace artifact for post-mortem debugging,
@@ -10594,7 +11253,7 @@ def save_models(models, path='saved_data/stage5_models.pkl'):
             )
         with open(trace_path, 'w', encoding='utf-8') as _tf:
             _tf.write('\n'.join(lines) + '\n')
-        print(f"  Stage 5 trace saved â†’ {trace_path}")
+        print(f"  Stage 5 trace saved → {trace_path}")
     except Exception as _trace_e:
         logger.debug(f"stage5 trace write failed: {_trace_e}")
 
@@ -10607,7 +11266,7 @@ def save_models(models, path='saved_data/stage5_models.pkl'):
 def _safe_larch_setstate(self, state):
     """
     Patched __setstate__ that skips attributes Larch no longer supports.
-    Larch changed its API between versions â€” 'availability_any' was removed.
+    Larch changed its API between versions - 'availability_any' was removed.
     Without this patch, loading a model saved with an older Larch crashes with:
       TypeError: Cannot set 'availability_any' on object of type Model
     """
@@ -10642,7 +11301,7 @@ def load_models(path='saved_data/stage5_models.pkl'):
     """
     Load models saved by save_models().
 
-    Tries cloudpickle â†’ dill â†’ pickle. In each case, patches Larch's
+    Tries cloudpickle → dill → pickle. In each case, patches Larch's
     __setstate__ first so attributes removed in newer Larch versions
     (e.g. 'availability_any') are silently skipped rather than crashing.
     """
@@ -10673,7 +11332,7 @@ def load_models(path='saved_data/stage5_models.pkl'):
                     if _coef:
                         _mdl._coef_cache = dict(_coef)
                         _res[_ckey] = dict(_coef)
-            print(f"Stage 5 models loaded ({loader_name}) â† {path}")
+            print(f"Stage 5 models loaded ({loader_name}) ← {path}")
             return models
         except ImportError:
             continue
@@ -10687,9 +11346,9 @@ def load_models(path='saved_data/stage5_models.pkl'):
     )
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # LOCATION CHOICE SUMMARY  (ActivitySim-style output)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def save_location_choice_summary(
     models: dict,
@@ -10801,14 +11460,14 @@ def save_location_choice_summary(
                 seg_df = pd.DataFrame(seg_rows)
                 seg_path = os.path.join(out_dir, f'{seg}_{mtype}_coefficients.csv')
                 seg_df.to_csv(seg_path, index=False)
-                logger.info(f"  Location choice: {seg}/{mtype} coefficients â†’ {seg_path}")
+                logger.info(f"  Location choice: {seg}/{mtype} coefficients → {seg_path}")
 
     # Combined summary CSV
     if all_rows:
         summary_df = pd.DataFrame(all_rows)
         summary_path = os.path.join(out_dir, 'location_choice_summary.csv')
         summary_df.to_csv(summary_path, index=False)
-        logger.info(f"  Location choice summary â†’ {summary_path}")
+        logger.info(f"  Location choice summary → {summary_path}")
 
         # HTML report
         _write_location_choice_html(summary_df, models, out_dir)
@@ -10829,9 +11488,9 @@ def save_location_choice_summary(
                 choosers_path, index=False
             )
             obs_lc[['chooser_id', 'choice']].to_csv(choices_path, index=False)
-            logger.info(f"  Location choice observations â†’ {obs_path}")
-            logger.info(f"  Location choice choosers â†’ {choosers_path}")
-            logger.info(f"  Location choice choices â†’ {choices_path}")
+            logger.info(f"  Location choice observations → {obs_path}")
+            logger.info(f"  Location choice choosers → {choosers_path}")
+            logger.info(f"  Location choice choices → {choices_path}")
             _val_df, _val_sum = _location_choice_validation(obs_lc, models, landuse, out_dir)
             # Re-render the coefficient HTML with zone validation embedded
             if all_rows and _val_df is not None:
@@ -10839,7 +11498,7 @@ def save_location_choice_summary(
                 _write_location_choice_html(summary_df, models, out_dir,
                                             val_df=_val_df, val_summary=_val_sum)
 
-    logger.info(f"  Location choice outputs saved â†’ {out_dir}/")
+    logger.info(f"  Location choice outputs saved → {out_dir}/")
     return out_dir
 
 
@@ -10866,20 +11525,20 @@ def _write_location_choice_html(summary_df: pd.DataFrame, models: dict, out_dir:
                 p   = r.get('p_value', float('nan'))
                 try:
                     at = abs(float(t))
-                    sig = 'â˜…â˜…â˜…' if at > 3.3 else 'â˜…â˜…' if at > 2.6 else 'â˜…' if at > 1.96 else ''
+                    sig = '★★★' if at > 3.3 else '★★' if at > 2.6 else '★' if at > 1.96 else ''
                     t_color = '#1a7a1a' if at > 3.3 else '#2e7d32' if at > 2.6 else '#558b2f' if at > 1.96 else '#b71c1c'
                 except Exception:
                     sig = ''; t_color = '#888'
                 try:
                     pf = float(p)
-                    p_str = f'{pf:.4f}' if np.isfinite(pf) else 'â€”'
+                    p_str = f'{pf:.4f}' if np.isfinite(pf) else '-'
                     p_color = '#1a7a1a' if pf < 0.001 else '#2e7d32' if pf < 0.01 else '#558b2f' if pf < 0.05 else '#f57c00' if pf < 0.10 else '#b71c1c'
                     p_bold = 'font-weight:bold;' if pf < 0.01 else ''
                 except Exception:
-                    p_str = 'â€”'; p_color = '#888'; p_bold = ''
+                    p_str = '-'; p_color = '#888'; p_bold = ''
                 val_str = f"{r['value']:.4f}"
-                se_str  = f"{r['std_err']:.4f}" if np.isfinite(float(r['std_err'])) else 'â€”'
-                t_str   = f"{float(t):.2f}" if np.isfinite(float(t)) else 'â€”'
+                se_str  = f"{r['std_err']:.4f}" if np.isfinite(float(r['std_err'])) else '-'
+                t_str   = f"{float(t):.2f}" if np.isfinite(float(t)) else '-'
                 rows_html.append(
                     f'<tr><td>{r["coefficient_name"]}</td>'
                     f'<td style="text-align:right">{val_str}</td>'
@@ -10891,12 +11550,12 @@ def _write_location_choice_html(summary_df: pd.DataFrame, models: dict, out_dir:
             n_free  = int((mdf['constrain'] == 'F').sum())
             n_fixed = int((mdf['constrain'] == 'T').sum())
             try:
-                ll_str = f'{float(ll):.2f}' if np.isfinite(float(ll)) else 'â€”'
+                ll_str = f'{float(ll):.2f}' if np.isfinite(float(ll)) else '-'
             except Exception:
-                ll_str = 'â€”'
+                ll_str = '-'
             sections.append(f"""
 <div style="margin:20px 0; padding:15px; border:1px solid #ddd; border-radius:8px;">
-  <h2>{seg.upper()} â€” {mtype} choice model</h2>
+  <h2>{seg.upper()} - {mtype} choice model</h2>
   <p style="background:#e3f2fd;padding:8px 12px;border-radius:4px;font-size:0.95em;">
     <b>Log-likelihood:</b> {ll_str} &nbsp;|&nbsp;
     <b>N obs:</b> {n_tours} &nbsp;|&nbsp;
@@ -10917,13 +11576,13 @@ def _write_location_choice_html(summary_df: pd.DataFrame, models: dict, out_dir:
   <p style="font-size:0.8em;color:#666;margin-top:6px;">
     p-value colour: <span style="color:#1a7a1a;font-weight:bold">p&lt;0.001</span>
     <span style="color:#2e7d32;font-weight:bold"> p&lt;0.01</span>
-    <span style="color:#558b2f"> p&lt;0.05 â˜…</span>
+    <span style="color:#558b2f"> p&lt;0.05 ★</span>
     <span style="color:#f57c00"> p&lt;0.10</span>
-    <span style="color:#b71c1c"> pâ‰¥0.10 (not sig.)</span>
+    <span style="color:#b71c1c"> p≥0.10 (not sig.)</span>
   </p>
 </div>""")
 
-    # â”€â”€ Zone-level validation section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Zone-level validation section ────────────────────────────────────────
     val_sections = []
     if val_df is not None and len(val_df) > 0:
         for seg in val_df['segment'].unique():
@@ -10934,7 +11593,7 @@ def _write_location_choice_html(summary_df: pd.DataFrame, models: dict, out_dir:
                 pct_obs = f"{r['obs_share']*100:.1f}%"
                 pct_pred = f"{r['pred_share']*100:.1f}%" if np.isfinite(r.get('pred_share', np.nan)) else 'n/a'
                 ratio = (r['pred_share'] / r['obs_share']) if r['obs_share'] > 0 else 0
-                flag = ' âš ' if ratio > 3 or (r['obs_share'] > 0 and ratio < 0.33) else ''
+                flag = ' ⚠' if ratio > 3 or (r['obs_share'] > 0 and ratio < 0.33) else ''
                 rows_v.append(
                     f'<tr><td>{int(r["zone"])}</td>'
                     f'<td style="text-align:right">{int(r["obs_tours"])}</td>'
@@ -10953,7 +11612,7 @@ def _write_location_choice_html(summary_df: pd.DataFrame, models: dict, out_dir:
                                f'Mean trip dist={dist}</p>')
             val_sections.append(f"""
 <div style="margin:20px 0; padding:15px; border:1px solid #aad; border-radius:8px; background:#f8f8ff;">
-  <h2>{seg.upper()} â€” Destination zone validation (top 20 observed)</h2>
+  <h2>{seg.upper()} - Destination zone validation (top 20 observed)</h2>
   {sum_row}
   <table style="border-collapse:collapse; width:60%; font-size:13px;">
     <thead><tr style="background:#e8eaf6;">
@@ -10964,7 +11623,7 @@ def _write_location_choice_html(summary_df: pd.DataFrame, models: dict, out_dir:
     </tr></thead>
     <tbody>{''.join(rows_v)}</tbody>
   </table>
-  <p style="font-size:11px; color:#666;">âš  = predicted share &gt;3Ã— or &lt;0.33Ã— observed</p>
+  <p style="font-size:11px; color:#666;">⚠ = predicted share &gt;3× or &lt;0.33× observed</p>
 </div>""")
 
     html = f"""<!DOCTYPE html>
@@ -10984,7 +11643,7 @@ tr:hover {{ background: #f9f9f9; }}</style>
     html_path = os.path.join(out_dir, 'location_choice_summary.html')
     with open(html_path, 'w', encoding='utf-8') as f:
         f.write(html)
-    logger.info(f"  Location choice HTML report â†’ {html_path}")
+    logger.info(f"  Location choice HTML report → {html_path}")
 
 
 def _build_activitysim_location_observations(
@@ -11096,7 +11755,7 @@ def _build_activitysim_location_observations(
     if _mode_col is not None:
         _mode_vals = t[_mode_col]
         if _mode_vals.dtype == object:
-            # Map string mode names â†’ integer codes
+            # Map string mode names → integer codes
             _mode_vals = _mode_vals.map(MODE_MAP)
         out['tour_mode'] = pd.to_numeric(_mode_vals, errors='coerce').fillna(0).astype(int)
 
@@ -11150,7 +11809,7 @@ def _model_predicted_zone_shares(model, n_zones_hint: int = 330) -> pd.Series:
 
     Falls back to ``model.probability()`` when no cache is present.
     """
-    # â”€â”€ Fast path: use pre-computed full-zone shares â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Fast path: use pre-computed full-zone shares ──────────────────────
     _cached = getattr(model, '_pred_zone_shares', None)
     if _cached is not None and len(_cached) > 0:
         logger.debug(
@@ -11159,7 +11818,7 @@ def _model_predicted_zone_shares(model, n_zones_hint: int = 330) -> pd.Series:
         )
         return _cached
 
-    # â”€â”€ Fallback: ask Larch for probabilities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Fallback: ask Larch for probabilities ─────────────────────────────
     # NOTE: if importance sampling was used, this only covers sampled alts.
     try:
         prob = model.probability(return_format="dataframe")
@@ -11188,9 +11847,9 @@ def _model_predicted_mode_shares(model) -> pd.Series:
     (set once while the DataTree is still live; survives pkl round-trips).
     Falls back to ``model.probability()`` if the cache is absent.
 
-    Returns a pd.Series indexed by mode code with share values (0â€“1).
+    Returns a pd.Series indexed by mode code with share values (0-1).
     """
-    # â”€â”€ Fast path: use cached shares (set before pickling) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Fast path: use cached shares (set before pickling) ───────────────
     _cached = getattr(model, '_pred_mode_shares', None)
     if _cached is not None and len(_cached) > 0:
         logger.debug(
@@ -11199,7 +11858,7 @@ def _model_predicted_mode_shares(model) -> pd.Series:
         )
         return _cached
 
-    # â”€â”€ Slow path: compute from live model (only works with DataTree attached) â”€
+    # ── Slow path: compute from live model (only works with DataTree attached) ─
     try:
         prob = model.probability(return_format="dataframe")
         # Nested logit: model.probability() returns ALL graph nodes including
@@ -11272,9 +11931,9 @@ def _location_choice_validation(
     for seg, purposes in SEG_PURPOSES.items():
         seg_obs = obs_obs[obs_obs['segment'] == seg].copy()
 
-        # â”€â”€ Edu: filter to actual school tours only â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Edu: filter to actual school tours only ───────────────────────
         # Exclude childcare/preschool purposes (different destination universe)
-        # and restrict to zones 1â€“329 (zone 330 = external, no school data).
+        # and restrict to zones 1-329 (zone 330 = external, no school data).
         if seg == 'edu':
             if 'purpose' in seg_obs.columns:
                 _childcare_lower = {'childcare or kindergarten'}
@@ -11291,18 +11950,18 @@ def _location_choice_validation(
                 if _n_outside > 0:
                     logger.info(
                         f"  Location validation [edu]: excluding {_n_outside} tours "
-                        "with destination outside zones 1â€“329 (zone 330 = external zone)"
+                        "with destination outside zones 1-329 (zone 330 = external zone)"
                     )
                 seg_obs = seg_obs[_valid_zone].copy()
 
-        # â”€â”€ Work: restrict to zones 1â€“329 only â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Work: restrict to zones 1-329 only ────────────────────────────
         elif seg == 'work' and 'choice' in seg_obs.columns:
             _valid_zone = pd.to_numeric(seg_obs['choice'], errors='coerce').between(1, 329)
             _n_outside = int((~_valid_zone).sum())
             if _n_outside > 0:
                 logger.info(
                     f"  Location validation [work]: excluding {_n_outside} tours "
-                    "with destination outside zones 1â€“329"
+                    "with destination outside zones 1-329"
                 )
             seg_obs = seg_obs[_valid_zone].copy()
 
@@ -11315,7 +11974,7 @@ def _location_choice_validation(
         obs_counts = obs_dest.astype(int).value_counts().reindex(all_zones, fill_value=0)
         obs_share = obs_counts / max(obs_counts.sum(), 1)
 
-        # â”€â”€ Model-predicted zone shares via probability() â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Model-predicted zone shares via probability() ───────────────
         res = models.get(seg, {})
         dest_model = res.get('dest_model')
         pred_share = pd.Series(0.0, index=all_zones)
@@ -11335,24 +11994,24 @@ def _location_choice_validation(
             if len(_model_shares) > 0:
                 pred_share = _model_shares.reindex(all_zones, fill_value=0.0)
                 logger.info(
-                    f"  Location validation [{seg}]: model.probability() succeeded â€” "
+                    f"  Location validation [{seg}]: model.probability() succeeded - "
                     f"{int((_model_shares > 1e-6).sum())} zones with non-zero share"
                 )
             else:
-                # model.probability() returned an empty Series â€” the model
+                # model.probability() returned an empty Series - the model
                 # is in an unusable state (estimation failed, or Larch mangled
                 # the pf after pickle).  This is a DATA QUALITY problem, not a
                 # normal operating condition.  Log it as an error so it's visible,
                 # then use the size-term as an unconditional proximity proxy so
                 # the validation table still outputs something meaningful.
                 logger.error(
-                    f"  Location validation [{seg}]: model.probability() returned empty â€” "
+                    f"  Location validation [{seg}]: model.probability() returned empty - "
                     "predicted zone shares are UNRELIABLE (size-term proxy used).\n"
-                    f"  â–º Root cause candidates:\n"
-                    f"    1. dest_model estimation failed â€” check LL and pf above.\n"
+                    f"  ► Root cause candidates:\n"
+                    f"    1. dest_model estimation failed - check LL and pf above.\n"
                     f"    2. Larch mangled internal state after pickle/reload.\n"
                     f"    3. dest_model.data has zero rows (estimation dataset empty).\n"
-                    f"  â–º Predicted shares in validation CSV will reflect SIZE TERM only,\n"
+                    f"  ► Predicted shares in validation CSV will reflect SIZE TERM only,\n"
                     f"    not the full model.  Do not use them to judge model fit."
                 )
                 try:
@@ -11378,7 +12037,7 @@ def _location_choice_validation(
         else:
             logger.error(
                 f"  Location validation [{seg}]: dest_model is MISSING from models dict.\n"
-                f"  â–º Segment '{seg}' was not estimated â€” check _run_segment logs above."
+                f"  ► Segment '{seg}' was not estimated - check _run_segment logs above."
             )
 
         # Zone-level comparison
@@ -11463,7 +12122,7 @@ def _location_choice_validation(
             + (f", mean dist={dist_mean:.1f}km" if not np.isnan(dist_mean) else "")
         )
 
-        # â”€â”€ Mode share validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode share validation ─────────────────────────────────────────
         mode_model = res.get('mode_model')
         obs_mode_col = next(
             (c for c in ['tour_mode', 'TOURMODE', 'mode_code', 'mode']
@@ -11471,7 +12130,7 @@ def _location_choice_validation(
             None,
         )
 
-        # Observed mode shares â€” tour_mode is integer-coded (MODE_MAP values)
+        # Observed mode shares - tour_mode is integer-coded (MODE_MAP values)
         if obs_mode_col is not None:
             _raw = pd.to_numeric(seg_obs[obs_mode_col], errors='coerce')
             # If column is still strings (e.g. 'DA', 'SR') map to int codes
@@ -11515,26 +12174,26 @@ def _location_choice_validation(
         _val_df_out = pd.DataFrame(val_rows)
         val_path = os.path.join(out_dir, 'location_choice_validation.csv')
         _val_df_out.to_csv(val_path, index=False)
-        logger.info(f"  Location validation detail â†’ {val_path}")
+        logger.info(f"  Location validation detail → {val_path}")
 
     if summary_rows:
         _sum_df_out = pd.DataFrame(summary_rows)
         sum_path = os.path.join(out_dir, 'location_choice_validation_summary.csv')
         _sum_df_out.to_csv(sum_path, index=False)
-        logger.info(f"  Location validation summary â†’ {sum_path}")
+        logger.info(f"  Location validation summary → {sum_path}")
 
     if mode_rows:
         _mode_df = pd.DataFrame(mode_rows)
         mode_path = os.path.join(out_dir, 'mode_share_validation.csv')
         _mode_df.to_csv(mode_path, index=False)
-        logger.info(f"  Mode share validation â†’ {mode_path}")
+        logger.info(f"  Mode share validation → {mode_path}")
         # print to console for quick review
-        print("\n  â”€â”€ MODE SHARE: Predicted vs Observed (estimation data) â”€â”€â”€â”€â”€â”€")
+        print("\n  ── MODE SHARE: Predicted vs Observed (estimation data) ──────")
         for seg in _mode_df['segment'].unique():
             _s = _mode_df[_mode_df['segment'] == seg]
             print(f"\n  [{seg.upper()}]  {'Mode':<10s}  {'Obs%':>7s}  {'Pred%':>7s}  {'Diff':>6s}")
             for _, r in _s.sort_values('mode_code').iterrows():
-                flag = ' â—„' if abs(r['diff_pp']) > 5 else ''
+                flag = ' ◄' if abs(r['diff_pp']) > 5 else ''
                 print(f"  [{seg.upper()}]  {r['mode_name']:<10s}  "
                       f"{r['obs_share_pct']:7.1f}  {r['pred_share_pct']:7.1f}  "
                       f"{r['diff_pp']:+6.1f}{flag}")
@@ -11543,8 +12202,8 @@ def _location_choice_validation(
         _work_df = pd.DataFrame(work_rows).sort_values('zone')
         work_path = os.path.join(out_dir, 'work_destination_validation.csv')
         _work_df.to_csv(work_path, index=False)
-        logger.info(f"  Work destination validation â†’ {work_path}")
-        print("\n  â”€â”€ WORK DESTINATION: Top 30 observed zones â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+        logger.info(f"  Work destination validation → {work_path}")
+        print("\n  ── WORK DESTINATION: Top 30 observed zones ────────────────────────────────")
         print(f"  {'Zone':>6s}  {'Obs':>5s}  {'Pred':>7s}  {'Ratio':>6s}  "
               f"{'TOTEMP':>7s}  {'FPSEMPN':>7s}  {'HEREMPN':>7s}  {'Comm(k)':>8s}")
         _work_top30 = _work_df.nlargest(30, 'obs_workers').sort_values('zone')
@@ -11556,7 +12215,7 @@ def _location_choice_validation(
             _obs = int(r['obs_workers'])
             _ps  = r['pred_workers_scaled']
             _ratio = _obs / max(_ps, 0.1)
-            _flag = ' â—„â—„' if _ratio > 4 else (' â—„' if _ratio > 2 else '')
+            _flag = ' ◄◄' if _ratio > 4 else (' ◄' if _ratio > 2 else '')
             print(f"  {int(r['zone']):6d}  {_obs:5d}  {_ps:7.1f}  {_ratio:6.2f}  "
                   f"{_te:7d}  {_fp:7d}  {_he:7d}  {_com:8.0f}{_flag}")
 
@@ -11564,9 +12223,9 @@ def _location_choice_validation(
         _edu_df = pd.DataFrame(edu_rows).sort_values('zone')
         edu_path = os.path.join(out_dir, 'edu_destination_validation.csv')
         _edu_df.to_csv(edu_path, index=False)
-        logger.info(f"  Education destination validation â†’ {edu_path}")
+        logger.info(f"  Education destination validation → {edu_path}")
         _has_study = 'obs_primary' in _edu_df.columns
-        print("\n  â”€â”€ EDU DESTINATION: Top 25 observed zones â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+        print("\n  ── EDU DESTINATION: Top 25 observed zones ─────────────────────────────────")
         if _has_study:
             print(f"  {'Zone':>6s}  {'ObsTot':>6s}  {'ObsPrim':>7s}  {'ObsSec':>6s}  "
                   f"{'Pred':>7s}  {'Ratio':>6s}  {'PriSch':>7s}  {'SecSch':>7s}")
@@ -11580,7 +12239,7 @@ def _location_choice_validation(
             _obs = int(r['obs_students'])
             _ps  = r['pred_students_scaled']
             _ratio = _obs / max(_ps, 0.1)
-            _flag = ' â—„â—„' if _ratio > 4 else (' â—„' if _ratio > 2 else '')
+            _flag = ' ◄◄' if _ratio > 4 else (' ◄' if _ratio > 2 else '')
             if _has_study:
                 _op = int(r.get('obs_primary', 0))
                 _os = int(r.get('obs_secondary', 0))
@@ -11590,7 +12249,7 @@ def _location_choice_validation(
                 print(f"  {int(r['zone']):6d}  {_obs:5d}  {_ps:7.1f}  {_ratio:6.2f}  "
                       f"{_pri_sch:8d}  {_sec_sch:9d}{_flag}")
 
-    # â”€â”€ Build combined validation HTML report â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Build combined validation HTML report ────────────────────────────
     _mode_df_for_html = pd.DataFrame(mode_rows) if mode_rows else None
     _work_df_for_html = pd.DataFrame(work_rows).sort_values('zone') \
         if work_rows else None
@@ -11619,7 +12278,7 @@ def _write_validation_html(
     """Write a comprehensive validation HTML report with all levels."""
     sections = []
 
-    # â”€â”€ Summary table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Summary table ─────────────────────────────────────────────────────
     if summary_df is not None and len(summary_df) > 0:
         _sum_rows = []
         for _, r in summary_df.iterrows():
@@ -11650,7 +12309,7 @@ def _write_validation_html(
   </table>
 </div>""")
 
-    # â”€â”€ Mode share table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Mode share table ──────────────────────────────────────────────────
     if mode_df is not None and len(mode_df) > 0:
         mode_html_parts = []
         for seg in mode_df['segment'].unique():
@@ -11678,7 +12337,7 @@ def _write_validation_html(
   {''.join(mode_html_parts)}
 </div>""")
 
-    # â”€â”€ Top-zone destination tables â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Top-zone destination tables ───────────────────────────────────────
     for seg, purposes in [('work', _WORK_PURPOSES), ('edu', _EDU_PURPOSES), ('nonmand', _NONMAND_PURPOSES)]:
         if val_df is None:
             continue
@@ -11694,7 +12353,7 @@ def _write_validation_html(
             f"<td style='text-align:right'>{r['obs_share']*100:.2f}%</td>"
             f"<td style='text-align:right'>{r['pred_share']*100:.2f}%</td>"
             f"<td style='text-align:right; color:{'#b71c1c' if r['obs_share'] > 0 and (r['pred_share'] / max(r['obs_share'], 1e-9) > 3 or r['pred_share'] / max(r['obs_share'], 1e-9) < 0.33) else '#333'}'>"
-            f"{'âš ' if r['obs_share'] > 0 and (r['pred_share'] / max(r['obs_share'], 1e-9) > 3 or r['pred_share'] / max(r['obs_share'], 1e-9) < 0.33) else ''}"
+            f"{'⚠' if r['obs_share'] > 0 and (r['pred_share'] / max(r['obs_share'], 1e-9) > 3 or r['pred_share'] / max(r['obs_share'], 1e-9) < 0.33) else ''}"
             f"</td></tr>"
             for _, r in _sv.iterrows()
         )
@@ -11709,16 +12368,16 @@ def _write_validation_html(
                 _sum_row = f'<p>Pearson r = {_corr} | RMSE = {_rmse} | Mean trip dist = {_dist}</p>'
         sections.append(f"""
 <div class="val-section">
-  <h2>{seg.upper()} â€” Destination Zone Distribution (Top 25 Observed)</h2>
+  <h2>{seg.upper()} - Destination Zone Distribution (Top 25 Observed)</h2>
   {_sum_row}
   <table>
     <thead><tr><th>Zone</th><th>Obs Trips</th><th>Obs Share</th><th>Pred Share</th><th>Flag</th></tr></thead>
     <tbody>{_rows}</tbody>
   </table>
-  <p style="font-size:11px;color:#666">âš  = predicted share &gt;3Ã— or &lt;0.33Ã— observed</p>
+  <p style="font-size:11px;color:#666">⚠ = predicted share &gt;3× or &lt;0.33× observed</p>
 </div>""")
 
-    # â”€â”€ Work destination with landuse â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Work destination with landuse ─────────────────────────────────────
     if work_df is not None and len(work_df) > 0:
         _wr = work_df.nlargest(20, 'obs_workers').sort_values('zone')
         _rows = ''.join(
@@ -11733,8 +12392,8 @@ def _write_validation_html(
         )
         sections.append(f"""
 <div class="val-section" style="background:#f8fff8;">
-  <h2>Work Destination Validation â€” Top 20 Zones with Landuse</h2>
-  <p style="font-size:0.9em;color:#666">Pred = model probability Ã— N_obs_work (scaled counts).
+  <h2>Work Destination Validation - Top 20 Zones with Landuse</h2>
+  <p style="font-size:0.9em;color:#666">Pred = model probability × N_obs_work (scaled counts).
   Compare against TOTEMP, FPSEMPN (finance/prof/service employment).</p>
   <table>
     <thead><tr><th>Zone</th><th>Obs Workers</th><th>Pred (scaled)</th>
@@ -11743,7 +12402,7 @@ def _write_validation_html(
   </table>
 </div>""")
 
-    # â”€â”€ Education destination with landuse â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Education destination with landuse ────────────────────────────────
     if edu_df is not None and len(edu_df) > 0:
         _er = edu_df.head(20)
         _rows = ''.join(
@@ -11758,8 +12417,8 @@ def _write_validation_html(
         )
         sections.append(f"""
 <div class="val-section" style="background:#fff8f8;">
-  <h2>Education Destination Validation â€” Top 20 Zones with Landuse</h2>
-  <p style="font-size:0.9em;color:#666">Pred = model probability Ã— N_obs_edu (scaled counts).
+  <h2>Education Destination Validation - Top 20 Zones with Landuse</h2>
+  <p style="font-size:0.9em;color:#666">Pred = model probability × N_obs_edu (scaled counts).
   Compare against Primary/Secondary/Education (OSM school counts) and HSENROLL.</p>
   <table>
     <thead><tr><th>Zone</th><th>Obs Students</th><th>Pred (scaled)</th>
@@ -11788,7 +12447,7 @@ def _write_validation_html(
   </style>
 </head>
 <body>
-  <h1>Stage 5 â€” Destination + Mode Choice Validation Report</h1>
+  <h1>Stage 5 - Destination + Mode Choice Validation Report</h1>
   <p>Generated from HHTS estimation data. Predicted shares from model.probability()
   aggregated over all choosers.</p>
 {body}
@@ -11798,8 +12457,8 @@ def _write_validation_html(
     try:
         with open(val_html_path, 'w', encoding='utf-8') as _f:
             _f.write(html)
-        logger.info(f"  Validation HTML report â†’ {val_html_path}")
-        print(f"  Validation HTML â†’ {val_html_path}")
+        logger.info(f"  Validation HTML report → {val_html_path}")
+        print(f"  Validation HTML → {val_html_path}")
     except Exception as _hw:
         logger.warning(f"  Could not write validation HTML: {_hw}")
 
@@ -11813,9 +12472,9 @@ def write_destination_validation_html(
 ):
     """
     Write three separate HTML validation reports for destination model output:
-      - tour_destination_validation.html  â€” tour-level DTAZ distribution
-      - trip_destination_validation.html  â€” trip-level DTAZ distribution
-      - location_assignment_validation.html â€” combined assignment stats
+      - tour_destination_validation.html  - tour-level DTAZ distribution
+      - trip_destination_validation.html  - trip-level DTAZ distribution
+      - location_assignment_validation.html - combined assignment stats
 
     Parameters
     ----------
@@ -11858,9 +12517,9 @@ def write_destination_validation_html(
             hhi = float(((counts / total) ** 2).sum())
             sections.append(f"""
 <div style="margin:16px 0; padding:12px; border:1px solid #ccc; border-radius:6px;">
-  <h3>{purp.upper()} â€” top {top_n} destination zones</h3>
+  <h3>{purp.upper()} - top {top_n} destination zones</h3>
   <p>{total:,} trips/tours | {n_zones_used} zones used | HHI={hhi:.4f}
-     <span style="font-size:11px; color:#666;">(HHIâ†’0 = dispersed, HHIâ†’1 = concentrated)</span></p>
+     <span style="font-size:11px; color:#666;">(HHI→0 = dispersed, HHI→1 = concentrated)</span></p>
   <table style="border-collapse:collapse; font-size:12px; width:70%;">
     <thead><tr style="background:#f0f0f0;">
       <th>Zone</th><th style="text-align:right">Count</th>
@@ -11877,7 +12536,7 @@ def write_destination_validation_html(
            'td,th{border-bottom:1px solid #eee;padding:4px 8px} '
            'tr:hover{background:#f9f9f9}')
 
-    # â”€â”€ Tour-level HTML â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Tour-level HTML ───────────────────────────────────────────────────────
     purp_col = next((c for c in ['segment', 'purpose', 'tourpurp'] if tours_df is not None and c in (tours_df.columns if tours_df is not None else [])), None)
     tour_body = _zone_table_html(tours_df, 'DTAZ', purp_col or '', 'tour destinations', top_n)
     tour_html = (f'<!DOCTYPE html><html><head><meta charset="utf-8">'
@@ -11889,9 +12548,9 @@ def write_destination_validation_html(
     tour_path = os.path.join(out_dir, 'tour_destination_validation.html')
     with open(tour_path, 'w', encoding='utf-8') as f:
         f.write(tour_html)
-    logger.info(f"  Tour destination validation â†’ {tour_path}")
+    logger.info(f"  Tour destination validation → {tour_path}")
 
-    # â”€â”€ Trip-level HTML â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Trip-level HTML ───────────────────────────────────────────────────────
     trip_purp_col = next((c for c in ['purpose', 'trip_purpose', 'segment'] if trips_df is not None and c in (trips_df.columns if trips_df is not None else [])), None)
     trip_body = _zone_table_html(trips_df, 'DTAZ', trip_purp_col or '', 'trip destinations', top_n)
     trip_html = (f'<!DOCTYPE html><html><head><meta charset="utf-8">'
@@ -11903,9 +12562,9 @@ def write_destination_validation_html(
     trip_path = os.path.join(out_dir, 'trip_destination_validation.html')
     with open(trip_path, 'w', encoding='utf-8') as f:
         f.write(trip_html)
-    logger.info(f"  Trip destination validation â†’ {trip_path}")
+    logger.info(f"  Trip destination validation → {trip_path}")
 
-    # â”€â”€ Location assignment summary HTML â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Location assignment summary HTML ────────────────────────────────────
     assign_sections = []
     for label, df in [('Tours', tours_df), ('Trips', trips_df)]:
         if df is None or len(df) == 0 or 'DTAZ' not in df.columns:
@@ -11938,7 +12597,7 @@ def write_destination_validation_html(
     assign_path = os.path.join(out_dir, 'location_assignment_validation.html')
     with open(assign_path, 'w', encoding='utf-8') as f:
         f.write(assign_html)
-    logger.info(f"  Location assignment validation â†’ {assign_path}")
+    logger.info(f"  Location assignment validation → {assign_path}")
 
     return {'tour': tour_path, 'trip': trip_path, 'assignment': assign_path}
 
@@ -11946,7 +12605,7 @@ def write_destination_validation_html(
 def _save_coefficients(models: dict, path: str):
     """
     Save coefficient tables as CSV + HTML report (ActivitySim-style output).
-    HTML report includes: parameter, value, t-stat, significance, LL, rhoÂ².
+    HTML report includes: parameter, value, t-stat, significance, LL, rho².
     """
     rows = []
     combined_sections = []
@@ -11993,6 +12652,13 @@ def _save_coefficients(models: dict, path: str):
                 param_names = list(pf.index) if (pf is not None and len(pf) > 0) else list(coef_dict.keys())
                 for param_name in param_names:
                     val = coef_dict.get(str(param_name), float('nan'))
+                    # Skip parameters that are holdfasted at exactly zero —
+                    # they contribute nothing to the model and clutter the output.
+                    if pf is not None and param_name in pf.index:
+                        _skip_hf = bool(pf.loc[param_name].get('holdfast', False))
+                        _skip_val = coef_dict.get(str(param_name), float('nan'))
+                        if _skip_hf and np.isfinite(float(_skip_val)) and abs(float(_skip_val)) < 1e-8:
+                            continue
                     se = float('nan')
                     tstat = float('nan')
                     pval  = float('nan')
@@ -12000,7 +12666,7 @@ def _save_coefficients(models: dict, path: str):
                         row_pf = pf.loc[param_name]
                         # Use first non-NaN positive value from SE candidate columns.
                         # NOTE: pandas Series.get() returns NaN (not fallback) when key
-                        # exists but value is NaN â€” chained .get() silently fails.
+                        # exists but value is NaN - chained .get() silently fails.
                         # Loop instead to pick first valid SE.
                         _holdfast = bool(row_pf.get('holdfast', False))
                         for _se_col in ('std_err', 'std_err_opg', 'se', 'stderr'):
@@ -12095,7 +12761,7 @@ def _save_coefficients(models: dict, path: str):
                 except Exception as _fb_e:
                     logger.debug(f"Fallback coefficient extraction failed for {seg}/{mtype}: {_fb_e}")
 
-        # â”€â”€ add mixed logit section if available â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── add mixed logit section if available ──────────────────────
         mxl = res.get('mxl_result')
         if mxl is not None:
             try:
@@ -12109,10 +12775,10 @@ def _save_coefficients(models: dict, path: str):
                 )
                 mxl_section = f"""
 <div class="model-section">
-  <h2>{seg.upper()} â€” mode model (Mixed Logit â€” IVT~Normal)</h2>
+  <h2>{seg.upper()} - mode model (Mixed Logit - IVT~Normal)</h2>
   <p class="stats">
     <b>Log-likelihood:</b> {mxl['ll']:.1f} &nbsp;|&nbsp;
-    <b>ÏÂ²:</b> {mxl['rho2']:.3f} &nbsp;|&nbsp;
+    <b>ρ²:</b> {mxl['rho2']:.3f} &nbsp;|&nbsp;
     <b>Estimation obs:</b> {mxl['n_obs']} &nbsp;|&nbsp;
     <b>Random vars:</b> {', '.join(f'{k}~{v}' for k,v in mxl['randvars'].items())}
   </p>
@@ -12122,7 +12788,7 @@ def _save_coefficients(models: dict, path: str):
   </table>
   <p class="sig-note">Random IVT coefficient captures taste heterogeneity across travellers.
   Mean = population mean value of time sensitivity.
-  Std dev = spread of distribution (if significant â†’ heterogeneity confirmed).</p>
+  Std dev = spread of distribution (if significant → heterogeneity confirmed).</p>
 </div>"""
                 combined_sections.append(mxl_section)
                 mode_sections.append(mxl_section)
@@ -12133,7 +12799,7 @@ def _save_coefficients(models: dict, path: str):
         df = pd.DataFrame(rows)
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
         df.to_csv(path, index=False)
-        print(f"  Coefficients saved â†’ {path}")
+        print(f"  Coefficients saved → {path}")
 
         # write HTML reports
         html_path = path.replace('.csv', '.html')
@@ -12142,12 +12808,12 @@ def _save_coefficients(models: dict, path: str):
         dest_html_path = path.replace('.csv', '_dest.html')
         _write_html_report(mode_sections, mode_html_path)
         _write_html_report(dest_sections, dest_html_path)
-        print(f"  Combined HTML report saved  â†’ {html_path}")
-        print(f"  Mode-only HTML report saved  â†’ {mode_html_path}")
-        print(f"  Destination-only HTML report saved  â†’ {dest_html_path}")
+        print(f"  Combined HTML report saved  → {html_path}")
+        print(f"  Mode-only HTML report saved  → {mode_html_path}")
+        print(f"  Destination-only HTML report saved  → {dest_html_path}")
 
         # console summary
-        print("\n  â”€â”€ Model Summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+        print("\n  ── Model Summary ──────────────────────────────────────────")
         for seg in df['segment'].unique():
             sub = df[df['segment'] == seg]
             for mtype in sub['model_type'].unique():
@@ -12155,7 +12821,7 @@ def _save_coefficients(models: dict, path: str):
                 ll   = ssub['loglike'].iloc[0]
                 rho2 = ssub['rho2'].iloc[0]
                 print(f"\n  [{seg.upper()} {mtype}]  "
-                      f"LL={ll:.1f}  ÏÂ²={rho2:.3f}  n_params={len(ssub)}")
+                      f"LL={ll:.1f}  ρ²={rho2:.3f}  n_params={len(ssub)}")
                 print(f"  {'Parameter':<35} {'Value':>8}  {'t-stat':>7}  Sig")
                 print(f"  {'-'*60}")
                 for _, r in ssub.iterrows():
@@ -12171,7 +12837,7 @@ def _save_coefficients(models: dict, path: str):
                     se_str = f'{float(se):.4f}' if pd.notna(se) and np.isfinite(float(se)) else 'n/a'
                     print(f"  {r['parameter']:<35} {r['value']:>8.4f}  SE={se_str:>7}  {t_str}  {sig}")
     else:
-        print("  WARNING: no coefficients extracted â€” writing diagnostic placeholder HTML")
+        print("  WARNING: no coefficients extracted - writing diagnostic placeholder HTML")
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
         pd.DataFrame(columns=['segment', 'model_type', 'parameter', 'value', 'std_err', 'tstat', 'pval', 'loglike', 'rho2']).to_csv(path, index=False)
         _write_html_report([
@@ -12190,14 +12856,14 @@ def _html_model_table(seg, mtype, rows, ll, rho2, n_tours):
     def _fmt(v, fmt='.4f'):
         try:
             f = float(v)
-            return format(f, fmt) if np.isfinite(f) else 'â€”'
+            return format(f, fmt) if np.isfinite(f) else '-'
         except Exception:
-            return 'â€”'
+            return '-'
     def sig_stars(t):
         try:
             at = abs(float(t))
             if not np.isfinite(at): return ''
-            return 'â˜…â˜…â˜…' if at > 3.3 else 'â˜…â˜…' if at > 2.6 else 'â˜…' if at > 1.96 else ''
+            return '★★★' if at > 3.3 else '★★' if at > 2.6 else '★' if at > 1.96 else ''
         except Exception:
             return ''
     def sig_color(t, p):
@@ -12234,10 +12900,10 @@ def _html_model_table(seg, mtype, rows, ll, rho2, n_tours):
     ll_str   = _fmt(ll,   '.2f')
     return f"""
 <div class="model-section">
-  <h2>{seg.upper()} â€” {mtype} model</h2>
+  <h2>{seg.upper()} - {mtype} model</h2>
   <p class="stats">
     <b>Log-likelihood:</b> {ll_str} &nbsp;|&nbsp;
-    <b>ÏÂ² (null):</b> {rho2_str} &nbsp;|&nbsp;
+    <b>ρ² (null):</b> {rho2_str} &nbsp;|&nbsp;
     <b>N obs:</b> {n_tours} &nbsp;|&nbsp;
     <b>Params (free):</b> {sum(1 for r in rows if not r.get('holdfast', False))}
   </p>
@@ -12250,11 +12916,11 @@ def _html_model_table(seg, mtype, rows, ll, rho2, n_tours):
     </tbody>
   </table>
   <p class="sig-note">
-    p-value colour: <span style="color:#1a7a1a;font-weight:bold">p&lt;0.001 â˜…â˜…â˜…</span> &nbsp;
-    <span style="color:#2e7d32;font-weight:bold">p&lt;0.01 â˜…â˜…</span> &nbsp;
-    <span style="color:#558b2f">p&lt;0.05 â˜…</span> &nbsp;
+    p-value colour: <span style="color:#1a7a1a;font-weight:bold">p&lt;0.001 ★★★</span> &nbsp;
+    <span style="color:#2e7d32;font-weight:bold">p&lt;0.01 ★★</span> &nbsp;
+    <span style="color:#558b2f">p&lt;0.05 ★</span> &nbsp;
     <span style="color:#f57c00">p&lt;0.10</span> &nbsp;
-    <span style="color:#b71c1c">pâ‰¥0.10 (not significant)</span>
+    <span style="color:#b71c1c">p≥0.10 (not significant)</span>
   </p>
 </div>"""
 
@@ -12266,7 +12932,7 @@ def _write_html_report(sections: list, path: str):
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Stage 5 Model Results â€” Destination + Mode Choice</title>
+  <title>Stage 5 Model Results - Destination + Mode Choice</title>
   <style>
     body   {{ font-family: Arial, sans-serif; margin: 40px; color: #222; }}
     h1     {{ border-bottom: 2px solid #1565c0; padding-bottom: 8px; }}
@@ -12284,8 +12950,8 @@ def _write_html_report(sections: list, path: str):
   </style>
 </head>
 <body>
-  <h1>Stage 5 â€” Destination + Mode Choice Model Results</h1>
-  <p>Generated by stage5_destination_choice.py â€” QTS/HHTS ABM Pipeline</p>
+  <h1>Stage 5 - Destination + Mode Choice Model Results</h1>
+  <p>Generated by stage5_destination_choice.py - QTS/HHTS ABM Pipeline</p>
 {body}
 </body>
 </html>"""
@@ -12310,21 +12976,21 @@ def compute_validation_metrics(
     Compute comprehensive Stage 5 validation metrics.
 
     Returns a dict with:
-      zone_rmse        â€” RMSE of observed vs predicted destination zone share (per segment)
-      zone_pearson     â€” Pearson correlation of zone shares (per segment)
-      zone_kl          â€” KL divergence obsâ€–pred (per segment)
-      mode_share_obs   â€” observed mode share (%)
-      mode_share_pred  â€” predicted mode share (%)
-      mean_tt_obs      â€” mean observed travel time by segment (min)
-      mean_tt_pred     â€” mean predicted travel time by segment (min)
-      dist_decay_rmse  â€” RMSE of distance-decay profile (trip length distribution)
-      param_table      â€” DataFrame of all estimated parameters with t-stats
+      zone_rmse        - RMSE of observed vs predicted destination zone share (per segment)
+      zone_pearson     - Pearson correlation of zone shares (per segment)
+      zone_kl          - KL divergence obs‖pred (per segment)
+      mode_share_obs   - observed mode share (%)
+      mode_share_pred  - predicted mode share (%)
+      mean_tt_obs      - mean observed travel time by segment (min)
+      mean_tt_pred     - mean predicted travel time by segment (min)
+      dist_decay_rmse  - RMSE of distance-decay profile (trip length distribution)
+      param_table      - DataFrame of all estimated parameters with t-stats
     """
     from scipy.stats import pearsonr
     metrics: dict = {}
     eps = 1e-9
 
-    # â”€â”€ Diagnostic: summarise what we received â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Diagnostic: summarise what we received ────────────────────────────
     _pp_cols = list(pred_plan.columns) if not pred_plan.empty else []
     _pp_rt   = pred_plan['row_type'].value_counts().to_dict() if 'row_type' in _pp_cols else 'no row_type col'
     _pp_purp = pred_plan['purpose'].value_counts().head(10).to_dict() if 'purpose' in _pp_cols else 'no purpose col'
@@ -12334,7 +13000,7 @@ def compute_validation_metrics(
     print(f"  [validation] pred_plan top purposes: {_pp_purp}")
     print(f"  [validation] pred_plan columns: {_pp_cols}")
 
-    # â”€â”€ Segment membership â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Segment membership ────────────────────────────────────────────────
     SEG_PURPOSES = {
         'work':    _WORK_PURPOSES,
         'edu':     _EDU_PURPOSES,
@@ -12345,7 +13011,7 @@ def compute_validation_metrics(
          if c in obs_tours.columns), None
     )
 
-    # â”€â”€ 1. Zone-level destination accuracy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 1. Zone-level destination accuracy ────────────────────────────────
     metrics['zone_rmse']    = {}
     metrics['zone_pearson'] = {}
     metrics['zone_kl']      = {}
@@ -12362,7 +13028,7 @@ def compute_validation_metrics(
         else:
             obs_d = pd.Series(dtype=float)
 
-        # predicted â€” prefer activity rows (each activity IS the destination),
+        # predicted - prefer activity rows (each activity IS the destination),
         # fall back to trip rows, then any purpose-matching rows.
         pred_d = pd.Series(dtype=float)
         if _has_purpose_pred and _has_dtaz_pred:
@@ -12384,7 +13050,7 @@ def compute_validation_metrics(
             pred_d = pd.to_numeric(pred_plan['DTAZ'], errors='coerce').dropna()
 
         if obs_d.empty or pred_d.empty:
-            logger.debug(f"Destination metrics [{seg}]: obs n={len(obs_d)}, pred n={len(pred_d)} â€” skipping")
+            logger.debug(f"Destination metrics [{seg}]: obs n={len(obs_d)}, pred n={len(pred_d)} - skipping")
             metrics['zone_rmse'][seg]    = float('nan')
             metrics['zone_pearson'][seg] = float('nan')
             metrics['zone_kl'][seg]      = float('nan')
@@ -12402,7 +13068,7 @@ def compute_validation_metrics(
             corr, _ = pearsonr(obs_share.values, pred_share.values)
         else:
             corr = float('nan')
-        # KL divergence (obsâ€–pred)
+        # KL divergence (obs‖pred)
         kl = float(np.sum(
             obs_share.values * np.log((obs_share.values + eps) / (pred_share.values + eps))
         ))
@@ -12410,7 +13076,7 @@ def compute_validation_metrics(
         metrics['zone_pearson'][seg] = float(corr)
         metrics['zone_kl'][seg]      = kl
 
-    # â”€â”€ 2. Mode share comparison â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 2. Mode share comparison ──────────────────────────────────────────
     obs_mode_col  = next((c for c in ['tour_mode', 'mode', 'mode_code']
                           if c in obs_tours.columns), None)
     # Accept 'mode' (int) or 'mode_name' (string) from pred_plan
@@ -12439,7 +13105,7 @@ def compute_validation_metrics(
 
         mode_col_data = trip_rows[pred_mode_col]
         if mode_col_data.dtype == object or str(mode_col_data.dtype) == 'object':
-            # String mode names â€” map to int codes for aggregation
+            # String mode names - map to int codes for aggregation
             inv_map = {v: k for k, v in MODE_NAMES.items()}
             pred_modes = mode_col_data.map(inv_map).dropna().astype(int)
         else:
@@ -12461,7 +13127,7 @@ def compute_validation_metrics(
     else:
         metrics['mode_share_pred'] = {}
 
-    # â”€â”€ 3. Mean travel time by segment â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 3. Mean travel time by segment ───────────────────────────────────
     metrics['mean_tt_obs']  = {}
     metrics['mean_tt_pred'] = {}
 
@@ -12491,12 +13157,12 @@ def compute_validation_metrics(
         else:
             metrics['mean_tt_pred'][seg] = float('nan')
 
-    # â”€â”€ 4. Distance-decay profile RMSE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 4. Distance-decay profile RMSE ───────────────────────────────────
     dist_col_pred = next((c for c in ['dist', 'SOVTOLL_DIST__AM'] if c in pred_plan.columns), None)
     dist_col_obs  = next((c for c in ['dist', 'SOVTOLL_DIST__AM', 'tour_distance'] if c in obs_tours.columns), None)
 
     if dist_col_pred and dist_col_obs:
-        bins = np.arange(0, 105, 5)   # 0â€“100 km in 5-km bands
+        bins = np.arange(0, 105, 5)   # 0-100 km in 5-km bands
         if _has_rowtype_pred:
             _dist_rows = pred_plan[pred_plan['row_type'] == 'trip']
         else:
@@ -12512,7 +13178,7 @@ def compute_validation_metrics(
     else:
         metrics['dist_decay_rmse'] = float('nan')
 
-    # â”€â”€ 5. Parameter table from estimated models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 5. Parameter table from estimated models ─────────────────────────
     param_rows = []
     if models:
         for seg, res in models.items():
@@ -12549,7 +13215,7 @@ def compute_validation_metrics(
                     })
     metrics['param_table'] = pd.DataFrame(param_rows)
 
-    # â”€â”€ 7. ActivitySim-style level checks: workplace/school/tour/trip â”€â”€â”€â”€â”€â”€â”€
+    # ── 7. ActivitySim-style level checks: workplace/school/tour/trip ───────
     # Explicitly validate all location-choice levels used in this pipeline:
     #   workplace location (person anchor), school location (person anchor),
     #   tour-level destination rows (activity rows), and trip-level OD rows.
@@ -12652,9 +13318,9 @@ def compute_validation_metrics(
 
             metrics['location_levels']['trip'] = _trip_metrics
 
-    # â”€â”€ 6. Mode share comparison (obs vs predicted) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 6. Mode share comparison (obs vs predicted) ──────────────────────────
     # NOTE: obs_tours is the SURVEY population; pred_plan is the SYNTHETIC
-    # population.  They have completely disjoint person IDs â€” a row-by-row
+    # population.  They have completely disjoint person IDs - a row-by-row
     # confusion matrix is meaningless.  Instead we compare the MARGINAL MODE
     # SHARE DISTRIBUTIONS, which is the correct validation for an MNL.
     try:
@@ -12666,13 +13332,13 @@ def compute_validation_metrics(
                               if c in pred_plan.columns), None)
 
         if obs_mode_col and pred_mode_col:
-            # â”€â”€ observed mode shares (survey) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── observed mode shares (survey) ────────────────────────────────
             obs_raw = pd.to_numeric(obs_tours[obs_mode_col], errors='coerce').dropna().astype(int)
             obs_share = (obs_raw.map(MODE_LABELS)
                                 .value_counts(normalize=True)
                                 .reindex(ALL_MODE_NAMES, fill_value=0.0) * 100)
 
-            # â”€â”€ predicted mode shares (synthetic population) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── predicted mode shares (synthetic population) ─────────────────
             pred_col = pred_plan[pred_mode_col]
             if pred_col.dtype == object or str(pred_col.dtype) == 'object':
                 # string mode names (mode_name column)
@@ -12702,7 +13368,7 @@ def compute_validation_metrics(
                                                  .value_counts(normalize=True)
                                                  .reindex(ALL_MODE_NAMES, fill_value=0.0) * 100)
 
-            # â”€â”€ build comparison table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── build comparison table ────────────────────────────────────────
             share_df = pd.DataFrame({
                 'Observed_%': obs_share.round(1),
                 'Predicted_%': pred_share.round(1),
@@ -12727,7 +13393,7 @@ def compute_validation_metrics(
                 import os as _os
                 _os.makedirs('saved_data', exist_ok=True)
                 share_df.to_csv('saved_data/mode_share_comparison.csv')
-                logger.info("Mode share comparison saved â†’ saved_data/mode_share_comparison.csv")
+                logger.info("Mode share comparison saved → saved_data/mode_share_comparison.csv")
             except Exception:
                 pass
         else:
@@ -12741,7 +13407,7 @@ def compute_validation_metrics(
         metrics['mode_share_jsd'] = float('nan')
         metrics['mode_share_mae_pp'] = float('nan')
 
-    # â”€â”€ 7a. Per-segment top-zone discrepancies (identifies over/under-predicted zones) â”€â”€â”€
+    # ── 7a. Per-segment top-zone discrepancies (identifies over/under-predicted zones) ───
     metrics['top_zone_discrepancies'] = {}
     for seg, purposes in SEG_PURPOSES.items():
         try:
@@ -12779,7 +13445,7 @@ def compute_validation_metrics(
         except Exception as _zd_e:
             logger.debug(f"Zone discrepancy [{seg}]: {_zd_e}")
 
-    # â”€â”€ 7b. Per-segment mode share comparison â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 7b. Per-segment mode share comparison ──────────────────────────────
     metrics['mode_share_by_segment'] = {}
     MODE_LABELS = {1: 'DA', 2: 'SR', 3: 'Walk', 4: 'Bike', 5: 'Transit'}
     ALL_MODE_NAMES = ['DA', 'SR', 'Walk', 'Bike', 'Transit']
@@ -12817,13 +13483,13 @@ def compute_validation_metrics(
         except Exception as _ms_e:
             logger.debug(f"Per-segment mode share [{seg}]: {_ms_e}")
 
-    # â”€â”€ 8. Print summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 8. Print summary ─────────────────────────────────────────────────
     print("\n" + "=" * 65)
     print("STAGE 5 VALIDATION SUMMARY")
     print("=" * 65)
 
     # Destination zone accuracy
-    print("\nâ”€â”€ Destination zone accuracy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+    print("\n── Destination zone accuracy ───────────────────────────────")
     for seg in SEG_PURPOSES:
         r = metrics['zone_rmse'].get(seg, float('nan'))
         c = metrics['zone_pearson'].get(seg, float('nan'))
@@ -12831,14 +13497,14 @@ def compute_validation_metrics(
         print(f"  {seg:10s}  RMSE={r:.4f}  Pearson r={c:.3f}  KL={k:.4f}")
 
     # Overall mode share
-    print("\nâ”€â”€ Overall mode share (%) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+    print("\n── Overall mode share (%) ──────────────────────────────────")
     print(f"  {'Mode':10s}  {'Observed':>9s}  {'Predicted':>10s}  {'Diff':>7s}")
     _all_modes = ALL_MODE_NAMES
     for m in _all_modes:
         o = metrics['mode_share_obs'].get(m, 0.0)
         p = metrics['mode_share_pred'].get(m, 0.0)
         d = p - o
-        flag = ' â—„' if abs(d) > 5.0 else ''
+        flag = ' ◄' if abs(d) > 5.0 else ''
         print(f"  {m:10s}  {o:9.1f}  {p:10.1f}  {d:+7.1f}{flag}")
     _mode_mae_pp = metrics.get('mode_share_mae_pp', float('nan'))
     _mode_jsd = metrics.get('mode_share_jsd', float('nan'))
@@ -12847,18 +13513,18 @@ def compute_validation_metrics(
 
     # Per-segment mode shares
     for seg, seg_df in metrics.get('mode_share_by_segment', {}).items():
-        print(f"\nâ”€â”€ Mode share by segment: {seg.upper()} â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+        print(f"\n── Mode share by segment: {seg.upper()} ─────────────────────")
         print(f"  {'Mode':10s}  {'Obs_%':>7s}  {'Pred_%':>8s}  {'Diff_%':>8s}")
         for mode in ALL_MODE_NAMES:
             if mode in seg_df.index:
                 o_ = seg_df.loc[mode, 'Obs_%']
                 p_ = seg_df.loc[mode, 'Pred_%']
                 d_ = seg_df.loc[mode, 'Diff_%']
-                flag = ' â—„' if abs(d_) > 5.0 else ''
+                flag = ' ◄' if abs(d_) > 5.0 else ''
                 print(f"  {mode:10s}  {o_:7.1f}  {p_:8.1f}  {d_:+8.1f}{flag}")
 
     # Mean travel time
-    print("\nâ”€â”€ Mean travel time (min) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+    print("\n── Mean travel time (min) ──────────────────────────────────")
     for seg in SEG_PURPOSES:
         o = metrics['mean_tt_obs'].get(seg, float('nan'))
         p = metrics['mean_tt_pred'].get(seg, float('nan'))
@@ -12870,7 +13536,7 @@ def compute_validation_metrics(
     # Explicit level summaries (ActivitySim-style coverage)
     _lvl = metrics.get('location_levels', {})
     if _lvl:
-        print("\nâ”€â”€ Location-choice level checks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+        print("\n── Location-choice level checks ───────────────────────────")
         _w = _lvl.get('workplace', {})
         if _w:
             print(f"  workplace: n={_w.get('n_activity_rows', 0)}  "
@@ -12907,14 +13573,14 @@ def compute_validation_metrics(
             )
             top_under = disc[disc['diff'] < 0].head(5)
 
-            print(f"\nâ”€â”€ Top 5 over-predicted zones [{seg}] â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+            print(f"\n── Top 5 over-predicted zones [{seg}] ──────────────────────")
             print(f"  {'Zone':>6}  {'Obs':>5}  {'Pred':>7}  {'Diff':>7}")
             for z, row in top_over.iterrows():
-                note = '  â† no survey obs' if int(row['obs']) == 0 else ''
+                note = '  ← no survey obs' if int(row['obs']) == 0 else ''
                 print(f"  {z:6d}  {int(row['obs']):5d}  {row['pred_scaled']:7.1f}  {row['diff']:+7.1f}{note}")
             if len(_over_unobs) > 0 and len(_over_obs) >= 5:
-                print(f"  ({len(_over_unobs)} additional zone(s) over-predicted with 0 survey obs â€” see zone_discrepancy_{seg}.csv)")
-            print(f"\nâ”€â”€ Top 5 under-predicted zones [{seg}] â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+                print(f"  ({len(_over_unobs)} additional zone(s) over-predicted with 0 survey obs - see zone_discrepancy_{seg}.csv)")
+            print(f"\n── Top 5 under-predicted zones [{seg}] ─────────────────────")
             print(f"  {'Zone':>6}  {'Obs':>5}  {'Pred':>7}  {'Diff':>7}")
             for z, row in top_under.iterrows():
                 print(f"  {z:6d}  {int(row['obs']):5d}  {row['pred_scaled']:7.1f}  {row['diff']:+7.1f}")
@@ -12928,12 +13594,12 @@ def compute_validation_metrics(
                   f"t={r['t_stat']:.2f}  se={r['std_err']:.3f}")
     print("=" * 65 + "\n")
 
-    # â”€â”€ 7. Save CSV â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 7. Save CSV ──────────────────────────────────────────────────────
     if save_path and not metrics['param_table'].empty:
         try:
             os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
             metrics['param_table'].to_csv(save_path, index=False)
-            print(f"  Validation parameter table â†’ {save_path}")
+            print(f"  Validation parameter table → {save_path}")
         except Exception as _e:
             logger.debug(f"compute_validation_metrics: save failed: {_e}")
 
@@ -12995,16 +13661,51 @@ def compute_multilevel_validation(
     print("MULTI-LEVEL VALIDATION REPORT")
     print("=" * 70)
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════════
     # LEVEL 1: TRIP-LEVEL VALIDATION
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-    print("\nâ”€â”€ LEVEL 1: TRIP-LEVEL VALIDATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n── LEVEL 1: TRIP-LEVEL VALIDATION ─────────────────────────────")
 
     # Extract trips from pred_plan
     if _has_rowtype:
         pred_trips = pred_plan[pred_plan['row_type'] == 'trip'].copy()
     else:
         pred_trips = pred_plan.copy()
+
+    # ── Build OD→skim-distance lookup from predicted trips ──────────────────
+    # pred trips already carry `dist` from SOVTOLL_DIST__AM (km).  We extract
+    # unique (OTAZ,DTAZ)→dist pairs and reuse the same skim for observed tours
+    # so both TLFD curves use identical distance definitions.
+    _pred_dist_col = next(
+        (c for c in ['distance', 'DIST', 'dist', 'travdist'] if c in pred_trips.columns), None
+    )
+    _od_dist_lookup: dict = {}
+    if (_pred_dist_col and 'OTAZ' in pred_trips.columns
+            and 'DTAZ' in pred_trips.columns):
+        _lu = (pred_trips[['OTAZ', 'DTAZ', _pred_dist_col]]
+               .dropna()
+               .drop_duplicates(['OTAZ', 'DTAZ']))
+        _od_dist_lookup = {
+            (int(o), int(d)): float(v)
+            for o, d, v in _lu[['OTAZ', 'DTAZ', _pred_dist_col]].itertuples(index=False, name=None)
+        }
+        # symmetric: also add reverse pair with the same value
+        for (o, d), v in list(_od_dist_lookup.items()):
+            _od_dist_lookup.setdefault((d, o), v)
+
+    # ── Deduplicate predicted trips to primary legs only ─────────────────────
+    # Multi-stop tours produce multiple trip rows per tour (outbound + return +
+    # stops).  Stop legs are short and inflate the 0-3 km bins.  Keep only the
+    # longest-leg trip per (person_id, purpose) to approximate the primary OD.
+    _pred_trips_primary = pred_trips
+    if _pred_dist_col and 'person_id' in pred_trips.columns and 'purpose' in pred_trips.columns:
+        _d_vals = pd.to_numeric(pred_trips[_pred_dist_col], errors='coerce')
+        _pred_trips_primary = (
+            pred_trips.assign(_d_tmp=_d_vals)
+            .sort_values('_d_tmp', ascending=False)
+            .drop_duplicates(subset=['person_id', 'purpose'], keep='first')
+            .drop(columns=['_d_tmp'])
+        )
 
     # Trip length frequency distribution (TLFD) by segment
     trip_tlfd = {}
@@ -13013,25 +13714,52 @@ def compute_multilevel_validation(
                    '15-20', '20-30', '30-50', '50-100', '100+']
 
     for seg, purposes in SEG_PURPOSES.items():
-        # Observed TLFD
+        # ── Observed TLFD ─────────────────────────────────────────────────────
+        # Prefer skim-derived OD distance (same source as pred) over survey
+        # tour_distance which uses cumulative odometer readings and may have
+        # data-quality issues (many near-zero entries → inflated 0-1 km band).
         obs_dist = pd.Series(dtype=float)
-        if _obs_purp_col and _obs_dist_col:
-            _m = obs_tours[_obs_purp_col].isin(purposes)
-            obs_dist = pd.to_numeric(
-                obs_tours.loc[_m, _obs_dist_col], errors='coerce'
-            ).dropna()
-        elif _obs_dist_col:
-            obs_dist = pd.to_numeric(obs_tours[_obs_dist_col], errors='coerce').dropna()
+        _obs_subset = pd.DataFrame()
+        if _obs_purp_col:
+            _m_obs = obs_tours[_obs_purp_col].isin(purposes)
+            _obs_subset = obs_tours.loc[_m_obs]
+        elif not obs_tours.empty:
+            _obs_subset = obs_tours
 
-        # Predicted TLFD â€” use distance column if available
+        if (not _obs_subset.empty and _od_dist_lookup
+                and 'OTAZ' in _obs_subset.columns
+                and _obs_dtaz_col in _obs_subset.columns):
+            # Look up skim km for each observed OTAZ→DTAZ pair
+            _o_vec = pd.to_numeric(_obs_subset['OTAZ'], errors='coerce').fillna(0).astype(int)
+            _d_vec = pd.to_numeric(_obs_subset[_obs_dtaz_col], errors='coerce').fillna(0).astype(int)
+            obs_dist = pd.Series(
+                [_od_dist_lookup.get((int(o), int(d)), np.nan)
+                 for o, d in zip(_o_vec, _d_vec)],
+                dtype=float,
+            ).dropna()
+            _obs_dist_source = 'skim (OTAZ→DTAZ lookup)'
+        elif not _obs_subset.empty and _obs_dist_col:
+            obs_dist = pd.to_numeric(_obs_subset[_obs_dist_col], errors='coerce').dropna()
+            _obs_dist_source = f'survey col {_obs_dist_col!r} (may differ from skim units)'
+        else:
+            _obs_dist_source = 'none'
+
+        # Report intrazonal rate (OTAZ==DTAZ) - these always appear as 0-1 km
+        _intrazone_pct = np.nan
+        if (not _obs_subset.empty and 'OTAZ' in _obs_subset.columns
+                and _obs_dtaz_col in _obs_subset.columns):
+            _o2 = pd.to_numeric(_obs_subset['OTAZ'], errors='coerce')
+            _d2 = pd.to_numeric(_obs_subset[_obs_dtaz_col], errors='coerce')
+            _valid = _o2.notna() & _d2.notna()
+            if _valid.any():
+                _intrazone_pct = float((_o2[_valid] == _d2[_valid]).mean() * 100)
+
+        # ── Predicted TLFD (primary legs only) ────────────────────────────────
         pred_dist = pd.Series(dtype=float)
-        _pred_dist_col = next(
-            (c for c in ['distance', 'DIST', 'dist', 'travdist'] if c in pred_trips.columns), None
-        )
-        if 'purpose' in pred_trips.columns and _pred_dist_col:
-            _m = pred_trips['purpose'].isin(purposes)
+        if 'purpose' in _pred_trips_primary.columns and _pred_dist_col:
+            _m_pred = _pred_trips_primary['purpose'].isin(purposes)
             pred_dist = pd.to_numeric(
-                pred_trips.loc[_m, _pred_dist_col], errors='coerce'
+                _pred_trips_primary.loc[_m_pred, _pred_dist_col], errors='coerce'
             ).dropna()
 
         if not obs_dist.empty:
@@ -13058,9 +13786,11 @@ def compute_multilevel_validation(
         _rmse = np.sqrt(np.mean((obs_freq.values - pred_freq.values) ** 2))
         print(f"\n  {seg.upper()} trip length distribution (TLFD):")
         print(f"    n_obs={len(obs_dist):<6d}  n_pred={len(pred_dist):<6d}  RMSE={_rmse:.4f}")
+        if np.isfinite(_intrazone_pct):
+            print(f"    intrazonal obs={_intrazone_pct:.1f}%  dist_source={_obs_dist_source}")
         print(f"    {'Band':>10s}  {'Obs%':>6s}  {'Pred%':>7s}  {'Diff':>6s}")
         for _, row in tlfd_df.iterrows():
-            flag = ' â—„' if abs(row['diff_pp']) > 3.0 else ''
+            flag = ' ◄' if abs(row['diff_pp']) > 3.0 else ''
             print(f"    {row['distance_band']:>10s}  {row['obs_share']:6.1f}  "
                   f"{row['pred_share']:7.1f}  {row['diff_pp']:+6.1f}{flag}")
 
@@ -13104,16 +13834,41 @@ def compute_multilevel_validation(
 
     results['trip_od'] = trip_od
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════════
     # LEVEL 2: TOUR-LEVEL VALIDATION
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-    print("\n\nâ”€â”€ LEVEL 2: TOUR-LEVEL VALIDATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n\n── LEVEL 2: TOUR-LEVEL VALIDATION ────────────────────────────")
 
-    # Extract activity/destination rows from pred_plan
+    # Extract activity/destination rows from pred_plan.
+    # Keep only the PRIMARY destination per tour (one record per person×purpose)
+    # so that intermediate stops don't dilute the zone distribution toward
+    # nearby zones.  Primary = activity with the highest skim distance from
+    # the person's origin, or failing that, the first activity record.
     if _has_rowtype:
-        pred_acts = pred_plan[pred_plan['row_type'] == 'activity'].copy()
+        _all_acts = pred_plan[pred_plan['row_type'] == 'activity'].copy()
     else:
-        pred_acts = pred_plan.copy()
+        _all_acts = pred_plan.copy()
+
+    if ('person_id' in _all_acts.columns and 'purpose' in _all_acts.columns
+            and 'DTAZ' in _all_acts.columns):
+        if _od_dist_lookup and 'OTAZ' in _all_acts.columns:
+            _all_acts['_pri_dist'] = [
+                _od_dist_lookup.get((int(o), int(d)), 0.0)
+                for o, d in zip(
+                    pd.to_numeric(_all_acts['OTAZ'], errors='coerce').fillna(0).astype(int),
+                    pd.to_numeric(_all_acts['DTAZ'],  errors='coerce').fillna(0).astype(int),
+                )
+            ]
+            pred_acts = (
+                _all_acts.sort_values('_pri_dist', ascending=False)
+                .drop_duplicates(subset=['person_id', 'purpose'], keep='first')
+                .drop(columns=['_pri_dist'])
+            )
+        else:
+            # No distance lookup - keep first activity per person×purpose
+            pred_acts = _all_acts.drop_duplicates(subset=['person_id', 'purpose'], keep='first')
+    else:
+        pred_acts = _all_acts
 
     tour_zone_accuracy = {}
     for seg, purposes in SEG_PURPOSES.items():
@@ -13178,7 +13933,7 @@ def compute_multilevel_validation(
             # Top 10 most observed zones
             print(f"    {'Zone':>6s}  {'Obs':>5s}  {'Pred':>7s}  {'O%':>5s}  {'P%':>6s}  {'Diff':>6s}")
             for _, row in zone_df.head(10).iterrows():
-                flag = ' â—„' if abs(row['diff_pp']) > 1.0 else ''
+                flag = ' ◄' if abs(row['diff_pp']) > 1.0 else ''
                 print(f"    {int(row['zone']):6d}  {int(row['obs_count']):5d}  "
                       f"{row['pred_count_scaled']:7.1f}  {row['obs_share']:5.1f}  "
                       f"{row['pred_share']:6.1f}  {row['diff_pp']:+6.1f}{flag}")
@@ -13190,7 +13945,7 @@ def compute_multilevel_validation(
 
     results['tour_zone_accuracy'] = tour_zone_accuracy
 
-    # Tour mode Ã— segment cross-tab
+    # Tour mode × segment cross-tab
     tour_mode_seg = {}
     MODE_LABELS = {1: 'DA', 2: 'SR', 3: 'Walk', 4: 'Bike', 5: 'Transit'}
     ALL_MODE_NAMES = ['DA', 'SR', 'Walk', 'Bike', 'Transit']
@@ -13226,10 +13981,10 @@ def compute_multilevel_validation(
 
     results['tour_mode_by_segment'] = tour_mode_seg
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════════
     # LEVEL 3: WORK ASSIGNMENT VALIDATION
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-    print("\n\nâ”€â”€ LEVEL 3: WORK ASSIGNMENT VALIDATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n\n── LEVEL 3: WORK ASSIGNMENT VALIDATION ───────────────────────")
 
     work_val = {}
     # Observed work destination distribution
@@ -13293,7 +14048,7 @@ def compute_multilevel_validation(
         for _, row in work_df.head(15).iterrows():
             _te = int(row.get('TOTEMP', 0))
             _fp = int(row.get('FPSEMPN', 0))
-            flag = ' â—„' if abs(row['diff']) > 10 else ''
+            flag = ' ◄' if abs(row['diff']) > 10 else ''
             print(f"  {int(row['zone']):6d}  {int(row['obs_workers']):5d}  "
                   f"{row['pred_workers_scaled']:7.1f}  {row['diff']:+7.1f}  "
                   f"{_te:7d}  {_fp:7d}{flag}")
@@ -13305,10 +14060,10 @@ def compute_multilevel_validation(
 
     results['work_assignment'] = work_val
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════════
     # LEVEL 4: EDUCATION ASSIGNMENT VALIDATION
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-    print("\n\nâ”€â”€ LEVEL 4: EDUCATION ASSIGNMENT VALIDATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n\n── LEVEL 4: EDUCATION ASSIGNMENT VALIDATION ──────────────────")
 
     edu_val = {}
     _obs_study_col = next((c for c in ['STUDYING', 'studying'] if c in obs_tours.columns), None)
@@ -13461,9 +14216,9 @@ def compute_multilevel_validation(
 
     results['edu_assignment'] = edu_val
 
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════════
     # SUMMARY TABLE
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+    # ══════════════════════════════════════════════════════════════════════
     summary_rows = []
 
     # Tour-level metrics
@@ -13502,17 +14257,17 @@ def compute_multilevel_validation(
     summary_df = pd.DataFrame(summary_rows)
     results['summary'] = summary_df
 
-    print("\n\nâ”€â”€ VALIDATION SUMMARY TABLE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+    print("\n\n── VALIDATION SUMMARY TABLE ───────────────────────────────────")
     print(f"  {'Level':<20s}  {'Segment':<12s}  {'n_obs':>6s}  {'n_pred':>7s}  "
           f"{'Pearson':>8s}  {'RMSE':>7s}")
-    print(f"  {'â”€'*65}")
+    print(f"  {'─'*65}")
     for _, row in summary_df.iterrows():
         print(f"  {row['level']:<20s}  {row['segment']:<12s}  {int(row['n_obs']):6d}  "
               f"{int(row['n_pred']):7d}  {row['pearson_r']:8.3f}  {row['rmse']:7.4f}")
 
     try:
         summary_df.to_csv(f'{save_dir}/multilevel_validation_summary.csv', index=False)
-        print(f"\n  Summary saved â†’ {save_dir}/multilevel_validation_summary.csv")
+        print(f"\n  Summary saved → {save_dir}/multilevel_validation_summary.csv")
     except Exception:
         pass
 
@@ -13627,15 +14382,15 @@ def _save_compact_kpi_summaries(metrics: dict, save_path: str):
     agg_df.to_csv(agg_csv, index=False)
     _write_compact_kpi_html(agg_df, agg_html, title='Stage 5 Level KPIs (All Runs)')
 
-    print(f"  Compact KPI summary â†’ {run_csv}")
-    print(f"  Compact KPI HTML    â†’ {run_html}")
-    print(f"  Cross-run KPI CSV   â†’ {agg_csv}")
-    print(f"  Cross-run KPI HTML  â†’ {agg_html}")
+    print(f"  Compact KPI summary → {run_csv}")
+    print(f"  Compact KPI HTML    → {run_html}")
+    print(f"  Cross-run KPI CSV   → {agg_csv}")
+    print(f"  Cross-run KPI HTML  → {agg_html}")
 
 
 def _compute_model_fit_stats(models: dict) -> pd.DataFrame:
     """
-    Extract LL-null, LL-final, n_obs, n_params, McFadden ÏÂ², AIC, BIC
+    Extract LL-null, LL-final, n_obs, n_params, McFadden ρ², AIC, BIC
     for every estimated mode and destination model.
 
     Returns a DataFrame indexed by (segment, model_type).
@@ -13709,7 +14464,7 @@ def _check_behavioural_signs(models: dict) -> list:
         'c_size_term':     ('>', 0,  'Employment/size attracts'),
         'c_logsum':        ('>', 0,  'Better mode access attracts'),
         'c_aggl':          ('>', 0,  'Agglomeration attracts (clustering)'),
-        'c_comp':          ('<', 0,  'Competition deters (or â‰ˆ0)'),
+        'c_comp':          ('<', 0,  'Competition deters (or ≈0)'),
         'c_propensity_dist': ('>', 0, 'Mobile persons less distance-deterred'),
         # mode model
         'c_ivt_auto':      ('<', 0,  'Auto IVT deters driving'),
@@ -13718,8 +14473,8 @@ def _check_behavioural_signs(models: dict) -> list:
         'c_bike_time':     ('<', 0,  'Bike time deters cycling'),
         'c_veh_da':        ('>', 0,  'Vehicle ownership promotes DA'),
         'c_noveh_transit': ('>', 0,  'Zero-car HH shifts to transit'),
-        'c_incp_transit':  ('<', 0,  'Higher income â†’ less transit'),
-        'c_incp_da':       ('>', 0,  'Higher income â†’ more DA'),
+        'c_incp_transit':  ('<', 0,  'Higher income → less transit'),
+        'c_incp_da':       ('>', 0,  'Higher income → more DA'),
         'ASC_Walk':        ('<', 0,  'Walk baseline below DA'),
         'ASC_Bike':        ('<', 0,  'Bike baseline below DA'),
         'ASC_Transit':     ('<', 0,  'Transit baseline below DA'),
@@ -13756,8 +14511,8 @@ def _check_behavioural_signs(models: dict) -> list:
 
 def _compute_acdc_effects(models: dict, landuse: pd.DataFrame) -> dict:
     """
-    Analyse how agglomeration (c_aggl Ã— acdc_aggl) and competition
-    (c_comp Ã— acdc_comp) terms influence destination probabilities.
+    Analyse how agglomeration (c_aggl × acdc_aggl) and competition
+    (c_comp × acdc_comp) terms influence destination probabilities.
 
     For each segment this function computes:
       - Estimated coefficients c_aggl and c_comp (and t-stats if available)
@@ -13774,8 +14529,8 @@ def _compute_acdc_effects(models: dict, landuse: pd.DataFrame) -> dict:
             't_aggl': float, 't_comp': float,
             'aggl_mean': float, 'aggl_sd': float,
             'comp_mean': float, 'comp_sd': float,
-            'utility_aggl_mean': float,   # c_aggl Ã— mean(acdc_aggl)
-            'utility_aggl_p90':  float,   # c_aggl Ã— p90(acdc_aggl)
+            'utility_aggl_mean': float,   # c_aggl × mean(acdc_aggl)
+            'utility_aggl_p90':  float,   # c_aggl × p90(acdc_aggl)
             'prob_ratio_aggl':   float,   # P(top-decile) / P(bottom-decile), ceteris paribus
             'top10_zones':       DataFrame,
             'zone_effects':      DataFrame (zone_id, acdc_aggl, acdc_comp, net_acdc_util),
@@ -13829,7 +14584,7 @@ def _compute_acdc_effects(models: dict, landuse: pd.DataFrame) -> dict:
         }).sort_values('net_acdc_util', ascending=False).reset_index(drop=True)
 
         # Probability ratio: top vs bottom decile aggl zone (ceteris paribus)
-        # P_j âˆ exp(V_j); ratio = exp(V_top - V_bottom)
+        # P_j ∝ exp(V_j); ratio = exp(V_top - V_bottom)
         if len(util_aggl) >= 10:
             p90_util = float(np.percentile(util_aggl[np.isfinite(util_aggl)], 90))
             p10_util = float(np.percentile(util_aggl[np.isfinite(util_aggl)], 10))
@@ -13862,8 +14617,8 @@ def _compute_tld_metrics(obs_tours: pd.DataFrame,
     Trip-length distribution (TLD) comparison: observed HHTS vs synthetic.
 
     Returns a dict with:
-      obs_quantiles, pred_quantiles  â€” p10/p25/p50/p75/p90/mean
-      band_share_obs, band_share_pred â€” % in <5, 5-15, 15-30, 30-60, 60+ km
+      obs_quantiles, pred_quantiles  - p10/p25/p50/p75/p90/mean
+      band_share_obs, band_share_pred - % in <5, 5-15, 15-30, 30-60, 60+ km
     """
     dist_col_obs  = next((c for c in ['DIST', 'dist', 'SOVTOLL_DIST__AM', 'tour_distance']
                           if c in obs_tours.columns), None)
@@ -13926,13 +14681,13 @@ def print_stage5_dashboard(
 
     Sections
     --------
-    1. Model fit â€” LL, McFadden ÏÂ², AIC, BIC for every model
-    2. Behavioural sign checks â€” expected vs estimated coefficient signs
-    3. ACDC agglomeration/competition effects â€” zone-level utility contributions,
+    1. Model fit - LL, McFadden ρ², AIC, BIC for every model
+    2. Behavioural sign checks - expected vs estimated coefficient signs
+    3. ACDC agglomeration/competition effects - zone-level utility contributions,
        probability ratios, top-10 most-agglomerated zones
-    4. Destination zone accuracy â€” RMSE, Pearson r, KL divergence
-    5. Mode share comparison â€” observed vs predicted with segment breakdown
-    6. Trip-length distribution â€” quantiles and distance-band shares
+    4. Destination zone accuracy - RMSE, Pearson r, KL divergence
+    5. Mode share comparison - observed vs predicted with segment breakdown
+    6. Trip-length distribution - quantiles and distance-band shares
     7. Insignificant free parameters
 
     Saves:
@@ -13945,12 +14700,12 @@ def print_stage5_dashboard(
     """
     os.makedirs(save_dir, exist_ok=True)
     W = 72   # console width
-    SEP = 'â”€' * W
+    SEP = '─' * W
 
     def _hdr(title):
-        print(f'\nâ”Œ{SEP}â”')
-        print(f'â”‚  {title:<{W-2}}â”‚')
-        print(f'â””{SEP}â”˜')
+        print(f'\n┌{SEP}┐')
+        print(f'│  {title:<{W-2}}│')
+        print(f'└{SEP}┘')
 
     def _row(label, *vals, width=12):
         parts = f'  {label:<26s}'
@@ -13958,16 +14713,16 @@ def print_stage5_dashboard(
             parts += f'{str(v):>{width}}'
         print(parts)
 
-    print(f'\n{"â•"*W}')
-    print(f'  STAGE 5 DASHBOARD â€” Destination + Mode Choice')
-    print(f'{"â•"*W}')
+    print(f'\n{"═"*W}')
+    print(f'  STAGE 5 DASHBOARD - Destination + Mode Choice')
+    print(f'{"═"*W}')
 
-    # â”€â”€ 1. Model fit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 1. Model fit ──────────────────────────────────────────────────────
     _hdr('1. MODEL FIT STATISTICS')
     fit_df = _compute_model_fit_stats(models)
     if not fit_df.empty:
         print(f'  {"Segment":<10} {"Model":<6} {"LL-null":>10} {"LL-final":>10}'
-              f' {"ÏÂ²":>7} {"AIC":>10} {"BIC":>10} {"n_obs":>7} {"n_free":>7}')
+              f' {"ρ²":>7} {"AIC":>10} {"BIC":>10} {"n_obs":>7} {"n_free":>7}')
         print(f'  {"-"*70}')
         for _, r in fit_df.iterrows():
             rho2_str = f'{r.rho2:.4f}' if np.isfinite(r.rho2) else '   n/a'
@@ -13980,7 +14735,7 @@ def print_stage5_dashboard(
         except Exception:
             pass
 
-    # â”€â”€ 2. Behavioural sign checks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 2. Behavioural sign checks ────────────────────────────────────────
     _hdr('2. BEHAVIOURAL SIGN CHECKS')
     sign_checks = _check_behavioural_signs(models)
     if sign_checks:
@@ -13988,7 +14743,7 @@ def print_stage5_dashboard(
         passes = [c for c in sign_checks if c['pass'] is True]
         unknowns = [c for c in sign_checks if c['pass'] is None]
         print(f'  Checked {len(sign_checks)} parameters:  '
-              f'âœ“ {len(passes)} pass   âœ— {len(fails)} fail   ? {len(unknowns)} NaN')
+              f'✓ {len(passes)} pass   ✗ {len(fails)} fail   ? {len(unknowns)} NaN')
         if fails:
             print(f'\n  FAILURES (unexpected coefficient signs):')
             print(f'  {"Seg":<8} {"Model":<6} {"Parameter":<22} {"Value":>8} {"Expected":>10}  Note')
@@ -13997,14 +14752,14 @@ def print_stage5_dashboard(
                 print(f'  {c["segment"]:<8} {c["model"]:<6} {c["parameter"]:<22}'
                       f' {c["value"]:>8.4f} {c["expected"]:>10}  {c["note"]}')
         else:
-            print('  All checked parameters have the expected sign âœ“')
+            print('  All checked parameters have the expected sign ✓')
         try:
             pd.DataFrame(sign_checks).to_csv(f'{save_dir}/dashboard_sign_checks.csv', index=False)
         except Exception:
             pass
 
-    # â”€â”€ 3. ACDC agglomeration / competition effects â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    _hdr('3. ACDC â€” AGGLOMERATION & COMPETITION EFFECTS')
+    # ── 3. ACDC agglomeration / competition effects ───────────────────────
+    _hdr('3. ACDC - AGGLOMERATION & COMPETITION EFFECTS')
     acdc = _compute_acdc_effects(models, landuse)
     for seg, ef in acdc.items():
         print(f'\n  [{seg.upper()}]')
@@ -14012,8 +14767,8 @@ def print_stage5_dashboard(
         print(f'  {"-"*65}')
 
         # Agglomeration
-        aggl_sig = 'âœ“' if abs(ef['t_aggl']) >= 1.96 else 'âœ—' if np.isfinite(ef['t_aggl']) else '?'
-        comp_sig  = 'âœ“' if abs(ef['t_comp'])  >= 1.96 else 'âœ—' if np.isfinite(ef['t_comp'])  else '?'
+        aggl_sig = '✓' if abs(ef['t_aggl']) >= 1.96 else '✗' if np.isfinite(ef['t_aggl']) else '?'
+        comp_sig  = '✓' if abs(ef['t_comp'])  >= 1.96 else '✗' if np.isfinite(ef['t_comp'])  else '?'
         print(f'  {"c_aggl (agglomeration)":<20} {ef["c_aggl"]:>12.4f} {ef["t_aggl"]:>7.2f}'
               f'  {aggl_sig} More clustered zones attract more trips')
         print(f'  {"c_comp (competition)":<20} {ef["c_comp"]:>12.4f} {ef["t_comp"]:>7.2f}'
@@ -14024,16 +14779,16 @@ def print_stage5_dashboard(
               f'Utility at mean  : {ef["utility_aggl_mean"]:+.4f}')
         print(f'    SD   score  : {ef["aggl_sd"]:.4f}   '
               f'Utility at p90   : {ef["utility_aggl_p90"]:+.4f}')
-        print(f'    Prob ratio  : p90/p10 aggl zone = {ef["prob_ratio_aggl"]:.2f}Ã— '
+        print(f'    Prob ratio  : p90/p10 aggl zone = {ef["prob_ratio_aggl"]:.2f}× '
               f'(ceteris paribus)')
 
         # Interpretation of probability ratio
         r = ef['prob_ratio_aggl']
         if np.isfinite(r) and r > 1:
-            print(f'    â†’ A top-decile agglomeration zone is {r:.1f}Ã— more likely to be')
+            print(f'    → A top-decile agglomeration zone is {r:.1f}× more likely to be')
             print(f'      chosen than a bottom-decile zone, holding all else constant.')
         elif np.isfinite(r) and r < 1:
-            print(f'    â†’ Agglomeration reduces destination probability (unexpected sign).')
+            print(f'    → Agglomeration reduces destination probability (unexpected sign).')
 
         # Top-10 zones
         top10 = ef['top10_zones']
@@ -14050,7 +14805,7 @@ def print_stage5_dashboard(
         except Exception:
             pass
 
-    # â”€â”€ 4. Destination zone accuracy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 4. Destination zone accuracy ──────────────────────────────────────
     if metrics:
         _hdr('4. DESTINATION ZONE ACCURACY')
         print(f'  {"Segment":<10}  {"RMSE":>8}  {"Pearson r":>10}  {"KL div":>8}  Quality')
@@ -14064,16 +14819,16 @@ def print_stage5_dashboard(
                 continue
             # Quality flag
             if c > 0.90 and r < 0.002:
-                qual = 'â˜…â˜…â˜… Excellent'
+                qual = '★★★ Excellent'
             elif c > 0.75 and r < 0.005:
-                qual = 'â˜…â˜…  Good'
+                qual = '★★  Good'
             elif c > 0.50:
-                qual = 'â˜…   Fair'
+                qual = '★   Fair'
             else:
-                qual = 'âœ—   Poor'
+                qual = '✗   Poor'
             print(f'  {seg:<10}  {r:>8.5f}  {c:>10.3f}  {kl:>8.4f}  {qual}')
 
-        # â”€â”€ 5. Mode share â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── 5. Mode share ─────────────────────────────────────────────────
         _hdr('5. MODE SHARE COMPARISON  (Observed HHTS  vs  Synthetic Population)')
         ALL_MODES = ['DA', 'SR', 'Walk', 'Bike', 'Transit']
         obs_ms  = metrics.get('mode_share_obs',  {})
@@ -14085,7 +14840,7 @@ def print_stage5_dashboard(
                 o = obs_ms.get(m, 0.0)
                 p = pred_ms.get(m, 0.0)
                 d = p - o
-                flag = ' â—„ LARGE' if abs(d) > 5.0 else ''
+                flag = ' ◄ LARGE' if abs(d) > 5.0 else ''
                 print(f'  {m:<10}  {o:>8.1f}  {p:>8.1f}  {d:>+8.1f}{flag}')
 
         ms_by_seg = metrics.get('mode_share_by_segment', {})
@@ -14097,10 +14852,10 @@ def print_stage5_dashboard(
                     o_ = sdf.loc[m, 'Obs_%']
                     p_ = sdf.loc[m, 'Pred_%']
                     d_ = sdf.loc[m, 'Diff_%']
-                    flag = ' â—„' if abs(d_) > 5.0 else ''
+                    flag = ' ◄' if abs(d_) > 5.0 else ''
                     print(f'         {m:<10}  {o_:>7.1f}  {p_:>7.1f}  {d_:>+7.1f}{flag}')
 
-    # â”€â”€ 6. Trip-length distribution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 6. Trip-length distribution ───────────────────────────────────────
     if obs_tours is not None and pred_plan is not None:
         _hdr('6. TRIP-LENGTH DISTRIBUTION')
         tld = _compute_tld_metrics(obs_tours, pred_plan)
@@ -14123,7 +14878,7 @@ def print_stage5_dashboard(
             o = bs_o.get(band, float('nan'))
             p = bs_p.get(band, float('nan'))
             d = (p - o) if (np.isfinite(o) and np.isfinite(p)) else float('nan')
-            flag = ' â—„' if abs(d) > 5.0 else ''
+            flag = ' ◄' if abs(d) > 5.0 else ''
             print(f'  {band:<10}  {o:>8.1f}  {p:>8.1f}  {d:>+8.1f}{flag}')
 
         print(f'\n  n (obs={tld["n_obs"]:,}  pred={tld["n_pred"]:,})')
@@ -14136,13 +14891,13 @@ def print_stage5_dashboard(
         except Exception:
             pass
 
-    # â”€â”€ 7. Insignificant free parameters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 7. Insignificant free parameters ─────────────────────────────────
     if metrics and not metrics.get('param_table', pd.DataFrame()).empty:
         _hdr('7. INSIGNIFICANT FREE PARAMETERS  (|t| < 1.96)')
         pt  = metrics['param_table']
         bad = pt[~pt['significant'] & ~pt['holdfast']]
         if bad.empty:
-            print('  All free parameters are statistically significant âœ“')
+            print('  All free parameters are statistically significant ✓')
         else:
             print(f'  {len(bad)} parameters below significance threshold:')
             print(f'  {"Seg":<8} {"Model":<6} {"Parameter":<24} {"Value":>9} {"t-stat":>8} {"SE":>9}')
@@ -14151,7 +14906,7 @@ def print_stage5_dashboard(
                 print(f'  {r.segment:<8} {r.model:<6} {r.parameter:<24}'
                       f' {r.value:>9.4f} {r.t_stat:>8.2f} {r.std_err:>9.4f}')
 
-    print(f'\n{"â•"*W}\n')
+    print(f'\n{"═"*W}\n')
 
     return {
         'fit':          fit_df,
@@ -14175,15 +14930,15 @@ def write_vehicle_dat(
         vehicle_id, hhid, person_id, mode, OTAZ, DTAZ,
         STARTIME_min, ENDTIME_min, travtime_min, purpose
 
-    SR trips that share a vehicle_id with a DA trip represent carpools â€”
+    SR trips that share a vehicle_id with a DA trip represent carpools -
     the vehicle is counted ONCE for network loading but both travellers
     are recorded.
 
     For network-aware simulation:
-      â€¢ Each unique vehicle_id = one vehicle in the network
-      â€¢ DA + matched SR trips have the same vehicle_id â†’ one vehicle,
+      • Each unique vehicle_id = one vehicle in the network
+      • DA + matched SR trips have the same vehicle_id → one vehicle,
         multiple occupants (correct for capacity / congestion models)
-      â€¢ vehicle.dat total row count â‰  total car trips;
+      • vehicle.dat total row count ≠ total car trips;
         unique vehicle_id count = actual vehicles on network
     """
     car_modes = {1, 2}   # DA=1, SR=2
@@ -14195,14 +14950,14 @@ def write_vehicle_dat(
 
     car_trips = trips[pd.to_numeric(trips['mode'], errors='coerce').isin(car_modes)].copy()
     if car_trips.empty:
-        logger.warning("write_vehicle_dat: no motorised trips found â€” file not written")
+        logger.warning("write_vehicle_dat: no motorised trips found - file not written")
         return pd.DataFrame()
 
     if 'vehicle_id' not in car_trips.columns or (car_trips['vehicle_id'] == '').all():
-        logger.warning("write_vehicle_dat: vehicle_id not assigned â€” run _assign_vehicle_ids first")
+        logger.warning("write_vehicle_dat: vehicle_id not assigned - run _assign_vehicle_ids first")
         return pd.DataFrame()
 
-    # â”€â”€ Build household mapping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Build household mapping ───────────────────────────────────────────
     hhid_col = None
     if persons is not None:
         pp = persons.copy()
@@ -14232,7 +14987,7 @@ def write_vehicle_dat(
         'purpose':       car_trips.get('purpose', pd.Series('', index=car_trips.index)).fillna(''),
     }).reset_index(drop=True)
 
-    # Sort: vehicle_id â†’ STARTIME (chronological order for network loading)
+    # Sort: vehicle_id → STARTIME (chronological order for network loading)
     veh_df = veh_df.sort_values(['vehicle_id', 'STARTIME_min']).reset_index(drop=True)
 
     # Summary
@@ -14242,13 +14997,13 @@ def write_vehicle_dat(
     n_joint = veh_df[veh_df['mode'] == 2].groupby('vehicle_id').ngroups
     print(f"\nVehicle summary:")
     print(f"  {n_veh:,} unique vehicles  |  {n_da:,} DA trips  |  {n_sr:,} SR trips")
-    print(f"  {n_joint:,} vehicles with â‰¥1 SR passenger (joint/carpool)")
+    print(f"  {n_joint:,} vehicles with ≥1 SR passenger (joint/carpool)")
 
     if save_path:
         try:
             os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
             veh_df.to_csv(save_path, index=False)
-            print(f"  vehicle.dat â†’ {save_path}")
+            print(f"  vehicle.dat → {save_path}")
         except Exception as _e:
             logger.warning(f"write_vehicle_dat: save failed: {_e}")
 
@@ -14267,7 +15022,7 @@ def plot_dest_zone_validation(
 
     Parameters
     ----------
-    obs_tours : HHTS tours DataFrame (output of _prep_hhts_tours) â€” the
+    obs_tours : HHTS tours DataFrame (output of _prep_hhts_tours) - the
                 'ground truth' with observed DTAZ and primary_purpose columns.
     pred_plan : Stage 5 plan DataFrame (trips + activities interleaved).
     save_path : PNG output path.
@@ -14281,7 +15036,7 @@ def plot_dest_zone_validation(
         logger.warning("plot_dest_zone_validation: matplotlib not available")
         return
 
-    # â”€â”€ segment filters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── segment filters ───────────────────────────────────────────────────────
     SEG_PURPOSES = {
         'Work':          _WORK_PURPOSES,
         'Education':     _EDU_PURPOSES,
@@ -14298,10 +15053,10 @@ def plot_dest_zone_validation(
     PRED_DTAZ_COL = next((c for c in ['DTAZ', 'dest_taz', 'dtaz', 'DEST_TAZ'] if c in pred_plan.columns), None)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('Stage 5 â€” Destination Choice: Observed vs Predicted Zone Distribution',
+    fig.suptitle('Stage 5 - Destination Choice: Observed vs Predicted Zone Distribution',
                  fontsize=13, fontweight='bold')
 
-    # â”€â”€ one-time diagnostic: show plan structure â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── one-time diagnostic: show plan structure ──────────────────────────────
     _has_rowtype  = 'row_type' in pred_plan.columns
     _has_purpose  = PRED_SEG_COL is not None
     _has_dtaz     = PRED_DTAZ_COL is not None
@@ -14320,7 +15075,7 @@ def plot_dest_zone_validation(
         # Build a lowercase set for case-insensitive matching
         purposes_lower = {str(p).lower() for p in purposes}
 
-        # â”€â”€ observed DTAZ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── observed DTAZ ─────────────────────────────────────────────────
         obs_dtaz = pd.Series(dtype=float)
         if OBS_SEG_COL and OBS_DTAZ_COL:
             _obs_purp = obs_tours[OBS_SEG_COL].astype(str).str.lower()
@@ -14334,12 +15089,12 @@ def plot_dest_zone_validation(
         elif OBS_DTAZ_COL:
             _raw = pd.to_numeric(obs_tours[OBS_DTAZ_COL], errors='coerce')
             obs_dtaz = _raw[_raw > 0].dropna()
-        # Education and Work: restrict observed DTAZ to zones 1â€“329 only
+        # Education and Work: restrict observed DTAZ to zones 1-329 only
         if seg_label in ('Education', 'Work') and not obs_dtaz.empty:
             obs_dtaz = obs_dtaz[obs_dtaz.between(1, 329)]
 
-        # â”€â”€ predicted DTAZ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # Priority: activity rows â†’ trip rows â†’ any row with matching purpose â†’ all DTAZ
+        # ── predicted DTAZ ────────────────────────────────────────────────
+        # Priority: activity rows → trip rows → any row with matching purpose → all DTAZ
         pred_dtaz = pd.Series(dtype=float)
 
         def _extract_pred(mask):
@@ -14362,15 +15117,15 @@ def plot_dest_zone_validation(
 
         if pred_dtaz.empty:
             _samp = pred_plan[PRED_SEG_COL].astype(str).unique()[:5].tolist() if _has_purpose else 'N/A'
-            print(f"  [dest validation] {seg_label}: pred_dtaz empty â€” "
+            print(f"  [dest validation] {seg_label}: pred_dtaz empty - "
                   f"purposes={list(purposes)[:4]}, plan purpose sample={_samp}")
 
-        # Education and Work: restrict predicted DTAZ to zones 1â€“329
+        # Education and Work: restrict predicted DTAZ to zones 1-329
         if seg_label in ('Education', 'Work') and not pred_dtaz.empty:
             pred_dtaz = pred_dtaz[pred_dtaz.between(1, 329)]
 
-        # â”€â”€ out-of-range diagnostics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # Log any predicted zones outside 1â€“330 so bad assignments are visible.
+        # ── out-of-range diagnostics ──────────────────────────────────────
+        # Log any predicted zones outside 1-330 so bad assignments are visible.
         if not pred_dtaz.empty:
             _pred_int = pred_dtaz.astype(int)
             _n_zero   = int((_pred_int == 0).sum())
@@ -14380,8 +15135,8 @@ def plot_dest_zone_validation(
             if _n_bad > 0:
                 _bad_vals = sorted(_pred_int[(_pred_int <= 0) | (_pred_int > 330)].unique().tolist())[:10]
                 print(
-                    f"  [dest validation] {seg_label}: WARNING â€” {_n_bad}/{len(_pred_int)} "
-                    f"predicted zones outside 1â€“330  "
+                    f"  [dest validation] {seg_label}: WARNING - {_n_bad}/{len(_pred_int)} "
+                    f"predicted zones outside 1-330  "
                     f"(zero={_n_zero}, neg={_n_neg}, >330={_n_hi})  "
                     f"example bad values: {_bad_vals}"
                 )
@@ -14394,29 +15149,29 @@ def plot_dest_zone_validation(
                 _max_z = int(_pred_int.max())
                 _nuniq = int(_pred_int.nunique())
                 print(
-                    f"  [dest validation] {seg_label}: pred zones OK â€” "
-                    f"range [{_min_z}â€“{_max_z}], {_nuniq} unique zones, n={len(_pred_int):,}"
+                    f"  [dest validation] {seg_label}: pred zones OK - "
+                    f"range [{_min_z}-{_max_z}], {_nuniq} unique zones, n={len(_pred_int):,}"
                 )
         if not obs_dtaz.empty:
             _obs_int = obs_dtaz.astype(int)
             _n_obs_bad = int((_obs_int <= 0).sum() + (_obs_int > 330).sum())
             if _n_obs_bad > 0:
                 _obs_bad = sorted(_obs_int[(_obs_int <= 0) | (_obs_int > 330)].unique().tolist())[:10]
-                print(f"  [dest validation] {seg_label}: WARNING â€” {_n_obs_bad} obs zones outside 1â€“330: {_obs_bad}")
+                print(f"  [dest validation] {seg_label}: WARNING - {_n_obs_bad} obs zones outside 1-330: {_obs_bad}")
 
         if obs_dtaz.empty and pred_dtaz.empty:
-            ax.set_title(f'{seg_label}\n(no data â€” check purpose/DTAZ columns)')
+            ax.set_title(f'{seg_label}\n(no data - check purpose/DTAZ columns)')
             ax.text(0.5, 0.5, 'No data\nCheck purpose column names',
                     ha='center', va='center', transform=ax.transAxes, fontsize=9, color='#888')
             continue
 
         obs_cnt = obs_dtaz.astype(int).value_counts()
         pred_cnt = pred_dtaz.astype(int).value_counts()
-        # Show all zones 1â€“330 binned and ordered leftâ†’right (zones 1 to 330)
+        # Show all zones 1-330 binned and ordered left→right (zones 1 to 330)
         _bin_edges = list(range(1, 331, bin_width)) + [331]
         _n_bins = len(_bin_edges) - 1
         _bin_labels = [str(_bin_edges[i]) for i in range(_n_bins)]
-        # Expand value_counts to full 1â€“330 index then accumulate into bins
+        # Expand value_counts to full 1-330 index then accumulate into bins
         _obs_all  = obs_cnt.reindex(range(1, 331), fill_value=0).astype(float)
         _pred_all = pred_cnt.reindex(range(1, 331), fill_value=0).astype(float)
         obs_binned  = np.array([_obs_all.loc[_bin_edges[i]:_bin_edges[i+1]-1].sum()
@@ -14437,7 +15192,7 @@ def plot_dest_zone_validation(
 
         ax.set_xticks(x)
         ax.set_xticklabels(_bin_labels, rotation=70, fontsize=7)
-        ax.set_xlabel(f'Destination Zone (bin={bin_width}, ordered 1â†’330)', fontsize=9)
+        ax.set_xlabel(f'Destination Zone (bin={bin_width}, ordered 1→330)', fontsize=9)
         ax.set_ylabel('Share (%)', fontsize=9)
         ax.set_title(seg_label,                  fontsize=10)
         ax.legend(fontsize=8)
@@ -14455,7 +15210,7 @@ def plot_dest_zone_validation(
     os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
     fig.savefig(save_path, dpi=140, bbox_inches='tight')
     plt.close(fig)
-    print(f"  Dest zone validation plot â†’ {save_path}")
+    print(f"  Dest zone validation plot → {save_path}")
 
 
 
@@ -14475,6 +15230,7 @@ def run_stage5(
     coef_warm_start: dict = None,
     warm_start_model_path: str = None,
     crash_skims=None,
+    hhts_persons: pd.DataFrame = None,
 ) -> tuple:
     """
     Estimate mode + destination models on HHTS and build full trip chains
@@ -14482,23 +15238,31 @@ def run_stage5(
 
     Parameters
     ----------
-    trips      : HHTS trips from process_survey()["trips"]
-    persons    : HHTS persons from process_survey()["persons"]
-    synth_s4   : Stage 4 output â€” one row per activity per person
-    skims      : OMX file path or open OMX handle
-    landuse    : zone landuse (sc.get_land())
-    tours      : HHTS tours from process_survey()["tours"] â€” needed for
-                 tour_mode (observed mode choice). If None, falls back to trips.
-    seed       : random seed
-    save_path  : where to pickle fitted models
-    segments   : ['work','edu','nonmand'] by default
-    verbose    : logsum progress printing
+    trips        : HHTS trips from process_survey()["trips"]
+    persons      : persons used for PREDICTION (synth population).
+                   Also used for estimation if hhts_persons is not provided.
+    synth_s4     : Stage 4 output - one row per activity per person
+    skims        : OMX file path or open OMX handle
+    landuse      : zone landuse (sc.get_land())
+    tours        : HHTS tours from process_survey()["tours"] - needed for
+                   tour_mode (observed mode choice). If None, falls back to trips.
+    seed         : random seed
+    save_path    : where to pickle fitted models
+    segments     : ['work','edu','nonmand'] by default
+    verbose      : logsum progress printing
     coef_warm_start : optional dict of parameter names to warm-start values;
                       useful for reusing coefficients from previous GA or
                       baseline estimates.
     warm_start_model_path : optional path to saved Stage 5 models pickle.
                       If provided and coef_warm_start is empty, coefficients
                       from this file will be merged into the initial estimate.
+    hhts_persons : optional HHTS persons table used ONLY for estimation
+                   (merging person attributes onto HHTS tours in _prep_hhts_tours).
+                   When provided, ``persons`` is still used for prediction.
+                   Pass out["persons"] here when ``persons`` is the synthetic
+                   population - otherwise person attributes (sexp, incp, etc.)
+                   won't merge and interaction terms become all-zeros, triggering
+                   a Numba TypingError in Larch's dim3_filler.
 
     Returns
     -------
@@ -14506,10 +15270,10 @@ def run_stage5(
     models : fitted models dict
     """
     if not LARCH_AVAILABLE:
-        logger.warning("Larch not available â€” using distance-only fallback")
+        logger.warning("Larch not available - using distance-only fallback")
 
     print("=" * 60)
-    print("STAGE 5 â€” Destination + Mode + Trip Chain (Larch)")
+    print("STAGE 5 - Destination + Mode + Trip Chain (Larch)")
     if os.environ.get('STAGE5_CLEAR_SHARROW_CACHE', '0') == '1':
         _clear_sharrow_cache()
     print("=" * 60)
@@ -14542,25 +15306,68 @@ def run_stage5(
         except Exception as e:
             logger.warning(f"run_stage5: warm-start model load failed: {e}")
 
+    # Auto-load pre-fit warm-start from _test_mode_prefit.py output.
+    # If GA_WARMSTART_PATH points to a JSON file (written by the local DE
+    # pre-fit validation script), merge those parameter values into
+    # coef_warm_start so the HPC run starts from the DE-found basin.
+    # Keys in the JSON are "{segment}_{param}" e.g. "work_ASC_SR".
+    _prefit_json = os.environ.get('GA_WARMSTART_PATH', '')
+    if not _prefit_json:
+        # Also check the default location written by _test_mode_prefit.py
+        _default_prefit = os.path.join(os.path.dirname(save_path or ''), 'mode_prefit_warmstart.json')
+        if os.path.isfile(_default_prefit):
+            _prefit_json = _default_prefit
+    if _prefit_json and os.path.isfile(_prefit_json):
+        try:
+            import json as _json
+            with open(_prefit_json) as _pf:
+                _prefit_params = _json.load(_pf)
+            _n_loaded = 0
+            for _k, _v in _prefit_params.items():
+                # Key format: "{segment}_{param}" — strip the segment prefix
+                # and load as generic warm-start (will match any segment that
+                # has the same parameter name).
+                _parts = _k.split('_', 1)
+                if len(_parts) == 2 and _parts[0] in ('work', 'edu', 'nonmand'):
+                    _bare_param = _parts[1]
+                    # Only insert if not already overridden by a caller-supplied value
+                    if _bare_param not in coef_warm_start:
+                        coef_warm_start[_bare_param] = float(_v)
+                        _n_loaded += 1
+            if _n_loaded:
+                logger.info(
+                    f"run_stage5: loaded {_n_loaded} pre-fit warm-start params "
+                    f"from {_prefit_json}"
+                )
+        except Exception as _pf_e:
+            logger.warning(f"run_stage5: failed to load pre-fit warm-start JSON ({_pf_e})")
+
     skims, close_skims = _open_skims(skims)
 
-    # â”€â”€ prep HHTS estimation data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── prep HHTS estimation data ──────────────────────────────────────
     # Mode choice needs tour_mode (observed choice per tour).
     # ActivitySim: choosers merged with persons before the groupby loop.
     print("\n[1/3] Preparing HHTS tours...")
     estimation_src = tours if tours is not None else trips
     if tours is None:
         logger.warning(
-            "run_stage5: tours=None â€” using trips table for estimation. "
+            "run_stage5: tours=None - using trips table for estimation. "
             "tour_mode may be missing. Pass tours=out['tours'] for best results."
         )
-    hhts_tours = _prep_hhts_tours(estimation_src, persons)
+    _est_persons = hhts_persons if hhts_persons is not None else persons
+    if hhts_persons is not None:
+        logger.info(
+            "run_stage5: using hhts_persons for estimation "
+            f"({len(hhts_persons):,} rows) and persons for prediction "
+            f"({len(persons):,} rows)"
+        )
+    hhts_tours = _prep_hhts_tours(estimation_src, _est_persons)
     obs_tours  = hhts_tours   # keep reference for validation plot at end
     if 'tour_mode' not in hhts_tours.columns or hhts_tours['tour_mode'].isna().all():
         if 'mode' in hhts_tours.columns:
             hhts_tours['tour_mode'] = hhts_tours['mode'].map(MODE_MAP).fillna(2).astype(int)
         else:
-            logger.warning("tour_mode not found â€” defaulting all to DA (1)")
+            logger.warning("tour_mode not found - defaulting all to DA (1)")
             hhts_tours['tour_mode'] = 1
 
     # resolve segment column (ActivitySim: segment_column_name = "tour_purpose")
@@ -14572,16 +15379,16 @@ def run_stage5(
     if seg_col:
         print(f"  Purpose distribution: {hhts_tours[seg_col].value_counts().head(8).to_dict()}")
 
-    # â”€â”€ ActivitySim groupby-segment estimation loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── ActivitySim groupby-segment estimation loop ────────────────────
     # Mirrors tour_mode_choice_simulate:
     #   for tour_purpose, tours_segment in tours.groupby(segment_col, observed=True):
     #       choices = run_tour_mode_choice_simulate(tours_segment, tour_purpose, ...)
     #       choices_list.append(choices)
-    # We do the same for estimation â€” one model per segment, concat results.
-    # â”€â”€ build flat skim table once â€” reused by _run_segment for OD merges â”€â”€
+    # We do the same for estimation - one model per segment, concat results.
+    # ── build flat skim table once - reused by _run_segment for OD merges ──
     # _estimate_mixed_logit needs per-observation IVT/walk/bike values; the
     # HHTS tour table has OTAZ/DTAZ but no skim values merged on.  Building
-    # skim_df_est here (once) and passing it down avoids rebuilding it 3Ã—.
+    # skim_df_est here (once) and passing it down avoids rebuilding it 3×.
     print("\n  Reading flat skim table for estimation OD merges...")
     skim_df_est = _skim_flat(skims)
     print(f"  Skim table: {len(skim_df_est)} OD pairs, "
@@ -14604,12 +15411,12 @@ def run_stage5(
                           if s in hhts_tours['_segment'].dropna().unique()]
         print(f"  Available segments: {available_segs}")
 
-        # groupby segment â€” exactly mirrors ActivitySim's tour_purpose groupby
+        # groupby segment - exactly mirrors ActivitySim's tour_purpose groupby
         for seg, tours_segment in hhts_tours.groupby('_segment', observed=True):
             if seg not in segments:
                 continue
             try:
-                result = _run_segment(seg, tours_segment, persons, landuse, skims,
+                result = _run_segment(seg, tours_segment, _est_persons, landuse, skims,
                                       skim_df=skim_df_est, seed=seed, verbose=verbose,
                                       mode_feature_override=mode_feature_override,
                                       dest_feature_override=dest_feature_override,
@@ -14621,12 +15428,12 @@ def run_stage5(
                             f"run_stage5 [{seg}]: destination coefficients are empty"
                         )
                     models[seg] = result
-                    print(f"  [{seg}] estimation complete â€” keys: {list(result.keys())}")
+                    print(f"  [{seg}] estimation complete - keys: {list(result.keys())}")
                 else:
                     msg = f"  [{seg}] _run_segment returned empty result"
                     if strict_estimation:
                         raise RuntimeError(msg)
-                    print(msg + " â€” skipping")
+                    print(msg + " - skipping")
             except Exception as _seg_e:
                 import traceback as _tb_seg
                 print(f"\n  !! [{seg}] _run_segment FAILED: {_seg_e!r}")
@@ -14635,11 +15442,11 @@ def run_stage5(
                 if strict_estimation:
                     raise
     else:
-        # no purpose column â€” run all segments on full data (fallback)
-        logger.warning("No purpose column found â€” running all segments on full tours table")
+        # no purpose column - run all segments on full data (fallback)
+        logger.warning("No purpose column found - running all segments on full tours table")
         for seg in segments:
             try:
-                result = _run_segment(seg, hhts_tours, persons, landuse, skims,
+                result = _run_segment(seg, hhts_tours, _est_persons, landuse, skims,
                                       skim_df=skim_df_est, seed=seed, verbose=verbose,
                                       mode_feature_override=mode_feature_override,
                                       dest_feature_override=dest_feature_override,
@@ -14656,7 +15463,7 @@ def run_stage5(
                     msg = f"  [{seg}] _run_segment returned empty result"
                     if strict_estimation:
                         raise RuntimeError(msg)
-                    print(msg + " â€” skipping")
+                    print(msg + " - skipping")
             except Exception as _seg_e2:
                 import traceback as _tb_seg2
                 print(f"\n  !! [{seg}] _run_segment FAILED: {_seg_e2!r}")
@@ -14665,7 +15472,7 @@ def run_stage5(
                 if strict_estimation:
                     raise
 
-    # â”€â”€ Print coefficient tables immediately after estimation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Print coefficient tables immediately after estimation ─────────────
     # This runs BEFORE save_models so coefficients are always printed to
     # console even if serialisation fails.  _print_model_table is robust to
     # mangled models and will fall back to _coef_cache if pf is unavailable.
@@ -14685,21 +15492,21 @@ def run_stage5(
                 print(f"\n  [{_seg} {_mtype}] _print_model_table failed ({_pte})")
                 if _cache:
                     print(f"  {'Parameter':<35} {'Value':>10}")
-                    print(f"  {'â”€'*48}")
+                    print(f"  {'─'*48}")
                     for _pn, _pv in sorted(_cache.items()):
                         print(f"  {_pn:<35} {_pv:>10.4f}")
                 else:
                     print(f"  No coefficient data available for {_seg}/{_mtype}")
 
-        # â”€â”€ Frozen probability table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Frozen probability table ──────────────────────────────────────
         # Print the cell-level mode share table computed from HHTS observations.
         # These are the probabilities applied directly to the synthetic population
-        # (no random draws at prediction time) â€” showing them here confirms they
+        # (no random draws at prediction time) - showing them here confirms they
         # were computed and validates mode shares vs HHTS observed.
         _fp = _res.get('frozen_probs')
         if _fp is not None and not _fp.empty:
-            print(f"\n  â”Œâ”€ {_seg.upper()} Frozen probabilities "
-                  f"({len(_fp)} cells, {int(_fp['n_obs'].sum())} HHTS obs) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
+            print(f"\n  ┌─ {_seg.upper()} Frozen probabilities "
+                  f"({len(_fp)} cells, {int(_fp['n_obs'].sum())} HHTS obs) ──────────")
             _fp_disp = _fp[FROZEN_CELL_COLS + FROZEN_PROB_COLS + ['n_obs']].copy()
             _fp_pct  = _fp_disp[FROZEN_PROB_COLS] * 100
             for _pc in FROZEN_PROB_COLS:
@@ -14710,7 +15517,7 @@ def run_stage5(
             hdr += ' '.join(f"{'p_'+m:<8}" for m in ['DA','SR','Walk','Bike','Transit'])
             hdr += '  n_obs'
             print(hdr)
-            print("  " + "â”€" * (len(hdr) - 2))
+            print("  " + "─" * (len(hdr) - 2))
             for _, _row in _top.iterrows():
                 ln  = f"  {str(_row.get('ptype','')):<22} "
                 ln += f"{str(_row.get('indp_group','')):<12} "
@@ -14726,19 +15533,19 @@ def run_stage5(
             _m_fp = _res.get('frozen_probs')
             if _m_fp is not None:
                 _mean_row = _m_fp[FROZEN_PROB_COLS].mean()
-                print(f"  {'â”€'*70}")
+                print(f"  {'─'*70}")
                 print(f"  Mean across cells: " +
                       "  ".join(f"{p.replace('p_','')}={v:.1%}"
                                 for p, v in _mean_row.items()))
-            print(f"  â””{'â”€'*69}")
+            print(f"  └{'─'*69}")
         else:
-            logger.warning(f"[{_seg}] No frozen probabilities â€” mode prediction will "
+            logger.warning(f"[{_seg}] No frozen probabilities - mode prediction will "
                            "use per-observation MNL/MXL probabilities")
 
     if save_path:
         save_models(models, save_path)
 
-    # â”€â”€ models summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── models summary ────────────────────────────────────────────────
     if not models:
         msg = (
             "run_stage5: no segment produced a model; terminating because "
@@ -14746,18 +15553,18 @@ def run_stage5(
         )
         if strict_estimation:
             raise RuntimeError(msg)
-        print("\n  !! WARNING: models dict is empty â€” no segment produced a result.")
-        print("     Prediction will use gravity-only fallback â€” destinations will be coarse.")
+        print("\n  !! WARNING: models dict is empty - no segment produced a result.")
+        print("     Prediction will use gravity-only fallback - destinations will be coarse.")
     else:
         print(f"\n  Models estimated/loaded for segments: {list(models.keys())}")
         for _seg, _res in models.items():
             _mm = _res.get('mode_model')
             _dm = _res.get('dest_model')
-            print(f"    [{_seg}] mode_model={'âœ“' if _mm else 'âœ—'}  "
-                  f"dest_model={'âœ“' if _dm else 'âœ—'}  "
+            print(f"    [{_seg}] mode_model={'✓' if _mm else '✗'}  "
+                  f"dest_model={'✓' if _dm else '✗'}  "
                   f"keys={list(_res.keys())}")
 
-    # â”€â”€ ensure OTAZ on synth_s4 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── ensure OTAZ on synth_s4 ────────────────────────────────────────
     print("\n[3/3] Building full trip chains for synthetic population...")
     s4 = synth_s4.copy()
     _pp_s4 = persons.copy()
@@ -14775,9 +15582,9 @@ def run_stage5(
             s4['OTAZ'] = s4[_pid_col].map(otaz_map).fillna(1).astype(int).clip(lower=1)
             _bad_otaz = (s4['OTAZ'] <= 0).sum()
             if _bad_otaz > 0:
-                logger.warning(f"run_stage5: {_bad_otaz} rows had OTAZ=0 (person_id not in map) â€” defaulted to zone 1")
+                logger.warning(f"run_stage5: {_bad_otaz} rows had OTAZ=0 (person_id not in map) - defaulted to zone 1")
 
-    # â”€â”€ Propagate usual work/school locations from persons to activities â”€â”€
+    # ── Propagate usual work/school locations from persons to activities ──
     # assign_usual_locations (called before Stage 1) adds WORK_TAZ / SCHOOL_TAZ
     # to the synthetic population.  Stage 5 _build_trip_chain needs them on the
     # activities DataFrame so it can bypass destination choice for workers/students
@@ -14790,40 +15597,40 @@ def run_stage5(
             logger.info(f"run_stage5: propagated {_taz_col} from persons "
                         f"to activities ({_n_anchored:,} anchored)")
 
-    # â”€â”€ OTAZ diagnostic â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── OTAZ diagnostic ────────────────────────────────────────────────
     _otaz_counts = s4['OTAZ'].value_counts()
     print(f"  synth_s4 OTAZ: {s4['OTAZ'].nunique()} unique zones, "
           f"total {len(s4):,} rows | "
           f"top 5: {_otaz_counts.head(5).to_dict()}")
     _zero_otaz = (s4['OTAZ'] == 0).sum()
     if _zero_otaz > 0:
-        print(f"  !! WARNING: {_zero_otaz:,} rows have OTAZ=0 â€” these will not "
+        print(f"  !! WARNING: {_zero_otaz:,} rows have OTAZ=0 - these will not "
               f"get model-based predictions (gravity will handle them)")
     if s4['OTAZ'].nunique() <= 3:
-        print(f"  !! WARNING: very few unique OTAZ values ({s4['OTAZ'].nunique()}) â€” "
+        print(f"  !! WARNING: very few unique OTAZ values ({s4['OTAZ'].nunique()}) - "
               f"check that persons table has OTAZ column and synth_s4 person_ids match")
     if 'purpose' in s4.columns:
         print(f"  synth_s4 purpose distribution: "
               f"{s4['purpose'].value_counts().head(8).to_dict()}")
 
-    # build skim lookup for travel time insertion â€” reuse table already built
+    # build skim lookup for travel time insertion - reuse table already built
     print("  Building skim lookup for travel time insertion...")
     skim_df   = skim_df_est   # already built before the segment loop
     sk_lookup = _skim_lookup(skim_df)
     print(f"  Skim lookup: {len(sk_lookup)} OD pairs")
 
-    # â”€â”€ zone-batch prediction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── zone-batch prediction ─────────────────────────────────────────
     # Processing zones in batches of BATCH_SIZE ensures that each DataTree
     # contains activities from MULTIPLE distinct OTAZs.  This means
     # tour.acdc_comp is a genuine array (varies across rows) rather than a
     # scalar constant (all rows share the same OTAZ in a single-zone batch).
-    # Sharrow hashes the DataTree structure â€” a scalar col vs array col are
+    # Sharrow hashes the DataTree structure - a scalar col vs array col are
     # different shapes and trigger a fresh JIT compilation.  With batches of
     # ~50 zones we get ~7 compilations total instead of 325.
     #
-    # Memory: 50 zones Ã— ~12k persons = ~600k activities per batch â†’ ~400 MB.
+    # Memory: 50 zones × ~12k persons = ~600k activities per batch → ~400 MB.
     # BATCH_SIZE = 1 means one origin zone per iteration (safest for memory).
-    # Each zone has ~12k persons / ~40k activities â†’ ~300 MB peak per batch.
+    # Each zone has ~12k persons / ~40k activities → ~300 MB peak per batch.
     # Increase to 5-10 if you have spare memory and want fewer sharrow recompiles.
     BATCH_SIZE = int(os.environ.get('STAGE5_BATCH_SIZE', '1'))
 
@@ -14850,7 +15657,7 @@ def run_stage5(
                        if 'person_id' in s4_batch.columns else len(s4_batch))
 
         print(f"  Batch {b_idx+1:3d}/{n_batches} "
-              f"(zones {batch_zones[0]}â€“{batch_zones[-1]}) â€” "
+              f"(zones {batch_zones[0]}-{batch_zones[-1]}) - "
               f"{n_ppl_batch:,} persons, {len(s4_batch):,} activities")
 
         try:
@@ -14883,19 +15690,19 @@ def run_stage5(
             continue
 
     if not zone_plans:
-        raise RuntimeError("All batches failed during prediction â€” check model fit.")
+        raise RuntimeError("All batches failed during prediction - check model fit.")
 
     print(f"\n  Concatenating {len(zone_plans)} zone plans...")
     plan = pd.concat(zone_plans, ignore_index=True)
 
-    # _attach_skims already run per-zone â€” skip the global call below
+    # _attach_skims already run per-zone - skip the global call below
     # (still call it to fill any gaps from zones where skims were absent)
     plan = _attach_skims(plan, skim_df)
 
     if close_skims:
         skims.close()
 
-    # â”€â”€ summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── summary ───────────────────────────────────────────────────────
     n_trips = (plan['row_type'] == 'trip').sum()
     n_acts  = (plan['row_type'] == 'activity').sum()
     n_ppl   = plan['person_id'].nunique()
@@ -14908,7 +15715,7 @@ def run_stage5(
               f"dest LL={res.get('dest_ll', '?'):.1f}  "
               f"n_tours={res.get('n_tours', '?')}")
 
-    # â”€â”€ destination zone validation bar-chart â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── destination zone validation bar-chart ─────────────────────────
     # Uses the HHTS estimation tours (obs_tours) vs the synthetic prediction.
     # obs_tours was built from the 'tours' / 'trips' arg at the top of run_stage5.
     try:
@@ -14918,11 +15725,11 @@ def run_stage5(
         if 'obs_tours' in dir() and obs_tours is not None and not obs_tours.empty:
             plot_dest_zone_validation(obs_tours, plan, save_path=_val_path)
         else:
-            logger.debug("plot_dest_zone_validation: obs_tours not available â€” skipping")
+            logger.debug("plot_dest_zone_validation: obs_tours not available - skipping")
     except Exception as _plot_e:
         logger.debug(f"plot_dest_zone_validation failed: {_plot_e}")
 
-    # â”€â”€ Comprehensive validation metrics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Comprehensive validation metrics ───────────────────────────────────
     try:
         _metrics_path = os.path.join(
             os.path.dirname(save_path) if save_path else 'saved_data',
@@ -14933,11 +15740,11 @@ def run_stage5(
                 obs_tours, plan, models=models, persons=persons, save_path=_metrics_path
             )
         else:
-            logger.debug("compute_validation_metrics: obs_tours not available â€” skipping")
+            logger.debug("compute_validation_metrics: obs_tours not available - skipping")
     except Exception as _vm_e:
         logger.debug(f"compute_validation_metrics failed: {_vm_e}")
 
-    # â”€â”€ Multi-level validation (trip / tour / work / edu assignment) â”€â”€â”€â”€â”€â”€
+    # ── Multi-level validation (trip / tour / work / edu assignment) ──────
     try:
         _ml_save_dir = os.path.join(
             os.path.dirname(save_path) if save_path else 'saved_data',
@@ -14949,12 +15756,12 @@ def run_stage5(
                 obs_tours, plan, landuse=_lu_ml, save_dir=_ml_save_dir
             )
         else:
-            logger.debug("compute_multilevel_validation: obs_tours not available â€” skipping")
+            logger.debug("compute_multilevel_validation: obs_tours not available - skipping")
     except Exception as _ml_e:
         logger.warning(f"compute_multilevel_validation failed: {_ml_e}")
         import traceback; logger.debug(traceback.format_exc())
 
-    # â”€â”€ HTML destination validation reports â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── HTML destination validation reports ───────────────────────────────
     try:
         _html_out_dir = os.path.join(
             os.path.dirname(save_path) if save_path else 'saved_data',
@@ -14979,7 +15786,7 @@ def run_stage5(
         logger.debug(f"write_destination_validation_html failed: {_html_e}")
         import traceback; logger.debug(traceback.format_exc())
 
-    # â”€â”€ Full dashboard (model fit, sign checks, ACDC, TLD, mode share) â”€â”€â”€
+    # ── Full dashboard (model fit, sign checks, ACDC, TLD, mode share) ───
     try:
         _lu_for_dash = landuse if landuse is not None else pd.DataFrame()
         _obs_for_dash = obs_tours if obs_tours is not None and not obs_tours.empty else None
@@ -14995,7 +15802,7 @@ def run_stage5(
         logger.debug(f"print_stage5_dashboard failed: {_dash_e}")
         import traceback; logger.debug(traceback.format_exc())
 
-    # â”€â”€ Write vehicle.dat â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Write vehicle.dat ─────────────────────────────────────────────────
     try:
         _veh_path = os.path.join(
             os.path.dirname(save_path) if save_path else 'saved_data',
@@ -15065,7 +15872,7 @@ def trip_destination_model(plan: pd.DataFrame,
         import os
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
         out.to_csv(save_path, index=False)
-        logger.info(f"trip_destination_model: saved {len(out)} trip rows â†’ {save_path}")
+        logger.info(f"trip_destination_model: saved {len(out)} trip rows → {save_path}")
     return out
 
 
@@ -15169,7 +15976,7 @@ def mode_choice_model(name: str, **kwargs):
 #   python stage5_destination_choice.py --skims path/to/matrices.omx
 #
 # Requires downcasted_matrices_base.omx in the working directory (or pass --skims).
-# Stage 5 calls Larch NL / MXL models â€” each evaluation writes a flow code.
+# Stage 5 calls Larch NL / MXL models - each evaluation writes a flow code.
 # On 3.7M persons this stage takes ~30-60 min depending on segment count.
 
 if __name__ == '__main__':
@@ -15214,7 +16021,7 @@ if __name__ == '__main__':
 
     zone_arg = args[0] if args else None
 
-    # â”€â”€ load HHTS + landuse â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── load HHTS + landuse ───────────────────────────────────────────────
     log.info("Loading HHTS survey data + landuse...")
     from data_connect import Synth_Connect
     from compute_accessibility import run_accessibility
@@ -15248,7 +16055,7 @@ if __name__ == '__main__':
     scheduled = pd.read_csv(input_csv)
     log.info(f"  {len(scheduled):,} rows loaded")
 
-    # â”€â”€ check skims â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── check skims ───────────────────────────────────────────────────────
     if not os.path.isfile(SKIMS_PATH):
         raise FileNotFoundError(
             f"Skims file not found: '{SKIMS_PATH}'.\n"
@@ -15258,7 +16065,7 @@ if __name__ == '__main__':
     from read_skims import list_omx_matrices
     list_omx_matrices(SKIMS_PATH)
 
-    # â”€â”€ run Stage 5 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── run Stage 5 ───────────────────────────────────────────────────────
     os.makedirs(_OUT, exist_ok=True)
     scheduled_dest, models = run_stage5(
         out['trips'], out['persons'], scheduled,
@@ -15270,8 +16077,8 @@ if __name__ == '__main__':
     )
     scheduled_dest.to_csv(os.path.join(_OUT, 'stage5_output.csv'), index=False)
 
-    log.info(f"Stage 5 output saved â†’ {_OUT}/stage5_output.csv")
-    log.info(f"Stage 5 models saved â†’ {_OUT}/stage5_models.pkl")
+    log.info(f"Stage 5 output saved → {_OUT}/stage5_output.csv")
+    log.info(f"Stage 5 models saved → {_OUT}/stage5_models.pkl")
     log.info(f"  {len(scheduled_dest):,} rows (trips + activities interleaved)")
     log.info(f"Pass {_OUT}/stage5_output.csv to stage6_plan_finalisation.py")
 

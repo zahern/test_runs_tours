@@ -15,8 +15,8 @@ with open('saved_data/ga_results.pkl', 'rb') as f:
 out_dir = 'runs/ga_staged__20538563.aqua/plots'
 os.makedirs(out_dir, exist_ok=True)
 
-# Regenerate plots for stages 1-4 (and any per-segment subplots)
-for stage in [1, 2, 3, 4]:
+# Regenerate plots for stages 1-5 (and any per-segment subplots)
+for stage in [1, 2, 3, 4, 5]:
     res = ga_results.results.get(stage)
     if res is None:
         continue

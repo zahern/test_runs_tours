@@ -561,6 +561,55 @@ def validate_stage5(out: dict, s5_models: dict, save_dir: str) -> dict:
         except Exception:
             return None
 
+    def _get_mode_alt_order(mode_mdl):
+        """
+        Extract mode → column index mapping from Larch model.
+        
+        FIX (2026-05-15): Larch models may reorder alternatives internally.
+        This function gets the correct alternative-to-column mapping so
+        probabilities can be aligned to mode IDs [1,2,3,4,5] correctly.
+        
+        Enhanced (2026-05-15): Also check idca_names (tuple of alternative names)
+        to verify the order of probability columns matches mode_idca dimensions.
+        """
+        try:
+            if hasattr(mode_mdl, 'alternatives'):
+                alts = mode_mdl.alternatives
+                if alts is not None:
+                    # Larch 6.x: alternatives is a sorted array of alt IDs
+                    return {int(alt): i for i, alt in enumerate(alts)}
+        except Exception:
+            pass
+        
+        # Check alternative names as secondary source of truth
+        try:
+            if hasattr(mode_mdl, 'idca_names') and mode_mdl.idca_names:
+                # idca_names is typically a tuple of alternative names
+                # Try to extract numeric IDs from names or use positional mapping
+                names = list(mode_mdl.idca_names)
+                mapping = {}
+                for i, name in enumerate(names):
+                    # Try to parse 'DA', 'SR', 'Walk', 'Bike', 'Transit' → 1,2,3,4,5
+                    name_lower = str(name).lower()
+                    if name_lower == 'da':
+                        mapping[1] = i
+                    elif name_lower == 'sr':
+                        mapping[2] = i
+                    elif name_lower == 'walk':
+                        mapping[3] = i
+                    elif name_lower == 'bike':
+                        mapping[4] = i
+                    elif name_lower in ('transit', 'pt', 'public'):
+                        mapping[5] = i
+                if len(mapping) == 5:
+                    return mapping
+        except Exception:
+            pass
+        
+        # Fallback: assume alternatives are in order [1,2,3,4,5]
+        # This is the default when alternatives aren't reordered
+        return {1: 0, 2: 1, 3: 2, 4: 3, 5: 4}
+
     # ── 5A: Mode share: observed vs predicted ──────────────────────────────
     fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=False)
     fig.suptitle('Stage 5 — Mode Choice: Observed vs Predicted Mode Shares',
@@ -584,7 +633,18 @@ def validate_stage5(out: dict, s5_models: dict, save_dir: str) -> dict:
         if mode_mdl is not None:
             try:
                 probs = np.asarray(mode_mdl.probability())  # (N, K)
-                pred_share = pd.Series(probs.mean(axis=0), index=range(1, probs.shape[1] + 1))\
+                # Map Larch alternative IDs to probability column indices correctly
+                # (in case Larch reordered alternatives internally)
+                alt_to_col = _get_mode_alt_order(mode_mdl)
+                # Reorder prob columns to match mode IDs [1,2,3,4,5]
+                pred_probs_by_mode = {}
+                for mode_id in range(1, 6):
+                    col_idx = alt_to_col.get(mode_id, mode_id - 1)
+                    if 0 <= col_idx < probs.shape[1]:
+                        pred_probs_by_mode[mode_id] = probs[:, col_idx].mean()
+                    else:
+                        pred_probs_by_mode[mode_id] = 0.0
+                pred_share = pd.Series(pred_probs_by_mode, index=range(1,6)) \
                                .reindex(range(1,6)).fillna(0) * 100
                 # For the confusion matrix: sample from predicted distribution
                 # (not argmax — argmax assigns everyone to DA and makes the matrix

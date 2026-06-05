@@ -87,9 +87,19 @@
 #                       Wall: 2h  RAM: 32 GB
 #                       Runs after J6.
 #
+#  J8 sa_bandit       : SA-Bandit GA variable selection (stages 1–5, estimation only).
+#                       Uses BanditFeatureSearcher (Thompson-sampling + SA temperature)
+#                       with fast budget (pop=40, gens=75) so all 5 stages complete
+#                       comfortably within the 20h walltime.
+#                       Installs editable MetaCount + SearchLibrium if available on HPC.
+#                       Writes to runs/sa_bandit/.
+#                       Wall: 20h  RAM: 194 GB  CPUs: 4 (parallel segment evaluation)
+#                       Independent — runs concurrently with all other jobs.
+#                       Override budget: GA_BUDGET_SA=standard for deeper search.
+#
 # USAGE
 # -----
-#   qsub job_submit_all_tests.pbs              # submit all 7 jobs
+#   qsub job_submit_all_tests.pbs              # submit all 8 jobs
 #
 #   # Override conda env, resource requests, or parallelism:
 #   CONDA_ENV=myenv NCPUS_HEAVY=8 MEM_HEAVY=256GB qsub job_submit_all_tests.pbs
@@ -120,6 +130,9 @@ WALLTIME_MAIN="${WALLTIME_MAIN:-20:59:00}"
 WALLTIME_SAFETY="${WALLTIME_SAFETY:-23:59:00}"
 WALLTIME_JOINT="${WALLTIME_JOINT:-04:00:00}"
 WALLTIME_ANALYSIS="${WALLTIME_ANALYSIS:-02:00:00}"
+WALLTIME_SA_BANDIT="${WALLTIME_SA_BANDIT:-20:59:00}"
+NCPUS_SA="${NCPUS_SA:-4}"                   # CPUs for SA-Bandit (parallelises segment search)
+GA_BUDGET_SA="${GA_BUDGET_SA:-fast}"        # fast=all stages in ~10h; standard=deeper but ~25h+
 DRY_RUN="${DRY_RUN:-0}"
 
 # Clean old submission logs
@@ -309,10 +322,50 @@ echo \"[J7 safety_analysis] done exit=\$?\""
 JID7=$(submit _t_safety_anal.pbs "$JID6")
 echo "J7 safety_anal  → $JID7  (after J6)"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# J8 — sa_bandit  (independent, fast budget — fits all 5 stages in 20h)
+#
+# Uses GA_BUDGET=fast (pop=40, gens=75, restarts=1 → 4000 total steps vs
+# 21000 for standard).  Stage 1 benchmark: ~1.5h on 4 CPUs (standard took
+# 5.25h on 8 CPUs, killing the job at 23h with only Stage 1 done).
+# Installs editable MetaCount + SearchLibrium from HPC source trees so the
+# BanditSA adaptive search and Thompson-sampling arms are available.
+# ═══════════════════════════════════════════════════════════════════════════
+write_pbs "_t_sa_bandit.pbs" "saw_sa_bandit" "$WALLTIME_SA_BANDIT" \
+    "select=1:ncpus=${NCPUS_SA}:mem=${MEM_HEAVY}" \
+    "mkdir -p runs/sa_bandit/plots
+rm -f log_sa_bandit.out log_sa_bandit.err
+# Install editable MetaCount + SearchLibrium (required for BanditSA arms)
+_HPC_MC=/mnt/hpccs01/home/ahernz/source/MetaCount
+_HPC_SL=/mnt/hpccs01/home/ahernz/source/SearchLibrium
+[ -d \"\$_HPC_MC\" ] && pip install -e \"\$_HPC_MC\" --upgrade -q \\
+    || pip install --upgrade --no-cache-dir -q metacountregressor
+[ -d \"\$_HPC_SL\" ] && pip install -e \"\$_HPC_SL\" --upgrade -q \\
+    || pip install --upgrade --no-cache-dir -q SearchLibrium
+pip install --upgrade --no-cache-dir -q jax jaxlib jaxopt
+export GA_ESTIMATOR=sa_bandit
+export GA_USE_BANDIT_SA=1
+export GA_USE_SA=1
+export GA_BUDGET=${GA_BUDGET_SA}
+export JAX_PLATFORMS=cpu
+export GA_METACOUNT_FORCE_CPU=1
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+echo \"[J8 sa_bandit] started \$(date)\"
+python -u pipeline_logger.py ga \\
+    > log_sa_bandit.out \\
+    2> log_sa_bandit.err
+echo \"[J8 sa_bandit] done exit=\$?\""
+
+JID8=$(submit _t_sa_bandit.pbs)
+echo "J8 sa_bandit    → $JID8  (independent, parallel, GA_BUDGET=${GA_BUDGET_SA})"
+
 # ── Cleanup temp scripts ──────────────────────────────────────────────────
 if [ "$DRY_RUN" != "1" ]; then
     rm -f _t_main.pbs _t_ga.pbs _t_ga_staged.pbs _t_joint.pbs \
-          _t_safety_base.pbs _t_safety_nosa.pbs _t_safety_anal.pbs
+          _t_safety_base.pbs _t_safety_nosa.pbs _t_safety_anal.pbs \
+          _t_sa_bandit.pbs
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────
@@ -328,11 +381,13 @@ echo "  J4 joint_model  ( 4h,  32GB)     ← J1    — Tobit-I + Heckman compari
 echo "  J5 safety_base  (24h, 194GB+GPU)          — safety-skim baseline run"
 echo "  J6 safety_nosa  (24h, 194GB+GPU) ← J5    — no-safety run"
 echo "  J7 safety_anal  ( 2h,  32GB)     ← J6    — analysis + plots + HTML report"
+echo "  J8 sa_bandit    (20h, 194GB×4)           — SA-Bandit GA, fast budget, all stages"
 echo ""
 echo "  Parallel tracks:"
 echo "    [J1→J2→J3]  main model chain"
 echo "    [J1→J4]     joint participation model (light, starts when J1 finishes)"
 echo "    [J5→J6→J7]  safety experiment (independent; runs concurrently)"
+echo "    [J8]        SA-Bandit GA (independent; fast budget — all 5 stages in ~10h)"
 echo ""
 echo "  Key outputs"
 echo "  -----------"
@@ -353,6 +408,8 @@ echo "                        plots/safety_mode_share.png,"
 echo "                        plots/safety_activity_levels.png,"
 echo "                        plots/safety_zone_derivation.png,"
 echo "                        safety_zone_ranking.csv"
+echo "  runs/sa_bandit/       ga_results.pkl, ga_reports/, convergence plots"
+echo "                        log: log_sa_bandit.out / .err"
 echo ""
 echo "  Monitor:"
 echo "    qstat -u \$USER"
@@ -360,6 +417,7 @@ echo "    tail -f log_main.err"
 echo "    tail -f log_ga_staged.err"
 echo "    tail -f log_joint.err"
 echo "    tail -f log_safety_analysis.err"
+echo "    tail -f log_sa_bandit.err"
 echo ""
 echo "  To preview without submitting:"
 echo "    DRY_RUN=1 bash job_submit_all_tests.pbs"

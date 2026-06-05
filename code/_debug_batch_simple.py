@@ -40,12 +40,13 @@ logger.info(f"S4 sample: {s4_full.shape}, columns={list(s4_full.columns)}")
 logger.info(f"Purpose values: {s4_full['purpose'].value_counts().to_dict()}")
 
 # Load models (will reuse from smoke run)
+# Use load_models() which patches Larch's __setstate__ before unpickling,
+# avoiding "Cannot set 'availability_any'" errors on newer Larch versions.
 logger.info("Loading Stage 5 models...")
-import pickle
 try:
-    with open('runs/stage5_smoke_models.pkl', 'rb') as f:
-        models = pickle.load(f)
-        logger.info(f"Loaded models for segments: {list(models.keys())}")
+    from stage5_destination_choice import load_models as _s5_load
+    models = _s5_load('runs/stage5_smoke_models.pkl')
+    logger.info(f"Loaded models for segments: {list(models.keys())}")
 except Exception as e:
     logger.error(f"Failed to load models: {e}")
     sys.exit(1)

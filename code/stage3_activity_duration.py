@@ -478,15 +478,15 @@ def _feature_cols(df: pd.DataFrame, ptypes: list,
     return base
 
 
-    def _feature_cols_for_purpose(df: pd.DataFrame, ptypes: list, purpose: str,
-                      feature_override=None) -> list:
-        person_feats = _duration_person_features(df, purpose, feature_override)
-        base = (['start_hr', 'log_dist', 'B', 'budget_per_activity_hr', 'day_span_hr',
+def _feature_cols_for_purpose(df: pd.DataFrame, ptypes: list, purpose: str,
+                              feature_override=None) -> list:
+    person_feats = _duration_person_features(df, purpose, feature_override)
+    base = (['start_hr', 'log_dist', 'B', 'budget_per_activity_hr', 'day_span_hr',
              'n_mandatory', 'n_discretionary'] +
             ACTIVITY_COLS +
             [c for c in person_feats if c in df.columns] +
             [f'ptype_{pt}' for pt in ptypes if f'ptype_{pt}' in df.columns])
-        return list(dict.fromkeys([c for c in base if c in df.columns]))
+    return list(dict.fromkeys([c for c in base if c in df.columns]))
 
 
 def estimate_duration_models(

@@ -284,10 +284,14 @@ def plot_population_summary(plan: pd.DataFrame, save_path: str):
         # travtime is in minutes (skim output); dividing here keeps units consistent
         # regardless of total daily travel magnitude.
         raw_tt = pd.to_numeric(trips[tt_col], errors='coerce')
-        # Detect seconds encoding only (rare): median per-trip > 3600 sec → /60/60
-        if raw_tt.median() > 3600:
+        # Unit detection:
+        #   >600  : seconds per trip (very unlikely but possible) -> hours
+        #   >6    : minutes per trip (common) -> hours
+        #   <=6   : already hours
+        _tt_med = float(raw_tt.median()) if len(raw_tt.dropna()) else float('nan')
+        if np.isfinite(_tt_med) and _tt_med > 600:
             raw_tt = raw_tt / 3600.0
-        elif raw_tt.median() > 60:
+        elif np.isfinite(_tt_med) and _tt_med > 6:
             raw_tt = raw_tt / 60.0   # minutes → hours
         # else already in hours (skim returns hours) — leave as-is
         person_travtime = raw_tt.groupby(trips['person_id']).sum()
@@ -334,20 +338,22 @@ def plot_population_summary(plan: pd.DataFrame, save_path: str):
                 acts_nh['_dwell'] = 0.0
 
             person_dwell = acts_nh.groupby('person_id')['_dwell'].sum()
-            tour_time = person_travtime.add(person_dwell, fill_value=0).clip(0, 18)
+            # Allow full-day spread in diagnostics; avoid hard clipping at 18h
+            # which can hide unit issues and create an artificial pile-up.
+            tour_time = person_travtime.add(person_dwell, fill_value=0).clip(0, 24)
         else:
-            tour_time = person_travtime.clip(0, 18)
+            tour_time = person_travtime.clip(0, 24)
         if len(tour_time) > 5:
             med = tour_time.median()
             mn  = tour_time.mean()
             ax_tour.hist(tour_time, bins=36, color='#3D6B35', alpha=0.75,
-                         edgecolor='white', linewidth=0.4, range=(0, 18))
+                         edgecolor='white', linewidth=0.4, range=(0, 24))
             ax_tour.axvline(med, color='red', ls='--', lw=1.8, label=f'Median {med:.1f}h')
             ax_tour.axvline(mn,  color='orange', ls='--', lw=1.5, label=f'Mean {mn:.1f}h')
             ax_tour.set_xlabel('Total active time out-of-home (hours)')
             ax_tour.set_ylabel('Persons')
             ax_tour.set_title('Daily out-of-home activity + travel time')
-            ax_tour.set_xlim(0, 18)
+            ax_tour.set_xlim(0, 24)
             ax_tour.legend(fontsize=8)
             ax_tour.grid(alpha=0.3)
         else:

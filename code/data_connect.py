@@ -225,7 +225,107 @@ rl_map = {'child':3,
 }
 
 ###############################################################################
-# HELPER FUNCTIONS - 
+# BINARY DUMMY ENCODING
+# Called after any person DataFrame is assembled (HHTS or synth pop).
+# Adds proper binary indicator columns for marital status, household type,
+# and industry sector so the GA can select them without ordinal bias.
+###############################################################################
+
+# ABS MSTP (marital status) codes used in the synthetic population
+_MSTP_MARRIED   = {1}           # married (registered)
+_MSTP_DEFACTO   = {2}           # de facto / common-law
+_MSTP_SEPARATED = {3}           # separated
+_MSTP_DIVORCED  = {4}           # divorced
+_MSTP_WIDOWED   = {5}           # widowed
+_MSTP_SINGLE    = {6}           # never married
+
+# Industry (indp) groupings derived from industy_map
+_IND_PROFESSIONAL  = {13}           # professional/scientific/technical
+_IND_FINANCIAL     = {11, 12}       # financial services + real estate
+_IND_IT            = {10}           # information & communication
+_IND_HEALTH        = {17}           # health & social assistance
+_IND_EDUCATION     = {16}           # education & training
+_IND_PUBLIC_ADMIN  = {14, 15}       # public administration + administrative services
+_IND_CONSTRUCTION  = {5}            # construction
+_IND_MANUFACTURING = {3}            # manufacturing
+_IND_BLUE_COLLAR   = {1, 2, 3, 4, 5}  # agriculture/mining/manufacturing/utilities/construction
+_IND_RETAIL        = {6, 7}         # retail + wholesale trade
+_IND_HOSPITALITY   = {8}            # accommodation & food
+_IND_TRANSPORT     = {9}            # transport, postal, warehousing
+_IND_ARTS_OTHER    = {18, 19}       # arts, recreation, other services
+_IND_NOT_WORKING   = {20}           # not applicable / unknown
+
+
+def add_person_binary_dummies(df: 'pd.DataFrame') -> 'pd.DataFrame':
+    """
+    Add binary dummy columns for marital status, household size type,
+    and industry sector to a person DataFrame.
+
+    Safe to call on both HHTS and synthetic-population DataFrames; each
+    block only runs when the required source column is present.
+
+    Columns added
+    -------------
+    Marital status (from 'mstp', ABS MSTP coding 1-6):
+        is_married, is_defacto, is_separated, is_divorced,
+        is_widowed, is_never_married, is_partnered
+
+    Household size type (from 'nprd'):
+        hh_1person, hh_couple, hh_small_group, hh_large_group
+
+    Industry sector (from 'indp', derived from INDUSTRY text):
+        ind_professional, ind_financial, ind_it,
+        ind_health, ind_education, ind_public_admin,
+        ind_construction, ind_manufacturing, ind_blue_collar,
+        ind_retail, ind_hospitality, ind_transport,
+        ind_arts_other, ind_not_working
+    """
+    import pandas as _pd
+    import numpy as _np
+
+    # -- Marital status -------------------------------------------------------
+    if 'mstp' in df.columns:
+        m = _pd.to_numeric(df['mstp'], errors='coerce').fillna(0).astype(int)
+        df['is_married']      = m.isin(_MSTP_MARRIED).astype(int)
+        df['is_defacto']      = m.isin(_MSTP_DEFACTO).astype(int)
+        df['is_separated']    = m.isin(_MSTP_SEPARATED).astype(int)
+        df['is_divorced']     = m.isin(_MSTP_DIVORCED).astype(int)
+        df['is_widowed']      = m.isin(_MSTP_WIDOWED).astype(int)
+        df['is_never_married']= m.isin(_MSTP_SINGLE).astype(int)
+        # Convenience: currently partnered (married or de facto)
+        df['is_partnered']    = m.isin(_MSTP_MARRIED | _MSTP_DEFACTO).astype(int)
+
+    # -- Household size type (from nprd = household size count) ---------------
+    if 'nprd' in df.columns:
+        n = _pd.to_numeric(df['nprd'], errors='coerce').fillna(0).astype(int)
+        df['hh_1person']    = (n == 1).astype(int)    # single-person
+        df['hh_couple']     = (n == 2).astype(int)    # couple or lone-parent+1
+        df['hh_small_group']= n.isin([3, 4]).astype(int)  # small family/group
+        df['hh_large_group']= (n >= 5).astype(int)    # large family/houseshare
+
+    # -- Industry sector (from indp numeric code) -----------------------------
+    if 'indp' in df.columns:
+        i = _pd.to_numeric(df['indp'], errors='coerce').fillna(20).astype(int)
+        df['ind_professional'] = i.isin(_IND_PROFESSIONAL).astype(int)
+        df['ind_financial']    = i.isin(_IND_FINANCIAL).astype(int)
+        df['ind_it']           = i.isin(_IND_IT).astype(int)
+        df['ind_health']       = i.isin(_IND_HEALTH).astype(int)
+        df['ind_education']    = i.isin(_IND_EDUCATION).astype(int)
+        df['ind_public_admin'] = i.isin(_IND_PUBLIC_ADMIN).astype(int)
+        df['ind_construction'] = i.isin(_IND_CONSTRUCTION).astype(int)
+        df['ind_manufacturing']= i.isin(_IND_MANUFACTURING).astype(int)
+        df['ind_blue_collar']  = i.isin(_IND_BLUE_COLLAR).astype(int)
+        df['ind_retail']       = i.isin(_IND_RETAIL).astype(int)
+        df['ind_hospitality']  = i.isin(_IND_HOSPITALITY).astype(int)
+        df['ind_transport']    = i.isin(_IND_TRANSPORT).astype(int)
+        df['ind_arts_other']   = i.isin(_IND_ARTS_OTHER).astype(int)
+        df['ind_not_working']  = i.isin(_IND_NOT_WORKING).astype(int)
+
+    return df
+
+
+###############################################################################
+# HELPER FUNCTIONS -
 ###############################################################################
 def count_stops(df):
     rows = []
@@ -2620,9 +2720,10 @@ class Synth_Connect:
             warnings.filterwarnings('ignore', category=DeprecationWarning)
             warnings.filterwarnings('ignore', message='.*DataFrameGroupBy.*')
             df = df.groupby('HHID', group_keys=False).apply(update_rlhp)
-        logging.info(f'length of list after processing: {len(df)}') 
+        logging.info(f'length of list after processing: {len(df)}')
         df['rlhp'] = df['RELATIONSHIP'].map(rl_map).fillna(5).astype(int)
         df['STUDYING'] = df['STUDYING'].map(study_map).fillna(0).astype(int)
+        df = add_person_binary_dummies(df)
         return df
     
     def synth_filter_function(self, persons, filter_function):
@@ -2640,7 +2741,8 @@ class Synth_Connect:
         persons['person_id'] = persons['PERSID']
         persons['STUDYING'] = persons.apply(get_studying, axis=1)
         persons['WORKSTAT'] = persons.apply(get_workstat, axis=1)
-        persons['CARLICENCE'] = persons.apply(get_licence, axis = 1)
+        persons['CARLICENCE'] = persons.apply(get_licence, axis=1)
+        persons = add_person_binary_dummies(persons)
         persons['chosen'] = 1 #dummy
         if filter_function is not None: #
             mask = filter_function(persons)
@@ -2892,7 +2994,8 @@ class Synth_Connect:
         persons['person_id'] = persons['PERSID']
         persons['STUDYING'] = persons.apply(get_studying, axis=1)
         persons['WORKSTAT'] = persons.apply(get_workstat, axis=1)
-        persons['CARLICENCE'] = persons.apply(get_licence, axis = 1)
+        persons['CARLICENCE'] = persons.apply(get_licence, axis=1)
+        persons = add_person_binary_dummies(persons)
         persons['HHSIZE'] = persons['nprd']
         persons['chosen'] = 1 #dummy
         
@@ -2951,7 +3054,8 @@ class Synth_Connect:
         persons['person_id'] = persons['PERSID']
         persons['STUDYING'] = persons.apply(get_studying, axis=1)
         persons['WORKSTAT'] = persons.apply(get_workstat, axis=1)
-        persons['CARLICENCE'] = persons.apply(get_licence, axis = 1)
+        persons['CARLICENCE'] = persons.apply(get_licence, axis=1)
+        persons = add_person_binary_dummies(persons)
         persons['HHSIZE'] = persons['nprd']
         persons['chosen'] = 1 #dummy
         persons = persons.rename(columns ={
@@ -2996,7 +3100,8 @@ class Synth_Connect:
         persons['person_id'] = persons['PERSID']
         persons['STUDYING'] = persons.apply(get_studying, axis=1)
         persons['WORKSTAT'] = persons.apply(get_workstat, axis=1)
-        persons['CARLICENCE'] = persons.apply(get_licence, axis = 1)
+        persons['CARLICENCE'] = persons.apply(get_licence, axis=1)
+        persons = add_person_binary_dummies(persons)
         persons['HHSIZE'] = persons['nprd']
         persons['chosen'] = 1 #dummy
         persons['tour_mode'] = 'DA'
@@ -3077,7 +3182,8 @@ class Synth_Connect:
         persons['PERSID'] = persons['abspid']  # Ensure PERSID starts from 1
         persons['STUDYING'] = persons.apply(get_studying, axis=1)
         persons['WORKSTAT'] = persons.apply(get_workstat, axis=1)
-        persons['CARLICENCE'] = persons.apply(get_licence, axis = 1)
+        persons['CARLICENCE'] = persons.apply(get_licence, axis=1)
+        persons = add_person_binary_dummies(persons)
         persons['HHSIZE'] = persons['nprd']
         persons['chosen'] = 1 #dummy
         persons['tour_mode'] = 'DA'

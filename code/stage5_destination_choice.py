@@ -3937,29 +3937,109 @@ SKIM_TO_EXPR = {
 }
 
 
-def _mode_spec_custom(m, Mode, custom_vars: list):
+def _mode_spec_custom(m, Mode, custom_vars: list, segment: str = 'all'):
     """
-    GA-restricted mode spec - only includes UEC terms whose skim variable
-    is in custom_vars.  Delegates to _build_mode_utility with a filtered UEC.
+    GA-restricted mode spec.  Each MODE_UEC term is either:
+      - backbone (always on): core IVTs, walk/bike times, ASCs, trip-structure
+      - person-attribute (gated): included only when a mapped GA candidate is selected
+      - optional skim (gated): included when the skim matrix name is in custom_vars
+      - extra skim (dynamic): injected when a candidate absent from MODE_UEC is selected
+
+    Previously ALL non-skim terms were always included regardless of gene selection,
+    so the model never changed between GA evaluations.
     """
+    import re as _re
+
     if isinstance(custom_vars, dict):
-        # custom_vars is already a filtered UEC dict
         return _build_mode_utility(m, Mode, "all", uec=custom_vars)
 
-    # Build a filtered UEC containing only terms whose skim is in custom_vars
-    # Always include ASC terms and income terms (person attributes, not skims)
-    filtered_uec = {}
+    # ── 1. Always-on backbone terms ─────────────────────────────────────────
+    # Core skim impedance terms must always be present for model identification.
+    # Trip-structure terms (joint travel, stops, time-of-day) are also structural.
+    _ALWAYS_INCLUDE = {
+        'c_ivt_auto', 'c_ivt_transit', 'c_walk_time', 'c_bike_time',
+        'ASC_SR', 'ASC_Walk', 'ASC_Bike', 'ASC_Transit',
+        'c_joint_sr', 'c_walk_stops', 'c_bike_stops', 'c_bike_shop', 'c_peak_da',
+    }
+
+    # ── 2. Person/tour term → candidate gate mapping ─────────────────────────
+    # A MODE_UEC person/tour term is included when ANY of its mapped candidates
+    # is selected (gene=1).  Terms absent from this map are always included.
+    _COEFF_GATE: dict[str, set] = {
+        # Vehicle ownership / mode captivity
+        'c_veh_da':         {'vehrd', 'has_vehicle', 'one_vehicle', 'multi_vehicle'},
+        'c_veh_sr':         {'vehrd', 'has_vehicle', 'one_vehicle', 'multi_vehicle'},
+        'c_noveh_transit':  {'vehrd', 'no_vehicle'},
+        'c_noveh_walk':     {'vehrd', 'no_vehicle'},
+        # Income
+        'c_incp_da':        {'incp', 'income_verylo', 'income_lo', 'income_mid',
+                             'income_midplus', 'income_midhi', 'income_hi', 'income_veryhi'},
+        'c_incp_sr':        {'incp', 'income_verylo', 'income_lo', 'income_mid',
+                             'income_midplus', 'income_midhi', 'income_hi', 'income_veryhi'},
+        'c_incp_transit':   {'incp', 'income_verylo', 'income_lo', 'income_mid',
+                             'income_midplus', 'income_midhi', 'income_hi', 'income_veryhi'},
+        'c_incp_active':    {'incp', 'income_verylo', 'income_lo', 'income_mid',
+                             'income_midplus', 'income_midhi', 'income_hi', 'income_veryhi'},
+        # Age
+        'c_age_walk':       {'age_child', 'age_teen', 'age_working', 'age_older', 'age_senior'},
+        'c_age_bike':       {'age_child', 'age_teen', 'age_working', 'age_older', 'age_senior'},
+        'c_young_bike':     {'age_child', 'age_teen'},
+        # Gender
+        'c_female_transit': {'sexp', 'is_female'},
+        'c_female_walk':    {'sexp', 'is_female'},
+        # Household size
+        'c_hhsize_sr':      {'nprd', 'hh_alone', 'hh_couple', 'hh_medium',
+                             'hh_size_large', 'hh_child', 'n_workers_hh'},
+        # Bicycles
+        'c_bikes_bike':     {'bikes'},
+        # Work status / person type
+        'c_ftwork_da':      {'WORKSTAT', 'mandatory_role', 'ptype_FullTimeWorker'},
+        'c_ptwork_sr':      {'WORKSTAT', 'mandatory_role', 'ptype_PartTimeWorker'},
+        # Nonmand vehicle × bike (nonmand segment only)
+        'c_bike_veh':       {'vehrd', 'has_vehicle'},
+    }
+
+    # ── 3. Extra skim candidates not in MODE_UEC ─────────────────────────────
+    # Injected dynamically when their gene is selected.
+    _EXTRA_SKIM_SPECS: dict[str, list] = {
+        'SOVTOLL_TIME__PM':      [('c_ivt_auto_pm',   'od.SOVTOLL_TIME__PM / 60.0',        {'DA': None, 'SR': None})],
+        'HOV2TOLL_TIME__AM':     [('c_ivt_hov2_am',   'od.HOV2TOLL_TIME__AM / 60.0',       {'SR': None})],
+        'WLK_LOC_WLK_XWAIT__AM': [('c_xwait_transit', 'od.WLK_LOC_WLK_XWAIT__AM / 60.0',  {'Transit': None})],
+    }
+
+    custom_set = set(custom_vars)
+    filtered_uec: dict = {}
+
     for coeff, (expr, mode_filter) in MODE_UEC.items():
-        # keep person-attribute terms and ASC terms unconditionally
-        if not expr.startswith("od.") and not expr.startswith("log(od."):
+
+        # backbone: always on
+        if coeff in _ALWAYS_INCLUDE:
             filtered_uec[coeff] = (expr, mode_filter)
             continue
-        # keep skim terms only if the skim column is in custom_vars
-        skim_col = expr.replace("od.", "").replace("log(", "").replace("+1)", "")
-        if skim_col in custom_vars:
+
+        # optional skim terms: gate by matrix name
+        if expr.startswith("od.") or expr.startswith("log(od."):
+            _sm = _re.search(r'od\.([A-Za-z0-9_]+)', expr)
+            skim_col = _sm.group(1) if _sm else ''
+            if skim_col in custom_set:
+                filtered_uec[coeff] = (expr, mode_filter)
+            continue
+
+        # person/tour terms: include when a mapped candidate is selected
+        if coeff in _COEFF_GATE:
+            if custom_set & _COEFF_GATE[coeff]:
+                filtered_uec[coeff] = (expr, mode_filter)
+        else:
+            # unmapped tour/person term → always include (safe fallback)
             filtered_uec[coeff] = (expr, mode_filter)
 
-    return _build_mode_utility(m, Mode, "all", uec=filtered_uec)
+    # inject extra skim terms for selected candidates absent from MODE_UEC
+    for var in custom_vars:
+        for coeff, expr, mf in _EXTRA_SKIM_SPECS.get(var, []):
+            if coeff not in filtered_uec:
+                filtered_uec[coeff] = (expr, mf)
+
+    return _build_mode_utility(m, Mode, segment, uec=filtered_uec)
 
 
 def _dest_spec_custom(mm, segment: str, custom_vars: list):
@@ -4028,7 +4108,7 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
         pass   # weights already baked into dataset freq_weights if supported
 
     if custom_mode_vars is not None:
-        m = _mode_spec_custom(m, Mode, custom_mode_vars)
+        m = _mode_spec_custom(m, Mode, custom_mode_vars, segment=segment)
     else:
         m = _build_mode_utility(m, Mode, segment)
 
@@ -5242,6 +5322,7 @@ def _estimate(model, two_phase: bool = False):
     print(f"    _estimate phase-1: {_n_free_now} free params, maxiter={est_options['maxiter']} ...")
     try:
         result = model.maximize_loglike(options=est_options)
+        #todo : why candidate pool mode=5 and dest = 2
         print(f"    _estimate phase-1 done: LL={getattr(result, 'loglike', '?')}")
     except Exception as _mll_e:
         logger.warning(
@@ -5785,6 +5866,7 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
                     ls_col = np.asarray(m_copy.logsums(datatree=tmp), dtype=np.float32)
                 except TypeError as e:
                     if j == 0:
+                        #todo i get a typererror here: TypeError: logsums() got an unexpected keyword argument 'datatree' why?
                         logger.debug(
                             "_logsums: logsums(datatree=...) TypeError with "
                             f"DTAZ variant {_set_dtaz.variant}: {e}"

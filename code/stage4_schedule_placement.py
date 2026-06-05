@@ -377,6 +377,7 @@ class MNLTimingModel:
                         'time_consumed', 'duration_min', 'time_remaining']
         if self.include_person_features_:
             feature_list = feature_list + PERSON_FEATURES
+        feature_list = list(dict.fromkeys(feature_list))  # deduplicate, preserve order
         for col in feature_list:
             if col in df.columns:
                 arrays.append(

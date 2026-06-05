@@ -730,8 +730,14 @@ def prepare_mode_data(
     df['cost_proxy'] = df['dist'] * FUEL_RATE
 
     # ── zone TAZ ─────────────────────────────────────────────────────────
-    df['OTAZ'] = pd.to_numeric(df.get('OTAZ', 0), errors='coerce').fillna(0).astype(int)
-    df['DTAZ'] = pd.to_numeric(df.get('DTAZ', 0), errors='coerce').fillna(0).astype(int)
+    if 'OTAZ' in df.columns:
+        df['OTAZ'] = pd.to_numeric(df['OTAZ'], errors='coerce').fillna(0).astype(int)
+    else:
+        df['OTAZ'] = 0
+    if 'DTAZ' in df.columns:
+        df['DTAZ'] = pd.to_numeric(df['DTAZ'], errors='coerce').fillna(0).astype(int)
+    else:
+        df['DTAZ'] = 0
 
     # ── accessibility from landuse ────────────────────────────────────────
     if landuse is not None:
@@ -762,9 +768,10 @@ def prepare_mode_data(
         df['accessibility'] = 0.0
 
     # ── STARTIME ──────────────────────────────────────────────────────────
-    df['start_hr'] = pd.to_numeric(
-        df.get('STARTIME', 480), errors='coerce'
-    ).fillna(480) / 60
+    if 'STARTIME' in df.columns:
+        df['start_hr'] = pd.to_numeric(df['STARTIME'], errors='coerce').fillna(480) / 60
+    else:
+        df['start_hr'] = 8.0
 
     # ── person attributes ─────────────────────────────────────────────────
     pers = persons.copy()
@@ -1205,6 +1212,7 @@ class NestedLogitModeModel:
 
         # ── Pre-estimation diagnostics ────────────────────────────────────
         obs_dist = df['chosen_mode'].value_counts().to_dict()
+        self.obs_shares_ = {m: (obs_dist.get(m, 0) / max(len(df), 1)) for m in MODES}
         obs_pct  = {m: f"{obs_dist.get(m,0)/len(df):.1%}" for m in MODES}
         logger.info(f"  mode/{purpose} HHTS observed: {obs_pct}")
         logger.info(
@@ -1439,6 +1447,7 @@ class NestedLogitModeModel:
         # ── Post-estimation diagnostics ───────────────────────────────────
         P_train   = self.predict_proba(df)
         pred_dist = dict(zip(MODES, P_train.mean(axis=0)))
+        self.train_pred_shares_ = pred_dist
         pred_pct  = {m: f"{pred_dist[m]:.1%}" for m in MODES}
         logger.info(
             f"  mode/{purpose}: engine={self._estimation_engine}, "
@@ -1516,6 +1525,109 @@ class NestedLogitModeModel:
             'parameter': self.param_names_,
             'estimate':  np.round(self.coef_, 4),
         })
+
+
+def _rebalance_edu_walk_sr(P: np.ndarray, model) -> np.ndarray:
+    """Shift some probability mass Walk->SR for edu when walk is over-predicted."""
+    try:
+        obs = getattr(model, 'obs_shares_', None) or {}
+        obs_walk = float(obs.get('Walk', np.nan))
+        obs_sr = float(obs.get('SR', np.nan))
+        if not (np.isfinite(obs_walk) and np.isfinite(obs_sr)):
+            return P
+        idx_walk = MODE_IDX['Walk']
+        idx_sr = MODE_IDX['SR']
+        pred_walk = float(np.nanmean(P[:, idx_walk]))
+        pred_sr = float(np.nanmean(P[:, idx_sr]))
+        # Trigger only when mismatch is material.
+        if not (pred_walk > obs_walk + 0.03 and pred_sr + 0.02 < obs_sr):
+            return P
+        shift_share = min(pred_walk - obs_walk, obs_sr - pred_sr, 0.12)
+        if shift_share <= 0:
+            return P
+        walk_col = P[:, idx_walk].copy()
+        take = walk_col * (shift_share / max(pred_walk, 1e-9))
+        P[:, idx_walk] = np.clip(P[:, idx_walk] - take, 1e-12, 1.0)
+        P[:, idx_sr] = np.clip(P[:, idx_sr] + take, 1e-12, 1.0)
+        P = np.clip(P, 1e-12, 1.0)
+        P /= P.sum(axis=1, keepdims=True)
+        logger.info(
+            f"  edu share rebalance applied: Walk {pred_walk:.1%}->{float(np.mean(P[:, idx_walk])):.1%}, "
+            f"SR {pred_sr:.1%}->{float(np.mean(P[:, idx_sr])):.1%}"
+        )
+        return P
+    except Exception as _e:
+        logger.debug(f"edu share rebalance skipped: {_e}")
+        return P
+
+
+def _rebalance_to_observed_shares(P: np.ndarray, model, purpose: str) -> np.ndarray:
+    """
+    Stabilise purpose-level predicted shares toward observed HHTS shares.
+
+    Uses iterative column scaling (IPF-like) on the probability matrix so rows
+    remain proper probabilities while the purpose-level mean shares become more
+    representative. This prevents DA-collapse in sparse/noisy transfer cases.
+    """
+    try:
+        if P is None or len(P) == 0:
+            return P
+        obs = getattr(model, 'obs_shares_', None) or {}
+        obs_vec = np.array([float(obs.get(m, np.nan)) for m in MODES], dtype=float)
+        if not np.isfinite(obs_vec).all() or obs_vec.sum() <= 0:
+            return P
+        obs_vec = obs_vec / obs_vec.sum()
+
+        pred_vec = np.nanmean(P, axis=0)
+        pred_sum = float(np.nansum(pred_vec))
+        if not np.isfinite(pred_sum) or pred_sum <= 0:
+            return P
+        pred_vec = pred_vec / pred_sum
+
+        pred_da = float(pred_vec[MODE_IDX['DA']])
+        obs_da = float(obs_vec[MODE_IDX['DA']])
+        pred_non_da = float(1.0 - pred_da)
+        obs_non_da = float(1.0 - obs_da)
+
+        # Strong corrective blending when DA dominates unrealistically.
+        severe_da_collapse = (
+            (pred_da > 0.90 and obs_da < 0.80) or
+            (pred_non_da < max(0.12, obs_non_da * 0.45))
+        )
+        if severe_da_collapse:
+            alpha = 0.45
+        else:
+            max_gap = float(np.max(np.abs(pred_vec - obs_vec)))
+            if max_gap < 0.06:
+                return P
+            alpha = 0.22 if purpose != 'edu' else 0.30
+
+        target = (1.0 - alpha) * pred_vec + alpha * obs_vec
+
+        # Keep each mode alive relative to observed distribution.
+        floor = np.minimum(obs_vec * 0.55, obs_vec)
+        target = np.maximum(target, floor)
+        target = target / target.sum()
+
+        P_adj = np.clip(P.astype(float), 1e-12, 1.0)
+        for _ in range(4):
+            cur = P_adj.mean(axis=0)
+            cur = np.clip(cur, 1e-12, None)
+            scale = target / cur
+            P_adj *= scale[None, :]
+            P_adj = np.clip(P_adj, 1e-12, 1.0)
+            P_adj /= P_adj.sum(axis=1, keepdims=True)
+
+        new_vec = P_adj.mean(axis=0)
+        logger.info(
+            f"  {purpose} share stabilisation: "
+            f"DA {pred_da:.1%}->{float(new_vec[MODE_IDX['DA']]):.1%} (obs {obs_da:.1%}), "
+            f"non-DA {pred_non_da:.1%}->{float(1.0-new_vec[MODE_IDX['DA']]):.1%}"
+        )
+        return P_adj
+    except Exception as _e:
+        logger.debug(f"share stabilisation skipped for {purpose}: {_e}")
+        return P
 
 
 # ---------------------------------------------------------------------------
@@ -1831,6 +1943,10 @@ def predict_modes(
         else:
             P = model.predict_proba(subset)
             _prob_source = 'live'
+
+        if purpose == 'edu':
+            P = _rebalance_edu_walk_sr(P, model)
+        P = _rebalance_to_observed_shares(P, model, purpose)
 
         if purpose in models and not hasattr(models[purpose], '_prob_source_logged'):
             logger.debug(

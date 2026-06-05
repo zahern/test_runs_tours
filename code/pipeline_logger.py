@@ -153,7 +153,27 @@ def _setup_logging(mode: str = 'main', arg: str = None) -> None:
         suffix = f"{mode}_{safe_arg}"
 
     ga_estimator = os.environ.get('GA_ESTIMATOR', 'default').strip().lower()
-    if ga_estimator and ga_estimator != 'default':
+    _ga_mode = mode in ('ga', 'ga_staged', 'ga_stage5_smoke')
+    _use_sa = os.environ.get('GA_USE_SA', '0').strip() == '1'
+    _use_bandit_sa = os.environ.get('GA_USE_BANDIT_SA', '0').strip() == '1'
+    if _ga_mode:
+        # For GA modes: always include estimator name; prefix with sa_ vs ga_ based on SA flags.
+        _estim_label = ga_estimator if ga_estimator else 'default'
+        if _use_sa or _use_bandit_sa:
+            # sa_bandit estimator with SA flags -> 'sa_bandit' (not 'sa_ga_sa_bandit')
+            if _estim_label == 'sa_bandit':
+                _estim_label = 'bandit'
+            _search_prefix = 'sa'
+        else:
+            _search_prefix = 'ga'
+        # mode suffix after the 'ga' base: '' for 'ga', '_staged' for 'ga_staged', etc.
+        _mode_tail = mode[2:]  # '' or '_staged' or '_stage5_smoke'
+        if arg:
+            safe_arg = arg.replace('/', '_').replace('\\', '_').replace(' ', '')
+            suffix = f"{_search_prefix}_{_estim_label}{_mode_tail}_{safe_arg}"
+        else:
+            suffix = f"{_search_prefix}_{_estim_label}{_mode_tail}"
+    elif ga_estimator and ga_estimator != 'default':
         suffix = f"{suffix}_{ga_estimator}"
 
     _run_tag_env = os.environ.get('PIPELINE_RUN_TAG', '').strip()
@@ -240,6 +260,54 @@ def _setup_logging(mode: str = 'main', arg: str = None) -> None:
             json.dump(manifest, _mf, indent=2)
     except Exception:
         pass
+
+    # Maintain stable aliases for tooling/users that expect fixed folders
+    # (e.g. runs/main and runs/main_ga) while still keeping tagged histories.
+    alias_name = None
+    if mode == 'main':
+        alias_name = 'main'
+    elif mode in ('ga', 'ga_staged', 'ga_stage5_smoke'):
+        alias_name = 'main_ga'
+    if alias_name:
+        alias_dir = os.path.join(run_root, alias_name)
+        try:
+            os.makedirs(alias_dir, exist_ok=True)
+            with open(os.path.join(alias_dir, 'LATEST_RUN.txt'), 'w', encoding='utf-8') as _lf:
+                _lf.write(OUT_DIR + '\n')
+            alias_manifest = dict(manifest)
+            alias_manifest.update({'alias': alias_name, 'latest_out_dir': OUT_DIR})
+            with open(os.path.join(alias_dir, 'run_manifest.json'), 'w', encoding='utf-8') as _amf:
+                json.dump(alias_manifest, _amf, indent=2)
+            logging.getLogger('pipeline').info(
+                f"Stable alias updated: {alias_dir} -> {OUT_DIR}"
+            )
+        except Exception as _alias_e:
+            logging.getLogger('pipeline').warning(
+                f"Could not update stable alias '{alias_name}': {_alias_e}"
+            )
+
+    # When mode='ga', also write a per-estimator alias (e.g. main_ga_metacount)
+    # so that a following ga_staged job with GA_STAGED_REUSE_ESTIMATOR=1 can
+    # locate this run's ga_results.pkl without relying on shared main_ga alias
+    # (which would be clobbered by parallel ga chains with different estimators).
+    if mode == 'ga' and ga_estimator and ga_estimator not in ('default', ''):
+        _est_alias_name = f'main_ga_{ga_estimator}'
+        _est_alias_dir = os.path.join(run_root, _est_alias_name)
+        try:
+            os.makedirs(_est_alias_dir, exist_ok=True)
+            with open(os.path.join(_est_alias_dir, 'LATEST_RUN.txt'), 'w', encoding='utf-8') as _lf:
+                _lf.write(OUT_DIR + '\n')
+            _est_alias_manifest = dict(manifest)
+            _est_alias_manifest.update({'alias': _est_alias_name, 'latest_out_dir': OUT_DIR})
+            with open(os.path.join(_est_alias_dir, 'run_manifest.json'), 'w', encoding='utf-8') as _amf:
+                json.dump(_est_alias_manifest, _amf, indent=2)
+            logging.getLogger('pipeline').info(
+                f"Estimator alias updated: {_est_alias_dir} -> {OUT_DIR}"
+            )
+        except Exception as _est_alias_e:
+            logging.getLogger('pipeline').warning(
+                f"Could not update estimator alias '{_est_alias_name}': {_est_alias_e}"
+            )
 
     # Log pkl cleanup now that the logger is ready
     if _cleaned_pkls:
@@ -2307,6 +2375,9 @@ def _write_trip_models_html_report(
     -------
     {save_dir}/stage5t_models_report.html     — combined report
     {save_dir}/stage5t_mode_{purpose}.html    — per-purpose mode model
+    
+    FIX (2026-05-15): Added diagnostic logging when models dict is empty
+    to catch cases where trip-level estimation produced no models.
     """
     import math as _math
 
@@ -2430,17 +2501,36 @@ def _write_trip_models_html_report(
         "td{padding:5px 10px;border-bottom:1px solid #eee;font-size:.88em}"
         "tr:hover td{background:#f5f5f5}"
         ".sig-note{font-size:.8em;color:#555;margin-top:6px}"
+        ".warning{background:#fff3cd;padding:12px;border:1px solid #ffc107;border-radius:4px;margin-bottom:16px}"
     )
 
     # Build combined report body
     mode_sections = [_mode_section_html(p, m) for p, m in mode_models.items() if m is not None]
     dest_sections = [_dest_section_html(s, r) for s, r in dest_models.items() if r is not None]
 
+    # FIX (2026-05-15): Log and handle case where no models were successfully estimated
+    if not mode_sections and not dest_sections:
+        logger.warning(
+            f"  [5t] HTML report: no valid models found. "
+            f"mode_models keys={list(mode_models.keys())} (None count={sum(1 for m in mode_models.values() if m is None)}); "
+            f"dest_models keys={list(dest_models.keys())} (None count={sum(1 for d in dest_models.values() if d is None)})"
+        )
+        # Create a placeholder warning message so the report is not completely empty
+        warning_msg = (
+            "<div class='warning'><strong>⚠ No trip-level models estimated</strong><p>"
+            "All trip-level mode and destination models failed to estimate. "
+            "This may indicate insufficient data or model specification issues. "
+            "Check the run logs for detailed error messages.</p></div>"
+        )
+    else:
+        warning_msg = ""
+
     body = (
-        "<h2 style='margin-top:0;color:#1a3a5c'>Trip-Level Mode Choice Models</h2>"
-        + '\n'.join(mode_sections)
+        warning_msg
+        + "<h2 style='margin-top:0;color:#1a3a5c'>Trip-Level Mode Choice Models</h2>"
+        + ('\n'.join(mode_sections) if mode_sections else "<p><em>No mode models available.</em></p>")
         + "<hr><h2 style='color:#1a3a5c;margin-top:32px'>Trip-Level Destination Choice Models</h2>"
-        + '\n'.join(dest_sections)
+        + ('\n'.join(dest_sections) if dest_sections else "<p><em>No destination models available.</em></p>")
     )
 
     html = (
@@ -3479,9 +3569,8 @@ def stage5(out, synth_persons, scheduled, landuse):
     import openmatrix as omx
     from stage5_destination_choice import _skim_flat, _skim_lookup
     skims_path = 'downcasted_matrices_base.omx'
-    # Allow Stage 5 to complete with diagnostics/artifacts even when one
-    # segment has unstable estimation. This preserves HTML/KPI traces.
-    os.environ.setdefault('STAGE5_STRICT_ESTIMATION', '0')
+    # Require Stage 5 to fit cleanly by default; fallback paths are opt-in.
+    os.environ.setdefault('STAGE5_STRICT_ESTIMATION', '1')
     # Keep destination-estimation requirement enabled by default.
     os.environ.setdefault('STAGE5_REQUIRE_DEST_ESTIMATION', '1')
 
@@ -3732,6 +3821,10 @@ def spatial_plots(plan, synth, landuse):
 
 @timer("GA — all stages")
 def ga_all(out, landuse):
+    # Baseline-first policy: estimator/stage fallbacks must be explicitly enabled.
+    os.environ.setdefault('GA_ESTIMATOR_FALLBACK', '0')
+    os.environ.setdefault('GA_STAGE5_FALLBACK_TO_MAIN', '0')
+    os.environ.setdefault('GA_STAGE5_PREFIT_BASELINE', '1')
     _run_ga_stages_with_checkpoints(out, landuse)
 
 
@@ -3846,12 +3939,152 @@ def _format_ga_checkpoint_summary(res) -> dict:
     return summary
 
 
+def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -> None:
+    """
+    Re-estimate stage `sid` using the GA's best-selected features and write
+    a coefficient HTML to the ga_reports/ subdir of OUT_DIR.
+
+    This gives coefficient tables with actual fitted values and t-stats in the
+    GA search run directory (not just in the ga_staged run).
+    Stage 5 fits Larch mode+destination models on HHTS using the best features.
+    """
+    from ga_hypothesis_testing import _ga_save_stage_coef_csv
+    if res is None:
+        return
+    best_feats = getattr(res, 'best_features', None)
+    save_dir = os.path.join(OUT_DIR, 'ga_reports')
+    os.makedirs(save_dir, exist_ok=True)
+    try:
+        if sid == 1:
+            from stage1_activity_frequency import estimate_frequency_models
+            models = estimate_frequency_models(
+                out['tours'], out['persons'],
+                feature_override=best_feats if isinstance(best_feats, list) else None,
+            )
+            _ga_save_stage_coef_csv(models, 'stage1', save_dir)
+            logger.info("GA stage 1 coefficient HTML saved to ga_reports/stage1_coefficients.html")
+        elif sid == 2:
+            from stage2_day_duration import aggregate_person_day, estimate_day_models
+            pd_df = aggregate_person_day(out['tours'], out['persons'])
+            models = estimate_day_models(
+                pd_df,
+                feature_override=best_feats if isinstance(best_feats, list) else None,
+            )
+            _ga_save_stage_coef_csv(models, 'stage2', save_dir)
+            logger.info("GA stage 2 coefficient HTML saved to ga_reports/stage2_coefficients.html")
+        elif sid == 3:
+            from stage3_activity_duration import estimate_duration_models
+            models = estimate_duration_models(
+                out['tours'], out['persons'], trips=out.get('trips'),
+                feature_override=best_feats if isinstance(best_feats, list) else None,
+            )
+            _ga_save_stage_coef_csv(models, 'stage3', save_dir)
+            logger.info("GA stage 3 coefficient HTML saved to ga_reports/stage3_coefficients.html")
+        elif sid == 4:
+            from stage4_schedule_placement import estimate_timing_models
+            # best_feats may be a per-purpose dict (not list) — pass directly;
+            # estimate_timing_models/_timing_person_features handles both.
+            models = estimate_timing_models(
+                out['trips'], out['tours'], out['persons'],
+                feature_override=best_feats,
+            )
+            _ga_save_stage_coef_csv(models, 'stage4', save_dir)
+            logger.info("GA stage 4 coefficient HTML saved to ga_reports/stage4_coefficients.html")
+        elif sid == 5:
+            import openmatrix as omx
+            from stage5_destination_choice import (
+                _prep_hhts_tours, _filter_seg, _mode_tree, _build_mode_model,
+                _estimate, _logsums, _attach_size_term, _attach_acdc_terms,
+                _dest_tree, _build_dest_model, _skim_flat,
+            )
+            _skims_path = os.environ.get('PIPELINE_SKIMS_PATH', 'downcasted_matrices_base.omx')
+            if not os.path.isabs(_skims_path):
+                _skims_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _skims_path)
+            _s5_mode_feats = (best_feats.get('mode') if isinstance(best_feats, dict)
+                              else (best_feats or []))
+            _s5_dest_feats = (best_feats.get('dest') if isinstance(best_feats, dict)
+                              else (best_feats or []))
+            _hhts_input = out.get('tours') or out.get('trips')
+            _s5_tours = _prep_hhts_tours(_hhts_input, out['persons'])
+            _s5_models = {}
+            _skims_hdl = omx.open_file(_skims_path, 'r')
+            try:
+                try:
+                    _skim_df = _skim_flat(_skims_hdl)
+                except Exception as _se:
+                    import pandas as _pd
+                    _skim_df = _pd.DataFrame()
+                    logger.warning(f"GA stage 5 coef HTML: skim_flat failed: {_se}")
+                _lu = landuse if landuse is not None else getattr(res, 'metadata', {}).get('landuse')
+                for _seg in ['work', 'edu', 'nonmand']:
+                    _st = _filter_seg(_s5_tours, _seg)
+                    if len(_st) < 50:
+                        continue
+                    try:
+                        _dt_m = _mode_tree(_st, out['persons'], _lu, _skims_hdl)
+                        _mode_mdl = _build_mode_model(_dt_m, _seg,
+                                                      custom_mode_vars=_s5_mode_feats)
+                        _mode_mdl = _estimate(_mode_mdl)
+                        _ls = _logsums(_mode_mdl, _dt_m, skims=_skims_hdl, verbose=False)
+                        _lu_st = _attach_size_term(_lu, _seg)
+                        _lu_st, _seg_acdc = _attach_acdc_terms(_lu_st, _st, _skim_df, _seg)
+                        _dt_d = _dest_tree(_seg_acdc, out['persons'], _lu_st, _skims_hdl, _ls)
+                        _dest_mdl = _build_dest_model(_dt_d, _seg,
+                                                      custom_dest_vars=_s5_dest_feats)
+                        _dest_mdl = _estimate(_dest_mdl)
+                        _s5_models[f'{_seg}_mode'] = _mode_mdl
+                        _s5_models[f'{_seg}_dest'] = _dest_mdl
+                    except Exception as _seg_exc:
+                        logger.warning(f"GA stage 5 coef HTML [{_seg}]: {_seg_exc}")
+            finally:
+                _skims_hdl.close()
+            if _s5_models:
+                _ga_save_stage_coef_csv(_s5_models, 'stage5', save_dir)
+                logger.info(
+                    "GA stage 5 coefficient HTML saved to ga_reports/stage5_coefficients.html"
+                )
+    except Exception as _exc:
+        logger.warning(f"GA stage {sid} coef HTML from best features failed: {_exc}")
+
+
 def _run_ga_stages_with_checkpoints(out, landuse):
-    """Run GA stages sequentially with after-stage checkpointing."""
+    """Run GA stages sequentially with after-stage checkpointing.
+
+    Supports resume: if ga_results_checkpoint.pkl already contains completed
+    stages (e.g. from a prior PBS run that was killed mid-way), those stages
+    are reloaded and skipped so the job continues from where it left off.
+    Per-purpose progress within each stage is checkpointed via the
+    GA_CHECKPOINT_DIR env var, which is read by the stage-level run functions
+    in ga_hypothesis_testing.py.
+    """
     from ga_hypothesis_testing import AllStagesResult
 
+    # ── Resume detection ──────────────────────────────────────────────────
+    _ckpt_path = os.path.join(OUT_DIR, 'ga_results_checkpoint.pkl')
     all_ga = AllStagesResult()
-    _save_ga_checkpoint(all_ga, stage_id=0, failed=False)
+    _skip_stages: set = set()
+    if os.path.exists(_ckpt_path):
+        try:
+            with open(_ckpt_path, 'rb') as _f:
+                _prev = pickle.load(_f)
+            _prev_completed = set(
+                int(k) for k in getattr(_prev, 'results', {}).keys()
+            )
+            if _prev_completed:
+                all_ga = _prev
+                _skip_stages = _prev_completed
+                logger.info(
+                    f"Resuming GA: reloaded checkpoint with completed stages "
+                    f"{sorted(_skip_stages)} from {_ckpt_path}"
+                )
+        except Exception as _e:
+            logger.warning(f"Could not load GA checkpoint for resume: {_e} — starting fresh")
+    if not _skip_stages:
+        _save_ga_checkpoint(all_ga, stage_id=0, failed=False)
+
+    # Expose OUT_DIR to stage functions so per-purpose checkpoints can be
+    # saved incrementally (and reloaded on resume).
+    os.environ['GA_CHECKPOINT_DIR'] = OUT_DIR
 
     _stages = [
         (1, lambda: ga_stage1(out)),
@@ -3862,11 +4095,43 @@ def _run_ga_stages_with_checkpoints(out, landuse):
     ]
 
     for sid, runner in _stages:
+        if sid in _skip_stages:
+            logger.info(f"GA stage {sid} skipped (results loaded from checkpoint)")
+            continue
         try:
             all_ga.results[sid] = runner()
             _res = all_ga.results[sid]
             _hist = getattr(_res, 'history', []) if _res is not None else []
             _hist_df = pd.DataFrame(_hist) if _hist else None
+
+            _seg_results = {}
+            if _res is not None and isinstance(getattr(_res, 'metadata', None), dict):
+                _seg_results = _res.metadata.get('segment_results', {}) or {}
+            if _seg_results:
+                for _seg_label, _seg_res in _seg_results.items():
+                    _seg_hist = getattr(_seg_res, 'history', []) or []
+                    if _seg_hist:
+                        _hdf = pd.DataFrame(_seg_hist)
+                        _best = _hdf.get('best_so_far', _hdf.get('best_fitness', pd.Series(dtype=float)))
+                        _div = _hdf.get('diversity', pd.Series(dtype=float))
+                        _n_gen = int(len(_hdf))
+                        _div_max = float(pd.to_numeric(_div, errors='coerce').max()) if len(_div) else float('nan')
+                        _impr = float(_best.iloc[-1] - _best.iloc[0]) if len(_best) > 1 else 0.0
+                        logger.info(
+                            f"GA stage {sid} segment '{_seg_label}': gens={_n_gen} "
+                            f"max_diversity={_div_max:.3f} best_so_far_delta={_impr:.6f}"
+                        )
+                    else:
+                        logger.info(f"GA stage {sid} segment '{_seg_label}': no history rows recorded")
+            elif _hist_df is not None and not _hist_df.empty:
+                _best = _hist_df.get('best_so_far', _hist_df.get('best_fitness', pd.Series(dtype=float)))
+                _div = _hist_df.get('diversity', pd.Series(dtype=float))
+                _impr = float(_best.iloc[-1] - _best.iloc[0]) if len(_best) > 1 else 0.0
+                _div_max = float(pd.to_numeric(_div, errors='coerce').max()) if len(_div) else float('nan')
+                logger.info(
+                    f"GA stage {sid}: gens={len(_hist_df)} max_diversity={_div_max:.3f} "
+                    f"best_so_far_delta={_impr:.6f}"
+                )
             
             # Build enhanced summary with model details and proper BIC reporting
             summary = _format_ga_checkpoint_summary(_res)
@@ -3877,6 +4142,9 @@ def _run_ga_stages_with_checkpoints(out, landuse):
                 summary=summary,
                 table=_hist_df,
             )
+            # Re-estimate with the best features and save coefficient HTML
+            # so users can inspect named coefficients in the GA search run dir.
+            _ga_save_stage_coef_html_from_best(sid, _res, out, landuse=landuse)
             _save_ga_checkpoint(all_ga, stage_id=sid, failed=False)
             logger.info(
                 f"GA checkpoint saved after stage {sid} "
@@ -3897,45 +4165,43 @@ def _ga_budget_params() -> dict:
     """
     Read GA_BUDGET env var and return pop/gens/restarts.
 
-    GA_BUDGET=smoke      → pop=8,  gens=2,   restarts=0   (sanity check only)
-    GA_BUDGET=fast       → pop=30, gens=40,  restarts=1   (current default — for quick tests)
-    GA_BUDGET=standard   → pop=50, gens=100, restarts=3   (recommended for HPC production)
-    GA_BUDGET=thorough   → pop=80, gens=200, restarts=5   (paper-quality; ~6–8× slower than fast)
+    Total evaluation steps = pop_size * (n_generations + n_restarts * (n_generations // 3)).
+    All levels below have been tuned so that reducing restarts redistributes those
+    steps back into the main run (same total compute, longer uninterrupted convergence).
 
-    Larger populations explore more of the binary chromosome space per generation;
-    more generations allow convergence; restarts escape local optima.
+    GA_BUDGET=smoke      pop=8,   gens=2,   restarts=0  (sanity check only)
+    GA_BUDGET=ultrafast  pop=25,  gens=30,  restarts=0  total_gens_equiv=30  (~45 min/purpose for MetaCount)
+    GA_BUDGET=fast       pop=40,  gens=75,  restarts=1  total_gens_equiv=100
+    GA_BUDGET=standard   pop=60,  gens=263, restarts=1  total_gens_equiv=350
+    GA_BUDGET=thorough   pop=100, gens=540, restarts=2  total_gens_equiv=900
 
-    For Stage 5 specifically, each fitness eval fits a Larch NL model (~2–5 s).
-    Throughput ≈ pop_size × n_generations × n_segments × 5 s ÷ 3600 hours.
-      fast     : ~40×60  × 3 × 5 s ≈ 1.0 h  (exploration run, no improvement guarantee)
-      standard : ~60×150 × 3 × 5 s ≈ 3.8 h  (default — visible convergence)
-      thorough : ~100×300× 3 × 5 s ≈ 12.5 h (full overnight, strong convergence)
+    Fewer restarts means the SA-Bandit main run has more generations to warm up
+    the temperature schedule and sharpen the Beta posteriors before being reset.
+    One restart is kept (fast/standard) to recover from bad random initialisations.
+
+    For Stage 5 specifically, each fitness eval fits a Larch NL model (~2-5 s).
     Stages 1-4 are much faster (seconds/eval); budget only matters for Stage 5.
     """
     level = os.environ.get('GA_BUDGET', 'standard').strip().lower()
     budgets = {
-        'smoke':    dict(pop_size=8,   n_generations=2,   n_restarts=0),
-        'fast':     dict(pop_size=40,  n_generations=60,  n_restarts=2),
-        'standard': dict(pop_size=60,  n_generations=150, n_restarts=4),
-        'thorough': dict(pop_size=100, n_generations=300, n_restarts=6),
+        'smoke':     dict(pop_size=8,   n_generations=2,   n_restarts=0),
+        'ultrafast': dict(pop_size=25,  n_generations=30,  n_restarts=0),
+        'fast':      dict(pop_size=40,  n_generations=75,  n_restarts=1),
+        'standard':  dict(pop_size=60,  n_generations=263, n_restarts=1),
+        'thorough':  dict(pop_size=100, n_generations=540, n_restarts=2),
     }
     if level not in budgets:
         logger.warning(f"Unknown GA_BUDGET='{level}'; using 'standard'. "
-                   f"Valid choices: smoke, fast, standard, thorough")
+                   f"Valid choices: smoke, ultrafast, fast, standard, thorough")
         level = 'standard'
     params = dict(budgets[level])
 
-    # MetaCount/SearchLibrium fitness calls can be substantially slower or
-    # may trigger frequent estimator fallbacks. Use a lighter default budget
-    # so staged GA runs complete and write plots/checkpoints before walltime.
     est = os.environ.get('GA_ESTIMATOR', 'default').strip().lower()
+    # MetaCount/SearchLibrium circuit-breakers prevent wasted evaluations;
+    # use the same budget as the default estimator so coverage is equivalent.
     if est in ('metacount', 'searchlibrium', 'both', 'hybrid'):
-        if level == 'standard':
-            params = {'pop_size': 35, 'n_generations': 80, 'n_restarts': 2}
-        elif level == 'thorough':
-            params = {'pop_size': 60, 'n_generations': 160, 'n_restarts': 3}
         logger.info(
-            f"GA estimator={est!r}: using estimator-safe budget "
+            f"GA estimator={est!r}: using full budget "
             f"pop={params['pop_size']} gens={params['n_generations']} restarts={params['n_restarts']}"
         )
 
@@ -5665,14 +5931,32 @@ def GA_main(filepath: str = None):
     if ga_results is not None:
         # ── Apply GA-selected features through stages 1–5 ─────────────
         from ga_hypothesis_testing import apply_ga_results_to_pipeline
-        scheduled_dest, s5_models = apply_ga_results_to_pipeline(
-            ga_results   = ga_results,
-            out          = out,
-            synth        = travellers,
-            landuse      = landuse,
-            skims_path   = 'downcasted_matrices_base.omx',
-            save_dir     = OUT_DIR,
-        )
+        _prev_larch_engine = os.environ.get('GA_LARCH_ENGINE')
+        _prev_strict_s5 = os.environ.get('STAGE5_STRICT_ESTIMATION')
+        try:
+            # GA search can use numba, but final Stage 5 application is more
+            # stable on JAX for large idca dataflows on Linux/HPC.
+            if os.name != 'nt':
+                os.environ['GA_LARCH_ENGINE'] = 'jax'
+            # Require strict Stage 5 fit during GA apply.
+            os.environ['STAGE5_STRICT_ESTIMATION'] = '1'
+            scheduled_dest, s5_models = apply_ga_results_to_pipeline(
+                ga_results   = ga_results,
+                out          = out,
+                synth        = travellers,
+                landuse      = landuse,
+                skims_path   = 'downcasted_matrices_base.omx',
+                save_dir     = OUT_DIR,
+            )
+        finally:
+            if _prev_larch_engine is None:
+                os.environ.pop('GA_LARCH_ENGINE', None)
+            else:
+                os.environ['GA_LARCH_ENGINE'] = _prev_larch_engine
+            if _prev_strict_s5 is None:
+                os.environ.pop('STAGE5_STRICT_ESTIMATION', None)
+            else:
+                os.environ['STAGE5_STRICT_ESTIMATION'] = _prev_strict_s5
         # ── Post-GA diagnostics (coefficients + HHTS validation) ──────
         _ga_post_estimation_report(s5_models, out, OUT_DIR)
     else:
@@ -5727,8 +6011,49 @@ def GA_STAGED(filepath: str = None):
     sc, out, landuse = load_data()
 
     # ── GA estimation for all stages (HHTS only) ──────────────────────
-    # Checkpoints are written after every stage to avoid all-or-nothing runs.
-    all_ga = _run_ga_stages_with_checkpoints(out, landuse)
+    # When GA_STAGED_REUSE_ESTIMATOR=1, load ga_results.pkl from a prior 'ga'
+    # run dir instead of re-running estimation.  This lets the estimation job
+    # use a lighter memory allocation (no synth population) while this job only
+    # pays the 250 GB cost once for prediction.  Resolution order:
+    #   1. GA_STAGED_GA_DIR env var (explicit path)
+    #   2. runs/main_ga_<estimator>/LATEST_RUN.txt  (per-estimator alias)
+    #   3. runs/main_ga/LATEST_RUN.txt              (shared alias fallback)
+    # Falls back to full re-estimation if no valid pkl is found.
+    _reuse_est = os.environ.get('GA_STAGED_REUSE_ESTIMATOR', '0').strip() == '1'
+    if _reuse_est:
+        _ga_dir = os.environ.get('GA_STAGED_GA_DIR', '').strip()
+        if not _ga_dir:
+            _est_key = os.environ.get('GA_ESTIMATOR', 'default').strip().lower()
+            _run_root_env = os.environ.get('PIPELINE_RUN_ROOT', 'runs')
+            for _alias_cand in [
+                os.path.join(_run_root_env, f'main_ga_{_est_key}', 'LATEST_RUN.txt'),
+                os.path.join(_run_root_env, 'main_ga', 'LATEST_RUN.txt'),
+            ]:
+                if os.path.isfile(_alias_cand):
+                    with open(_alias_cand, 'r', encoding='utf-8') as _f:
+                        _ga_dir = _f.read().strip()
+                    if _ga_dir:
+                        logger.info(f"[GA_STAGED] resolved prior ga dir via {_alias_cand}")
+                        break
+        _ga_pkl = os.path.join(_ga_dir, 'ga_results.pkl') if _ga_dir else ''
+        if _ga_pkl and os.path.isfile(_ga_pkl):
+            logger.info(
+                f"[GA_STAGED] GA_STAGED_REUSE_ESTIMATOR=1: loading ga_results.pkl "
+                f"from prior 'ga' run — skipping re-estimation.\n"
+                f"  source: {_ga_pkl}"
+            )
+            with open(_ga_pkl, 'rb') as _f:
+                all_ga = pickle.load(_f)
+        else:
+            logger.warning(
+                f"[GA_STAGED] GA_STAGED_REUSE_ESTIMATOR=1 requested but no valid "
+                f"ga_results.pkl found (tried: {_ga_pkl!r}) — "
+                f"falling back to full re-estimation"
+            )
+            all_ga = _run_ga_stages_with_checkpoints(out, landuse)
+    else:
+        # Checkpoints are written after every stage to avoid all-or-nothing runs.
+        all_ga = _run_ga_stages_with_checkpoints(out, landuse)
 
     # ── Export per-stage history CSVs + combined convergence plot ─────────
     try:
@@ -5752,14 +6077,29 @@ def GA_STAGED(filepath: str = None):
 
     # ── Apply GA-selected features through stages 1–5 ─────────────────
     from ga_hypothesis_testing import apply_ga_results_to_pipeline
-    scheduled_dest, s5_models = apply_ga_results_to_pipeline(
-        ga_results = all_ga,
-        out        = out,
-        synth      = travellers,
-        landuse    = landuse,
-        skims_path = 'downcasted_matrices_base.omx',
-        save_dir   = OUT_DIR,
-    )
+    _prev_larch_engine = os.environ.get('GA_LARCH_ENGINE')
+    _prev_strict_s5 = os.environ.get('STAGE5_STRICT_ESTIMATION')
+    try:
+        if os.name != 'nt':
+            os.environ['GA_LARCH_ENGINE'] = 'jax'
+        os.environ['STAGE5_STRICT_ESTIMATION'] = '1'
+        scheduled_dest, s5_models = apply_ga_results_to_pipeline(
+            ga_results = all_ga,
+            out        = out,
+            synth      = travellers,
+            landuse    = landuse,
+            skims_path = 'downcasted_matrices_base.omx',
+            save_dir   = OUT_DIR,
+        )
+    finally:
+        if _prev_larch_engine is None:
+            os.environ.pop('GA_LARCH_ENGINE', None)
+        else:
+            os.environ['GA_LARCH_ENGINE'] = _prev_larch_engine
+        if _prev_strict_s5 is None:
+            os.environ.pop('STAGE5_STRICT_ESTIMATION', None)
+        else:
+            os.environ['STAGE5_STRICT_ESTIMATION'] = _prev_strict_s5
     # ── Post-GA diagnostics (coefficients + HHTS validation) ──────────
     _ga_post_estimation_report(s5_models, out, OUT_DIR)
 

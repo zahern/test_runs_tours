@@ -1808,7 +1808,7 @@ def compile_validation_report(out_dir: pathlib.Path) -> None:
 
         html_rows = []
         for _, row in best.iterrows():
-            bg = "#e8f5e9" if row["status"] == "ok" else "#ffebee" \
+            bg = "#e8f5e9" if row.get("status") == "ok" else "#ffebee" \
                 if "status" in row else "#e8f5e9"
             html_rows.append(
                 f"<tr style='background:{bg}'>"

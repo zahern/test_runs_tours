@@ -6,6 +6,7 @@
 
 #PBS -m n
 #PBS -r y
+#PBS -l walltime=06:00:00
 
 set -euo pipefail
 
@@ -47,7 +48,16 @@ case "$GA_ESTIMATOR" in
     metacount)     _need_metacount=1 ;;
     searchlibrium) _need_searchlib=1 ;;
     both)          _need_metacount=1; _need_searchlib=1 ;;
+    hybrid)        _need_metacount=1; _need_searchlib=1 ;;
+    sa_bandit)     _need_metacount=1; _need_searchlib=1 ;;
 esac
+# Bandit SA mode requires upstream editable installs that contain banditsa/adaptive_search.
+# Force ESTIMATOR_SOURCE=editable when GA_USE_BANDIT_SA=1.
+if [ "${GA_USE_BANDIT_SA:-0}" = "1" ]; then
+    ESTIMATOR_SOURCE=editable
+    _need_metacount=1
+    _need_searchlib=1
+fi
 
 if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_metacount" = "1" ]; then
     echo "[pkg] Installing MetaCount estimator (${ESTIMATOR_SOURCE})..."
@@ -60,6 +70,18 @@ if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_metacount" = "1" ]; then
     fi
     pip install --upgrade --no-cache-dir -q jax jaxlib jaxopt \
         && echo "[pkg] jax/jaxlib/jaxopt installed"
+    # Clear stale bytecode — stale .pyc files persist across pip upgrades and cause
+    # wrong-line-number tracebacks and runtime errors from old bytecode.
+    python - <<'PYEOF' 2>/dev/null || true
+import importlib, shutil, os
+try:
+    import metacountregressor as _mc
+    _d = os.path.join(os.path.dirname(_mc.__file__), '__pycache__')
+    shutil.rmtree(_d, ignore_errors=True)
+    print(f'[pkg] cleared metacountregressor __pycache__: {_d}')
+except ImportError:
+    pass
+PYEOF
 fi
 
 if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_searchlib" = "1" ]; then
@@ -72,6 +94,10 @@ if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_searchlib" = "1" ]; then
             && echo "[pkg] SearchLibrium installed (PyPI latest)"
     fi
 fi
+
+echo "[pkg] Installed estimator versions:"
+pip show metacountregressor 2>/dev/null | awk '/^Name:|^Version:|^Location:/{print "  " $0}' || true
+pip show SearchLibrium 2>/dev/null | awk '/^Name:|^Version:|^Location:/{print "  " $0}' || true
 # ──────────────────────────────────────────────────────────────────────────
 
 # Keep linear algebra and numba-backed sections from oversubscribing cores.
@@ -86,18 +112,33 @@ export PIPELINE_ACCELERATOR
 export PIPELINE_RUN_TAG
 export PIPELINE_RUN_ROOT="$RUN_ROOT"
 export GA_ESTIMATOR
-# Force Larch to use numba engine during GA fitness evaluations to avoid
-# cusolver_gesvdj_ffi CUDA kernel errors (jaxlib 0.10.0 / CUDA 13 incompatibility).
-# Small per-purpose datasets in GA context are faster on numba CPU anyway.
-export GA_LARCH_ENGINE="${GA_LARCH_ENGINE:-numba}"
+export GA_USE_SA="${GA_USE_SA:-0}"
+export GA_USE_BANDIT_SA="${GA_USE_BANDIT_SA:-0}"
+# When 1, GA_STAGED skips re-running estimation and loads ga_results.pkl from
+# the prior 'ga' run dir (resolved via per-estimator alias or GA_STAGED_GA_DIR).
+# Set automatically by submit_pipeline_runs.sh --split-estimation.
+export GA_STAGED_REUSE_ESTIMATOR="${GA_STAGED_REUSE_ESTIMATOR:-0}"
+# Explicit path override for the prior 'ga' run dir (optional).
+export GA_STAGED_GA_DIR="${GA_STAGED_GA_DIR:-}"
+# Allow Larch to auto-select engine (JAX first on Linux, numba fallback).
+# Hard-forcing numba can trigger nopython typing failures in Stage 5 idca flows.
+export GA_LARCH_ENGINE="${GA_LARCH_ENGINE:-auto}"
 # Force MetaCount to always use CPU (cusolver_gesvdj_ffi unavailable on CUDA 13).
 export GA_METACOUNT_FORCE_CPU="${GA_METACOUNT_FORCE_CPU:-1}"
+# When a real estimator is selected, mixing model families mid-search
+# (e.g. MetaCount NB2 on one evaluation, ordered-logit on the next) produces
+# non-comparable BIC values.  Disable statsmodels fallback for those cases.
+if [ "$GA_ESTIMATOR" = "default" ] || [ -z "$GA_ESTIMATOR" ]; then
+    export GA_ESTIMATOR_FALLBACK="${GA_ESTIMATOR_FALLBACK:-1}"
+else
+    export GA_ESTIMATOR_FALLBACK="${GA_ESTIMATOR_FALLBACK:-0}"
+fi
 # For GA search modes, force JAX to CPU to prevent CUDA kernel errors during
 # per-case fitness evaluations (small batches are faster on numba/CPU anyway).
 # ga_stage5_smoke is excluded: it uses GPU (JAX/XLA) for the final model fit,
 # which benefits from CUDA when a GPU node is requested (--gpu 1 --accelerator gpu).
 case "$MODE" in
-    ga|ga_metacount|ga_searchlibrium)
+    ga|ga_metacount|ga_searchlibrium|sa_smoke)
         export JAX_PLATFORMS=cpu
         ;;
     ga_stage5_smoke)
@@ -120,17 +161,42 @@ if [ "$MODE" = "joint_model" ]; then
     export JOINT_PARTICIPATION_MODEL=1
 fi
 
-run_suffix="$MODE"
+# Build a zone suffix component for all modes
+_zone_sfx=""
 if [ -n "$ZONE_ARG" ]; then
-    safe_arg=${ZONE_ARG//\//_}
-    safe_arg=${safe_arg//\\/_}
-    safe_arg=${safe_arg// /}
-    run_suffix="${MODE}_${safe_arg}"
+    _zone_sfx="${ZONE_ARG//\//_}"
+    _zone_sfx="${_zone_sfx//\\/_}"
+    _zone_sfx="${_zone_sfx// /}"
 fi
-# Append estimator name so parallel estimator-variant runs land in distinct dirs.
-# e.g. main_metacount__JOBID/  vs  main__JOBID/  vs  main_both__JOBID/
-if [ -n "$GA_ESTIMATOR" ] && [ "$GA_ESTIMATOR" != "default" ]; then
-    run_suffix="${run_suffix}_${GA_ESTIMATOR}"
+
+# For GA/SA search modes always include estimator name and use clean search-prefix.
+# Pattern: {ga|sa}_{estimator}[_staged][_zone]  e.g. ga_default  sa_metacount_staged
+if [ "$MODE" = "ga" ] || [ "$MODE" = "ga_staged" ] || [ "$MODE" = "ga_stage5_smoke" ]; then
+    _estim="${GA_ESTIMATOR:-default}"
+    if [ "${GA_USE_SA:-0}" = "1" ] || [ "${GA_USE_BANDIT_SA:-0}" = "1" ]; then
+        _pfx="sa"
+        # sa_bandit + SA flags → 'sa_bandit' not 'sa_ga_sa_bandit'
+        [ "$_estim" = "sa_bandit" ] && _estim="bandit"
+    else
+        _pfx="ga"
+    fi
+    # mode tail: '' for 'ga', '_staged' for 'ga_staged', '_stage5_smoke' for smoke
+    _mode_tail="${MODE#ga}"
+    run_suffix="${_pfx}_${_estim}${_mode_tail}"
+    [ -n "$_zone_sfx" ] && run_suffix="${run_suffix}_${_zone_sfx}"
+else
+    # All other modes: existing logic
+    run_suffix="$MODE"
+    [ -n "$_zone_sfx" ] && run_suffix="${MODE}_${_zone_sfx}"
+    # Append estimator name so parallel estimator-variant runs land in distinct dirs.
+    # e.g. main_metacount__JOBID/  vs  main__JOBID/  vs  main_both__JOBID/
+    if [ -n "$GA_ESTIMATOR" ] && [ "$GA_ESTIMATOR" != "default" ]; then
+        run_suffix="${run_suffix}_${GA_ESTIMATOR}"
+    fi
+    # Prepend sa_ when running simulated annealing or bandit SA
+    if [ "${GA_USE_SA:-0}" = "1" ] || [ "${GA_USE_BANDIT_SA:-0}" = "1" ]; then
+        run_suffix="sa_${run_suffix}"
+    fi
 fi
 run_suffix="${run_suffix}__${PIPELINE_RUN_TAG}"
 
@@ -196,6 +262,11 @@ $(case "$MODE" in
         echo "Runs estimation-only wiring check and writes stage reports/checkpoints."
         echo "No full synthetic-population prediction in this mode."
         ;;
+    sa_smoke)
+        echo "SA signal-bearing smoke test (5-phase: activity frequency, duration, schedule, mode NL, destination MNL)."
+        echo "Verifies SA perturbation, fitness signal, and progressive search across all pipeline stages."
+        echo "Exit 0 = all 10 checks pass. Exit 1 = at least one failure — gated jobs will not start."
+        ;;
     safety_baseline)
         echo "Safety experiment — baseline run with crash-risk skims active."
         echo "Generates trip plans used to measure safety-aware mode shift."
@@ -243,6 +314,9 @@ $(case "$MODE" in
         echo "  stage_reports/ga_stage5_smoke.*"
         echo "  ga_reports/ga_summary.html  plots/ga_stage5.png"
         ;;
+    sa_smoke)
+        echo "  pipeline_run.log  (PASS/FAIL per check, 10/10 required for exit 0)"
+        ;;
     mcr_search)
         echo "  mcr_search_result.json  best_spec.json  mcr_search_summary.html"
         ;;
@@ -254,7 +328,10 @@ OUTLINE
 echo "  run_outline.txt → ${_outline}"
 
 set +e
-if [ "$MODE" = "safety_analysis" ]; then
+if [ "$MODE" = "sa_smoke" ]; then
+    stdbuf -oL python -u _test_sa_smoke.py \
+        2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+elif [ "$MODE" = "safety_analysis" ]; then
     stdbuf -oL python -u safety_experiment_analysis.py \
         2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
 elif [ "$MODE" = "joint_model" ]; then

@@ -30,6 +30,9 @@ PAPER_EXPERIMENT=0              # ga_staged + safety chain with conservative def
 STAGE5_SMOKE_PRESET=0           # ga_stage5_smoke only (quick wiring check)
 GA_ESTIMATOR=default            # GA_ESTIMATOR for the primary MODES above
 INSTALL_ESTIMATORS=1            # default: install latest estimator packages at job start
+GA_USE_SA=0                     # 1 = force SimulatedAnnealing for all stages (overrides per-stage logic)
+GA_BUDGET="${GA_BUDGET:-standard}"  # budget profile passed to PBS jobs: smoke|ultrafast|fast|standard|thorough
+GA_BUDGET_BANDIT="${GA_BUDGET_BANDIT:-ultrafast}"  # budget override for SA-Bandit chain (ultrafast ~45min/purpose for MetaCount)
 CLEAN_RUN_DIRS=0                # 1 = clear previous run directories before submit (destructive)
 # Lighter resources for analysis/joint jobs (no GPU, less RAM)
 JOINT_MEM=32GB
@@ -47,8 +50,35 @@ MCR_R=200                             # Halton draws for simulation
 MCR_MEM=64GB
 MCR_WALLTIME=08:00:00
 MCR_CPUS=8
+# SA smoke-test gate resources (submitted as PBS J0 before all --sa-cases jobs)
+SMOKE_CPUS=4
+SMOKE_MEM=32GB
+SMOKE_WALLTIME=02:00:00
+SKIP_SMOKE_GATE=0
 WALLTIME_SET=0
 ANALYSIS_WALLTIME_SET=0
+EST_WALLTIME_SET=0
+# Split-estimation: submit ga (estimation) with lighter resources then ga_staged
+# (prediction only) with full resources.  GA estimation works on HHTS data only
+# so it never needs the 250 GB required for synthetic-population prediction.
+# Enable with --split-estimation.  Adjust with --est-mem and --est-walltime.
+SPLIT_ESTIMATION=0
+EST_MEM=64GB         # RAM for ga estimation jobs (no synth population)
+EST_WALLTIME=12:00:00 # walltime for ga estimation jobs
+# SA research-case bundle (--sa-cases)
+# Submits all 5 comparative cases in one call:
+#   (1) main               — no SA, full pipeline with safety skims
+#   (2) safety_nosafety    — same pipeline with crash skim zeroed (counterfactual)
+#   (3) ga_staged          — SA normal (default/OrderedLogit estimator)
+#   (4) ga_staged_metacount — SA with MetaCount estimator
+#   (5) ga_staged_searchlibrium — SA with SearchLibrium estimator
+# Cases 3–5 each auto-submit ga then ga_staged (afterok).
+# Safety chain (2) always has safety_baseline -> safety_nosafety -> safety_analysis.
+INCLUDE_SA_CASES=0
+# SA bandit case (--sa-bandit)
+# Submits ga → ga_staged with GA_ESTIMATOR=sa_bandit, GA_USE_BANDIT_SA=1, GA_USE_SA=1.
+# Run dir: sa_ga_sa_bandit__<JOBID>/ and sa_ga_staged_sa_bandit__<JOBID>/
+INCLUDE_SA_BANDIT=0
 
 usage() {
 cat <<'EOF'
@@ -98,6 +128,11 @@ Options:
                                     MetaCount + SearchLibrium from PyPI at job start.
     --skip-estimator-install       Set INSTALL_ESTIMATORS=0 (advanced): skip
                                     automatic estimator package refresh.
+    --force-sa                     Force SimulatedAnnealing for ALL stages in every
+                                    submitted job (GA_USE_SA=1).  Without this flag
+                                    SA is only active when the estimator for that
+                                    stage is metacount or searchlibrium.
+                                    --sa-cases sets this automatically for cases 3-5.
     --clean-runs                   Also clear previous run directories under
                              --run-root before submit.
                              WARNING: destructive. Leave off unless needed.
@@ -113,6 +148,42 @@ Options:
      --mcr-r N                      Halton simulation draws per MCR job.  Default: 200
      --mcr-mem SIZE                 RAM per MCR search job.          Default: 64GB
      --mcr-walltime HH:MM:SS        Walltime per MCR search job.     Default: 08:00:00
+     --sa-cases                     Submit all 5 comparative SA research cases:
+                                      (1) main            (no SA, with safety skims)
+                                      (2) safety chain    (baseline → nosafety → analysis)
+                                      (3) ga+ga_staged    (SA normal, default estimator)
+                                      (4) ga+ga_staged    (SA MetaCount)
+                                      (5) ga+ga_staged    (SA SearchLibrium)
+                                    Total: 10 jobs (1 main + 3 safety + 2×3 SA chains).
+                                    A smoke-test gate job (sa_smoke) is submitted first;
+                                    all 10 SA jobs depend on it via afterok so they only
+                                    start if the smoke test exits 0 (all 10 checks pass).
+                                    Use --skip-smoke-gate to bypass (re-submission only).
+     --skip-smoke-gate               Skip the sa_smoke pre-flight gate when using --sa-cases.
+                                    Use only on re-submission after the smoke test has
+                                    already passed in the same environment.
+     --sa-bandit                    Submit a blended bandit SA case:
+                                      GA_ESTIMATOR=sa_bandit, GA_USE_BANDIT_SA=1, GA_USE_SA=1
+                                      MetaCount (stages 1-3) + SearchLibrium (stage 4) + Larch (stage 5)
+                                      Outer loop uses BanditFeatureSearcher.
+                                      Inner estimators use BanditGuidedSA / BanditSA (editable installs).
+                                      Run dirs: sa_ga_sa_bandit__<JOBID>/ and sa_ga_staged_sa_bandit__<JOBID>/
+     --split-estimation             Split ga + ga_staged into separate PBS jobs with different
+                                    memory allocations:
+                                      ga       (HHTS estimation only) → --est-mem / --est-walltime
+                                      ga_staged (synth population prediction) → --mem / --walltime
+                                    Estimation never loads the synthetic population so 64 GB is
+                                    usually sufficient, saving the 250 GB allocation for the
+                                    prediction job only.  GA_STAGED_REUSE_ESTIMATOR=1 is set
+                                    automatically on ga_staged so it loads ga_results.pkl from
+                                    the prior ga run instead of re-running estimation.
+                                    Applies to all ga/ga_staged chains: --sa-cases, --sa-bandit,
+                                    --include-ga-estimator-variants, and MODES chains.
+                                    Default: 0 (combined job as before)
+     --est-mem SIZE                 RAM for estimation-only ga jobs.  Default: 64GB
+                                    Rule of thumb: 8 × ncpus GB for MetaCount/SearchLibrium.
+     --est-walltime HH:MM:SS        Walltime for estimation-only ga jobs.  Default: 12:00:00
+                                    GA budget=standard with MetaCount typically finishes in ~6-8 h.
      --all                          Shorthand for --include-safety --include-joint
                                     --include-estimator-variants --include-mcr-search.
                                     Submits all 13 jobs (SA default):
@@ -147,6 +218,18 @@ Examples:
     # All 22 jobs: main chain + safety + variants + MCR SA+DE+HS × all families:
     ./submit_pipeline_runs.sh --all --mcr-algo all \
         --mcr-families "count duration linear cmf"
+
+    # All 5 SA research cases (10 jobs) — recommended entry point:
+    ./submit_pipeline_runs.sh --sa-cases --cpus 8 --workers 8 --mem 250GB
+
+    # Same with split estimation (lighter ga jobs, full memory only for prediction):
+    ./submit_pipeline_runs.sh --sa-cases --sa-bandit --split-estimation \
+        --est-mem 64GB --est-walltime 12:00:00 \
+        --cpus 8 --workers 8 --mem 250GB
+
+    # SA cases on CPU only (no GPU node available):
+    ./submit_pipeline_runs.sh --sa-cases --gpu 0 --accelerator cpu \
+        --cpus 8 --workers 8 --mem 250GB
 
     # MCR search only (SA, 3 families = 3 jobs), no pipeline:
     ./submit_pipeline_runs.sh --modes "" --include-mcr-search
@@ -291,6 +374,10 @@ while [ $# -gt 0 ]; do
             INSTALL_ESTIMATORS=0
             shift
             ;;
+        --force-sa)
+            GA_USE_SA=1
+            shift
+            ;;
         --clean-runs)
             CLEAN_RUN_DIRS=1
             shift
@@ -321,6 +408,51 @@ while [ $# -gt 0 ]; do
             ;;
         --mcr-walltime)
             MCR_WALLTIME="$2"
+            shift 2
+            ;;
+        --sa-cases|--include-sa-cases)
+            INCLUDE_SA_CASES=1
+            shift
+            ;;
+        --sa-bandit)
+            INCLUDE_SA_BANDIT=1
+            shift
+            ;;
+        --ga-budget)
+            GA_BUDGET="$2"
+            shift 2
+            ;;
+        --sa-budget)
+            GA_BUDGET_BANDIT="$2"
+            shift 2
+            ;;
+        --split-estimation)
+            SPLIT_ESTIMATION=1
+            shift
+            ;;
+        --est-mem)
+            EST_MEM="$2"
+            shift 2
+            ;;
+        --est-walltime)
+            EST_WALLTIME="$2"
+            EST_WALLTIME_SET=1
+            shift 2
+            ;;
+        --skip-smoke-gate)
+            SKIP_SMOKE_GATE=1
+            shift
+            ;;
+        --smoke-mem)
+            SMOKE_MEM="$2"
+            shift 2
+            ;;
+        --smoke-walltime)
+            SMOKE_WALLTIME="$2"
+            shift 2
+            ;;
+        --smoke-cpus)
+            SMOKE_CPUS="$2"
             shift 2
             ;;
         --all)
@@ -409,6 +541,32 @@ if [ "$STAGE5_SMOKE_PRESET" -eq 1 ]; then
     echo "Stage 5 smoke preset enabled: ga_stage5_smoke (accelerator=${ACCELERATOR}, workers=1)."
 fi
 
+# Validate requested modes and block accidental smoke-mode submission unless
+# --stage5-smoke preset was explicitly requested.
+for _mode in "${MODES[@]}"; do
+    case "$_mode" in
+        "")
+            ;;
+        main|ga|ga_staged|ga_stage5_smoke)
+            ;;
+        *)
+            echo "Unsupported mode in --modes: $_mode" >&2
+            echo "Allowed modes: main ga ga_staged (and ga_stage5_smoke only via --stage5-smoke)" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [ "$STAGE5_SMOKE_PRESET" -ne 1 ]; then
+    for _mode in "${MODES[@]}"; do
+        if [ "$_mode" = "ga_stage5_smoke" ]; then
+            echo "ga_stage5_smoke is reserved for --stage5-smoke preset and is not part of normal submit chains." >&2
+            echo "Use: ./submit_pipeline_runs.sh --stage5-smoke" >&2
+            exit 1
+        fi
+    done
+fi
+
 if ! command -v qsub >/dev/null 2>&1; then
     echo "qsub not found in PATH" >&2
     exit 1
@@ -458,25 +616,35 @@ fi
 # Light select strings (no GPU) for joint_model and safety_analysis
 SELECT_JOINT="select=1:ncpus=4:mem=${JOINT_MEM}"
 SELECT_ANALYSIS="select=1:ncpus=4:mem=${ANALYSIS_MEM}"
+# Estimation-only select: no GPU (ga mode forces JAX_PLATFORMS=cpu anyway).
+# Used for 'ga' jobs when --split-estimation is set.
+SELECT_EST="select=1:ncpus=${CPUS}:mem=${EST_MEM}"
 
 submit_one() {
     local mode="$1"
     local depend="${2:-}"
     local estimator="${3:-${GA_ESTIMATOR}}"
+    # Optional overrides for split-estimation.  Pass "" to use global defaults.
+    local extra_vars="${4:-}"           # comma-separated extra PBS -v entries
+    local override_select="${5:-${SELECT}}"
+    local override_walltime="${6:-${WALLTIME}}"
     local job_name="saw_${mode}"
     # Append estimator suffix to job name so qstat clearly shows which variant
     if [ -n "$estimator" ] && [ "$estimator" != "default" ]; then
         job_name="saw_${mode}_${estimator}"
     fi
     local vars out_f err_f
-    vars="MODE=${mode},ZONE_ARG=${ZONE_ARG},CONDA_ENV=${CONDA_ENV},THREADS=${THREADS},S5_WORKERS=${S5_WORKERS},RUN_ROOT=${RUN_ROOT},PIPELINE_ACCELERATOR=${ACCELERATOR},GA_ESTIMATOR=${estimator},INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS}"
+    vars="MODE=${mode},ZONE_ARG=${ZONE_ARG},CONDA_ENV=${CONDA_ENV},THREADS=${THREADS},S5_WORKERS=${S5_WORKERS},RUN_ROOT=${RUN_ROOT},PIPELINE_ACCELERATOR=${ACCELERATOR},GA_ESTIMATOR=${estimator},INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-0},GA_BUDGET=${GA_BUDGET}"
+    if [ -n "$extra_vars" ]; then
+        vars="${vars},${extra_vars}"
+    fi
     out_f="$(pwd)/${job_name}.out"
     err_f="$(pwd)/${job_name}.err"
 
     if [ -n "$depend" ]; then
-        qsub -N "$job_name" -o "$out_f" -e "$err_f" -l walltime="$WALLTIME" -l "$SELECT" -W "depend=afterok:${depend}" -v "$vars" "$PBS_SCRIPT"
+        qsub -N "$job_name" -o "$out_f" -e "$err_f" -l walltime="$override_walltime" -l "$override_select" -W "depend=afterok:${depend}" -v "$vars" "$PBS_SCRIPT"
     else
-        qsub -N "$job_name" -o "$out_f" -e "$err_f" -l walltime="$WALLTIME" -l "$SELECT" -v "$vars" "$PBS_SCRIPT"
+        qsub -N "$job_name" -o "$out_f" -e "$err_f" -l walltime="$override_walltime" -l "$override_select" -v "$vars" "$PBS_SCRIPT"
     fi
 }
 
@@ -489,13 +657,17 @@ echo "  s5_workers         = $S5_WORKERS"
 echo "  accelerator        = $ACCELERATOR"
 echo "  ga_estimator       = $GA_ESTIMATOR"
 echo "  install_estimators = $INSTALL_ESTIMATORS"
+echo "  ga_budget          = $GA_BUDGET  (bandit override: $GA_BUDGET_BANDIT)"
 echo "  zone_arg           = ${ZONE_ARG:-<all>}"
 echo "  conda_env          = $CONDA_ENV"
 echo "  include_safety     = $INCLUDE_SAFETY"
 echo "  include_joint      = $INCLUDE_JOINT"
 echo "  include_est_var    = $INCLUDE_ESTIMATOR_VARIANTS"
 echo "  include_ga_est_var = $INCLUDE_GA_ESTIMATOR_VARIANTS"
+echo "  include_sa_cases   = $INCLUDE_SA_CASES"
+echo "  include_sa_bandit  = $INCLUDE_SA_BANDIT"
 echo "  clean_run_dirs     = $CLEAN_RUN_DIRS"
+echo "  split_estimation   = $SPLIT_ESTIMATION  (est: ${EST_MEM}/${EST_WALLTIME}  predict: ${MEM}/${WALLTIME})"
 echo "  joint select       = $SELECT_JOINT  walltime=$JOINT_WALLTIME"
 echo "  analysis sel.      = $SELECT_ANALYSIS  walltime=$ANALYSIS_WALLTIME"
 
@@ -620,6 +792,21 @@ submit_mcr_search() {
     echo "────────────────────────────────────────────────────────────────────"
 }
 
+# ── submit_smoke_gate ────────────────────────────────────────────────────────
+# Submits _test_sa_smoke.py as a lightweight PBS job (mode=sa_smoke).
+# All --sa-cases jobs depend on this via afterok; if it exits non-zero
+# (any check fails) the heavy SA jobs are never released by the scheduler.
+submit_smoke_gate() {
+    local select_smoke="select=1:ncpus=${SMOKE_CPUS}:mem=${SMOKE_MEM}"
+    local vars_smoke
+    vars_smoke="MODE=sa_smoke,ZONE_ARG=,CONDA_ENV=${CONDA_ENV},THREADS=1,S5_WORKERS=1,RUN_ROOT=${RUN_ROOT},PIPELINE_ACCELERATOR=cpu,GA_ESTIMATOR=default,INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS},GA_USE_SA=0"
+    qsub -N saw_sa_smoke \
+        -o "$(pwd)/saw_sa_smoke.out" -e "$(pwd)/saw_sa_smoke.err" \
+        -l walltime="${SMOKE_WALLTIME}" \
+        -l "$select_smoke" \
+        -v "$vars_smoke" "$PBS_SCRIPT"
+}
+
 # ── submit_ga_estimator_chain ────────────────────────────────────────────────
 # Submits ga → ga_staged (afterok) for a given estimator.
 # The ga_staged job always waits for ga so results are consistent.
@@ -631,14 +818,176 @@ submit_ga_estimator_chain() {
 
     echo ""
     echo "── GA estimator chain [GA_ESTIMATOR=${est}] ──────────────────────────"
-    jid_ga=$(submit_one "ga" "$depend" "$est")
-    echo "  ga [GA_ESTIMATOR=${est}]         -> $jid_ga${depend:+ (afterok:$depend)}"
+    if [ "$SPLIT_ESTIMATION" -eq 1 ]; then
+        # Estimation job: lighter resources — HHTS only, no synth population.
+        # ga mode forces JAX_PLATFORMS=cpu so no GPU node is requested.
+        jid_ga=$(submit_one "ga" "$depend" "$est" "" "${SELECT_EST}" "${EST_WALLTIME}")
+        echo "  ga [GA_ESTIMATOR=${est}] (est-only, ${EST_MEM})  -> $jid_ga${depend:+ (afterok:$depend)}"
 
-    jid_ga_staged=$(submit_one "ga_staged" "$jid_ga" "$est")
-    echo "  ga_staged [GA_ESTIMATOR=${est}]  -> $jid_ga_staged (afterok:$jid_ga)"
+        # Prediction job: full resources — loads synth population (250 GB).
+        # GA_STAGED_REUSE_ESTIMATOR=1 tells GA_STAGED to load ga_results.pkl
+        # from the prior ga run via alias rather than re-running estimation.
+        jid_ga_staged=$(submit_one "ga_staged" "$jid_ga" "$est" "GA_STAGED_REUSE_ESTIMATOR=1")
+        echo "  ga_staged [GA_ESTIMATOR=${est}] (predict, ${MEM})  -> $jid_ga_staged (afterok:$jid_ga)"
+        echo "    [split] estimation (${EST_MEM}/${EST_WALLTIME}) → prediction (${MEM}/${WALLTIME})"
+    else
+        jid_ga=$(submit_one "ga" "$depend" "$est")
+        echo "  ga [GA_ESTIMATOR=${est}]         -> $jid_ga${depend:+ (afterok:$depend)}"
+
+        jid_ga_staged=$(submit_one "ga_staged" "$jid_ga" "$est")
+        echo "  ga_staged [GA_ESTIMATOR=${est}]  -> $jid_ga_staged (afterok:$jid_ga)"
+    fi
     echo "    logs : saw_ga_${est}.out  saw_ga_staged_${est}.out"
     echo "    dirs : ${RUN_ROOT}/ga_${est}__<JOBID>/  ${RUN_ROOT}/ga_staged_${est}__<JOBID>/"
     echo "────────────────────────────────────────────────────────────────────"
+}
+
+# ── submit_sa_bandit_chain ────────────────────────────────────────────────────
+# Submit ga → ga_staged for the blended bandit SA case.
+# Sets GA_ESTIMATOR=sa_bandit, GA_USE_BANDIT_SA=1, GA_USE_SA=1.
+# Run dirs land in sa_ga_sa_bandit__<JOBID>/ and sa_ga_staged_sa_bandit__<JOBID>/
+# because pbs_pipeline_mode.pbs prepends sa_ when GA_USE_SA=1 or GA_USE_BANDIT_SA=1.
+# The PBS install block forces ESTIMATOR_SOURCE=editable when GA_USE_BANDIT_SA=1
+# so MetaCount (adaptive_search.BanditGuidedSA) and SearchLibrium (banditsa.BanditSA)
+# are installed from the upstream HPC source paths.
+submit_sa_bandit_chain() {
+    local depend="${1:-}"
+    local _prev_sa="$GA_USE_SA"
+    local _prev_bandit_sa="${GA_USE_BANDIT_SA:-0}"
+    local _prev_budget="$GA_BUDGET"
+
+    GA_USE_SA=1
+    GA_USE_BANDIT_SA=1
+    GA_BUDGET="$GA_BUDGET_BANDIT"  # fast by default — standard budget cannot finish 5 stages
+
+    echo ""
+    echo "── SA Bandit chain [GA_ESTIMATOR=sa_bandit, GA_USE_BANDIT_SA=1] ──────"
+    local jid_ga jid_ga_staged
+    if [ "$SPLIT_ESTIMATION" -eq 1 ]; then
+        jid_ga=$(submit_one "ga" "$depend" "sa_bandit" "" "${SELECT_EST}" "${EST_WALLTIME}")
+        echo "  ga [sa_bandit] (est-only, ${EST_MEM})     -> $jid_ga${depend:+ (afterok:$depend)}"
+
+        jid_ga_staged=$(submit_one "ga_staged" "$jid_ga" "sa_bandit" "GA_STAGED_REUSE_ESTIMATOR=1")
+        echo "  ga_staged [sa_bandit] (predict, ${MEM})   -> $jid_ga_staged (afterok:$jid_ga)"
+        echo "    [split] estimation (${EST_MEM}/${EST_WALLTIME}) → prediction (${MEM}/${WALLTIME})"
+    else
+        jid_ga=$(submit_one "ga" "$depend" "sa_bandit")
+        echo "  ga [sa_bandit]         -> $jid_ga${depend:+ (afterok:$depend)}"
+
+        jid_ga_staged=$(submit_one "ga_staged" "$jid_ga" "sa_bandit")
+        echo "  ga_staged [sa_bandit]  -> $jid_ga_staged (afterok:$jid_ga)"
+    fi
+    echo "    logs : saw_ga_sa_bandit.out  saw_ga_staged_sa_bandit.out"
+    echo "    dirs : ${RUN_ROOT}/sa_ga_sa_bandit__<JOBID>/"
+    echo "           ${RUN_ROOT}/sa_ga_staged_sa_bandit__<JOBID>/"
+    echo "────────────────────────────────────────────────────────────────────"
+
+    GA_USE_SA="$_prev_sa"
+    GA_USE_BANDIT_SA="$_prev_bandit_sa"
+    GA_BUDGET="$_prev_budget"
+}
+
+# ── submit_sa_cases ───────────────────────────────────────────────────────────
+# Submit all 5 comparative SA research cases in one call.
+#
+# Case  PBS jobs  Description
+# ────  ────────  ──────────────────────────────────────────────────────────────
+# 1     1         main            — standard pipeline, no SA, safety skims ON
+# 2     3         safety chain    — baseline → nosafety → analysis (crash skim=0)
+# 3     2         SA normal       — GA search + prediction, default estimator
+# 4     2         SA MetaCount    — GA search + prediction, MetaCount NB2
+# 5     2         SA SearchLibrium— GA search + prediction, SearchLibrium
+#
+# Binary SA decisions (genes) select features at each stage 1–5.
+# apply_ga_results_to_pipeline() translates winning genes to population prediction.
+# Stage 5 mode/dest candidates include CRASH so safety-skim data feeds SA search;
+# the safety_nosafety arm zeros crash skims for a clean counterfactual.
+#
+# Total: 10 PBS jobs, all independent (parallel by default).
+submit_sa_cases() {
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════════╗"
+    echo "║  SA RESEARCH CASES  (5 cases, 10 PBS jobs)                      ║"
+    echo "╠══════════════════════════════════════════════════════════════════╣"
+    echo "║  Case 1 : main              (no SA, with safety skims)          ║"
+    echo "║  Case 2 : safety chain      (baseline → nosafety → analysis)    ║"
+    echo "║  Case 3 : SA normal         (GA_ESTIMATOR=default)              ║"
+    echo "║  Case 4 : SA MetaCount      (GA_ESTIMATOR=metacount)            ║"
+    echo "║  Case 5 : SA SearchLibrium  (GA_ESTIMATOR=searchlibrium)        ║"
+    echo "╚══════════════════════════════════════════════════════════════════╝"
+    echo ""
+
+    # ── Smoke-test pre-flight gate ────────────────────────────────────────
+    local smoke_dep=""
+    if [ "$SKIP_SMOKE_GATE" -ne 1 ]; then
+        echo "  Submitting SA smoke-test gate (sa_smoke)..."
+        local smoke_jid
+        smoke_jid=$(submit_smoke_gate)
+        echo "  sa_smoke gate     -> $smoke_jid"
+        echo "    log : saw_sa_smoke.out / saw_sa_smoke.err"
+        echo "    All 10 SA jobs gated on afterok:$smoke_jid"
+        echo "    (use --skip-smoke-gate on re-submission once smoke has passed)"
+        echo ""
+        smoke_dep="$smoke_jid"
+    else
+        echo "  Smoke-test gate skipped (--skip-smoke-gate)."
+        echo ""
+    fi
+
+    # ── Case 1: main (no SA, safety skims active) ─────────────────────────
+    local jid_main_sa
+    jid_main_sa=$(submit_one "main" "$smoke_dep" "default")
+    echo "  Case 1: main (no SA)               -> $jid_main_sa${smoke_dep:+ (afterok:$smoke_dep)}"
+    echo "    out : ${RUN_ROOT}/main_default__<JOBID>/"
+    echo ""
+
+    # ── Case 2: safety chain (baseline → nosafety → analysis) ─────────────
+    # Runs independently of main so the full SA experiment can proceed in
+    # parallel.  safety_nosafety zeros the CRASH skim column so the model
+    # uses identical structure but no crash utility — clean counterfactual.
+    echo "  Case 2: safety chain (crash skim = 0 counterfactual)"
+    submit_safety_chain "$smoke_dep"
+    echo ""
+
+    # ── Cases 3–5: SA chains (ga → ga_staged, three estimator variants) ───
+    # Each SA chain:
+    #   ga        — run_ga_all_stages() with binary variable selection (SA/HS/DE)
+    #               stage 5 fitness uses CRASH skim from OD matrix
+    #   ga_staged — apply_ga_results_to_pipeline() re-estimates with best genes
+    #               then predicts over full synthetic population
+    # All three run in parallel (no inter-dependency).
+    # Force SA engine for all stages in cases 3-5 so the comparison is
+    # purely about the fitness function, not GA vs SA search strategy.
+    local _prev_use_sa="$GA_USE_SA"
+    GA_USE_SA=1
+
+    echo "  Case 3: SA normal (default estimator)"
+    submit_ga_estimator_chain "default" "$smoke_dep"
+    echo ""
+
+    echo "  Case 4: SA MetaCount"
+    submit_ga_estimator_chain "metacount" "$smoke_dep"
+    echo ""
+
+    echo "  Case 5: SA SearchLibrium"
+    submit_ga_estimator_chain "searchlibrium" "$smoke_dep"
+
+    GA_USE_SA="$_prev_use_sa"
+    echo ""
+
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo "  SA cases submitted.  Monitor with: qstat -u \$USER"
+    echo "  Run dirs: ${RUN_ROOT}/main_default__*/  ${RUN_ROOT}/ga_staged_*/"
+    echo "            ${RUN_ROOT}/safety_*/"
+    echo ""
+    echo "  How SA binary decisions reach the population:"
+    echo "    GA search encodes each candidate variable as a binary gene (0/1)."
+    echo "    After search, apply_ga_results_to_pipeline() reads best_features"
+    echo "    from ga_results.pkl and passes them as feature_override to each"
+    echo "    stage runner (run_stage1 … run_stage5).  Stage 5 always gets"
+    echo "    the safety CRASH skim from the OD matrix; the nosafety case sets"
+    echo "    CRASH = 0 via SAFETY_EXPERIMENT_MODE=nosafety."
+    echo "═══════════════════════════════════════════════════════════════════"
 }
 
 # ── clean_previous_outputs ─────────────────────────────────────────────────
@@ -765,8 +1114,19 @@ for mode in "${MODES[@]}"; do
     # ga_staged ALWAYS depends on ga (afterok), regardless of --parallel/--sequential.
     # This ensures ga results are available before ga_staged starts.
     if [ "$mode" = "ga_staged" ] && [ -n "$jid_ga" ]; then
-        jid=$(submit_one "$mode" "$jid_ga")
-        echo "  $mode -> $jid (afterok:$jid_ga)"
+        if [ "$SPLIT_ESTIMATION" -eq 1 ]; then
+            jid=$(submit_one "$mode" "$jid_ga" "" "GA_STAGED_REUSE_ESTIMATOR=1")
+        else
+            jid=$(submit_one "$mode" "$jid_ga")
+        fi
+        echo "  $mode -> $jid (afterok:$jid_ga)${SPLIT_ESTIMATION:+ [predict-only]}"
+    elif [ "$mode" = "ga" ] && [ "$SPLIT_ESTIMATION" -eq 1 ]; then
+        if [ "$SUBMIT_MODE" = sequential ] && [ -n "$prev_jid" ]; then
+            jid=$(submit_one "$mode" "$prev_jid" "" "" "${SELECT_EST}" "${EST_WALLTIME}")
+        else
+            jid=$(submit_one "$mode" "" "" "" "${SELECT_EST}" "${EST_WALLTIME}")
+        fi
+        echo "  $mode -> $jid [est-only, ${EST_MEM}/${EST_WALLTIME}]"
     elif [ "$SUBMIT_MODE" = sequential ] && [ -n "$prev_jid" ]; then
         jid=$(submit_one "$mode" "$prev_jid")
         echo "  $mode -> $jid (afterok:$prev_jid)"
@@ -793,8 +1153,13 @@ if [ -n "$jid_ga" ]; then
     done
     if [ "$_ga_staged_in_modes" -eq 0 ]; then
         echo "  (auto) ga_staged always follows ga — adding ga_staged after ga"
-        jid=$(submit_one "ga_staged" "$jid_ga")
-        echo "  ga_staged -> $jid (afterok:$jid_ga)"
+        if [ "$SPLIT_ESTIMATION" -eq 1 ]; then
+            jid=$(submit_one "ga_staged" "$jid_ga" "" "GA_STAGED_REUSE_ESTIMATOR=1")
+            echo "  ga_staged -> $jid (afterok:$jid_ga) [predict-only, ${MEM}/${WALLTIME}]"
+        else
+            jid=$(submit_one "ga_staged" "$jid_ga")
+            echo "  ga_staged -> $jid (afterok:$jid_ga)"
+        fi
         prev_jid="$jid"
     fi
 fi
@@ -840,6 +1205,17 @@ if [ "$INCLUDE_GA_ESTIMATOR_VARIANTS" -eq 1 ]; then
     for est in metacount searchlibrium; do
         submit_ga_estimator_chain "$est"
     done
+fi
+
+# ── SA research cases (5 cases, 10 jobs) ─────────────────────────────────────
+# All run independently in parallel.  See submit_sa_cases() above for details.
+if [ "$INCLUDE_SA_CASES" -eq 1 ]; then
+    submit_sa_cases
+fi
+
+# ── SA bandit case (ga + ga_staged with BanditFeatureSearcher outer loop) ─────
+if [ "$INCLUDE_SA_BANDIT" -eq 1 ]; then
+    submit_sa_bandit_chain
 fi
 
 # ── MCR ExperimentBuilder structure-search jobs ───────────────────────────────

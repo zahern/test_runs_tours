@@ -1,0 +1,129 @@
+#!/bin/bash -l
+# Orchestrator PBS job.
+# Submits 5 stage jobs in parallel, then merge, then ga_staged prediction.
+#
+# IMPORTANT — resource shape variables (STAGE_SELECT / PRED_SELECT) contain
+# colons, which collide with PBS -v delimiter syntax.  Pass resources as
+# separate atomic variables and assemble the select string inside this script.
+#
+# Correct submission:
+#   qsub -v "RUN_TAG=exp,GA_BUDGET=standard,STAGE_NCPUS=8,STAGE_MEM=128GB,STAGE_WALLTIME=36:00:00,PRED_NCPUS=8,PRED_MEM=250GB,PRED_WALLTIME=24:00:00" job_submit_ga_parallel_chain.pbs
+#
+# Do NOT pass STAGE_SELECT or PRED_SELECT directly via -v; the colons in their
+# values (e.g. 1:ncpus=8:mem=128GB) will be misread by PBS as variable separators.
+
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=1:mem=2GB
+#PBS -l walltime=00:30:00
+
+set -euo pipefail
+
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:-ga_parallel_${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+
+# Estimation settings propagated to stage jobs.
+GA_BUDGET=${GA_BUDGET:-fast}
+GA_ESTIMATOR=${GA_ESTIMATOR:-sa_bandit}
+GA_USE_SA=${GA_USE_SA:-1}
+GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-1}
+GA_N_RESTARTS=${GA_N_RESTARTS:-0}
+GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-4}
+STAGE23_JOINT=${STAGE23_JOINT:-0}
+GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT:-1.50}
+GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH:-0.05}
+
+# ── Resource shapes ───────────────────────────────────────────────────────────
+# Pass STAGE_NCPUS / STAGE_MEM / PRED_NCPUS / PRED_MEM individually via -v
+# to avoid colon-collision with the PBS variable-list delimiter.
+# The select strings are assembled here from those atomic variables.
+STAGE_NCPUS=${STAGE_NCPUS:-4}
+STAGE_MEM=${STAGE_MEM:-96GB}
+STAGE_WALLTIME=${STAGE_WALLTIME:-24:00:00}
+
+MERGE_NCPUS=${MERGE_NCPUS:-1}
+MERGE_MEM=${MERGE_MEM:-8GB}
+MERGE_WALLTIME=${MERGE_WALLTIME:-01:00:00}
+
+PRED_NCPUS=${PRED_NCPUS:-8}
+PRED_MEM=${PRED_MEM:-250GB}
+PRED_WALLTIME=${PRED_WALLTIME:-24:00:00}
+
+# Assembled select strings: prefer a directly-set value, fall back to atomic parts
+STAGE_SELECT=${STAGE_SELECT:-"1:ncpus=${STAGE_NCPUS}:mem=${STAGE_MEM}"}
+MERGE_SELECT="1:ncpus=${MERGE_NCPUS}:mem=${MERGE_MEM}"
+PRED_SELECT=${PRED_SELECT:-"1:ncpus=${PRED_NCPUS}:mem=${PRED_MEM}"}
+
+# Prediction mode settings for pbs_pipeline_mode.pbs
+THREADS=${THREADS:-1}
+S5_WORKERS=${S5_WORKERS:-8}
+PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS:-1}
+
+cd "$PBS_O_WORKDIR"
+
+echo "=========================================="
+echo "Parallel GA chain submitter"
+echo "Submitter job : ${PBS_JOBID:-unknown}"
+echo "Run root      : ${RUN_ROOT}"
+echo "Run tag       : ${RUN_TAG}"
+echo "Estimator     : ${GA_ESTIMATOR}"
+echo "Budget        : ${GA_BUDGET}"
+echo "Restarts      : ${GA_N_RESTARTS}"
+echo "Stage select  : ${STAGE_SELECT}  walltime=${STAGE_WALLTIME}"
+echo "Pred  select  : ${PRED_SELECT}   walltime=${PRED_WALLTIME}"
+echo "=========================================="
+
+submit_stage() {
+  local sid="$1"
+  # Note: -v list uses comma as separator; no colon-containing values here.
+  qsub \
+    -N "ga_s${sid}_${RUN_TAG}" \
+    -l "select=${STAGE_SELECT}" \
+    -l "walltime=${STAGE_WALLTIME}" \
+    -v "STAGE_ID=${sid},RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},GA_BUDGET=${GA_BUDGET},GA_ESTIMATOR=${GA_ESTIMATOR},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA},GA_N_RESTARTS=${GA_N_RESTARTS},GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS},PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR},STAGE23_JOINT=${STAGE23_JOINT},GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT},GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH}" \
+    job_ga_stage_single.pbs | awk '{print $1}'
+}
+
+jid0=$(submit_stage 0)
+jid1=$(submit_stage 1)
+jid2=$(submit_stage 2)
+jid3=$(submit_stage 3)
+jid4=$(submit_stage 4)
+jid5=$(submit_stage 5)
+
+echo "Submitted stages: ${jid0} ${jid1} ${jid2} ${jid3} ${jid4} ${jid5}"
+
+deps="${jid0}:${jid1}:${jid2}:${jid3}:${jid4}:${jid5}"
+
+jid_merge=$(qsub \
+  -N "ga_merge_${RUN_TAG}" \
+  -W "depend=afterok:${deps}" \
+  -l "select=${MERGE_SELECT}" \
+  -l "walltime=${MERGE_WALLTIME}" \
+  -v "RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},STAGE_IDS=0,1,2,3,4,5,STRICT_MERGE=1" \
+  job_merge_ga_results.pbs | awk '{print $1}')
+
+echo "Submitted merge: ${jid_merge}"
+
+MERGED_DIR="${RUN_ROOT}/${RUN_TAG}/merged"
+
+jid_pred=$(qsub \
+  -N "ga_pred_${RUN_TAG}" \
+  -W "depend=afterok:${jid_merge}" \
+  -l "select=${PRED_SELECT}" \
+  -l "walltime=${PRED_WALLTIME}" \
+  -v "MODE=ga_staged,CONDA_ENV=${CONDA_ENV},RUN_ROOT=${RUN_ROOT},THREADS=${THREADS},S5_WORKERS=${S5_WORKERS},GA_ESTIMATOR=${GA_ESTIMATOR},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA},GA_BUDGET=${GA_BUDGET},GA_STAGED_REUSE_ESTIMATOR=1,GA_STAGED_GA_DIR=${MERGED_DIR},INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS},PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR},GA_N_RESTARTS=${GA_N_RESTARTS},GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT},GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH}" \
+  pbs_pipeline_mode.pbs | awk '{print $1}')
+
+echo "Submitted prediction: ${jid_pred}"
+
+echo "=========================================="
+echo "Submission chain complete"
+echo "Run tag         : ${RUN_TAG}"
+echo "Stage deps      : ${deps}"
+echo "Merge job       : ${jid_merge}"
+echo "Prediction job  : ${jid_pred}"
+echo "Merged GA dir   : ${MERGED_DIR}"
+echo "=========================================="

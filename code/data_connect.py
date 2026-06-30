@@ -162,8 +162,8 @@ sex_map = {'male':1,
            'female':2}
 
 
-work_map = {'workPartTime':1,
-            'workFullTime':2,
+work_map = {'workFullTime':1,
+            'workPartTime':2,
             'otherReason':3,
             'carer':4,
             'retired':5,
@@ -1074,6 +1074,17 @@ class Synth_Connect:
         trips['OTAZ'] = trips['ORIGSA2_2021'].map(o).fillna(330).astype(int)
         trips['DTAZ'] = trips['DESTSA2_2021'].map(o).fillna(330).astype(int)
         persons['OTAZ'] = persons['HOME_SA2_2021'].map(o).fillna(330).astype(int)
+
+        _unmapped_o = trips['ORIGSA2_2021'].dropna().astype(int)
+        _unmapped_origs = set(_unmapped_o[_unmapped_o.map(o).isna()])
+        _unmapped_d = trips['DESTSA2_2021'].dropna().astype(int)
+        _unmapped_dests = set(_unmapped_d[_unmapped_d.map(o).isna()])
+        _unmapped = _unmapped_origs | _unmapped_dests
+        if _unmapped:
+            logging.warning(
+                f"process_survey: {len(_unmapped)} SA2 codes not in zone mapping "
+                f"(defaulted to TAZ 330): {sorted(_unmapped)[:10]}"
+            )
 
         # -------------------------------
         # MODE & PURPOSE CLEANING
@@ -2262,11 +2273,12 @@ class Synth_Connect:
                     for c in _missing_osm:
                         if c not in self.land.columns:
                             self.land[c] = 0.0
+            # ── Validate OSM merge completeness ───────────────────────────────
+            for c in _OSM_SIZE_COLS:
+                if c not in self.land.columns:
+                    self.land[c] = 0.0
             # ──────────────────────────────────────────────────────────────────
 
-            print('todo make sure this is converted right')
-            #self.land = pd.read_csv('Z:/lanuse/landuse_final.csv')
-            #self.land = pd.read_csv('seq_zone_ids.csv')
             return self.land
         
     def get_tours(self):
@@ -2291,30 +2303,32 @@ class Synth_Connect:
                 
                 
             MODES = {
-            'Car driver': 'DA',
-            'Walking': 'Walk',
-            'Car passenger': 'SR',
-            'Public Bus': 'Transit',
-            'Motorcycle driver': 'DA',
-            'Truck passenger': 'SR',
-            'Charter/Courtesy/Other bus':'Transit',
-            'Light rail':'Transit',
-            'Public bus':'Transit',
-            'School bus (with route number)': 'Transit',
-            'E-bike or E-scooter': 'Bike',
-            'Truck driver':'DA',
-            'Uber / Other Ride Share':'SR',
-            'Train': 'Transit',
-            'Other method':'DA',
-            'Motorcycle passenger':'SR',
-            'Taxi':'SR',
-            'Bicycle':'Bike',
-            'Mobility scooter':'Walk',
-            'Ferry':'Transit',
-            'School bus (private/chartered)': 'Transit'
+                'Car driver': 'DA',
+                'Walking': 'Walk',
+                'Car passenger': 'SR',
+                'Public Bus': 'Transit',
+                'Motorcycle driver': 'DA',
+                'Truck passenger': 'SR',
+                'Charter/Courtesy/Other bus':'Transit',
+                'Light rail':'Transit',
+                'Public bus':'Transit',
+                'School bus (with route number)': 'Transit',
+                'E-bike or E-scooter': 'Bike',
+                'Truck driver':'DA',
+                'Uber / Other Ride Share':'SR',
+                'Train': 'Transit',
+                'Other method':'DA',
+                'Motorcycle passenger':'SR',
+                'Taxi':'SR',
+                'Bicycle':'Bike',
+                'Mobility scooter':'Walk',
+                'Ferry':'Transit',
+                'School bus (private/chartered)': 'Transit',
+                'Car driver ': 'DA',
+                'Walking ': 'Walk',
+                'Bicycle ': 'Bike',
+                'Public Bus ': 'Transit',
             }
-            
-            
             self.trips['MODE1'] = self.trips['MODE1'].map(MODES)
             self.trips['OTAZ'] = self.trips['OTAZ'].astype(int)
             self.trips['DTAZ'] = self.trips['DTAZ'].astype(int)

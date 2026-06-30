@@ -41,7 +41,7 @@ GA_BUDGET = 'fast'           # 'smoke' | 'fast' | 'standard' | 'thorough'
 GA_VERBOSE_EVERY = 5         # matches the default in BanditFeatureSearcher
 
 # Which stages to run (subset for faster iteration; None = all five)
-RUN_STAGES = [5]            # e.g. [1, 2] to run only stages 1 & 2
+RUN_STAGES = [1, 2, 3, 4, 5]            # e.g. [1, 2] to run only stages 1 & 2
 
 # ─────────────────────────────── ENV SETUP ───────────────────────────────────
 # All env-vars MUST be set before any pipeline or JAX import.

@@ -278,11 +278,39 @@ def build_safety_proxy_summary():
     }
 
 # ── HTML report ───────────────────────────────────────────────────────────────
-SAFETY_COEFFS = {
-    'WORK mode  c_crash_veh': -0.0782,  'EDU mode c_crash_veh':  0.0056,
-    'NONMAND    c_crash_veh': -0.0182,  'WORK dest c_crash':     -0.1863,
-    'EDU dest   c_crash':     -0.1995,  'NONMAND dest c_crash':  -0.2361,
-}
+def _read_safety_coeffs(baseline_coef_path: str) -> dict:
+    """Read crash/safety coefficients from the baseline coefficient CSV."""
+    coeffs = {}
+    if os.path.exists(baseline_coef_path):
+        try:
+            df = pd.read_csv(baseline_coef_path)
+            param_col = next((c for c in df.columns
+                             if c.lower() in ('parameter', 'coef_name', 'coefficient_name', 'name', 'variable')),
+                            df.columns[0])
+            val_col = next((c for c in df.columns
+                           if c.lower() in ('value', 'coef', 'estimate')), None)
+            if val_col:
+                crash_rows = df[df[param_col].str.lower().str.contains('crash', na=False)]
+                for _, row in crash_rows.iterrows():
+                    seg = str(row.get('segment', row.get('purpose', '')))
+                    param = str(row[param_col])
+                    val = pd.to_numeric(row[val_col], errors='coerce')
+                    key = f"{seg} {param}" if seg else param
+                    coeffs[key] = float(val) if pd.notna(val) else 0.0
+        except Exception:
+            pass
+    return coeffs
+
+SAFETY_COEFFS = _read_safety_coeffs(os.path.join(DIR_BASE, 'stage5_models_coefficients.csv'))
+if not SAFETY_COEFFS:
+    SAFETY_COEFFS = _read_safety_coeffs(os.path.join(DIR_BASE, 'stage5_tour_coefficients.csv'))
+if not SAFETY_COEFFS:
+    # Fallback defaults if no coefficient file is found
+    SAFETY_COEFFS = {
+        'WORK mode  c_crash_veh': -0.0782,  'EDU mode c_crash_veh':  0.0056,
+        'NONMAND    c_crash_veh': -0.0182,  'WORK dest c_crash':     -0.1863,
+        'EDU dest   c_crash':     -0.1995,  'NONMAND dest c_crash':  -0.2361,
+    }
 
 def write_report(summary, plot_files):
     out_path = os.path.join(DIR_OUT, 'safety_report.html')

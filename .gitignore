@@ -16,7 +16,8 @@ env/
 .vscode/
 .claude/
 .idea/
-
+TSP_Paper/
+TSP__Departmentment_of_Infrastructure___Mathematical_Program/
 # ── Cluster / PBS log files (*.err, *.out, *.eNNNNNNN, *.oNNNNNNN) ─────────
 *.err
 *.out
@@ -56,6 +57,10 @@ code/pddopulation_by_order_with_osm_and_landuse.csv
 # ── Text / LaTeX files (keep README.md, ignore everything else) ─────────────
 *.txt
 *.tex
+*.pdf
+*.ppt
+*.cmd
+
 
 # ── Known large binary / data files (> 100 MB) ──────────────
 # Uncomment or add any file whose size exceeds GitHub's 100 MB limit.

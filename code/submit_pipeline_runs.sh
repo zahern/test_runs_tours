@@ -22,23 +22,34 @@ GPU_COUNT=1
 RUN_ROOT=runs
 PBS_SCRIPT=pbs_pipeline_mode.pbs
 ACCELERATOR=gpu
+# SA-Bandit defaults: fewer parallel workers to avoid JAX cache memory explosion
+# (8 workers × ~28 GB JAX cache each ≈ 224 GB, crashes 160 GB jobs)
+GA_PARALLEL_SEGMENTS_SA_BANDIT=4
 INCLUDE_SAFETY=0
 INCLUDE_JOINT=0
 INCLUDE_ESTIMATOR_VARIANTS=0   # submit main+metacount, main+searchlibrium, main+both
 INCLUDE_GA_ESTIMATOR_VARIANTS=0 # submit ga+ga_staged for metacount and searchlibrium
 PAPER_EXPERIMENT=0              # ga_staged + safety chain with conservative defaults
+PAPER_BANDIT_EXPERIMENT=0       # sa_bandit ga+ga_staged + safety chain for paper completion
 STAGE5_SMOKE_PRESET=0           # ga_stage5_smoke only (quick wiring check)
 GA_ESTIMATOR=default            # GA_ESTIMATOR for the primary MODES above
 INSTALL_ESTIMATORS=1            # default: install latest estimator packages at job start
 GA_USE_SA=0                     # 1 = force SimulatedAnnealing for all stages (overrides per-stage logic)
 GA_BUDGET="${GA_BUDGET:-standard}"  # budget profile passed to PBS jobs: smoke|ultrafast|fast|standard|thorough
 GA_BUDGET_BANDIT="${GA_BUDGET_BANDIT:-ultrafast}"  # budget override for SA-Bandit chain (ultrafast ~45min/purpose for MetaCount)
+# Number of GA stage-2..5 segments (purposes/targets/tour-segments) searched
+# concurrently in spawn-mode subprocesses. Empty = let ga_hypothesis_testing.py
+# pick min(n_segments, cpu_count, 4). Set with --ga-parallel-segments, usually
+# equal to --cpus for full utilisation during the 8-purpose stages 3/4.
+GA_PARALLEL_SEGMENTS=
 CLEAN_RUN_DIRS=0                # 1 = clear previous run directories before submit (destructive)
 # Lighter resources for analysis/joint jobs (no GPU, less RAM)
 JOINT_MEM=32GB
 JOINT_WALLTIME=04:00:00
 ANALYSIS_MEM=32GB
 ANALYSIS_WALLTIME=02:00:00
+PAPER_COLLECT_MEM=8GB
+PAPER_COLLECT_WALLTIME=01:00:00
 # MCR ExperimentBuilder structure-search jobs (metacountregressor 1.0.49+)
 # Each family (count, duration, linear, cmf) runs an independent PBS job.
 # --mcr-algo all submits SA+DE+HS variants per family (3× more jobs).
@@ -181,9 +192,21 @@ Options:
                                     --include-ga-estimator-variants, and MODES chains.
                                     Default: 0 (combined job as before)
      --est-mem SIZE                 RAM for estimation-only ga jobs.  Default: 64GB
-                                    Rule of thumb: 8 × ncpus GB for MetaCount/SearchLibrium.
+                                    Rule of thumb: 8 × ncpus GB for MetaCount/SearchLibrium,
+                                    PLUS extra headroom per --ga-parallel-segments worker
+                                    (each worker is a separate JAX/MetaCount/SearchLibrium
+                                    process — see --ga-parallel-segments).
      --est-walltime HH:MM:SS        Walltime for estimation-only ga jobs.  Default: 12:00:00
                                     GA budget=standard with MetaCount typically finishes in ~6-8 h.
+     --ga-parallel-segments N       Run N GA stage-2..5 segments (purposes/targets/tour
+                                    segments) concurrently in separate spawn-mode
+                                    subprocesses.  Default: unset (ga_hypothesis_testing.py
+                                    picks min(n_segments, cpu_count, 4) automatically).
+                                    Stages 3 & 4 have 8 purposes each, so N=8 (=--cpus)
+                                    fully uses an 8-core node during those stages.
+                                    Each concurrent segment is a full JAX/MetaCount/
+                                    SearchLibrium process — increase --est-mem
+                                    accordingly (roughly scale --est-mem with N).
      --all                          Shorthand for --include-safety --include-joint
                                     --include-estimator-variants --include-mcr-search.
                                     Submits all 13 jobs (SA default):
@@ -196,12 +219,27 @@ Options:
                                     With --mcr-families "count duration linear cmf": 16 jobs.
      --accelerator cpu|gpu          JAX/Larch platform.              Default: gpu
      --gpu N                        GPU count per heavy job.         Default: 1
-    --paper-experiment             Submit GA-staged + safety chain as one
-                             sequential paper experiment:
-                             ga_staged -> safety_baseline -> safety_nosafety -> safety_analysis
-                             Uses walltime=23:59:00 for heavy jobs unless --walltime
-                             was explicitly provided, and analysis walltime=04:00:00
-                             unless --analysis-walltime was explicitly provided.
+     --paper-experiment             Submit GA-staged + safety chain as one
+                              sequential paper experiment:
+                              ga_staged -> safety_baseline -> safety_nosafety -> safety_analysis
+                              Uses walltime=23:59:00 for heavy jobs unless --walltime
+                              was explicitly provided, and analysis walltime=04:00:00
+                              unless --analysis-walltime was explicitly provided.
+     --paper-bandit                Submit SA-bandit GA+GA_STAGED + safety chain as one
+                              sequential paper experiment using the SA bandit search.
+                              Produces paper-ready outputs in abm_safety/Figures/:
+                                sa_bandit_ga_all_stages.png   (GA convergence)
+                                sa_bandit_stage5_coef.html    (safety model coefficients)
+                                sa_bandit_safety_comparison.csv
+                                sa_bandit_safety_report.html
+                                safety_plots/*.png
+                              All 5 GA stages use the BanditFeatureSearcher with
+                              MetaCount (stages 1-3), SearchLibrium (stage 4), and
+                              Larch (stage 5).  After ga+ga_staged, runs:
+                              safety_baseline -> safety_nosafety -> safety_analysis.
+                              Default: EST_MEM=64GB  EST_WALLTIME=23:59:00
+                                       MEM=250GB     WALLTIME=23:59:00
+                                       ANALYSIS_WALLTIME=04:00:00
     --stage5-smoke                Submit Stage 5-only GA smoke test as one job
                                   (mode: ga_stage5_smoke).
                                   Defaults to CPU, no GPU, workers=1, walltime=02:00:00
@@ -263,6 +301,13 @@ Examples:
 
     # Paper experiment chain (GA staged + safety ablation + analysis):
     ./submit_pipeline_runs.sh --paper-experiment
+
+    # SA-Bandit paper experiment (BanditFeatureSearcher + safety comparison for paper):
+    ./submit_pipeline_runs.sh --paper-bandit
+
+    # SA-Bandit with split estimation (lighter ga, full memory for prediction):
+    ./submit_pipeline_runs.sh --paper-bandit --split-estimation \
+        --est-mem 64GB --cpus 8 --workers 8 --mem 250GB
 
     # Stage 5-only GA smoke test (very fast wiring check):
     ./submit_pipeline_runs.sh --stage5-smoke
@@ -426,6 +471,10 @@ while [ $# -gt 0 ]; do
             GA_BUDGET_BANDIT="$2"
             shift 2
             ;;
+        --ga-parallel-segments)
+            GA_PARALLEL_SEGMENTS="$2"
+            shift 2
+            ;;
         --split-estimation)
             SPLIT_ESTIMATION=1
             shift
@@ -483,6 +532,10 @@ while [ $# -gt 0 ]; do
             PAPER_EXPERIMENT=1
             shift
             ;;
+        --paper-bandit)
+            PAPER_BANDIT_EXPERIMENT=1
+            shift
+            ;;        
         --stage5-smoke)
             STAGE5_SMOKE_PRESET=1
             shift
@@ -520,8 +573,36 @@ if [ "$PAPER_EXPERIMENT" -eq 1 ]; then
     echo "Paper experiment preset enabled: ga_staged + safety chain (sequential)."
 fi
 
+if [ "$PAPER_BANDIT_EXPERIMENT" -eq 1 ]; then
+    MODES=()
+    INCLUDE_SA_BANDIT=1
+    INCLUDE_SAFETY=1
+    SUBMIT_MODE=sequential
+    if [ "$WALLTIME_SET" -eq 0 ]; then
+        WALLTIME=23:59:00
+    fi
+    if [ "$ANALYSIS_WALLTIME_SET" -eq 0 ]; then
+        ANALYSIS_WALLTIME=04:00:00
+    fi
+    if [ "$EST_WALLTIME_SET" -eq 0 ]; then
+        EST_WALLTIME=23:59:00
+    fi
+    echo "Paper bandit experiment preset enabled: sa_bandit ga+ga_staged + safety chain (sequential)."
+    echo "  The SA bandit search produces paper-ready outputs in abm_safety/Figures/."
+fi
+
 if [ "$PAPER_EXPERIMENT" -eq 1 ] && [ "$STAGE5_SMOKE_PRESET" -eq 1 ]; then
     echo "--paper-experiment and --stage5-smoke cannot be used together" >&2
+    exit 1
+fi
+
+if [ "$PAPER_EXPERIMENT" -eq 1 ] && [ "$PAPER_BANDIT_EXPERIMENT" -eq 1 ]; then
+    echo "--paper-experiment and --paper-bandit cannot be used together" >&2
+    exit 1
+fi
+
+if [ "$PAPER_BANDIT_EXPERIMENT" -eq 1 ] && [ "$STAGE5_SMOKE_PRESET" -eq 1 ]; then
+    echo "--paper-bandit and --stage5-smoke cannot be used together" >&2
     exit 1
 fi
 
@@ -599,6 +680,11 @@ if [ "$S5_WORKERS" -gt "$CPUS" ]; then
     S5_WORKERS="$CPUS"
 fi
 
+if [ -n "$GA_PARALLEL_SEGMENTS" ] && [ "$GA_PARALLEL_SEGMENTS" -gt "$CPUS" ]; then
+    echo "Warning: --ga-parallel-segments ($GA_PARALLEL_SEGMENTS) exceeds --cpus ($CPUS) — reducing to $CPUS" >&2
+    GA_PARALLEL_SEGMENTS="$CPUS"
+fi
+
 if [ "$ACCELERATOR" = "gpu" ] && [ "$GPU_COUNT" -le 0 ]; then
     echo "--accelerator gpu requires --gpu > 0" >&2
     exit 1
@@ -635,6 +721,9 @@ submit_one() {
     fi
     local vars out_f err_f
     vars="MODE=${mode},ZONE_ARG=${ZONE_ARG},CONDA_ENV=${CONDA_ENV},THREADS=${THREADS},S5_WORKERS=${S5_WORKERS},RUN_ROOT=${RUN_ROOT},PIPELINE_ACCELERATOR=${ACCELERATOR},GA_ESTIMATOR=${estimator},INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-0},GA_BUDGET=${GA_BUDGET}"
+    if [ -n "$GA_PARALLEL_SEGMENTS" ]; then
+        vars="${vars},GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS}"
+    fi
     if [ -n "$extra_vars" ]; then
         vars="${vars},${extra_vars}"
     fi
@@ -654,6 +743,7 @@ echo "  select             = $SELECT"
 echo "  walltime           = $WALLTIME"
 echo "  threads            = $THREADS"
 echo "  s5_workers         = $S5_WORKERS"
+echo "  ga_parallel_segs   = ${GA_PARALLEL_SEGMENTS:-<auto: min(n_segments,cpus,4)>}"
 echo "  accelerator        = $ACCELERATOR"
 echo "  ga_estimator       = $GA_ESTIMATOR"
 echo "  install_estimators = $INSTALL_ESTIMATORS"
@@ -855,10 +945,13 @@ submit_sa_bandit_chain() {
     local _prev_sa="$GA_USE_SA"
     local _prev_bandit_sa="${GA_USE_BANDIT_SA:-0}"
     local _prev_budget="$GA_BUDGET"
+    local _prev_par_segs="$GA_PARALLEL_SEGMENTS"
 
     GA_USE_SA=1
     GA_USE_BANDIT_SA=1
     GA_BUDGET="$GA_BUDGET_BANDIT"  # fast by default — standard budget cannot finish 5 stages
+    # Reduce parallel workers: 8 workers × ~28 GB JAX cache each exceeds 160 GB PBS mem
+    GA_PARALLEL_SEGMENTS="${GA_PARALLEL_SEGMENTS:-$GA_PARALLEL_SEGMENTS_SA_BANDIT}"
 
     echo ""
     echo "── SA Bandit chain [GA_ESTIMATOR=sa_bandit, GA_USE_BANDIT_SA=1] ──────"
@@ -882,9 +975,12 @@ submit_sa_bandit_chain() {
     echo "           ${RUN_ROOT}/sa_ga_staged_sa_bandit__<JOBID>/"
     echo "────────────────────────────────────────────────────────────────────"
 
+    prev_jid="$jid_ga_staged"
+
     GA_USE_SA="$_prev_sa"
     GA_USE_BANDIT_SA="$_prev_bandit_sa"
     GA_BUDGET="$_prev_budget"
+    GA_PARALLEL_SEGMENTS="$_prev_par_segs"
 }
 
 # ── submit_sa_cases ───────────────────────────────────────────────────────────
@@ -1173,6 +1269,12 @@ if [ "$INCLUDE_JOINT" -eq 1 ]; then
     fi
 fi
 
+# ── SA bandit case (ga + ga_staged with BanditFeatureSearcher outer loop) ─────
+# Runs BEFORE safety chain so safety can depend on SA-bandit feature selection.
+if [ "$INCLUDE_SA_BANDIT" -eq 1 ]; then
+    submit_sa_bandit_chain
+fi
+
 if [ "$INCLUDE_SAFETY" -eq 1 ]; then
     # Safety chain is independent of the main model chain — submit in parallel
     # unless --sequential was given (in which case chain after last main job).
@@ -1213,9 +1315,24 @@ if [ "$INCLUDE_SA_CASES" -eq 1 ]; then
     submit_sa_cases
 fi
 
-# ── SA bandit case (ga + ga_staged with BanditFeatureSearcher outer loop) ─────
-if [ "$INCLUDE_SA_BANDIT" -eq 1 ]; then
-    submit_sa_bandit_chain
+# ── Paper collection: copy SA-bandit + safety outputs to abm_safety/Figures/ ──
+# Runs after safety_analysis when --paper-bandit is used.
+# Lightweight job: copies existing outputs to the paper figures directory.
+if [ "$PAPER_BANDIT_EXPERIMENT" -eq 1 ] && [ -n "${prev_jid:-}" ]; then
+    echo ""
+    echo "── Paper output collection ────────────────────────────────────────────"
+    _pc_select="select=1:ncpus=2:mem=${PAPER_COLLECT_MEM}"
+    jid_collect=$(qsub -N saw_paper_collect \
+        -o "$(pwd)/saw_paper_collect.out" -e "$(pwd)/saw_paper_collect.err" \
+        -l walltime="$PAPER_COLLECT_WALLTIME" -l "$_pc_select" \
+        -W "depend=afterok:${prev_jid}" \
+        -v "MODE=paper_collect,ZONE_ARG=,CONDA_ENV=${CONDA_ENV},THREADS=1,S5_WORKERS=1,RUN_ROOT=${RUN_ROOT},PIPELINE_ACCELERATOR=cpu" \
+        "$PBS_SCRIPT")
+    echo "  paper_collect   -> $jid_collect (afterok:$prev_jid)"
+    echo "    Copies SA-bandit + safety outputs to abm_safety/Figures/"
+    echo "    log: saw_paper_collect.out"
+    echo "────────────────────────────────────────────────────────────────────"
+    prev_jid="$jid_collect"
 fi
 
 # ── MCR ExperimentBuilder structure-search jobs ───────────────────────────────
@@ -1266,6 +1383,15 @@ fi
 if [ "$INCLUDE_SAFETY" -eq 1 ]; then
     echo "  safety_baseline ──► safety_nosafety ──► safety_analysis"
 fi
+if [ "$INCLUDE_SA_BANDIT" -eq 1 ]; then
+    echo "  sa_bandit ga ──► sa_bandit ga_staged  (BanditFeatureSearcher)"
+    if [ "$PAPER_BANDIT_EXPERIMENT" -eq 1 ]; then
+        echo "  └── safety_baseline ──► safety_nosafety ──► safety_analysis ──► paper_collect"
+    fi
+fi
+if [ "$PAPER_BANDIT_EXPERIMENT" -eq 1 ]; then
+    echo "  paper_collect  → copies SA-bandit + safety outputs to abm_safety/Figures/"
+fi
 if [ "$INCLUDE_MCR_SEARCH" -eq 1 ]; then
     read -r -a _mcr_fams_arr <<< "$MCR_FAMILIES"
     _mcr_alg_list=$( [ "$MCR_ALGO" = "all" ] && echo "sa de hs" || echo "$MCR_ALGO" )
@@ -1290,6 +1416,8 @@ _gst_in=0; for _m in "${MODES[@]}"; do [ "$_m" = "ga_staged" ] && _gst_in=1; don
 [ "$INCLUDE_ESTIMATOR_VARIANTS" -eq 1 ]     && _total=$(( _total + 3 ))
 if [ "$INCLUDE_GA_ESTIMATOR_VARIANTS" -eq 1 ]; then _total=$(( _total + 4 )); fi
 [ "$INCLUDE_SAFETY" -eq 1 ]                 && _total=$(( _total + 3 ))
+if [ "$INCLUDE_SA_BANDIT" -eq 1 ]; then _total=$(( _total + 2 )); fi   # ga + ga_staged
+[ "$PAPER_BANDIT_EXPERIMENT" -eq 1 ]        && _total=$(( _total + 1 ))  # paper_collect
 if [ "$INCLUDE_MCR_SEARCH" -eq 1 ]; then
     read -r -a _c_fams <<< "$MCR_FAMILIES"
     _c_alg=$( [ "$MCR_ALGO" = "all" ] && echo "sa de hs" || echo "$MCR_ALGO" )
@@ -1329,6 +1457,19 @@ if [ "$INCLUDE_SAFETY" -eq 1 ]; then
     echo "                                  plots/safety_activity_levels.png"
     echo "                                  plots/safety_zone_derivation.png"
     echo "                                  safety_zone_ranking.csv"
+fi
+if [ "$PAPER_BANDIT_EXPERIMENT" -eq 1 ]; then
+    echo ""
+    echo "  PAPER OUTPUTS → abm_safety/Figures/"
+    echo "    sa_bandit_ga_all_stages.png              GA convergence across all 5 stages"
+    echo "    sa_bandit_stage5_coef.html               Stage 5 safety model coefficients"
+    echo "    sa_bandit_safety_comparison.csv          Safety vs no-safety comparison table"
+    echo "    sa_bandit_safety_report.html             Complete safety experiment report"
+    echo "    sa_bandit_synth_population_report.html   Synth population vs HHTS comparison"
+    echo "    sa_bandit_synth_vs_hhts_comparison.csv   Synth vs HHTS numeric comparison"
+    echo "    safety_plots/*.png                       All safety + synth-vs-HHTS figures"
+    echo "    sa_bandit_ga_stage*.csv                  Per-stage convergence data"
+    echo "    sa_bandit_stage5_models.pkl              Stage 5 models for coefficient tables"
 fi
 if [ "$INCLUDE_MCR_SEARCH" -eq 1 ]; then
     read -r -a _kout_fams <<< "$MCR_FAMILIES"
@@ -1370,5 +1511,8 @@ if [ "$INCLUDE_SAFETY" -eq 1 ]; then
     echo "  tail -f saw_safety_base.out   saw_safety_base.err"
     echo "  tail -f saw_safety_nosa.out   saw_safety_nosa.err"
     echo "  tail -f saw_safety_anal.out   saw_safety_anal.err"
+fi
+if [ "$PAPER_BANDIT_EXPERIMENT" -eq 1 ]; then
+    echo "  tail -f saw_paper_collect.out  saw_paper_collect.err"
 fi
 echo "═══════════════════════════════════════════════════════════════"

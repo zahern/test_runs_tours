@@ -222,6 +222,7 @@ NEST_MEMBERS = {
 FUEL_RATE = 0.12   # ~12 cents/km
 
 # Person feature columns — extended with age5p and industry/licence for heterogeneity spec
+#TODO I WANT workstat, BUT WHEN WORKSTAT I WANT IT POPULATED INTO THE MODEL BROKEN DOWN AS CATEGOGICAL HOW TO
 PERSON_FEATURES = ['sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING', 'incp', 'age5p',
                    'indp', 'CARLICENCE']
 
@@ -826,10 +827,10 @@ def prepare_mode_data(
     # city/suburban destinations, school-zone parking restrictions, etc.
     df['indp_public']     = _indp.isin([15, 16, 17]).astype(float)
 
-    # Worker type: full-time vs part-time (QTS work_map: 1=PT, 2=FT)
+    # Worker type: full-time vs part-time (QTS work_map: 1=FT, 2=PT)
     # Full-time workers face stricter schedule constraints → more DA
-    df['full_time'] = (df['WORKSTAT'] == 2).astype(float)
-    df['part_time'] = (df['WORKSTAT'] == 1).astype(float)
+    df['full_time'] = (df['WORKSTAT'] == 1).astype(float)
+    df['part_time'] = (df['WORKSTAT'] == 2).astype(float)
 
     mode_dist = df['chosen_mode'].value_counts().to_dict()
     mode_pct  = {m: f"{v/len(df):.1%}" for m, v in mode_dist.items()}
@@ -1638,7 +1639,7 @@ def estimate_mode_models(
     trips: pd.DataFrame,
     persons: pd.DataFrame,
     landuse: Optional[pd.DataFrame] = None,
-    min_sample: int = 50,
+    min_sample: int = 20,
 ) -> dict:
     """
     Fit one NestedLogitModeModel per activity purpose.

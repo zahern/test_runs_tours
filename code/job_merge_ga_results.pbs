@@ -1,0 +1,42 @@
+#!/bin/bash -l
+# Merge per-stage GA artifacts into one ga_results.pkl.
+
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=1:mem=8GB
+#PBS -l walltime=01:00:00
+
+set -euo pipefail
+
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:?RUN_TAG is required}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+STAGE_IDS=${STAGE_IDS:-1,2,3,4,5}
+STRICT_MERGE=${STRICT_MERGE:-1}
+
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+echo "=========================================="
+echo "Merge GA results job"
+echo "PBS job     : ${PBS_JOBID:-unknown}"
+echo "Run root    : ${RUN_ROOT}"
+echo "Run tag     : ${RUN_TAG}"
+echo "Stage ids   : ${STAGE_IDS}"
+echo "Strict      : ${STRICT_MERGE}"
+echo "Started     : $(date)"
+echo "=========================================="
+
+if [ "${STRICT_MERGE}" = "1" ]; then
+  python -u -X utf8 merge_ga_results.py --run-root "${RUN_ROOT}" --run-tag "${RUN_TAG}" --stage-ids "${STAGE_IDS}" --strict
+else
+  python -u -X utf8 merge_ga_results.py --run-root "${RUN_ROOT}" --run-tag "${RUN_TAG}" --stage-ids "${STAGE_IDS}"
+fi
+
+EXIT_CODE=$?
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+exit "${EXIT_CODE}"

@@ -59,8 +59,29 @@ import logging
 import os
 import pickle
 from typing import Optional
+from scipy.stats import norm as _norm
 
 logger = logging.getLogger(__name__)
+
+_SEARCHLIB_OK = False
+try:
+    import io as _io, sys as _sys
+    _sl_old = _sys.stdout; _sys.stdout = _io.StringIO()
+    try:
+        from SearchLibrium import MultinomialLogit as _SLMNL
+    finally:
+        _sys.stdout = _sl_old
+    _SEARCHLIB_OK = True
+except Exception:
+    pass
+
+STAGE4_ESTIMATOR = os.environ.get('STAGE4_ESTIMATOR', 'scipy').strip().lower()
+if STAGE4_ESTIMATOR == 'searchlibrium' and not _SEARCHLIB_OK:
+    logger.warning("STAGE4_ESTIMATOR=searchlibrium but SearchLibrium not installed — falling back to scipy")
+    STAGE4_ESTIMATOR = 'scipy'
+elif STAGE4_ESTIMATOR not in ('scipy', 'searchlibrium', 'jaxopt'):
+    logger.warning(f"Unknown STAGE4_ESTIMATOR='{STAGE4_ESTIMATOR}' — falling back to scipy")
+    STAGE4_ESTIMATOR = 'scipy'
 
 
 # ---------------------------------------------------------------------------
@@ -98,16 +119,22 @@ MIN_TRAVEL_GAP = 10
 
 PURPOSES = list(PURPOSE_PRIORITY.keys())
 
-PERSON_FEATURES = ['sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING']
+PERSON_FEATURES = ['sexp', 'vehrd', 'nprd']
+
+# Home-zone landuse accessibility columns — merged from persons if available
+ACC_FEATURES = [
+    'auto_work_acc', 'auto_edu_acc', 'auto_shop_acc', 'auto_nonmand_acc',
+    'walk_acc', 'bike_acc', 'transit_acc',
+]
 
 DEFAULT_FEATURES_BY_PURPOSE = {
-    'work': ['WORKSTAT', 'CARLICENCE', 'vehrd', 'ptype_FullTimeWorker', 'ptype_WorkingStudent', 'wfh'],
-    'edu': ['STUDYING', 'ptype_SchoolChild', 'ptype_UniversityStudent', 'age_child', 'age_teen', 'transit_acc'],
-    'escort': ['hh_child', 'vehrd', 'has_vehicle', 'nprd', 'WORKSTAT'],
-    'shopping': ['incp', 'vehrd', 'has_vehicle', 'nprd', 'walk_acc'],
-    'social': ['is_female', 'nprd', 'age_teen', 'age_older', 'walk_acc'],
-    'othmaint': ['WORKSTAT', 'vehrd', 'nprd', 'auto_nonmand_acc'],
-    'othdiscr': ['incp', 'vehrd', 'age_older', 'walk_acc'],
+    'work': ['CARLICENCE', 'vehrd', 'ptype_FullTimeWorker', 'ptype_WorkingStudent', 'wfh', 'auto_work_acc', 'transit_acc'],
+    'edu': ['ptype_SchoolChild', 'ptype_UniversityStudent', 'age_child', 'age_teen', 'transit_acc', 'walk_acc', 'auto_edu_acc'],
+    'escort': ['hh_child', 'vehrd', 'has_vehicle', 'nprd', 'auto_nonmand_acc', 'walk_acc'],
+    'shopping': ['incp', 'vehrd', 'has_vehicle', 'nprd', 'walk_acc', 'auto_shop_acc'],
+    'social': ['is_female', 'nprd', 'age_teen', 'age_older', 'walk_acc', 'transit_acc'],
+    'othmaint': ['vehrd', 'nprd', 'auto_nonmand_acc', 'walk_acc'],
+    'othdiscr': ['incp', 'vehrd', 'age_older', 'walk_acc', 'auto_nonmand_acc'],
     'eat': ['incp', 'nprd', 'walk_acc', 'transit_acc'],
 }
 
@@ -291,7 +318,7 @@ def prepare_timing_data(
     except ImportError:
         pers['ptype'] = 'NonWorker'
 
-    _extra_pers = [c for c in ['AGEGROUP'] if c in pers.columns]
+    _extra_pers = [c for c in ['AGEGROUP'] + ACC_FEATURES if c in pers.columns]
     keep = (['person_id', 'ptype'] +
             [c for c in PERSON_FEATURES if c in pers.columns] +
             _extra_pers)
@@ -338,6 +365,17 @@ class MNLTimingModel:
                    time_consumed, duration_min, person attributes
     """
 
+    PTYPE_ALLOWLIST: dict = {
+        'work':     {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent'},
+        'edu':      {'SchoolChild', 'UniversityStudent', 'WorkingStudent', 'Preschool'},
+        'escort':   None,
+        'shopping': None,
+        'social':   None,
+        'othmaint': None,
+        'othdiscr': None,
+        'eat':      None,
+    }
+
     def __init__(self):
         self.coef_          = None   # (n_periods, n_features)
         self.feature_names_ = None
@@ -345,6 +383,7 @@ class MNLTimingModel:
         self.feature_override_ = None   # set externally to override PERSON_FEATURES
         self.mu_            = None
         self.sd_            = None
+        self._const_mask    = np.array([], dtype=bool)   # set by _fit_scipy
         self.n_periods_     = len(TIME_PERIODS)
         self.coef_export_names_ = None
         self.coef_export_values_ = None
@@ -356,6 +395,7 @@ class MNLTimingModel:
         self.period_blend_alpha_ = 0.0
         self.include_person_features_ = True
         self.fit_status_ = 'not_fit'
+        self.purpose_ = None
 
     def _build_X(self, df: pd.DataFrame) -> np.ndarray:
         """Build feature matrix for MNL estimation / prediction."""
@@ -367,8 +407,13 @@ class MNLTimingModel:
             arrays.append((df['purpose'] == p).astype(float).values)
             cols.append(f'purp_{p}')
 
-        # ptype dummies
-        for pt in (self.ptypes_ or []):
+        # ptype dummies  — filter by purpose to avoid nonsensical predictors
+        # (e.g. Preschool in the work timing model, FullTimeWorker in edu)
+        allowed = self.PTYPE_ALLOWLIST.get(self.purpose_, None)
+        ptype_pool = (self.ptypes_ or [])
+        if allowed is not None:
+            ptype_pool = [pt for pt in ptype_pool if pt in allowed]
+        for pt in ptype_pool:
             arrays.append((df['ptype'] == pt).astype(float).values)
             cols.append(f'ptype_{pt}')
 
@@ -427,45 +472,76 @@ class MNLTimingModel:
         return grad.ravel()
 
     def fit(self, X: np.ndarray, y: np.ndarray):
+        if STAGE4_ESTIMATOR == 'searchlibrium' and _SEARCHLIB_OK:
+            self._fit_searchlibrium(X, y)
+        elif STAGE4_ESTIMATOR == 'jaxopt':
+            self._fit_jaxopt(X, y)
+        else:
+            self._fit_scipy(X, y)
+
+        ll_val = float(self.ll_)
+        rho2   = float(1.0 - ll_val / self.null_ll_) if self.null_ll_ < 0 else float('nan')
+
+        self.rho2_     = rho2
+        self.converged_ = self.converged_ or (np.isfinite(rho2) and rho2 > 0.05)
+        self.fit_status_ = 'ok' if self.converged_ else 'optimizer_stopped'
+
+        # ── Numerical Hessian → standard errors ──────────────────────────
+        try:
+            _n_feats = len(self.feature_names_ or [])
+            _K = self.n_periods_
+            _all_coef_flat = np.zeros((_K - 1) * _n_feats)
+            if self.coef_ is not None:
+                _all_coef_flat[:] = self.coef_.ravel()
+            if _n_feats > 0 and np.isfinite(_all_coef_flat).all():
+
+                def _neg_ll_wrapper(coef_flat):
+                    return self._neg_ll(coef_flat, X, y)
+
+                _hess = _numerical_hessian(_neg_ll_wrapper, _all_coef_flat)
+                _se   = np.sqrt(np.diag(np.linalg.pinv(_hess)))
+                _se   = np.where(np.isfinite(_se) & (_se > 1e-10), _se, float('nan'))
+                _t    = _all_coef_flat / _se
+
+                # Export friendly: one row per (alt, feature) pair
+                export_names  = []
+                export_values = []
+                for alt_idx in range(1, _K):
+                    for feat_idx, fn in enumerate(self.feature_names_ or []):
+                        i = (alt_idx - 1) * _n_feats + feat_idx
+                        export_names.append(f'{PERIOD_LABELS[alt_idx]}::{fn}')
+                        export_values.append(_all_coef_flat[i])
+                self.coef_export_names_  = export_names
+                self.coef_export_values_ = export_values
+                self.std_err_export_ = np.where(np.isfinite(_se), _se, float('nan'))
+                self.t_stat_export_  = np.where(np.isfinite(_t),  _t,  float('nan'))
+                self.p_value_export_ = 2.0 * (1.0 - _norm.cdf(np.abs(self.t_stat_export_)))
+        except Exception as _hess_exc:
+            logger.debug(f"  timing/{self.purpose_}: hessian/export failed: {_hess_exc}")
+
+    def _fit_scipy(self, X: np.ndarray, y: np.ndarray):
         from scipy.optimize import minimize
 
-        # standardise — but skip constant features (sd=0) so they retain
-        # their raw value (0 or 1).  Purpose dummies are always constant
-        # within a per-purpose training subset (e.g. purp_work=1 for every
-        # row when fitting the work model).  If we standardise them the
-        # result is (1-1)/1 = 0, effectively removing the per-period
-        # intercept and causing the MNL to collapse to the base period.
-        # Passing through raw values preserves the intercept role.
         self.mu_ = X.mean(axis=0)
         self.sd_ = X.std(axis=0)
-        self._const_mask = (self.sd_ == 0)   # True for constant columns
-        self.sd_[self._const_mask] = 1.0     # avoid div-by-zero
+        self._const_mask = (self.sd_ == 0)
+        self.sd_[self._const_mask] = 1.0
         Xs = np.where(self._const_mask, X, (X - self.mu_) / self.sd_)
 
         K = self.n_periods_
         F = Xs.shape[1]
 
-        # ── Initialise from empirical log-shares ────────────────────────
-        # Starting at zero gives all periods equal probability, which is far
-        # from the true (skewed) distribution. Starting from log-shares of
-        # observed periods gives L-BFGS a much better warm-start and avoids
-        # the flat-gradient regime that caused nan coefficients in production.
         period_counts = np.bincount(y, minlength=K).astype(float)
-        period_counts = np.maximum(period_counts, 1.0)   # avoid log(0)
+        period_counts = np.maximum(period_counts, 1.0)
         self.observed_period_shares_ = (period_counts / period_counts.sum()).astype(float)
         log_shares    = np.log(period_counts / period_counts.sum())
-        # Base period (0) fixed at 0 → intercepts = log_share[k] - log_share[0]
         init_intercepts = log_shares[1:] - log_shares[0]
 
-        # Stack: (K-1) intercept-only rows, all slope columns zero
         init = np.zeros((K - 1) * F)
         for k in range(K - 1):
             init[k * F] = init_intercepts[k]
 
-        # ── L2-regularised MNL log-likelihood ──────────────────────────
-        # Ridge penalty prevents coefficients from exploding when a period
-        # is rare (<5% of obs) and its log-share is large-negative.
-        L2 = 1e-3   # mild regularisation — preserves interpretability
+        L2 = 1e-3
 
         def neg_ll_reg(coef_flat):
             coef = coef_flat.reshape(K - 1, F)
@@ -487,9 +563,9 @@ class MNLTimingModel:
             prob = E / E.sum(axis=1, keepdims=True)
             N    = len(y)
             ind  = np.zeros((N, K)); ind[np.arange(N), y] = 1.0
-            grad_full = Xs.T @ (prob - ind)   # (F, K)
-            grad      = grad_full[:, 1:].T     # (K-1, F) — drop base period
-            return grad.ravel() + L2 * coef_flat  # add ridge gradient
+            grad_full = Xs.T @ (prob - ind)
+            grad      = grad_full[:, 1:].T
+            return grad.ravel() + L2 * coef_flat
 
         res = minimize(
             neg_ll_reg, init, jac=neg_ll_grad,
@@ -497,7 +573,6 @@ class MNLTimingModel:
             options={'maxiter': 2000, 'ftol': 1e-10},
         )
 
-        # If L-BFGS-B didn't converge, retry with Newton-CG (more robust for small n)
         if not res.success and len(y) < 500:
             res2 = minimize(
                 neg_ll_reg, res.x, jac=neg_ll_grad,
@@ -507,84 +582,172 @@ class MNLTimingModel:
             if -res2.fun < -res.fun:
                 res = res2
 
-        # Null LL: all periods equally likely (intercept-only at empirical shares)
         null_ll = float(np.sum(np.log(period_counts / period_counts.sum())[y]))
         ll_val  = float(-res.fun)
-        rho2    = float(1.0 - ll_val / null_ll) if null_ll < 0 else float('nan')
 
         self.coef_     = res.x.reshape(K - 1, F)
         self.ll_       = ll_val
         self.null_ll_  = null_ll
-        self.rho2_     = rho2
         self.n_obs_    = len(y)
-        self.converged_ = bool(res.success) or (np.isfinite(rho2) and rho2 > 0.05)
-        self.fit_status_ = 'ok' if self.converged_ else 'optimizer_stopped'
-        try:
-            params = res.x.copy()
-            hess = _numerical_hessian(neg_ll_reg, params)
-            cov = np.linalg.pinv(hess)
-            self.std_err_ = np.sqrt(np.clip(np.diag(cov), 0.0, None))
-            self.t_stat_ = np.divide(params, self.std_err_, out=np.full_like(params, np.nan), where=self.std_err_ > 0)
-            from scipy.stats import norm as _norm
-            self.p_value_ = 2.0 * _norm.sf(np.abs(self.t_stat_))
-        except Exception:
-            self.std_err_ = np.full_like(res.x, np.nan)
-            self.t_stat_ = np.full_like(res.x, np.nan)
-            self.p_value_ = np.full_like(res.x, np.nan)
+        self.converged_ = bool(res.success)
 
-        export_names = [f'{p}::{f}' for p in PERIOD_LABELS[1:] for f in self.feature_names_]
-        export_values = res.x.copy()
-        keep = np.ones(len(export_values), dtype=bool)
-        for i, name in enumerate(export_names):
-            if name.split('::', 1)[1].startswith('purp_') and abs(export_values[i]) < 1e-12:
-                keep[i] = False
-        self.coef_export_names_  = [name for i, name in enumerate(export_names) if keep[i]]
-        self.coef_export_values_ = export_values[keep]
-        self.std_err_export_ = self.std_err_[keep] if self.std_err_ is not None else None
-        self.t_stat_export_  = self.t_stat_[keep]  if self.t_stat_  is not None else None
-        self.p_value_export_ = self.p_value_[keep] if self.p_value_ is not None else None
-        rho2_str = f"{rho2:.3f}" if np.isfinite(rho2) else "nan"
-        if (not np.isfinite(rho2)) or (rho2 < 0):
-            logger.warning(
-                f"MNL timing model poor fit (n={len(y)}, rho\u00b2={rho2_str})"
-                f" — falling back to empirical period shares for prediction"
-            )
-            self.coef_ = np.zeros((K - 1, F))
-            for k in range(K - 1):
-                self.coef_[k, 0] = init_intercepts[k]
-            self.converged_ = False
-            self.fit_status_ = 'fallback_empirical_negative_rho2'
-        elif not res.success:
-            if np.isfinite(rho2) and rho2 > 0.05:
-                logger.warning(
-                    f"MNL timing model optimizer stopped early (n={len(y)}) but "
-                    f"rho\u00b2={rho2_str} — model accepted as usable"
+    def _fit_jaxopt(self, X: np.ndarray, y: np.ndarray):
+        try:
+            import jax.numpy as jnp
+            import jax
+        except ImportError:
+            self._fit_scipy(X, y)
+            return
+
+        K = self.n_periods_
+        F = X.shape[1]
+        period_counts = np.bincount(y, minlength=K).astype(float)
+        period_counts = np.maximum(period_counts, 1.0)
+        self.observed_period_shares_ = (period_counts / period_counts.sum()).astype(float)
+
+        self.mu_ = X.mean(axis=0)
+        self.sd_ = X.std(axis=0)
+        self._const_mask = (self.sd_ == 0)
+        self.sd_[self._const_mask] = 1.0
+        Xs = np.where(self._const_mask, X, (X - self.mu_) / self.sd_).astype(np.float32)
+        X_jax = jnp.asarray(Xs, dtype=jnp.float32)
+        y_jax = jnp.asarray(y, dtype=jnp.int32)
+        L2 = 1e-3
+
+        @jax.jit
+        def _nll(params):
+            coef = params.reshape(K - 1, F)
+            coef_full = jnp.vstack([jnp.zeros((1, F), dtype=jnp.float32), coef])
+            Z = X_jax @ coef_full.T
+            Z = Z - jax.lax.stop_gradient(jnp.max(Z, axis=1, keepdims=True))
+            prob = jax.nn.softmax(Z, axis=1)
+            ll = jnp.sum(jnp.log(jnp.clip(prob[jnp.arange(len(y)), y_jax], 1e-12, 1)))
+            return -ll + 0.5 * L2 * jnp.sum(params ** 2)
+
+        _grad_fn = jax.jit(jax.grad(_nll))
+
+        init = np.zeros((K - 1) * F, dtype=np.float32)
+        log_shares = np.log(period_counts / period_counts.sum())
+        init_intercepts = log_shares[1:] - log_shares[0]
+        for k in range(K - 1):
+            init[k * F] = float(init_intercepts[k])
+
+        def _f(x): return float(_nll(jnp.asarray(x, dtype=jnp.float32)))
+        def _g(x): return np.array(_grad_fn(jnp.asarray(x, dtype=jnp.float32)), dtype=float)
+
+        from scipy.optimize import minimize
+        res = minimize(_f, init.astype(float), method='L-BFGS-B', jac=_g,
+                       options={'maxiter': 2000, 'ftol': 1e-10})
+
+        if not res.success and len(y) < 500:
+            res2 = minimize(_f, res.x, method='CG', jac=_g,
+                            options={'maxiter': 3000, 'gtol': 1e-7})
+            if res2.fun < res.fun:
+                res = res2
+
+        null_ll = float(np.sum(np.log(period_counts / period_counts.sum())[y]))
+        ll_val  = float(-res.fun + 0.5 * L2 * np.sum(res.x ** 2))
+
+        self.coef_     = res.x.reshape(K - 1, F)
+        self.ll_       = ll_val
+        self.null_ll_  = null_ll
+        self.n_obs_    = len(y)
+        self.converged_ = bool(res.success)
+
+    def _fit_searchlibrium(self, X: np.ndarray, y: np.ndarray):
+        _SLMNL = None
+        try:
+            from SearchLibrium import MultinomialLogit as _SLMNL
+        except ImportError:
+            pass
+        if _SLMNL is None:
+            self._fit_scipy(X, y)
+            return
+
+        period_counts = np.bincount(y, minlength=self.n_periods_).astype(float)
+        period_counts = np.maximum(period_counts, 1.0)
+        self.observed_period_shares_ = (period_counts / period_counts.sum()).astype(float)
+
+        F = X.shape[1]
+        K = self.n_periods_
+        feat_names = self.feature_names_ or [f'x{i}' for i in range(F)]
+
+        mnl = _SLMNL()
+        try:
+            # Use wide_setup if available (SearchLibrium >= 0.0.111), otherwise
+            # fall back to manual long-format construction.
+            if hasattr(mnl, 'wide_setup'):
+                mnl.wide_setup(
+                    X_wide=X, y_chosen=y, varnames=feat_names, n_alts=K,
+                    empirical_init=True,
+                    l2_penalty=1e-3,
                 )
-                self.fit_status_ = 'accepted_optimizer_stopped'
             else:
-                logger.warning(
-                    f"MNL timing model did not converge (n={len(y)}, rho\u00b2={rho2_str})"
-                    f" — falling back to empirical period shares for prediction"
+                # ── Manual wide → long (backward compat) ──────────────────
+                N = len(y)
+                rows = []
+                for alt in range(K):
+                    chunk = np.zeros((N, F + 2))
+                    chunk[:, :F] = X
+                    chunk[:, F] = float(alt)
+                    chunk[:, F + 1] = (y == alt).astype(float)
+                    rows.append(chunk)
+                long_mat = np.vstack(rows)
+                ids = np.tile(np.arange(N, dtype=np.int32), K)
+                sort_idx = np.lexsort((long_mat[:, F].astype(np.int32), ids))
+                long_sorted = long_mat[sort_idx]
+                ids_sorted = ids[sort_idx]
+                mnl.setup(
+                    X=long_sorted[:, :F].astype(float),
+                    y=long_sorted[:, F + 1].astype(int),
+                    varnames=feat_names,
+                    alts=np.arange(K),
+                    isvars=feat_names,
+                    ids=ids_sorted,
+                    base_alt=0,
+                    l2_penalty=1e-3,
                 )
-                self.coef_ = np.zeros((K - 1, F))
-                for k in range(K - 1):
-                    self.coef_[k, 0] = init_intercepts[k]
-                self.fit_status_ = 'fallback_empirical_no_convergence'
-        logger.info(f"MNL timing model converged={self.converged_}, "
-                    f"ll={ll_val:.1f}, rho\u00b2={rho2_str}")
-        return self
+        except Exception:
+            self._fit_scipy(X, y)
+            return
+
+        try:
+            mnl.fit()
+        except Exception:
+            self._fit_scipy(X, y)
+            return
+
+        ll_val = float(getattr(mnl, 'loglik', float('-inf')))
+        if not np.isfinite(ll_val) or ll_val > 0:
+            self._fit_scipy(X, y)
+            return
+
+        coeff = np.asarray(getattr(mnl, 'coeff_est', []), dtype=float)
+        n_expected = (K - 1) * F
+        if len(coeff) == n_expected:
+            coef_mat = coeff.reshape(K - 1, F)
+        elif len(coeff) == K * F and F > 0:
+            coef_mat = coeff.reshape(K, F)[1:, :]
+        else:
+            coef_mat = np.zeros((K - 1, F))
+
+        null_ll = float(np.sum(np.log(period_counts / period_counts.sum())[y]))
+
+        self.coef_     = coef_mat
+        self.ll_       = ll_val
+        self.null_ll_  = null_ll
+        self.n_obs_    = len(y)
+        self.converged_ = True
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """Return P(period=k) for each row. Shape (N, K)."""
-        # Mirror the same constant-feature passthrough used in fit().
-        # Without this, purpose dummies (always 0 or 1 in the per-purpose
-        # training set) would be zeroed by standardization, removing the
-        # per-period intercepts that distinguish e.g. work departing at
-        # am_peak from early.
-        const_mask = getattr(self, '_const_mask', np.zeros(X.shape[1], dtype=bool))
-        Xs = np.where(const_mask, X, (X - self.mu_) / self.sd_)
         K  = self.n_periods_
-        F  = Xs.shape[1]
+        F  = X.shape[1]
+        if self.mu_ is not None and self.sd_ is not None:
+            const_mask = self._const_mask if len(self._const_mask) == F else np.zeros(F, dtype=bool)
+            Xs = np.where(const_mask, X, (X - self.mu_) / np.where(self.sd_ > 0, self.sd_, 1.0))
+        else:
+            Xs = X
         coef_full = np.vstack([np.zeros((1, F)), self.coef_])
         Z  = Xs @ coef_full.T
         return self._softmax(Z)
@@ -659,6 +822,10 @@ def estimate_timing_models(
 
     for purpose in PURPOSES:
         subset = data[data['purpose'] == purpose].copy()
+        # Filter rows to ptypes valid for this purpose (e.g. no Preschool in work).
+        _allowed_ptypes = MNLTimingModel.PTYPE_ALLOWLIST.get(purpose)
+        if _allowed_ptypes is not None and 'ptype' in subset.columns:
+            subset = subset[subset['ptype'].isin(_allowed_ptypes)].copy()
         if len(subset) < min_sample:
             logger.warning(f"  timing/{purpose}: {len(subset)} obs — skipping")
             continue
@@ -669,16 +836,24 @@ def estimate_timing_models(
             continue
 
         m = MNLTimingModel()
+        m.purpose_ = purpose
         m.ptypes_ = ptypes
-        m.feature_override_ = _timing_person_features(data, purpose, feature_override)
+        # Filter feature_override to exclude ptype dummies for disallowed ptypes
+        _fo = _timing_person_features(data, purpose, feature_override)
+        if _allowed_ptypes is not None:
+            _fo = [f for f in _fo
+                   if not (f.startswith('ptype_') and f[len('ptype_'):] not in _allowed_ptypes)]
+        m.feature_override_ = _fo
         X = m._build_X(subset)
         m.fit(X, y)
+        _X_for_prune = X
 
         if (not m.converged_) or (not np.isfinite(m.rho2_)) or (m.rho2_ < 0):
             logger.warning(f"  timing/{purpose}: retrying with reduced person features")
             m2 = MNLTimingModel()
+            m2.purpose_ = purpose
             m2.ptypes_ = ptypes
-            m2.feature_override_ = _timing_person_features(data, purpose, feature_override)
+            m2.feature_override_ = _fo
             m2.include_person_features_ = False
             X2 = m2._build_X(subset)
             m2.fit(X2, y)
@@ -688,6 +863,69 @@ def estimate_timing_models(
                     f"{m.rho2_ if np.isfinite(m.rho2_) else float('nan'):.3f} -> {m2.rho2_:.3f}"
                 )
                 m = m2
+                _X_for_prune = X2
+
+        # Iterative p-value + magnitude pruning \u2014 drop features insignificant
+        # across ALL non-base periods.  Purpose dummies and structural timing
+        # features are never pruned (they encode intercepts and activity state).
+        _s4_zthresh = float(os.environ.get('GA_SIG_COEF_ZERO', '0.01'))
+        _s4_pthresh = float(os.environ.get('GA_SIG_PVAL_THRESH', '0.10'))
+        _S4_STRUCTURAL = frozenset({'day_position', 'time_consumed', 'duration_min', 'time_remaining'})
+        for _s4_round in range(3):
+            _s4_pv = getattr(m, 'p_value_', None)
+            _s4_coef = getattr(m, 'coef_', None)
+            if _s4_pv is None or _s4_coef is None:
+                break
+            _s4_F = _s4_coef.shape[1]
+            _s4_K1 = _s4_coef.shape[0]
+            if _s4_F <= 1 or len(_s4_pv) < _s4_K1 * _s4_F:
+                break
+            _s4_pv_mat = np.asarray(_s4_pv[:_s4_K1 * _s4_F]).reshape(_s4_K1, _s4_F)
+            _s4_coef_mat = np.asarray(_s4_coef)
+            _s4_fnames = m.feature_names_ or []
+            _s4_keep = np.ones(_s4_F, dtype=bool)
+            for _s4_fi in range(_s4_F):
+                _s4_fn = _s4_fnames[_s4_fi] if _s4_fi < len(_s4_fnames) else ''
+                if _s4_fn.startswith('purp_') or _s4_fn in _S4_STRUCTURAL:
+                    continue
+                _s4_fi_pv = _s4_pv_mat[:, _s4_fi]
+                _s4_fi_co = _s4_coef_mat[:, _s4_fi]
+                _all_insig = np.all(~np.isfinite(_s4_fi_pv) | (_s4_fi_pv > _s4_pthresh))
+                _all_small = np.all(np.abs(_s4_fi_co) < _s4_zthresh)
+                if _all_insig or _all_small:
+                    _s4_keep[_s4_fi] = False
+            _s4_keep_idx = np.where(_s4_keep)[0]
+            if len(_s4_keep_idx) == _s4_F or len(_s4_keep_idx) == 0:
+                break
+            _s4_new_names = [_s4_fnames[i] for i in _s4_keep_idx]
+            _s4_Xp = _X_for_prune[:, _s4_keep_idx]
+            # Decompose kept names back into model config so _build_X at
+            # prediction time produces the same pruned columns.
+            # Include structural features in feature_override_ at their original
+            # position so that deduplication in _build_X preserves column order
+            # (structural features must stay between GA features and PERSON_FEATURES).
+            _s4_kept_ptypes = [n[len('ptype_'):] for n in _s4_new_names
+                                if n.startswith('ptype_')]
+            _s4_kept_cont = [n for n in _s4_new_names
+                             if not n.startswith('purp_')
+                             and not n.startswith('ptype_')]
+            _s4_mp = MNLTimingModel()
+            _s4_mp.purpose_ = m.purpose_
+            _s4_mp.ptypes_ = _s4_kept_ptypes
+            _s4_mp.include_person_features_ = False
+            _s4_mp.feature_override_ = _s4_kept_cont
+            _s4_mp.feature_names_ = _s4_new_names
+            _s4_mp.fit(_s4_Xp, y)
+            _s4_mp.feature_names_ = _s4_new_names
+            if not np.isfinite(_s4_mp.rho2_) or _s4_mp.rho2_ < 0:
+                break
+            logger.info(
+                f"  timing/{purpose} prune round {_s4_round + 1}: "
+                f"{_s4_F} \u2192 {len(_s4_keep_idx)} features, "
+                f"rho\u00b2={_s4_mp.rho2_:.3f}"
+            )
+            m = _s4_mp
+            _X_for_prune = _s4_Xp
 
         m.fit_within_period_offsets(subset)
         m.period_blend_alpha_ = float(
@@ -761,6 +999,9 @@ def build_schedule(
     person_feats  = {col: df[col].to_numpy(dtype=float)
                      if col in df.columns else np.zeros(n)
                      for col in PERSON_FEATURES}
+    acc_feats     = {col: df[col].to_numpy(dtype=float)
+                     if col in df.columns else np.zeros(n)
+                     for col in ACC_FEATURES}
     ptypes        = df['ptype'].tolist() if 'ptype' in df.columns else ['NonWorker'] * n
 
     startimes = np.empty(n, dtype=float)
@@ -785,6 +1026,8 @@ def build_schedule(
             }
             for col in PERSON_FEATURES:
                 feat_dict[col] = float(person_feats[col][i])
+            for col in ACC_FEATURES:
+                feat_dict[col] = float(acc_feats[col][i])
 
             # Single-row DataFrame built from pre-computed dict
             feat_row   = pd.DataFrame([feat_dict])

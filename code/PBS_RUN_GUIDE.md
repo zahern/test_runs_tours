@@ -12,6 +12,67 @@ This document explains the new PBS launcher files and the commands they submit.
   Main entry point for `main`, `ga`, `ga_staged`, `safety_baseline`, and `safety_nosafety`.
 - `safety_experiment_analysis.py`
   Post-processing script for the safety experiment comparison.
+- `_run_ga_single_stage.py`
+  Runs exactly one GA stage (1-5) and writes a one-stage `ga_results.pkl` artifact.
+- `merge_ga_results.py`
+  Merges per-stage GA artifacts into one combined `ga_results.pkl`.
+- `job_ga_stage_single.pbs`
+  PBS worker that runs one GA stage (used by fan-out stage jobs).
+- `job_merge_ga_results.pbs`
+  PBS worker that merges completed stage outputs.
+- `job_submit_ga_parallel_chain.pbs`
+  PBS submitter job that launches stage 1..5 in parallel, then merge, then `ga_staged` prediction.
+
+## Parallel Stage Chain (GA Fan-out + Merge + Prediction)
+
+This workflow is for running stages `1..5` simultaneously across separate PBS jobs,
+joining the stage models, then running `ga_staged` validation/prediction from the
+merged `ga_results.pkl`.
+
+### One-command submit
+
+```bash
+qsub -v RUN_TAG=exp_sa_parallel_001,GA_ESTIMATOR=sa_bandit,GA_BUDGET=fast,GA_N_RESTARTS=0 job_submit_ga_parallel_chain.pbs
+```
+
+What the submitter does:
+
+1. Submits 5 stage jobs in parallel (`job_ga_stage_single.pbs`): stage 1,2,3,4,5.
+2. Submits merge job (`job_merge_ga_results.pbs`) with `afterok` dependency on all 5 jobs.
+3. Submits prediction job (`pbs_pipeline_mode.pbs` with `MODE=ga_staged`) dependent on merge,
+   with `GA_STAGED_REUSE_ESTIMATOR=1` and `GA_STAGED_GA_DIR=<RUN_ROOT>/<RUN_TAG>/merged`.
+
+### Key environment variables
+
+- `RUN_TAG`
+  Logical experiment id. Artifacts are written under `RUN_ROOT/<RUN_TAG>/...`.
+- `RUN_ROOT`
+  Base directory for parallel-stage artifacts (default `runs/ga_parallel`).
+- `GA_ESTIMATOR`
+  Estimator selection (default `sa_bandit`).
+- `GA_BUDGET`
+  Budget profile (`smoke|ultrafast|fast|standard|thorough`).
+- `GA_N_RESTARTS`
+  Restart count override (default `0` in the parallel chain).
+- `STAGE_SELECT`, `STAGE_WALLTIME`
+  Resource shape for each stage job.
+- `PRED_SELECT`, `PRED_WALLTIME`
+  Resource shape for the final `ga_staged` prediction job.
+
+### Typical resource override example
+
+```bash
+qsub -v RUN_TAG=exp1,GA_ESTIMATOR=sa_bandit,GA_BUDGET=standard,GA_N_RESTARTS=0,STAGE_SELECT=1:ncpus=8:mem=128GB,STAGE_WALLTIME=36:00:00,PRED_SELECT=1:ncpus=8:mem=250GB,PRED_WALLTIME=24:00:00 job_submit_ga_parallel_chain.pbs
+```
+
+### Outputs
+
+- Stage artifacts:
+  `runs/ga_parallel/<RUN_TAG>/stage1/ ... stage5/`
+- Merged artifact for reuse:
+  `runs/ga_parallel/<RUN_TAG>/merged/ga_results.pkl`
+- Final prediction/validation run:
+  standard `ga_staged` run directory under `RUN_ROOT` (managed by `pipeline_logger.py`).
 
 ## Run Isolation
 

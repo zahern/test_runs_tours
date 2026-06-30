@@ -307,6 +307,26 @@ def build_person_profiles(df: pd.DataFrame) -> pd.DataFrame:
     for pt in PTYPES:
         d[f'ptype_{pt}'] = (d['ptype'] == pt).astype(np.int8)
 
+    # WORKSTAT (0=not working, 1=fulltime, 2=parttime) and STUDYING (0=none,
+    # 1=primary, 2=secondary, 3=tertiary PT, 4=tertiary FT) are nominal codes
+    # with no meaningful linear scale — break them into per-category binary
+    # indicators (like ptype_*) so the GA/estimators treat them as binaries
+    # rather than as categorical/ordinal codes. Built here so estimation
+    # (HHTS) and prediction (synth pop) derive identical columns.
+    if 'WORKSTAT' in d.columns:
+        ws_num = pd.to_numeric(d['WORKSTAT'], errors='coerce').fillna(0).astype(int)
+        d['workstat_fulltime']   = (ws_num == 1).astype(np.int8)
+        d['workstat_parttime']   = (ws_num == 2).astype(np.int8)
+        d['workstat_notworking'] = (ws_num == 0).astype(np.int8)
+
+    if 'STUDYING' in d.columns:
+        stud_num = pd.to_numeric(d['STUDYING'], errors='coerce').fillna(0).astype(int)
+        d['studying_none']        = (stud_num == 0).astype(np.int8)
+        d['studying_primary']     = (stud_num == 1).astype(np.int8)
+        d['studying_secondary']   = (stud_num == 2).astype(np.int8)
+        d['studying_tertiary_pt'] = (stud_num == 3).astype(np.int8)
+        d['studying_tertiary_ft'] = (stud_num == 4).astype(np.int8)
+
     ag = pd.to_numeric(
         d.get('AGEGROUP', d.get('age5p', pd.Series(6, index=d.index))),
         errors='coerce').fillna(6).astype(int)
@@ -452,15 +472,12 @@ def estimate_cdap(persons: pd.DataFrame,
     """
     Estimate CDAP model on QTS HHTS persons using Larch MNL + MXL.
 
-    Previously used compute_engine='jax' which caused OOM on the HPC —
-    JAX pre-allocates the full (n_persons × n_alts × n_features) tensor
-    in device memory before any computation. With 23k persons × 3 alts
-    × 20 features this exceeds the cgroup memory limit.
-
-    Fix: compute_engine='numba' — Larch compiles flows with numba instead
-    of JAX/XLA. Numba allocates memory lazily per-case rather than as a
-    monolithic tensor, so memory use is proportional to n_cases not
-    n_cases × n_alts × n_features × sizeof(float32).
+    Uses compute_engine='jax' — Larch compiles the MNL log-likelihood
+    and gradient via XLA/JAX for GPU acceleration.  The CDAP model is
+    small (23k persons × 3 alts × 20 features ≈ 5.5 MB) so JAX memory
+    footprint is negligible.  With XLA_PYTHON_CLIENT_PREALLOCATE=false
+    (set in pbs_pipeline_mode.pbs for bandit+GPU), JAX allocates GPU
+    memory on-demand rather than pre-allocating.
     """
     print("\n[1/2] Estimating from HHTS...")
     data = prepare_cdap_data(persons)
@@ -490,9 +507,9 @@ def estimate_cdap(persons: pd.DataFrame,
     dt = lx.DataTree(base=ds_ca, person=ds_co,
                      relationships=('base.person_id @ person.person_id',))
 
-    # ── MNL (numba engine — avoids JAX OOM) ──────────────────────────────────
-    print("  Estimating MNL (numba engine)...")
-    mnl = lx.Model(dt, compute_engine='numba')
+    # ── MNL (JAX engine — GPU-accelerated) ──────────────────────────────────
+    print("  Estimating MNL (JAX engine)...")
+    mnl = lx.Model(dt, compute_engine='jax')
     mnl.choice_ca_var = 'chosen'
     mnl.utility_co[1] = lx.P('ASC_N')
     mnl.utility_co[2] = lx.P('ASC_M')
@@ -513,8 +530,8 @@ def estimate_cdap(persons: pd.DataFrame,
     _fill_larch_inference(mnl)
     _print_larch_table(mnl, "CDAP MNL")
 
-    # ── MXL (numba engine, full sample) ──────────────────────────────────────
-    print(f"\n  Estimating Mixed Logit (200 draws, numba)...")
+    # ── MXL (JAX engine, full sample) ──────────────────────────────────────
+    print(f"\n  Estimating Mixed Logit (200 draws, JAX)...")
     mxl = mnl.copy()
     for feat in MXL_RANDOM:
         for prefix in ['b_N_', 'b_M_']:
@@ -598,7 +615,7 @@ def _estimate_mxl_subsample(sub: pd.DataFrame,
                      relationships=('base.person_id @ person.person_id',))
 
     # simple MNL first (starting point for MXL)
-    mnl = lx.Model(dt, compute_engine='numba')
+    mnl = lx.Model(dt, compute_engine='jax')
     mnl.choice_ca_var = 'chosen'
     mnl.utility_co[1] = lx.P('ASC_N')
     mnl.utility_co[2] = lx.P('ASC_M')
@@ -777,7 +794,7 @@ def predict_cdap(synth: pd.DataFrame, result: dict, seed: int = 42) -> pd.DataFr
 
             # Build a fresh model against dt_pred, transfer fitted parameters.
             # Some Larch versions don't support mnl.datatree = ... on a loaded model.
-            fresh = lx.Model(dt_pred, compute_engine='numba')
+            fresh = lx.Model(dt_pred, compute_engine='jax')
             fresh.choice_ca_var = 'chosen'
             fresh.utility_co[1] = lx.P('ASC_N')
             fresh.utility_co[2] = lx.P('ASC_M')

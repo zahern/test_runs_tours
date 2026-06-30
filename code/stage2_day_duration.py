@@ -62,12 +62,12 @@ ACTIVITY_COLS = [
 ]
 
 # Person-level predictors
-PERSON_FEATURES = ['sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING', 'incp']
+PERSON_FEATURES = ['sexp', 'vehrd', 'nprd', 'incp']
 
 DEFAULT_FEATURES_BY_TARGET = {
-    'start': ['WORKSTAT', 'STUDYING', 'vehrd', 'wfh', 'WFHWEEK', 'sexp', 'nprd'],
-    'end': ['WORKSTAT', 'STUDYING', 'vehrd', 'sexp', 'nprd'],
-    'budget': ['WORKSTAT', 'STUDYING', 'vehrd', 'incp', 'sexp', 'nprd'],
+    'start': ['vehrd', 'wfh', 'WFHWEEK', 'sexp', 'nprd'],
+    'end': ['vehrd', 'sexp', 'nprd'],
+    'budget': ['vehrd', 'incp', 'sexp', 'nprd'],
 }
 
 
@@ -640,6 +640,8 @@ def estimate_day_models(person_day: pd.DataFrame,
     # OLS on clipped data attenuates coefficients because obs censored at
     # MIN_START are treated as if that was their true value.  Tobit models
     # the latent departure time correctly.
+    _s2_zthresh = float(os.environ.get('GA_SIG_COEF_ZERO', '0.01'))
+    _s2_pthresh = float(os.environ.get('GA_SIG_PVAL_THRESH', '0.10'))
     _pf = _stage2_person_features(feature_override, 'start', person_day)
     derived_feats = ['n_mandatory', 'n_discretionary', 'mandatory_share', 'escort_share', 'vehs_per_person', 'income_per_person']
     start_feats = ACTIVITY_COLS + derived_feats + _pf
@@ -648,6 +650,24 @@ def estimate_day_models(person_day: pd.DataFrame,
     m_start = TobitModel(lo=MIN_START, hi=MAX_START, log_y=False)
     m_start.fit(X_start, y_start)
     m_start.feature_names_ = start_cols
+    for _r in range(3):
+        if len(start_cols) <= 1:
+            break
+        _pv = getattr(m_start, 'p_value_', None)
+        _co = np.asarray(m_start.coef_).ravel()
+        if _pv is None or len(_pv) < len(start_cols) + 1:
+            break
+        _fv = _pv[1:len(start_cols) + 1]
+        _ki = [i for i in range(len(start_cols))
+               if not ((i < len(_co) and abs(_co[i]) < _s2_zthresh)
+                       or (np.isfinite(_fv[i]) and _fv[i] > _s2_pthresh))]
+        if len(_ki) == 0 or len(_ki) == len(start_cols):
+            break
+        X_start = X_start[:, _ki]
+        start_cols = [start_cols[i] for i in _ki]
+        m_start = TobitModel(lo=MIN_START, hi=MAX_START, log_y=False)
+        m_start.fit(X_start, y_start)
+        m_start.feature_names_ = start_cols
     logger.info(f"start_of_day Tobit  RMSE={m_start.rmse_:.1f} min  LL={m_start.ll_:.1f}")
 
     # â”€â”€ end_of_day â€” Tobit right-censored at MAX_END â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -662,10 +682,33 @@ def estimate_day_models(person_day: pd.DataFrame,
 
     y_end = person_day['end_of_day'].clip(MIN_END, MAX_END).values
 
+    _end_maxiter = int(os.environ.get('STAGE2_TOBIT_MAXITER', '2000'))
     m_end = TobitModel(lo=MIN_END, hi=MAX_END, log_y=False, ridge=0.05)
-    m_end.fit(X_end, y_end, maxiter=2000)
+    m_end.fit(X_end, y_end, maxiter=_end_maxiter)
     m_end.feature_names_ = end_cols
-    logger.info(f"end_of_day Tobit    RMSE={m_end.rmse_:.1f} min  LL={m_end.ll_:.1f}")
+    for _r in range(3):
+        if len(end_cols) <= 2:
+            break
+        _pv = getattr(m_end, 'p_value_', None)
+        _co = np.asarray(m_end.coef_).ravel()
+        if _pv is None or len(_pv) < len(end_cols) + 1:
+            break
+        _fv = _pv[1:len(end_cols) + 1]
+        _ki = [i for i in range(len(end_cols))
+               if end_cols[i] == 'start_pred'
+               or not ((i < len(_co) and abs(_co[i]) < _s2_zthresh)
+                       or (np.isfinite(_fv[i]) and _fv[i] > _s2_pthresh))]
+        if len(_ki) == 0 or len(_ki) == len(end_cols):
+            break
+        X_end = X_end[:, _ki]
+        end_cols = [end_cols[i] for i in _ki]
+        m_end = TobitModel(lo=MIN_END, hi=MAX_END, log_y=False, ridge=0.05)
+        m_end.fit(X_end, y_end, maxiter=_end_maxiter)
+        m_end.feature_names_ = end_cols
+    logger.info(
+        f"end_of_day Tobit    RMSE={m_end.rmse_:.1f} min  LL={m_end.ll_:.1f}  "
+        f"maxiter={_end_maxiter}"
+    )
 
     # â”€â”€ budget B â€” lognormal OLS (soft boundaries, no censoring) â”€â”€â”€â”€â”€â”€
     _pf_budget = _stage2_person_features(feature_override, 'budget', person_day)
@@ -676,6 +719,24 @@ def estimate_day_models(person_day: pd.DataFrame,
     m_budget = LinearModel(log_y=True)
     m_budget.fit(X_budget, y_budget)
     m_budget.feature_names_ = budget_cols
+    for _r in range(3):
+        if len(budget_cols) <= 1:
+            break
+        _pv = getattr(m_budget, 'p_value_', None)
+        _co = np.asarray(m_budget.coef_).ravel()
+        if _pv is None or len(_pv) < len(budget_cols) + 1:
+            break
+        _fv = _pv[1:len(budget_cols) + 1]
+        _ki = [i for i in range(len(budget_cols))
+               if not ((i < len(_co) and abs(_co[i]) < _s2_zthresh)
+                       or (np.isfinite(_fv[i]) and _fv[i] > _s2_pthresh))]
+        if len(_ki) == 0 or len(_ki) == len(budget_cols):
+            break
+        X_budget = X_budget[:, _ki]
+        budget_cols = [budget_cols[i] for i in _ki]
+        m_budget = LinearModel(log_y=True)
+        m_budget.fit(X_budget, y_budget)
+        m_budget.feature_names_ = budget_cols
     logger.info(f"budget lognormal    RMSE={m_budget.rmse_:.3f} hrs")
 
     print(
@@ -722,7 +783,8 @@ def predict_day_budget(
 
     Requires synth to have:
       - n_{purpose}_out columns  (from Stage 1)
-      - person attributes: sexp, vehrd, nprd, WORKSTAT, STUDYING, incp
+      - person attributes: sexp, vehrd, nprd, incp
+      - WORKSTAT, STUDYING are used only to derive ptype column
       - ptype column (or will be derived)
 
     Parameters

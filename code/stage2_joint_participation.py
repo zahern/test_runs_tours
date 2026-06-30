@@ -27,7 +27,7 @@ Two econometric approaches are implemented and compared:
         correlated with the duration (B) given travel.
 
         Identification: ideally at least one variable in Z not in X.
-        Natural candidates: day_of_week, household_size (nprd), STUDYING
+        Natural candidates: day_of_week, household_size (nprd)
         if not already in outcome equation.
 
         When IMR coefficient is not significant (p > 0.1), selection bias
@@ -88,7 +88,7 @@ from stage2_day_duration import (
 
 # Selection equation can use additional sociodemographic signals that may
 # predict the *decision* to travel but not necessarily the *duration*.
-SELECTION_EXTRA = ['nprd', 'STUDYING']   # household size, student status
+SELECTION_EXTRA = ['nprd']   # household size
 
 
 # ---------------------------------------------------------------------------
@@ -1179,8 +1179,8 @@ The Heckman model corrects for this via the IMR term.</p>
 <ul>
 <li><b>Identification</b>: The Heckman model requires at least one variable in the selection
     equation not appearing in the outcome equation (exclusion restriction) for proper
-    identification.  Here <code>STUDYING</code> and <code>nprd</code> (household size)
-    serve as candidates — valid if they predict whether someone travels but not how long.</li>
+    identification.  Here <code>nprd</code> (household size) serves as a candidate
+    — valid if it predicts whether someone travels but not how long.</li>
 <li><b>Tobit I consistency</b>: Tobit I is fully efficient under homoskedasticity and
     normality of errors.  If these fail (test with residual plots), consider a
     generalised Tobit or semi-parametric alternatives.</li>

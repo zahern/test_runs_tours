@@ -1,0 +1,30 @@
+{
+  "results": {
+    "01_build_zone_mapping.py": {
+      "status": "SUCCESS",
+      "returncode": 0,
+      "elapsed_s": 2.5
+    },
+    "02_build_hhts_od.py": {
+      "status": "SUCCESS",
+      "returncode": 0,
+      "elapsed_s": 10.4
+    },
+    "03_build_synth_pop_od.py": {
+      "status": "SUCCESS",
+      "returncode": 0,
+      "elapsed_s": 25.2
+    },
+    "04_build_demand_omx.py": {
+      "status": "SUCCESS",
+      "returncode": 0,
+      "elapsed_s": 15.8
+    },
+    "05_build_zone_polygons.py": {
+      "status": "SUCCESS",
+      "returncode": 0,
+      "elapsed_s": 71.9
+    }
+  },
+  "all_success": true
+}

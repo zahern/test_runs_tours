@@ -1,0 +1,7 @@
+stage,group,feature
+5,mode,bikes
+5,mode,is_female
+5,mode,nprd
+5,mode,vehrd
+5,mode,CRASH
+5,dest,incp

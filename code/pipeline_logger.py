@@ -48,6 +48,40 @@ if os.environ.get('DEBUG_JAX_BACKEND', '0') == '1':
 import matplotlib
 matplotlib.use('Agg')
 
+# ── Monkey-patch: fix jnp.linalg.inv → scipy.linalg.inv for CUDA 13 ──────
+# jaxlib 0.4.30 on CUDA 13 crashes at cusolver_gesvdj_ffi (symbol removed in
+# CUDA 13).  Larch's jax_invhess_loglike() calls jnp.linalg.inv(hess) which
+# XLA routes to CUDA's SVD.  We replace it with scipy.linalg.inv on CPU.
+# This only affects the Hessian inversion — optimisation gradients still use GPU.
+def _patch_jax_linalg():
+    """Replace jnp.linalg.inv with a scipy-based fallback for CUDA 13 compat."""
+    try:
+        import jax.numpy as jnp
+        import scipy.linalg as _splinalg
+        _orig_inv = jnp.linalg.inv
+
+        def _safe_inv(a):
+            """jnp.linalg.inv replacement using scipy (CPU) to avoid CUDA 13 SVD crash."""
+            arr = np.asarray(a, dtype=np.float64)
+            inv_arr = _splinalg.inv(arr)
+            return jnp.asarray(inv_arr)
+
+        jnp.linalg.inv = _safe_inv
+        # Also patch the jax.scipy.linalg path that some JAX ops use
+        import jax.scipy.linalg as _jslinalg
+        if hasattr(_jslinalg, 'inv'):
+            _jslinalg.inv = _safe_inv
+        return True
+    except Exception:
+        return False
+
+_PATCHED_LINALG = _patch_jax_linalg()
+if _PATCHED_LINALG:
+    import logging as _logging
+    _logging.getLogger('pipeline').info(
+        "JAX linalg.inv patched → scipy.linalg.inv (CUDA 13 cusolver_gesvdj_ffi workaround)"
+    )
+
 os.makedirs('saved_data', exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -1631,11 +1665,11 @@ def _write_stage_checkpoint_report(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @timer("Estimate Stage 1 — activity frequency")
-def estimate_stage1(out):
+def estimate_stage1(out, landuse=None):
     from stage1_activity_frequency import estimate_frequency_models, save_models, prepare_frequency_data
     import pandas as pd
     logger.info("  Preparing HHTS frequency data...")
-    models = estimate_frequency_models(out["tours"], out["persons"])
+    models = estimate_frequency_models(out["tours"], out["persons"], landuse=landuse)
     path = os.path.join(OUT_DIR, 'stage1_models.pkl')
     save_models(models, path)
     _save_stage_coef_csv(models, 'stage1', OUT_DIR)
@@ -3942,11 +3976,8 @@ def _format_ga_checkpoint_summary(res) -> dict:
 def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -> None:
     """
     Re-estimate stage `sid` using the GA's best-selected features and write
-    a coefficient HTML to the ga_reports/ subdir of OUT_DIR.
-
-    This gives coefficient tables with actual fitted values and t-stats in the
-    GA search run directory (not just in the ga_staged run).
-    Stage 5 fits Larch mode+destination models on HHTS using the best features.
+    coefficient HTML + models pkl to OUT_DIR (mirrors the main pipeline layout)
+    and also to the ga_reports/ subdir.
     """
     from ga_hypothesis_testing import _ga_save_stage_coef_csv
     if res is None:
@@ -3954,15 +3985,102 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
     best_feats = getattr(res, 'best_features', None)
     save_dir = os.path.join(OUT_DIR, 'ga_reports')
     os.makedirs(save_dir, exist_ok=True)
+
+    def _persist(models, stage_name):
+        """Save coefficients to both ga_reports/ and OUT_DIR, plus pkl to OUT_DIR, plus HTML."""
+        _ga_save_stage_coef_csv(models, stage_name, save_dir)
+        _ga_save_stage_coef_csv(models, stage_name, OUT_DIR)
+        _pkl_path = os.path.join(OUT_DIR, f'{stage_name}_models.pkl')
+        try:
+            with open(_pkl_path, 'wb') as _f:
+                pickle.dump(models, _f)
+            logger.info(f"GA {stage_name} models → {_pkl_path}")
+        except Exception as _pe:
+            logger.warning(f"GA {stage_name} pkl save failed: {_pe}")
+        # Write HTML coefficient table from the CSV data
+        _html_path = os.path.join(OUT_DIR, f'{stage_name}_coefficients.html')
+        try:
+            _csv_path = os.path.join(OUT_DIR, f'{stage_name}_coefficients.csv')
+            if os.path.exists(_csv_path):
+                import pandas as _pd_html
+                _df_coef = _pd_html.read_csv(_csv_path)
+                def _p_style(p):
+                    try:
+                        pf = float(p)
+                        if pf < 0.001: return "color:#1a7a1a;font-weight:bold"
+                        if pf < 0.01:  return "color:#2e7d32;font-weight:bold"
+                        if pf < 0.05:  return "color:#558b2f"
+                        if pf < 0.10:  return "color:#f57c00"
+                        return "color:#b71c1c"
+                    except Exception:
+                        return ""
+                rows_html = ""
+                for _, row in _df_coef.iterrows():
+                    p = row.get('p_value', row.get('pval', float('nan')))
+                    style = _p_style(p)
+                    cells = "".join(f"<td style='{style if c in ('p_value','pval','t_stat','t_stat_opg') else ''}'>{v}</td>"
+                                    for c, v in row.items())
+                    rows_html += f"<tr>{cells}</tr>"
+                headers = "".join(f"<th>{c}</th>" for c in _df_coef.columns)
+                html_body = (f"<table border='1' style='border-collapse:collapse;font-size:0.9em'>"
+                             f"<thead><tr>{headers}</tr></thead><tbody>{rows_html}</tbody></table>")
+                with open(_html_path, 'w', encoding='utf-8') as _fh:
+                    _fh.write(f"<html><body><h2>GA {stage_name} coefficients</h2>{html_body}</body></html>")
+                logger.info(f"GA {stage_name} coefficients HTML → {_html_path}")
+        except Exception as _he:
+            logger.warning(f"GA {stage_name} HTML write failed: {_he}")
+
     try:
-        if sid == 1:
+        if sid == 0:
+            # Stage 0: CDAP feature search — write a simple JSON + text summary.
+            # The CDAP model itself is saved via run_cdap's own cache path.
+            import json as _json
+            _s0_path = os.path.join(OUT_DIR, 'stage0_cdap_best_features.json')
+            _s0_summary = {
+                'best_features': list(best_feats) if best_feats else [],
+                'best_fitness':  float(getattr(res, 'best_fitness', float('nan'))),
+                'fitness_metric': str(getattr(res, 'fitness_metric', '')),
+                'n_features':    len(best_feats) if best_feats else 0,
+            }
+            with open(_s0_path, 'w', encoding='utf-8') as _f:
+                _json.dump(_s0_summary, _f, indent=2, default=str)
+            logger.info(f"GA stage0 (CDAP) best features → {_s0_path}")
+            # Also write a plain-text report alongside the checkpoint
+            _s0_txt = os.path.join(OUT_DIR, 'stage0_cdap_report.txt')
+            with open(_s0_txt, 'w', encoding='utf-8') as _f:
+                _f.write(f"CDAP GA stage 0 — best feature set\n")
+                _f.write(f"fitness: {_s0_summary['best_fitness']:.6f}  ({_s0_summary['fitness_metric']})\n")
+                _f.write(f"n_features: {_s0_summary['n_features']}\n\n")
+                for feat in (_s0_summary['best_features'] or []):
+                    _f.write(f"  {feat}\n")
+            logger.info(f"GA stage0 (CDAP) text report → {_s0_txt}")
+        elif sid == 1:
             from stage1_activity_frequency import estimate_frequency_models
             models = estimate_frequency_models(
                 out['tours'], out['persons'],
                 feature_override=best_feats if isinstance(best_feats, list) else None,
+                landuse=landuse,
             )
-            _ga_save_stage_coef_csv(models, 'stage1', save_dir)
-            logger.info("GA stage 1 coefficient HTML saved to ga_reports/stage1_coefficients.html")
+            _persist(models, 'stage1')
+        elif sid == 23:
+            # Joint Stage 2+3 Weibull AFT model — already fitted by ga_stage23_joint.
+            # Re-persist from the metadata dict so coefficients land in OUT_DIR.
+            _j23_models = (res.metadata or {}).get('stage23_joint_models') if res else None
+            if _j23_models and _j23_models.get('success'):
+                _j23_pkl = os.path.join(OUT_DIR, 'stage23_joint_models.pkl')
+                with open(_j23_pkl, 'wb') as _f:
+                    pickle.dump(_j23_models, _f)
+                logger.info(f"GA stage23_joint models → {_j23_pkl}")
+                # Also copy to saved_data/ for downstream consumption
+                import shutil as _sh
+                _sd_pkl = os.path.join('saved_data', 'stage23_joint_models.pkl')
+                try:
+                    _sh.copy2(_j23_pkl, _sd_pkl)
+                    logger.info(f"GA stage23_joint models → {_sd_pkl}")
+                except Exception as _ce:
+                    logger.warning(f"stage23_joint copy to saved_data failed: {_ce}")
+            else:
+                logger.warning("_ga_save_stage_coef_html_from_best sid=23: no joint model in metadata")
         elif sid == 2:
             from stage2_day_duration import aggregate_person_day, estimate_day_models
             pd_df = aggregate_person_day(out['tours'], out['persons'])
@@ -3970,26 +4088,21 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                 pd_df,
                 feature_override=best_feats if isinstance(best_feats, list) else None,
             )
-            _ga_save_stage_coef_csv(models, 'stage2', save_dir)
-            logger.info("GA stage 2 coefficient HTML saved to ga_reports/stage2_coefficients.html")
+            _persist(models, 'stage2')
         elif sid == 3:
             from stage3_activity_duration import estimate_duration_models
             models = estimate_duration_models(
                 out['tours'], out['persons'], trips=out.get('trips'),
                 feature_override=best_feats if isinstance(best_feats, list) else None,
             )
-            _ga_save_stage_coef_csv(models, 'stage3', save_dir)
-            logger.info("GA stage 3 coefficient HTML saved to ga_reports/stage3_coefficients.html")
+            _persist(models, 'stage3')
         elif sid == 4:
             from stage4_schedule_placement import estimate_timing_models
-            # best_feats may be a per-purpose dict (not list) — pass directly;
-            # estimate_timing_models/_timing_person_features handles both.
             models = estimate_timing_models(
                 out['trips'], out['tours'], out['persons'],
                 feature_override=best_feats,
             )
-            _ga_save_stage_coef_csv(models, 'stage4', save_dir)
-            logger.info("GA stage 4 coefficient HTML saved to ga_reports/stage4_coefficients.html")
+            _persist(models, 'stage4')
         elif sid == 5:
             import openmatrix as omx
             from stage5_destination_choice import (
@@ -4005,7 +4118,6 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
             _s5_dest_feats = (best_feats.get('dest') if isinstance(best_feats, dict)
                               else (best_feats or []))
             _hhts_input = out.get('tours') or out.get('trips')
-            _s5_tours = _prep_hhts_tours(_hhts_input, out['persons'])
             _s5_models = {}
             _skims_hdl = omx.open_file(_skims_path, 'r')
             try:
@@ -4017,20 +4129,22 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                     logger.warning(f"GA stage 5 coef HTML: skim_flat failed: {_se}")
                 _lu = landuse if landuse is not None else getattr(res, 'metadata', {}).get('landuse')
                 for _seg in ['work', 'edu', 'nonmand']:
-                    _st = _filter_seg(_s5_tours, _seg)
-                    if len(_st) < 50:
-                        continue
                     try:
+                        _st = _filter_seg(_hhts_input, _seg)
+                        if not isinstance(_st, (pd.DataFrame, type(None))):
+                            _st = pd.DataFrame()
+                        if isinstance(_st, pd.DataFrame) and len(_st) < 50:
+                            continue
                         _dt_m = _mode_tree(_st, out['persons'], _lu, _skims_hdl)
                         _mode_mdl = _build_mode_model(_dt_m, _seg,
-                                                      custom_mode_vars=_s5_mode_feats)
+                                                       custom_mode_vars=_s5_mode_feats)
                         _mode_mdl = _estimate(_mode_mdl)
                         _ls = _logsums(_mode_mdl, _dt_m, skims=_skims_hdl, verbose=False)
                         _lu_st = _attach_size_term(_lu, _seg)
                         _lu_st, _seg_acdc = _attach_acdc_terms(_lu_st, _st, _skim_df, _seg)
                         _dt_d = _dest_tree(_seg_acdc, out['persons'], _lu_st, _skims_hdl, _ls)
                         _dest_mdl = _build_dest_model(_dt_d, _seg,
-                                                      custom_dest_vars=_s5_dest_feats)
+                                                       custom_dest_vars=_s5_dest_feats)
                         _dest_mdl = _estimate(_dest_mdl)
                         _s5_models[f'{_seg}_mode'] = _mode_mdl
                         _s5_models[f'{_seg}_dest'] = _dest_mdl
@@ -4039,10 +4153,61 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
             finally:
                 _skims_hdl.close()
             if _s5_models:
-                _ga_save_stage_coef_csv(_s5_models, 'stage5', save_dir)
-                logger.info(
-                    "GA stage 5 coefficient HTML saved to ga_reports/stage5_coefficients.html"
-                )
+                # Convert flat {seg_mode, seg_dest} → nested {seg: {mode_model, dest_model}}
+                # required by save_models() and _write_smoke_models_html()
+                _s5_nested = {}
+                for _seg in ['work', 'edu', 'nonmand']:
+                    _mm = _s5_models.get(f'{_seg}_mode')
+                    _dm = _s5_models.get(f'{_seg}_dest')
+                    if _mm is not None or _dm is not None:
+                        _s5_nested[_seg] = {'mode_model': _mm, 'dest_model': _dm}
+                if _s5_nested:
+                    from stage5_destination_choice import save_models as _s5_save
+                    _s5_pkl = os.path.join(OUT_DIR, 'stage5_models.pkl')
+                    try:
+                        _s5_save(_s5_nested, _s5_pkl)
+                        logger.info(f"GA stage5 models → {_s5_pkl}")
+                    except Exception as _sp:
+                        logger.warning(f"GA stage5 save_models failed: {_sp}")
+                        try:
+                            with open(_s5_pkl, 'wb') as _f:
+                                pickle.dump(_s5_nested, _f)
+                        except Exception:
+                            pass
+                    try:
+                        _write_smoke_models_html(
+                            _s5_nested, OUT_DIR,
+                            title='GA Stage 5 \u2014 Best Feature Model Coefficients',
+                        )
+                    except Exception as _sh:
+                        logger.warning(f"GA stage5 HTML write failed: {_sh}")
+            # Fallback: always write a basic CSV from GA best-features summary
+            # even when model re-estimation fails, so downstream consumers can
+            # see what features were selected.
+            try:
+                _s5_basic_rows = []
+                if isinstance(best_feats, dict):
+                    for _k, _v in best_feats.items():
+                        _s5_basic_rows.append({'segment': str(_k), 'param': 'GA_selected',
+                                                'value': ', '.join(map(str, _v)) if isinstance(_v, (list, tuple)) else str(_v)})
+                elif best_feats:
+                    _s5_basic_rows.append({'segment': 'all', 'param': 'GA_selected',
+                                            'value': ', '.join(map(str, best_feats))})
+                if _s5_basic_rows:
+                    import pandas as _pd
+                    _basic_csv = os.path.join(OUT_DIR, 'stage5_coefficients.csv')
+                    _pd.DataFrame(_s5_basic_rows).to_csv(_basic_csv, index=False)
+                    logger.info(f"GA stage5 feature summary CSV → {_basic_csv}")
+                    _html_path = os.path.join(OUT_DIR, 'stage5_coefficients.html')
+                    try:
+                        _pd.DataFrame(_s5_basic_rows).to_html(_html_path, index=False,
+                            border=1, justify='left',
+                            classes='table', escape=True)
+                        logger.info(f"GA stage5 feature summary HTML → {_html_path}")
+                    except Exception:
+                        pass
+            except Exception as _fb:
+                logger.warning(f"GA stage5 fallback summary write failed: {_fb}")
     except Exception as _exc:
         logger.warning(f"GA stage {sid} coef HTML from best features failed: {_exc}")
 
@@ -4087,7 +4252,8 @@ def _run_ga_stages_with_checkpoints(out, landuse):
     os.environ['GA_CHECKPOINT_DIR'] = OUT_DIR
 
     _stages = [
-        (1, lambda: ga_stage1(out)),
+        (0, lambda: ga_stage0(out)),
+        (1, lambda: ga_stage1(out, landuse)),
         (2, lambda: ga_stage2(out)),
         (3, lambda: ga_stage3(out)),
         (4, lambda: ga_stage4(out)),
@@ -4197,13 +4363,37 @@ def _ga_budget_params() -> dict:
     params = dict(budgets[level])
 
     est = os.environ.get('GA_ESTIMATOR', 'default').strip().lower()
-    # MetaCount/SearchLibrium circuit-breakers prevent wasted evaluations;
-    # use the same budget as the default estimator so coverage is equivalent.
+    # MetaCount / SearchLibrium evaluations are 5-30× more expensive than
+    # default statsmodels, so using the standard budget (>15k evals per
+    # purpose) causes multi-day runs.  We override the budget level to
+    # 'ultrafast' (~750 evals) unless the user explicitly chose a budget.
+    # Set GA_BUDGET to 'fast' or 'standard' to opt in to heavier search.
     if est in ('metacount', 'searchlibrium', 'both', 'hybrid'):
-        logger.info(
-            f"GA estimator={est!r}: using full budget "
-            f"pop={params['pop_size']} gens={params['n_generations']} restarts={params['n_restarts']}"
-        )
+        _user_budget = os.environ.get('GA_BUDGET', '').strip().lower()
+        if not _user_budget:
+            os.environ['GA_BUDGET'] = 'ultrafast'
+            params = dict(budgets['ultrafast'])
+            logger.info(
+                f"GA estimator={est!r}: MetaCount is 5-30× slower per eval; "
+                f"auto-setting GA_BUDGET='ultrafast' "
+                f"(pop={params['pop_size']} gens={params['n_generations']} "
+                f"restarts={params['n_restarts']}).  "
+                f"Set GA_BUDGET=fast/standard/thorough explicitly to override."
+            )
+        else:
+            logger.info(
+                f"GA estimator={est!r}: using user-requested budget '{_user_budget}' "
+                f"pop={params['pop_size']} gens={params['n_generations']} "
+                f"restarts={params['n_restarts']}"
+            )
+
+    # Optional hard override for restart count (useful for uninterrupted SA-bandit runs).
+    _n_restarts_env = os.environ.get('GA_N_RESTARTS', '').strip()
+    if _n_restarts_env:
+        try:
+            params['n_restarts'] = max(0, int(_n_restarts_env))
+        except ValueError:
+            logger.warning(f"Ignoring invalid GA_N_RESTARTS={_n_restarts_env!r}; expected integer >= 0")
 
     logger.info(f"GA budget level: {level!r} → pop={params['pop_size']}  "
                 f"gens={params['n_generations']}  restarts={params['n_restarts']}")
@@ -4335,11 +4525,20 @@ def _ga_plot_stage_result(res, save_path: str) -> None:
     logger.info(f"  GA plot saved → {save_path}  ({n} segment(s))")
 
 
+@timer("GA — Stage 0 (CDAP activity pattern)")
+def ga_stage0(out):
+    from census_bridge import run_ga_cdap
+    _bp = _ga_budget_params()
+    res = run_ga_cdap(out["persons"], **_bp)
+    _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage0.png'))
+    return res
+
+
 @timer("GA — Stage 1 (activity frequency)")
-def ga_stage1(out):
+def ga_stage1(out, landuse=None):
     from census_bridge import run_ga_stage1
     _bp = _ga_budget_params()
-    res = run_ga_stage1(out["tours"], out["persons"], **_bp)
+    res = run_ga_stage1(out["tours"], out["persons"], landuse=landuse, **_bp)
     _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage1.png'))
     return res
 
@@ -4359,6 +4558,49 @@ def ga_stage3(out):
     _bp = _ga_budget_params()
     res = run_ga_stage3(out["tours"], out["persons"], trips=out["trips"], **_bp)
     _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage3.png'))
+    return res
+
+
+@timer("GA — Stage 2+3 Joint (budget-constrained)")
+def ga_stage23_joint(out):
+    """
+    Joint SA-Bandit search over a shared Stage 2+3 feature pool.
+
+    Activated via STAGE23_JOINT=1.  Replaces the separate ga_stage2 + ga_stage3
+    calls with a single metaheuristic search that:
+      1. Optimises a shared feature set against a fast OLS-BIC joint oracle
+         (stage23_fitness_joint — <2 ms per eval, ~3000 evals in <5 min)
+      2. After convergence, runs fit_joint_stage23 once with the winning features
+         to produce the final JAX-optimised budget-constrained model.
+
+    Saves stage23_joint_models.pkl and stage23_joint_summary.txt to OUT_DIR.
+    """
+    import pickle
+    from ga_hypothesis_testing import _run_ga_stage23_joint
+    _bp = _ga_budget_params()
+    _n_restarts = _bp.pop('n_restarts', 2)
+    res = _run_ga_stage23_joint(
+        tours=out["tours"], persons=out["persons"],
+        trips=out.get("trips"),
+        ga_kwargs=_bp,
+        n_restarts=_n_restarts,
+    )
+    _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage23_joint.png'))
+
+    # Persist the final JAX joint model
+    final_models = (res.metadata or {}).get('stage23_joint_models')
+    if final_models:
+        pkl_path = os.path.join(OUT_DIR, 'stage23_joint_models.pkl')
+        with open(pkl_path, 'wb') as fh:
+            pickle.dump(final_models, fh)
+        logger.info(f"Joint Stage 2+3 model → {pkl_path}")
+
+        summary_path = os.path.join(OUT_DIR, 'stage23_joint_summary.txt')
+        from stage23_joint import joint_model_summary
+        with open(summary_path, 'w') as fh:
+            fh.write(joint_model_summary(final_models))
+
+    out['stage23_joint_models'] = final_models
     return res
 
 
@@ -4450,12 +4692,20 @@ def _write_smoke_models_html(models: dict, save_dir: str, title: str = 'Stage 5 
                 try:
                         coef = _coef_dict_from_model(mdl)
                         pf = None
-                        if hasattr(mdl, '_final_pf') and isinstance(mdl._final_pf, pd.DataFrame):
-                                pf = mdl._final_pf
-                        else:
-                                try: pf = mdl.pf
-                                except Exception: pass
-                        params = list(pf.index) if pf is not None and len(pf) > 0 else list(coef.keys())
+                        try:
+                                _pf = getattr(mdl, '_final_pf', None)
+                                if isinstance(_pf, pd.DataFrame):
+                                        pf = _pf
+                        except Exception:
+                                pass
+                        if pf is None:
+                                try:
+                                        _pf2 = mdl.pf
+                                        if isinstance(_pf2, pd.DataFrame):
+                                                pf = _pf2
+                                except Exception:
+                                        pass
+                        params = list(pf.index) if isinstance(pf, pd.DataFrame) and len(pf) > 0 else list(coef.keys())
                         rows = ""
                         for p in params:
                                 val = coef.get(str(p), float('nan'))
@@ -4504,8 +4754,21 @@ def _write_smoke_models_html(models: dict, save_dir: str, title: str = 'Stage 5 
                 ll_s   = _fmt(ll,   '.2f')
                 rho2_s = _fmt(rho2, '.4f')
                 try:
-                        pf = mdl._final_pf if hasattr(mdl, '_final_pf') and isinstance(getattr(mdl, '_final_pf', None), pd.DataFrame) else mdl.pf
-                        n_free = int((pf.get('holdfast', pd.Series([False]*len(pf))) == False).sum())
+                        try:
+                                _pf = getattr(mdl, '_final_pf', None)
+                        except Exception:
+                                _pf = None
+                        if isinstance(_pf, pd.DataFrame):
+                                pf = _pf
+                        else:
+                                try:
+                                        pf = mdl.pf
+                                except Exception:
+                                        pf = None
+                        if isinstance(pf, pd.DataFrame) and 'holdfast' in pf.columns:
+                                n_free = int((pf['holdfast'].fillna(True).astype(bool) == False).sum())
+                        else:
+                                n_free = '?'
                 except Exception:
                         n_free = '?'
                 return (f"<p class='stats'>"
@@ -5463,7 +5726,7 @@ def main(filepath: str = None):
                 return float('nan')
 
     logger.info("▶  Estimating Stage 1 models (activity frequency)...")
-    s1_models = estimate_stage1(out)
+    s1_models = estimate_stage1(out, landuse)
     logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 1]")
 
     logger.info("▶  Estimating Stage 2 models (day duration)...")
@@ -5589,7 +5852,6 @@ def main(filepath: str = None):
 
     # Reconstruct minimal out dict for cdap and usual_locations
     _out_for_cdap = {'persons': _pkl.load(open(_out_persons_ref, 'rb'))}
-    synth      = cdap(_out_for_cdap, synth)
     # Load HHTS tours for usual-location validation plots (work/school destinations)
     _hhts_tours_for_val = None
     _hhts_tours_stage5_val = None
@@ -5610,7 +5872,9 @@ def main(filepath: str = None):
                 logger.debug(f"  Could not prepare Stage 5 validation tours ({_pve})")
         except Exception as _tle:
             logger.debug(f"  Could not load HHTS tours for validation ({_tle})")
+    # usual_locations must run BEFORE cdap so work/school zones are known
     synth      = usual_locations(synth, landuse, hhts_tours=_hhts_tours_for_val)
+    synth      = cdap(_out_for_cdap, synth)
     _audit_hhts_synth_consistency(_out_for_cdap.get('persons'), synth, landuse,
                                   label='post_usual_locations')
 
@@ -5923,8 +6187,8 @@ def GA_main(filepath: str = None):
     synth = (load_synth(filepath, landuse=landuse) if filepath and os.path.isfile(filepath)
              else load_synth_all_zones(SYNTH_DIR, landuse=landuse))
 
-    synth = cdap(out, synth)
     synth = usual_locations(synth, landuse, hhts_tours=out.get('tours'))
+    synth = cdap(out, synth)
     travellers = synth[synth['CDAP'].isin(['M', 'N'])].copy()
     print(f"  CDAP filter: {len(travellers):,}/{len(synth):,} persons are travellers")
 
@@ -6045,12 +6309,46 @@ def GA_STAGED(filepath: str = None):
             with open(_ga_pkl, 'rb') as _f:
                 all_ga = pickle.load(_f)
         else:
-            logger.warning(
-                f"[GA_STAGED] GA_STAGED_REUSE_ESTIMATOR=1 requested but no valid "
-                f"ga_results.pkl found (tried: {_ga_pkl!r}) — "
-                f"falling back to full re-estimation"
-            )
-            all_ga = _run_ga_stages_with_checkpoints(out, landuse)
+            # Secondary fallback: if GA_STAGED_GA_DIR points to a 'merged' subdir
+            # but that pkl is missing, try to auto-merge from adjacent stage PKLs.
+            # This handles the case where merge_ga_results.py didn't run (e.g. PBS
+            # job killed) but all per-stage ga_results.pkl files exist.
+            _auto_merged = False
+            if _ga_dir and os.path.basename(_ga_dir) == 'merged':
+                _stage_base = os.path.dirname(_ga_dir)
+                from ga_hypothesis_testing import AllStagesResult as _ASR
+                _all_ga_try = _ASR()
+                for _sid in range(6):
+                    _sp = os.path.join(_stage_base, f'stage{_sid}', 'ga_results.pkl')
+                    if not os.path.isfile(_sp):
+                        continue
+                    try:
+                        with open(_sp, 'rb') as _sf:
+                            _sobj = pickle.load(_sf)
+                        if isinstance(_sobj, _ASR) and _sid in _sobj.results:
+                            _all_ga_try.results[_sid] = _sobj.results[_sid]
+                        elif isinstance(_sobj, _ASR) and len(_sobj.results) == 1:
+                            _all_ga_try.results[_sid] = next(iter(_sobj.results.values()))
+                    except Exception as _sme:
+                        logger.warning(f"[GA_STAGED] auto-merge stage {_sid}: {_sme}")
+                if _all_ga_try.results:
+                    all_ga = _all_ga_try
+                    _auto_merged = True
+                    # Save the merged pkl so the merge step is skipped next time
+                    os.makedirs(_ga_dir, exist_ok=True)
+                    with open(_ga_pkl, 'wb') as _mf:
+                        pickle.dump(all_ga, _mf)
+                    logger.info(
+                        f"[GA_STAGED] auto-merged {len(all_ga.results)} stage PKLs "
+                        f"→ {_ga_pkl}"
+                    )
+            if not _auto_merged:
+                logger.warning(
+                    f"[GA_STAGED] GA_STAGED_REUSE_ESTIMATOR=1 requested but no valid "
+                    f"ga_results.pkl found (tried: {_ga_pkl!r}) — "
+                    f"falling back to full re-estimation"
+                )
+                all_ga = _run_ga_stages_with_checkpoints(out, landuse)
     else:
         # Checkpoints are written after every stage to avoid all-or-nothing runs.
         all_ga = _run_ga_stages_with_checkpoints(out, landuse)
@@ -6070,8 +6368,8 @@ def GA_STAGED(filepath: str = None):
     synth = (load_synth(filepath, landuse=landuse) if filepath and os.path.isfile(filepath)
              else load_synth_all_zones(SYNTH_DIR, landuse=landuse))
 
-    synth = cdap(out, synth)
     synth = usual_locations(synth, landuse, hhts_tours=out.get('tours'))
+    synth = cdap(out, synth)
     travellers = synth[synth['CDAP'].isin(['M', 'N'])].copy()
     print(f"  CDAP filter: {len(travellers):,}/{len(synth):,} persons are travellers")
 

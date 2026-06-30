@@ -108,6 +108,11 @@ export OPENBLAS_NUM_THREADS="$THREADS"
 export MKL_NUM_THREADS="$THREADS"
 export NUMEXPR_NUM_THREADS="$THREADS"
 export STAGE5_WORKERS="$S5_WORKERS"
+# Number of GA stage-2..5 segments (purposes/targets/tour segments) searched
+# concurrently in spawn-mode subprocesses. Empty = ga_hypothesis_testing.py
+# picks min(n_segments, cpu_count, 4) automatically. Set via
+# submit_pipeline_runs.sh --ga-parallel-segments.
+export GA_PARALLEL_SEGMENTS="${GA_PARALLEL_SEGMENTS:-}"
 export PIPELINE_ACCELERATOR
 export PIPELINE_RUN_TAG
 export PIPELINE_RUN_ROOT="$RUN_ROOT"
@@ -123,8 +128,22 @@ export GA_STAGED_GA_DIR="${GA_STAGED_GA_DIR:-}"
 # Allow Larch to auto-select engine (JAX first on Linux, numba fallback).
 # Hard-forcing numba can trigger nopython typing failures in Stage 5 idca flows.
 export GA_LARCH_ENGINE="${GA_LARCH_ENGINE:-auto}"
-# Force MetaCount to always use CPU (cusolver_gesvdj_ffi unavailable on CUDA 13).
-export GA_METACOUNT_FORCE_CPU="${GA_METACOUNT_FORCE_CPU:-1}"
+# SA-Bandit: MetaCount can use GPU with on-demand memory allocation.
+# XLA_PYTHON_CLIENT_PREALLOCATE=false lets 4 workers share 1 GPU cleanly.
+# Each per-eval fit is small (1k-6k rows × 20-30 features) — GPU is μs vs CPU seconds.
+if [ "${GA_USE_BANDIT_SA:-0}" = "1" ] && [ "${PIPELINE_ACCELERATOR:-cpu}" = "gpu" ]; then
+    export GA_METACOUNT_FORCE_CPU=0
+    export XLA_PYTHON_CLIENT_PREALLOCATE=false
+else
+    export GA_METACOUNT_FORCE_CPU="${GA_METACOUNT_FORCE_CPU:-1}"
+fi
+# SA-Bandit: prevent JAX cache thrashing by overriding cgroup-detected limit.
+# 4 GPU workers at ~15 GB RSS each (less with GPU offloading) — well under 250 GB.
+if [ "${GA_USE_BANDIT_SA:-0}" = "1" ]; then
+    export GA_JAX_CACHE_MEM_LIMIT_GB="${GA_JAX_CACHE_MEM_LIMIT_GB:-200}"
+    export GA_JAX_CACHE_CHECK_EVERY="${GA_JAX_CACHE_CHECK_EVERY:-100}"
+    export GA_SIG_PENALTY_WEIGHT="${GA_SIG_PENALTY_WEIGHT:-0.50}"
+fi
 # When a real estimator is selected, mixing model families mid-search
 # (e.g. MetaCount NB2 on one evaluation, ordered-logit on the next) produces
 # non-comparable BIC values.  Disable statsmodels fallback for those cases.
@@ -133,12 +152,20 @@ if [ "$GA_ESTIMATOR" = "default" ] || [ -z "$GA_ESTIMATOR" ]; then
 else
     export GA_ESTIMATOR_FALLBACK="${GA_ESTIMATOR_FALLBACK:-0}"
 fi
-# For GA search modes, force JAX to CPU to prevent CUDA kernel errors during
-# per-case fitness evaluations (small batches are faster on numba/CPU anyway).
-# ga_stage5_smoke is excluded: it uses GPU (JAX/XLA) for the final model fit,
-# which benefits from CUDA when a GPU node is requested (--gpu 1 --accelerator gpu).
+# For GA search modes, force JAX to CPU to prevent CUDA kernel errors.
+# sa_bandit with GPU: allow JAX to auto-detect CUDA (per-eval MetaCount fits
+# benefit from GPU μs execution vs CPU seconds; workers share GPU via
+# XLA_PYTHON_CLIENT_PREALLOCATE=false).
+# ga_stage5_smoke uses GPU for the final model fit.
 case "$MODE" in
-    ga|ga_metacount|ga_searchlibrium|sa_smoke)
+    ga|ga_metacount|ga_searchlibrium)
+        if [ "${GA_USE_BANDIT_SA:-0}" = "1" ] && [ "${PIPELINE_ACCELERATOR:-cpu}" = "gpu" ]; then
+            :  # let JAX auto-detect GPU — per-worker GPU memory is small with PREALLOCATE=false
+        else
+            export JAX_PLATFORMS=cpu
+        fi
+        ;;
+    sa_smoke)
         export JAX_PLATFORMS=cpu
         ;;
     ga_stage5_smoke)
@@ -208,6 +235,7 @@ echo "Mode:        $MODE"
 echo "Zone arg:    ${ZONE_ARG:-<all>}"
 echo "Conda env:   $CONDA_ENV"
 echo "Threads:     $THREADS"
+echo "GA parallel segments: ${GA_PARALLEL_SEGMENTS:-<auto>}"
 echo "Accelerator: $PIPELINE_ACCELERATOR"
 echo "GA estimator:$GA_ESTIMATOR"
 echo "Run tag:     $PIPELINE_RUN_TAG"
@@ -231,6 +259,7 @@ GA budget     : ${GA_BUDGET:-standard}
 Accelerator   : ${PIPELINE_ACCELERATOR}
 Threads       : ${THREADS}
 S5 workers    : ${S5_WORKERS}
+GA parallel segs: ${GA_PARALLEL_SEGMENTS:-<auto>}
 Resources     : $(qstat -f "${PBS_JOBID:-unknown}" 2>/dev/null | grep Resource_List | head -1 | sed 's/.*Resource_List.//' || echo 'n/a')
 Conda env     : ${CONDA_ENV}
 Working dir   : ${PBS_O_WORKDIR}
@@ -334,6 +363,157 @@ if [ "$MODE" = "sa_smoke" ]; then
 elif [ "$MODE" = "safety_analysis" ]; then
     stdbuf -oL python -u safety_experiment_analysis.py \
         2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+elif [ "$MODE" = "paper_collect" ]; then
+    # Phase A: Generate synthetic population vs HHTS comparison report.
+    stdbuf -oL python -u compare_synth_hhts.py \
+        2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+
+    # Phase B: Collect paper-ready outputs from the SA-bandit and safety_analysis runs
+    # and copy them to abm_safety/Figures/ for LaTeX inclusion.
+    stdbuf -oL python -u - << 'PYEOF' \
+        2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+import shutil, os, glob, sys
+
+RUN_ROOT = os.environ.get('PIPELINE_RUN_ROOT', 'runs')
+PAPER_DIR = os.path.join('abm_safety', 'Figures')
+os.makedirs(PAPER_DIR, exist_ok=True)
+os.makedirs(os.path.join(PAPER_DIR, 'safety_plots'), exist_ok=True)
+
+print("=" * 60)
+print("PAPER OUTPUT COLLECTION")
+print(f"  Paper figures dir: {os.path.abspath(PAPER_DIR)}")
+print("=" * 60)
+
+# Find the most recent SA-bandit run directories
+sa_dirs = sorted(
+    glob.glob(os.path.join(RUN_ROOT, 'sa_bandit__*')),
+    key=os.path.getmtime, reverse=True
+)
+sa_dir = sa_dirs[0] if sa_dirs else None
+print(f"\n  SA-bandit run dir: {sa_dir or 'NOT FOUND'}")
+
+# Also check ga_staged dir for prediction outputs (stage5 coefficients)
+sa_staged_dirs = sorted(
+    glob.glob(os.path.join(RUN_ROOT, 'sa_bandit_staged__*')),
+    key=os.path.getmtime, reverse=True
+)
+sa_staged_dir = sa_staged_dirs[0] if sa_staged_dirs else None
+print(f"  SA-bandit staged dir: {sa_staged_dir or 'NOT FOUND'}")
+
+# Find the most recent safety_analysis directory
+anal_dirs = sorted(
+    glob.glob(os.path.join(RUN_ROOT, 'safety_analysis__*')),
+    key=os.path.getmtime, reverse=True
+)
+anal_dir = anal_dirs[0] if anal_dirs else None
+print(f"  Safety analysis dir: {anal_dir or 'NOT FOUND'}")
+
+copied = 0
+
+# Combine both dirs for searching outputs
+_search_dirs = [d for d in (sa_dir, sa_staged_dir) if d]
+
+# 1. GA convergence plot (from sa_dir — the estimation job)
+if sa_dir:
+    ga_plot = os.path.join(sa_dir, 'plots', 'ga_all_stages.png')
+    if not os.path.exists(ga_plot):
+        ga_plot = os.path.join(sa_dir, 'ga_all_stages.png')
+    if os.path.exists(ga_plot):
+        dst = os.path.join(PAPER_DIR, 'sa_bandit_ga_all_stages.png')
+        shutil.copy2(ga_plot, dst)
+        print(f"  [OK] sa_bandit_ga_all_stages.png")
+        copied += 1
+    else:
+        print(f"  [MISS] ga_all_stages.png not found in {sa_dir}")
+
+    # Per-stage GA convergence CSVs
+    ga_reports_dir = os.path.join(sa_dir, 'ga_reports')
+    if os.path.isdir(ga_reports_dir):
+        for f in os.listdir(ga_reports_dir):
+            if f.endswith('.csv'):
+                src = os.path.join(ga_reports_dir, f)
+                dst = os.path.join(PAPER_DIR, f'sa_bandit_{f}')
+                shutil.copy2(src, dst)
+                print(f"  [OK] sa_bandit_{f}")
+                copied += 1
+
+# 2. Stage 5 coefficient HTML (from sa_staged_dir or sa_dir)
+for _d in _search_dirs:
+    coef_html = os.path.join(_d, 'stage5_models_coefficients.html')
+    if not os.path.exists(coef_html):
+        coef_html = os.path.join(_d, 'stage5_tour_coefficients.html')
+    if not os.path.exists(coef_html):
+        coef_html = os.path.join(_d, 'ga_reports', 'ga_stage5_coef.html')
+    if not os.path.exists(coef_html):
+        coef_html = os.path.join(_d, 'stage5_coefficients.html')
+    if os.path.exists(coef_html):
+        dst = os.path.join(PAPER_DIR, 'sa_bandit_stage5_coef.html')
+        shutil.copy2(coef_html, dst)
+        print(f"  [OK] sa_bandit_stage5_coef.html (from {os.path.basename(_d)})")
+        copied += 1
+        break
+else:
+    print(f"  [MISS] stage5 coefficient HTML not found in any SA-bandit dir")
+
+# 3. Stage 5 models pickle for paper coefficient tables
+for _d in _search_dirs:
+    pkl_src = os.path.join(_d, 'stage5_models.pkl')
+    if os.path.exists(pkl_src):
+        shutil.copy2(pkl_src,
+                     os.path.join(PAPER_DIR, 'sa_bandit_stage5_models.pkl'))
+        print(f"  [OK] sa_bandit_stage5_models.pkl (from {os.path.basename(_d)})")
+        copied += 1
+        break
+if anal_dir:
+    # Safety comparison CSV
+    csv_src = os.path.join(anal_dir, 'safety_comparison.csv')
+    if os.path.exists(csv_src):
+        dst = os.path.join(PAPER_DIR, 'sa_bandit_safety_comparison.csv')
+        shutil.copy2(csv_src, dst)
+        print(f"  [OK] sa_bandit_safety_comparison.csv")
+        copied += 1
+
+    # Safety report HTML
+    report_src = os.path.join(anal_dir, 'safety_report.html')
+    if os.path.exists(report_src):
+        dst = os.path.join(PAPER_DIR, 'sa_bandit_safety_report.html')
+        shutil.copy2(report_src, dst)
+        print(f"  [OK] sa_bandit_safety_report.html")
+        copied += 1
+
+    # Safety comparison plots
+    src_plots = os.path.join(anal_dir, 'plots')
+    dst_plots = os.path.join(PAPER_DIR, 'safety_plots')
+    if os.path.isdir(src_plots):
+        for f in os.listdir(src_plots):
+            if f.endswith('.png'):
+                shutil.copy2(os.path.join(src_plots, f),
+                           os.path.join(dst_plots, f))
+                print(f"  [OK] safety_plots/{f}")
+                copied += 1
+
+# 5. Synthetic population vs HHTS comparison outputs
+# Produced by compare_synth_hhts.py (Phase A above)
+print(f"\n  Synth vs HHTS comparison:")
+for _fname, _dstname in [
+    ('synth_vs_hhts_comparison.csv', 'sa_bandit_synth_vs_hhts_comparison.csv'),
+    ('synth_population_report.html', 'sa_bandit_synth_population_report.html'),
+    ('plots/synth_vs_hhts_mode_share.png', 'safety_plots/synth_vs_hhts_mode_share.png'),
+    ('plots/synth_vs_hhts_trip_counts.png', 'safety_plots/synth_vs_hhts_trip_counts.png'),
+    ('plots/synth_vs_hhts_distance.png', 'safety_plots/synth_vs_hhts_distance.png'),
+]:
+    _src = os.path.join(anal_dir, _fname)
+    _dst = os.path.join(PAPER_DIR, _dstname)
+    if os.path.exists(_src):
+        os.makedirs(os.path.dirname(_dst), exist_ok=True)
+        shutil.copy2(_src, _dst)
+        print(f"  [OK] {_dstname}")
+        copied += 1
+
+print(f"\n  Total files copied: {copied}")
+print(f"  Paper-ready outputs -> {os.path.abspath(PAPER_DIR)}/")
+print("=" * 60)
+PYEOF
 elif [ "$MODE" = "joint_model" ]; then
     # Tobit-I + Heckman joint participation+duration comparison.
     # Loads data and the already-estimated Stage 2 models from the most-recent

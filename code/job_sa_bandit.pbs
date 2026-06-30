@@ -1,0 +1,186 @@
+#!/bin/bash -l
+# SA-Bandit full pipeline job — GA estimation + safety comparison + population prediction
+#
+# Phases:
+#   1. GA estimation (HHTS only, stages 1-5): parallel workers, CPU-bound
+#   2. Safety comparison (HHTS Stage 5 with/without safety skims): single-process
+#   3. Population prediction (~3.7M persons, all zones, stages 1-6): memory-bound
+#
+# Parallel segment counts per stage (sets the resource floor):
+#   Stage 1: 3  (work / edu / nonmand)   nonmand = escort+shopping+social+othmaint+othdiscr+eat
+#   Stage 2: 3  (start_of_day / end_of_day / B)
+#   Stage 3: 3  (work / edu / nonmand)   same pooled structure as Stage 1 and Stage 5
+#   Stage 4: 8  (work / edu / escort / shopping / othmaint / othdiscr / eat / social — individual)
+#   Stage 5: 3  (work / edu / nonmand — each runs mode GA then dest GA in sequence)
+#
+# Memory sizing: Phase 3 (prediction) is the bottleneck.
+#   Loading all synthetic zones + landuse enrichment ≈ 150-180 GB.
+#   With 8 workers × 8 GB JAX cache = 64 GB + parent/pandas ≈ 50 GB = 114 GB for GA phase.
+#   Request 194GB covers both phases comfortably.  4 CPUs per the known-working
+#   node config (matches job_pbs_all.pbs).  GA runs 4 parallel segments at a time.
+#
+# Skip phases at submit time:
+#   qsub -v RUN_PREDICTION=0 job_sa_bandit.pbs                # GA + safety only (no synth pop)
+#   qsub -v RUN_SAFETY_COMPARISON=0 job_sa_bandit.pbs         # GA + prediction only
+#
+# Budget overrides:
+#   qsub -v GA_BUDGET=standard job_sa_bandit.pbs              # standard budget
+#   qsub -v STAGE23_JOINT=1 job_sa_bandit.pbs                 # joint S2+S3 budget model
+#
+# Budget / walltime guide:
+#   fast      ~20–35 h total  →  walltime 72:00:00  (default, good for iterating)
+#   standard  ~60–90 h total  →  walltime 96:00:00  (production quality — increase via qsub -l)
+
+#PBS -N sa_bandit
+#PBS -l select=1:ncpus=4:mem=194GB
+#PBS -l walltime=48:00:00
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ── Tuneable at submission time via -v ───────────────────────────────────────
+GA_BUDGET=${GA_BUDGET:-fast}
+RUN_PREDICTION=${RUN_PREDICTION:-1}
+RUN_SAFETY_COMPARISON=${RUN_SAFETY_COMPARISON:-1}
+
+# Sized for Stage 4 which has 8 individual purposes (the bottleneck).
+# Each stage uses min(n_pending, GA_PARALLEL_SEGMENTS) workers, so stages
+# with fewer segments (1/2/3/5: all 3) automatically use fewer workers.
+GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-8}
+
+# Per-worker JAX compilation cache cap.
+# Peak: 8 workers × 8 GB = 64 GB JAX + ~50 GB parent/pandas = 114 GB.
+# Node has 194 GB → ~80 GB buffer for synth population loading.
+GA_JAX_CACHE_MEM_LIMIT_GB=${GA_JAX_CACHE_MEM_LIMIT_GB:-8}
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+# ─────────────────────────────────────────────────────────────────────────────
+
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# ── Install MetaCount + SearchLibrium (editable source; skip if already linked) ──
+_HPC_MC=/mnt/hpccs01/home/ahernz/source/MetaCount
+_HPC_SL=/mnt/hpccs01/home/ahernz/source/SearchLibrium
+
+_pkg_needs_install() {
+    # Returns 0 (true) if the package is not installed or its source dir changed.
+    local pkg="$1" src_dir="$2"
+    if ! python -c "import $pkg" 2>/dev/null; then return 0; fi
+    if [ -n "$src_dir" ] && [ -d "$src_dir" ]; then
+        # Check if the installed location matches the editable source.
+        local loc
+        loc=$(python -c "import $pkg, os; print(os.path.dirname($pkg.__file__))" 2>/dev/null || echo "")
+        [[ "$loc" != "$src_dir"* ]] && return 0
+    fi
+    return 1
+}
+
+echo "[pkg] Checking MetaCount..."
+if [ -d "$_HPC_MC" ]; then
+    if _pkg_needs_install metacountregressor "$_HPC_MC"; then
+        pip install -e "$_HPC_MC" -q && echo "[pkg] MetaCount installed (editable: $_HPC_MC)"
+    else
+        echo "[pkg] MetaCount already installed (editable) — skipping"
+    fi
+else
+    if _pkg_needs_install metacountregressor ""; then
+        pip install --no-cache-dir -q metacountregressor && echo "[pkg] MetaCount installed (PyPI)"
+    else
+        echo "[pkg] MetaCount already installed — skipping"
+    fi
+fi
+
+echo "[pkg] Checking jax/jaxlib/jaxopt..."
+if ! python -c "import jax, jaxlib, jaxopt" 2>/dev/null; then
+    pip install --no-cache-dir -q jax jaxlib jaxopt && echo "[pkg] jax/jaxlib/jaxopt installed"
+else
+    echo "[pkg] jax/jaxlib/jaxopt already installed — skipping"
+fi
+
+echo "[pkg] Checking SearchLibrium..."
+if [ -d "$_HPC_SL" ]; then
+    if _pkg_needs_install SearchLibrium "$_HPC_SL"; then
+        pip install -e "$_HPC_SL" -q && echo "[pkg] SearchLibrium installed (editable: $_HPC_SL)"
+    else
+        echo "[pkg] SearchLibrium already installed (editable) — skipping"
+    fi
+else
+    if _pkg_needs_install SearchLibrium ""; then
+        pip install --no-cache-dir -q SearchLibrium && echo "[pkg] SearchLibrium installed (PyPI)"
+    else
+        echo "[pkg] SearchLibrium already installed — skipping"
+    fi
+fi
+
+echo "[pkg] Package versions:"
+pip show metacountregressor 2>/dev/null | awk '/^Name:|^Version:/{print "  " $0}' || true
+pip show SearchLibrium      2>/dev/null | awk '/^Name:|^Version:/{print "  " $0}' || true
+
+# ── Runtime env ──────────────────────────────────────────────────────────────
+# Force JAX to CPU — SA-Bandit per-eval fits are small; CPU avoids XLA CUDA errors.
+export JAX_PLATFORMS=cpu
+export GA_METACOUNT_FORCE_CPU=1
+export TF_CPP_MIN_LOG_LEVEL=3
+
+# Prevent linear-algebra libraries from oversubscribing cores across subprocesses.
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+# SA-Bandit search settings
+export GA_BUDGET="$GA_BUDGET"
+export RUN_PREDICTION="$RUN_PREDICTION"
+export RUN_SAFETY_COMPARISON="$RUN_SAFETY_COMPARISON"
+export GA_PARALLEL_SEGMENTS="$GA_PARALLEL_SEGMENTS"
+export GA_JAX_CACHE_MEM_LIMIT_GB="$GA_JAX_CACHE_MEM_LIMIT_GB"
+export GA_JAX_CACHE_CHECK_EVERY=100
+export GA_SIG_PENALTY_WEIGHT=1.50
+export GA_SIG_PVAL_THRESH=0.05
+export GA_ESTIMATOR=sa_bandit
+export GA_USE_BANDIT_SA=1
+# Pad all feature matrices to a fixed width so JAX compiles once per stage
+# rather than once per unique chromosome width (~10-50x fewer JIT compilations).
+export GA_PAD_FEATURES=1
+
+# Joint Stage 2+3 budget-constrained model (Weibull/lognormal B + per-purpose
+# lognormal durations estimated jointly with a budget-penalty term).
+# Set to 1 to replace independent Stage 2 + Stage 3 GA runs with a single
+# JAX-optimised joint fit.  Requires ~5 min to converge vs 634 min for GA.
+# Leave 0 for the default independent-stage SA-Bandit search.
+export STAGE23_JOINT=${STAGE23_JOINT:-1}
+
+# ── Job header ────────────────────────────────────────────────────────────────
+echo "=========================================="
+echo "PBS job       : ${PBS_JOBID:-unknown}"
+echo "Working dir   : $PBS_O_WORKDIR"
+echo "Budget        : $GA_BUDGET"
+echo "Prediction    : $RUN_PREDICTION  (1=yes, 0=skip synth pop)"
+echo "Safety comp   : $RUN_SAFETY_COMPARISON  (1=yes, 0=skip)"
+echo "Parallel segs : $GA_PARALLEL_SEGMENTS"
+echo "JAX cache/wkr : ${GA_JAX_CACHE_MEM_LIMIT_GB} GB"
+echo "Started       : $(date)"
+echo "=========================================="
+echo ""
+echo "Parallel segments by stage:"
+echo "  Stage 1 (3): work / edu / nonmand(escort+shopping+social+othmaint+othdiscr+eat)"
+echo "  Stage 2 (3): start_of_day / end_of_day / B"
+echo "  Stage 3 (3): work / edu / nonmand  [pooled non-mandatory duration]"
+echo "  Stage 4 (8): work / edu / escort / shopping / othmaint / othdiscr / eat / social"
+echo "  Stage 5 (3): work / edu / nonmand  [mode GA then dest GA per segment]"
+echo ""
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+stdbuf -oL python -u _run_sa_bandit.py
+EXIT_CODE=$?
+
+echo ""
+echo "=========================================="
+echo "Finished : $(date)  exit_code=${EXIT_CODE}"
+echo "=========================================="
+exit "$EXIT_CODE"

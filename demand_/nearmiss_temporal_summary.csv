@@ -1,0 +1,5 @@
+time_period,total_events,steering_events,braking_events,combined_events,car_events,hcv_events,avg_speed,avg_accel,pct_of_daily_total
+am,11779,8677,3029,73,4457,7322,42.49,0.5651,13.99
+op,36908,27609,9077,222,15241,21667,42.25,0.5651,43.83
+pm,12733,9539,3102,92,5550,7183,40.45,0.5764,15.12
+ev,22793,17909,4747,137,10085,12708,44.91,0.566,27.07

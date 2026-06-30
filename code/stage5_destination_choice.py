@@ -118,7 +118,12 @@ def _lx_model(dt, **kwargs) -> 'lx.Model':
     Pass ``compute_engine`` in kwargs to override both (e.g. for testing).
     """
     if 'compute_engine' in kwargs:
-        return lx.Model(dt, **kwargs)
+        _engine = kwargs.pop('compute_engine')
+        try:
+            return lx.Model(dt, compute_engine=_engine, **kwargs)
+        except Exception as _e:
+            logger.debug(f"_lx_model: requested engine='{_engine}' failed ({_e}), trying alternatives")
+            # Fall through to auto-detect
     # GA fitness evaluations explicitly request numba via GA_LARCH_ENGINE=numba
     # to avoid the cusolver_gesvdj_ffi CUDA kernel error that fires when Larch's
     # JAX path tries to compute the covariance Hessian on the CUDA device.
@@ -757,6 +762,10 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
         'person_id',
         # Original socio-economic
         'incp', 'indp', 'sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING',
+        # WORKSTAT / STUDYING binary dummies (preferred over raw codes in UEC expressions)
+        'workstat_fulltime', 'workstat_parttime', 'workstat_notworking',
+        'studying_none', 'studying_primary', 'studying_secondary',
+        'studying_tertiary_pt', 'studying_tertiary_ft',
         # New behavioural additions
         'age5p', 'AGEGROUP',    # age bands - walk/bike/distance deterrence
         'CARLICENCE',           # car licence - DA prerequisite
@@ -1502,8 +1511,21 @@ _PERSON_BEHAVIOURAL_DEFAULTS = {
     'bikes':             0,     # no bikes in household
     'nprd':              2,     # household size 2
     'sexp':              1,     # male (neutral default)
-    'WORKSTAT':          0,     # not working
+    'WORKSTAT':          0,     # not working (kept for travel_propensity and legacy expressions)
     'STUDYING':          0,
+    # WORKSTAT binary dummies (derived in _ensure_person_behavioural_cols from WORKSTAT
+    # if not already present via cdap.build_person_profiles). Preferred over raw WORKSTAT in
+    # mode/dest UEC expressions because treating WORKSTAT as continuous implies a meaningless
+    # linear ordering 0→1→2 that conflates "not working" with "part-time" magnitudes.
+    'workstat_fulltime':  0,    # WORKSTAT == 1
+    'workstat_parttime':  0,    # WORKSTAT == 2
+    'workstat_notworking':1,    # WORKSTAT == 0  (default: assume not working for safety)
+    # STUDYING binary dummies (same rationale as WORKSTAT)
+    'studying_none':         1,
+    'studying_primary':      0,
+    'studying_secondary':    0,
+    'studying_tertiary_pt':  0,
+    'studying_tertiary_ft':  0,
     'vehrd':             1,     # 1 vehicle (most common in SEQ)
     'incp':              8,     # mid income band
     'indp':              19,    # not employed industry
@@ -1621,6 +1643,26 @@ def _ensure_person_behavioural_cols(persons: pd.DataFrame) -> pd.DataFrame:
     # Always recompute from source attributes so it reflects the actual person
     # table rather than a stale default.  Very cheap (vectorized numpy).
     pp['travel_propensity'] = _travel_propensity_score(pp).values
+
+    # ── WORKSTAT binary dummies ────────────────────────────────────────────
+    # Derive workstat_fulltime / workstat_parttime / workstat_notworking from
+    # the raw WORKSTAT code when they are not already present (e.g. data that
+    # was not routed through cdap.build_person_profiles).  Identical mapping to
+    # the one in build_person_profiles so estimation and prediction are consistent.
+    if 'workstat_fulltime' not in pp.columns and 'WORKSTAT' in pp.columns:
+        _ws = pd.to_numeric(pp['WORKSTAT'], errors='coerce').fillna(0).astype(int)
+        pp['workstat_fulltime']  = (_ws == 1).astype(np.int8)
+        pp['workstat_parttime']  = (_ws == 2).astype(np.int8)
+        pp['workstat_notworking']= (_ws == 0).astype(np.int8)
+
+    # ── STUDYING binary dummies ────────────────────────────────────────────
+    if 'studying_none' not in pp.columns and 'STUDYING' in pp.columns:
+        _st = pd.to_numeric(pp['STUDYING'], errors='coerce').fillna(0).astype(int)
+        pp['studying_none']        = (_st == 0).astype(np.int8)
+        pp['studying_primary']     = (_st == 1).astype(np.int8)
+        pp['studying_secondary']   = (_st == 2).astype(np.int8)
+        pp['studying_tertiary_pt'] = (_st == 3).astype(np.int8)
+        pp['studying_tertiary_ft'] = (_st == 4).astype(np.int8)
 
     # ── Occupation sub-group dummies ───────────────────────────────────────
     # Derived from indp (industry/occupation code) if available.
@@ -2325,23 +2367,25 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
         # and edu_prim_priv_cond become all-zeros.  Larch then classifies them as
         # CO (1D) rather than CA (2D); the Numba dim3_filler later tries a 2D index
         # and crashes with TypingError.  Holdfasting prevents the misclassification.
+        #
+        # SAFETY-NET: Always holdfast person×zone interaction coefficients at 0
+        # for estimation.  These are pre-computed data columns; the associated
+        # parameters (c_female_dist, c_incp_dist, etc.) are GA-selected via the
+        # _SAFE_PAIRS mechanism.  Estimating them directly triggers Numba
+        # TypingError when GA_LARCH_ENGINE=numba.
         _PERSON_ZONE_INTERACTION_COLS = {
             'female_x_log_dist', 'edu_prim_priv_cond', 'occp_mgr_x_log_dist',
             'occp_trades_x_log_dist', 'propensity_x_log_dist',
             'person_dist_draw_x_log_dist', 'noveh_walk_acc', 'noveh_transit_acc',
+            'incp_x_log_dist', 'age5p_x_log_dist', 'vehrd_x_log_dist',
+            'nprd_x_log_dist', 'occp_group_x_log_dist',
+            'ftwork_x_log_dist', 'WORKSTAT_x_log_dist', 'incp_x_auto_work_acc',
         }
-        _zero_interaction_cols = [
-            c for c in _PERSON_ZONE_INTERACTION_COLS
-            if c in _numeric_ca.columns and _ca_stds.get(c, 0) < 1e-8
-        ]
-        if _zero_interaction_cols:
-            logger.warning(
-                f"_dest_tree: all-zero CA interaction columns - "
-                f"person attributes likely not merged (check HHTS persons passed "
-                f"for estimation, not synth). Holdfasting to prevent CO "
-                f"misclassification: {_zero_interaction_cols}"
-            )
-            _collinear_ca_cols.update(_zero_interaction_cols)
+        # Always flag these as collinear so their coefficients get holdfasted at 0
+        # during _build_dest_model.  This prevents Larch's Numba flow compiler from
+        # trying to JIT-compile them as 2D matrices (which crashes when they're 1D
+        # flat-mode columns).
+        _collinear_ca_cols.update(_PERSON_ZONE_INTERACTION_COLS)
 
         # Restrict to genuinely CA-varying columns - those with nonzero mean
         # within-chooser variance.  IDCO (person-level) variables are constant
@@ -2934,8 +2978,8 @@ MODE_UEC = {
     # Auto/Transit: SOVTOLL_TIME__AM median=58.8 min → divide by 60 → hours
     "c_ivt_auto":       ("od.SOVTOLL_TIME__AM / 60.0",         {"DA": None, "SR": None}),
     "c_ivt_transit":    ("od.WLK_LOC_WLK_TOTIVT__AM / 60.0",  {"Transit": None}),
-    "c_walk_time":      ("log(od.DISTWALK * 12 + 1)",           {"Walk": None}),
-    "c_bike_time":      ("log(od.DISTBIKE * 4 + 1)",            {"Bike": None}),
+    "c_walk_time":      ("log(max(od.DISTWALK, 0.3) * 12 + 1)", {"Walk": None}),
+    "c_bike_time":      ("log(max(od.DISTBIKE, 0.5) * 4 + 1)",   {"Bike": None}),
 
     # ── Crash safety perception ────────────────────────────────────────────
     "c_crash_veh":      ("log(od.CRASH+1)",               {"DA": None, "SR": None, "Transit": None}),
@@ -2974,8 +3018,17 @@ MODE_UEC = {
     "c_female_walk":    ("(person.sexp == 2)",            {"Walk": None}),
 
     # ── Worker type ───────────────────────────────────────────────────────
-    "c_ftwork_da":      ("(person.WORKSTAT == 1)",        {"DA": None}),
-    "c_ptwork_sr":      ("(person.WORKSTAT == 2)",        {"SR": None}),
+    # Use the pre-computed binary dummies (workstat_fulltime/parttime) rather than
+    # inline equality tests against the raw ordinal WORKSTAT code.  The binaries are
+    # derived in _ensure_person_behavioural_cols (and upstream in
+    # cdap.build_person_profiles) with fixed category→name mappings, so the column
+    # is unambiguously a 0/1 indicator and its coefficient is directly interpretable.
+    "c_ftwork_da":        ("person.workstat_fulltime",    {"DA": None}),
+    "c_ptwork_sr":        ("person.workstat_parttime",    {"SR": None}),
+    # Non-working persons (workstat_notworking) tend toward transit / walk — they
+    # lack the work-schedule pressure that makes DA reliable and may not own a car.
+    # Positive coefficient → non-workers are systematically more transit-prone.
+    "c_notwork_transit":  ("person.workstat_notworking",  {"Transit": None}),
 
     # ── Walk / bike stops ─────────────────────────────────────────────────
     "c_walk_stops":     ("tour.outbound_stops",           {"Walk": None}),
@@ -3993,8 +4046,11 @@ def _mode_spec_custom(m, Mode, custom_vars: list, segment: str = 'all'):
         # Bicycles
         'c_bikes_bike':     {'bikes'},
         # Work status / person type
-        'c_ftwork_da':      {'WORKSTAT', 'mandatory_role', 'ptype_FullTimeWorker'},
-        'c_ptwork_sr':      {'WORKSTAT', 'mandatory_role', 'ptype_PartTimeWorker'},
+        # Gate on both the new binary dummies AND the legacy candidates so models
+        # estimated before the WORKSTAT→binary migration still activate these terms.
+        'c_ftwork_da':       {'workstat_fulltime',  'WORKSTAT', 'mandatory_role', 'ptype_FullTimeWorker'},
+        'c_ptwork_sr':       {'workstat_parttime',  'WORKSTAT', 'mandatory_role', 'ptype_PartTimeWorker'},
+        'c_notwork_transit': {'workstat_notworking', 'mandatory_role', 'ptype_Retired'},
         # Nonmand vehicle × bike (nonmand segment only)
         'c_bike_veh':       {'vehrd', 'has_vehicle'},
     }
@@ -4205,6 +4261,17 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
     except Exception:
         pass
 
+    # Constrain ASC_Walk to be non-positive for all segments.
+    # DISTWALK = DIST in the current OMX (both use road-network distance),
+    # so the walk-time coefficient cannot properly identify the walk deterrent.
+    # Without this constraint the ASC drifts positive (e.g. +2.8 for work),
+    # causing intrazonal/zero-distance trips to heavily overpredict walk mode.
+    try:
+        if 'ASC_Walk' in m.pf.index:
+            _pf_set(m, 'ASC_Walk', 'maximum', 0.0)
+    except Exception:
+        pass
+
     for _p in (
         'c_clr_tr', 'c_mgr_da', 'c_lab_da', 'c_ind_da', 'c_off_tr',
         'c_pub_tr', 'c_pub_wk', 'c_hlt_tr', 'c_ret_sr',
@@ -4329,7 +4396,10 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
 
     # Use _lx_model for engine selection - tries jax first on Linux (faster),
     # numba first on Windows.  Previous hardcoded numba caused issues on HPC.
-    mm = _lx_model(dt)
+    # FORCE JAX: Numba flow compiler has a TypingError with person×zone
+    # interaction columns (female_x_log_dist etc.) in flat-mode CA datasets.
+    # These columns are 1D in the flat DataFrame but Numba tries 2D indexing.
+    mm = _lx_model(dt, compute_engine='jax')
 
     # Choice definition: flat dataset has DTAZ as co variable directly
     if _is_flat:
@@ -4402,7 +4472,7 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
             try:
                 if len(mm.pf) == 0:
                     logger.warning(f"_build_dest_model [{segment}]: creating fresh Model instance")
-                    mm2 = lx.Model(datatree=dt, compute_engine='numba')
+                    mm2 = lx.Model(datatree=dt, compute_engine='jax')
                     mm2.choice_co_code = "DTAZ" if _is_flat else "tour.DTAZ"
                     try:
                         mm2.weight_co_var = "weight"
@@ -6761,10 +6831,7 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
         ds = lx.Dataset.construct.from_idca(mxl_df)
 
         # ── Step 1: MNL baseline ──────────────────────────────────────────
-        # column names match the idca data: mxl_ca_ivt_h, mxl_ca_walk_h, mxl_ca_bike_h
-        # Force numba here; JAX mixed-logit on Windows often triggers sharrow
-        # rewrite/CPU-binding errors before convergence.
-        mnl = _lx_model(ds, compute_engine='numba')
+        mnl = _lx_model(ds, compute_engine='jax')
         mnl.choice_ca_var       = 'chosen'
         mnl.availability_ca_var = 'avail'
         mnl.utility_ca = (
@@ -9634,8 +9701,8 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
 
         ivt_auto = xp.clip(xp.asarray(ivt_auto) / 60.0, 0.05, 5.0)   # minutes → hours
         ivt_transit = xp.clip(xp.asarray(ivt_transit) / 60.0, 0.05, 6.0)
-        walk_time = xp.log(xp.clip(xp.asarray(dist_walk), 0, None) * 12.0 + 1.0)
-        bike_time = xp.log(xp.clip(xp.asarray(dist_bike), 0, None) * 4.0 + 1.0)
+        walk_time = xp.log(xp.clip(xp.asarray(dist_walk), 0.3, None) * 12.0 + 1.0)
+        bike_time = xp.log(xp.clip(xp.asarray(dist_bike), 0.5, None) * 4.0 + 1.0)
         log_crash = xp.log(xp.asarray(crash) + 1.0)
 
         # ── 4. Person attributes ──────────────────────────────────────────

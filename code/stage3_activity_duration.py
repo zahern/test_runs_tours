@@ -72,6 +72,25 @@ PURPOSES = [
 
 ACTIVITY_COLS = [f'n_{p}_out' for p in PURPOSES]
 
+# Valid person types per purpose — mirrors Stage 1 VALID_PTYPES_FOR_PURPOSE.
+# Preschool excluded from work; school-age children excluded from adult-only purposes.
+VALID_PTYPES_FOR_DURATION: dict = {
+    'work':     {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent'},
+    'edu':      {'SchoolChild', 'UniversityStudent', 'WorkingStudent', 'Preschool'},
+    'escort':   {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+                 'UniversityStudent', 'Retired', 'NonWorker'},
+    'shopping': {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+                 'UniversityStudent', 'Retired', 'NonWorker'},
+    'social':   {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+                 'UniversityStudent', 'Retired', 'NonWorker'},
+    'othmaint': {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+                 'UniversityStudent', 'Retired', 'NonWorker'},
+    'othdiscr': {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+                 'UniversityStudent', 'Retired', 'NonWorker'},
+    'eat':      {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+                 'UniversityStudent', 'SchoolChild', 'Retired', 'NonWorker'},
+}
+
 # Duration floors / ceilings per purpose (minutes).
 # Upper bounds are SOFT — the model can predict above them (lognormal tail),
 # and the budget rescaling may stretch up to 1.5× the bound before clipping.
@@ -390,10 +409,25 @@ class BudgetLognormal:
     def fit(self, X: np.ndarray, y: np.ndarray):
         from scipy.optimize import minimize
 
+        n_feat = X.shape[1]
+
+        # Drop zero-variance columns from the MLE to avoid wasting parameters
+        # and inflating AIC/BIC.  coef_ is padded back to n_feat with zeros so
+        # _eta / predict_mean accept the full feature matrix unchanged.
+        col_var = X.var(axis=0)
+        active = col_var > 1e-12          # bool mask, shape (n_feat,)
+        n_active = int(active.sum())
+
+        # Standardisation stats for all columns (inactive sd stays 1).
         self.mu_ = X.mean(axis=0)
         self.sd_ = X.std(axis=0)
         self.sd_[self.sd_ == 0] = 1.0
-        Xs = np.column_stack([np.ones(len(X)), (X - self.mu_) / self.sd_])
+
+        # Design matrix restricted to informative columns.
+        X_act = X[:, active]
+        Xs = np.column_stack([np.ones(len(X)),
+                              (X_act - self.mu_[active]) / self.sd_[active]])
+
         log_y = np.log(np.clip(y, 1e-6, None))
         ols = np.linalg.lstsq(Xs, log_y, rcond=None)[0]
         resid_std = max(np.std(log_y - Xs @ ols), 0.05)
@@ -402,31 +436,53 @@ class BudgetLognormal:
         def neg_ll_fn(p): return self._neg_ll(p, Xs, log_y)
         def neg_gr_fn(p): return -self._neg_ll_grad(p, Xs, log_y)
 
-        res = minimize(neg_ll_fn, init, jac=neg_gr_fn, method='L-BFGS-B', options={'maxiter': 500, 'ftol': 1e-10})
-        n_feat = X.shape[1]
+        res = minimize(neg_ll_fn, init, jac=neg_gr_fn, method='L-BFGS-B',
+                       options={'maxiter': 500, 'ftol': 1e-10})
+
         self.intercept_ = res.x[0]
-        self.coef_ = res.x[1:n_feat + 1]
-        self.log_sigma_ = res.x[n_feat + 1]
+
+        # Full-length coef_ (zero for inactive features).
+        self.coef_ = np.zeros(n_feat)
+        self.coef_[active] = res.x[1:n_active + 1]
+
+        self.log_sigma_ = res.x[n_active + 1]
         self.sigma_ = float(np.exp(self.log_sigma_))
         self.ll_ = float(-res.fun)
-        self.aic_ = float(2 * (n_feat + 2) - 2 * self.ll_)
+        self.aic_ = float(2 * (n_active + 2) - 2 * self.ll_)   # k = n_active + 2
         self.rmse_ = float(np.sqrt(np.mean((y - self.predict_mean(X)) ** 2)))
         self.n_ = len(y)
         self.converged_ = bool(res.success)
         self._clip_coefficients()
-        self._clip_coefficients()
 
         try:
-            params = np.concatenate([[self.intercept_], self.coef_, [self.log_sigma_]])
-            hess = _numerical_hessian(lambda p: self._neg_ll(p, Xs, log_y), params)
+            params_active = res.x                   # intercept + n_active coefs + log_sigma
+            hess = _numerical_hessian(lambda p: self._neg_ll(p, Xs, log_y), params_active)
             cov = np.linalg.pinv(hess)
-            self.std_err_ = np.sqrt(np.clip(np.diag(cov), 0.0, None))
-            self.t_stat_ = np.divide(params, self.std_err_, out=np.full_like(params, np.nan), where=self.std_err_ > 0)
-            self.p_value_ = 2.0 * norm.sf(np.abs(self.t_stat_))
+            se_active = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+            ts_active = np.divide(params_active, se_active,
+                                  out=np.full_like(params_active, np.nan),
+                                  where=se_active > 0)
+            pv_active = 2.0 * norm.sf(np.abs(ts_active))
+
+            # Pad to n_feat + 2 so callers can zip against feature_names_.
+            size = n_feat + 2
+            self.std_err_ = np.full(size, np.nan)
+            self.t_stat_  = np.full(size, np.nan)
+            self.p_value_ = np.full(size, np.nan)
+            active_idx = np.where(active)[0]
+            self.std_err_[0]              = se_active[0]           # intercept
+            self.std_err_[active_idx + 1] = se_active[1:n_active + 1]
+            self.std_err_[-1]             = se_active[-1]          # log_sigma
+            self.t_stat_[0]               = ts_active[0]
+            self.t_stat_[active_idx + 1]  = ts_active[1:n_active + 1]
+            self.t_stat_[-1]              = ts_active[-1]
+            self.p_value_[0]              = pv_active[0]
+            self.p_value_[active_idx + 1] = pv_active[1:n_active + 1]
+            self.p_value_[-1]             = pv_active[-1]
         except Exception:
             size = n_feat + 2
             self.std_err_ = np.full(size, np.nan)
-            self.t_stat_ = np.full(size, np.nan)
+            self.t_stat_  = np.full(size, np.nan)
             self.p_value_ = np.full(size, np.nan)
         return self
 
@@ -481,11 +537,14 @@ def _feature_cols(df: pd.DataFrame, ptypes: list,
 def _feature_cols_for_purpose(df: pd.DataFrame, ptypes: list, purpose: str,
                               feature_override=None) -> list:
     person_feats = _duration_person_features(df, purpose, feature_override)
+    # Restrict ptype dummies to ptypes valid for this purpose
+    _valid_set = VALID_PTYPES_FOR_DURATION.get(purpose)
+    _ptypes_for_purpose = [pt for pt in ptypes if _valid_set is None or pt in _valid_set]
     base = (['start_hr', 'log_dist', 'B', 'budget_per_activity_hr', 'day_span_hr',
              'n_mandatory', 'n_discretionary'] +
             ACTIVITY_COLS +
             [c for c in person_feats if c in df.columns] +
-            [f'ptype_{pt}' for pt in ptypes if f'ptype_{pt}' in df.columns])
+            [f'ptype_{pt}' for pt in _ptypes_for_purpose if f'ptype_{pt}' in df.columns])
     return list(dict.fromkeys([c for c in base if c in df.columns]))
 
 
@@ -557,11 +616,17 @@ def estimate_duration_models(
 
     models = {}
 
+    _s3_zthresh = float(os.environ.get('GA_SIG_COEF_ZERO', '0.01'))
+    _s3_pthresh = float(os.environ.get('GA_SIG_PVAL_THRESH', '0.10'))
+
     for purpose in PURPOSES:
         lo, hi = DURATION_BOUNDS[purpose]
 
-        # filter to tours whose purpose matches
+        # filter to tours whose purpose matches, then to valid ptypes
         subset = data[data['_purpose_coded'] == purpose].copy()
+        _valid_ptype_set = VALID_PTYPES_FOR_DURATION.get(purpose)
+        if _valid_ptype_set is not None and 'ptype' in subset.columns:
+            subset = subset[subset['ptype'].isin(_valid_ptype_set)].copy()
 
         if len(subset) < min_sample:
             logger.warning(f"  {purpose}: {len(subset)} obs < {min_sample} — skipping")
@@ -575,6 +640,32 @@ def estimate_duration_models(
         m = BudgetLognormal()
         m.fit(X, y)
         m.feature_names_ = X_cols
+
+        # Iterative p-value + magnitude pruning (up to 3 rounds)
+        for _prune_round in range(3):
+            if len(X_cols) <= 1:
+                break
+            _pvals = getattr(m, 'p_value_', None)
+            _coefs = np.asarray(m.coef_).ravel()
+            if _pvals is None or len(_pvals) < len(X_cols) + 1:
+                break
+            # layout: [0]=intercept, [1:n+1]=features, [-1]=log_sigma
+            _feat_pvals = _pvals[1:len(X_cols) + 1]
+            _keep = np.ones(len(X_cols), dtype=bool)
+            for _fi in range(len(X_cols)):
+                _near_zero = _fi < len(_coefs) and abs(_coefs[_fi]) < _s3_zthresh
+                _insig = (np.isfinite(_feat_pvals[_fi]) and _feat_pvals[_fi] > _s3_pthresh)
+                if _near_zero or _insig:
+                    _keep[_fi] = False
+            _keep_idx = np.where(_keep)[0]
+            if len(_keep_idx) == 0 or len(_keep_idx) == len(X_cols):
+                break
+            X_cols = [X_cols[i] for i in _keep_idx]
+            X = subset[X_cols].fillna(0).values.astype(float)
+            m = BudgetLognormal()
+            m.fit(X, y)
+            m.feature_names_ = X_cols
+
         mean_pred = float(np.nanmean(m.predict_mean(X))) if len(X) else float('nan')
         mean_obs = float(np.nanmean(y)) if len(y) else float('nan')
         calib = 1.0

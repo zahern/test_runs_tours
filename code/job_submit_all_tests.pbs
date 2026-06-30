@@ -131,7 +131,7 @@ WALLTIME_SAFETY="${WALLTIME_SAFETY:-23:59:00}"
 WALLTIME_JOINT="${WALLTIME_JOINT:-04:00:00}"
 WALLTIME_ANALYSIS="${WALLTIME_ANALYSIS:-02:00:00}"
 WALLTIME_SA_BANDIT="${WALLTIME_SA_BANDIT:-20:59:00}"
-NCPUS_SA="${NCPUS_SA:-4}"                   # CPUs for SA-Bandit (parallelises segment search)
+NCPUS_SA="${NCPUS_SA:-8}"                   # CPUs for SA-Bandit (parallelises segment search)
 GA_BUDGET_SA="${GA_BUDGET_SA:-fast}"        # fast=all stages in ~10h; standard=deeper but ~25h+
 DRY_RUN="${DRY_RUN:-0}"
 
@@ -332,7 +332,7 @@ echo "J7 safety_anal  → $JID7  (after J6)"
 # BanditSA adaptive search and Thompson-sampling arms are available.
 # ═══════════════════════════════════════════════════════════════════════════
 write_pbs "_t_sa_bandit.pbs" "saw_sa_bandit" "$WALLTIME_SA_BANDIT" \
-    "select=1:ncpus=${NCPUS_SA}:mem=${MEM_HEAVY}" \
+    "select=1:ncpus=${NCPUS_SA}:mem=${MEM_HEAVY}:ngpus=1" \
     "mkdir -p runs/sa_bandit/plots
 rm -f log_sa_bandit.out log_sa_bandit.err
 # Install editable MetaCount + SearchLibrium (required for BanditSA arms)
@@ -347,8 +347,12 @@ export GA_ESTIMATOR=sa_bandit
 export GA_USE_BANDIT_SA=1
 export GA_USE_SA=1
 export GA_BUDGET=${GA_BUDGET_SA}
-export JAX_PLATFORMS=cpu
-export GA_METACOUNT_FORCE_CPU=1
+export GA_METACOUNT_FORCE_CPU=0
+export PIPELINE_ACCELERATOR=gpu
+export GA_JAX_CACHE_MEM_LIMIT_GB=180
+export GA_JAX_CACHE_CHECK_EVERY=50
+export GA_SIG_PENALTY_WEIGHT=0.50
+export GA_SIG_PVAL_THRESH=0.10
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1

@@ -1069,6 +1069,12 @@ def run_ga_stage1(tours, persons, **kw):
     return run_ga_stage(stage=1, tours=tours, persons=persons, **kw)
 
 
+def run_ga_cdap(persons, **kw):
+    """Shim — delegates to ga_hypothesis_testing.run_ga_stage(stage=0)."""
+    from ga_hypothesis_testing import run_ga_stage
+    return run_ga_stage(stage=0, persons=persons, **kw)
+
+
 def run_ga_stage2(tours, persons, **kw):
     """Shim — delegates to ga_hypothesis_testing.run_ga_stage(stage=2)."""
     from ga_hypothesis_testing import run_ga_stage

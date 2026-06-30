@@ -1,0 +1,4 @@
+stage,segment,best_fitness,best_bic_per_obs,n_features,best_features
+1,Stage1 Work,-0.7196345809213687,0.7196345809213687,12,"ptype_FullTimeWorker, ptype_PartTimeWorker, mandatory_role, incp, vehrd, CARLICENCE, nprd, is_female, hh_child, age_senior, hh_couple, hh_medium"
+1,Stage1 Non-Mandatory (combined),-2.659751226981262,2.659751226981262,16,"hh_child, nprd, vehrd, age_working, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, hh_alone, hh_size_large, CARLICENCE, ptype_UniversityStudent, ptype_Preschool, hh_medium"
+1,Stage1 School/Edu,-0.02548507121891339,0.02548507121891339,17,"ptype_UniversityStudent, age_child, is_female, mandatory_role, income_midplus, studying_tertiary_pt, studying_tertiary_ft, studying_secondary, studying_primary, nprd, age_working, ptype_Retired, CARLICENCE, age_senior, multi_vehicle, hh_couple, hh_medium"

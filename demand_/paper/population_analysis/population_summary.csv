@@ -1,0 +1,16 @@
+,value
+total_persons,2735747.0
+total_zones,321.0
+ptype_FullTimeWorker,1038983.0
+ptype_PartTimeWorker,841765.0
+ptype_School,369367.0
+ptype_NonWorker,259893.0
+ptype_other,225739.0
+pct_zero_vehicle,31.00063712031851
+mean_vehicles_per_person,1.7391341377693186
+pct_full_licence,66.09130888199822
+zones_with_pop,321.0
+zones_no_pop,0.0
+mean_pop_per_zone,8522.57632398754
+median_zone_crash_rate,1.5198417901992798
+pct_pop_high_crash,41.88243392818068

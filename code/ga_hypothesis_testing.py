@@ -561,37 +561,46 @@ class GAResult:
             ylabel = self.fitness_metric
             fill_lo, fill_hi = worst, best_so_far
 
-        #  main convergence lines 
-        ax.fill_between(gens, fill_lo, fill_hi, alpha=0.10, color='#534AB7',
-                        label='population range')
-
-        # Proposed-solution range (SA only): light band of ALL evaluated candidates,
-        # including rejected moves.  Shows how broadly the SA is exploring vs what it accepts.
+        # Proposed-solution range: band of ALL evaluated candidates,
+        # including rejected moves.  Shows how broadly the search explores.
         has_proposed = any(h.get('proposed_min') is not None for h in self.history)
         if has_proposed:
             raw_pmn = [h.get('proposed_min') for h in self.history]
             raw_pmx = [h.get('proposed_max') for h in self.history]
             if is_bic:
-                pmn = [-v if v is not None else np.nan for v in raw_pmx]  # sign-flip
+                pmn = [-v if v is not None else np.nan for v in raw_pmx]
                 pmx = [-v if v is not None else np.nan for v in raw_pmn]
             else:
                 pmn = [v if v is not None else np.nan for v in raw_pmn]
                 pmx = [v if v is not None else np.nan for v in raw_pmx]
-            # Only show where both bounds are finite
             valid = [(g, lo, hi) for g, lo, hi in zip(gens, pmn, pmx)
                      if np.isfinite(lo) and np.isfinite(hi)]
             if valid:
                 pg, plo, phi = zip(*valid)
-                ax.fill_between(pg, plo, phi, alpha=0.07, color='#CC7733',
+                ax.fill_between(pg, plo, phi, alpha=0.08, color='#CC7733',
                                 label='proposed candidates')
 
-        ax.plot(gens, mean, color='#888780', linewidth=1.2,
-                linestyle='--', label='population mean', zorder=3)
-        ax.plot(gens, best, color='#A59FF0', linewidth=1.0,
-                linestyle=':', label='generation best', zorder=4)
-        best_label = 'best-so-far (BIC/n)' if is_bic else f'best-so-far ({self.fitness_metric})'
-        ax.plot(gens, best_so_far, color='#534AB7', linewidth=2.2,
-                label=best_label, zorder=5)
+        if has_proposed:
+            # SA/Bandit mode: only best-so-far, current, and proposed
+            best_label = ('best-so-far (BIC/n)' if is_bic
+                          else f'best-so-far ({self.fitness_metric})')
+            ax.plot(gens, best_so_far, color='#534AB7', linewidth=2.2,
+                    label=best_label, zorder=5)
+            ax.plot(gens, best, color='#A59FF0', linewidth=1.2,
+                    linestyle='-', label='current solution', zorder=4)
+        else:
+            # GA mode: full population visualisation
+            ax.fill_between(gens, fill_lo, fill_hi, alpha=0.10, color='#534AB7',
+                            label='population range')
+
+            ax.plot(gens, mean, color='#888780', linewidth=1.2,
+                    linestyle='--', label='population mean', zorder=3)
+            ax.plot(gens, best, color='#A59FF0', linewidth=1.0,
+                    linestyle=':', label='generation best', zorder=4)
+            best_label = ('best-so-far (BIC/n)' if is_bic
+                          else f'best-so-far ({self.fitness_metric})')
+            ax.plot(gens, best_so_far, color='#534AB7', linewidth=2.2,
+                    label=best_label, zorder=5)
 
         # Annotate final best value
         if gens:
@@ -5278,7 +5287,8 @@ def _run_ga_stage4(trips, tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
     data = _enrich_ga_data(data, persons)
     purposes   = [p for p in PURPOSES if len(data[data['purpose'] == p]) >= 30]
     est            = ga_estimator()
-    use_sim_anneal = est in ('searchlibrium', 'both', 'hybrid', 'sa_bandit')
+    use_sim_anneal = (os.environ.get('GA_STAGE4_USE_SA', '1').strip() == '1'
+                      or est in ('searchlibrium', 'both', 'hybrid', 'sa_bandit'))
     n_alts         = int(data['period'].max() + 1) if 'period' in data.columns else 6
     print(f"  {len(data)} trips | purpose-specific feature sets | "
           f"{len(purposes)} purposes | estimator={est}")
@@ -6507,6 +6517,15 @@ def apply_ga_results_to_pipeline(
         print(f"  GA Stage 5 tour coefficients → {_coef_csv.replace('.csv', '.html')}")
     except Exception as _sce:
         logger.warning(f"  GA Stage 5 coefficient save failed: {_sce}")
+        try:
+            from pipeline_logger import _write_smoke_models_html
+            _write_smoke_models_html(
+                s5_models, save_dir,
+                title='Stage 5 Final Model Coefficients',
+            )
+            print(f"  GA Stage 5 tour coefficient report (fallback HTML) → {save_dir}/stage5_models_coefficients.html")
+        except Exception as _fbe:
+            logger.warning(f"  GA Stage 5 fallback HTML also failed: {_fbe}")
     # Also save via unified GA coefficient writer (stage5_coefficients.html)
     _ga_save_stage_coef_csv(s5_models, 'stage5', save_dir)
 

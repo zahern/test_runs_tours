@@ -1,0 +1,6 @@
+Evidence
+CON: Coefficients NOT proportional (r=0.481)
+CON: NM spec degrades on crashes (dBIC=+376.9)
+PRO: Predicted NM encompasses geometry for crash prediction
+"PRO: Copula LR test rejects independence (best=Bivariate NB (kimeldorf copula), rho=0.373, p=0.0000)"
+CON: Low feature overlap (Jaccard similarity: 0.345)

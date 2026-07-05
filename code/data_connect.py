@@ -929,7 +929,13 @@ class Synth_Connect:
     
     
     
-    def __init__(self):
+    def __init__(self, new_pop=False):
+        # new_pop=True switches to the 507-SA2-zone scope (Z:/test_runs_tours/new_pop):
+        # OTAZ/DTAZ/ORDER are the SA2 code itself (no ORDER indirection), landuse comes
+        # from zone_landuse_507.csv, and OSM size-term columns come from
+        # SA2_2016_OSM_counts_507.csv. See export_zone_sa2_files() in
+        # synth_pop/run_pipeline.py for how the population side is keyed the same way.
+        self.new_pop = new_pop
         self.data = None
         self.trips = None
         self.land = None
@@ -1068,23 +1074,98 @@ class Synth_Connect:
         trips['ORIGSA2_2021'] = trips['ORIGSA1_2021'].map(sa1_to_sa2)
         persons['HOME_SA2_2021'] = persons['HOME_SA1_2021'].map(sa1_to_sa2)
 
-        # FIX 1: TAZ zone lookup (was missing entirely from process_survey)
-        sa2_to_order = pd.read_csv('seq_zone_ids_.csv')[['SA2_MAIN16', 'ORDER']]
-        o = sa2_to_order.set_index('SA2_MAIN16')['ORDER']
-        trips['OTAZ'] = trips['ORIGSA2_2021'].map(o).fillna(330).astype(int)
-        trips['DTAZ'] = trips['DESTSA2_2021'].map(o).fillna(330).astype(int)
-        persons['OTAZ'] = persons['HOME_SA2_2021'].map(o).fillna(330).astype(int)
-
-        _unmapped_o = trips['ORIGSA2_2021'].dropna().astype(int)
-        _unmapped_origs = set(_unmapped_o[_unmapped_o.map(o).isna()])
-        _unmapped_d = trips['DESTSA2_2021'].dropna().astype(int)
-        _unmapped_dests = set(_unmapped_d[_unmapped_d.map(o).isna()])
-        _unmapped = _unmapped_origs | _unmapped_dests
-        if _unmapped:
-            logging.warning(
-                f"process_survey: {len(_unmapped)} SA2 codes not in zone mapping "
-                f"(defaulted to TAZ 330): {sorted(_unmapped)[:10]}"
+        # Preserve SA1 code as HOME_SA1 (ABS sub-zone, fallback for Level4).
+        if 'HOME_SA1_2021' in persons.columns:
+            import numpy as _np
+            persons['HOME_SA1'] = (
+                pd.to_numeric(persons['HOME_SA1_2021'], errors='coerce')
+                .fillna(0).astype(_np.int64)
             )
+
+        # Assign HOME_LVL4 (SEQ-STM Level4 micro-zone) to HHTS respondents so
+        # the walk/bike mode choice is TRAINED at the same fine-grain resolution
+        # it is PREDICTED — avoiding a training/prediction LOS mismatch.
+        # Strategy: sample uniformly from Level4 zones within each respondent's
+        # home SA2 (the same approach as assign_lvl4_to_population.py), which
+        # is consistent and produces the same within-SA2 distribution in training
+        # and prediction even without knowing the respondent's exact Level4 zone.
+        import os as _os
+        _lvl4_xwalk_path = _os.path.join(
+            _os.environ.get('NEW_POP_DIR', r'Z:\test_runs_tours\new_pop'),
+            '..', 'demand_', 'lvl4_to_emme_crosswalk.csv'
+        )
+        _lvl4_xwalk_path = _os.path.normpath(_lvl4_xwalk_path)
+        if _os.path.exists(_lvl4_xwalk_path):
+            import numpy as _np
+            _lxw = pd.read_csv(_lvl4_xwalk_path)
+            _lxw['sa2_code'] = pd.to_numeric(_lxw['sa2_code'], errors='coerce')
+            _lxw = _lxw.dropna(subset=['sa2_code'])
+            _lxw['sa2_code'] = _lxw['sa2_code'].astype(int)
+            _sa2_to_lvl4s = _lxw.groupby('sa2_code')['LvL4_ID'].apply(list).to_dict()
+
+            def _sample_lvl4(sa2):
+                opts = _sa2_to_lvl4s.get(int(sa2) if not pd.isna(sa2) else -1)
+                if opts:
+                    return int(_np.random.choice(opts))
+                return 0
+
+            persons['HOME_LVL4'] = persons['HOME_SA2_2021'].apply(
+                lambda s: _sample_lvl4(pd.to_numeric(s, errors='coerce') if s else -1)
+            ).astype(_np.int64)
+
+        if self.new_pop:
+            # 507-SA2-zone scope: OTAZ/DTAZ are the SA2 code directly, no ORDER
+            # lookup. Deliberately reuse 330 as the external/catch-all sentinel
+            # (not e.g. 999999999): SA2 codes are always 9-digit (>100,000,000),
+            # so 330 can never collide with a real new_pop zone either, and
+            # every existing "!= 330" catch-all check already scattered through
+            # stage5_destination_choice.py / stage6_plan_finalisation.py keeps
+            # working unchanged in new_pop mode.
+            import os as _os
+            EXTERNAL_TAZ = 330
+            _zone_list_path = _os.path.join(
+                _os.environ.get('NEW_POP_DIR', r'Z:\test_runs_tours\new_pop'),
+                '..', 'demand_', 'sa2_crosswalk_507.csv'
+            )
+            _zone_list_path = _os.path.normpath(_zone_list_path)
+            _valid_zones = None
+            if _os.path.exists(_zone_list_path):
+                _valid_zones = set(pd.read_csv(_zone_list_path)['sa2_code'].astype(int))
+
+            def _to_otaz(sa2_series):
+                sa2 = pd.to_numeric(sa2_series, errors='coerce')
+                if _valid_zones is not None:
+                    sa2 = sa2.where(sa2.isin(_valid_zones))
+                return sa2.fillna(EXTERNAL_TAZ).astype(int)
+
+            trips['OTAZ'] = _to_otaz(trips['ORIGSA2_2021'])
+            trips['DTAZ'] = _to_otaz(trips['DESTSA2_2021'])
+            persons['OTAZ'] = _to_otaz(persons['HOME_SA2_2021'])
+
+            _n_external = int((trips['OTAZ'] == EXTERNAL_TAZ).sum() + (trips['DTAZ'] == EXTERNAL_TAZ).sum())
+            if _n_external:
+                logging.warning(
+                    f"process_survey (new_pop): {_n_external} trip endpoints outside "
+                    f"the 507-zone list (defaulted to TAZ {EXTERNAL_TAZ})"
+                )
+        else:
+            # FIX 1: TAZ zone lookup (was missing entirely from process_survey)
+            sa2_to_order = pd.read_csv('seq_zone_ids_.csv')[['SA2_MAIN16', 'ORDER']]
+            o = sa2_to_order.set_index('SA2_MAIN16')['ORDER']
+            trips['OTAZ'] = trips['ORIGSA2_2021'].map(o).fillna(330).astype(int)
+            trips['DTAZ'] = trips['DESTSA2_2021'].map(o).fillna(330).astype(int)
+            persons['OTAZ'] = persons['HOME_SA2_2021'].map(o).fillna(330).astype(int)
+
+            _unmapped_o = trips['ORIGSA2_2021'].dropna().astype(int)
+            _unmapped_origs = set(_unmapped_o[_unmapped_o.map(o).isna()])
+            _unmapped_d = trips['DESTSA2_2021'].dropna().astype(int)
+            _unmapped_dests = set(_unmapped_d[_unmapped_d.map(o).isna()])
+            _unmapped = _unmapped_origs | _unmapped_dests
+            if _unmapped:
+                logging.warning(
+                    f"process_survey: {len(_unmapped)} SA2 codes not in zone mapping "
+                    f"(defaulted to TAZ 330): {sorted(_unmapped)[:10]}"
+                )
 
         # -------------------------------
         # MODE & PURPOSE CLEANING
@@ -2219,10 +2300,23 @@ class Synth_Connect:
         if self.land is not None:
             return self.land
         else:
-            self.land = pd.read_csv('zone_order_and_landuse.csv')
-            # Convert everything possible to numeric
+            import os as _os
+            if self.new_pop:
+                _new_pop_dir = _os.environ.get('NEW_POP_DIR', r'Z:\test_runs_tours\new_pop')
+                _landuse_path = _os.path.join(_new_pop_dir, 'saved_data', 'zone_landuse_507.csv')
+                _osm_path = _os.path.join(_new_pop_dir, 'saved_data', 'SA2_2016_OSM_counts_507.csv')
+                self.land = pd.read_csv(_landuse_path)
+                # ORDER == SA2 code in the 507-zone scope (no ORDER indirection) so
+                # every downstream .merge(..., on='ORDER') keeps working unchanged.
+                self.land['ORDER'] = self.land['SA2_MAIN16']
+            else:
+                self.land = pd.read_csv('zone_order_and_landuse.csv')
+            # Convert everything possible to numeric (keep column as-is if it can't)
             for col in self.land.columns:
-                self.land[col] = pd.to_numeric(self.land[col], errors="ignore")
+                try:
+                    self.land[col] = pd.to_numeric(self.land[col])
+                except (ValueError, TypeError):
+                    pass
 
             # Replace inf with NaN
             self.land = self.land.replace([np.inf, -np.inf], np.nan)
@@ -2235,9 +2329,11 @@ class Synth_Connect:
             self.land[numeric_cols] = self.land[numeric_cols].fillna(0)
 
             # ── Enrich with OSM POI counts needed by size terms ───────────────
-            # zone_order_and_landuse.csv lacks these OSM POI count columns.
-            # They live in pddopulation_by_order_with_osm_and_landuse.csv and are
-            # merged in once here so all downstream stages see them.
+            # zone_order_and_landuse.csv (or zone_landuse_507.csv in new_pop mode)
+            # lacks these OSM POI count columns. They live in
+            # pddopulation_by_order_with_osm_and_landuse.csv (legacy, ORDER-keyed)
+            # or SA2_2016_OSM_counts_507.csv (new_pop, SA2-keyed) and are merged
+            # in once here so all downstream stages see them.
             #   university    edu:     zone 40 CBD has 5 (QUT, TAFE etc) — edu rank 259/330 without it
             #   college       edu:     community colleges / TAFE campuses (38 nz)
             #   kindergarten  escort:  early childhood centres (222 nz; lu 'childcare' = 1 nz)
@@ -2257,15 +2353,16 @@ class Synth_Connect:
             ]
             _missing_osm = [c for c in _OSM_SIZE_COLS if c not in self.land.columns]
             if _missing_osm:
-                _pop_file = 'pddopulation_by_order_with_osm_and_landuse.csv'
+                _pop_file = _osm_path if self.new_pop else 'pddopulation_by_order_with_osm_and_landuse.csv'
+                _key_col = 'SA2_MAIN16' if self.new_pop else 'ORDER'
                 try:
-                    import os as _os
                     if _os.path.exists(_pop_file):
-                        _pop = pd.read_csv(_pop_file, usecols=['ORDER'] + _missing_osm)
-                        for c in _missing_osm:
+                        _avail = [c for c in _missing_osm if c in pd.read_csv(_pop_file, nrows=0).columns]
+                        _pop = pd.read_csv(_pop_file, usecols=[_key_col] + _avail)
+                        for c in _avail:
                             _pop[c] = pd.to_numeric(_pop[c], errors='coerce').fillna(0)
-                        self.land = self.land.merge(_pop[['ORDER'] + _missing_osm], on='ORDER', how='left')
-                        for c in _missing_osm:
+                        self.land = self.land.merge(_pop[[_key_col] + _avail], on=_key_col, how='left')
+                        for c in _avail:
                             self.land[c] = self.land[c].fillna(0)
                 except Exception as _e:
                     import logging as _log

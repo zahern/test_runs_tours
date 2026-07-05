@@ -117,10 +117,10 @@ PTYPE_LABELS = {
     2: 'PartTimeWorker',
     3: 'NonWorker',
     4: 'Retired',
-    5: 'Student',         # tertiary
-    6: 'School',          # primary/secondary
+    5: 'UniversityStudent',  # tertiary — must match HHTS assign_ptype in data_connect.py
+    6: 'SchoolChild',         # primary/secondary — must match HHTS assign_ptype
     7: 'Preschool',
-    8: 'JointWorkStudy',
+    8: 'WorkingStudent',      # full-time work + study — must match HHTS assign_ptype
 }
 
 def get_ptype(row) -> int:

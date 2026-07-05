@@ -101,11 +101,23 @@ print(f"Productions by mode:")
 print(productions.groupby('mode')['count'].sum())
 
 # --- f) Build OD matrix using HHTS destination proportions ---
-hhts['orig_sa2'] = hhts['ORIGSA1_2021'].astype(str).str.strip().str[:9]
-hhts['dest_sa2'] = hhts['DESTSA1_2021'].astype(str).str.strip().str[:9]
-hhts = hhts[hhts['orig_sa2'].str.match(r'^\d{9}$', na=False)]
-hhts = hhts[hhts['dest_sa2'].str.match(r'^\d{9}$', na=False)]
-print(f"\nHHTS after SA2 extraction: {len(hhts):,} trips")
+# Use authoritative ABS 2021 SA1→SA2 concordance rather than string truncation
+# (str[:9] gives the right answer for well-formed 11-digit SA1 codes but silently
+# mishandles floats, truncated codes, or future format changes).
+import os as _os
+_sa1_csv = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                         '..', 'SA1_SHP', 'sa1_2021.csv')
+_sa1_lookup = pd.read_csv(_sa1_csv).set_index('SA1_CODE21')['SA2_CODE21'].astype(int).to_dict()
+print(f"Loaded SA1→SA2 lookup: {len(_sa1_lookup):,} entries from {_sa1_csv}")
+
+hhts['orig_sa2'] = pd.to_numeric(hhts['ORIGSA1_2021'], errors='coerce').map(_sa1_lookup)
+hhts['dest_sa2'] = pd.to_numeric(hhts['DESTSA1_2021'], errors='coerce').map(_sa1_lookup)
+_n_before = len(hhts)
+hhts = hhts.dropna(subset=['orig_sa2', 'dest_sa2'])
+# Keep as 9-digit strings to match downstream zone_ids_str filtering and home_sa2_str joins
+hhts['orig_sa2'] = hhts['orig_sa2'].astype(int).astype(str)
+hhts['dest_sa2'] = hhts['dest_sa2'].astype(int).astype(str)
+print(f"\nHHTS after SA2 extraction ({_n_before - len(hhts):,} dropped — no concordance match): {len(hhts):,} trips")
 print(f"HHTS MAINMODE values:")
 print(hhts['MAINMODE'].value_counts().head(20))
 

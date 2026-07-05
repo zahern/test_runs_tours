@@ -39,7 +39,10 @@ MODE_MAP     = {'DA': 1, 'SR': 2, 'Walk': 3, 'Bike': 4, 'Transit': 5}
 MODE_NAMES   = {1: 'DA', 2: 'SR', 3: 'Walk', 4: 'Bike', 5: 'Transit'}
 DEST_CHOICE_SAMPLE_SIZE = 0    # 0 = use ALL zones during prediction (no sampling)
 MAX_MXL_OBS = 2500              # skip MXL on large segments that were causing OOM/NaN estimates
-DEST_EST_SAMPLE_SIZE    = 0    # 0 = use ALL zones during estimation (no importance sampling)
+# Importance sampling for destination choice estimation.
+# 0 = use ALL zones; >0 = Manski-Lerman with N alternatives per observation.
+# Override via env var STAGE5_DEST_SAMPLE_SIZE (e.g. PBS -v STAGE5_DEST_SAMPLE_SIZE=20).
+DEST_EST_SAMPLE_SIZE = int(os.environ.get('STAGE5_DEST_SAMPLE_SIZE', '20'))
 # Mixed logit is optional; default off because some Larch/sharrow builds
 # produce rewrite/Inf-loglike failures on large CA tables.
 STAGE5_ENABLE_MXL = os.environ.get('STAGE5_ENABLE_MXL', '0') == '1'
@@ -774,6 +777,8 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
         'occp_trades',          # binary: trades/technical
         'bikes',                # HH bicycle count - bike mode
         'ptype',                # person type string (for logging)
+        'HOME_SA1',             # SA1 sub-zone (fallback for Level4 if not available)
+        'HOME_LVL4',            # SEQ-STM Level4 micro-zone for walk/bike skim lookup
     ] if c in pp.columns]
     # Coerce person_id to str on both sides to prevent pandas merge error when
     # HHTS tours have int64 person_id and synth persons have object person_id.
@@ -4185,11 +4190,18 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
     m.set_value("Mu_NonMotor", 0.8)
     try:
         m.lock_value("Mu_Root", 1.0)  # holdfast
-        _pf_set(m, "Mu_Car",      "minimum", 0.001)
+        # Floor raised 0.001 → 0.10: run06/23300124 models collapsed Mu_Car to
+        # the 0.001 bound, scaling in-nest utilities by 1/mu = 1000×.  That
+        # made the Hessian non-invertible (every model fell back to OPG SEs →
+        # unreliable p-values) and produced degenerate predicted shares
+        # (e.g. work DA 0.1% vs 75.5% observed).  mu < 0.1 has no plausible
+        # behavioural interpretation; at the 0.10 bound the model is still
+        # near-deterministic within the nest but numerically sane.
+        _pf_set(m, "Mu_Car",      "minimum", 0.10)
         _pf_set(m, "Mu_Car",      "maximum", 1.0)
-        _pf_set(m, "Mu_Motor",    "minimum", 0.001)
+        _pf_set(m, "Mu_Motor",    "minimum", 0.10)
         _pf_set(m, "Mu_Motor",    "maximum", 1.0)
-        _pf_set(m, "Mu_NonMotor", "minimum", 0.001)
+        _pf_set(m, "Mu_NonMotor", "minimum", 0.10)
         _pf_set(m, "Mu_NonMotor", "maximum", 1.0)
     except Exception as e:
         logger.debug(f"Could not set nesting bounds: {e}")
@@ -5383,6 +5395,14 @@ def _estimate(model, two_phase: bool = False):
     except Exception as _zv_e:
         logger.debug(f"_estimate: zero-variance detection failed: {_zv_e}")
 
+    # Snapshot starting values so unmoved ("stuck") parameters can be flagged
+    # after estimation — a free param that ends exactly at its start value has
+    # a zero gradient (constant/absent utility column) and is not identified.
+    try:
+        _start_vals = model.pf['value'].astype(float).copy()
+    except Exception:
+        _start_vals = None
+
     # ── Phase 1: core terms only (industry/edu holdfasted if two_phase) ───
     # tighter gtol → optimizer walks further from the boundary so the Hessian
     # at convergence is better conditioned and std errors less likely to be NaN.
@@ -5666,6 +5686,46 @@ def _estimate(model, two_phase: bool = False):
     # model.pf returns fresh NaN values again.
     #
     # Solution: snapshot model.pf ONCE into a plain local DataFrame (_pf),
+    # ── Stuck / at-bound parameter diagnostics ────────────────────────────
+    # Free params that never moved from their starting values (zero gradient →
+    # unidentified: constant utility column, missing data merge, or placeholder
+    # zero-fill) and params pinned at the ±cap or a bound.  These are the
+    # coefficients that show up downstream with garbage SEs / p-values.
+    try:
+        if _start_vals is not None:
+            _pf_chk = model.pf
+            _hf_chk = (_pf_chk['holdfast'].fillna(False).astype(bool)
+                       if 'holdfast' in _pf_chk.columns
+                       else pd.Series(False, index=_pf_chk.index))
+            _cur = _pf_chk['value'].astype(float)
+            _stuck = [p for p in _pf_chk.index
+                      if not _hf_chk.get(p, False)
+                      and p in _start_vals.index
+                      and np.isfinite(_cur[p])
+                      and abs(_cur[p] - float(_start_vals[p])) < 1e-12]
+            _at_bound = []
+            for p in _pf_chk.index:
+                if _hf_chk.get(p, False) or not np.isfinite(_cur[p]):
+                    continue
+                _mx = float(_pf_chk.loc[p].get('maximum', np.nan)) if 'maximum' in _pf_chk.columns else np.nan
+                _mn = float(_pf_chk.loc[p].get('minimum', np.nan)) if 'minimum' in _pf_chk.columns else np.nan
+                if (np.isfinite(_mx) and abs(_cur[p] - _mx) < 1e-9) or \
+                   (np.isfinite(_mn) and abs(_cur[p] - _mn) < 1e-9):
+                    _at_bound.append(p)
+            if _stuck:
+                logger.warning(
+                    f"_estimate: {len(_stuck)} free params NEVER MOVED from their "
+                    f"starting values (zero gradient — likely constant/missing "
+                    f"utility column; not identified): {_stuck}"
+                )
+            if _at_bound:
+                logger.warning(
+                    f"_estimate: {len(_at_bound)} params ended AT A BOUND "
+                    f"(estimate is censored; SE/p-value unreliable): {_at_bound}"
+                )
+    except Exception as _sd_e:
+        logger.debug(f"_estimate: stuck-param diagnostic failed: {_sd_e}")
+
     # apply all fills to _pf, then store _pf as model._final_pf.
     # All downstream code (CSV, HTML, validation) uses _final_pf exclusively.
     try:
@@ -9633,22 +9693,100 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         dtaz = _col(tour_rows, 'DTAZ', default=1).astype(np.int32)
 
         # ── 3. Read skim values per OD pair ──────────────────────────────
-        # Use skim_lookup dict if available (fast); else read OMX directly.
+        # Multi-resolution: walk/bike use SA1-origin × SA2-destination skims
+        # (finer spatial resolution within each SA2 home zone) when available.
+        # Auto/transit use SA2→SA2 period-matched skims as before.
+        # Falls back gracefully when SA1 skims aren't built yet.
         ivt_auto    = np.full(n, 30.0, dtype=np.float32)
         ivt_transit = np.full(n, 45.0, dtype=np.float32)
         dist_walk   = np.full(n, 5.0,  dtype=np.float32)
         dist_bike   = np.full(n, 5.0,  dtype=np.float32)
+
+        # Load fine-grained walk/bike skims once. Walk and Bike use the more
+        # granular SA1-origin × SA2-destination skims by default (HOME_SA1
+        # assigned by assign_sa1_to_population.py, ABS SA1 ~7.7k zones); all
+        # other modes keep SA2→SA2 period-matched skims. Set
+        # WALK_BIKE_FINE_ZONE=lvl4 to prefer the SEQ-STM Level4 micro-zones
+        # instead (HOME_LVL4 from assign_lvl4_to_population.py — better EMME
+        # alignment but not the ABS zone system). Whichever is preferred, the
+        # other is the fallback.
+        _fine_pref = os.environ.get('WALK_BIKE_FINE_ZONE', 'sa1').strip().lower()
+        _fine_walk = None
+        _home_fine = None
+        _fine_key  = None
+
+        def _try_sa1():
+            try:
+                from read_skims import load_sa1_walk_skims as _load_sa1
+                if 'HOME_SA1' in tour_rows.columns:
+                    fw = _load_sa1()
+                    if fw:
+                        hf = pd.to_numeric(
+                            tour_rows['HOME_SA1'], errors='coerce'
+                        ).fillna(0).astype(int).values
+                        return fw, hf, 'sa1_to_row'
+            except Exception:
+                pass
+            return None, None, None
+
+        def _try_lvl4():
+            try:
+                from read_skims import load_lvl4_walk_skims as _load_lvl4
+                if 'HOME_LVL4' in tour_rows.columns:
+                    fw = _load_lvl4()
+                    if fw:
+                        hf = pd.to_numeric(
+                            tour_rows['HOME_LVL4'], errors='coerce'
+                        ).fillna(0).astype(int).values
+                        return fw, hf, 'lvl4_to_row'
+            except Exception:
+                pass
+            return None, None, None
+
+        _loaders = ([_try_lvl4, _try_sa1] if _fine_pref == 'lvl4'
+                    else [_try_sa1, _try_lvl4])
+        for _loader in _loaders:
+            _fine_walk, _home_fine, _fine_key = _loader()
+            if _fine_walk is not None:
+                break
         crash       = np.full(n, 0.0,  dtype=np.float32)
+
+        # _time_period code -> skim suffix (mirrors the 0..5 scheme defined
+        # in _prep_hhts_tours: 0=early/EA, 1=am_peak/AM, 2=midday/MD,
+        # 3=pm_peak/PM, 4=evening/EV, 5=late/EV)
+        _PERIOD_SUFFIX = {0: 'EA', 1: 'AM', 2: 'MD', 3: 'PM', 4: 'EV', 5: 'EV'}
+        if '_time_period' in tour_rows.columns:
+            period_codes = pd.to_numeric(tour_rows['_time_period'], errors='coerce').fillna(1).astype(int).values
+        else:
+            period_codes = np.ones(n, dtype=int)
+        period_suffix = np.array([_PERIOD_SUFFIX.get(int(p), 'AM') for p in period_codes])
 
         if skim_lookup:
             for i in range(n):
                 key = (int(otaz[i]), int(dtaz[i]))
                 sk = skim_lookup.get(key, {})
-                ivt_auto[i]    = float(sk.get('SOVTOLL_TIME__AM', 30.0)        or 30.0)
-                ivt_transit[i] = float(sk.get('WLK_LOC_WLK_TOTIVT__AM', 45.0) or 45.0)
-                dist_walk[i]   = float(sk.get('DISTWALK', 5.0)                 or 5.0)
-                dist_bike[i]   = float(sk.get('DISTBIKE', 5.0)                 or 5.0)
+                suf = period_suffix[i]
+                ivt_auto[i]    = float(sk.get(f'SOVTOLL_TIME__{suf}', sk.get('SOVTOLL_TIME__AM', 30.0)) or 30.0)
+                ivt_transit[i] = float(sk.get(f'WLK_LOC_WLK_TOTIVT__{suf}', sk.get('WLK_LOC_WLK_TOTIVT__AM', 45.0)) or 45.0)
                 crash[i]       = float(sk.get('CRASH', 0.0)                    or 0.0)
+                # Walk/bike: use SA1/Lvl4-origin × SA2-destination skim when available.
+                # DTAZ is either a 9-digit SA2 code (new_pop/507-zone) or an ORDER
+                # number 1-330 (329-zone pipeline).  Use magnitude to pick the right
+                # lookup: SA2 codes are always > 100,000,000; ORDER numbers are ≤ 330.
+                if (_fine_walk is not None and _home_fine is not None
+                        and _home_fine[i] > 0):
+                    r = _fine_walk[_fine_key].get(_home_fine[i])
+                    dtaz_int = int(dtaz[i])
+                    if dtaz_int >= 100_000_000:  # 9-digit SA2 code
+                        c = _fine_walk['sa2_to_col'].get(dtaz_int)
+                    else:                         # ORDER number (329-zone system)
+                        c = _fine_walk.get('order_to_col', {}).get(dtaz_int)
+                    if r is not None and c is not None:
+                        dist_walk[i] = float(_fine_walk['DISTWALK'][r, c]) or 5.0
+                        dist_bike[i] = float(_fine_walk['DISTBIKE'][r, c]) or 5.0
+                        continue
+                dist_walk[i] = float(sk.get('DISTWALK', 5.0) or 5.0)
+                dist_bike[i] = float(sk.get('DISTBIKE', 5.0) or 5.0)
         elif skims is not None:
             # Read matrices once and index per row
             def _mat(name, fallback):
@@ -9668,14 +9806,19 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                            for k, v in dict(skims.mapping(skims.listMappings()[0])).items()}
             except Exception:
                 pass
-            mat_ivt_auto    = _mat('SOVTOLL_TIME__AM', None)
-            mat_ivt_transit = _mat('WLK_LOC_WLK_TOTIVT__AM', None)
+            # Load per-period matrices (falls back to AM-only matrices for
+            # legacy OMX files that don't have the full 5-period set).
+            mat_ivt_auto_by_period    = {p: _mat(f'SOVTOLL_TIME__{p}', None) for p in ('AM', 'MD', 'PM', 'EA', 'EV')}
+            mat_ivt_transit_by_period = {p: _mat(f'WLK_LOC_WLK_TOTIVT__{p}', None) for p in ('AM', 'MD', 'PM', 'EA', 'EV')}
             mat_walk        = _mat('DISTWALK', None)
             mat_bike        = _mat('DISTBIKE', None)
             mat_crash       = _mat('CRASH', None)
             for i in range(n):
                 oi = mapping.get(int(otaz[i]), 0)
                 di = mapping.get(int(dtaz[i]), 0)
+                suf = period_suffix[i]
+                mat_ivt_auto = mat_ivt_auto_by_period.get(suf) or mat_ivt_auto_by_period.get('AM')
+                mat_ivt_transit = mat_ivt_transit_by_period.get(suf) or mat_ivt_transit_by_period.get('AM')
                 if mat_ivt_auto    is not None: ivt_auto[i]    = mat_ivt_auto[oi, di]
                 if mat_ivt_transit is not None: ivt_transit[i] = mat_ivt_transit[oi, di]
                 if mat_walk        is not None: dist_walk[i]   = mat_walk[oi, di]
@@ -10248,6 +10391,21 @@ def _predict_batch(
             'weight':          pd.Series(1.0, index=seg_rows.index),
         }).set_index('ptour_id')
 
+        # ── Fine-grained home zone for SA1/Lvl4 walk-bike skim lookup ────
+        # Walk and Bike travel uses SA1-origin skims (other modes stay on the
+        # SA2 OMX).  Pull HOME_SA1/HOME_LVL4 from the tour table if the
+        # upstream stages carried it, else from the person table.
+        for _fz in ('HOME_SA1', 'HOME_LVL4'):
+            if _fz in seg_rows.columns:
+                tour_rows[_fz] = pd.to_numeric(
+                    seg_rows[_fz], errors='coerce').fillna(0).astype(np.int64).values
+            elif pp is not None and _fz in pp.columns and 'person_id' in pp.columns:
+                _fz_map = (pp.drop_duplicates('person_id')
+                             .set_index(pp.drop_duplicates('person_id')['person_id'].astype(str))[_fz])
+                tour_rows[_fz] = pd.to_numeric(
+                    tour_rows['person_id'].map(_fz_map), errors='coerce'
+                ).fillna(0).astype(np.int64)
+
         # keep index as string (ptour_id is the caseid for Larch)
         seg_rows = seg_rows.copy()
         seg_rows['ptour_id'] = tour_rows.index.values
@@ -10530,13 +10688,56 @@ def _predict_batch(
             except Exception:
                 pass
 
-            # ── Attempt 0: frozen cell probabilities (most stable) ────────
-            # HHTS-estimated cell probabilities applied directly to synth pop.
-            # No MC noise, fully reproducible, industry/occupation-aware.
             mode_probs = None
             alt_ids    = [1, 2, 3, 4, 5]   # DA, SR, Walk, Bike, Transit
             _frozen = seg_models.get('frozen_probs')
-            if _frozen is not None and len(_frozen) > 0:
+
+            # ── Attempt -1: distance-aware numpy path with fine skims ─────
+            # The frozen-cell path keys on person type only (no OD distance),
+            # so it cannot reflect the SA1-origin walk/bike distances.  When
+            # fine-grained SA1/Lvl4 walk-bike skims are available for these
+            # tours, prefer _mode_probs_numpy so Walk/Bike utilities respond
+            # to the person's actual (SA1-resolution) travel distance while
+            # other modes keep SA2 skims.  Override with
+            # STAGE5_MODE_PRED_PRIORITY=frozen|numpy|auto (default auto).
+            _pred_priority = os.environ.get(
+                'STAGE5_MODE_PRED_PRIORITY', 'auto').strip().lower()
+            _fine_ready = False
+            if _pred_priority in ('auto', 'numpy'):
+                try:
+                    from read_skims import SA1_WALK_BIKE_H5, LVL4_WALK_BIKE_H5
+                    _fine_ready = (
+                        ('HOME_SA1' in tour_rows.columns
+                         and pd.to_numeric(tour_rows['HOME_SA1'], errors='coerce').fillna(0).gt(0).any()
+                         and os.path.exists(os.path.normpath(SA1_WALK_BIKE_H5)))
+                        or ('HOME_LVL4' in tour_rows.columns
+                            and pd.to_numeric(tour_rows['HOME_LVL4'], errors='coerce').fillna(0).gt(0).any()
+                            and os.path.exists(os.path.normpath(LVL4_WALK_BIKE_H5)))
+                    )
+                except Exception:
+                    _fine_ready = False
+            if _pred_priority == 'numpy' or (_pred_priority == 'auto' and _fine_ready):
+                try:
+                    _mode_coef_override = (
+                        seg_models.get('mode_coef') or
+                        seg_models.get('coef') or {}
+                    )
+                    mode_probs = _mode_probs_numpy(
+                        mode_mdl, tour_rows, pp, skims, skim_lookup,
+                        coef_override=_mode_coef_override
+                    )
+                    if mode_probs is not None:
+                        logger.info(
+                            f"Mode numpy-first path succeeded [{seg}] "
+                            f"(fine SA1/Lvl4 walk-bike skims active)")
+                except Exception as _nf_e:
+                    logger.debug(f"Mode numpy-first failed [{seg}]: {_nf_e}")
+                    mode_probs = None
+
+            # ── Attempt 0: frozen cell probabilities (most stable) ────────
+            # HHTS-estimated cell probabilities applied directly to synth pop.
+            # No MC noise, fully reproducible, industry/occupation-aware.
+            if mode_probs is None and _frozen is not None and len(_frozen) > 0:
                 try:
                     mode_probs = _mode_probs_frozen(_frozen, tour_rows, pp)
                     if mode_probs is not None:
@@ -12077,12 +12278,20 @@ def _location_choice_validation(
     lu = landuse.copy()
     lu_indexed = lu.set_index(zone_col) if zone_col else lu
 
+    # Real-zone range, derived from the landuse zone list rather than the
+    # legacy hardcoded "1-329" literal — so this works for both the legacy
+    # 1-329 ORDER scheme and the new_pop 507-zone scheme (ORDER = 9-digit
+    # SA2 code). 330 stays the external/catch-all sentinel in both schemes
+    # (see Synth_Connect.process_survey's EXTERNAL_TAZ).
+    _real_zone_lo = min(all_zones) if all_zones else 1
+    _real_zone_hi = max(all_zones) if all_zones else 329
+
     for seg, purposes in SEG_PURPOSES.items():
         seg_obs = obs_obs[obs_obs['segment'] == seg].copy()
 
         # ── Edu: filter to actual school tours only ───────────────────────
         # Exclude childcare/preschool purposes (different destination universe)
-        # and restrict to zones 1-329 (zone 330 = external, no school data).
+        # and restrict to real zones (zone 330 = external, no school data).
         if seg == 'edu':
             if 'purpose' in seg_obs.columns:
                 _childcare_lower = {'childcare or kindergarten'}
@@ -12094,23 +12303,23 @@ def _location_choice_validation(
                     )
                     seg_obs = seg_obs[~_cc_mask].copy()
             if 'choice' in seg_obs.columns:
-                _valid_zone = pd.to_numeric(seg_obs['choice'], errors='coerce').between(1, 329)
+                _valid_zone = pd.to_numeric(seg_obs['choice'], errors='coerce').between(_real_zone_lo, _real_zone_hi)
                 _n_outside = int((~_valid_zone).sum())
                 if _n_outside > 0:
                     logger.info(
                         f"  Location validation [edu]: excluding {_n_outside} tours "
-                        "with destination outside zones 1-329 (zone 330 = external zone)"
+                        "with destination outside real zones (zone 330 = external zone)"
                     )
                 seg_obs = seg_obs[_valid_zone].copy()
 
-        # ── Work: restrict to zones 1-329 only ────────────────────────────
+        # ── Work: restrict to real zones only ──────────────────────────────
         elif seg == 'work' and 'choice' in seg_obs.columns:
-            _valid_zone = pd.to_numeric(seg_obs['choice'], errors='coerce').between(1, 329)
+            _valid_zone = pd.to_numeric(seg_obs['choice'], errors='coerce').between(_real_zone_lo, _real_zone_hi)
             _n_outside = int((~_valid_zone).sum())
             if _n_outside > 0:
                 logger.info(
                     f"  Location validation [work]: excluding {_n_outside} tours "
-                    "with destination outside zones 1-329"
+                    "with destination outside real zones"
                 )
             seg_obs = seg_obs[_valid_zone].copy()
 
@@ -15201,6 +15410,21 @@ def plot_dest_zone_validation(
     OBS_DTAZ_COL  = next((c for c in ['DTAZ', 'dest_taz', 'dtaz', 'DEST_TAZ'] if c in obs_tours.columns), None)
     PRED_DTAZ_COL = next((c for c in ['DTAZ', 'dest_taz', 'dtaz', 'DEST_TAZ'] if c in pred_plan.columns), None)
 
+    # Real-zone range, derived from the actual DTAZ values seen rather than a
+    # hardcoded "1-329" literal — works for both the legacy 1-329 ORDER scheme
+    # and the new_pop 507-zone scheme (DTAZ = 9-digit SA2 code). 330 stays the
+    # external/catch-all sentinel in both schemes and is always excluded.
+    _all_dtaz_vals = []
+    if OBS_DTAZ_COL:
+        _v = pd.to_numeric(obs_tours[OBS_DTAZ_COL], errors='coerce')
+        _all_dtaz_vals.append(_v[(_v > 0) & (_v != 330)])
+    if PRED_DTAZ_COL:
+        _v = pd.to_numeric(pred_plan[PRED_DTAZ_COL], errors='coerce')
+        _all_dtaz_vals.append(_v[(_v > 0) & (_v != 330)])
+    _all_dtaz_vals = pd.concat(_all_dtaz_vals) if _all_dtaz_vals else pd.Series(dtype=float)
+    _real_lo = int(_all_dtaz_vals.min()) if not _all_dtaz_vals.empty else 1
+    _real_hi = int(_all_dtaz_vals.max()) if not _all_dtaz_vals.empty else 329
+
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle('Stage 5 - Destination Choice: Observed vs Predicted Zone Distribution',
                  fontsize=13, fontweight='bold')
@@ -15238,9 +15462,9 @@ def plot_dest_zone_validation(
         elif OBS_DTAZ_COL:
             _raw = pd.to_numeric(obs_tours[OBS_DTAZ_COL], errors='coerce')
             obs_dtaz = _raw[_raw > 0].dropna()
-        # Education and Work: restrict observed DTAZ to zones 1-329 only
+        # Education and Work: restrict observed DTAZ to real zones only
         if seg_label in ('Education', 'Work') and not obs_dtaz.empty:
-            obs_dtaz = obs_dtaz[obs_dtaz.between(1, 329)]
+            obs_dtaz = obs_dtaz[obs_dtaz.between(_real_lo, _real_hi)]
 
         # ── predicted DTAZ ────────────────────────────────────────────────
         # Priority: activity rows → trip rows → any row with matching purpose → all DTAZ
@@ -15269,29 +15493,30 @@ def plot_dest_zone_validation(
             print(f"  [dest validation] {seg_label}: pred_dtaz empty - "
                   f"purposes={list(purposes)[:4]}, plan purpose sample={_samp}")
 
-        # Education and Work: restrict predicted DTAZ to zones 1-329
+        # Education and Work: restrict predicted DTAZ to real zones
         if seg_label in ('Education', 'Work') and not pred_dtaz.empty:
-            pred_dtaz = pred_dtaz[pred_dtaz.between(1, 329)]
+            pred_dtaz = pred_dtaz[pred_dtaz.between(_real_lo, _real_hi)]
 
         # ── out-of-range diagnostics ──────────────────────────────────────
-        # Log any predicted zones outside 1-330 so bad assignments are visible.
+        # Log any predicted zones outside the real-zone range so bad
+        # assignments are visible.
         if not pred_dtaz.empty:
             _pred_int = pred_dtaz.astype(int)
             _n_zero   = int((_pred_int == 0).sum())
             _n_neg    = int((_pred_int < 0).sum())
-            _n_hi     = int((_pred_int > 330).sum())
+            _n_hi     = int((_pred_int > _real_hi).sum())
             _n_bad    = _n_zero + _n_neg + _n_hi
             if _n_bad > 0:
-                _bad_vals = sorted(_pred_int[(_pred_int <= 0) | (_pred_int > 330)].unique().tolist())[:10]
+                _bad_vals = sorted(_pred_int[(_pred_int <= 0) | (_pred_int > _real_hi)].unique().tolist())[:10]
                 print(
                     f"  [dest validation] {seg_label}: WARNING - {_n_bad}/{len(_pred_int)} "
-                    f"predicted zones outside 1-330  "
-                    f"(zero={_n_zero}, neg={_n_neg}, >330={_n_hi})  "
+                    f"predicted zones outside {_real_lo}-{_real_hi}  "
+                    f"(zero={_n_zero}, neg={_n_neg}, >{_real_hi}={_n_hi})  "
                     f"example bad values: {_bad_vals}"
                 )
                 logger.warning(
                     f"plot_dest_zone_validation [{seg_label}]: {_n_bad} out-of-range DTAZ "
-                    f"(zero={_n_zero}, neg={_n_neg}, >330={_n_hi}); examples={_bad_vals}"
+                    f"(zero={_n_zero}, neg={_n_neg}, >{_real_hi}={_n_hi}); examples={_bad_vals}"
                 )
             else:
                 _min_z = int(_pred_int.min())
@@ -15303,10 +15528,10 @@ def plot_dest_zone_validation(
                 )
         if not obs_dtaz.empty:
             _obs_int = obs_dtaz.astype(int)
-            _n_obs_bad = int((_obs_int <= 0).sum() + (_obs_int > 330).sum())
+            _n_obs_bad = int((_obs_int <= 0).sum() + (_obs_int > _real_hi).sum())
             if _n_obs_bad > 0:
-                _obs_bad = sorted(_obs_int[(_obs_int <= 0) | (_obs_int > 330)].unique().tolist())[:10]
-                print(f"  [dest validation] {seg_label}: WARNING - {_n_obs_bad} obs zones outside 1-330: {_obs_bad}")
+                _obs_bad = sorted(_obs_int[(_obs_int <= 0) | (_obs_int > _real_hi)].unique().tolist())[:10]
+                print(f"  [dest validation] {seg_label}: WARNING - {_n_obs_bad} obs zones outside {_real_lo}-{_real_hi}: {_obs_bad}")
 
         if obs_dtaz.empty and pred_dtaz.empty:
             ax.set_title(f'{seg_label}\n(no data - check purpose/DTAZ columns)')
@@ -15316,13 +15541,20 @@ def plot_dest_zone_validation(
 
         obs_cnt = obs_dtaz.astype(int).value_counts()
         pred_cnt = pred_dtaz.astype(int).value_counts()
-        # Show all zones 1-330 binned and ordered left→right (zones 1 to 330)
-        _bin_edges = list(range(1, 331, bin_width)) + [331]
+        # Show all real zones binned and ordered left->right. In the legacy
+        # 1-329 ORDER scheme this bins by zone number directly; in the
+        # new_pop 507-zone scheme (DTAZ = 9-digit SA2 code) bin_width no
+        # longer means "N zone IDs apart" but the bins still partition the
+        # full observed zone range evenly, which is what the chart needs.
+        _bin_span = max(_real_hi - _real_lo + 1, 1)
+        _eff_bin_width = bin_width if _bin_span <= 1000 else max(_bin_span // 20, 1)
+        _bin_edges = list(range(_real_lo, _real_hi + 1, _eff_bin_width)) + [_real_hi + 1]
         _n_bins = len(_bin_edges) - 1
         _bin_labels = [str(_bin_edges[i]) for i in range(_n_bins)]
-        # Expand value_counts to full 1-330 index then accumulate into bins
-        _obs_all  = obs_cnt.reindex(range(1, 331), fill_value=0).astype(float)
-        _pred_all = pred_cnt.reindex(range(1, 331), fill_value=0).astype(float)
+        # Expand value_counts to the full real-zone index then accumulate into bins
+        _full_idx = range(_real_lo, _real_hi + 1)
+        _obs_all  = obs_cnt.reindex(_full_idx, fill_value=0).astype(float)
+        _pred_all = pred_cnt.reindex(_full_idx, fill_value=0).astype(float)
         obs_binned  = np.array([_obs_all.loc[_bin_edges[i]:_bin_edges[i+1]-1].sum()
                                 for i in range(_n_bins)])
         pred_binned = np.array([_pred_all.loc[_bin_edges[i]:_bin_edges[i+1]-1].sum()
@@ -15341,7 +15573,7 @@ def plot_dest_zone_validation(
 
         ax.set_xticks(x)
         ax.set_xticklabels(_bin_labels, rotation=70, fontsize=7)
-        ax.set_xlabel(f'Destination Zone (bin={bin_width}, ordered 1→330)', fontsize=9)
+        ax.set_xlabel(f'Destination Zone (bin={_eff_bin_width}, ordered {_real_lo}->{_real_hi})', fontsize=9)
         ax.set_ylabel('Share (%)', fontsize=9)
         ax.set_title(seg_label,                  fontsize=10)
         ax.legend(fontsize=8)
@@ -15778,10 +16010,12 @@ def run_stage5(
     # ~50 zones we get ~7 compilations total instead of 325.
     #
     # Memory: 50 zones × ~12k persons = ~600k activities per batch → ~400 MB.
-    # BATCH_SIZE = 1 means one origin zone per iteration (safest for memory).
-    # Each zone has ~12k persons / ~40k activities → ~300 MB peak per batch.
-    # Increase to 5-10 if you have spare memory and want fewer sharrow recompiles.
-    BATCH_SIZE = int(os.environ.get('STAGE5_BATCH_SIZE', '1'))
+    # BATCH_SIZE = 1 means one origin zone per iteration (safest for memory,
+    # but catastrophically slow: each batch re-triggers Larch/sharrow flow
+    # compilation, ~12-15 min per batch × 330 zones ≈ 3 days — job 23300124
+    # burned a full walltime this way without ever writing predictions).
+    # Default 25 keeps peak memory ≈ 200-300 MB while cutting compilations 25×.
+    BATCH_SIZE = int(os.environ.get('STAGE5_BATCH_SIZE', '25'))
 
     zones = sorted(s4['OTAZ'].dropna().unique().astype(int).tolist())
     n_zones = len(zones)
@@ -15795,6 +16029,19 @@ def run_stage5(
     total_persons = 0
     total_trips   = 0
 
+    # ── Per-batch checkpointing ────────────────────────────────────────
+    # Each completed batch is pickled to <out_dir>/stage5_batches/ so a job
+    # killed mid-prediction (walltime, OOM) keeps its finished batches and a
+    # re-run resumes from disk instead of recomputing everything.  Batch seeds
+    # derive from batch_zones[0], so resumed results are identical to a
+    # straight-through run.  Disable with STAGE5_BATCH_CHECKPOINT=0.
+    _ckpt_dir = None
+    if os.environ.get('STAGE5_BATCH_CHECKPOINT', '1') == '1':
+        _ckpt_base = (os.environ.get('PIPELINE_OUT_DIR')
+                      or os.path.dirname(save_path) or '.')
+        _ckpt_dir = os.path.join(_ckpt_base, 'stage5_batches')
+        os.makedirs(_ckpt_dir, exist_ok=True)
+
     for b_idx, batch_zones in enumerate(zone_batches):
         batch_mask = s4['OTAZ'].isin(batch_zones)
         s4_batch   = s4[batch_mask].copy()
@@ -15804,6 +16051,23 @@ def run_stage5(
 
         n_ppl_batch = (s4_batch['person_id'].nunique()
                        if 'person_id' in s4_batch.columns else len(s4_batch))
+
+        _ckpt_fp = (os.path.join(
+            _ckpt_dir, f'batch_{batch_zones[0]}_{batch_zones[-1]}.pkl')
+            if _ckpt_dir else None)
+        if _ckpt_fp and os.path.exists(_ckpt_fp):
+            try:
+                batch_plan = pd.read_pickle(_ckpt_fp)
+                zone_plans.append(batch_plan)
+                total_persons += (batch_plan['person_id'].nunique()
+                                  if 'person_id' in batch_plan.columns else 0)
+                total_trips   += (batch_plan['row_type'] == 'trip').sum()
+                print(f"  Batch {b_idx+1:3d}/{n_batches} "
+                      f"(zones {batch_zones[0]}-{batch_zones[-1]}) - "
+                      f"resumed from checkpoint ({len(batch_plan):,} rows)")
+                continue
+            except Exception as _ck_e:
+                logger.warning(f"  Batch checkpoint unreadable, recomputing: {_ck_e}")
 
         print(f"  Batch {b_idx+1:3d}/{n_batches} "
               f"(zones {batch_zones[0]}-{batch_zones[-1]}) - "
@@ -15817,6 +16081,11 @@ def run_stage5(
             # attach skims immediately, then release DataTree memory
             batch_plan = _attach_skims(batch_plan, skim_df)
             zone_plans.append(batch_plan)
+            if _ckpt_fp:
+                try:
+                    batch_plan.to_pickle(_ckpt_fp)
+                except Exception as _cw_e:
+                    logger.warning(f"  Batch checkpoint write failed (non-fatal): {_cw_e}")
 
             total_persons += (batch_plan['person_id'].nunique()
                               if 'person_id' in batch_plan.columns else 0)

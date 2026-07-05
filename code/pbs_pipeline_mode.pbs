@@ -22,6 +22,25 @@ GA_ESTIMATOR=${GA_ESTIMATOR:-default}
 INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS:-1}
 ESTIMATOR_SOURCE=${ESTIMATOR_SOURCE:-pypi}
 
+# 507-zone SA2 population scope — forward to pipeline_logger.py via os.environ.
+# NEW_POP=1 switches process_survey() to SA2-direct OTAZ (no ORDER lookup),
+# synth pop loader to zone_<sa2>.csv files, and skims to PIPELINE_SKIMS_PATH.
+NEW_POP=${NEW_POP:-0}
+NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-}
+export NEW_POP
+export NEW_POP_MAPPED
+export NEW_POP_DIR
+# Export PIPELINE_SKIMS_PATH only when non-empty; otherwise unset it entirely
+# so Python's os.environ.get() returns None → falls back to _DEFAULT_SKIMS_PATH.
+# An empty string from PBS (-v "PIPELINE_SKIMS_PATH=") is treated as unset.
+if [ -n "$PIPELINE_SKIMS_PATH" ]; then
+    export PIPELINE_SKIMS_PATH
+else
+    unset PIPELINE_SKIMS_PATH
+fi
+
 cd "$PBS_O_WORKDIR"
 
 module purge
@@ -108,6 +127,14 @@ export OPENBLAS_NUM_THREADS="$THREADS"
 export MKL_NUM_THREADS="$THREADS"
 export NUMEXPR_NUM_THREADS="$THREADS"
 export STAGE5_WORKERS="$S5_WORKERS"
+# Zones per Stage-5 prediction batch. 1 zone/batch re-triggers Larch/sharrow
+# flow compilation per zone (~15 min each × 330 zones ≈ days — job 23300124
+# burned a full walltime without reaching the prediction write). 50 → ~7
+# compilations, ~400 MB peak per batch.
+export STAGE5_BATCH_SIZE="${STAGE5_BATCH_SIZE:-50}"
+# Write each finished prediction batch to <run_dir>/stage5_batches/ and resume
+# from there after a walltime kill (STAGE5_BATCH_CHECKPOINT=0 disables).
+export STAGE5_BATCH_CHECKPOINT="${STAGE5_BATCH_CHECKPOINT:-1}"
 # Number of GA stage-2..5 segments (purposes/targets/tour segments) searched
 # concurrently in spawn-mode subprocesses. Empty = ga_hypothesis_testing.py
 # picks min(n_segments, cpu_count, 4) automatically. Set via

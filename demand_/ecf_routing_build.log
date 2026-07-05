@@ -1,0 +1,33 @@
+Target SA2 zones: 324
+Loading road network...
+  10302 segments, CRS=EPSG:28355
+Snapping segment endpoints into shared nodes...
+  5214 unique nodes from 20604 endpoints
+Building routing graph...
+Snapping zone centroids to network...
+  WARNING: 30 zones snap >5000m from the network (missing/disconnected geometry) — their OD rows will be NaN
+Running Dijkstra from 324 zone sources over 5214 nodes...
+Accumulating exposure along shortest-path trees...
+  source zone 51/324 done
+  source zone 101/324 done
+  source zone 151/324 done
+  source zone 201/324 done
+  source zone 251/324 done
+  source zone 301/324 done
+
+OD pairs with a valid route: 81510/104652
+Written: Z:\test_runs_tours\demand_\nearmiss_ecf_skim_507.omx
+Written: Z:\test_runs_tours\demand_\nearmiss_ecf_od_507_summary.csv (81,482 OD pairs)
+
+Top 10 OD pairs by ecf_total:
+ origin_sa2  dest_sa2  ecf_total  nm_total  route_length_km
+  112031552 316051435 731.546692   10410.0       235.723831
+  309021230 316051435 731.546692   10410.0       235.723831
+  316051435 112031552 731.546692   10410.0       235.723831
+  316051435 309021230 731.546692   10410.0       235.723831
+  309051243 316051435 729.851746   10320.0       243.920593
+  316051435 309051243 729.851746   10320.0       243.920593
+  112031254 316051435 728.980530   10282.0       241.920593
+  316051435 112031254 728.980530   10282.0       241.920593
+  112031552 316071545 724.831116    9828.0       214.042679
+  309021230 316071545 724.831116    9828.0       214.042679

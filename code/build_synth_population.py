@@ -33,6 +33,9 @@ Usage
     # Build without attaching accessibility (faster — no landuse/skims needed):
     python build_synth_population.py --no-accessibility
 
+    # Build the new_pop 507-SA2-zone scope (zone_<sa2>.csv, OTAZ = SA2 code):
+    python build_synth_population.py --new-pop
+
     # Specify a custom zone directory:
     python build_synth_population.py --synth-dir /path/to/zone_csvs
 
@@ -80,6 +83,14 @@ OUT_FULL     = 'saved_data/synth_population.csv'
 OUT_PERSONS  = 'saved_data/synth_persons.csv'
 OUT_SUMMARY  = 'saved_data/synth_population_summary.csv'
 
+# new_pop / 507-SA2-zone scope (zone_<sa2>.csv files, OTAZ = SA2 code directly,
+# no ORDER indirection). Override root with env var NEW_POP_DIR.
+NEW_POP_DIR        = os.environ.get('NEW_POP_DIR', r'Z:\test_runs_tours\new_pop')
+NEW_POP_SYNTH_DIR  = os.path.join(NEW_POP_DIR, 'saved_data', 'zone_ids_sa2')
+NEW_POP_OUT_FULL    = os.path.join(NEW_POP_DIR, 'saved_data', 'synth_population.csv')
+NEW_POP_OUT_PERSONS = os.path.join(NEW_POP_DIR, 'saved_data', 'synth_persons.csv')
+NEW_POP_OUT_SUMMARY = os.path.join(NEW_POP_DIR, 'saved_data', 'synth_population_summary.csv')
+
 # Columns kept in the compact persons table (ABM-stage inputs only)
 PERSONS_COLS = [
     'person_id', 'OTAZ', 'SA2_MAIN16',
@@ -104,13 +115,31 @@ PERSONS_COLS = [
 # HELPERS
 # ---------------------------------------------------------------------------
 
-def _load_zone(filepath: str) -> pd.DataFrame:
-    """Read one order_N.csv and set OTAZ from filename."""
+def _parse_zone_id(filepath: str):
+    """
+    Parse the zone identifier from a zone CSV filename.
+
+    Two conventions are supported:
+      order_N.csv  -- legacy 329-zone scope, N is an arbitrary ORDER int.
+      zone_S.csv   -- new_pop 507-SA2-zone scope, S is the SA2 code itself
+                      (no ORDER indirection — see export_zone_sa2_files()
+                      in synth_pop/run_pipeline.py).
+    """
     match = re.search(r'order_(\d+)', filepath)
-    if not match:
-        logger.warning(f"  Skipping {filepath} — cannot parse ORDER from filename")
+    if match:
+        return int(match.group(1))
+    match = re.search(r'zone_(\d+)', filepath)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _load_zone(filepath: str) -> pd.DataFrame:
+    """Read one zone CSV (order_N.csv or zone_<sa2>.csv) and set OTAZ from filename."""
+    otaz = _parse_zone_id(filepath)
+    if otaz is None:
+        logger.warning(f"  Skipping {filepath} — cannot parse zone id from filename")
         return None
-    otaz = int(match.group(1))
     try:
         df = pd.read_csv(filepath, low_memory=False)
         df['OTAZ'] = otaz
@@ -226,20 +255,18 @@ def build_synth_population(
     from synth_attributes import enrich_synth_population
 
     # ── 1. Discover zone files ─────────────────────────────────────────────
-    pattern = os.path.join(synth_dir, 'order_*.csv')
-    files   = sorted(glob.glob(pattern))
+    # Supports both the legacy order_N.csv convention and the new_pop
+    # zone_<sa2>.csv convention (see _parse_zone_id).
+    files = sorted(glob.glob(os.path.join(synth_dir, 'order_*.csv'))
+                    + glob.glob(os.path.join(synth_dir, 'zone_*.csv')))
     if not files:
         raise FileNotFoundError(
-            f"No order_*.csv files found in '{synth_dir}'.\n"
-            f"  Expected: order_1.csv ... order_329.csv"
+            f"No order_*.csv or zone_*.csv files found in '{synth_dir}'."
         )
 
     if zones is not None:
         zone_set = set(zones)
-        files = [
-            f for f in files
-            if (m := re.search(r'order_(\d+)', f)) and int(m.group(1)) in zone_set
-        ]
+        files = [f for f in files if _parse_zone_id(f) in zone_set]
         logger.info(f"  Zone filter: {len(files)} files for zones {sorted(zone_set)[:10]}...")
     else:
         logger.info(f"  Found {len(files)} zone CSV files in {synth_dir}")
@@ -252,9 +279,9 @@ def build_synth_population(
         if df is not None:
             frames.append(df)
         else:
-            m = re.search(r'order_(\d+)', fp)
-            if m:
-                missing.append(int(m.group(1)))
+            zid = _parse_zone_id(fp)
+            if zid is not None:
+                missing.append(zid)
 
     if not frames:
         raise ValueError(f"No zone CSVs loaded from {synth_dir}")
@@ -358,6 +385,241 @@ def build_synth_population(
 
 
 # ---------------------------------------------------------------------------
+# 324-ZONE MAPPED POPULATION  (new_pop files → ORDER-based OTAZ)
+# ---------------------------------------------------------------------------
+
+#: Crosswalk produced by demand_/20_build_sa2_to_order_crosswalk.py
+_DEFAULT_CROSSWALK = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 '..', 'demand_', 'sa2_to_order_crosswalk.csv')
+)
+
+OUT_MAPPED_FULL    = 'saved_data/synth_population_mapped.csv'
+OUT_MAPPED_PERSONS = 'saved_data/synth_persons_mapped.csv'
+OUT_MAPPED_SUMMARY = 'saved_data/synth_population_mapped_summary.csv'
+
+
+def build_synth_population_mapped(
+    crosswalk_path: str = None,
+    new_pop_dir:    str = None,
+    out_full:       str = OUT_MAPPED_FULL,
+    out_persons:    str = OUT_MAPPED_PERSONS,
+    out_summary:    str = OUT_MAPPED_SUMMARY,
+    attach_accessibility: bool = False,
+    save:           bool = True,
+    verbose:        bool = True,
+) -> pd.DataFrame:
+    """
+    Load the new_pop 507-zone SA2 files, remap OTAZ from SA2 code → ORDER
+    number using demand_/sa2_to_order_crosswalk.csv, and return an enriched
+    synthetic population ready for the 329-zone pipeline.
+
+    Non-324-zone SA2 people are merged into their nearest 324-zone neighbour's
+    ORDER zone (crosswalk match_type='via_nearest_324').  Zones with zero
+    persons in the new_pop CSV files are silently skipped.
+
+    Run demand_/20_build_sa2_to_order_crosswalk.py first to generate the
+    crosswalk.
+
+    Parameters
+    ----------
+    crosswalk_path : path to sa2_to_order_crosswalk.csv
+                     (default: ../demand_/sa2_to_order_crosswalk.csv)
+    new_pop_dir    : root of new_pop scope
+                     (default: NEW_POP_DIR env var or Z:/test_runs_tours/new_pop)
+    out_full / out_persons / out_summary : output CSV paths
+    attach_accessibility : join accessibility columns (requires skims; slow)
+    save           : write output CSVs
+    """
+    from synth_attributes import enrich_synth_population
+
+    # ── resolve paths ──────────────────────────────────────────────────────
+    _xwalk_path = crosswalk_path or _DEFAULT_CROSSWALK
+    if not os.path.exists(_xwalk_path):
+        raise FileNotFoundError(
+            f"Crosswalk not found: {_xwalk_path}\n"
+            f"Run demand_/20_build_sa2_to_order_crosswalk.py first."
+        )
+    _np_dir  = new_pop_dir or os.environ.get('NEW_POP_DIR', NEW_POP_DIR)
+    _np_zone = os.path.join(_np_dir, 'saved_data', 'zone_ids_sa2')
+    if not os.path.isdir(_np_zone):
+        raise FileNotFoundError(f"new_pop zone dir not found: {_np_zone}")
+
+    # ── load crosswalk ─────────────────────────────────────────────────────
+    xwalk = pd.read_csv(_xwalk_path)
+    xwalk['sa2_code'] = xwalk['sa2_code'].astype(int)
+    xwalk['order']    = xwalk['order'].astype(int)
+    sa2_to_order  = dict(zip(xwalk['sa2_code'], xwalk['order']))
+    sa2_in_324    = set(xwalk.loc[xwalk['in_324'] == 1, 'sa2_code'])
+    logger.info(f"Crosswalk: {len(sa2_to_order)} SA2 zones → {xwalk['order'].nunique()} ORDER zones "
+                f"({len(sa2_in_324)} in 324-zone skim set)")
+
+    # ── discover zone_<sa2>.csv files ─────────────────────────────────────
+    zone_files = sorted(glob.glob(os.path.join(_np_zone, 'zone_*.csv')))
+    if not zone_files:
+        raise FileNotFoundError(f"No zone_*.csv files in {_np_zone}")
+    logger.info(f"Found {len(zone_files)} zone_<sa2>.csv files in {_np_zone}")
+
+    # ── load and remap ─────────────────────────────────────────────────────
+    frames  = []
+    skipped_no_crosswalk = []
+    skipped_empty        = []
+    n_non324 = 0
+
+    for fp in zone_files:
+        sa2_code = _parse_zone_id(fp)   # reads the <sa2> part from filename
+        if sa2_code is None:
+            continue
+        order = sa2_to_order.get(sa2_code)
+        if order is None:
+            skipped_no_crosswalk.append(sa2_code)
+            continue
+        try:
+            df = pd.read_csv(fp, low_memory=False)
+        except Exception as exc:
+            logger.warning(f"  Failed to read {fp}: {exc}")
+            continue
+        if len(df) == 0:
+            skipped_empty.append(sa2_code)
+            continue
+
+        df['OTAZ']     = order          # remap to ORDER number
+        df['HOME_SA2'] = sa2_code       # keep original SA2 for reference
+        if sa2_code not in sa2_in_324:
+            df['_in324'] = 0
+            n_non324 += len(df)
+        else:
+            df['_in324'] = 1
+        frames.append(df)
+
+    if not frames:
+        raise ValueError("No zone CSVs loaded — check new_pop_dir and crosswalk.")
+
+    # ── Fill empty SA2 zones from legacy 329-zone order_N.csv files ────────
+    # Some SA2 zones in the new_pop have zero people in their CSV (skipped_empty).
+    # For those ORDER zones, fall back to the legacy per-zone files so the
+    # destination-choice model still sees people in every ORDER zone.
+    if skipped_empty:
+        for _empty_sa2 in skipped_empty:
+            _empty_order = sa2_to_order.get(_empty_sa2)
+            if _empty_order is None:
+                continue
+            _legacy_path = os.path.join(SYNTH_DIR, f'order_{_empty_order}.csv')
+            if os.path.exists(_legacy_path):
+                try:
+                    _df = pd.read_csv(_legacy_path, low_memory=False)
+                    if len(_df) > 0:
+                        _df['OTAZ']     = _empty_order
+                        _df['HOME_SA2'] = _empty_sa2
+                        _df['_in324']   = 1 if _empty_sa2 in sa2_in_324 else 0
+                        frames.append(_df)
+                        logger.info(
+                            f"  Filled empty SA2 {_empty_sa2} → ORDER {_empty_order} "
+                            f"from legacy {_legacy_path} ({len(_df):,} persons)"
+                        )
+                except Exception as _leg_exc:
+                    logger.warning(
+                        f"  Legacy fallback failed for SA2 {_empty_sa2} "
+                        f"ORDER {_empty_order}: {_leg_exc}"
+                    )
+            else:
+                logger.warning(
+                    f"  No legacy fallback for empty SA2 {_empty_sa2} "
+                    f"(ORDER {_empty_order}) — {_legacy_path} not found; zone left blank"
+                )
+
+    synth = pd.concat(frames, ignore_index=True)
+
+    # Assign person_id using HOME_SA2 (original SA2 code, unique per source file)
+    # NOT OTAZ (ORDER), because multiple SA2s can map to the same ORDER zone which
+    # causes OTAZ * 1M + abspid collisions for people whose abspid values overlap.
+    id_src = next((c for c in ['abspid', 'PERSID'] if c in synth.columns), None)
+    if id_src:
+        synth['person_id'] = (
+            synth['HOME_SA2'].astype(np.int64) * 1_000_000
+            + synth[id_src].astype(np.int64)
+        )
+        if synth['person_id'].duplicated().any():
+            n_dup = synth['person_id'].duplicated().sum()
+            logger.warning(f"  {n_dup:,} duplicate person_ids even with HOME_SA2 — falling back to row index")
+            synth['person_id'] = np.arange(len(synth), dtype=np.int64)
+        else:
+            logger.info(f"  person_id: {synth['person_id'].nunique():,} unique (HOME_SA2 × 1M + {id_src})")
+    else:
+        synth['person_id'] = np.arange(len(synth), dtype=np.int64)
+
+    n_in324 = int((synth['_in324'] == 1).sum())
+    logger.info(
+        f"Loaded {len(synth):,} persons | {synth['OTAZ'].nunique()} ORDER zones\n"
+        f"  In-324 persons      : {n_in324:,}\n"
+        f"  Non-324 (remapped)  : {n_non324:,}\n"
+        f"  Zones no crosswalk  : {len(skipped_no_crosswalk)}\n"
+        f"  Zones empty (zero)  : {len(skipped_empty)}"
+    )
+    if skipped_no_crosswalk:
+        logger.warning(f"  SA2 codes with no crosswalk entry (skipped): {skipped_no_crosswalk[:10]}")
+    if skipped_empty:
+        logger.info(f"  Empty SA2 zones (zero pop — left blank): {skipped_empty}")
+
+    # drop internal flag column
+    synth.drop(columns=['_in324'], inplace=True, errors='ignore')
+
+    # ── enrich ────────────────────────────────────────────────────────────
+    landuse = None
+    if attach_accessibility:
+        try:
+            from data_connect import Synth_Connect
+            landuse = Synth_Connect().get_land()
+        except Exception as exc:
+            logger.warning(f"Could not load landuse for accessibility: {exc}")
+
+    synth = enrich_synth_population(synth, landuse=landuse)
+
+    if 'vehrd' in synth.columns:
+        synth['veh_bin']     = _veh_bin(synth['vehrd'])
+    if 'incp' in synth.columns:
+        synth['income_band'] = _income_band(synth['incp'])
+    if 'age5p' in synth.columns:
+        synth['age_group']   = _age_group(synth['age5p'])
+
+    n_persons = len(synth)
+    n_zones   = synth['OTAZ'].nunique()
+    ptype_dist = synth['ptype'].value_counts().to_dict()
+
+    if verbose:
+        print(f"\n  324-zone mapped synthetic population:")
+        print(f"    Persons       : {n_persons:,}")
+        print(f"    ORDER zones   : {n_zones}")
+        print(f"    In-324 zones  : {len(sa2_in_324)}")
+        print(f"    Non-324 (merged) persons: {n_non324:,}")
+        print(f"    Empty SA2 zones (zero pop): {len(skipped_empty)}")
+        for pt, cnt in sorted(ptype_dist.items(), key=lambda x: -x[1]):
+            print(f"      {pt:<20s}: {cnt:>8,}  ({cnt/n_persons*100:.1f}%)")
+
+    # ── save ──────────────────────────────────────────────────────────────
+    if save:
+        os.makedirs(os.path.dirname(out_full) or '.', exist_ok=True)
+        synth.to_csv(out_full, index=False)
+        logger.info(f"Saved mapped population → {out_full}")
+
+        keep_cols = [c for c in PERSONS_COLS + ['HOME_SA2'] if c in synth.columns]
+        extra = [c for c in synth.columns
+                 if c.endswith('_acc') or c in ('veh_bin', 'income_band', 'age_group')]
+        keep_cols = list(dict.fromkeys(keep_cols + extra))
+        synth[keep_cols].to_csv(out_persons, index=False)
+        logger.info(f"Saved compact mapped persons → {out_persons}")
+
+        pd.DataFrame([{
+            'n_persons': n_persons, 'n_order_zones': n_zones,
+            'n_in_324': len(sa2_in_324), 'n_non324_persons': n_non324,
+            'n_empty_zones': len(skipped_empty),
+            **{f'ptype_{k}': v for k, v in ptype_dist.items()}
+        }]).to_csv(out_summary, index=False)
+
+    return synth
+
+
+# ---------------------------------------------------------------------------
 # LOAD CACHED POPULATION
 # ---------------------------------------------------------------------------
 
@@ -427,16 +689,56 @@ if __name__ == '__main__':
         metavar='PATH',
         help=f'Compact persons CSV path (default: {OUT_PERSONS})',
     )
+    parser.add_argument(
+        '--new-pop',
+        action='store_true',
+        help=(f'Use the new_pop 507-SA2-zone scope: reads zone_<sa2>.csv from '
+              f'{NEW_POP_SYNTH_DIR} and writes outputs under {NEW_POP_DIR}\\saved_data\\ '
+              f'(overrides --synth-dir/--out/--out-persons unless explicitly given)'),
+    )
+    parser.add_argument(
+        '--new-pop-mapped',
+        action='store_true',
+        help=(f'Load new_pop 507-zone CSVs and remap OTAZ from SA2 code → ORDER '
+              f'number via demand_/sa2_to_order_crosswalk.csv.  Non-324-zone people '
+              f'are merged into their nearest 324-zone ORDER neighbour.  Destination '
+              f'skims stay on the 329-zone ORDER system.  Run '
+              f'demand_/20_build_sa2_to_order_crosswalk.py first.'),
+    )
+    parser.add_argument(
+        '--crosswalk',
+        default=None,
+        metavar='PATH',
+        help='Path to sa2_to_order_crosswalk.csv (--new-pop-mapped only; '
+             f'default: {_DEFAULT_CROSSWALK})',
+    )
     args = parser.parse_args()
 
-    synth = build_synth_population(
-        synth_dir            = args.synth_dir,
-        zones                = args.zones,
-        attach_accessibility = not args.no_accessibility,
-        out_full             = args.out,
-        out_persons          = args.out_persons,
-        save                 = True,
-        verbose              = True,
-    )
+    if args.new_pop_mapped:
+        synth = build_synth_population_mapped(
+            crosswalk_path       = args.crosswalk,
+            new_pop_dir          = os.environ.get('NEW_POP_DIR', NEW_POP_DIR),
+            out_full             = args.out if args.out != OUT_FULL else OUT_MAPPED_FULL,
+            out_persons          = args.out_persons if args.out_persons != OUT_PERSONS else OUT_MAPPED_PERSONS,
+            attach_accessibility = not args.no_accessibility,
+            save                 = True,
+            verbose              = True,
+        )
+    else:
+        synth_dir   = NEW_POP_SYNTH_DIR if args.new_pop and args.synth_dir == SYNTH_DIR else args.synth_dir
+        out_full    = NEW_POP_OUT_FULL if args.new_pop and args.out == OUT_FULL else args.out
+        out_persons = NEW_POP_OUT_PERSONS if args.new_pop and args.out_persons == OUT_PERSONS else args.out_persons
+        out_summary = NEW_POP_OUT_SUMMARY if args.new_pop else OUT_SUMMARY
+
+        synth = build_synth_population(
+            synth_dir            = synth_dir,
+            zones                = args.zones,
+            attach_accessibility = not args.no_accessibility,
+            out_full             = out_full,
+            out_persons          = out_persons,
+            out_summary          = out_summary,
+            save                 = True,
+            verbose              = True,
+        )
 
     print(f"\nDone.  {len(synth):,} persons written.")

@@ -83,6 +83,20 @@ RUN_SAFETY_COMPARISON = os.environ.get('RUN_SAFETY_COMPARISON', '1').strip() == 
 # Override via env: qsub -v RUN_PREDICTION=0 job_sa_bandit.pbs
 RUN_PREDICTION = os.environ.get('RUN_PREDICTION', '1').strip() == '1'
 
+# Set NEW_POP=1 to run against the 507-SA2-zone scope (Z:/test_runs_tours/new_pop)
+# instead of the legacy ~329-zone scope. This must be set before pipeline_logger
+# is imported below — it switches SYNTH_DIR (zone_<sa2>.csv instead of
+# order_N.csv), Synth_Connect(new_pop=True) (landuse/HHTS keyed by SA2 code),
+# and PIPELINE_SKIMS_PATH (demand_'s 507-zone OMX instead of
+# downcasted_matrices_base.omx) all at once — see pipeline_logger.py's
+# NEW_POP/NEW_POP_DIR/PIPELINE_SKIMS_PATH module-level setup.
+# Override via env: qsub -v NEW_POP=1 job_sa_bandit_507.pbs
+os.environ.setdefault('NEW_POP', os.environ.get('NEW_POP', '0'))
+NEW_POP = os.environ['NEW_POP'].strip() == '1'
+NEW_POP_DIR = os.environ.get('NEW_POP_DIR', r'Z:\test_runs_tours\new_pop')
+if NEW_POP:
+    os.environ.setdefault('PIPELINE_SKIMS_PATH', r'Z:\test_runs_tours\demand_\sa2_skims_507_omxspec.omx')
+
 # ─────────────────────────────── ENV SETUP ───────────────────────────────────
 # All env-vars MUST be set before any pipeline or JAX import.
 
@@ -147,7 +161,8 @@ if _STAGE23_JOINT:
 # ─────────────────────────────── LOGGING ─────────────────────────────────────
 # Create a timestamped output directory so repeated runs never clobber each other.
 _ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-pl.OUT_DIR = os.path.join('runs', f'sa_bandit_{_ts}')
+_run_tag = 'sa_bandit_507' if NEW_POP else 'sa_bandit'
+pl.OUT_DIR = os.path.join('runs', f'{_run_tag}_{_ts}')
 os.makedirs(os.path.join(pl.OUT_DIR, 'plots'), exist_ok=True)
 os.makedirs('saved_data', exist_ok=True)
 os.environ['PIPELINE_OUT_DIR'] = pl.OUT_DIR
@@ -671,7 +686,10 @@ def _fit_stage5_tour_models_hhts(
     from pipeline_logger import _inspect_model_parameters, _write_smoke_models_html
 
     os.makedirs(save_dir, exist_ok=True)
-    skims_path = 'downcasted_matrices_base.omx'
+    # Use the mode-appropriate skims (507-zone OMX under NEW_POP=1, legacy
+    # downcasted_matrices_base.omx otherwise) — never hardcode the legacy file.
+    from pipeline_logger import PIPELINE_SKIMS_PATH as _skims_default
+    skims_path = _skims_default
     if crash_skims is None:
         from pipeline_logger import _detect_stage5_crash_source
         crash_skims = _detect_stage5_crash_source()
@@ -763,7 +781,7 @@ def _run_prediction(out: dict, landuse, all_ga: AllStagesResult, run_dir: str):
         load_synth_all_zones, load_synth,
         cdap, usual_locations,
         stage5b, stage6, plot, spatial_plots,
-        SYNTH_DIR,
+        SYNTH_DIR, PIPELINE_SKIMS_PATH,
     )
     from ga_hypothesis_testing import apply_ga_results_to_pipeline
 
@@ -776,14 +794,7 @@ def _run_prediction(out: dict, landuse, all_ga: AllStagesResult, run_dir: str):
 
     # ── Load synthetic population ──────────────────────────────────────
     print("\n  Loading synthetic population (all zones) ...")
-    try:
-        from pipeline_logger import filepath as _fp
-        if _fp and os.path.isfile(_fp):
-            synth = load_synth(_fp, landuse=landuse)
-        else:
-            synth = load_synth_all_zones(SYNTH_DIR, landuse=landuse)
-    except Exception:
-        synth = load_synth_all_zones(SYNTH_DIR, landuse=landuse)
+    synth = load_synth_all_zones(SYNTH_DIR, landuse=landuse)
     print(f"  Loaded {len(synth):,} synthetic persons")
 
     # ── Long-term choices then CDAP ───────────────────────────────────
@@ -807,7 +818,7 @@ def _run_prediction(out: dict, landuse, all_ga: AllStagesResult, run_dir: str):
             out        = out,
             synth      = travellers,
             landuse    = landuse,
-            skims_path = 'downcasted_matrices_base.omx',
+            skims_path = PIPELINE_SKIMS_PATH,
             save_dir   = _save_dir,
         )
     except Exception as _ape:
@@ -819,7 +830,7 @@ def _run_prediction(out: dict, landuse, all_ga: AllStagesResult, run_dir: str):
     _ga_post_estimation_report(s5_models, out, _save_dir)
 
     # ── Stage 5b (trip-level destination) ──────────────────────────────
-    skims   = omx.open_file('downcasted_matrices_base.omx', 'r')
+    skims   = omx.open_file(PIPELINE_SKIMS_PATH, 'r')
     from stage5_destination_choice import _skim_flat, _skim_lookup
     sk = _skim_lookup(_skim_flat(skims))
     try:

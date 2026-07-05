@@ -55,22 +55,190 @@ logger = logging.getLogger(__name__)
 # (the module searches for these names in the OMX file)
 # ---------------------------------------------------------------------------
 
-DEFAULT_MATRICES = [
-    'DIST',
-    'DISTWALK',
-    'DISTBIKE',
-    'SOVTOLL_TIME__AM',
-    'SOVTOLL_TIME__PM',
-    'CRASH',
-    # common alternates — included so the reader is robust
-    'SOV_TIME__AM',
-    'SOV_TIME__PM',
-    'SOVTIME_AM',
-    'SOVTIME_PM',
-    'AUTO_TIME',
-    'WALK_DIST',
-    'BIKE_DIST',
-]
+# ---------------------------------------------------------------------------
+# 0.  SA1-LEVEL WALK/BIKE SKIMS  (multi-resolution active-mode LOS)
+# ---------------------------------------------------------------------------
+
+SA1_WALK_BIKE_H5 = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'demand_', 'walk_bike_sa1_to_sa2_skims.h5'
+)
+
+# Level 4 micro-zone skim (preferred over SA1 — uses SEQ-STM's own ~7,000-zone
+# system that was purpose-built for fine-grain travel analysis, with proper
+# alignment to the EMME network coordinate system).
+LVL4_WALK_BIKE_H5 = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'demand_', 'walk_bike_lvl4_to_sa2_skims.h5'
+)
+
+
+def load_lvl4_walk_skims(path: Optional[str] = None) -> Optional[dict]:
+    """
+    Load the Level4-origin x SA2-destination walk/bike skims built by
+    demand_/19_build_walk_bike_lvl4_skims.py.
+
+    The SEQ-STM model's Level 4 micro-zones (~7,000 zones) are the native
+    fine-grain zone system for active-mode modelling — they map directly
+    onto the EMME network and give better spatial resolution for walk/bike
+    than ABS SA1 zones, which can have boundary mismatches with the SEQSTM
+    geometry.
+
+    Returns a dict with keys:
+        'DISTWALK'    : float32 ndarray (n_lvl4, n_sa2) km
+        'DISTBIKE'    : float32 ndarray (n_lvl4, n_sa2) km
+        'lvl4_to_row' : dict {lvl4_id (int): row_idx}
+        'sa2_to_col'  : dict {sa2_code (int): col_idx}
+    Returns None if the file doesn't exist (run 18/19 scripts first).
+    """
+    p = os.path.normpath(path or LVL4_WALK_BIKE_H5)
+    if not os.path.exists(p):
+        logger.warning(
+            f"load_lvl4_walk_skims: {p} not found — "
+            f"run demand_/18_build_lvl4_emme_crosswalk.py then "
+            f"demand_/19_build_walk_bike_lvl4_skims.py to generate it. "
+            f"Walk/bike will fall back to SA2-averaged values."
+        )
+        return None
+    try:
+        import h5py as _h5py
+        with _h5py.File(p, 'r') as f:
+            lvl4_ids  = f['lvl4_ids'][...]
+            sa2_codes = f['sa2_codes'][...]
+            distwalk  = np.array(f['DISTWALK'], dtype=np.float32)
+            distbike  = np.array(f['DISTBIKE'],  dtype=np.float32)
+        sa2_to_col = {int(c): i for i, c in enumerate(sa2_codes)}
+        order_to_col = {}
+        try:
+            _seq_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    'seq_zone_ids_.csv')
+            if os.path.exists(_seq_csv):
+                _sdf = pd.read_csv(_seq_csv, usecols=['SA2_MAIN16', 'ORDER'])
+                _sdf = _sdf[pd.to_numeric(_sdf['SA2_MAIN16'], errors='coerce').fillna(0) > 0]
+                for _, row in _sdf.iterrows():
+                    col = sa2_to_col.get(int(row['SA2_MAIN16']))
+                    if col is not None:
+                        order_to_col[int(row['ORDER'])] = col
+        except Exception as _oe:
+            logger.warning(f"load_lvl4_walk_skims: could not build order_to_col: {_oe}")
+        logger.info(
+            f"Loaded Level4 walk/bike skims: {len(lvl4_ids)} Level4 origins x "
+            f"{len(sa2_codes)} SA2 destinations "
+            f"(ORDER→col coverage: {len(order_to_col)}/330)"
+        )
+        return {
+            'DISTWALK':    distwalk,
+            'DISTBIKE':    distbike,
+            'lvl4_to_row': {int(c): i for i, c in enumerate(lvl4_ids)},
+            'sa2_to_col':  sa2_to_col,
+            'order_to_col': order_to_col,
+        }
+    except Exception as e:
+        logger.warning(f"load_lvl4_walk_skims: error loading {p}: {e}")
+        return None
+
+
+def load_sa1_walk_skims(path: Optional[str] = None) -> Optional[dict]:
+    """
+    Load the SA1-origin × SA2-destination walk and bike distance skims built
+    by demand_/17_build_walk_bike_sa1_skims.py.
+
+    Returns a dict with keys:
+        'DISTWALK'   : float32 ndarray (n_sa1, n_sa2) — km
+        'DISTBIKE'   : float32 ndarray (n_sa1, n_sa2) — km
+        'sa1_to_row' : dict {sa1_code (int): row_idx} — fast SA1 → row lookup
+        'sa2_to_col' : dict {sa2_code (int): col_idx} — fast SA2 → col lookup
+
+    Returns None (with a warning) if the file doesn't exist yet
+    (demand_/16_*.py and 17_*.py haven't been run).
+
+    Usage in stage5 _mode_probs_numpy:
+        sa1_skim = load_sa1_walk_skims()
+        if sa1_skim and 'HOME_SA1' in tour_rows.columns:
+            home_sa1 = tour_rows['HOME_SA1'].values.astype(int)
+            for i in range(n):
+                r = sa1_skim['sa1_to_row'].get(home_sa1[i])
+                c = sa1_skim['sa2_to_col'].get(int(dtaz[i]))
+                if r is not None and c is not None:
+                    dist_walk[i] = sa1_skim['DISTWALK'][r, c]
+                    dist_bike[i] = sa1_skim['DISTBIKE'][r, c]
+    """
+    p = os.path.normpath(path or SA1_WALK_BIKE_H5)
+    if not os.path.exists(p):
+        logger.warning(
+            f"load_sa1_walk_skims: {p} not found — "
+            f"run demand_/16_build_sa1_emme_crosswalk.py then "
+            f"demand_/17_build_walk_bike_sa1_skims.py to generate it. "
+            f"Walk/bike distances will fall back to SA2-averaged values."
+        )
+        return None
+    try:
+        import h5py
+        with h5py.File(p, 'r') as f:
+            sa1_codes = f['sa1_codes'][...]
+            sa2_codes = f['sa2_codes'][...]
+            distwalk  = np.array(f['DISTWALK'], dtype=np.float32)
+            distbike  = np.array(f['DISTBIKE'],  dtype=np.float32)
+        sa2_to_col = {int(c): i for i, c in enumerate(sa2_codes)}
+        # Build ORDER→col for the 329-zone pipeline (ORDER number → skim col index).
+        # The destination dimension of the SA1 skim uses 9-digit SA2 codes; in the
+        # 329-zone pipeline DTAZ is an ORDER number (1-330).  Read seq_zone_ids_.csv
+        # (which maps ORDER → SA2_MAIN16, equivalent to SA2_CODE21 for ~93% of SEQ
+        # zones) to build the bridge so stage5 can look up either zone system.
+        order_to_col = {}
+        try:
+            _seq_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    'seq_zone_ids_.csv')
+            if os.path.exists(_seq_csv):
+                _sdf = pd.read_csv(_seq_csv, usecols=['SA2_MAIN16', 'ORDER'])
+                _sdf = _sdf[pd.to_numeric(_sdf['SA2_MAIN16'], errors='coerce').fillna(0) > 0]
+                for _, row in _sdf.iterrows():
+                    col = sa2_to_col.get(int(row['SA2_MAIN16']))
+                    if col is not None:
+                        order_to_col[int(row['ORDER'])] = col
+        except Exception as _oe:
+            logger.warning(f"load_sa1_walk_skims: could not build order_to_col: {_oe}")
+        logger.info(
+            f"Loaded SA1 walk/bike skims: {len(sa1_codes)} SA1 origins × "
+            f"{len(sa2_codes)} SA2 destinations "
+            f"(ORDER→col coverage: {len(order_to_col)}/330)"
+        )
+        return {
+            'DISTWALK':    distwalk,
+            'DISTBIKE':    distbike,
+            'sa1_to_row':  {int(c): i for i, c in enumerate(sa1_codes)},
+            'sa2_to_col':  sa2_to_col,
+            'order_to_col': order_to_col,
+        }
+    except Exception as e:
+        logger.warning(f"load_sa1_walk_skims: error loading {p}: {e}")
+        return None
+
+
+def _build_default_matrices():
+    """
+    Full set of relevant LOS variables across all 5 time periods (AM/MD/PM/EA/EV)
+    and all auto/transit submodes available in the SEQ-STM skims — matches the
+    matrix set aggregated by demand_/04_aggregate_skims.py into sa2_skims_507.omx.
+    Harmless for the legacy ~330-zone downcasted_matrices_base.omx (which only
+    has a handful of these) since omx_to_dataframe() silently drops any
+    candidate name not actually present in the file.
+    """
+    periods = ['AM', 'MD', 'PM', 'EA', 'EV']
+    auto = [f'{mode}_{metric}__{p}'
+            for mode in ('SOVTOLL', 'HOV2TOLL', 'HOV3TOLL')
+            for metric in ('TIME', 'DIST', 'TOLL')
+            for p in periods]
+    transit = [f'{mode}_{metric}__{p}'
+               for mode in ('DRV_LOC_WLK', 'WLK_LOC_DRV', 'WLK_LOC_WLK')
+               for metric in ('TOTIVT', 'FAR', 'WAIT', 'BOARDS')
+               for p in periods]
+    legacy_alternates = [
+        'CRASH', 'SOV_TIME__AM', 'SOV_TIME__PM', 'SOVTIME_AM', 'SOVTIME_PM',
+        'AUTO_TIME', 'WALK_DIST', 'BIKE_DIST',
+    ]
+    return ['DIST', 'DISTWALK', 'DISTBIKE'] + auto + transit + legacy_alternates
+
+
+DEFAULT_MATRICES = _build_default_matrices()
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +300,106 @@ def list_omx_matrices(omx_path: str) -> List[str]:
 # 2.  CORE CONVERTER
 # ---------------------------------------------------------------------------
 
+def _is_h5py_omx(omx_path: str) -> bool:
+    """
+    Detect demand_'s lightweight h5py-written OMX files (see
+    Z:/test_runs_tours/demand_/omx_utils.py — used for sa2_skims_507.omx and
+    other new_pop / 507-zone-scope skims to avoid an openmatrix/tables binary
+    incompatibility). These have an OMX_VERSION file attribute and a
+    /lookup/<name> string-array dataset instead of the standard tagged
+    OMX_Lookup mapping that the `openmatrix` package expects.
+    """
+    try:
+        import h5py
+    except ImportError:
+        return False
+    try:
+        with h5py.File(omx_path, 'r') as f:
+            return 'OMX_VERSION' in f.attrs
+    except Exception:
+        return False
+
+
+def _omx_to_dataframe_h5py(
+    omx_path: str,
+    matrices: Optional[List[str]] = None,
+    zone_index: Optional[str] = None,
+    chunksize: int = 500,
+) -> pd.DataFrame:
+    """h5py-based reader for demand_'s lightweight OMX files (see _is_h5py_omx)."""
+    import h5py
+
+    with h5py.File(omx_path, 'r') as f:
+        available = list(f['data'].keys())
+        logger.info(f"OMX (h5py): {len(available)} matrices available: {available}")
+
+        if matrices is None:
+            matrices = [m for m in DEFAULT_MATRICES if m in available]
+            if not matrices:
+                matrices = list(available)
+                logger.warning(f"None of the default matrix names found. Reading all {len(matrices)} matrices.")
+        else:
+            missing = [m for m in matrices if m not in available]
+            if missing:
+                logger.warning(f"Requested matrices not found in OMX: {missing}")
+            matrices = [m for m in matrices if m in available]
+        if not matrices:
+            raise ValueError(f"No readable matrices found in {omx_path}. Available: {available}")
+
+        lookup_names = list(f['lookup'].keys()) if 'lookup' in f else []
+        lookup_name = zone_index if zone_index in lookup_names else (lookup_names[0] if lookup_names else None)
+
+        if lookup_name:
+            raw = f['lookup'][lookup_name][...]
+            zone_ids = np.array([int(z.decode() if isinstance(z, bytes) else z) for z in raw], dtype=int)
+            row_order = np.arange(len(zone_ids), dtype=int)
+        else:
+            n = f['data'][matrices[0]].shape[0]
+            zone_ids = np.arange(1, n + 1, dtype=int)
+            row_order = np.arange(n, dtype=int)
+            logger.warning(f"No usable zone mapping — using 1-based indices 1..{n}.")
+
+        print(f"  Zone mapping: {len(zone_ids)} zones, IDs {zone_ids.min()}-{zone_ids.max()}")
+        n_zones = len(zone_ids)
+
+        arrays = {}
+        for name in matrices:
+            arr = np.array(f['data'][name], dtype=np.float32)
+            if arr.shape != (n_zones, n_zones):
+                logger.warning(f"Matrix '{name}' shape {arr.shape} != ({n_zones},{n_zones}) — skipping")
+                continue
+            arrays[name] = arr
+            logger.info(f"  Read '{name}': min={arr.min():.3f} max={arr.max():.3f}")
+
+    if not arrays:
+        raise ValueError("No matrices could be read from the OMX file.")
+
+    chunks = []
+    read_matrices = list(arrays.keys())
+    for chunk_start in range(0, n_zones, chunksize):
+        chunk_end = min(chunk_start + chunksize, n_zones)
+        chunk_zids = zone_ids[chunk_start:chunk_end]
+        chunk_rows = row_order[chunk_start:chunk_end]
+        n_chunk = len(chunk_zids)
+
+        otaz = np.repeat(chunk_zids, n_zones)
+        dtaz = np.tile(zone_ids, n_chunk)
+        chunk_dict = {'OTAZ': otaz, 'DTAZ': dtaz}
+        for name in read_matrices:
+            chunk_dict[name] = arrays[name][np.ix_(chunk_rows, row_order)].ravel()
+        chunks.append(pd.DataFrame(chunk_dict))
+
+    df = pd.concat(chunks, ignore_index=True)
+    df['OTAZ'] = df['OTAZ'].astype(int)
+    df['DTAZ'] = df['DTAZ'].astype(int)
+    print(
+        f"OMX (h5py) -> DataFrame complete\n  Shape  : {df.shape}\n"
+        f"  Zones  : {n_zones} ({zone_ids.min()}-{zone_ids.max()})\n"
+        f"  Matrices loaded: {read_matrices}"
+    )
+    return df
+
+
 def omx_to_dataframe(
     omx_path: str,
     matrices: Optional[List[str]] = None,
@@ -147,7 +415,7 @@ def omx_to_dataframe(
     matrices   : list of matrix names to read; None = all matrices
                  that match DEFAULT_MATRICES (or all if none match)
     zone_index : name of the zone mapping in the OMX file
-                 (e.g. 'NO', 'zone_id', 'TAZ'); None = auto-detect
+                 (e.g. 'NO', 'zone_id', 'TAZ', 'SA2_CODE'); None = auto-detect
     chunksize  : number of origin zones to process at once
                  (reduces peak memory for large matrices)
 
@@ -158,9 +426,15 @@ def omx_to_dataframe(
     Notes
     -----
     For a 330-zone model the full matrix has 330² = 108,900 rows.
-    For a 3,000-zone model it has 9M rows — use chunksize to avoid
-    loading everything into memory at once.
+    For the new_pop 507-zone model it has 507² = 257,049 rows.
+    demand_'s skims (e.g. sa2_skims_507.omx) are written with a lightweight
+    h5py-based writer (see Z:/test_runs_tours/demand_/omx_utils.py) to avoid
+    an openmatrix/tables binary incompatibility — those are auto-detected
+    and read directly via h5py instead of the `openmatrix` package.
     """
+    if _is_h5py_omx(omx_path):
+        return _omx_to_dataframe_h5py(omx_path, matrices=matrices, zone_index=zone_index, chunksize=chunksize)
+
     try:
         import openmatrix as omx
     except ImportError:
@@ -310,9 +584,9 @@ def omx_to_dataframe(
     df['DTAZ'] = df['DTAZ'].astype(int)
 
     print(
-        f"OMX → DataFrame complete\n"
+        f"OMX -> DataFrame complete\n"
         f"  Shape  : {df.shape}\n"
-        f"  Zones  : {n_zones} ({zone_ids.min()}–{zone_ids.max()})\n"
+        f"  Zones  : {n_zones} ({zone_ids.min()}-{zone_ids.max()})\n"
         f"  Matrices loaded: {read_matrices}"
     )
     return df
@@ -491,3 +765,112 @@ def prepare_skims_from_omx(
         f"skims_input must be an OMX path (str), omx.File, "
         f"or DataFrame. Got: {type(skims_input)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 4.  CRASH / NEAR-MISS SAFETY FACTORS (507-zone scope only)
+# ---------------------------------------------------------------------------
+
+# demand_'s road-safety OD data lives in separate OMX files from the travel
+# LOS skims (different build scripts: 05_crash_matrices.py / nearmiss
+# pipeline), all at the same 507-zone scope. Not loaded by default — call
+# merge_safety_skims() / merge_ecf_component() explicitly where a stage wants
+# to use crash/near-miss exposure as a destination- or route-choice factor
+# (e.g. alongside spatial_assignment.py / safety_experiment_analysis.py's
+# existing safety angle). Matrices available:
+#   crash_matrices_507.omx     : crash_total, crash_headon, crash_rearend,
+#                                 crash_runoff, crash_intersection, crash_other,
+#                                 crash_length_km, crash_rate_total
+#                                 (genuinely OD-specific — sourced from a
+#                                 pre-built SA2_OD_Crash_Matrix.xlsx).
+#                                 crash_rate_total (crashes/km) is the
+#                                 canonical ECF (Expected Crash Frequency)
+#                                 safety component used by the ABM — see
+#                                 merge_ecf_component() below.
+#   nearmiss_ecf_skim_507.omx  : ecf_total, ecf_per_km, nm_total, nm_per_km_total,
+#                                 nm_{am,op,pm,ev}, safety_index_total,
+#                                 route_length_km — route-aggregated near-miss/
+#                                 ExpCrashes exposure from
+#                                 demand_/15_nearmiss_ecf_od_skim.py. Available
+#                                 for supplementary analysis via
+#                                 merge_safety_skims(sources=['ecf']), but NOT
+#                                 the model's ECF component (only ~31% OD
+#                                 coverage — it's a curated subset of the road
+#                                 network, not every road).
+#   nearmiss_skim_507.omx      : DEPRECATED — kept only for backward
+#                                 compatibility. nearmiss_{origin,dest,total}_*
+#                                 are flat per-zone counts broadcast across
+#                                 rows/columns (every OD pair sharing an
+#                                 origin or destination zone gets an identical
+#                                 value) — NOT OD-pair-specific.
+SAFETY_OMX_FILES = {
+    'crash':    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'demand_', 'crash_matrices_507.omx'),
+    'ecf':      os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'demand_', 'nearmiss_ecf_skim_507.omx'),
+    'nearmiss': os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'demand_', 'nearmiss_skim_507.omx'),
+}
+
+ECF_SOURCE_MATRIX = 'crash_rate_total'  # the model's single ECF safety component
+
+
+def merge_ecf_component(skims_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Left-merge the model's single ECF (Expected Crash Frequency) safety
+    component — crash_rate_total (crashes/km) from crash_matrices_507.omx —
+    onto a flat OTAZ/DTAZ skims DataFrame, as a column named 'ECF'.
+
+    This is the canonical safety factor for the 507-zone activity model
+    (chosen over the route-aggregated near-miss/ExpCrashes skim in
+    nearmiss_ecf_skim_507.omx, which only covers ~31% of OD pairs).
+    """
+    path = SAFETY_OMX_FILES['crash']
+    if not os.path.exists(path):
+        logger.warning(f"merge_ecf_component: crash OMX not found at {path} — ECF column not added")
+        return skims_df
+    src_df = omx_to_dataframe(path, matrices=[ECF_SOURCE_MATRIX])
+    src_df = src_df.rename(columns={ECF_SOURCE_MATRIX: 'ECF'})
+    out = skims_df.merge(src_df[['OTAZ', 'DTAZ', 'ECF']], on=['OTAZ', 'DTAZ'], how='left')
+    out['ECF'] = out['ECF'].fillna(0)
+    return out
+
+
+def merge_safety_skims(skims_df: pd.DataFrame, sources: Optional[List[str]] = None,
+                       matrices: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    Left-merge crash/near-miss OD factors onto an existing flat OTAZ/DTAZ
+    skims DataFrame (e.g. the output of read_omx_skims() for sa2_skims_507.omx).
+
+    For the model's actual ECF safety component, prefer merge_ecf_component()
+    (crash_rate_total only) — this function is for supplementary/exploratory
+    analysis across the broader set of crash/near-miss factors.
+
+    Parameters
+    ----------
+    skims_df : flat OTAZ/DTAZ DataFrame to merge into (must already exist —
+               this does not build one on its own).
+    sources  : which safety OMX files to pull from; None = 'crash' only
+               (matches the model's ECF component). Pass ['crash', 'ecf'] or
+               ['nearmiss'] explicitly for supplementary/exploratory factors.
+    matrices : specific matrix names to merge; None = all available in each
+               source file.
+
+    Returns
+    -------
+    skims_df with additional crash_*/ecf_*/nm_* columns. Rows with no safety
+    data for that OD pair (e.g. pairs outside the EMME-mapped 303/507 zones,
+    or outside the ~31% of OD pairs the road-segment network in
+    nearmiss_ecf_skim_507.omx actually routes through) get 0, not NaN.
+    """
+    sources = sources or ['crash']
+    out = skims_df
+    for src in sources:
+        path = SAFETY_OMX_FILES.get(src)
+        if not path or not os.path.exists(path):
+            logger.warning(f"merge_safety_skims: {src} OMX not found at {path} — skipping")
+            continue
+        src_df = omx_to_dataframe(path, matrices=matrices)
+        merge_cols = [c for c in src_df.columns if c not in ('OTAZ', 'DTAZ')]
+        out = out.merge(src_df[['OTAZ', 'DTAZ'] + merge_cols], on=['OTAZ', 'DTAZ'], how='left')
+        for c in merge_cols:
+            out[c] = out[c].fillna(0)
+        logger.info(f"merge_safety_skims: merged {len(merge_cols)} columns from {src} ({path})")
+    return out

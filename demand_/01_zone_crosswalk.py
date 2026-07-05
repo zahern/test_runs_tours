@@ -24,9 +24,15 @@ gdf_all = gpd.read_file(shp_path)
 print(f"Shapefile columns: {gdf_all.columns.tolist()}")
 print(f"Total SA2 rows: {len(gdf_all)}")
 
-# Filter to Queensland (STE_CODE21 = '3')
-gdf_qld = gdf_all[gdf_all['STE_CODE21'] == '3'].copy()
-print(f"Queensland SA2 count: {len(gdf_qld)}")
+# Filter to Queensland + Richmond-Tweed NSW (SA4 code 112 — Ballina, Byron,
+# Tweed Heads area — included because the SEQ-STM transport model covers this
+# cross-border region and synth_pop already processes these 22 zones via the
+# z[:2]=='11' filter in sa_multi_wrapper._is_study_area_zone).
+gdf_qld = gdf_all[
+    (gdf_all['STE_CODE21'] == '3') |        # Queensland
+    (gdf_all['SA4_CODE21'] == '112')         # Richmond-Tweed NSW
+].copy()
+print(f"QLD + Richmond-Tweed SA2 count: {len(gdf_qld)}")
 
 # Reproject to WGS84 for lat/lon centroids
 gdf_qld = gdf_qld.to_crs(epsg=4326)

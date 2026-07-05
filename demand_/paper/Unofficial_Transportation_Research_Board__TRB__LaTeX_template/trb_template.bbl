@@ -1,0 +1,117 @@
+\begin{thebibliography}{21}
+\providecommand{\natexlab}[1]{#1}
+
+\bibitem[{{World Health Organization}(2023)}]{who2023}
+{World Health Organization}, Global Status Report on Road Safety 2023.
+  \emph{World Health Organization}, 2023.
+
+\bibitem[{Miaou and Lum(1993)}]{miaou1993}
+Miaou, S.-P. and H.~Lum, Modeling vehicle accidents and highway geometric
+  design relationships. \emph{Accident Analysis \& Prevention}, Vol.~25, No.~6,
+  1993, pp. 689--709.
+
+\bibitem[{Shankar et~al.(1995)Shankar, Mannering, and Barfield}]{shankar1995}
+Shankar, V., F.~Mannering, and W.~Barfield, Effect of roadway geometrics and
+  environmental factors on rural freeway accident frequencies. \emph{Accident
+  Analysis \& Prevention}, Vol.~27, No.~3, 1995, pp. 371--389.
+
+\bibitem[{Lord and Mannering(2010)}]{lord2010}
+Lord, D. and F.~Mannering, The statistical analysis of crash-frequency data: A
+  review and assessment of methodological alternatives. \emph{Transportation
+  Research Part A: Policy and Practice}, Vol.~44, No.~5, 2010, pp. 291--305.
+
+\bibitem[{Ayuso et~al.(2019)Ayuso, Guillen, and
+  P{\'e}rez-Mar{\'\i}n}]{ayuso2019}
+Ayuso, M., M.~Guillen, and A.~M. P{\'e}rez-Mar{\'\i}n, Telematics and gender
+  discrimination: Some usage-based evidence on whether men's risk of accidents
+  differs from women's. \emph{Risks}, Vol.~7, No.~2, 2019, p.~38.
+
+\bibitem[{Guo et~al.(2010)Guo, Klauer, Hankey, and Dingus}]{guo2010}
+Guo, F., S.~G. Klauer, J.~M. Hankey, and T.~A. Dingus, Near crashes as crash
+  surrogate for naturalistic driving studies. \emph{Transportation Research
+  Record}, Vol. 2147, No.~1, 2010, pp. 66--74.
+
+\bibitem[{Arum{\'\i} et~al.(2024)Arum{\'\i}, Guillen, and
+  P{\'e}rez-Mar{\'\i}n}]{arumi2023a}
+Arum{\'\i}, P., M.~Guillen, and A.~M. P{\'e}rez-Mar{\'\i}n, Can automobile
+  insurance telematics predict the risk of near-miss events? \emph{Applied
+  Sciences}, Vol.~14, No.~14, 2024, p. 6378.
+
+\bibitem[{Hyd{\'e}n(1987)}]{hyden1987}
+Hyd{\'e}n, C., \emph{The development of a method for traffic safety evaluation:
+  The Swedish Traffic Conflicts Technique}. Ph.D. thesis, Lund University,
+  1987.
+
+\bibitem[{Heinrich(1931)}]{heinrich1931}
+Heinrich, H.~W., \emph{Industrial Accident Prevention: A Scientific Approach}.
+  McGraw-Hill, 1931.
+
+\bibitem[{Xu et~al.(2024)Xu, Gao, Zuo, and Ozbay}]{Xu2024}
+Xu, C., J.~Gao, F.~Zuo, and K.~Ozbay, Estimating Urban Traffic Safety and
+  Analyzing Spatial Patterns through the Integration of City-Wide Near-Miss
+  Data: A New York City Case Study. \emph{Applied Sciences}, Vol.~14, No.~14,
+  2024, p. 6378.
+
+\bibitem[{Amoadu et~al.(2024)Amoadu, Akoto-Buabeng, Commey, and
+  Abraham}]{Amoadu2024}
+Amoadu, M., W.~Akoto-Buabeng, I.~T. Commey, and S.~A. Abraham, Prevalence and
+  predictors of near misses and road traffic crashes among long-distance bus
+  drivers in Ghana. \emph{Discover Psychology}, Vol.~4, No.~1, 2024.
+
+\bibitem[{Jomnonkwao et~al.(2023)Jomnonkwao, Champahom, Se, Hantanong, and
+  Ratanavaraha}]{Jomnonkwao2023}
+Jomnonkwao, S., T.~Champahom, C.~Se, N.~Hantanong, and V.~Ratanavaraha,
+  Contributing factors to near-miss experiences of motorcyclists in Thailand: A
+  random parameter probit model approach. \emph{Heliyon}, Vol.~9, No.~12, 2023,
+  p. e22625.
+
+\bibitem[{Boylan et~al.(2024)Boylan, Meyer, and Chen}]{Boylan2024}
+Boylan, J., D.~Meyer, and W.~S. Chen, A systematic review of the use of
+  in-vehicle telematics in monitoring driving behaviours. \emph{Accident
+  Analysis \& Prevention}, Vol. 199, 2024, p. 107519.
+
+\bibitem[{Nie et~al.(2025)Nie, Zhang, Wang, Zhang, and Zhao}]{Nie2025}
+Nie, Y., M.~Zhang, B.~Wang, C.~Zhang, and Y.~Zhao, Vehicle trajectory fractal
+  theory for macro-level highway crash rate analysis. \emph{Accident Analysis
+  \& Prevention}, Vol. 215, 2025, p. 107989.
+
+\bibitem[{Yang et~al.(2021)Yang, Xie, Ozbay, Zhao, and Yang}]{Yang2021}
+Yang, D., K.~Xie, K.~Ozbay, Z.~Zhao, and H.~Yang, Copula-based joint modeling
+  of crash count and conflict risk measures with accommodation of mixed
+  count-continuous margins. \emph{Analytic Methods in Accident Research},
+  Vol.~31, 2021, p. 100162.
+
+\bibitem[{Ahmad et~al.(2023)Ahmad, Gayah, and Donnell}]{Ahmad2023}
+Ahmad, N., V.~V. Gayah, and E.~T. Donnell, Copula-based bivariate count data
+  regression models for simultaneous estimation of crash counts based on
+  severity and number of vehicles. \emph{Accident Analysis and Prevention},
+  Vol. 181, 2023, p. 106928.
+
+\bibitem[{Calder\'in-Ojeda and G\'omez-D\'eniz(2019)}]{CaldronOjeda2019}
+Calder\'in-Ojeda, E. and E.~G\'omez-D\'eniz, The multivariate negative
+  binomial-Lindley distribution. Properties and new representation for the
+  univariate case. \emph{Journal of Computational and Applied Mathematics},
+  Vol. 347, 2019, pp. 36--48.
+
+\bibitem[{Zheng et~al.(2019)Zheng, Sayed, and Essa}]{Zheng2019}
+Zheng, L., T.~Sayed, and M.~Essa, Validating the bivariate extreme value
+  modeling approach for road safety estimation with different traffic conflict
+  indicators. \emph{Accident Analysis \& Prevention}, Vol. 123, 2019, pp.
+  314--323.
+
+\bibitem[{Geedipally and Lord(2010)}]{Geedipally2010}
+Geedipally, S.~R. and D.~Lord, Investigating the effect of modeling
+  single-vehicle and multi-vehicle crashes separately on confidence intervals
+  of Poisson-gamma models. \emph{Accident Analysis and Prevention}, Vol.~42,
+  No.~4, 2010, pp. 1273--1282.
+
+\bibitem[{Prentice(1989)}]{prentice1989}
+Prentice, R.~L., Surrogate endpoints in clinical trials: Definition and
+  operational criteria. \emph{Statistics in Medicine}, Vol.~8, No.~4, 1989, pp.
+  431--440.
+
+\bibitem[{Vuong(1989)}]{vuong1989}
+Vuong, Q.~H., \emph{Likelihood ratio tests for model selection and non-nested
+  hypotheses}, 1989.
+
+\end{thebibliography}

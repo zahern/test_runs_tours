@@ -14,24 +14,31 @@ hhts = pd.read_excel(r"Z:\test_runs_tours\5_QTS_TRIPS.xlsx")
 print(f"HHTS shape: {hhts.shape}")
 total_trips = len(hhts)
 
-# --- b) Convert SA1 codes to SA2 ---
-hhts['orig_sa2'] = hhts['ORIGSA1_2021'].astype(str).str.strip().str[:9]
-hhts['dest_sa2'] = hhts['DESTSA1_2021'].astype(str).str.strip().str[:9]
+# --- b) Convert SA1 codes to SA2 via authoritative ABS 2021 concordance ---
+_sa1_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        '..', 'SA1_SHP', 'sa1_2021.csv')
+_sa1_lookup = (pd.read_csv(_sa1_csv)[['SA1_CODE21', 'SA2_CODE21']]
+               .set_index('SA1_CODE21')['SA2_CODE21'].astype(int).to_dict())
+print(f"Loaded SA1→SA2 lookup: {len(_sa1_lookup):,} entries")
 
-# Keep only 9-digit numeric codes
-hhts = hhts[hhts['orig_sa2'].str.match(r'^\d{9}$', na=False)]
-hhts = hhts[hhts['dest_sa2'].str.match(r'^\d{9}$', na=False)]
-print(f"After SA2 extraction (9-digit only): {len(hhts):,}")
+hhts['orig_sa2'] = pd.to_numeric(hhts['ORIGSA1_2021'], errors='coerce').map(_sa1_lookup)
+hhts['dest_sa2'] = pd.to_numeric(hhts['DESTSA1_2021'], errors='coerce').map(_sa1_lookup)
+
+# Drop rows where the SA1 code had no concordance entry
+n_before = len(hhts)
+hhts = hhts.dropna(subset=['orig_sa2', 'dest_sa2'])
+hhts['orig_sa2'] = hhts['orig_sa2'].astype(int)
+hhts['dest_sa2'] = hhts['dest_sa2'].astype(int)
+print(f"After SA1→SA2 lookup ({n_before - len(hhts):,} dropped — no concordance match): {len(hhts):,}")
 
 # --- c) Filter to 507 zones ---
 with open(r"Z:\Paper_Plan\synth_pop\zone_ids_sa_only_507.txt") as f:
     content = f.read()
-zone_ids_507 = [int(x) for x in re.split(r'[\s,]+', content.strip()) if x]
-zone_ids_str = set(str(z) for z in zone_ids_507)
+zone_ids_507 = set(int(x) for x in re.split(r'[\s,]+', content.strip()) if x)
 
 hhts_507 = hhts[
-    hhts['orig_sa2'].isin(zone_ids_str) &
-    hhts['dest_sa2'].isin(zone_ids_str)
+    hhts['orig_sa2'].isin(zone_ids_507) &
+    hhts['dest_sa2'].isin(zone_ids_507)
 ].copy()
 n_in_507 = len(hhts_507)
 print(f"Trips with both SA2s in 507 zones: {n_in_507:,} ({100*n_in_507/total_trips:.1f}%)")
@@ -89,7 +96,7 @@ od_grouped = (
     .rename(columns={'orig_sa2': 'origin_sa2', 'dest_sa2': 'dest_sa2', 'TRIPWGT23': 'weighted_trips'})
 )
 
-# Convert to int SA2 codes
+# SA2 codes already int from lookup step above
 od_grouped['origin_sa2'] = od_grouped['origin_sa2'].astype(int)
 od_grouped['dest_sa2'] = od_grouped['dest_sa2'].astype(int)
 

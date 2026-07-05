@@ -1,0 +1,48 @@
+#!/bin/bash -l
+#PBS -N nearmiss_crash_new
+#PBS -l walltime=023:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ── Cluster paths ───────────────────────────────────────────────────────────
+SCRIPT_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template
+DATA_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_
+RESULTS_DIR=$DATA_DIR/results
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+mkdir -p "$RESULTS_DIR"
+
+# ------------------------------------------------------------------
+# JAX / XLA settings — CPU-only analysis
+# ------------------------------------------------------------------
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6   # cap JAX at 60% of available RAM
+export JAX_PLATFORMS=cpu
+export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
+cd "$SCRIPT_DIR"
+
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "Script dir:  $SCRIPT_DIR"
+echo "Data:        $DATA_DIR/near_miss_ecf.csv"
+echo "Results dir: $RESULTS_DIR"
+
+python -u nearmiss_crash_analysis.py \
+    --data    "$DATA_DIR/near_miss_ecf.csv" \
+    --out-dir "$RESULTS_DIR"
+
+EXIT_CODE=$?
+echo "Job finished at $(date) — exit_code=$EXIT_CODE"
+if [ $EXIT_CODE -ne 0 ]; then
+    echo "Analysis FAILED -- check the PBS .o file for the full traceback above"
+fi
+exit $EXIT_CODE

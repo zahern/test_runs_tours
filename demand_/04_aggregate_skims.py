@@ -48,16 +48,30 @@ print(f"Mapped EMME zones: {n_mapped}/{n_emme}")
 print(f"SA2 zones with EMME coverage: {len(set(agg_idx[mapped_emme]))}/{n_sa2}")
 
 # --- d) Priority matrices to process ---
-PRIORITY_MATRICES = [
-    'SOVTOLL_TIME__AM', 'SOVTOLL_TIME__MD', 'SOVTOLL_TIME__PM', 'SOVTOLL_TIME__EA', 'SOVTOLL_TIME__EV',
-    'SOVTOLL_DIST__AM', 'SOVTOLL_DIST__MD', 'SOVTOLL_DIST__PM',
-    'SOVTOLL_TOLL__AM', 'SOVTOLL_TOLL__PM',
-    'HOV2TOLL_TIME__AM', 'HOV2TOLL_TIME__PM',
-    'DRV_LOC_WLK_TOTIVT__AM', 'DRV_LOC_WLK_TOTIVT__PM',
-    'DRV_LOC_WLK_FAR__AM', 'DRV_LOC_WLK_FAR__PM',
-    'WLK_LOC_DRV_TOTIVT__AM', 'WLK_LOC_DRV_TOTIVT__PM',
-    'DIST', 'DISTBIKE', 'DISTWALK',
-]
+# Expanded from the original 20-matrix AM/PM-only subset to the full set of
+# relevant LOS variables across all 5 time periods (AM/MD/PM/EA/EV) and all
+# auto/transit submodes available in the source SEQ-STM skims — see
+# Z:\test_runs_tours\code\read_skims.py's DEFAULT_MATRICES for the matching
+# read-side list. This makes time-of-day-specific scheduling (stage4),
+# toll/cost-sensitive mode choice, and a proper walk-walk transit alternative
+# (WLK_LOC_WLK, previously not aggregated at all) available to the 507-zone
+# model — none of that requires re-estimating any model, it's just additional
+# explanatory data that becomes available once aggregated.
+_PERIODS = ['AM', 'MD', 'PM', 'EA', 'EV']
+_AUTO_MODES = ['SOVTOLL', 'HOV2TOLL', 'HOV3TOLL']
+_AUTO_METRICS = ['TIME', 'DIST', 'TOLL']
+_TRANSIT_MODES = ['DRV_LOC_WLK', 'WLK_LOC_DRV', 'WLK_LOC_WLK']
+_TRANSIT_METRICS = ['TOTIVT', 'FAR', 'WAIT', 'BOARDS']
+
+PRIORITY_MATRICES = ['DIST', 'DISTBIKE', 'DISTWALK']
+for _mode in _AUTO_MODES:
+    for _metric in _AUTO_METRICS:
+        for _period in _PERIODS:
+            PRIORITY_MATRICES.append(f'{_mode}_{_metric}__{_period}')
+for _mode in _TRANSIT_MODES:
+    for _metric in _TRANSIT_METRICS:
+        for _period in _PERIODS:
+            PRIORITY_MATRICES.append(f'{_mode}_{_metric}__{_period}')
 
 with h5py.File(SKIMS_PATH, 'r') as f:
     available_set = set(f['data'].keys())

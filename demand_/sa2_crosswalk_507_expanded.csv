@@ -1,4 +1,46 @@
 sa2_code,sa2_name,emme_zone_id
+112031250,Kingscliff - Fingal Head,1787
+112031250,Kingscliff - Fingal Head,1788
+112031250,Kingscliff - Fingal Head,1789
+112031250,Kingscliff - Fingal Head,1790
+112031250,Kingscliff - Fingal Head,1791
+112031250,Kingscliff - Fingal Head,1792
+112031251,Murwillumbah,1793
+112031251,Murwillumbah,1794
+112031251,Murwillumbah,1795
+112031251,Murwillumbah,1805
+112031251,Murwillumbah,1806
+112031252,Murwillumbah Surrounds,1800
+112031252,Murwillumbah Surrounds,1801
+112031252,Murwillumbah Surrounds,1802
+112031252,Murwillumbah Surrounds,1803
+112031252,Murwillumbah Surrounds,1804
+112031253,Pottsville,1785
+112031253,Pottsville,1786
+112031253,Pottsville,1796
+112031253,Pottsville,1797
+112031253,Pottsville,1798
+112031253,Pottsville,1799
+112031254,Tweed Heads,1817
+112031254,Tweed Heads,1818
+112031254,Tweed Heads,1819
+112031254,Tweed Heads,1820
+112031254,Tweed Heads,1821
+112031254,Tweed Heads,1822
+112031254,Tweed Heads,1823
+112031254,Tweed Heads,1824
+112031254,Tweed Heads,1825
+112031254,Tweed Heads,1826
+112031550,Banora Point,1812
+112031550,Banora Point,1813
+112031550,Banora Point,1814
+112031550,Banora Point,1815
+112031551,Terranora - North Tumbulgum,1816
+112031552,Tweed Heads South,1807
+112031552,Tweed Heads South,1808
+112031552,Tweed Heads South,1809
+112031552,Tweed Heads South,1810
+112031552,Tweed Heads South,1811
 301011001,Alexandra Hills,915
 301011001,Alexandra Hills,916
 301011001,Alexandra Hills,920
@@ -421,6 +463,7 @@ sa2_code,sa2_name,emme_zone_id
 304041101,Mitchelton,299
 304041101,Mitchelton,300
 304041101,Mitchelton,301
+304041102,Mount Coot-tha,263
 304041103,The Gap,284
 304041103,The Gap,285
 304041103,The Gap,286
@@ -619,12 +662,6 @@ sa2_code,sa2_name,emme_zone_id
 305041137,Toowong,501
 305041137,Toowong,502
 305041137,Toowong,503
-306051167,Herberton,799
-306051167,Herberton,800
-308031211,Lakes Creek,1226
-308031211,Lakes Creek,1227
-308031211,Lakes Creek,1236
-308031211,Lakes Creek,1237
 309011224,Broadbeach Waters,1600
 309011224,Broadbeach Waters,1601
 309011224,Broadbeach Waters,1602
@@ -821,9 +858,6 @@ sa2_code,sa2_name,emme_zone_id
 309071256,Oxenford - Maudsland,1387
 309081259,Clear Island Waters,1554
 309081259,Clear Island Waters,1555
-309081260,Merrimac,1570
-309081260,Merrimac,1571
-309081260,Merrimac,1572
 309081262,Varsity Lakes,1545
 309081262,Varsity Lakes,1546
 309081262,Varsity Lakes,1547
@@ -1076,6 +1110,7 @@ sa2_code,sa2_name,emme_zone_id
 310041300,Goodna,1215
 310041300,Goodna,1216
 310041300,Goodna,1676
+310041301,New Chum,1219
 310041302,Redbank Plains,1206
 310041302,Redbank Plains,1207
 310041302,Redbank Plains,1208
@@ -1148,6 +1183,7 @@ sa2_code,sa2_name,emme_zone_id
 311031314,Crestmead,1276
 311031314,Crestmead,1277
 311031314,Crestmead,1278
+311031315,Greenbank Military Camp,1256
 311031316,Hillcrest,1255
 311031316,Hillcrest,1257
 311031316,Hillcrest,1258
@@ -1214,8 +1250,6 @@ sa2_code,sa2_name,emme_zone_id
 311061336,Woodridge,1242
 311061336,Woodridge,1244
 311061336,Woodridge,1245
-312021352,Sarina,864
-312021352,Sarina,865
 313011362,Beachmere - Sandstone Point,998
 313011362,Beachmere - Sandstone Point,999
 313011362,Beachmere - Sandstone Point,1000
@@ -1302,7 +1336,6 @@ sa2_code,sa2_name,emme_zone_id
 314011383,Cashmere,960
 314011383,Cashmere,961
 314011383,Cashmere,962
-314011385,Eatons Hill,1093
 314011386,The Hills District,1088
 314011386,The Hills District,1089
 314011386,The Hills District,1090
@@ -1529,27 +1562,3 @@ sa2_code,sa2_name,emme_zone_id
 316081549,Noosa Hinterland,238
 316081549,Noosa Hinterland,239
 316081549,Noosa Hinterland,240
-317011446,Darling Heights,875
-317011448,Gatton,1103
-317011448,Gatton,1104
-317011448,Gatton,1111
-317011448,Gatton,1112
-317011451,Lockyer Valley - West,1105
-317011451,Lockyer Valley - West,1106
-317011451,Lockyer Valley - West,1107
-317011451,Lockyer Valley - West,1108
-317011451,Lockyer Valley - West,1109
-317011451,Lockyer Valley - West,1110
-317011459,Wilsonton,534
-317011459,Wilsonton,535
-319031511,Cooloola,241
-319031511,Cooloola,242
-319031511,Cooloola,243
-319031512,Gympie - North,244
-319031512,Gympie - North,245
-319031512,Gympie - North,246
-319031512,Gympie - North,247
-319031512,Gympie - North,248
-319031512,Gympie - North,249
-319031513,Gympie - South,250
-319031513,Gympie - South,251

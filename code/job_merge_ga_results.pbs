@@ -12,6 +12,7 @@ RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
 RUN_TAG=${RUN_TAG:?RUN_TAG is required}
 CONDA_ENV=${CONDA_ENV:-zigenv}
 STAGE_IDS=${STAGE_IDS:-1,2,3,4,5}
+STAGE_IDS=${STAGE_IDS//_/,}
 STRICT_MERGE=${STRICT_MERGE:-1}
 
 cd "$PBS_O_WORKDIR"

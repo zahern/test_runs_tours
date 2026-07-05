@@ -61,6 +61,25 @@ S5_WORKERS=${S5_WORKERS:-8}
 PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
 INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS:-1}
 
+# 507-zone SA2 population scope.  Set NEW_POP=1 to activate the new_pop
+# zoning system (OTAZ = SA2 code directly, matched to the GAN synth pop).
+# NEW_POP_DIR: parent of saved_data/zone_ids_sa2/ (relative to PBS_O_WORKDIR).
+# PIPELINE_SKIMS_PATH: openmatrix-spec OMX for stage 5 (run
+#   demand_/11_convert_skims_to_openmatrix.py on HPC to generate it first).
+NEW_POP=${NEW_POP:-0}
+NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+# Skim path default depends on mode:
+#   NEW_POP=1 (507-zone SA2 direct) : the openmatrix-spec converted OMX is
+#             required (run demand_/11_convert_skims_to_openmatrix.py first).
+#   NEW_POP_MAPPED=1 or standard 329: leave empty so pipeline_logger.py picks
+#             downcasted_matrices_base.omx based on its own mode flags.
+if [ "${NEW_POP}" = "1" ] && [ "${NEW_POP_MAPPED}" != "1" ]; then
+    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/sa2_skims_507_omxspec.omx}
+else
+    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-}
+fi
+
 cd "$PBS_O_WORKDIR"
 
 echo "=========================================="
@@ -73,6 +92,8 @@ echo "Budget        : ${GA_BUDGET}"
 echo "Restarts      : ${GA_N_RESTARTS}"
 echo "Stage select  : ${STAGE_SELECT}  walltime=${STAGE_WALLTIME}"
 echo "Pred  select  : ${PRED_SELECT}   walltime=${PRED_WALLTIME}"
+echo "New-pop (507) : NEW_POP=${NEW_POP}  NEW_POP_DIR=${NEW_POP_DIR}"
+echo "Skims path    : ${PIPELINE_SKIMS_PATH}"
 echo "=========================================="
 
 submit_stage() {
@@ -82,7 +103,7 @@ submit_stage() {
     -N "ga_s${sid}_${RUN_TAG}" \
     -l "select=${STAGE_SELECT}" \
     -l "walltime=${STAGE_WALLTIME}" \
-    -v "STAGE_ID=${sid},RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},GA_BUDGET=${GA_BUDGET},GA_ESTIMATOR=${GA_ESTIMATOR},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA},GA_N_RESTARTS=${GA_N_RESTARTS},GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS},PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR},STAGE23_JOINT=${STAGE23_JOINT},GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT},GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH}" \
+    -v "STAGE_ID=${sid},RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},GA_BUDGET=${GA_BUDGET},GA_ESTIMATOR=${GA_ESTIMATOR},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA},GA_N_RESTARTS=${GA_N_RESTARTS},GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS},PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR},STAGE23_JOINT=${STAGE23_JOINT},GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT},GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH},NEW_POP=${NEW_POP},NEW_POP_MAPPED=${NEW_POP_MAPPED},NEW_POP_DIR=${NEW_POP_DIR},PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH}" \
     job_ga_stage_single.pbs | awk '{print $1}'
 }
 
@@ -102,7 +123,7 @@ jid_merge=$(qsub \
   -W "depend=afterok:${deps}" \
   -l "select=${MERGE_SELECT}" \
   -l "walltime=${MERGE_WALLTIME}" \
-  -v "RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},STAGE_IDS=0,1,2,3,4,5,STRICT_MERGE=1" \
+  -v "RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},STAGE_IDS=0_1_2_3_4_5,STRICT_MERGE=1" \
   job_merge_ga_results.pbs | awk '{print $1}')
 
 echo "Submitted merge: ${jid_merge}"
@@ -114,7 +135,7 @@ jid_pred=$(qsub \
   -W "depend=afterok:${jid_merge}" \
   -l "select=${PRED_SELECT}" \
   -l "walltime=${PRED_WALLTIME}" \
-  -v "MODE=ga_staged,CONDA_ENV=${CONDA_ENV},RUN_ROOT=${RUN_ROOT},THREADS=${THREADS},S5_WORKERS=${S5_WORKERS},GA_ESTIMATOR=${GA_ESTIMATOR},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA},GA_BUDGET=${GA_BUDGET},GA_STAGED_REUSE_ESTIMATOR=1,GA_STAGED_GA_DIR=${MERGED_DIR},INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS},PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR},GA_N_RESTARTS=${GA_N_RESTARTS},GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT},GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH}" \
+  -v "MODE=ga_staged,CONDA_ENV=${CONDA_ENV},RUN_ROOT=${RUN_ROOT},THREADS=${THREADS},S5_WORKERS=${S5_WORKERS},GA_ESTIMATOR=${GA_ESTIMATOR},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA},GA_BUDGET=${GA_BUDGET},GA_STAGED_REUSE_ESTIMATOR=1,GA_STAGED_GA_DIR=${MERGED_DIR},INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS},PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR},GA_N_RESTARTS=${GA_N_RESTARTS},GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT},GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH},NEW_POP=${NEW_POP},NEW_POP_MAPPED=${NEW_POP_MAPPED},NEW_POP_DIR=${NEW_POP_DIR},PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH}" \
   pbs_pipeline_mode.pbs | awk '{print $1}')
 
 echo "Submitted prediction: ${jid_pred}"

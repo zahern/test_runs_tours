@@ -1,0 +1,6 @@
+Tag,Evidence
+CON,"Coefficients NOT proportional: r=0.481, R2=0.230"
+CON,Low feature overlap: Jaccard=0.474 — NM and crashes have different drivers
+CON,NM spec degrades on crashes: dBIC=+101.2
+PRO,"Predicted NM encompasses geometry: LR=890.9, p=0.0000"
+CON,Weak shared latent risk: partial r=0.092

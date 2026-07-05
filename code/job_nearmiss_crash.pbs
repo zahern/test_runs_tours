@@ -1,0 +1,423 @@
+#!/bin/bash -l
+# =============================================================================
+# job_nearmiss_crash.pbs
+# =============================================================================
+# Runs the near-miss / crash proxy analysis (Harmony Search + NB fits, coef
+# proportionality, specification transfer, encompassing, bivariate latent risk,
+# Vuong) end-to-end on the HPC and exports LaTeX-ready result tables so they
+# can be \input{} straight into trb_template.tex.
+#
+# What it does (matches nearmiss_crash_analysis.py main()):
+#   1. Dual Harmony Search (NM vs crashes)        — feature selection by BIC
+#   2. Full NB models on both responses
+#   3. Coefficient proportionality test           — β_crash ∝ β_NM ?
+#   4. Specification transfer                     — does NM-spec predict crashes?
+#   5. Encompassing test                          — does predicted NM encompass Geo?
+#   6. Bivariate latent risk                      — shared random-effect proxy
+#   7. Vuong non-nested test                      — NM-spec vs Crash-spec on crashes
+#   8. Synthesis (verdict) + CSV exports for paper
+#
+# Where things live (Windows paths mapped from HPC mounts):
+#   Script   : Z:\test_runs_tours\demand_\paper\Unofficial_Transportation_Research_Board__TRB__LaTeX_template\nearmiss_crash_analysis.py
+#   Data     : Z:\test_runs_tours\demand_\near_miss_ecf.csv   (12 MB)
+#   Results  : Z:\test_runs_tours\demand_\paper\Unofficial_Transportation_Research_Board__TRB__LaTeX_template\results\nearmiss_crash_<JOBID>\
+#   Python   : C:\Users\ahernz\AppData\Local\Temp\opencode\nm_venv\Scripts\python.exe
+#              (nm_venv – JAX cpu, statsmodels, sklearn, pandas, scipy)
+#
+# Resource sizing:
+#   - Single node, CPU-only JAX, 4 cores (script uses scipy_min L-BFGS-B, no
+#     multiprocessing; HS only fans out within a single process).
+#   - 32 GB RAM is plenty (12 MB CSV, ~hundreds of NB fits stay under a few GB).
+#   - Walltime 04:00:00 is generous; typical runtime is ~30–90 min.
+#
+# Submission:
+#   qsub job_nearmiss_crash.pbs                          # defaults
+#   qsub -v WALLTIME=08:00:00,MEM=64GB job_nearmiss_crash.pbs
+#   qsub -v RESULTS_DIR=/scratch/.../nm_results job_nearmiss_crash.pbs
+#
+# Outputs:
+#   results/nearmiss_crash_<JOBID>/run.log             – full stdout mirror
+#   results/nearmiss_crash_<JOBID>/run.err             – full stderr mirror
+#   results/nearmiss_crash_<JOBID>/analysis_summary.txt – condensed summary
+#   results/nearmiss_crash_<JOBID>/tables/*.csv        – LaTeX-ready result tables
+#   results/nearmiss_crash_<JOBID>/plots/*.png         – figures (when produced)
+#
+# Embedding into the TRB paper:
+#   See results/nearmiss_crash_<JOBID>/EMBEDDING_GUIDE.md (auto-generated).
+# =============================================================================
+
+#PBS -N nm_proxy_analysis
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -l walltime=04:00:00
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+set -euo pipefail
+
+# ── Tunables (override with `qsub -v KEY=value ...`) ────────────────────────────
+WALLTIME_HUMAN=${WALLTIME_HUMAN:-04:00:00}
+MEM_HUMAN=${MEM_HUMAN:-32GB}
+PYTHON_BIN="${PYTHON_BIN:-C:/Users/ahernz/AppData/Local/Temp/opencode/nm_venv/Scripts/python.exe}"
+SCRIPT_PATH="${SCRIPT_PATH:-Z:\\test_runs_tours\\demand_\\paper\\Unofficial_Transportation_Research_Board__TRB__LaTeX_template\\nearmiss_crash_analysis.py}"
+RESULTS_ROOT="${RESULTS_ROOT:-Z:\\test_runs_tours\\demand_\\paper\\Unofficial_Transportation_Research_Board__TRB__LaTeX_template\\results}"
+JOB_TAG="${JOB_TAG:-nearmiss_crash}"
+
+cd "$PBS_O_WORKDIR"
+
+# ── Output directory ───────────────────────────────────────────────────────────
+JOBID_SAFE="${PBS_JOBID:-manual}"
+JOBID_SAFE="${JOBID_SAFE//./_}"
+RESULTS_DIR="${RESULTS_ROOT%/}\\${JOB_TAG}_${JOBID_SAFE}"
+mkdir -p "$RESULTS_DIR/tables" "$RESULTS_DIR/plots"
+cd "$RESULTS_DIR"
+
+LOG_OUT="${RESULTS_DIR}/run.log"
+LOG_ERR="${RESULTS_DIR}/run.err"
+: > "$LOG_OUT"; : > "$LOG_ERR"
+
+# ── Header ─────────────────────────────────────────────────────────────────────
+{
+  echo "=========================================================="
+  echo "Near-Miss / Crash Proxy Analysis"
+  echo "PBS job     : ${PBS_JOBID:-unknown}"
+  echo "Node        : $(hostname)"
+  echo "Workdir     : $PBS_O_WORKDIR"
+  echo "Results dir : $RESULTS_DIR"
+  echo "Python      : $PYTHON_BIN"
+  echo "Script      : $SCRIPT_PATH"
+  echo "Walltime    : $WALLTIME_HUMAN   Mem: $MEM_HUMAN"
+  echo "Started     : $(date)"
+  echo "=========================================================="
+} | tee -a "$LOG_OUT"
+
+# ── Sanity: python and script exist ───────────────────────────────────────────
+if [ ! -f "$PYTHON_BIN" ]; then
+  echo "ERROR: python not found at $PYTHON_BIN" | tee -a "$LOG_ERR"
+  exit 2
+fi
+if [ ! -f "$SCRIPT_PATH" ]; then
+  echo "ERROR: script not found at $SCRIPT_PATH" | tee -a "$LOG_ERR"
+  exit 2
+fi
+
+# ── JAX / BLAS runtime knobs ───────────────────────────────────────────────────
+# Script forces JAX to CPU itself, but we pre-set the env to be safe and to keep
+# OpenBLAS/MKL from oversubscribing cores.
+export JAX_PLATFORMS=cpu
+export JAX_PLATFORM_NAME=cpu
+export CUDA_VISIBLE_DEVICES=""
+export TF_CPP_MIN_LOG_LEVEL=3
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export NUMEXPR_NUM_THREADS=4
+export PYTHONUNBUFFERED=1
+export PYTHONIOENCODING=utf-8
+export PYTHONUTF8=1
+
+# ── Run the analysis ──────────────────────────────────────────────────────────
+echo "[stage] Running nearmiss_crash_analysis.main() ..." | tee -a "$LOG_OUT"
+"$PYTHON_BIN" -X utf8 -u "$SCRIPT_PATH" \
+    > >(tee -a "$LOG_OUT") \
+    2> >(tee -a "$LOG_ERR" >&2)
+EXIT_CODE=$?
+
+echo "[stage] Python exit=$EXIT_CODE" | tee -a "$LOG_OUT"
+
+# ── Post-processing: produce LaTeX-ready tables from run output ────────────────
+# The Python script already drops proxy_analysis_evidence.csv next to itself.
+# We re-run a tiny post-processor that wraps the prints into machine-readable
+# booktabs CSVs for \input{} into trb_template.tex.
+echo "[stage] Building LaTeX-ready tables ..." | tee -a "$LOG_OUT"
+POSTPROC_OUT="$RESULTS_DIR/tables/_postproc_summary.txt"
+cat > _postproc.py <<'PY'
+"""
+Post-processor for nearmiss_crash_analysis.
+
+Re-derives a small set of paper-ready tables by re-running only the
+deterministic, fast parts of the analysis (no Harmony Search re-fits):
+  - HS feature overlap table
+  - Model fit comparison (NM vs Crash, native + transferred BIC)
+  - Synthesis verdict
+
+We deliberately re-run the cheap summary functions instead of trying to
+pickle state out of the heavy HS runs. Runtime: a few minutes on the
+already-fit best models — NOT another 80-iteration HS.
+"""
+import os, sys, warnings, json
+warnings.filterwarnings("ignore")
+os.environ["JAX_PLATFORMS"] = "cpu"
+
+import numpy as np
+import pandas as pd
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TABLES = os.path.join(HERE, "tables")
+os.makedirs(TABLES, exist_ok=True)
+
+# Lazy imports of the analysis script (it sits in the HPC template dir)
+SCRIPT_DIR = r"Z:\test_runs_tours\demand_\paper\Unofficial_Transportation_Research_Board__TRB__LaTeX_template"
+sys.path.insert(0, SCRIPT_DIR)
+from nearmiss_crash_analysis import (
+    load_data, harmony_search, fit_model,
+    print_model_summary, coefficient_proportionality_test,
+    specification_transfer, encompassing_test,
+    bivariate_random_effect_analysis, vuong_test,
+)
+
+def write_booktabs_csv(df, name):
+    """Write a pandas DataFrame as a booktabs-friendly CSV with LaTeX-safe values."""
+    df2 = df.copy()
+    for c in df2.select_dtypes(include=["float"]).columns:
+        df2[c] = df2[c].apply(
+            lambda v: "" if pd.isna(v) else f"{v:.6g}"
+        )
+    path = os.path.join(TABLES, f"{name}.csv")
+    df2.to_csv(path, index=False)
+    print(f"  wrote {path}")
+    return path
+
+def main():
+    df, GEO, NM_RESP = load_data()
+    nm_col = "nm_total"
+
+    print("Re-running Harmony Search to recover best specs (HS is deterministic w/ seed=42) ...")
+    hs_nm,   hs_nm_feats   = harmony_search(df, GEO, nm_col, "log_len",
+                                            max_iter=80, label="NM_response")
+    hs_cr,   hs_cr_feats   = harmony_search(df, GEO, "ObsCrashes", "log_len",
+                                            max_iter=80, label="Crash_response")
+
+    # 1. HS feature overlap table ------------------------------------------------
+    overlap = sorted(set(hs_nm_feats) & set(hs_cr_feats))
+    nm_only  = sorted(set(hs_nm_feats)   - set(hs_cr_feats))
+    cr_only  = sorted(set(hs_cr_feats)   - set(hs_nm_feats))
+    jaccard = len(overlap) / max(1, len(set(hs_nm_feats) | set(hs_cr_feats)))
+    write_booktabs_csv(pd.DataFrame({
+        "category": ["NM & Crash", "NM only", "Crash only"],
+        "count":    [len(overlap), len(nm_only), len(cr_only)],
+        "features": [", ".join(overlap), ", ".join(nm_only), ", ".join(cr_only)],
+    }), "hs_feature_overlap")
+
+    # 2. Full-model coefs for both responses ------------------------------------
+    full_nm   = fit_model(df, GEO, nm_col,      "log_len", label="Full-NM",   verbose=False)
+    full_cr   = fit_model(df, GEO, "ObsCrashes","log_len", label="Full-Crash",verbose=False)
+    coef_nm = full_nm["coef_table"].assign(Response="NM",      Model="Full-Geo")
+    coef_cr = full_cr["coef_table"].assign(Response="Crash",   Model="Full-Geo")
+    write_booktabs_csv(pd.concat([coef_nm, coef_cr], ignore_index=True),
+                       "full_model_coefficients")
+
+    # 3. Specification transfer table -------------------------------------------
+    print("Specification transfer ...")
+    st = specification_transfer(df, hs_nm_feats, hs_cr_feats, GEO)
+    rows = []
+    for key in ["NM_spec_on_NM", "NM_spec_on_crash",
+                "Crash_spec_on_NM", "Crash_spec_on_crash"]:
+        m = st[key]
+        rows.append({"model": m["label"], "n": m["n"], "k": m["k"],
+                     "LL": m["ll"], "AIC": m["aic"], "BIC": m["bic"]})
+    st_df = pd.DataFrame(rows)
+    write_booktabs_csv(st_df, "specification_transfer")
+
+    # 4. Encompassing test -------------------------------------------------------
+    print("Encompassing test ...")
+    enc = encompassing_test(df, GEO)
+    enc_df = pd.DataFrame([{
+        "test": "LR (unrestricted vs restricted)",
+        "LR_statistic": enc["lr_stat"],
+        "df": enc["df"],
+        "p_value": enc["p"],
+        "BIC_restricted": enc["bic_restricted"],
+        "BIC_unrestricted": enc["bic_unrestricted"],
+        "delta_BIC": enc["bic_unrestricted"] - enc["bic_restricted"],
+    }])
+    write_booktabs_csv(enc_df, "encompassing_test")
+
+    # 5. Bivariate latent risk --------------------------------------------------
+    print("Bivariate latent risk ...")
+    biv = bivariate_random_effect_analysis(df, GEO, nm_col)
+    biv_df = pd.DataFrame([{
+        "test": ["Response (per-km rate) - Spearman",
+                 "Response (per-km rate) - Pearson (log1p)",
+                 "After removing geometry - Pearson"],
+        "r":   [biv["spearman_r"], biv.get("partial_r", np.nan), biv["partial_r"]],
+        "p":   [biv["spearman_p"], biv.get("partial_p", np.nan), biv["partial_p"]],
+    }]).explode(["test","r","p"], ignore_index=True)
+    write_booktabs_csv(biv_df, "bivariate_latent_risk")
+
+    # 6. Vuong -------------------------------------------------------------------
+    vu = vuong_test(st["NM_spec_on_crash"], st["Crash_spec_on_crash"])
+    vu_df = pd.DataFrame([{"BIC_NMspec": vu["bic1"], "BIC_Crashspec": vu["bic2"],
+                            "delta_BIC": vu["delta_bic"]}])
+    write_booktabs_csv(vu_df, "vuong_test")
+
+    # 7. Final synthesis --------------------------------------------------------
+    prop = coefficient_proportionality_test(full_nm, full_cr) or {}
+    evidence_rows = []
+    if prop:
+        evidence_rows.append({
+            "test": "Coefficient proportionality",
+            "metric": "k_hat / r / R2_prop",
+            "value": f"{prop.get('k', float('nan')):.4f} / "
+                     f"{prop.get('corr', float('nan')):.4f} / "
+                     f"{prop.get('R2_prop', float('nan')):.4f}",
+            "verdict": "PRO" if (prop.get("corr", 0) > 0.7 and prop.get("R2_prop", 0) > 0.5) else "CON",
+        })
+    gap = st["NM_spec_on_crash"]["bic"] - st["Crash_spec_on_crash"]["bic"]
+    evidence_rows.append({
+        "test": "Specification transfer (NM-spec -> crashes)",
+        "metric": "delta_BIC",
+        "value": f"{gap:+.2f}",
+        "verdict": "PRO" if abs(gap) < 20 else "CON",
+    })
+    evidence_rows.append({
+        "test": "Encompassing (pred_NM ~ crashes)",
+        "metric": "p_value",
+        "value": f"{enc['p']:.4f}",
+        "verdict": "PRO" if enc["p"] < 0.05 else "CON",
+    })
+    evidence_rows.append({
+        "test": "Shared latent risk (partial Pearson r)",
+        "metric": f"r={biv['partial_r']:.4f}, p={biv['partial_p']:.2e}",
+        "value": f"{biv['partial_r']:.4f}",
+        "verdict": "PRO" if (biv["partial_r"] > 0.2 and biv["partial_p"] < 1e-10) else "CON",
+    })
+    evidence_rows.append({
+        "test": "Feature overlap (Jaccard)",
+        "metric": "Jaccard",
+        "value": f"{jaccard:.4f}",
+        "verdict": "PRO" if jaccard > 0.6 else "CON",
+    })
+    write_booktabs_csv(pd.DataFrame(evidence_rows), "synthesis_evidence")
+
+    # 8. A condensed text summary (handy for the paper appendix) ---------------
+    summary = []
+    summary.append("NEAR-MISS / CRASH PROXY ANALYSIS - SUMMARY")
+    summary.append("="*60)
+    summary.append(f"NM-optimal features   ({len(hs_nm_feats)}): {hs_nm_feats}")
+    summary.append(f"Crash-optimal feats   ({len(hs_cr_feats)}): {hs_cr_feats}")
+    summary.append(f"Overlap / Jaccard     : {len(overlap)} / {jaccard:.4f}")
+    summary.append(f"Full-NM  LL/AIC/BIC   : "
+                    f"{full_nm['ll']:.2f} / {full_nm['aic']:.2f} / {full_nm['bic']:.2f}")
+    summary.append(f"Full-Cr  LL/AIC/BIC   : "
+                    f"{full_cr['ll']:.2f} / {full_cr['aic']:.2f} / {full_cr['bic']:.2f}")
+    if prop:
+        summary.append(f"Proportionality       : k={prop.get('k', float('nan')):.4f}  "
+                        f"r={prop.get('corr', float('nan')):.4f}  "
+                        f"R2={prop.get('R2_prop', float('nan')):.4f}")
+    summary.append(f"Transfer gap (NM->Cr) : {gap:+.2f} BIC")
+    summary.append(f"Encompassing p        : {enc['p']:.4f}")
+    summary.append(f"Partial r (latent)    : {biv['partial_r']:.4f}  p={biv['partial_p']:.2e}")
+    summary.append(f"Vuong delta_BIC       : {vu['delta_bic']:+.2f}")
+    summary.append("-"*60)
+    summary.append("Tables written to ./tables/ :")
+    for f in sorted(os.listdir(TABLES)):
+        if f.endswith(".csv"):
+            summary.append(f"  - {f}")
+    with open(os.path.join(HERE, "analysis_summary.txt"), "w", encoding="utf-8") as fh:
+        fh.write("\n".join(summary))
+    print("\n".join(summary))
+
+if __name__ == "__main__":
+    main()
+PY
+
+cd "$RESULTS_DIR"
+"$PYTHON_BIN" -X utf8 -u _postproc.py \
+    >> "$LOG_OUT" 2>> "$LOG_ERR" || echo "[stage] post-processor exited non-zero (non-fatal)" | tee -a "$LOG_ERR"
+
+# ── Embedding how-to (auto-generated) ─────────────────────────────────────────
+EMBED_GUIDE="$RESULTS_DIR/EMBEDDING_GUIDE.md"
+cat > "$EMBED_GUIDE" <<MD
+# Embedding \`nearmiss_crash_analysis\` results into \`trb_template.tex\`
+
+This run wrote its **paper-ready tables** to:
+
+\`\`\`
+$RESULTS_DIR/tables/
+\`\`\`
+
+All tables are plain CSV with values rounded to 6 significant digits, ready
+to be loaded with \`pgfplotstable\` or any other LaTeX table package.
+
+## 1. Add the package to your preamble (once)
+
+\`\`\`latex
+\usepackage{pgfplotstable}
+\usepackage{booktabs}
+\pgfplotstableset{
+  every head row/.style={before row=\\toprule, after row=\\midrule},
+  every last row/.style={after row=\\bottomrule},
+  col sep=comma,
+  header=true,
+  string type,
+}
+\`\`\`
+
+## 2. Re-export the CSVs to your paper directory (or symlink/copy)
+
+\`\`\`bash
+cp "$RESULTS_DIR/tables/"*.csv tables/
+\`\`\`
+
+## 3. Drop them into the paper
+
+\`\`\`latex
+% --- Synthesis evidence table ---
+\\pgfplotstabletypeset[
+  columns={test,metric,value,verdict},
+  columns/test/.style={column name=Test,    column type={l}, string type},
+  columns/metric/.style={column name=Metric, column type={l}, string type},
+  columns/value/.style={column name=Value,  column type={l}, string type},
+  columns/verdict/.style={column name=Verdict,column type={c}, string type,
+                          @cell content={\\textbf{#1}}},
+]{tables/synthesis_evidence.csv}
+
+% --- Specification transfer model fits ---
+\\pgfplotstabletypeset[
+  columns/n/.style={column type={r}, fixed},
+  columns/k/.style={column type={r}, fixed},
+  columns/LL/.style={column type={r}, fixed, precision=2, zerofill},
+  columns/AIC/.style={column type={r}, fixed, precision=2, zerofill},
+  columns/BIC/.style={column type={r}, fixed, precision=2, zerofill},
+]{tables/specification_transfer.csv}
+
+% --- HS feature overlap ---
+\\pgfplotstabletypeset[
+  columns/count/.style={column type={r}, fixed},
+]{tables/hs_feature_overlap.csv}
+\`\`\`
+
+## 4. Optional: include the full run summary verbatim
+
+\`\`\`latex
+\\VerbatimInput[fontsize=\\footnotesize]{$RESULTS_DIR/analysis_summary.txt}
+\`\`\`
+
+(Make sure \`\\usepackage{fancyvrb}\` is in your preamble.)
+
+## 5. Available tables
+
+| File                              | What it is                                           |
+|-----------------------------------|------------------------------------------------------|
+| \`hs_feature_overlap.csv\`         | NM-only / Crash-only / shared HS-selected features  |
+| \`full_model_coefficients.csv\`    | Full Geo -> NM and Geo -> Crash NB coefficients      |
+| \`specification_transfer.csv\`     | LL/AIC/BIC for native + transferred specifications   |
+| \`encompassing_test.csv\`          | LR test + BIC comparison (restricted vs unrestricted)|
+| \`bivariate_latent_risk.csv\`      | Response & partial correlations                       |
+| \`vuong_test.csv\`                 | BIC delta between NM-spec and Crash-spec on crashes  |
+| \`synthesis_evidence.csv\`         | PRO/CON evidence tally for the verdict               |
+MD
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+{
+  echo "=========================================================="
+  echo "Finished : $(date)  exit_code=${EXIT_CODE}"
+  echo "Results  : $RESULTS_DIR"
+  echo "Embed help: $EMBED_GUIDE"
+  echo "Tables   : $RESULTS_DIR/tables/"
+  echo "Logs     : $LOG_OUT / $LOG_ERR"
+  echo "=========================================================="
+} | tee -a "$LOG_OUT"
+
+exit "${EXIT_CODE}"

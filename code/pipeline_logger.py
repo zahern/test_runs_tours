@@ -463,10 +463,48 @@ from ga_hypothesis_testing      import run_ga_all_stages
 # Point this at the folder containing your per-zone CSV files.
 # Files must be named  order_N.csv  (e.g. order_1.csv, order_40.csv).
 # The ORDER/OTAZ value is read from the filename — no need to add it manually.
-SYNTH_DIR = 'saved_data/zone_ids_sa2'
+#
+# Set NEW_POP=1 to switch to the 507-SA2-zone scope instead: zone_<sa2>.csv
+# files (OTAZ = SA2 code directly, no ORDER indirection — see
+# export_zone_sa2_files() in synth_pop/run_pipeline.py and
+# Synth_Connect(new_pop=True) in data_connect.py), read from
+# NEW_POP_DIR/saved_data/zone_ids_sa2 (NEW_POP_DIR defaults to
+# Z:\test_runs_tours\new_pop).
+NEW_POP = os.environ.get('NEW_POP', '0').strip() == '1'
+NEW_POP_DIR = os.environ.get('NEW_POP_DIR', r'Z:\test_runs_tours\new_pop')
 
-# Single-zone fallback (used by old CLI invocations and unit tests)
-DEFAULT_SYNTH = f'{SYNTH_DIR}/order_40.csv'
+# NEW_POP_MAPPED=1: load from new_pop 507-zone files but remap OTAZ from SA2
+# code → ORDER number via demand_/sa2_to_order_crosswalk.csv, so the existing
+# 329-zone ORDER skims (downcasted_matrices_base.omx) remain the destination
+# skim while the 324-zone SA1/Lvl4 walk/bike skims supply fine-grain active-
+# mode origins.  Run demand_/20_build_sa2_to_order_crosswalk.py first, then
+# build_synth_population.py --new-pop-mapped to pre-build the population CSV.
+NEW_POP_MAPPED = os.environ.get('NEW_POP_MAPPED', '0').strip() == '1'
+
+if NEW_POP:
+    SYNTH_DIR = os.path.join(NEW_POP_DIR, 'saved_data', 'zone_ids_sa2')
+    DEFAULT_SYNTH = os.path.join(SYNTH_DIR, 'zone_301011001.csv')
+    _DEFAULT_SKIMS_PATH = r'Z:\test_runs_tours\demand_\sa2_skims_507_omxspec.omx'
+elif NEW_POP_MAPPED:
+    # Population: loaded on-the-fly from new_pop zone_<sa2>.csv with SA2→ORDER
+    # remapping (build_synth_population.build_synth_population_mapped).
+    # Skims: 329-zone ORDER system unchanged — downcasted_matrices_base.omx.
+    SYNTH_DIR = os.path.join(
+        os.environ.get('NEW_POP_DIR', NEW_POP_DIR), 'saved_data', 'zone_ids_sa2'
+    )
+    DEFAULT_SYNTH = 'saved_data/synth_persons_mapped.csv'
+    _DEFAULT_SKIMS_PATH = 'downcasted_matrices_base.omx'
+else:
+    SYNTH_DIR = 'saved_data/zone_ids_sa2'
+    DEFAULT_SYNTH = f'{SYNTH_DIR}/order_40.csv'
+    _DEFAULT_SKIMS_PATH = 'downcasted_matrices_base.omx'
+
+# Single source of truth for the skims path, overridable per-run via
+# PIPELINE_SKIMS_PATH (e.g. qsub -v PIPELINE_SKIMS_PATH=...).
+# Use `or` instead of .get(key, default) so an *empty string* from PBS
+# (-v "PIPELINE_SKIMS_PATH=" passes '' into os.environ, not a missing key)
+# also falls back to the mode-appropriate default rather than resolving to CWD.
+PIPELINE_SKIMS_PATH = os.environ.get('PIPELINE_SKIMS_PATH') or _DEFAULT_SKIMS_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +514,7 @@ DEFAULT_SYNTH = f'{SYNTH_DIR}/order_40.csv'
 @timer("process_survey + landuse + accessibility")
 def load_data():
     from compute_accessibility import run_accessibility
-    sc      = Synth_Connect()
+    sc      = Synth_Connect(new_pop=NEW_POP)
     out     = sc.process_survey(save=False)
     landuse = sc.get_land()
     # ── Landuse patch: fill Primary=0 from Primary_total_priv ─────────────
@@ -500,22 +538,33 @@ def load_data():
                         f"for {_mask2.sum()} zone(s)")
     landuse = run_accessibility(
         landuse,
-        skims='downcasted_matrices_base.omx',
+        skims=PIPELINE_SKIMS_PATH,
         save_path='saved_data/accessibility.csv',
     )
     return sc, out, landuse
+
+
+def _parse_zone_id(filepath: str):
+    """Parse the zone id from order_N.csv (legacy) or zone_<sa2>.csv (new_pop)."""
+    import re
+    match = re.search(r'order_(\d+)', filepath)
+    if match:
+        return int(match.group(1))
+    match = re.search(r'zone_(\d+)', filepath)
+    if match:
+        return int(match.group(1))
+    return None
 
 
 @timer("load synthetic population — single zone")
 def load_synth(filepath: str = DEFAULT_SYNTH,
                landuse: pd.DataFrame = None):
     """Load one zone's synth CSV.  OTAZ is derived from the filename."""
-    import re
     synth = pd.read_csv(filepath)
 
-    match = re.search(r'order_(\d+)', filepath)
-    if match:
-        synth['OTAZ'] = int(match.group(1))
+    zone_id = _parse_zone_id(filepath)
+    if zone_id is not None:
+        synth['OTAZ'] = zone_id
     elif 'ORDER' in synth.columns:
         synth['OTAZ'] = synth['ORDER'].astype(int)
     elif 'OTAZ' in synth.columns:
@@ -537,40 +586,62 @@ def load_synth_all_zones(synth_dir: str = SYNTH_DIR,
     """
     Load every order_N.csv in synth_dir and concatenate into one DataFrame.
 
-    Each file contributes one zone's worth of synthetic persons.  OTAZ is
-    set from the filename (order_N.csv → OTAZ = N).
+    When NEW_POP_MAPPED=1: loads from new_pop zone_<sa2>.csv files and remaps
+    OTAZ from SA2 code → ORDER number via demand_/sa2_to_order_crosswalk.csv.
+    Non-324-zone people are merged into their nearest 324-zone ORDER neighbour.
+    A pre-built CSV (saved_data/synth_persons_mapped.csv) is used when present
+    to avoid the full remap on every run; rebuild it with
+      python build_synth_population.py --new-pop-mapped
 
     Parameters
     ----------
-    synth_dir : folder containing order_N.csv files
+    synth_dir : folder containing order_N.csv files (ignored for NEW_POP_MAPPED)
     landuse   : passed to enrich_synth_population for accessibility join
     zones     : optional list of zone ORDER numbers to restrict loading
-                (e.g. [40, 124, 200]).  None = load every file found.
 
     Returns
     -------
-    pd.DataFrame  — full synthetic population across all loaded zones,
-                    with OTAZ column set correctly per person.
+    pd.DataFrame  — full synthetic population with OTAZ set correctly.
     """
-    import re
+    # ── NEW_POP_MAPPED: load from pre-built mapped CSV or build on-the-fly ──
+    if NEW_POP_MAPPED:
+        from build_synth_population import (
+            build_synth_population_mapped,
+            OUT_MAPPED_PERSONS,
+        )
+        _cached = OUT_MAPPED_PERSONS
+        if os.path.exists(_cached):
+            logger.info(f"NEW_POP_MAPPED: loading pre-built mapped population from {_cached}")
+            synth = pd.read_csv(_cached, low_memory=False)
+            logger.info(f"  Loaded {len(synth):,} persons, {synth['OTAZ'].nunique()} ORDER zones")
+        else:
+            logger.info("NEW_POP_MAPPED: pre-built CSV not found — building from new_pop zone files")
+            synth = build_synth_population_mapped(
+                new_pop_dir=os.environ.get('NEW_POP_DIR', NEW_POP_DIR),
+                attach_accessibility=False,
+                save=True,
+            )
+        # Filter to specific ORDER zones if requested
+        if zones is not None:
+            synth = synth[synth['OTAZ'].isin(set(zones))].reset_index(drop=True)
+            logger.info(f"  Zone filter applied: {synth['OTAZ'].nunique()} zones retained")
+        return synth
 
-    pattern = os.path.join(synth_dir, 'order_*.csv')
-    files   = sorted(glob.glob(pattern))
+    files = sorted(glob.glob(os.path.join(synth_dir, 'order_*.csv'))
+                    + glob.glob(os.path.join(synth_dir, 'zone_*.csv')))
 
     if not files:
         raise FileNotFoundError(
-            f"No order_*.csv files found in '{synth_dir}'.\n"
-            f"  Expected files like: order_1.csv, order_2.csv, ..., order_329.csv\n"
+            f"No order_*.csv or zone_*.csv files found in '{synth_dir}'.\n"
+            f"  Legacy scope expects: order_1.csv, order_2.csv, ..., order_329.csv\n"
+            f"  new_pop scope expects: zone_<sa2>.csv (set NEW_POP=1)\n"
             f"  Check that SYNTH_DIR is set correctly at the top of pipeline_logger.py."
         )
 
     # Filter to specific zones if requested
     if zones is not None:
         zone_set = set(zones)
-        files = [
-            f for f in files
-            if (m := re.search(r'order_(\d+)', f)) and int(m.group(1)) in zone_set
-        ]
+        files = [f for f in files if _parse_zone_id(f) in zone_set]
         logger.info(f"  Zone filter: loading {len(files)} zones from {len(zone_set)} requested")
 
     logger.info(f"  Found {len(files)} zone CSV files in {synth_dir}")
@@ -578,11 +649,10 @@ def load_synth_all_zones(synth_dir: str = SYNTH_DIR,
     frames = []
     missing = []
     for filepath in files:
-        match = re.search(r'order_(\d+)', filepath)
-        if not match:
-            logger.warning(f"  Skipping {filepath} — cannot parse ORDER from filename")
+        otaz = _parse_zone_id(filepath)
+        if otaz is None:
+            logger.warning(f"  Skipping {filepath} — cannot parse zone id from filename")
             continue
-        otaz = int(match.group(1))
         try:
             df = pd.read_csv(filepath)
             df['OTAZ'] = otaz       # override/set from filename — always correct
@@ -626,6 +696,53 @@ def load_synth_all_zones(synth_dir: str = SYNTH_DIR,
 
     # Enrich once on the full population — much faster than per-zone
     synth = enrich_synth_population(synth, landuse=landuse)
+
+    # Assign HOME_SA1 for fine-grained walk/bike skim lookups in stage5.
+    # order_N.csv (329-zone) files don't carry HOME_SA1; assign here using the
+    # SA2_MAIN16 column (present in Census-derived CSVs) → SA1 membership from
+    # SA1_SHP/sa1_2021.csv.  In new_pop mode (zone_<sa2>.csv) the column is
+    # already present from assign_sa1_to_population.py.
+    if 'HOME_SA1' not in synth.columns:
+        try:
+            _sa1_csv = os.path.normpath(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), '..', 'SA1_SHP', 'sa1_2021.csv'))
+            _xw_csv  = os.path.normpath(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), '..', 'demand_',
+                'sa1_to_emme_crosswalk_seqtweed.csv'))
+            if os.path.exists(_sa1_csv):
+                _sa1_lu = pd.read_csv(_sa1_csv, dtype=str)[['SA1_CODE21', 'SA2_CODE21']]
+                if os.path.exists(_xw_csv):
+                    _study = set(pd.read_csv(_xw_csv, dtype={'SA1_CODE21': str})['SA1_CODE21'].str.strip())
+                    _sa1_lu = _sa1_lu[_sa1_lu['SA1_CODE21'].isin(_study)]
+                _sa2_to_sa1s = (
+                    _sa1_lu.groupby('SA2_CODE21')['SA1_CODE21']
+                    .apply(lambda x: np.array([int(v) for v in x], dtype=np.int64))
+                    .to_dict()
+                )
+                # In new_pop mode OTAZ IS the 2021 SA2 code — use it first so
+                # the lookup matches sa1_2021.csv's SA2_CODE21 keys exactly.
+                # SA2_MAIN16 is a 2016 code (~93% concordant with 2021) and is
+                # only the right key for the legacy Census-derived zone CSVs.
+                if NEW_POP:
+                    _sa2_col = next((c for c in ['OTAZ', 'SA2_CODE21', 'SA2_MAIN16'] if c in synth.columns), None)
+                else:
+                    _sa2_col = next((c for c in ['SA2_MAIN16', 'SA2_CODE21'] if c in synth.columns), None)
+                if _sa2_col is not None:
+                    _rng = np.random.default_rng(seed=42)
+                    _sa1_out = np.zeros(len(synth), dtype=np.int64)
+                    for _sa2_val, _grp_idx in synth.groupby(_sa2_col).groups.items():
+                        _sa1_list = _sa2_to_sa1s.get(str(_sa2_val))
+                        if _sa1_list is not None and len(_sa1_list):
+                            _sa1_out[_grp_idx] = _rng.choice(_sa1_list, size=len(_grp_idx))
+                    synth['HOME_SA1'] = _sa1_out
+                    _n_ok = int((_sa1_out > 0).sum())
+                    logger.info(f"  HOME_SA1 assigned via {_sa2_col}: "
+                                f"{_n_ok:,}/{len(synth):,} persons "
+                                f"({100*_n_ok/len(synth):.1f}% coverage)")
+                else:
+                    logger.warning("HOME_SA1: no SA2 column found — walk/bike fine-skim disabled")
+        except Exception as _sa1_err:
+            logger.warning(f"HOME_SA1 on-the-fly assignment failed: {_sa1_err}")
 
     # Per-zone person counts — log summary only (full zone list → DEBUG)
     zone_counts = synth.groupby('OTAZ').size()
@@ -785,7 +902,7 @@ def cdap(out, synth, landuse=None):
 def usual_locations(synth, landuse, hhts_tours=None):
     return run_usual_locations(
         synth, landuse,
-        skims='downcasted_matrices_base.omx',
+        skims=PIPELINE_SKIMS_PATH,
         save_path=os.path.join(OUT_DIR, 'usual_locations.csv'),
         hhts_tours=hhts_tours,
         plots_dir=os.path.join(OUT_DIR, 'plots'),
@@ -1959,7 +2076,7 @@ def estimate_stage5(out, landuse):
         _clear_sharrow_cache,
     )
     from read_skims import list_omx_matrices
-    skims_path = 'downcasted_matrices_base.omx'
+    skims_path = PIPELINE_SKIMS_PATH
     list_omx_matrices(skims_path)
     if os.environ.get('STAGE5_CLEAR_SHARROW_CACHE', '0') == '1':
         _clear_sharrow_cache()
@@ -3304,7 +3421,7 @@ def predict_stage5(activities, models=None, out=None, landuse=None, skims=None, 
     if models is None:
         models = s5_load(os.path.join(OUT_DIR, 'stage5_models.pkl'))
 
-    skims_path = 'downcasted_matrices_base.omx'
+    skims_path = PIPELINE_SKIMS_PATH
     if skims is None:
         skims = omx.open_file(skims_path, 'r')
     if sk is None:
@@ -3602,7 +3719,7 @@ def stage4(out, activities):
 def stage5(out, synth_persons, scheduled, landuse):
     import openmatrix as omx
     from stage5_destination_choice import _skim_flat, _skim_lookup
-    skims_path = 'downcasted_matrices_base.omx'
+    skims_path = PIPELINE_SKIMS_PATH
     # Require Stage 5 to fit cleanly by default; fallback paths are opt-in.
     os.environ.setdefault('STAGE5_STRICT_ESTIMATION', '1')
     # Keep destination-estimation requirement enabled by default.
@@ -3651,7 +3768,7 @@ def stage5b(out, scheduled_dest, landuse):
     result = run_stage5b(
         trips       = scheduled_dest,
         persons     = out["persons"],
-        skims_path  = 'downcasted_matrices_base.omx',
+        skims_path  = PIPELINE_SKIMS_PATH,
         landuse     = landuse,
         output_dir  = OUT_DIR,
     )
@@ -4110,14 +4227,23 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                 _estimate, _logsums, _attach_size_term, _attach_acdc_terms,
                 _dest_tree, _build_dest_model, _skim_flat,
             )
-            _skims_path = os.environ.get('PIPELINE_SKIMS_PATH', 'downcasted_matrices_base.omx')
+            _skims_path = PIPELINE_SKIMS_PATH
             if not os.path.isabs(_skims_path):
                 _skims_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _skims_path)
             _s5_mode_feats = (best_feats.get('mode') if isinstance(best_feats, dict)
                               else (best_feats or []))
             _s5_dest_feats = (best_feats.get('dest') if isinstance(best_feats, dict)
                               else (best_feats or []))
-            _hhts_input = out.get('tours') or out.get('trips')
+            _hhts_input = out.get('tours')
+            if _hhts_input is None:
+                _hhts_input = out.get('trips')
+            # _prep_hhts_tours adds ptour_id (and standardises column names) which
+            # _mode_tree / _dest_tree require.  Without this call, _mode_tree raises
+            # KeyError: 'ptour_id' for every segment.
+            try:
+                _hhts_input = _prep_hhts_tours(_hhts_input, out['persons'])
+            except Exception as _prep_e:
+                logger.warning(f"GA stage 5 coef HTML: _prep_hhts_tours failed: {_prep_e}")
             _s5_models = {}
             _skims_hdl = omx.open_file(_skims_path, 'r')
             try:
@@ -4190,7 +4316,7 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                     for _k, _v in best_feats.items():
                         _s5_basic_rows.append({'segment': str(_k), 'param': 'GA_selected',
                                                 'value': ', '.join(map(str, _v)) if isinstance(_v, (list, tuple)) else str(_v)})
-                elif best_feats:
+                elif isinstance(best_feats, (list, tuple, set)) and best_feats:
                     _s5_basic_rows.append({'segment': 'all', 'param': 'GA_selected',
                                             'value': ', '.join(map(str, best_feats))})
                 if _s5_basic_rows:
@@ -4620,7 +4746,7 @@ def ga_stage5(out, landuse):
     res = run_ga_stage5(
         trips=out["trips"], persons=out["persons"],
         landuse=landuse,
-        skims='downcasted_matrices_base.omx',
+        skims=PIPELINE_SKIMS_PATH,
         tours=out.get("tours"),
         **_bp,
     )
@@ -4872,7 +4998,7 @@ def _fit_stage5_smoke_models(
         )
 
         os.makedirs(save_dir, exist_ok=True)
-        skims_path = 'downcasted_matrices_base.omx'
+        skims_path = PIPELINE_SKIMS_PATH
         crash_skims = _detect_stage5_crash_source()
 
         prev_safety_mode = os.environ.get('SAFETY_EXPERIMENT_MODE')
@@ -6209,7 +6335,7 @@ def GA_main(filepath: str = None):
                 out          = out,
                 synth        = travellers,
                 landuse      = landuse,
-                skims_path   = 'downcasted_matrices_base.omx',
+                skims_path   = PIPELINE_SKIMS_PATH,
                 save_dir     = OUT_DIR,
             )
         finally:
@@ -6386,7 +6512,7 @@ def GA_STAGED(filepath: str = None):
             out        = out,
             synth      = travellers,
             landuse    = landuse,
-            skims_path = 'downcasted_matrices_base.omx',
+            skims_path = PIPELINE_SKIMS_PATH,
             save_dir   = OUT_DIR,
         )
     finally:
@@ -6403,7 +6529,7 @@ def GA_STAGED(filepath: str = None):
 
     import openmatrix as omx
     from stage5_destination_choice import _skim_flat, _skim_lookup
-    skims   = omx.open_file('downcasted_matrices_base.omx', 'r')
+    skims   = omx.open_file(PIPELINE_SKIMS_PATH, 'r')
     sk      = _skim_lookup(_skim_flat(skims))
     try:
         scheduled_dest = stage5b(out, scheduled_dest, landuse)

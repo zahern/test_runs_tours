@@ -1,0 +1,203 @@
+#!/bin/bash -l
+# SA-Bandit full pipeline job — SEQ 324-zone scope (new_pop: SA4 301-305,309-311,313,314,316 + Tweed)
+#
+# Same as job_sa_bandit.pbs (GA estimation + safety comparison + population
+# prediction) but targets the demand_-derived 507-zone scope instead of the
+# legacy ~329-zone scope. Just sets NEW_POP=1 before invoking the same
+# _run_sa_bandit.py entry point — see pipeline_logger.py's
+# NEW_POP/NEW_POP_DIR/PIPELINE_SKIMS_PATH module-level switches.
+#
+# ── ONE-TIME PREREQUISITE (run once, before the first 507-zone job) ──────────
+# The 507-zone skims (demand_/sa2_skims_507.omx) are written by demand_'s
+# lightweight h5py OMX writer to dodge a Windows openmatrix/tables binary
+# incompatibility — but pipeline_logger.py calls the real `openmatrix`
+# package directly, so it needs a spec-compliant file. Convert once on this
+# environment (where openmatrix+tables are actually installed):
+#   cd /path/to/demand_
+#   python 11_convert_skims_to_openmatrix.py
+# This also merges in crash_rate_total (from crash_matrices_507.omx) as the
+# 'CRASH' matrix — the model's ECF (Expected Crash Frequency) safety
+# component — so it lands wherever the ABM already reads od.CRASH /
+# skims['CRASH'].
+#
+# Also requires zone_landuse_507.csv, SA2_2016_OSM_counts_507.csv, and the
+# zone_<sa2>.csv population exports to already exist under
+# Z:/test_runs_tours/new_pop/saved_data/ (built by demand_/09_*.py,
+# demand_/10_*.py, and synth_pop/export_507_to_new_pop.py respectively).
+#
+# Skip phases at submit time (same as job_sa_bandit.pbs):
+#   qsub -v RUN_PREDICTION=0 job_sa_bandit_507.pbs
+#   qsub -v RUN_SAFETY_COMPARISON=0 job_sa_bandit_507.pbs
+#   qsub -v GA_BUDGET=standard job_sa_bandit_507.pbs
+#
+# Memory: the 507-zone population (~3.8M persons, similar order of magnitude
+# to the legacy ~3.7M-person/329-zone population) — same 194GB sizing as
+# job_sa_bandit.pbs should suffice; bump if Phase 3 (prediction) OOMs.
+
+#PBS -N sa_bandit_507
+#PBS -l select=1:ncpus=4:mem=194GB
+#PBS -l walltime=48:00:00
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ── Tuneable at submission time via -v ───────────────────────────────────────
+GA_BUDGET=${GA_BUDGET:-fast}
+RUN_PREDICTION=${RUN_PREDICTION:-1}
+RUN_SAFETY_COMPARISON=${RUN_SAFETY_COMPARISON:-1}
+GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-8}
+GA_JAX_CACHE_MEM_LIMIT_GB=${GA_JAX_CACHE_MEM_LIMIT_GB:-8}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+
+# 507-zone scope switches
+NEW_POP=1
+NEW_POP_DIR=${NEW_POP_DIR:-/mnt/hpccs01/home/ahernz/test_runs_tours/new_pop}
+PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/sa2_skims_507_omxspec.omx}
+# ─────────────────────────────────────────────────────────────────────────────
+
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+if [[ ! -f "$PIPELINE_SKIMS_PATH" ]]; then
+  # Build the spec-compliant OMX from the h5py-written source on first use.
+  # 11_convert_skims_to_openmatrix.py needs openmatrix+tables, which are
+  # available in this conda env (that's why conversion happens here, not on
+  # the Windows dev machine — see header comment).
+  _DEMAND_DIR="$(dirname "$PIPELINE_SKIMS_PATH")"
+  echo "[skims] $PIPELINE_SKIMS_PATH not found — converting from sa2_skims_507.omx ..."
+  if [[ ! -f "$_DEMAND_DIR/sa2_skims_507.omx" ]]; then
+    echo "ERROR: source skim $_DEMAND_DIR/sa2_skims_507.omx also missing — cannot convert."
+    exit 1
+  fi
+  ( cd "$_DEMAND_DIR" && python 11_convert_skims_to_openmatrix.py \
+      --in sa2_skims_507.omx \
+      --crash crash_matrices_507.omx \
+      --out "$(basename "$PIPELINE_SKIMS_PATH")" )
+  if [[ ! -f "$PIPELINE_SKIMS_PATH" ]]; then
+    echo "ERROR: conversion did not produce $PIPELINE_SKIMS_PATH"
+    exit 1
+  fi
+  echo "[skims] conversion complete: $PIPELINE_SKIMS_PATH"
+fi
+
+# ── Install MetaCount + SearchLibrium (editable source; skip if already linked) ──
+_HPC_MC=/mnt/hpccs01/home/ahernz/source/MetaCount
+_HPC_SL=/mnt/hpccs01/home/ahernz/source/SearchLibrium
+
+_pkg_needs_install() {
+    local pkg="$1" src_dir="$2"
+    if ! python -c "import $pkg" 2>/dev/null; then return 0; fi
+    if [ -n "$src_dir" ] && [ -d "$src_dir" ]; then
+        local loc
+        loc=$(python -c "import $pkg, os; print(os.path.dirname($pkg.__file__))" 2>/dev/null || echo "")
+        [[ "$loc" != "$src_dir"* ]] && return 0
+    fi
+    return 1
+}
+
+echo "[pkg] Checking MetaCount..."
+if [ -d "$_HPC_MC" ]; then
+    if _pkg_needs_install metacountregressor "$_HPC_MC"; then
+        pip install -e "$_HPC_MC" -q && echo "[pkg] MetaCount installed (editable: $_HPC_MC)"
+    else
+        echo "[pkg] MetaCount already installed (editable) — skipping"
+    fi
+else
+    if _pkg_needs_install metacountregressor ""; then
+        pip install --no-cache-dir -q metacountregressor && echo "[pkg] MetaCount installed (PyPI)"
+    else
+        echo "[pkg] MetaCount already installed — skipping"
+    fi
+fi
+
+echo "[pkg] Checking jax/jaxlib/jaxopt..."
+if ! python -c "import jax, jaxlib, jaxopt" 2>/dev/null; then
+    pip install --no-cache-dir -q jax jaxlib jaxopt && echo "[pkg] jax/jaxlib/jaxopt installed"
+else
+    echo "[pkg] jax/jaxlib/jaxopt already installed — skipping"
+fi
+
+echo "[pkg] Checking SearchLibrium..."
+if [ -d "$_HPC_SL" ]; then
+    if _pkg_needs_install SearchLibrium "$_HPC_SL"; then
+        pip install -e "$_HPC_SL" -q && echo "[pkg] SearchLibrium installed (editable: $_HPC_SL)"
+    else
+        echo "[pkg] SearchLibrium already installed (editable) — skipping"
+    fi
+else
+    if _pkg_needs_install SearchLibrium ""; then
+        pip install --no-cache-dir -q SearchLibrium && echo "[pkg] SearchLibrium installed (PyPI)"
+    else
+        echo "[pkg] SearchLibrium already installed — skipping"
+    fi
+fi
+
+# ── Runtime env ──────────────────────────────────────────────────────────────
+export JAX_PLATFORMS=cpu
+export GA_METACOUNT_FORCE_CPU=1
+export TF_CPP_MIN_LOG_LEVEL=3
+
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+export GA_BUDGET="$GA_BUDGET"
+export RUN_PREDICTION="$RUN_PREDICTION"
+export RUN_SAFETY_COMPARISON="$RUN_SAFETY_COMPARISON"
+export GA_PARALLEL_SEGMENTS="$GA_PARALLEL_SEGMENTS"
+export GA_JAX_CACHE_MEM_LIMIT_GB="$GA_JAX_CACHE_MEM_LIMIT_GB"
+export GA_JAX_CACHE_CHECK_EVERY=100
+export GA_SIG_PENALTY_WEIGHT=1.50
+export GA_SIG_PVAL_THRESH=0.05
+export GA_ESTIMATOR=sa_bandit
+export GA_USE_BANDIT_SA=1
+export GA_PAD_FEATURES=1
+export STAGE23_JOINT=${STAGE23_JOINT:-1}
+
+# Walk/Bike use the granular SA1-origin × SA2-destination skims
+# (walk_bike_sa1_to_sa2_skims.h5, HOME_SA1 per person); all other modes use
+# the SA2→SA2 OMX skims. 'lvl4' switches to SEQ-STM Level4 micro-zones.
+export WALK_BIKE_FINE_ZONE=${WALK_BIKE_FINE_ZONE:-sa1}
+# Mode prediction prefers the distance-aware path when fine skims exist
+# (frozen person-type cells can't reflect SA1 walk/bike distances).
+export STAGE5_MODE_PRED_PRIORITY=${STAGE5_MODE_PRED_PRIORITY:-auto}
+# Stage 5 prediction: 50 zones per batch (1 zone/batch = ~330 sharrow
+# recompiles ≈ days of walltime) + per-batch checkpoint/resume.
+export STAGE5_BATCH_SIZE=${STAGE5_BATCH_SIZE:-50}
+export STAGE5_BATCH_CHECKPOINT=${STAGE5_BATCH_CHECKPOINT:-1}
+
+# 507-zone scope — must be exported before _run_sa_bandit.py imports
+# pipeline_logger (it reads these at import time).
+export NEW_POP="$NEW_POP"
+export NEW_POP_DIR="$NEW_POP_DIR"
+export PIPELINE_SKIMS_PATH="$PIPELINE_SKIMS_PATH"
+
+# ── Job header ────────────────────────────────────────────────────────────────
+echo "=========================================="
+echo "PBS job       : ${PBS_JOBID:-unknown}"
+echo "Working dir   : $PBS_O_WORKDIR"
+echo "Zone scope    : 324 SEQ SA2 zones (NEW_POP=1, SA4 301-305/309-311/313-314/316 + Tweed)"
+echo "NEW_POP_DIR   : $NEW_POP_DIR"
+echo "Skims path    : $PIPELINE_SKIMS_PATH"
+echo "Budget        : $GA_BUDGET"
+echo "Prediction    : $RUN_PREDICTION  (1=yes, 0=skip synth pop)"
+echo "Safety comp   : $RUN_SAFETY_COMPARISON  (1=yes, 0=skip)"
+echo "Parallel segs : $GA_PARALLEL_SEGMENTS"
+echo "JAX cache/wkr : ${GA_JAX_CACHE_MEM_LIMIT_GB} GB"
+echo "Started       : $(date)"
+echo "=========================================="
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+stdbuf -oL python -u _run_sa_bandit.py
+EXIT_CODE=$?
+
+echo ""
+echo "=========================================="
+echo "Finished : $(date)  exit_code=${EXIT_CODE}"
+echo "=========================================="
+exit "$EXIT_CODE"

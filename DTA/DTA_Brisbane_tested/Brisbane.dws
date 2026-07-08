@@ -1,0 +1,17 @@
+Version="2.0"
+Origin="bottom_left"
+coordinate="feet"
+start_time="0"
+[GUI]
+node_display_size=50.00000
+node_text_display_ratio=4.00000
+load_movement_data=1
+[coordinate]
+read_AMS_files=0.00000
+[movement]
+prohibit_non_specified_movement_on_freeway_and_ramp=1.00000
+hide_non_specified_movement_on_freeway_and_ramp=1.00000
+[display]
+read_link_x_y=1
+[simulation_result]
+simulation_start_time_in_min=0.00000

@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #PBS -N nearmiss_crash_new
-#PBS -l walltime=023:00:00
+#PBS -l walltime=030:00:00
 #PBS -l select=1:ncpus=4:mem=64GB
 #PBS -j oe
 #PBS -m abe

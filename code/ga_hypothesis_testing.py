@@ -6925,11 +6925,22 @@ h1,h2{{color:#2c3e50}}</style></head><body>
 
 
 def _save_model(model, path: str) -> None:
-    """Silently save a model object (dict, fitted estimator, etc.) to pickle."""
+    """Silently save a model object (dict, fitted estimator, etc.) to pickle.
+
+    Uses cloudpickle, not stdlib pickle: Larch model objects (e.g. Stage 5's
+    mode/dest models) carry lambdas (DictOfAlts.<lambda> in larch.model.linear)
+    that stdlib pickle cannot serialize ("Can't pickle <function ...>: attribute
+    lookup ... failed"), silently producing an empty/missing file. This mirrors
+    the save path stage5_destination_choice.py already uses successfully.
+    """
     try:
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         with open(path, 'wb') as f:
-            pickle.dump(model, f)
+            try:
+                import cloudpickle
+                cloudpickle.dump(model, f)
+            except ImportError:
+                pickle.dump(model, f)
         print(f"    Model saved ÔåÆ {path}")
     except Exception as e:
         logger.warning(f"Could not save model to {path}: {e}")

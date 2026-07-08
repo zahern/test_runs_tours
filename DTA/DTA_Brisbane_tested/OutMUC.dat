@@ -1,0 +1,133 @@
+ **********************************************
+ **  Summaries for mtc Iteration Procedures  **
+ **********************************************
+  SIMULATION START  DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   7   6  17  26  28
+  SIMULATION FINISH DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   7   6  17  42  14
+  BASIC PARAMETERS
+  Planning Horizon:    120.0000    
+  Iterations Limt.:            0
+  Loading Factor  :   0.0000000E+00
+  Start Time of Collecting Stats:  0.0000000E+00
+  End   Time of Collecting Stats:   1440.000    
+  Iteration:           0
+  RoundPass:           0
+ -----------------------------------------------
+  
+   Vehicles Still in the Network   
+     Number of Vehicles             =          536294
+     Total Travel Time w/o queueing =    23133756.000
+     Total Trip Distances           =     4778911.500
+     Total STOP Time                =    13644984.000
+     Average Travel Time            =          43.136
+     Average Trip Distance          =           8.911
+     Average STOP Time              =          25.443
+     Average travel Speed           =          12.395
+ -----------------------------------------------
+   Vehicles Outside the Network   
+     Number of Vehicles             =          380916
+     Total Travel Time w/o queueing =    12214473.000
+     Total Travel Time w queueing   =    13134169.000
+     Total Trip Distances           =     5237839.500
+     Total STOP Time                =     5774425.500
+     Average Travel Time            =          32.066
+     Average Trip Distance          =          13.751
+     Average STOP Time              =          15.159
+     Average travel Speed           =          25.729
+ -----------------------------------------------
+ 
+  For All Vehicles in the Network   
+     Number of Vehicles             =          917210
+     Total Travel Time w/o queueing =    35348228.000
+     Total Trip Distances           =    10016751.000
+     Total STOP Time                =    19419410.000
+     Average Travel Time            =          38.539
+     Average Trip Distance          =          10.921
+     Average STOP Time              =          21.172
+     Average travel Speed           =          17.002
+ -------------------------------------------------
+ The following mtc information is only for	    
+ Those vehicles that have reached the destinations
+ -------------------------------------------------
+ 
+ 
+  LOV Vehicle -------------------------
+  ----------------------------------------------
+ Class Number                 =               1
+  ----------------------------------------------
+ Class Number                 =               2
+  ----------------------------------------------
+ Class Number                 =               3
+  ----------------------------------------------
+ Class Number                 =               4
+  ----------------------------------------------
+ Class Number                 =               5
+ number of vehicles           =          380916
+ ------------------
+Total Overall Travel Time(min)=    13134920.000
+Total Trip Times(min)         =    12214473.000
+Total Entry Queue Time(min)   =      918135.312
+Total Trip Distance(ml)       =     5237839.500
+Total STOP Time(min)          =     5774425.500
+Average Overall Trip Time(min)=          34.482
+Average Trip Times(min)       =          32.066
+Average Entry Q Time(min)     =           2.410
+Average STOP Time(min)        =          15.159
+Average Trip Distance(ml)     =          13.751
+ ----------------------------------
+ 
+ 
+  HOV Vehicle -------------------------
+  ----------------------------------------------
+ Class Number                 =               1
+  ----------------------------------------------
+ Class Number                 =               2
+  ----------------------------------------------
+ Class Number                 =               3
+  ----------------------------------------------
+ Class Number                 =               4
+  ----------------------------------------------
+ Class Number                 =               5
+ -------------------------------------------------
+ The following MUT information is only for	    
+ Those vehicles that have reached the destinations
+ -------------------------------------------------
+ 
+  Auto  Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               1
+ number of vehicles           =          380916
+ ------------------
+Total Overall Travel Time(min)=    13134920.000
+Total Trip Times(min)         =    12214473.000
+Total Entry Queue Time(min)   =      918135.312
+Total Trip Distance(ml)       =     5237839.500
+Total STOP Time(min)          =     5774425.500
+Average Overall Trip Time(min)=          34.482
+Average Trip Times(min)       =          32.066
+Average Entry Q Time(min)     =           2.410
+Average STOP Time(min)        =          15.159
+Average Trip Distance(ml)     =          13.751
+Average Toll Expense($)       =           0.000
+ ----------------------------------
+  Truck Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               2
+  HOV   Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               3
+  --------------------------------------------------
+ Type Number                 =               4
+  --------------------------------------------------
+ Type Number                 =               5
+  --------------------------------------------------
+ Type Number                 =               6
+  --------------------------------------------------
+ Type Number                 =               7
+ Writing Out CPU Time. Note to get actual clock time please subtract from time stamps printed for each iteration. 
+ 
+ CPU Times of operation were        3536.42 seconds  
+ CPU Times of simulation were       3535.91 seconds   99.99 % of total)
+ CPU Times of assignment were          0.00 seconds    0.00 % of total)
+ CPU Times of others were              0.52 seconds    0.01 % of total)
+ CPU Time of operation was                  3536.47 seconds by DTime
+ User and System Time of operation was      2413.53     1122.94 seconds by DTime

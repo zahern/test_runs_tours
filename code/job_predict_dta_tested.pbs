@@ -1,0 +1,68 @@
+#!/bin/bash
+#PBS -N predict_dta_tested
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=8:mem=128GB
+#PBS -m abe
+#PBS -r y
+
+# ─────────────────────────────────────────────────────────────────────────────
+# job_predict_dta_tested.pbs
+# ─────────────────────────────────────────────────────────────────────────────
+# Runs predict_and_export_dta_tested.py: prediction-only (no re-estimation)
+# using the already-fitted stage1-5 models against the new_pop population,
+# then writes vehicle.dat straight into
+#   Z:\test_runs_tours\DTA\DTA_Brisbane_tested\vehicle.dat
+# (previous file backed up alongside it first).
+#
+# Read the caveats at the top of predict_and_export_dta_tested.py before
+# submitting — in particular: stage5_models.pkl is the pre-GA-refinement
+# version until ga_pred_run06 (or a rerun of it) finishes successfully.
+#
+#   qsub job_predict_dta_tested.pbs
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+# ── Environment ───────────────────────────────────────────────────────────────
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+# ── CPU-only JAX/XLA enforcement ──────────────────────────────────────────────
+export JAX_PLATFORM_NAME=cpu
+export JAX_PLATFORMS=cpu
+export CUDA_VISIBLE_DEVICES=""
+export TF_CPP_MIN_LOG_LEVEL=3
+export XLA_FLAGS="--xla_force_host_platform_device_count=${NCPUS:-8}"
+
+# ── Population source: new_pop, remapped onto the standard ORDER scheme ──────
+export NEW_POP_MAPPED=1
+export NEW_POP=0
+
+LOG_OUT="log_predict_dta_tested.out"
+LOG_ERR="log_predict_dta_tested.err"
+rm -f "$LOG_OUT" "$LOG_ERR"
+
+echo "==========================================================" | tee -a "$LOG_OUT"
+echo "PBS job  : $PBS_JOBID"                                       | tee -a "$LOG_OUT"
+echo "Node     : $(hostname)"                                      | tee -a "$LOG_OUT"
+echo "Workdir  : $PBS_O_WORKDIR"                                   | tee -a "$LOG_OUT"
+echo "Started  : $(date)"                                          | tee -a "$LOG_OUT"
+echo "==========================================================" | tee -a "$LOG_OUT"
+
+mkdir -p saved_data
+mkdir -p runs/predict_dta_tested
+
+python -u predict_and_export_dta_tested.py >> "$LOG_OUT" 2>> "$LOG_ERR"
+
+EXIT_CODE=$?
+echo "Finished : $(date)  exit_code=${EXIT_CODE}" | tee -a "$LOG_OUT"
+
+if [ "$EXIT_CODE" -ne 0 ]; then
+    echo "ERROR: run exited with code ${EXIT_CODE}. Check ${LOG_ERR}" | tee -a "$LOG_OUT"
+fi
+
+exit "${EXIT_CODE}"

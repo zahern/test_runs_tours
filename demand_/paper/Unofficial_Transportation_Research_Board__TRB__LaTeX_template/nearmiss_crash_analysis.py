@@ -35,7 +35,7 @@ from metacountregressor.main_hpc_lc_patch import (
     build_param_index,
 )
 import jax, jax.numpy as jnp
-from scipy.optimize import minimize as scipy_min
+from scipy.optimize import minimize as scipy_min, differential_evolution
 from scipy import stats as scipy_stats
 from dataclasses import replace
 from sklearn.preprocessing import StandardScaler
@@ -555,23 +555,29 @@ def specification_transfer(df, nm_features, crash_features, out_dir):
 # ===================================================================
 # 6. ENCOMPASSING TEST
 # ===================================================================
-def encompassing_test(df, GEO, out_dir):
+def encompassing_test(df, nm_feats, crash_feats, out_dir):
+    """Does the NM model's predicted value encompass the Crash model's own
+    geometry?  nm_feats and crash_feats should be each response's own final
+    (searched) spec, not a single shared feature list for both — the two
+    responses aren't assumed to need the same geometry.
+    """
     print("\n" + "="*70)
     print("  ENCOMPASSING TEST: Does predicted NM encompass geometry?")
     print("="*70)
 
-    nm_model = fit_model(df, GEO, "nm_total", "log_len",
+    nm_model = fit_model(df, nm_feats, "nm_total", "log_len",
                          label="Step1: NM ~ Geo", verbose=False)
     print(f"  NM model: LL={nm_model['ll']:.2f}, BIC={nm_model['bic']:.2f}")
 
     # Predict NM from fitted model
-    df_e = df.dropna(subset=GEO + ["nm_total", "ObsCrashes", "log_len"]).copy()
+    all_feats = sorted(set(nm_feats) | set(crash_feats))
+    df_e = df.dropna(subset=all_feats + ["nm_total", "ObsCrashes", "log_len"]).copy()
     params_nm = nm_model["params"]
-    n_geo = len(GEO)
+    n_geo = len(nm_feats)
 
     # Re-standardize to get predictions
     scaler_en = StandardScaler()
-    X_r = scaler_en.fit_transform(df_e[GEO].values.astype(float))
+    X_r = scaler_en.fit_transform(df_e[nm_feats].values.astype(float))
     intercept_nm = params_nm[0]
     beta_nm = params_nm[1:n_geo+1]
     eta_nm = intercept_nm + X_r @ beta_nm + df_e["log_len"].values
@@ -582,13 +588,13 @@ def encompassing_test(df, GEO, out_dir):
         print("  WARNING: pred_nm still has NaN, filling with 0")
         df_e["pred_nm"] = df_e["pred_nm"].fillna(0)
 
-    # Restricted: crashes ~ geometry
-    crash_geo = fit_model(df_e, GEO, "ObsCrashes", "log_len",
+    # Restricted: crashes ~ geometry (Crash's own final spec)
+    crash_geo = fit_model(df_e, crash_feats, "ObsCrashes", "log_len",
                           label="Restricted: Crashes ~ Geo", verbose=False)
     print(f"  Restricted (Geo only): LL={crash_geo['ll']:.2f}, BIC={crash_geo['bic']:.2f}")
 
     # Unrestricted: crashes ~ geometry + predicted NM
-    crash_nm = fit_model(df_e, GEO + ["pred_nm"], "ObsCrashes", "log_len",
+    crash_nm = fit_model(df_e, crash_feats + ["pred_nm"], "ObsCrashes", "log_len",
                          label="Unrestricted: Crashes ~ Geo + predNM", verbose=False)
     print(f"  Unrestricted (+predNM): LL={crash_nm['ll']:.2f}, BIC={crash_nm['bic']:.2f}")
 
@@ -616,12 +622,17 @@ def encompassing_test(df, GEO, out_dir):
 # ===================================================================
 # 7. BIVARIATE LATENT RISK
 # ===================================================================
-def bivariate_latent_risk(df, GEO, nm_col, out_dir):
+def bivariate_latent_risk(df, geo_feats, nm_col, out_dir):
+    """geo_feats should be the union of both responses' final (searched)
+    feature sets — the best-known drivers of either response — rather than
+    the full unselected candidate pool, so the partial correlation controls
+    for the geometry that's actually believed to matter.
+    """
     print("\n" + "="*70)
     print("  BIVARIATE LATENT RISK ANALYSIS")
     print("="*70)
 
-    df_b = df.dropna(subset=GEO + [nm_col, "ObsCrashes", "log_len"]).copy()
+    df_b = df.dropna(subset=geo_feats + [nm_col, "ObsCrashes", "log_len"]).copy()
     y_nm = df_b[nm_col].values / df_b["seg_len_km"].values
     y_cr = df_b["ObsCrashes"].values / df_b["seg_len_km"].values
 
@@ -631,7 +642,7 @@ def bivariate_latent_risk(df, GEO, nm_col, out_dir):
 
     # Partial correlation (remove geometry)
     from sklearn.linear_model import LinearRegression
-    X_g = df_b[GEO].values
+    X_g = df_b[geo_feats].values
     resid_nm = np.log1p(y_nm) - LinearRegression().fit(X_g, np.log1p(y_nm)).predict(X_g)
     resid_cr = np.log1p(y_cr) - LinearRegression().fit(X_g, np.log1p(y_cr)).predict(X_g)
     r_partial, p_partial = pearsonr(resid_nm, resid_cr)
@@ -898,6 +909,20 @@ def fit_joint_copula_full(df, nm_col, nm_model, crash_model, copula_name="kimeld
     ll_joint   = -neg_joint_ll(params_opt)
     theta_opt  = float(params_opt[i_theta])
 
+    # Decode the jointly-optimised marginals so this result is self-sufficient
+    # for conditional_crash_prediction() — same field names fit_bivariate_copula
+    # (IFM) produces, but built from the joint (not two-step) MLE.
+    b1_opt, la1_opt = params_opt[:n_nm], params_opt[i_la1]
+    b2_opt, la2_opt = params_opt[i_b2:i_b2 + n_cr], params_opt[i_la2]
+    alpha1_opt = float(np.exp(np.clip(la1_opt, -10, 10)))
+    alpha2_opt = float(np.exp(np.clip(la2_opt, -10, 10)))
+    mu1_opt    = np.exp(np.clip(Xnm_f @ b1_opt + offset, -20, 20))
+    mu2_opt    = np.exp(np.clip(Xcr_f @ b2_opt + offset, -20, 20))
+    u1c_opt = np.clip(_nb_cdf(y1, mu1_opt, alpha1_opt), eps, 1 - eps)
+    u1p_opt = np.where(y1 > 0, np.clip(_nb_cdf(y1 - 1, mu1_opt, alpha1_opt), 0, 1 - eps), 0.0)
+    u2c_opt = np.clip(_nb_cdf(y2, mu2_opt, alpha2_opt), eps, 1 - eps)
+    u2p_opt = np.where(y2 > 0, np.clip(_nb_cdf(y2 - 1, mu2_opt, alpha2_opt), 0, 1 - eps), 0.0)
+
     k_nm_r  = nm_r["k"]  if nm_r  else nm_model["k"]
     k_cr_r  = cr_r["k"]  if cr_r  else crash_model["k"]
     ll_marg = ((nm_r["ll"] if nm_r else nm_model["ll"]) +
@@ -917,6 +942,9 @@ def fit_joint_copula_full(df, nm_col, nm_model, crash_model, copula_name="kimeld
         "k_joint": K_total, "k_indep": k_indep,
         "lr_stat": lr_stat, "p_lr": p_lr, "converged": res.success,
         "params": params_opt,
+        "mu1": mu1_opt, "alpha1": alpha1_opt, "mu2": mu2_opt, "alpha2": alpha2_opt,
+        "u1c": u1c_opt, "u1p": u1p_opt, "u2c": u2c_opt, "u2p": u2p_opt,
+        "y1": y1, "y2": y2, "df_c": df_c,
     }
 
 
@@ -1173,6 +1201,165 @@ def bivariate_copula_analysis(df, nm_col, nm_model, crash_model, out_dir):
 
 
 # ===================================================================
+# 8c. COPULA STRUCTURE SEARCH — joint feature selection for NM & Crash,
+#     scored against the FULL JOINT-MLE copula BIC (fit_joint_copula_full:
+#     beta_NM, alpha_NM, beta_crash, alpha_crash AND theta all optimised
+#     together), not the two-step IFM approximation and not each marginal
+#     in isolation.
+#
+#     Steps 7/7b fit a copula theta on top of whichever NM/Crash feature
+#     sets were already chosen (by Step 1's marginal-only SA). That answers
+#     "given these two independently-chosen specs, is there leftover
+#     dependence?" but never asks whether a DIFFERENT pair of specs would
+#     make the two responses fit together better as a coupled system. This
+#     search answers that: it perturbs the NM and Crash feature sets
+#     directly against the joint-MLE copula BIC, so the two specs can trade
+#     off against each other instead of being frozen from separate marginal
+#     searches — and because it's the full joint MLE, the dependence
+#     parameter itself feeds back into the marginal estimates too, not just
+#     the reverse. Solved with scipy's differential_evolution rather than a
+#     hand-rolled simulated-annealing sweep.
+# ===================================================================
+
+def differential_evolution_copula_search(
+    df, candidates, nm_col, offset_col, copula_name="kimeldorf",
+    init_nm_feats=None, init_crash_feats=None,
+    maxiter=20, popsize=6, n_runs=2, seed=42, plot_path=None,
+):
+    """Jointly search NM and Crash feature subsets to minimise the FULL
+    joint-MLE copula BIC (fit_joint_copula_full), using scipy's
+    differential_evolution solver.
+
+    Each candidate feature gets one continuous gene per response in [0, 1]
+    (2*len(candidates) genes total); a gene > 0.5 includes that feature in
+    that response's spec. This is a continuous relaxation of the underlying
+    binary feature-selection problem, which is what lets DE (a
+    continuous-domain solver) operate on it directly.
+
+    Every candidate solution triggers two NB refits plus a full joint-MLE
+    copula fit (itself two more NB refits for its own initialisation), so
+    this is markedly more expensive per-evaluation than the old IFM-scored
+    SA search — keep maxiter/popsize modest. Runs n_runs independent DE
+    searches (different seeds) and keeps the global best; run 0 seeds its
+    initial population from (init_nm_feats, init_crash_feats) when given
+    (e.g. the MCR-searched final specs) so the search refines from a good
+    starting point instead of from scratch.
+    """
+    print(f"\n  DE JOINT-MODEL COPULA STRUCTURE SEARCH — joint (NM, Crash) "
+          f"feature selection")
+    print(f"  {len(candidates)} candidates, maxiter={maxiter}, popsize={popsize}, "
+          f"{n_runs} runs, copula={copula_name} (scored on full joint-MLE BIC)")
+
+    dfs = df.dropna(subset=candidates + [nm_col, "ObsCrashes", offset_col]).reset_index(drop=True)
+    af, Kf = list(candidates), len(candidates)
+    n_genes = 2 * Kf
+
+    def _decode(x):
+        x = np.asarray(x)
+        nm_mask = (x[:Kf] > 0.5).astype(int)
+        cr_mask = (x[Kf:] > 0.5).astype(int)
+        return nm_mask, cr_mask
+
+    def _score(x):
+        nm_mask, cr_mask = _decode(x)
+        nm_sel = [af[i] for i in range(Kf) if nm_mask[i] == 1]
+        cr_sel = [af[i] for i in range(Kf) if cr_mask[i] == 1]
+        if len(nm_sel) < 2 or len(cr_sel) < 2:
+            return 1e12, None
+        try:
+            nm_m  = fit_model(dfs, nm_sel, nm_col, offset_col, label="_dej_nm", verbose=False)
+            cr_m  = fit_model(dfs, cr_sel, "ObsCrashes", offset_col, label="_dej_cr", verbose=False)
+            fit_r = fit_joint_copula_full(dfs, nm_col, nm_m, cr_m, copula_name=copula_name)
+            return fit_r["bic_joint"], (nm_m, cr_m, fit_r)
+        except Exception:
+            return 1e12, None
+
+    def _objective(x):
+        return _score(x)[0]
+
+    seed_vec = None
+    if init_nm_feats or init_crash_feats:
+        seed_vec = np.full(n_genes, 0.1)
+        for f in (init_nm_feats or []):
+            if f in af: seed_vec[af.index(f)] = 0.9
+        for f in (init_crash_feats or []):
+            if f in af: seed_vec[Kf + af.index(f)] = 0.9
+
+    global_best_score   = 1e12
+    global_best_payload = None
+    global_best_history = []
+
+    for run in range(n_runs):
+        run_seed = seed + run * 97
+        history  = []
+
+        def _callback(xk, convergence=None):
+            history.append(_objective(xk))
+
+        init_pop = "latinhypercube"
+        if run == 0 and seed_vec is not None:
+            rng0 = np.random.RandomState(run_seed)
+            pop  = rng0.uniform(0.0, 1.0, size=(popsize * n_genes, n_genes))
+            pop[0] = seed_vec
+            init_pop = pop
+
+        print(f"\n  [Run {run+1}/{n_runs}] seed={run_seed}  genes={n_genes}")
+        res = differential_evolution(
+            _objective, bounds=[(0.0, 1.0)] * n_genes,
+            maxiter=maxiter, popsize=popsize, seed=run_seed,
+            mutation=(0.4, 1.4), recombination=0.7,
+            init=init_pop, polish=False, callback=_callback,
+        )
+        final_score, final_payload = _score(res.x)
+        history.append(final_score)
+        best_so_far = np.minimum.accumulate(history)
+
+        print(f"  [Run {run+1}] best joint BIC={best_so_far[-1]:.2f}  nfev={res.nfev}")
+
+        if best_so_far[-1] < global_best_score and final_payload is not None:
+            global_best_score   = float(best_so_far[-1])
+            global_best_payload = final_payload
+        global_best_history.extend(best_so_far.tolist())
+
+    if global_best_payload is None:
+        print("  DE joint-model copula search failed to find a valid solution.")
+        return None
+
+    nm_model_best, crash_model_best, fit_best = global_best_payload
+    nm_feats_best    = nm_model_best["features"]
+    crash_feats_best = crash_model_best["features"]
+
+    print(f"\n  BEST DE JOINT-MODEL STRUCTURE: joint BIC={global_best_score:.2f}  "
+          f"theta={fit_best['theta']:.4f}  copula={copula_name}")
+    print(f"  NM features    ({len(nm_feats_best)}): {[_V(f) for f in nm_feats_best]}")
+    print(f"  Crash features ({len(crash_feats_best)}): {[_V(f) for f in crash_feats_best]}")
+
+    if plot_path:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(range(1, len(global_best_history) + 1), global_best_history,
+                "darkorange", linewidth=1.2, alpha=0.8)
+        ax.axhline(y=min(global_best_history), color="red", linestyle="--", alpha=0.5,
+                   label=f"Best = {min(global_best_history):.2f}")
+        ax.set_xlabel("Generation")
+        ax.set_ylabel("Joint-MLE copula BIC (best so far)")
+        ax.set_title("Differential Evolution Joint-Model Search Convergence\n"
+                     f"(popsize={popsize}, {n_runs} runs, {copula_name} copula)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=150)
+        plt.close(fig)
+        print(f"  Convergence plot saved: {plot_path}")
+
+    return {
+        "nm_features": nm_feats_best, "crash_features": crash_feats_best,
+        "nm_model": nm_model_best, "crash_model": crash_model_best,
+        "fit": fit_best, "bic_joint": global_best_score,
+        "history": global_best_history,
+    }
+
+
+# ===================================================================
 # 8b. RANDOM PARAMETERS NB
 # ===================================================================
 def fit_random_params_nb(df, fixed_feats, rdm_feats, y_col, offset_col, label="RP-NB"):
@@ -1249,32 +1436,51 @@ def fit_random_params_nb(df, fixed_feats, rdm_feats, y_col, offset_col, label="R
         return None
 
 
-def random_params_analysis(df, nm_col, sa_nm_feats, sa_crash_feats, full_nm, full_crash, out_dir):
+def random_params_analysis(df, nm_col, sa_nm_feats, sa_crash_feats, full_nm, full_crash, out_dir,
+                           mcr_nm=None, mcr_crash=None):
     """Run random-parameters NB for both responses.
 
-    Strategy: treat the 3–4 features with the largest absolute coefficients
-    in the fixed model as random (they are the most likely to have heterogeneous
-    effects across segments).  Compare LL via LR test (df = n_rdm, chi²).
+    Preferred strategy: use the fixed/random-independent/random-correlated
+    role split already found by the MCR structure search (mcr_nm/mcr_crash),
+    since that role assignment was actually searched rather than guessed.
+    Falls back to the old heuristic (treat the 3-4 largest-|coef| features
+    as random) only when no MCR result is available for that response.
+    Compare LL via LR test (df = n_rdm, chi²).
     """
     print("\n" + "="*70)
     print("  RANDOM PARAMETERS NB ANALYSIS")
     print("="*70)
 
     results = {}
-    for y_col, sa_feats, full_model, tag in [
-        (nm_col,      sa_nm_feats,    full_nm,    "NM"),
-        ("ObsCrashes", sa_crash_feats, full_crash, "Crash"),
+    for y_col, sa_feats, full_model, tag, mcr_result in [
+        (nm_col,      sa_nm_feats,    full_nm,    "NM",    mcr_nm),
+        ("ObsCrashes", sa_crash_feats, full_crash, "Crash", mcr_crash),
     ]:
-        # Pick top-k features by |coef| from SA model as random candidates
-        # (exclude intercept and dispersion row)
-        ct    = full_model["coef_table"]
-        feat_rows = ct.iloc[1:]
-        if ct["Variable"].iloc[-1].startswith("ln("): feat_rows = feat_rows.iloc[:-1]
-        feat_rows  = feat_rows[feat_rows["Variable"].isin([_V(f) for f in sa_feats])]
-        feat_rows  = feat_rows.reindex(feat_rows["Estimate"].abs().sort_values(ascending=False).index)
-        top_feats_labels = feat_rows["Variable"].head(4).tolist()
-        rdm = [f for f in sa_feats if _V(f) in top_feats_labels]
-        fixed = [f for f in sa_feats if f not in rdm]
+        rdm = fixed = None
+        if mcr_result is not None:
+            rdm_candidates = sorted(set(
+                [r.split(":")[0] for r in mcr_result.get("rdm_i_orig", [])]
+                + [r.split(":")[0] for r in mcr_result.get("rdm_c_orig", [])]
+            ))
+            fixed_candidates = [f for f in mcr_result.get("fixed_orig", []) if f not in rdm_candidates]
+            if rdm_candidates and fixed_candidates:
+                rdm, fixed = rdm_candidates, fixed_candidates
+                print(f"  [{tag}] Using MCR-searched roles: "
+                      f"{len(fixed)} fixed, {len(rdm)} random")
+
+        if rdm is None:
+            # Fallback: MCR result unavailable/degenerate for this response —
+            # pick top-k features by |coef| from the SA model as random candidates
+            # (exclude intercept and dispersion row).
+            print(f"  [{tag}] MCR roles unavailable; falling back to top-4-|coef| heuristic")
+            ct    = full_model["coef_table"]
+            feat_rows = ct.iloc[1:]
+            if ct["Variable"].iloc[-1].startswith("ln("): feat_rows = feat_rows.iloc[:-1]
+            feat_rows  = feat_rows[feat_rows["Variable"].isin([_V(f) for f in sa_feats])]
+            feat_rows  = feat_rows.reindex(feat_rows["Estimate"].abs().sort_values(ascending=False).index)
+            top_feats_labels = feat_rows["Variable"].head(4).tolist()
+            rdm = [f for f in sa_feats if _V(f) in top_feats_labels]
+            fixed = [f for f in sa_feats if f not in rdm]
 
         if len(rdm) < 1 or len(fixed) < 1:
             print(f"  [{tag}] Insufficient features for RP-NB, skipping.")
@@ -1554,20 +1760,29 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # ============================================================
-    # STEP 1: DUAL SIMULATED ANNEALING
+    # STEP 1: DUAL SIMULATED ANNEALING (coarse feature pre-filter)
     # ============================================================
+    # Narrows the 30-feature GEO pool down to a tractable candidate set for
+    # each response before the more expensive MCR role search below. Trimmed
+    # from 1200 to 700 iterations: the cooling schedule (T_start=8.0,
+    # cooling_rate=0.995) reaches T<0.4 by iteration ~600, after which the
+    # search is effectively greedy and every restart was landing on the
+    # identical BIC for the remaining 500+ iterations — pure wasted compute.
     print("\n\n" + "#"*70)
     print("#  STEP 1: SIMULATED ANNEALING — Best geometry for NM vs crashes")
+    print("#  (coarse pre-filter; STEP 2 below does the real role search)")
     print("#"*70)
 
     hs_nm, hs_nm_feats, hs_nm_hist = simulated_annealing_search(
         df, GEO, nm_col, "log_len",
         label="NM_response", p_threshold=0.10, penalty_per_insig=10.0,
+        max_iter=700, cooling_rate=0.996,
         plot_path=os.path.join(OUTPUT_DIR, "sa_convergence_nm.png")
     )
     hs_crash, hs_crash_feats, hs_crash_hist = simulated_annealing_search(
         df, GEO, "ObsCrashes", "log_len",
         label="Crash_response", p_threshold=0.10, penalty_per_insig=10.0,
+        max_iter=700, cooling_rate=0.996,
         plot_path=os.path.join(OUTPUT_DIR, "sa_convergence_crash.png")
     )
 
@@ -1583,18 +1798,13 @@ def main():
     ax2.set_title("SA: Crash Response\n(penalised BIC best so far)")
     ax2.set_xlabel("Iteration"); ax2.set_ylabel("Penalised BIC"); ax2.grid(True, alpha=0.3)
 
-    fig.suptitle("Simulated Annealing Convergence (NB, 1200 iters × 3 restarts, significance-penalised)", fontsize=13)
+    fig.suptitle("Simulated Annealing Convergence (NB, 700 iters × 3 restarts, significance-penalised)", fontsize=13)
     fig.tight_layout()
     hs_plot = os.path.join(OUTPUT_DIR, "sa_convergence_combined.png")
     fig.savefig(hs_plot, dpi=150)
     plt.close(fig)
 
-    overlap = set(hs_nm_feats) & set(hs_crash_feats)
-    jaccard = len(overlap) / len(set(hs_nm_feats) | set(hs_crash_feats))
-    print(f"\n  Feature overlap: {len(overlap)}/{len(set(hs_nm_feats) | set(hs_crash_feats))} "
-          f"(Jaccard = {jaccard:.4f})")
-
-    # Save the best models as LaTeX tables
+    # Save the SA models as LaTeX tables
     model_to_latex(hs_nm,
                    os.path.join(OUTPUT_DIR, "sa_best_nm.tex"),
                    "Simulated Annealing Best Model: Near-Miss Response",
@@ -1605,82 +1815,15 @@ def main():
                    "tab:sa_crash")
 
     # ============================================================
-    # STEP 2: FULL MODELS (all geometry)
+    # STEP 2: MCR STRUCTURE SEARCH — roles: fixed / rdm-ind / rdm-corr
     # ============================================================
+    # This is the rigorous search (searches parameter ROLES, not just
+    # in/out), so it now runs before — not after — the tests that need a
+    # "best spec": proportionality, transfer, encompassing, bivariate risk,
+    # copula, and RP-NB all consume its output below instead of Step 1's
+    # cruder fixed-effects-only selection.
     print("\n\n" + "#"*70)
-    print("#  STEP 2: Full models — same geometry, two responses")
-    print("#"*70)
-
-    full_nm = fit_model(df, GEO, nm_col, "log_len",
-                        label="Full: Geometry -> Near-Miss", verbose=False)
-    full_crash = fit_model(df, GEO, "ObsCrashes", "log_len",
-                           label="Full: Geometry -> Crashes", verbose=False)
-    print(f"  NM full model:   LL={full_nm['ll']:.2f}, BIC={full_nm['bic']:.2f}, k={full_nm['k']}")
-    print(f"  Crash full model: LL={full_crash['ll']:.2f}, BIC={full_crash['bic']:.2f}, k={full_crash['k']}")
-
-    model_to_latex(full_nm,
-                   os.path.join(OUTPUT_DIR, "full_model_nm.tex"),
-                   "Full Model: Geometry -> Near-Miss Count (NB)",
-                   "tab:full_nm")
-    model_to_latex(full_crash,
-                   os.path.join(OUTPUT_DIR, "full_model_crash.tex"),
-                   "Full Model: Geometry -> Observed Crash Count (NB)",
-                   "tab:full_crash")
-
-    # ============================================================
-    # STEP 3: COEFFICIENT PROPORTIONALITY
-    # ============================================================
-    prop = coefficient_proportionality_test(full_nm, full_crash, OUTPUT_DIR)
-
-    # ============================================================
-    # STEP 4: SPECIFICATION TRANSFER
-    # ============================================================
-    transfer = specification_transfer(df, hs_nm_feats, hs_crash_feats, OUTPUT_DIR)
-
-    # ============================================================
-    # STEP 5: ENCOMPASSING TEST
-    # ============================================================
-    enc = encompassing_test(df, GEO, OUTPUT_DIR)
-
-    # ============================================================
-    # STEP 6: BIVARIATE LATENT RISK
-    # ============================================================
-    biv = bivariate_latent_risk(df, GEO, nm_col, OUTPUT_DIR)
-
-    # ============================================================
-    # STEP 7: BIVARIATE COPULA MODELS
-    # ============================================================
-    print("\n\n" + "#"*70)
-    print("#  STEP 7: BIVARIATE COPULA — Frank / Normal / Clayton")
-    print("#  Coupled NB models + E[crashes | NM, X] conditional prediction")
-    print("#"*70)
-
-    cop = bivariate_copula_analysis(df, nm_col, full_nm, full_crash, OUTPUT_DIR)
-
-    # Joint MLE copula search (all params simultaneously)
-    print("\n\n" + "#"*70)
-    print("#  STEP 7b: JOINT COPULA MLE — Frank / Normal / Kimeldorf")
-    print("#  All β, α, θ optimised simultaneously (vs IFM two-step above)")
-    print("#"*70)
-
-    joint_cop = joint_copula_search(df, nm_col, full_nm, full_crash, OUTPUT_DIR)
-
-    # ============================================================
-    # STEP 8: RANDOM PARAMETERS NB
-    # ============================================================
-    print("\n\n" + "#"*70)
-    print("#  STEP 8: RANDOM PARAMETERS NB — heterogeneity in coefficients")
-    print("#"*70)
-
-    rp_results = random_params_analysis(
-        df, nm_col, hs_nm_feats, hs_crash_feats, full_nm, full_crash, OUTPUT_DIR
-    )
-
-    # ============================================================
-    # STEP 9: MCR STRUCTURE SEARCH — roles: fixed / rdm-ind / rdm-corr
-    # ============================================================
-    print("\n\n" + "#"*70)
-    print("#  STEP 9: MCR STRUCTURE SEARCH — roles: fixed / rdm-ind / rdm-corr")
+    print("#  STEP 2: MCR STRUCTURE SEARCH — roles: fixed / rdm-ind / rdm-corr")
     print("#  Uses metacountregressor StructureEvaluatorLC + patched SA neighbor")
     print("#"*70)
 
@@ -1699,6 +1842,166 @@ def main():
         max_latent_classes=1, out_dir=OUTPUT_DIR,
         N_max=1500, max_time_per_start=1800,
     )
+
+    def _mcr_final_feats(mcr_result, fallback_feats):
+        """Union of MCR's fixed + random-independent + random-correlated
+        variable names, falling back to the Step 1 SA feature set when the
+        MCR search failed or returned a degenerate (<2 feature) result."""
+        if mcr_result is None:
+            return list(fallback_feats)
+        feats = sorted(set(
+            mcr_result.get("fixed_orig", [])
+            + [r.split(":")[0] for r in mcr_result.get("rdm_i_orig", [])]
+            + [r.split(":")[0] for r in mcr_result.get("rdm_c_orig", [])]
+        ))
+        return feats if len(feats) >= 2 else list(fallback_feats)
+
+    nm_final_feats    = _mcr_final_feats(mcr_nm, hs_nm_feats)
+    crash_final_feats = _mcr_final_feats(mcr_crash, hs_crash_feats)
+    print(f"\n  Final NM spec    ({len(nm_final_feats)} vars): {[_V(f) for f in nm_final_feats]}")
+    print(f"  Final Crash spec ({len(crash_final_feats)} vars): {[_V(f) for f in crash_final_feats]}")
+
+    overlap = set(nm_final_feats) & set(crash_final_feats)
+    jaccard = len(overlap) / len(set(nm_final_feats) | set(crash_final_feats))
+    print(f"\n  Feature overlap (final specs): {len(overlap)}/"
+          f"{len(set(nm_final_feats) | set(crash_final_feats))} (Jaccard = {jaccard:.4f})")
+
+    # Fit the two response models on their final (searched) feature sets —
+    # everything from here on uses these, not the Step 1 pre-filter models.
+    spec_nm_model    = fit_model(df, nm_final_feats, nm_col, "log_len",
+                                 label="Final: NM (searched spec)", verbose=False)
+    spec_crash_model = fit_model(df, crash_final_feats, "ObsCrashes", "log_len",
+                                 label="Final: Crash (searched spec)", verbose=False)
+    print(f"  Final NM model:    LL={spec_nm_model['ll']:.2f}, BIC={spec_nm_model['bic']:.2f}, "
+          f"k={spec_nm_model['k']}")
+    print(f"  Final Crash model: LL={spec_crash_model['ll']:.2f}, BIC={spec_crash_model['bic']:.2f}, "
+          f"k={spec_crash_model['k']}")
+
+    # ============================================================
+    # STEP 3: FULL MODELS (all geometry) — internal baseline only, not
+    # exported to LaTeX. Kept on the FULL 30-feature GEO set (not the
+    # searched final specs) specifically for the proportionality test
+    # below: that test compares coefficients on shared variables, which
+    # needs both models fit on a common variable set to be an
+    # apples-to-apples comparison. The full 30-variable coefficient tables
+    # themselves are not shown in the paper (only their BIC/LL are cited),
+    # so no model_to_latex() call here.
+    # ============================================================
+    print("\n\n" + "#"*70)
+    print("#  STEP 3: Full models — same geometry, two responses (baseline)")
+    print("#"*70)
+
+    full_nm = fit_model(df, GEO, nm_col, "log_len",
+                        label="Full: Geometry -> Near-Miss", verbose=False)
+    full_crash = fit_model(df, GEO, "ObsCrashes", "log_len",
+                           label="Full: Geometry -> Crashes", verbose=False)
+    print(f"  NM full model:   LL={full_nm['ll']:.2f}, BIC={full_nm['bic']:.2f}, k={full_nm['k']}")
+    print(f"  Crash full model: LL={full_crash['ll']:.2f}, BIC={full_crash['bic']:.2f}, k={full_crash['k']}")
+
+    # ============================================================
+    # STEP 4: COEFFICIENT PROPORTIONALITY (uses the full-geometry baseline)
+    # ============================================================
+    prop = coefficient_proportionality_test(full_nm, full_crash, OUTPUT_DIR)
+
+    # ============================================================
+    # STEP 5: SPECIFICATION TRANSFER (uses MCR-searched final specs)
+    # ============================================================
+    transfer = specification_transfer(df, nm_final_feats, crash_final_feats, OUTPUT_DIR)
+
+    # ============================================================
+    # STEP 6: ENCOMPASSING TEST (uses MCR-searched final specs)
+    # ============================================================
+    enc = encompassing_test(df, nm_final_feats, crash_final_feats, OUTPUT_DIR)
+
+    # ============================================================
+    # STEP 7: BIVARIATE LATENT RISK (controls for the union of both
+    # final specs, rather than the full unselected 30-feature pool)
+    # ============================================================
+    geo_control_feats = sorted(set(nm_final_feats) | set(crash_final_feats))
+    biv = bivariate_latent_risk(df, geo_control_feats, nm_col, OUTPUT_DIR)
+
+    # ============================================================
+    # STEP 8: BIVARIATE COPULA MODELS (on the MCR-searched final specs)
+    # ============================================================
+    print("\n\n" + "#"*70)
+    print("#  STEP 8: BIVARIATE COPULA — Frank / Normal / Clayton")
+    print("#  Coupled NB models + E[crashes | NM, X] conditional prediction")
+    print("#"*70)
+
+    cop = bivariate_copula_analysis(df, nm_col, spec_nm_model, spec_crash_model, OUTPUT_DIR)
+
+    # Joint MLE copula search (all params simultaneously)
+    print("\n\n" + "#"*70)
+    print("#  STEP 8b: JOINT COPULA MLE — Frank / Normal / Kimeldorf")
+    print("#  All β, α, θ optimised simultaneously (vs IFM two-step above)")
+    print("#"*70)
+
+    joint_cop = joint_copula_search(df, nm_col, spec_nm_model, spec_crash_model, OUTPUT_DIR)
+
+    # ============================================================
+    # STEP 9: RANDOM PARAMETERS NB (uses MCR's searched roles directly,
+    # instead of guessing which features are random by |coef| size)
+    # ============================================================
+    print("\n\n" + "#"*70)
+    print("#  STEP 9: RANDOM PARAMETERS NB — heterogeneity in coefficients")
+    print("#"*70)
+
+    rp_results = random_params_analysis(
+        df, nm_col, nm_final_feats, crash_final_feats, spec_nm_model, spec_crash_model,
+        OUTPUT_DIR, mcr_nm=mcr_nm, mcr_crash=mcr_crash,
+    )
+
+    # ============================================================
+    # STEP 10: DE JOINT-MODEL COPULA STRUCTURE SEARCH — the definitive
+    # joint model. Steps 8/8b fit a copula theta on top of feature sets
+    # chosen by separately optimising each marginal (Step 8b's "joint MLE"
+    # still uses the Step-2 MCR feature sets, not a search of its own).
+    # This step instead perturbs the NM and Crash feature sets DIRECTLY
+    # against the FULL joint-MLE copula BIC (fit_joint_copula_full: all of
+    # beta_NM, alpha_NM, beta_crash, alpha_crash, theta optimised together),
+    # so the two specs can trade off against each other and against the
+    # dependence parameter — answering "what's the best COUPLED model"
+    # rather than "given these two independently-best marginals, is there
+    # leftover dependence". Solved with differential_evolution rather than
+    # the hand-rolled SA used elsewhere in this script.
+    # ============================================================
+    print("\n\n" + "#"*70)
+    print("#  STEP 10: DE JOINT-MODEL COPULA STRUCTURE SEARCH")
+    print("#  Searches both specs together against the full joint-MLE copula BIC")
+    print("#"*70)
+
+    copula_search_candidates = sorted(
+        set(hs_nm_feats) | set(hs_crash_feats) | set(nm_final_feats) | set(crash_final_feats)
+    )
+    copula_search = differential_evolution_copula_search(
+        df, copula_search_candidates, nm_col, "log_len",
+        copula_name=cop["best_copula"],
+        init_nm_feats=nm_final_feats, init_crash_feats=crash_final_feats,
+        maxiter=40, popsize=12, n_runs=1,
+        plot_path=os.path.join(OUTPUT_DIR, "copula_search_convergence.png"),
+    )
+
+    if copula_search is not None:
+        cs_fit = copula_search["fit"]
+        cs_bic_indep = cs_fit["bic_indep"]
+        cs_bic_gain  = cs_bic_indep - cs_fit["bic_joint"]
+        E_cond_cs = conditional_crash_prediction(cs_fit, max_y2=60)
+        r_cond_cs, _ = scipy_stats.pearsonr(E_cond_cs, cs_fit["y2"])
+        r_marg_cs, _ = scipy_stats.pearsonr(cs_fit["mu2"], cs_fit["y2"])
+        print(f"\n  Joint-searched copula: theta={cs_fit['theta']:.4f}  "
+              f"LR={cs_fit['lr_stat']:.1f}  p={cs_fit['p_lr']:.2e}  "
+              f"dBIC vs independence={cs_bic_gain:+.1f}")
+        print(f"  Conditional-prediction r: marginal={r_marg_cs:.4f}  "
+              f"copula-conditional={r_cond_cs:.4f}  delta={r_cond_cs - r_marg_cs:+.4f}")
+        pd.DataFrame([{
+            "nm_features": ";".join(copula_search["nm_features"]),
+            "crash_features": ";".join(copula_search["crash_features"]),
+            "copula": cop["best_copula"], "theta": cs_fit["theta"],
+            "bic_joint": cs_fit["bic_joint"], "bic_indep": cs_bic_indep,
+            "delta_bic": cs_bic_gain, "lr_stat": cs_fit["lr_stat"], "p_lr": cs_fit["p_lr"],
+            "r_marginal": r_marg_cs, "r_conditional": r_cond_cs,
+        }]).to_csv(os.path.join(OUTPUT_DIR, "copula_search_best.csv"), index=False)
+        print(f"  Saved: copula_search_best.csv")
 
     # ============================================================
     # SYNTHESIS
@@ -1734,21 +2037,34 @@ def main():
     else:
         evidence.append(("CON", f"Weak shared latent risk: partial r={biv['partial_r']:.3f}"))
 
-    best_cop = cop["best_copula"]
-    best_r   = cop["fits"][best_cop]
-    bic_gain = cop["bic_indep"] - best_r["bic_joint"]
-    r_delta  = cop["pred"]["r_cond"] - cop["pred"]["r_marg"]
-    if best_r["p_lr"] < 0.01 and bic_gain > 0:
+    # Copula evidence: prefer the joint-searched result (Step 10) — it's the
+    # best-found coupled model, not just theta bolted onto separately-chosen
+    # marginals — falling back to the IFM result (Step 8) if the search failed.
+    if copula_search is not None:
+        cop_label = "Bivariate copula (joint-searched spec)"
+        cop_fit   = copula_search["fit"]
+        cop_bic_gain  = cop_fit["bic_indep"] - cop_fit["bic_joint"]
+        cop_r_delta   = r_cond_cs - r_marg_cs
+        cop_theta, cop_lr, cop_p = cop_fit["theta"], cop_fit["lr_stat"], cop_fit["p_lr"]
+    else:
+        cop_label = "Bivariate copula (IFM on searched marginals)"
+        best_cop  = cop["best_copula"]
+        cop_fit   = cop["fits"][best_cop]
+        cop_bic_gain = cop["bic_indep"] - cop_fit["bic_joint"]
+        cop_r_delta  = cop["pred"]["r_cond"] - cop["pred"]["r_marg"]
+        cop_theta, cop_lr, cop_p = cop_fit["theta"], cop_fit["lr_stat"], cop_fit["p_lr"]
+
+    if cop_p < 0.01 and cop_bic_gain > 0:
         evidence.append(("PRO", (
-            f"Bivariate copula ({best_cop}) rejects independence: "
-            f"θ={best_r['theta']:.3f}, LR={best_r['lr_stat']:.1f}, "
-            f"p={best_r['p_lr']:.2e}, ΔBIC={bic_gain:.1f}; "
-            f"conditional prediction Δr={r_delta:+.4f}"
+            f"{cop_label} rejects independence: "
+            f"θ={cop_theta:.3f}, LR={cop_lr:.1f}, "
+            f"p={cop_p:.2e}, ΔBIC={cop_bic_gain:.1f}; "
+            f"conditional prediction Δr={cop_r_delta:+.4f}"
         )))
     else:
         evidence.append(("CON", (
-            f"Bivariate copula ({best_cop}) does NOT significantly improve independence: "
-            f"LR={best_r['lr_stat']:.1f}, p={best_r['p_lr']:.2e}"
+            f"{cop_label} does NOT significantly improve independence: "
+            f"LR={cop_lr:.1f}, p={cop_p:.2e}"
         )))
 
     pro = sum(1 for e in evidence if e[0] == "PRO")
@@ -1775,14 +2091,14 @@ def main():
     print(f"\n  All outputs in: {OUTPUT_DIR}")
     print(f"  SA plots:     sa_convergence_nm.png, sa_convergence_crash.png, "
           f"sa_convergence_combined.png")
-    print(f"  Model tables: sa_best_nm.tex, sa_best_crash.tex, "
-          f"full_model_nm.tex, full_model_crash.tex")
+    print(f"  MCR search:   mcr_search_NM.csv, mcr_search_Crash.csv")
+    print(f"  Model tables: sa_best_nm.tex, sa_best_crash.tex")
     print(f"  Diagnostics:  coefficient_proportionality.png, bivariate_residuals.png")
     print(f"  Copula (IFM): copula_comparison.csv, copula_conditional_predictions.csv, "
           f"copula_prediction_comparison.png")
     print(f"  Copula (Joint MLE): copula_joint_comparison.csv")
+    print(f"  Copula (structure search): copula_search_convergence.png, copula_search_best.csv")
     print(f"  RP-NB:        rp_nb_comparison.csv")
-    print(f"  MCR search:   mcr_search_NM.csv, mcr_search_Crash.csv")
     print(f"  Summary:      proxy_evidence.csv")
     print("\n" + "="*70)
     print("  ANALYSIS COMPLETE")

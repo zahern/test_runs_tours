@@ -912,6 +912,13 @@ _NONMAND_PURPOSES = set(NON_MANDATORY) | {
     'othmaint', 'Personal Business', 'Personal business',
     'Pickup/deliver something (not work-related)',
     'othdiscr', 'Other place (please specify)', 'Other Place', 'Refuel my vehicle',
+    # Segment-level label itself — some upstream stages (e.g. synthetic population
+    # activities, as opposed to HHTS granular purposes) tag primary_purpose with the
+    # aggregated segment name directly rather than a granular purpose. 'work'/'edu'
+    # already matched here by coincidence (both _WORK_PURPOSES/_EDU_PURPOSES include
+    # the literal segment name); 'nonmand' did not, which silently dropped every
+    # nonmand tour from mode prediction (0 tours matched -> hardcoded DA default).
+    'nonmand', 'Nonmand', 'NONMAND', 'non_mandatory', 'Non-mandatory', 'NonMandatory',
 }
 
 
@@ -4424,6 +4431,19 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
     # SLSQP to treat any gradient step as negligible → optimizer stalls at
     # initial values. Unweighted MLE remains consistent for MNL parameters.
 
+    # Columns _dest_tree() flagged as person×zone interaction terms or
+    # collinear (see _PERSON_ZONE_INTERACTION_COLS / _collinear_ca_cols there).
+    # These are structurally 1D (constant per person) but sharrow's numba Flow
+    # compiler tries to JIT-compile them as 2D CA arrays, which raises a
+    # TypingError - not just once, but on EVERY loglike/gradient evaluation
+    # inside maximize_loglike() (one per optimizer iteration/line-search step/
+    # finite-difference perturbation), since holdfasting only locks the
+    # coefficient value and leaves the column in the compiled Flow. Dropping
+    # the term from the utility expression entirely (below) keeps the column
+    # out of the Flow so the failure - and the per-evaluation recompile cost -
+    # never happens.
+    _dt_collinear = set(getattr(dt, 'attrs', {}).get('_collinear_cols', []))
+
     # Build utility from flat UEC (pre-joined columns) or legacy DataTree UEC
     _built_uec_keys = []   # track which params we expect in pf
     if _is_flat:
@@ -4438,6 +4458,20 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
         # Filter for segment
         _seg_uec = {k: (expr, segs) for k, (expr, segs) in _uec.items()
                     if segs is None or segment in segs}
+
+        # Exclude terms referencing collinear/person-zone-interaction CA columns
+        # (see the _dt_collinear comment above) - drop the term rather than
+        # only holdfasting its coefficient, so sharrow never compiles a Flow
+        # for it.
+        _dropped_terms = {k: v for k, v in _seg_uec.items() if v[0] in _dt_collinear}
+        if _dropped_terms:
+            _seg_uec = {k: v for k, v in _seg_uec.items() if k not in _dropped_terms}
+            logger.info(
+                f"_build_dest_model [{segment}]: excluded {len(_dropped_terms)} utility "
+                f"term(s) referencing collinear/interaction CA columns (avoids sharrow "
+                f"numba TypingError): {sorted(_dropped_terms.keys())}"
+            )
+
         if not _seg_uec:
             _seg_uec = {'c_logsum': ('logsum', None), 'c_log_dist': ('log_DIST_1', None)}
             logger.warning(f"_build_dest_model [{segment}]: no flat UEC terms for segment; using minimal fallback")
@@ -4622,17 +4656,19 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
 
     # Also holdfast any UEC coefficient whose source CA column was flagged
     # as collinear during _dest_tree (|r| ≥ 0.995 with another column).
-    # Build reverse map: flat_col → coeff_name from DEST_UEC_FLAT
-    _col_to_coeff = {expr: coeff for coeff, (expr, _) in DEST_UEC_FLAT.items()}
-    _dt_collinear = set(getattr(dt, 'attrs', {}).get('_collinear_cols', []))
-    for _cc in _dt_collinear:
-        _coeff_name = _col_to_coeff.get(_cc)
-        if _coeff_name and _coeff_name not in _INITIAL_HOLDFAST:
-            logger.info(
-                f"_build_dest_model [{segment}]: holdfasting '{_coeff_name}' "
-                f"(CA col '{_cc}' flagged as collinear by _dest_tree)"
-            )
-            _INITIAL_HOLDFAST.add(_coeff_name)
+    # Flat mode already excluded these terms from the utility above (see
+    # _dt_collinear), so they'll never appear in mm.pf - this fallback only
+    # matters for the legacy (non-flat) DataTree path.
+    if not _is_flat:
+        _col_to_coeff = {expr: coeff for coeff, (expr, _) in DEST_UEC_FLAT.items()}
+        for _cc in _dt_collinear:
+            _coeff_name = _col_to_coeff.get(_cc)
+            if _coeff_name and _coeff_name not in _INITIAL_HOLDFAST:
+                logger.info(
+                    f"_build_dest_model [{segment}]: holdfasting '{_coeff_name}' "
+                    f"(CA col '{_cc}' flagged as collinear by _dest_tree)"
+                )
+                _INITIAL_HOLDFAST.add(_coeff_name)
     for _hf in _INITIAL_HOLDFAST:
         if _hf in mm.pf.index:
             try:
@@ -5988,6 +6024,7 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
 
         ls_array_larch = np.zeros((len(case_ids), len(zone_ids)), dtype=np.float32)
         n_failed = 0
+        _datatree_kwarg_unsupported = False
         for j, dtaz in enumerate(zone_ids):
             try:
                 tmp = _set_dtaz(dt_mode, dtaz)
@@ -5995,31 +6032,26 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
                 try:
                     ls_col = np.asarray(m_copy.logsums(datatree=tmp), dtype=np.float32)
                 except TypeError as e:
+                    # logsums(datatree=...) isn't supported by the installed Larch
+                    # version. The fallback below (reassigning m_copy.datatree then
+                    # calling logsums()) "succeeds" but forces Larch to recompile its
+                    # evaluation flow from scratch on EVERY zone - confirmed via
+                    # production logs showing continuous "writing fresh flow code"
+                    # output that never progressed past zone 1 of ~300 in 24h wall
+                    # time. Abandon the per-zone loop after the first zone and drop
+                    # straight to the numpy fallback (Attempt 3) instead of limping
+                    # through the rest of the zones at that cost.
                     if j == 0:
-                        #todo i get a typererror here: TypeError: logsums() got an unexpected keyword argument 'datatree' why?
-                        logger.debug(
-                            "_logsums: logsums(datatree=...) TypeError with "
-                            f"DTAZ variant {_set_dtaz.variant}: {e}"
+                        logger.warning(
+                            "_logsums: logsums(datatree=...) unsupported by installed Larch "
+                            f"(DTAZ variant {_set_dtaz.variant}: {e}). The per-zone fallback "
+                            "recompiles the model flow on every zone - abandoning the Larch "
+                            "per-zone loop after zone 1 and using the numpy fallback instead."
                         )
-                    try:
-                        tmp_for_model = tmp.copy()
-                    except Exception as copy_e:
-                        if j == 0:
-                            logger.debug(
-                                "_logsums: datatree copy failed before logsums() "
-                                f"fallback ({type(copy_e).__name__}: {copy_e}); "
-                                "using original datatree."
-                            )
-                        tmp_for_model = tmp
-                    m_copy.datatree = tmp_for_model
-                    if j == 0:
-                        logger.debug(
-                            "_logsums: using logsums() fallback with model.datatree "
-                            f"variant {_set_dtaz.variant}."
-                        )
-                        m_copy.mangle()
-                        m_copy.unmangle()
-                    ls_col = np.asarray(m_copy.logsums(), dtype=np.float32)
+                        _datatree_kwarg_unsupported = True
+                        n_failed = len(zone_ids)
+                        break
+                    raise
                 if ls_col is not None and not np.all(np.isnan(ls_col)):
                     ls_array_larch[:, j] = np.nan_to_num(ls_col, nan=0.0)
                 else:
@@ -6028,7 +6060,9 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
                 logger.debug(f"Logsum failed for zone {dtaz}: {e}")
                 n_failed += 1
 
-        if n_failed < len(zone_ids):
+        if _datatree_kwarg_unsupported:
+            pass   # ls_array stays None -> falls through to numpy fallback below
+        elif n_failed < len(zone_ids):
             ls_array = ls_array_larch
         else:
             logger.error(
@@ -9817,8 +9851,12 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                 oi = mapping.get(int(otaz[i]), 0)
                 di = mapping.get(int(dtaz[i]), 0)
                 suf = period_suffix[i]
-                mat_ivt_auto = mat_ivt_auto_by_period.get(suf) or mat_ivt_auto_by_period.get('AM')
-                mat_ivt_transit = mat_ivt_transit_by_period.get(suf) or mat_ivt_transit_by_period.get('AM')
+                mat_ivt_auto = mat_ivt_auto_by_period.get(suf)
+                if mat_ivt_auto is None:
+                    mat_ivt_auto = mat_ivt_auto_by_period.get('AM')
+                mat_ivt_transit = mat_ivt_transit_by_period.get(suf)
+                if mat_ivt_transit is None:
+                    mat_ivt_transit = mat_ivt_transit_by_period.get('AM')
                 if mat_ivt_auto    is not None: ivt_auto[i]    = mat_ivt_auto[oi, di]
                 if mat_ivt_transit is not None: ivt_transit[i] = mat_ivt_transit[oi, di]
                 if mat_walk        is not None: dist_walk[i]   = mat_walk[oi, di]
@@ -13010,13 +13048,10 @@ def _save_coefficients(models: dict, path: str):
                 param_names = list(pf.index) if (pf is not None and len(pf) > 0) else list(coef_dict.keys())
                 for param_name in param_names:
                     val = coef_dict.get(str(param_name), float('nan'))
-                    # Skip parameters that are holdfasted at exactly zero —
-                    # they contribute nothing to the model and clutter the output.
-                    if pf is not None and param_name in pf.index:
-                        _skip_hf = bool(pf.loc[param_name].get('holdfast', False))
-                        _skip_val = coef_dict.get(str(param_name), float('nan'))
-                        if _skip_hf and np.isfinite(float(_skip_val)) and abs(float(_skip_val)) < 1e-8:
-                            continue
+                    # Report every parameter, including those holdfasted at exactly
+                    # zero (collinear/dropped) — flagged via 'holdfast' rather than
+                    # omitted, so the report always matches the full model table.
+                    holdfast = bool(pf.loc[param_name].get('holdfast', False)) if (pf is not None and param_name in pf.index) else False
                     se = float('nan')
                     tstat = float('nan')
                     pval  = float('nan')
@@ -13062,6 +13097,7 @@ def _save_coefficients(models: dict, path: str):
                         'pval':       pval,
                         'loglike':    ll,
                         'rho2':       rho2,
+                        'holdfast':   holdfast,
                     }
                     rows.append(r)
                     seg_rows.append(r)
@@ -13096,6 +13132,7 @@ def _save_coefficients(models: dict, path: str):
                                 'pval':       float('nan'),
                                 'loglike':    float(ll) if ll is not None else float('nan'),
                                 'rho2':       float('nan'),
+                                'holdfast':   False,
                             }
                             rows.append(r)
                             seg_rows.append(r)
@@ -13178,8 +13215,9 @@ def _save_coefficients(models: dict, path: str):
                 ssub = sub[sub['model_type'] == mtype]
                 ll   = ssub['loglike'].iloc[0]
                 rho2 = ssub['rho2'].iloc[0]
+                n_free = int((~ssub['holdfast'].astype(bool)).sum()) if 'holdfast' in ssub.columns else len(ssub)
                 print(f"\n  [{seg.upper()} {mtype}]  "
-                      f"LL={ll:.1f}  ρ²={rho2:.3f}  n_params={len(ssub)}")
+                      f"LL={ll:.1f}  ρ²={rho2:.3f}  n_params={len(ssub)} ({n_free} free)")
                 print(f"  {'Parameter':<35} {'Value':>8}  {'t-stat':>7}  Sig")
                 print(f"  {'-'*60}")
                 for _, r in ssub.iterrows():
@@ -13193,7 +13231,8 @@ def _save_coefficients(models: dict, path: str):
                         t_str = '    n/a'; sig = ''
                     se = r['std_err']
                     se_str = f'{float(se):.4f}' if pd.notna(se) and np.isfinite(float(se)) else 'n/a'
-                    print(f"  {r['parameter']:<35} {r['value']:>8.4f}  SE={se_str:>7}  {t_str}  {sig}")
+                    hf = ' (holdfast: collinear)' if bool(r.get('holdfast', False)) else ''
+                    print(f"  {r['parameter']:<35} {r['value']:>8.4f}  SE={se_str:>7}  {t_str}  {sig}{hf}")
     else:
         print("  WARNING: no coefficients extracted - writing diagnostic placeholder HTML")
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
@@ -13244,8 +13283,8 @@ def _html_model_table(seg, mtype, rows, ll, rho2, n_tours):
             return ''
 
     rows_html = '\n'.join(
-        f'<tr>'
-        f'<td>{r["parameter"]}</td>'
+        f'<tr{" style=\'color:#999999;font-style:italic\'" if r.get("holdfast") else ""}>'
+        f'<td>{r["parameter"]}{" (holdfast)" if r.get("holdfast") else ""}</td>'
         f'<td style="text-align:right">{_fmt(r["value"])}</td>'
         f'<td style="text-align:right">{_fmt(r["std_err"])}</td>'
         f'<td style="text-align:right; color:{sig_color(r["tstat"], r.get("pval"))}">'

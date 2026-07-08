@@ -1,33 +1,33 @@
 <!DOCTYPE html><html><head><meta charset='utf-8'><title>Stage 1 — Activity Frequency</title><style>body{font-family:Arial,sans-serif;font-size:13px;margin:20px}h1{color:#2c3e50}table{border-collapse:collapse;width:100%}th{background:#2c3e50;color:white;padding:6px 10px;text-align:left}td{border:1px solid #ddd;padding:5px 10px}tr:nth-child(even){background:#f9f9f9}.ok{color:green}.warn{color:orange}.note{color:#555;font-style:italic}</style></head><body><h1>Stage 1 — Activity Frequency — Estimated Model Coefficients</h1><p class='note'>Saved: saved_data/stage1_models.pkl</p><table><tr><th>Group</th><th>Sub-group</th><th>n obs</th><th>OK?</th><th>Features</th><th>Fit stat</th></tr><tr><td>work</td><td>PartTimeWorker</td><td>1932</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>incp</td><td></td></tr>
 <tr><td>work</td><td>FullTimeWorker</td><td>6777</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>incp, vehrd, CARLICENCE, nprd, is_female, age_senior</td><td></td></tr>
 <tr><td>work</td><td>WorkingStudent</td><td>109</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>age_senior</td><td></td></tr>
-<tr><td>edu</td><td>SchoolChild</td><td>3358</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>vehrd, studying_secondary, studying_primary, CARLICENCE</td><td></td></tr>
+<tr><td>edu</td><td>SchoolChild</td><td>3358</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>age_child, vehrd, studying_secondary, studying_primary, CARLICENCE</td><td></td></tr>
 <tr><td>edu</td><td>WorkingStudent</td><td>109</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>ptype_UniversityStudent, age_child, vehrd, is_female, mandatory_role, studying_tertiary_pt, studying_secondary, studying_primary, nprd, ptype_Retired, CARLICENCE, age_senior</td><td></td></tr>
 <tr><td>edu</td><td>UniversityStudent</td><td>202</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>is_female, studying_tertiary_pt, age_senior</td><td></td></tr>
-<tr><td>social</td><td>Retired</td><td>3029</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>nprd, vehrd, incp</td><td></td></tr>
+<tr><td>social</td><td>Retired</td><td>3029</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>nprd, vehrd, incp, age_older</td><td></td></tr>
 <tr><td>social</td><td>PartTimeWorker</td><td>1932</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>nprd, vehrd, age_older</td><td></td></tr>
-<tr><td>social</td><td>NonWorker</td><td>1200</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd</td><td></td></tr>
-<tr><td>social</td><td>FullTimeWorker</td><td>6777</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>vehrd, is_female, CARLICENCE</td><td></td></tr>
+<tr><td>social</td><td>NonWorker</td><td>1200</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp</td><td></td></tr>
+<tr><td>social</td><td>FullTimeWorker</td><td>6777</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, vehrd, is_female, CARLICENCE</td><td></td></tr>
 <tr><td>social</td><td>WorkingStudent</td><td>109</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, CARLICENCE, ptype_UniversityStudent</td><td></td></tr>
 <tr><td>social</td><td>UniversityStudent</td><td>202</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, CARLICENCE, ptype_UniversityStudent</td><td></td></tr>
 <tr><td>escort</td><td>Retired</td><td>3029</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>nprd, is_female, CARLICENCE</td><td></td></tr>
 <tr><td>escort</td><td>PartTimeWorker</td><td>1932</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, is_female, CARLICENCE</td><td></td></tr>
-<tr><td>escort</td><td>NonWorker</td><td>1200</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, is_female, CARLICENCE</td><td></td></tr>
-<tr><td>escort</td><td>FullTimeWorker</td><td>6777</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, is_female, age_older, CARLICENCE</td><td></td></tr>
-<tr><td>escort</td><td>WorkingStudent</td><td>109</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>age_older</td><td></td></tr>
-<tr><td>escort</td><td>UniversityStudent</td><td>202</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, is_female, CARLICENCE</td><td></td></tr>
+<tr><td>escort</td><td>NonWorker</td><td>1200</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, is_female, CARLICENCE</td><td></td></tr>
+<tr><td>escort</td><td>FullTimeWorker</td><td>6777</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, CARLICENCE</td><td></td></tr>
+<tr><td>escort</td><td>WorkingStudent</td><td>109</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, age_older</td><td></td></tr>
+<tr><td>escort</td><td>UniversityStudent</td><td>202</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, is_female, age_older, CARLICENCE</td><td></td></tr>
 <tr><td>shopping</td><td>Retired</td><td>3029</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>age_older, CARLICENCE</td><td></td></tr>
 <tr><td>shopping</td><td>PartTimeWorker</td><td>1932</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, age_older</td><td></td></tr>
-<tr><td>shopping</td><td>NonWorker</td><td>1200</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>nprd</td><td></td></tr>
+<tr><td>shopping</td><td>NonWorker</td><td>1200</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>nprd, age_older</td><td></td></tr>
 <tr><td>shopping</td><td>FullTimeWorker</td><td>6777</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older</td><td></td></tr>
 <tr><td>shopping</td><td>WorkingStudent</td><td>109</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>CARLICENCE</td><td></td></tr>
 <tr><td>shopping</td><td>UniversityStudent</td><td>202</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>nprd, age_older</td><td></td></tr>
-<tr><td>othmaint</td><td>Retired</td><td>3029</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>nprd, vehrd</td><td></td></tr>
+<tr><td>othmaint</td><td>Retired</td><td>3029</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>nprd, vehrd, is_female, age_older, CARLICENCE</td><td></td></tr>
 <tr><td>othmaint</td><td>PartTimeWorker</td><td>1932</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, vehrd, age_older</td><td></td></tr>
-<tr><td>othmaint</td><td>NonWorker</td><td>1200</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>nprd, age_older</td><td></td></tr>
-<tr><td>othmaint</td><td>FullTimeWorker</td><td>6777</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>is_female, age_older</td><td></td></tr>
+<tr><td>othmaint</td><td>NonWorker</td><td>1200</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>nprd, vehrd, age_older</td><td></td></tr>
+<tr><td>othmaint</td><td>FullTimeWorker</td><td>6777</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, is_female, age_older</td><td></td></tr>
 <tr><td>othmaint</td><td>WorkingStudent</td><td>109</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, CARLICENCE, ptype_UniversityStudent</td><td></td></tr>
-<tr><td>othmaint</td><td>UniversityStudent</td><td>202</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, CARLICENCE, ptype_UniversityStudent</td><td></td></tr>
+<tr><td>othmaint</td><td>UniversityStudent</td><td>202</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>is_female</td><td></td></tr>
 <tr><td>othdiscr</td><td>Retired</td><td>3029</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, CARLICENCE, ptype_UniversityStudent</td><td></td></tr>
 <tr><td>othdiscr</td><td>PartTimeWorker</td><td>1932</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, CARLICENCE, ptype_UniversityStudent</td><td></td></tr>
 <tr><td>othdiscr</td><td>NonWorker</td><td>1200</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, CARLICENCE, ptype_UniversityStudent</td><td></td></tr>
@@ -36,17 +36,17 @@
 <tr><td>othdiscr</td><td>UniversityStudent</td><td>202</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, CARLICENCE, ptype_UniversityStudent</td><td></td></tr>
 <tr><td>eat</td><td>Retired</td><td>3029</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>incp</td><td></td></tr>
 <tr><td>eat</td><td>PartTimeWorker</td><td>1932</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, CARLICENCE, ptype_UniversityStudent</td><td></td></tr>
-<tr><td>eat</td><td>NonWorker</td><td>1200</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, CARLICENCE, ptype_UniversityStudent</td><td></td></tr>
+<tr><td>eat</td><td>NonWorker</td><td>1200</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>age_older</td><td></td></tr>
 <tr><td>eat</td><td>FullTimeWorker</td><td>6777</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, CARLICENCE, ptype_UniversityStudent</td><td></td></tr>
 <tr><td>eat</td><td>SchoolChild</td><td>3358</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>incp, CARLICENCE</td><td></td></tr>
 <tr><td>eat</td><td>WorkingStudent</td><td>109</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, CARLICENCE, ptype_UniversityStudent</td><td></td></tr>
-<tr><td>eat</td><td>UniversityStudent</td><td>202</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd, vehrd, incp, is_female, age_older, mandatory_role, ptype_FullTimeWorker, ptype_PartTimeWorker, CARLICENCE, ptype_UniversityStudent</td><td></td></tr>
+<tr><td>eat</td><td>UniversityStudent</td><td>202</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>hh_child, nprd</td><td></td></tr>
 <tr><td>_nonmand</td><td>Retired</td><td>3029</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>vehrd</td><td></td></tr>
 <tr><td>_nonmand</td><td>PartTimeWorker</td><td>1932</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>sexp, nprd, STUDYING</td><td></td></tr>
 <tr><td>_nonmand</td><td>NonWorker</td><td>1200</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>sexp, nprd</td><td></td></tr>
 <tr><td>_nonmand</td><td>FullTimeWorker</td><td>6777</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>sexp, vehrd, nprd, incp</td><td></td></tr>
 <tr><td>_nonmand</td><td>WorkingStudent</td><td>109</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>sexp, vehrd, nprd, STUDYING, WORKSTAT, incp</td><td></td></tr>
-<tr><td>_nonmand</td><td>UniversityStudent</td><td>202</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>sexp, nprd</td><td></td></tr>
+<tr><td>_nonmand</td><td>UniversityStudent</td><td>202</td><td><span class="ok">&#10003;</span></td><td style='font-size:11px'>sexp, nprd, WORKSTAT</td><td></td></tr>
 <tr><td>_nonmand_split</td><td>FullTimeWorker</td><td colspan=4>[0.42014488 0.16091756 0.19592963 0.13142463 0.01086582 0.08071749]</td></tr>
 <tr><td>_nonmand_split</td><td>NonWorker</td><td colspan=4>[0.41110614 0.21943574 0.17151814 0.13837886 0.00626959 0.05329154]</td></tr>
 <tr><td>_nonmand_split</td><td>PartTimeWorker</td><td colspan=4>[0.41909023 0.19649515 0.18866518 0.12155108 0.00969426 0.0645041 ]</td></tr>

@@ -633,6 +633,63 @@ def save_motorised_trips(
 
 
 # ===========================================================================
+# ZONE CROSSWALK  (ABM zone numbering  ->  a specific DynusT network's zones)
+# ===========================================================================
+
+def apply_dynust_zone_crosswalk(motorised_trips: dict, crosswalk_path: str) -> dict:
+    """
+    Remap OTAZ/DTAZ from the ABM's zone numbering onto a target DynusT
+    network's own zone numbering, and drop trips that fall outside that
+    network's coverage.
+
+    Needed because write_dynus_vehicle_dat() writes OTAZ/DTAZ straight into
+    vehicle.dat's zone fields, which only works if the ABM's zone numbers
+    already match the target network's numbering 1:1. For networks where
+    they don't (e.g. a network covering a smaller sub-area, or with a
+    different zone count) use build_dynust_zone_crosswalk.py to build a
+    crosswalk CSV first (columns: ORDER, dynust_zone, dist_m, in_network),
+    then pass its path here.
+
+    Trips where the origin or destination ABM zone has in_network=False
+    (i.e. no DynusT zone in this network is anywhere near it) are dropped
+    entirely rather than forced onto a distant/wrong zone.
+
+    Parameters
+    ----------
+    motorised_trips : dict from save_motorised_trips()  {label: DataFrame}
+    crosswalk_path  : CSV from build_dynust_zone_crosswalk.py
+
+    Returns
+    -------
+    dict, same shape as motorised_trips, with OTAZ/DTAZ remapped to the
+    target network's zone numbers and out-of-coverage trips removed.
+    """
+    cw = pd.read_csv(crosswalk_path)
+    order_to_dynust = cw.set_index('ORDER')['dynust_zone'].to_dict()
+    in_network = set(cw.loc[cw['in_network'], 'ORDER'])
+
+    remapped = {}
+    for label, df in motorised_trips.items():
+        if df is None or len(df) == 0:
+            remapped[label] = df
+            continue
+        d = df.copy()
+        otaz = pd.to_numeric(d['OTAZ'], errors='coerce')
+        dtaz = pd.to_numeric(d['DTAZ'], errors='coerce')
+        keep = otaz.isin(in_network) & dtaz.isin(in_network)
+        n_before = len(d)
+        d = d.loc[keep].copy()
+        d['OTAZ'] = otaz.loc[keep].map(order_to_dynust).astype(int)
+        d['DTAZ'] = dtaz.loc[keep].map(order_to_dynust).astype(int)
+        logger.info(
+            f"apply_dynust_zone_crosswalk[{label}]: {len(d):,}/{n_before:,} trips "
+            f"kept (both endpoints inside target network's coverage)"
+        )
+        remapped[label] = d
+    return remapped
+
+
+# ===========================================================================
 # DYNUS-T  vehicle.dat  WRITER
 # ===========================================================================
 
@@ -1326,6 +1383,7 @@ def run_stage6(
     skim_lookup: Optional[dict] = None,
     sa2_geo: Optional[pd.DataFrame] = None,
     save_dir: str = 'saved_data',
+    dynust_zone_crosswalk: Optional[str] = None,
     repair_dwells: bool = True,
     max_repair_iterations: int = 3,
     dynus_sim_start_min: int = DYNUS_SIM_START_MIN,
@@ -1348,6 +1406,15 @@ def run_stage6(
                          From get_zone_centroids_rich(landuse) in spatial_assignment.
                          Used to pin lat/lon onto every trip row.
     save_dir           : directory to write outputs
+    dynust_zone_crosswalk : path to a crosswalk CSV from
+                         build_dynust_zone_crosswalk.py (columns: ORDER,
+                         dynust_zone, dist_m, in_network). Pass this when the
+                         target DynusT network's zone numbering doesn't match
+                         the ABM's own zone numbers 1:1 (e.g. a network that
+                         only covers a sub-area) — remaps OTAZ/DTAZ and drops
+                         trips outside that network's coverage before writing
+                         vehicle.dat. Leave None to write OTAZ/DTAZ as-is
+                         (only correct when the two zone systems already match).
     repair_dwells      : whether to run destination repair loop (default True)
     max_repair_iterations : how many times to tighten distance per person
     dynus_sim_start_min : DynusT simulation start (minutes from midnight, default 360=6am)
@@ -1528,6 +1595,8 @@ def run_stage6(
     del all_aimsun_chunks
 
     motorised_splits = save_motorised_trips(trips_aimsun_all, save_dir)
+    if dynust_zone_crosswalk:
+        motorised_splits = apply_dynust_zone_crosswalk(motorised_splits, dynust_zone_crosswalk)
     write_dynus_vehicle_dat(
         motorised_splits,
         save_dir = save_dir,

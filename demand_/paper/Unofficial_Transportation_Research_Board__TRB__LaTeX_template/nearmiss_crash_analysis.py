@@ -403,6 +403,100 @@ def simulated_annealing_search(df, candidates, y_col, offset_col, max_iter=1200,
     return final, bf, best_history
 
 
+def differential_evolution_feature_search(
+    df, candidates, y_col, offset_col, maxiter=60, popsize=15,
+    label="DE", plot_path=None, p_threshold=0.10,
+    penalty_per_insig=10.0, seed=42,
+):
+    """Differential Evolution for binary feature selection with significance penalty.
+
+    Each candidate feature gets one continuous gene in [0, 1]; a gene > 0.5
+    includes that feature.  scipy's ``differential_evolution`` minimises
+    penalised_BIC = raw_BIC + n_insig * penalty_per_insig.
+    """
+    print(f"\n  DIFFERENTIAL EVOLUTION [{label}] — y = {y_col}")
+    print(f"  {len(candidates)} candidates, maxiter={maxiter}, popsize={popsize}, "
+          f"p-threshold={p_threshold}, penalty={penalty_per_insig}/insig")
+
+    dfs = df.dropna(subset=candidates + [y_col, offset_col]).reset_index(drop=True)
+    af, Kf = list(candidates), len(candidates)
+
+    def _score(x):
+        mask = (np.asarray(x) > 0.5).astype(int)
+        if mask.sum() < 2:
+            return 1e12
+        sel = [af[i] for i in range(Kf) if mask[i] == 1]
+        o = fit_model(dfs, sel, y_col, offset_col, label="DE", verbose=False)
+        if o is None:
+            return 1e12
+        coefs = o["coef_table"]
+        feature_rows = coefs.iloc[1:]
+        if coefs["Variable"].iloc[-1].startswith("ln("):
+            feature_rows = feature_rows.iloc[:-1]
+        n_insig = sum(1 for p in feature_rows["p"]
+                      if np.isnan(p) or p > p_threshold)
+        return o["bic"] + n_insig * penalty_per_insig
+
+    history = []
+
+    def _callback(xk, convergence=None):
+        history.append(_score(xk))
+
+    print(f"  Launching scipy.differential_evolution (seed={seed}) ...")
+    res = differential_evolution(
+        _score, bounds=[(0.0, 1.0)] * Kf,
+        maxiter=maxiter, popsize=popsize, seed=seed,
+        mutation=(0.4, 1.4), recombination=0.7,
+        polish=False, callback=_callback,
+    )
+    history.append(_score(res.x))
+    best_so_far = np.minimum.accumulate(history)
+
+    best_mask = (np.asarray(res.x) > 0.5).astype(int)
+    bf = [af[i] for i in range(Kf) if best_mask[i] == 1]
+
+    if len(bf) < 2:
+        print(f"  DE [{label}] returned <2 features; falling back to random mask.")
+        bf = list(np.random.choice(af, max(2, min(8, len(af))), replace=False))
+
+    # Final model fit
+    final = fit_model(dfs, bf, y_col, offset_col, label=f"DE-{label}", verbose=False)
+    coefs_f = final["coef_table"]
+    feature_rows_f = coefs_f.iloc[1:]
+    if coefs_f["Variable"].iloc[-1].startswith("ln("):
+        feature_rows_f = feature_rows_f.iloc[:-1]
+    n_insig_f = sum(1 for p in feature_rows_f["p"]
+                    if np.isnan(p) or p > p_threshold)
+    penalized_bic_f = final["bic"] + n_insig_f * penalty_per_insig
+
+    print(f"\n  BEST [{label}]: raw_BIC={final['bic']:.2f}  "
+          f"penalised_BIC={penalized_bic_f:.2f}  "
+          f"insig={n_insig_f}/{len(bf)}  |  {len(bf)} features:")
+    for f in bf:
+        pv = feature_rows_f[coefs_f["Variable"] == _V(f)]["p"].values
+        p_str = f"p={pv[0]:.4f}" if len(pv) and np.isfinite(pv[0]) else "p=nan"
+        sig = "***" if (len(pv) and (not np.isnan(pv[0])) and pv[0] < p_threshold) else ""
+        print(f"    {sig:3s} {_V(f):<50s} {p_str}")
+
+    if plot_path:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(range(1, len(best_so_far) + 1), best_so_far, "darkorange", linewidth=1.2, alpha=0.8)
+        ax.axhline(y=min(best_so_far), color="red", linestyle="--", alpha=0.5,
+                   label=f"Best = {min(best_so_far):.2f}")
+        ax.set_xlabel("Generation")
+        ax.set_ylabel("Penalised BIC (best so far)")
+        ax.set_title(f"Differential Evolution Convergence — {label}\n"
+                     f"(penalty={penalty_per_insig} per p > {p_threshold})")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=150)
+        plt.close(fig)
+        print(f"  Convergence plot saved: {plot_path}")
+
+    return final, bf, best_so_far.tolist()
+
+
 def model_to_latex(model, filename, caption, label):
     """Export coefficient table as LaTeX .tex fragment."""
     tbl = model["coef_table"].copy()

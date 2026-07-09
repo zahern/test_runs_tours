@@ -93,6 +93,8 @@ import os
 import pickle
 from typing import Optional
 
+from larch_regularization import elasticnet_objective
+
 # ── JAX: XLA-JIT utility matrix computation (CPU-only, no GPU required) ──
 import os as _os
 _os.environ.setdefault('JAX_PLATFORM_NAME', 'cpu')
@@ -1260,20 +1262,29 @@ class NestedLogitModeModel:
                     _lm.doctor(repair_nan_utility=True)
                 except Exception:
                     pass
-                _lm_result = _lm.maximize_loglike(
-                    options={'maxiter': 600, 'ftol': 1e-10, 'gtol': 1e-7}
-                )
-                _ll_larch  = float(_lm_result.loglike)
-                # Fallback to relaxed tolerances if LL is NaN or very bad
-                if not np.isfinite(_ll_larch) or _ll_larch < self.ll_null_ * 2:
-                    logger.debug(
-                        f"  mode/{purpose}: Larch LL={_ll_larch:.1f} — retrying with "
-                        "relaxed tolerances"
-                    )
+                # Elastic-net (L1+L2) penalty on the objective, mirroring
+                # metacountregressor's penalized-likelihood estimation - see
+                # larch_regularization.py. Restored before LL is read back
+                # so self.ll_final_ reflects the true unpenalized likelihood.
+                _ennet_lm = elasticnet_objective(_lm)
+                _ennet_lm.__enter__()
+                try:
                     _lm_result = _lm.maximize_loglike(
-                        options={'maxiter': 300, 'ftol': 1e-6, 'gtol': 1e-4}
+                        options={'maxiter': 600, 'ftol': 1e-10, 'gtol': 1e-7}
                     )
-                    _ll_larch = float(_lm_result.loglike)
+                    _ll_larch  = float(_lm_result.loglike)
+                    # Fallback to relaxed tolerances if LL is NaN or very bad
+                    if not np.isfinite(_ll_larch) or _ll_larch < self.ll_null_ * 2:
+                        logger.debug(
+                            f"  mode/{purpose}: Larch LL={_ll_larch:.1f} — retrying with "
+                            "relaxed tolerances"
+                        )
+                        _lm_result = _lm.maximize_loglike(
+                            options={'maxiter': 300, 'ftol': 1e-6, 'gtol': 1e-4}
+                        )
+                        _ll_larch = float(_lm_result.loglike)
+                finally:
+                    _ennet_lm.__exit__(None, None, None)
 
                 self.coef_   = _extract_larch_coef_to_scipy(_lm, self.param_names_, self.init_)
                 self.ll_final_ = _ll_larch

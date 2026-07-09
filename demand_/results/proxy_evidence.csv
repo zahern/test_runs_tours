@@ -4,4 +4,4 @@ CON,Low feature overlap: Jaccard=0.250 — NM and crashes have different drivers
 CON,NM spec degrades on crashes: dBIC=+241.5
 PRO,"Predicted NM encompasses geometry: LR=938.1, p=0.0000"
 CON,Weak shared latent risk: partial r=0.093
-CON,"Bivariate copula (joint-searched spec) does NOT significantly improve independence: LR=-958.0, p=1.00e+00"
+CON,"Bivariate copula (joint-searched spec) does NOT significantly improve independence: LR=-5693.1, p=1.00e+00"

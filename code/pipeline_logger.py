@@ -8223,6 +8223,7 @@ def run_mcr_search(data_arg: Optional[str] = None) -> None:
     try:
         from metacountregressor import (
             ExperimentBuilder,
+            ModelConstraints,
             load_example16_3_model_data,
             load_example_duration_data,
             load_example_linear_data,
@@ -8270,6 +8271,15 @@ def run_mcr_search(data_arg: Optional[str] = None) -> None:
         offset_col = "OFFSET" if "OFFSET" in df.columns else None
         variables = [v for v in ["AADT", "LENGTH", "SPEED", "CURVES", "WIDTH", "SHOULDERW", "SLOPE", "SHOULDER"] if v in df.columns]
         family_kwargs = {}
+        # SHOULDERW (continuous shoulder width) and SHOULDER (shoulder presence)
+        # are two encodings of the same road-geometry feature - the CMF branch
+        # below already treats them as alternatives (one goes to local_vars,
+        # the other to baseline_vars). Use metacountregressor's native
+        # mutual_exclusion so the count-family structure search never puts
+        # both in a spec at once (redundant df, inflates BIC for no LL gain).
+        mcr_constraints = None
+        if {"SHOULDERW", "SHOULDER"}.issubset(set(variables)):
+            mcr_constraints = ModelConstraints().mutual_exclusion(["SHOULDERW", "SHOULDER"])
     elif family == "duration":
         # Survival models in MetaCount are searched under model_family="duration".
         df = base_df.copy() if base_df is not None else load_example_duration_data()
@@ -8289,6 +8299,7 @@ def run_mcr_search(data_arg: Optional[str] = None) -> None:
         offset_col = None
         variables = [v for v in ["AADT", "LENGTH", "SPEED", "CURVES", "WIDTH", "SHOULDERW", "SLOPE"] if v in df.columns]
         family_kwargs = {"budget_col": "B"}
+        mcr_constraints = None
     elif family == "linear":
         df = base_df.copy() if base_df is not None else load_example_linear_data()
         if "LINEAR_TARGET" not in df.columns:
@@ -8305,6 +8316,7 @@ def run_mcr_search(data_arg: Optional[str] = None) -> None:
         offset_col = None
         variables = [v for v in ["AADT", "LENGTH", "SPEED", "CURVES", "WIDTH", "SHOULDERW", "SLOPE"] if v in df.columns]
         family_kwargs = {}
+        mcr_constraints = None
     else:  # cmf
         df = base_df.copy() if base_df is not None else load_example16_3_model_data()
         if "OFFSET" not in df.columns and {"AADT", "LENGTH"}.issubset(df.columns):
@@ -8323,6 +8335,11 @@ def run_mcr_search(data_arg: Optional[str] = None) -> None:
             "baseline_vars": baseline_vars,
             "local_vars": local_vars,
         }
+        # cmf routes through build_search() (model_family != "count"), which
+        # does not forward `constraints`/`mutual_exclusion` in this package
+        # version - SHOULDERW/SHOULDER exclusivity is instead handled above
+        # by construction (each goes to at most one of baseline_vars/local_vars).
+        mcr_constraints = None
 
     builder = ExperimentBuilder(
         df=df,
@@ -8339,6 +8356,7 @@ def run_mcr_search(data_arg: Optional[str] = None) -> None:
         default_roles=default_roles,
         max_latent_classes=1,
         R=draws_r,
+        constraints=mcr_constraints,
         **family_kwargs,
     )
 

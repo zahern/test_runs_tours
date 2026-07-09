@@ -63,11 +63,15 @@ INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS:-1}
 
 # 507-zone SA2 population scope.  Set NEW_POP=1 to activate the new_pop
 # zoning system (OTAZ = SA2 code directly, matched to the GAN synth pop).
+# NEW_POP_MAPPED=1 is the production default - matches job_full_pipeline_dta_tested.pbs
+# and job_predict_dta_tested.pbs (both hardcode NEW_POP_MAPPED=1), so a bare
+# `qsub job_submit_ga_parallel_chain.pbs` produces GA results on the same
+# population scope the vehicle.dat pipeline expects, with no -v flags needed.
 # NEW_POP_DIR: parent of saved_data/zone_ids_sa2/ (relative to PBS_O_WORKDIR).
 # PIPELINE_SKIMS_PATH: openmatrix-spec OMX for stage 5 (run
 #   demand_/11_convert_skims_to_openmatrix.py on HPC to generate it first).
 NEW_POP=${NEW_POP:-0}
-NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+NEW_POP_MAPPED=${NEW_POP_MAPPED:-1}
 NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
 # Skim path default depends on mode:
 #   NEW_POP=1 (507-zone SA2 direct) : the openmatrix-spec converted OMX is

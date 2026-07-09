@@ -44,6 +44,8 @@ import pickle
 from typing import Optional
 from scipy.stats import norm
 
+from larch_regularization import elasticnet_objective
+
 logger = logging.getLogger(__name__)
 
 CDAP_LABELS = {0: 'H', 1: 'N', 2: 'M'}
@@ -521,7 +523,12 @@ def estimate_cdap(persons: pd.DataFrame,
     except (TypeError, AttributeError):
         pass
     mnl.set_cap(10)
-    r = mnl.maximize_loglike(options={'ftol': 1e-8})
+    # Elastic-net (L1+L2) penalty on the objective, mirroring
+    # metacountregressor's penalized-likelihood estimation - see
+    # larch_regularization.py. Restored before LL/covariance are read back
+    # so cached results reflect the true unpenalized likelihood.
+    with elasticnet_objective(mnl):
+        r = mnl.maximize_loglike(options={'ftol': 1e-8})
     mnl._cached_ll = float(r.loglike)
     try:
         mnl.calculate_parameter_covariance()
@@ -547,7 +554,8 @@ def estimate_cdap(persons: pd.DataFrame,
         pass
     mxl_ok = False
     try:
-        r2 = mxl.maximize_loglike(stderr=True, options={'ftol': 1e-8})
+        with elasticnet_objective(mxl):
+            r2 = mxl.maximize_loglike(stderr=True, options={'ftol': 1e-8})
         mxl._cached_ll = float(r2.loglike)
         try:
             mxl.calculate_parameter_covariance()
@@ -623,7 +631,8 @@ def _estimate_mxl_subsample(sub: pd.DataFrame,
         mnl.utility_co[1] += lx.P(f'b_N_{feat}') * lx.X(f'person.{feat}')
         mnl.utility_co[2] += lx.P(f'b_M_{feat}') * lx.X(f'person.{feat}')
     mnl.set_cap(10)
-    mnl.maximize_loglike(options={'ftol': 1e-7})
+    with elasticnet_objective(mnl):
+        mnl.maximize_loglike(options={'ftol': 1e-7})
     _fill_larch_inference(mnl)
 
     # add Normal mixtures on the 3 key random variables
@@ -641,7 +650,8 @@ def _estimate_mxl_subsample(sub: pd.DataFrame,
     except Exception:
         pass
 
-    r = mxl.maximize_loglike(stderr=True, options={'ftol': 1e-7})
+    with elasticnet_objective(mxl):
+        r = mxl.maximize_loglike(stderr=True, options={'ftol': 1e-7})
     mxl._cached_ll = float(r.loglike)
     try:
         mxl.calculate_parameter_covariance()

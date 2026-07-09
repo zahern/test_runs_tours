@@ -30,6 +30,8 @@ except Exception:
     jnp = np
     JAX_AVAILABLE = False
 
+from larch_regularization import elasticnet_objective
+
 logger = logging.getLogger(__name__)
 
 PURPOSES     = ['work', 'edu', 'social', 'escort',
@@ -50,6 +52,12 @@ STAGE5_ENABLE_MXL = os.environ.get('STAGE5_ENABLE_MXL', '0') == '1'
 _DIST_WALK_BANNER_SHOWN = False
 # Track which segments have already been warned about DIST/DISTWALK correlation
 _DIST_WALK_CORR_WARNED: set = set()
+# Track (c1, c2) collinear-column pairs already warned about at WARNING level.
+# _dest_tree() re-detects the same structural collinearity on every zone-loop/
+# batch iteration it's called for; without this the log fills with tens of
+# thousands of repeats of the same ~10 pairs. First occurrence still logs at
+# WARNING (so it's visible), repeats are demoted to DEBUG.
+_WARNED_COLLINEAR_CA_PAIRS: set = set()
 
 # ── Industry-of-employment → mode affinity group ─────────────────────────────
 # Source: ANZSIC 1-digit codes stored in 'indp' column (census/HHTS).
@@ -2467,12 +2475,16 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                         frozenset(['indp_finance_flag', 'occp_mgr']),
                     }
                 )
-                _log_fn = logger.debug if _is_known else logger.warning
+                _pair_key = frozenset([c1, c2])
+                _already_warned = _pair_key in _WARNED_COLLINEAR_CA_PAIRS
+                _log_fn = logger.debug if (_is_known or _already_warned) else logger.warning
                 _log_fn(
                     f"_dest_tree: COLLINEAR CA columns detected - "
                     f"'{c1}' vs '{c2}' (|r|={_corr[j,i]:.4f}); "
                     f"'{to_holdfast}' will be holdfasted at 0 in estimation"
+                    + ("" if _already_warned else " (further repeats of this pair logged at DEBUG)")
                 )
+                _WARNED_COLLINEAR_CA_PAIRS.add(_pair_key)
                 _collinear_ca_cols.add(to_holdfast)
                 # Detect the specific DISTWALK=DIST / DISTBIKE=DIST cases
                 if set([c1, c2]) & {'DISTWALK', 'DIST'} == {'DISTWALK', 'DIST'}:
@@ -5439,6 +5451,18 @@ def _estimate(model, two_phase: bool = False):
     except Exception:
         _start_vals = None
 
+    # ── Elastic-net (L1+L2) penalty on the estimation objective ───────────
+    # Mirrors metacountregressor's penalized-likelihood objective (see
+    # larch_regularization.py) so Larch-estimated coefficients get the same
+    # shrinkage toward zero as the metacountregressor-fitted count models
+    # elsewhere in this pipeline. Patches model.logloss/d_logloss (the
+    # objective/gradient scipy.optimize.minimize actually calls here, since
+    # set_cap() above gives every parameter finite bounds and Larch picks
+    # SLSQP over BHHH). Restored to the true unpenalized likelihood before
+    # std errors/covariance are computed below.
+    _ennet_ctx = elasticnet_objective(model)
+    _ennet_ctx.__enter__()
+
     # ── Phase 1: core terms only (industry/edu holdfasted if two_phase) ───
     # tighter gtol → optimizer walks further from the boundary so the Hessian
     # at convergence is better conditioned and std errors less likely to be NaN.
@@ -5708,6 +5732,11 @@ def _estimate(model, two_phase: bool = False):
                 _compute_inference()
     except Exception as _e:
         logger.debug(f"Destination stabilization refit skipped: {_e}")
+
+    # Restore the true (unpenalized) logloss/d_logloss now that all
+    # maximize_loglike() calls for this model are done - everything below
+    # (std errors, covariance, diagnostics) must reflect the real likelihood.
+    _ennet_ctx.__exit__(None, None, None)
 
     # ── Build definitive parameter frame (nuclear guarantee + final cache) ──────
     #
@@ -7052,7 +7081,12 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
         except Exception:
             pass
 
-        mnl.maximize_loglike(options={'ftol': 1e-9, 'maxiter': 500})
+        _ennet_mnl = elasticnet_objective(mnl)
+        _ennet_mnl.__enter__()
+        try:
+            mnl.maximize_loglike(options={'ftol': 1e-9, 'maxiter': 500})
+        finally:
+            _ennet_mnl.__exit__(None, None, None)
 
         # ── Step 2: Add Normal mixtures ───────────────────────────────────
         # Random parameters capture taste heterogeneity across persons:
@@ -7098,15 +7132,20 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
         print(f"\n  Estimating mixed logit ({n_draws} Halton draws)...")
         # Two-phase optimisation: BFGS first (fast, moves params far from start),
         # then L-BFGS-B to refine near the optimum.
+        _ennet_mxl = elasticnet_objective(mxl_final)
+        _ennet_mxl.__enter__()
         try:
-            mxl_final.maximize_loglike(
-                stderr=False,
-                method='BFGS',
-                options={'gtol': 1e-4, 'maxiter': 200},
-            )
-        except Exception:
-            pass
-        mxl_final.maximize_loglike(stderr=True, options={'ftol': 1e-10, 'gtol': 1e-6, 'maxiter': 800})
+            try:
+                mxl_final.maximize_loglike(
+                    stderr=False,
+                    method='BFGS',
+                    options={'gtol': 1e-4, 'maxiter': 200},
+                )
+            except Exception:
+                pass
+            mxl_final.maximize_loglike(stderr=True, options={'ftol': 1e-10, 'gtol': 1e-6, 'maxiter': 800})
+        finally:
+            _ennet_mxl.__exit__(None, None, None)
 
         # ── extract results ──────────────────────────────────────────
         pf   = mxl_final.pf
@@ -8964,12 +9003,30 @@ def skim_lookup_to_df(skim_lookup: dict) -> pd.DataFrame:
 
 
 def _softmax_from_utilities(V: np.ndarray) -> np.ndarray:
-    """Convert utility matrix to row-normalized probabilities."""
+    """Convert utility matrix to row-normalized probabilities.
+
+    NaN/Inf utilities are treated as infeasible alternatives (probability 0),
+    not propagated. Previously only ``row_max`` was computed from a
+    NaN-sanitized copy of V - the actual ``exp(V - row_max)`` step still ran
+    on the raw V, so a single NaN utility cell poisoned exp_V -> the row sum
+    -> the entire row's probabilities to NaN (this is what was producing the
+    all-"nan" Pred columns in the destination validation report).
+    """
     if V is None or V.size == 0:
         return np.zeros((0, 0), dtype=np.float64)
-    row_max = np.max(np.where(np.isfinite(V), V, -np.inf), axis=1, keepdims=True)
+    V_finite = np.where(np.isfinite(V), V, -np.inf)
+    _n_bad = int((~np.isfinite(V)).sum())
+    if _n_bad > 0:
+        logger.warning(
+            f"_softmax_from_utilities: {_n_bad} non-finite utility cell(s) "
+            f"({_n_bad / V.size:.2%} of {V.shape[0]}x{V.shape[1]}) treated as "
+            "infeasible (prob=0). Check the utility terms/data columns feeding "
+            "_dest_utility_numpy for NaN/Inf - a coefficient's source column "
+            "may be missing at this call site."
+        )
+    row_max = np.max(V_finite, axis=1, keepdims=True)
     row_max = np.where(np.isfinite(row_max), row_max, 0.0)
-    exp_V = np.exp(np.clip(V - row_max, -500, 0))
+    exp_V = np.exp(np.clip(V_finite - row_max, -500, 0))
     totals = exp_V.sum(axis=1, keepdims=True)
     totals = np.where(totals > 0, totals, 1.0)
     return (exp_V / totals).astype(np.float64)

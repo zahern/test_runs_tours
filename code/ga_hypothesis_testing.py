@@ -333,6 +333,16 @@ STAGE_COLLINEAR_GROUPS: Dict[Any, List[List[str]]] = {
         ['Education', 'Primary', 'Secondary'],
         ['DIST', 'SOVTOLL_TIME__AM'],
         ['TOTPOP', 'TOTHH'],
+        # Person-x-distance interaction terms - _dest_tree's runtime collinearity
+        # check (stage5_destination_choice.py) flags every one of these pairs at
+        # |r|=1.0 on every estimation, meaning the GA was routinely proposing
+        # chromosomes that spend a free parameter (BIC penalty) on a coefficient
+        # that gets holdfasted to 0 anyway. Grouped as one clique since they're
+        # all pairwise collinear with each other, not just with log_DIST_1.
+        ['ageNp_x_log_dist', 'incp_x_log_dist', 'nprd_x_log_dist',
+         'vehrd_x_log_dist', 'log_DIST_1', 'auto_work_acc'],
+        ['walk_feasible', 'intrazonal', 'commercial'],
+        ['size_term', 'log_correction', 'log_TOTEMP_1'],
     ],
     # Stage 6 (trip mode)
     6: [
@@ -343,6 +353,52 @@ STAGE_COLLINEAR_GROUPS: Dict[Any, List[List[str]]] = {
         ['has_vehicle', 'no_vehicle', 'one_vehicle', 'multi_vehicle', 'vehrd'],
         ['inc_hi', 'inc_lo', 'incp'],
         ['older', 'age5p'],
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# REQUIRE-ONE GROUPS  (stage-specific)
+# ---------------------------------------------------------------------------
+# Companion to STAGE_COLLINEAR_GROUPS. Each entry is a list of variable
+# lists; within each inner list, AT LEAST ONE variable must be active in any
+# chromosome.
+#
+# IMPORTANT - only applies to variables the GA actually searches over.
+# Stage 5 mode/destination choice (stage5_destination_choice.py) already
+# hardcodes genuine per-mode impedance terms UNCONDITIONALLY in MODE_UEC /
+# DEST_UEC, entirely outside the GA-selected chromosome:
+#   MODE_UEC:  c_ivt_auto (DA/SR, SOVTOLL_TIME__AM), c_ivt_transit (Transit,
+#              WLK_LOC_WLK_TOTIVT__AM), c_walk_time (Walk, DISTWALK),
+#              c_bike_time (Bike, DISTBIKE) - one impedance term PER MODE,
+#              classic nested-logit practice.
+#   DEST_UEC:  c_log_dist / c_dist (universal distance deterrent), c_logsum,
+#              c_size_term - all unconditional for every segment.
+# _stage5_mode_candidates()/_stage5_dest_candidates() (the GA-searchable
+# pools) only cover ENRICHMENT variables layered on top of that backbone
+# (income, vehicle ownership, PM/HOV2 skim variants, land-use sub-splits) -
+# 'SOVTOLL_TIME__AM'/'DIST' aren't even in those pools. A require-one group
+# naming them doesn't enforce "the model has impedance" (already true by
+# construction); it just forces one specific enrichment skim to always be
+# selected, which has no theoretical basis. So: no require-one entries for
+# '5_mode' / '5_dest' - the identification requirement is already met by the
+# fixed UEC, not by anything the search controls.
+#
+# Stage 6 (trip-level mode choice) is genuinely different: it has no
+# backbone UEC - tt_avg, tt_am, log_dist, dist, ldw, distwalk, ldb, distbike
+# are ALL freely searchable (only 'crash' is hard-fixed via fixed_features).
+# Without a require-one constraint the GA can legally converge on a
+# specification with zero time/cost/distance variables, degenerating to pure
+# ASCs + demographics - not identified as a meaningful mode choice model.
+# The group below is the UNION of every impedance variable across all four
+# STAGE_COLLINEAR_GROUPS[6] at-most-one subgroups (motorised time, general
+# distance, walk-specific, bike-specific) - "the model must have SOME
+# impedance measure," not "must have this specific skim variant." Which one
+# satisfies it is left to the GA/data, consistent with classic mode choice
+# theory (utility must be differentiated by cost/time somewhere, but theory
+# doesn't dictate a single fixed skim column).
+STAGE_REQUIRE_ONE_GROUPS: Dict[Any, List[List[str]]] = {
+    6: [
+        ['tt_avg', 'tt_am', 'log_dist', 'dist', 'ldw', 'distwalk', 'ldb', 'distbike'],
     ],
 }
 
@@ -373,6 +429,46 @@ def _repair_collinearity(
             for idx in active_idx:
                 if idx != keep:
                     genes[idx] = 0
+    return genes
+
+
+def _repair_require_one(
+    genes: np.ndarray,
+    feature_names: List[str],
+    require_groups: List[List[str]],
+    rng: np.random.Generator,
+    protected_idx: Optional[set[int]] = None,
+    collinear_groups: Optional[List[List[str]]] = None,
+) -> np.ndarray:
+    """
+    Repair a chromosome so AT LEAST ONE gene per require-one group is active.
+
+    Companion to _repair_collinearity. When a group has no active gene, one
+    member is turned on - preferring a member that doesn't immediately
+    conflict with an already-active partner in collinear_groups, so this
+    activation doesn't just get undone by a later collinearity repair pass.
+    Always called AFTER _repair_collinearity at every call site so the
+    "at least one" guarantee is the final word.
+    """
+    genes = genes.copy()
+    protected_idx = protected_idx or set()
+    collinear_groups = collinear_groups or []
+    feat_idx = {f: i for i, f in enumerate(feature_names)}
+
+    def _conflicts(idx: int) -> bool:
+        for cg in collinear_groups:
+            cg_idx = {feat_idx[f] for f in cg if f in feat_idx}
+            if idx in cg_idx and any(genes[j] == 1 for j in cg_idx if j != idx):
+                return True
+        return False
+
+    for group in require_groups:
+        member_idx = [feat_idx[f] for f in group if f in feat_idx]
+        if not member_idx or any(genes[i] == 1 for i in member_idx):
+            continue
+        safe = [i for i in member_idx if not _conflicts(i)]
+        pick = int(rng.choice(safe if safe else member_idx))
+        genes[pick] = 1
     return genes
 
 
@@ -965,6 +1061,7 @@ class GeneticAlgorithm:
         verbose:             bool  = True,
         feature_names:       List[str] = None,    # required for collinearity repair
         collinear_groups:    List[List[str]] = None,  # from STAGE_COLLINEAR_GROUPS
+        require_one_groups:  List[List[str]] = None,  # from STAGE_REQUIRE_ONE_GROUPS
         fixed_features:      Optional[List[str]] = None,
         progress_label:      str = '',
         fitness_metric:      str = 'mean(-BIC/n)',
@@ -986,6 +1083,7 @@ class GeneticAlgorithm:
         self.rng                 = np.random.default_rng(seed)
         self.feature_names       = feature_names or []
         self.collinear_groups    = collinear_groups or []
+        self.require_one_groups  = require_one_groups or []
         self.fixed_features      = fixed_features or []
         self.progress_label      = progress_label
         self.fitness_metric      = fitness_metric
@@ -1034,6 +1132,11 @@ class GeneticAlgorithm:
             collinear_groups=self.collinear_groups,
             protected_idx=self._fixed_idx,
         )
+        if self.require_one_groups and self.feature_names:
+            genes = _repair_require_one(genes, self.feature_names,
+                                        self.require_one_groups, self.rng,
+                                        protected_idx=self._fixed_idx,
+                                        collinear_groups=self.collinear_groups)
         return Individual(genes=genes)
 
     def _init_population(self, seed_individuals: list = None) -> List[Individual]:
@@ -1141,6 +1244,11 @@ class GeneticAlgorithm:
             collinear_groups=self.collinear_groups,
             protected_idx=self._fixed_idx,
         )
+        if self.require_one_groups and self.feature_names:
+            genes = _repair_require_one(genes, self.feature_names,
+                                        self.require_one_groups, self.rng,
+                                        protected_idx=self._fixed_idx,
+                                        collinear_groups=self.collinear_groups)
 
         return Individual(genes=genes)
 
@@ -1379,6 +1487,7 @@ class SimulatedAnnealing:
         verbose:             bool  = True,
         feature_names:       List[str] = None,
         collinear_groups:    List[List[str]] = None,
+        require_one_groups:  List[List[str]] = None,
         fixed_features:      Optional[List[str]] = None,
         progress_label:      str  = '',
         fitness_metric:      str  = 'mean(-BIC/n)',
@@ -1396,6 +1505,7 @@ class SimulatedAnnealing:
         self.rng            = np.random.default_rng(seed)
         self.feature_names  = feature_names or []
         self.collinear_groups = collinear_groups or []
+        self.require_one_groups = require_one_groups or []
         self.fixed_features = fixed_features or []
         self.progress_label = progress_label
         self.fitness_metric = fitness_metric
@@ -1426,12 +1536,18 @@ class SimulatedAnnealing:
             genes = _repair_collinearity(genes, self.feature_names,
                                          self.collinear_groups, self.rng,
                                          protected_idx=self._fixed_idx)
-        return _enforce_feature_bounds(
+        genes = _enforce_feature_bounds(
             genes, min_active, self.max_features, self.rng,
             feature_names=self.feature_names,
             collinear_groups=self.collinear_groups,
             protected_idx=self._fixed_idx,
         )
+        if self.require_one_groups and self.feature_names:
+            genes = _repair_require_one(genes, self.feature_names,
+                                        self.require_one_groups, self.rng,
+                                        protected_idx=self._fixed_idx,
+                                        collinear_groups=self.collinear_groups)
+        return genes
 
     def _neighbor(self, genes: np.ndarray) -> np.ndarray:
         """
@@ -1479,12 +1595,18 @@ class SimulatedAnnealing:
             g = _repair_collinearity(g, self.feature_names,
                                      self.collinear_groups, self.rng,
                                      protected_idx=self._fixed_idx)
-        return _enforce_feature_bounds(
+        g = _enforce_feature_bounds(
             g, max(self.min_features, len(self._fixed_idx)), self.max_features, self.rng,
             feature_names=self.feature_names,
             collinear_groups=self.collinear_groups,
             protected_idx=self._fixed_idx,
         )
+        if self.require_one_groups and self.feature_names:
+            g = _repair_require_one(g, self.feature_names,
+                                    self.require_one_groups, self.rng,
+                                    protected_idx=self._fixed_idx,
+                                    collinear_groups=self.collinear_groups)
+        return g
 
     def _evaluate(self, genes: np.ndarray) -> float:
         key = tuple(genes.tolist())
@@ -1689,6 +1811,7 @@ class BanditFeatureSearcher:
         verbose:             bool  = True,
         feature_names:       List[str] = None,
         collinear_groups:    List[List[str]] = None,
+        require_one_groups:  List[List[str]] = None,
         fixed_features:      Optional[List[str]] = None,
         progress_label:      str   = '',
         fitness_metric:      str   = 'mean(-BIC/n)',
@@ -1714,6 +1837,7 @@ class BanditFeatureSearcher:
         self.verbose        = verbose
         self.feature_names  = feature_names or []
         self.collinear_groups = collinear_groups or []
+        self.require_one_groups = require_one_groups or []
         self.fixed_features = fixed_features or []
         self.progress_label = progress_label
         self.fitness_metric = fitness_metric
@@ -1763,6 +1887,12 @@ class BanditFeatureSearcher:
             genes = _repair_collinearity(
                 genes, self.feature_names, self.collinear_groups,
                 self.rng, protected_idx=self._fixed_idx,
+            )
+        if self.require_one_groups and self.feature_names:
+            genes = _repair_require_one(
+                genes, self.feature_names, self.require_one_groups,
+                self.rng, protected_idx=self._fixed_idx,
+                collinear_groups=self.collinear_groups,
             )
         return genes
 
@@ -1945,6 +2075,13 @@ class BanditFeatureSearcher:
                             self.collinear_groups, self.rng,
                             protected_idx=self._fixed_idx,
                         )
+                    if self.require_one_groups and self.feature_names:
+                        cand_genes = _repair_require_one(
+                            cand_genes, self.feature_names,
+                            self.require_one_groups, self.rng,
+                            protected_idx=self._fixed_idx,
+                            collinear_groups=self.collinear_groups,
+                        )
                 else:
                     # Global Thompson sample (standard path)
                     cand_genes = self._sample_chromosome()
@@ -2077,15 +2214,16 @@ class BanditFeatureSearcher:
 
 
 def _make_searcher(
-    n_features:       int,
-    fitness_fn:       Callable,
-    ga_kwargs:        dict,
-    use_sim_anneal:   bool = False,
-    use_bandit:       bool = False,
-    feature_names:    List[str] = None,
-    collinear_groups: List[List[str]] = None,
-    fixed_features:   Optional[List[str]] = None,
-    fitness_metric:   str = 'mean(-BIC/n)',
+    n_features:         int,
+    fitness_fn:         Callable,
+    ga_kwargs:          dict,
+    use_sim_anneal:     bool = False,
+    use_bandit:         bool = False,
+    feature_names:      List[str] = None,
+    collinear_groups:   List[List[str]] = None,
+    require_one_groups: List[List[str]] = None,
+    fixed_features:     Optional[List[str]] = None,
+    fitness_metric:     str = 'mean(-BIC/n)',
 ) -> 'GeneticAlgorithm | SimulatedAnnealing | BanditFeatureSearcher':
     """
     Factory: return the appropriate searcher class.
@@ -2111,10 +2249,11 @@ def _make_searcher(
     return cls(
         n_features,
         fitness_fn,
-        feature_names    = feature_names or [],
-        collinear_groups = collinear_groups or [],
-        fixed_features   = fixed_features or [],
-        fitness_metric   = fitness_metric,
+        feature_names      = feature_names or [],
+        collinear_groups   = collinear_groups or [],
+        require_one_groups = require_one_groups or [],
+        fixed_features     = fixed_features or [],
+        fitness_metric     = fitness_metric,
         **ga_kwargs,
     )
 
@@ -2168,6 +2307,7 @@ def _ga_segment_worker(payload: dict) -> dict:
     fitness_metric   = payload['fitness_metric']
     stage_id         = payload['stage_id']
     collinear_groups = payload['collinear_groups']
+    require_one_groups = payload.get('require_one_groups', [])
     label            = payload['label']
 
     _dmod, _dname, _dargs = payload['default_fit']
@@ -2210,11 +2350,12 @@ def _ga_segment_worker(payload: dict) -> dict:
     _ga_kwargs = _resolve_min_features(ga_kwargs, feat_names, fixed_feats)
     searcher = _make_searcher(
         len(feat_names), _seg_fit, _ga_kwargs,
-        use_sim_anneal   = use_sim_anneal,
-        feature_names    = feat_names,
-        collinear_groups = collinear_groups,
-        fixed_features   = fixed_feats,
-        fitness_metric   = fitness_metric,
+        use_sim_anneal      = use_sim_anneal,
+        feature_names       = feat_names,
+        collinear_groups    = collinear_groups,
+        require_one_groups  = require_one_groups,
+        fixed_features      = fixed_feats,
+        fitness_metric      = fitness_metric,
     )
     print(f"\n  [{label}] Running per-segment search (worker pid={os.getpid()}) ...")
     t0 = time.time()
@@ -4273,9 +4414,10 @@ def _run_ga_cdap(persons, ga_kwargs, n_restarts=2) -> GAResult:
 
     searcher = _make_searcher(
         len(feat_names), fitness, ga_kwargs,
-        feature_names    = feat_names,
-        collinear_groups = STAGE_COLLINEAR_GROUPS.get(0, []),
-        fitness_metric   = 'mean(-BIC/n) [Larch MNL]',
+        feature_names       = feat_names,
+        collinear_groups    = STAGE_COLLINEAR_GROUPS.get(0, []),
+        require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get(0, []),
+        fitness_metric      = 'mean(-BIC/n) [Larch MNL]',
     )
     best, history, pop = searcher.run_with_restarts(n_restarts=n_restarts)
     best_feats = [f for f, g in zip(feat_names, best.genes) if g == 1]
@@ -4376,8 +4518,9 @@ def _run_ga_usual_loc(persons, landuse, skims, ga_kwargs, n_restarts=2) -> GARes
     kw = {**ga_kwargs, 'min_features': 3}
     ga  = GeneticAlgorithm(
         n_total, fitness,
-        feature_names    = feat_names,
-        collinear_groups = STAGE_COLLINEAR_GROUPS.get(-1, []),
+        feature_names       = feat_names,
+        collinear_groups    = STAGE_COLLINEAR_GROUPS.get(-1, []),
+        require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get(-1, []),
         **kw,
     )
     best, history, pop = ga.run_with_restarts(n_restarts=n_restarts)
@@ -4721,6 +4864,7 @@ def _run_ga_stage1(tours, persons, ga_kwargs, n_restarts=2, landuse=None) -> GAR
             'use_sim_anneal':      use_sim_anneal,
             'fitness_metric':      fitness_metric,
             'collinear_groups':    STAGE_COLLINEAR_GROUPS.get(1, []),
+            'require_one_groups':  STAGE_REQUIRE_ONE_GROUPS.get(1, []),
             'fallback_to_default': fallback_to_default,
             'feature_map_key':     purpose,
             'default_fit':         ('ga_hypothesis_testing', '_stage1_fitness_aggregate', ([purpose], _purpose_ptypes)),
@@ -4881,6 +5025,7 @@ def _run_ga_stage2(tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
             'use_sim_anneal':     use_sim_anneal,
             'fitness_metric':     fitness_metric,
             'collinear_groups':   STAGE_COLLINEAR_GROUPS.get(2, []),
+            'require_one_groups': STAGE_REQUIRE_ONE_GROUPS.get(2, []),
             'fallback_to_default': fallback_to_default,
             'feature_map_key':    _target_key_map.get(target, target),
             # Stage 2 GA search uses fast OLS-BIC regardless of estimator mode.
@@ -5035,6 +5180,7 @@ def _run_ga_stage3(tours, persons, ga_kwargs, trips=None, n_restarts=2) -> GARes
             'use_sim_anneal':     use_sim_anneal,
             'fitness_metric':     fitness_metric,
             'collinear_groups':   STAGE_COLLINEAR_GROUPS.get(3, []),
+            'require_one_groups': STAGE_REQUIRE_ONE_GROUPS.get(3, []),
             'fallback_to_default': fallback_to_default,
             'feature_map_key':    purpose,
             # Stage 3 GA search uses fast OLS-on-log(duration) BIC.
@@ -5217,6 +5363,7 @@ def _run_ga_stage23_joint(tours, persons, ga_kwargs, trips=None, n_restarts=2) -
         'use_sim_anneal':      use_sim_anneal,
         'fitness_metric':      fitness_metric,
         'collinear_groups':    STAGE_COLLINEAR_GROUPS.get(2, []),
+        'require_one_groups':  STAGE_REQUIRE_ONE_GROUPS.get(2, []),
         'fallback_to_default': False,
         'feature_map_key':     'joint',
         # Fast OLS-BIC proxy: <2 ms per eval, so SA-Bandit can run 3000+ evals.
@@ -5346,6 +5493,7 @@ def _run_ga_stage4(trips, tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
             'use_sim_anneal':     use_sim_anneal,
             'fitness_metric':     fitness_metric,
             'collinear_groups':   STAGE_COLLINEAR_GROUPS.get(4, []),
+            'require_one_groups': STAGE_REQUIRE_ONE_GROUPS.get(4, []),
             'fallback_to_default': fallback_to_default,
             'feature_map_key':    purpose,
             'default_fit':        ('ga_hypothesis_testing', '_stage4_fitness_aggregate', ([purpose],)),
@@ -5458,8 +5606,9 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
             len(seg_mode_cands), _mode_fit, _ga_kwargs_mode,
             use_sim_anneal   = False,
             use_bandit       = True,
-            feature_names    = seg_mode_cands,
-            collinear_groups = STAGE_COLLINEAR_GROUPS.get('5_mode', []),
+            feature_names       = seg_mode_cands,
+            collinear_groups    = STAGE_COLLINEAR_GROUPS.get('5_mode', []),
+            require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get('5_mode', []),
             fixed_features   = _mode_fixed,
             fitness_metric   = 'mean(-BIC/n) [Larch NL]',
         )
@@ -5525,8 +5674,9 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
                 len(seg_dest_cands), _dest_fit, _ga_kwargs_dest,
                 use_sim_anneal   = False,
                 use_bandit       = True,
-                feature_names    = seg_dest_cands,
-                collinear_groups = STAGE_COLLINEAR_GROUPS.get('5_dest', []),
+                feature_names       = seg_dest_cands,
+                collinear_groups    = STAGE_COLLINEAR_GROUPS.get('5_dest', []),
+                require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get('5_dest', []),
                 fixed_features   = _dest_fixed,
                 fitness_metric   = 'mean(-BIC/n) [Larch NL]',
             )
@@ -5971,8 +6121,9 @@ def _run_ga_stage5_trip(trips, persons, skims, landuse, ga_kwargs,
 
         mode_ga  = GeneticAlgorithm(
             n_mode, _trip_mode_fit,
-            feature_names    = mode_cands,
-            collinear_groups = STAGE_COLLINEAR_GROUPS.get('5_mode', []),
+            feature_names       = mode_cands,
+            collinear_groups    = STAGE_COLLINEAR_GROUPS.get('5_mode', []),
+            require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get('5_mode', []),
             fixed_features   = [f for f in ['CRASH'] if f in mode_cands],
             **ga_kwargs,
         )
@@ -6009,8 +6160,9 @@ def _run_ga_stage5_trip(trips, persons, skims, landuse, ga_kwargs,
 
         dest_ga  = GeneticAlgorithm(
             len(dest_cands), _trip_dest_fit,
-            feature_names    = dest_cands,
-            collinear_groups = STAGE_COLLINEAR_GROUPS.get('5_dest', []),
+            feature_names       = dest_cands,
+            collinear_groups    = STAGE_COLLINEAR_GROUPS.get('5_dest', []),
+            require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get('5_dest', []),
             fixed_features   = [f for f in ['c_crash'] if f in dest_cands],
             **ga_kwargs,
         )
@@ -6151,8 +6303,9 @@ def _run_ga_stage6(trips, persons, landuse, ga_kwargs, n_restarts=2) -> GAResult
 
         purp_ga   = GeneticAlgorithm(
             len(feat_names), _purp_fitness,
-            feature_names    = feat_names,
-            collinear_groups = STAGE_COLLINEAR_GROUPS.get(6, []),
+            feature_names       = feat_names,
+            collinear_groups    = STAGE_COLLINEAR_GROUPS.get(6, []),
+            require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get(6, []),
             fixed_features   = [f for f in ['crash'] if f in feat_names],
             **ga_kwargs,
         )
@@ -6202,8 +6355,9 @@ def _run_ga_stage6(trips, persons, landuse, ga_kwargs, n_restarts=2) -> GAResult
         seeds.sort(key=lambda x: x.fitness, reverse=True)
         ga  = GeneticAlgorithm(
             len(feat_names), fitness,
-            feature_names    = feat_names,
-            collinear_groups = STAGE_COLLINEAR_GROUPS.get(6, []),
+            feature_names       = feat_names,
+            collinear_groups    = STAGE_COLLINEAR_GROUPS.get(6, []),
+            require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get(6, []),
             fixed_features   = [f for f in ['crash'] if f in feat_names],
             **ga_kwargs,
         )

@@ -620,6 +620,53 @@ def omx_to_dataframe(
 # 3.  HIGH-LEVEL READER  (main entry point)
 # ---------------------------------------------------------------------------
 
+def _overlay_real_walk_bike(df: pd.DataFrame) -> pd.DataFrame:
+    """Overlay OSM-routed DISTWALK/DISTBIKE onto a loaded skim DataFrame.
+
+    Source: demand_/walk_bike_osm_sa2_371.omx (built by
+    21_build_osm_walk_bike_skims.py), keyed by SA2 code — the same id space as
+    the 371-zone 507 skims, so the merge is on (OTAZ, DTAZ). Returns df
+    unchanged if the file is absent or its zone ids don't overlap df's (so it
+    never silently corrupts a mismatched zone system). Path overridable via
+    REAL_WALK_BIKE_OMX.
+    """
+    path = os.environ.get(
+        'REAL_WALK_BIKE_OMX',
+        os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      '..', 'demand_', 'walk_bike_osm_sa2_371.omx')))
+    if not path or not os.path.exists(path):
+        return df
+    if 'OTAZ' not in df.columns or 'DTAZ' not in df.columns:
+        return df
+    try:
+        wb = omx_to_dataframe(path, matrices=['DISTWALK', 'DISTBIKE'])
+    except Exception as e:
+        logger.warning(f"_overlay_real_walk_bike: could not read {path}: {e} — "
+                       "keeping existing DISTWALK/DISTBIKE")
+        return df
+    # Refuse to overlay across mismatched zone systems.
+    _shared = set(df['DTAZ'].unique()) & set(wb['DTAZ'].unique())
+    if len(_shared) < 0.5 * df['DTAZ'].nunique():
+        logger.warning(
+            f"_overlay_real_walk_bike: zone ids in {os.path.basename(path)} "
+            f"overlap only {len(_shared)} of {df['DTAZ'].nunique()} skim zones "
+            "— skipping overlay (zone-system mismatch)")
+        return df
+    wb = wb.rename(columns={'DISTWALK': '_wb_walk', 'DISTBIKE': '_wb_bike'})
+    df = df.merge(wb[['OTAZ', 'DTAZ', '_wb_walk', '_wb_bike']],
+                  on=['OTAZ', 'DTAZ'], how='left')
+    for src, dst in [('_wb_walk', 'DISTWALK'), ('_wb_bike', 'DISTBIKE')]:
+        df[dst] = df[src].where(df[src].notna(),
+                                df[dst] if dst in df.columns else df[src])
+    df = df.drop(columns=['_wb_walk', '_wb_bike'])
+    logger.info(
+        f"_overlay_real_walk_bike: applied real OSM walk/bike from "
+        f"{os.path.basename(path)} "
+        f"(walk mean={df['DISTWALK'].mean():.3f} bike mean={df['DISTBIKE'].mean():.3f} "
+        f"km; distinct={not np.allclose(df['DISTWALK'], df['DISTBIKE'])})")
+    return df
+
+
 def read_omx_skims(
     omx_path: str,
     matrices: Optional[List[str]] = None,
@@ -672,6 +719,15 @@ def read_omx_skims(
             f"been retired — point PIPELINE_SKIMS_PATH at sa2_skims_507(_omxspec)"
             f".omx, or set ZONE_SYSTEM_N_ZONES if you intend a different zone set."
         )
+
+    # ── ZONE MIGRATION (371): overlay real OSM walk/bike distances ────────
+    # If the OSM-routed walk/bike skim (demand_/21_build_osm_walk_bike_skims.py)
+    # has been built, replace the placeholder DISTWALK/DISTBIKE (which upstream
+    # are identical to each other and only 0.9x auto DIST) with the real
+    # pedestrian-network walk distance and the detour-scaled bike distance.
+    # No-op until that file exists, so this is inert on the branch and
+    # self-activates once the builder has run.
+    df = _overlay_real_walk_bike(df)
 
     if add_derived:
         # ── average travel time ───────────────────────────────────────

@@ -44,8 +44,14 @@ Usage
 import os
 
 # Must be set BEFORE importing pipeline_logger — it reads these at import time.
-os.environ.setdefault('NEW_POP_MAPPED', '1')
-os.environ.setdefault('NEW_POP', '0')       # keep HHTS + landuse on the standard 330-zone scope
+# ZONE MIGRATION (371): run SA2-native. NEW_POP=1 loads the new_pop population
+# with OTAZ/DTAZ = SA2 code directly (no ORDER indirection) and uses the 371-zone
+# 507 skims. NEW_POP_MAPPED is explicitly OFF — it collapses the 371 SA2 zones
+# down to the legacy 330 ORDER scheme (nearest-order), which is exactly what the
+# migration retires. 17 NSW-fringe zones have no population (354/371 populated) —
+# accepted; they remain valid destinations via land use.
+os.environ.setdefault('NEW_POP', '1')       # 371-zone SA2-native scope
+os.environ.setdefault('NEW_POP_MAPPED', '0')
 os.environ.setdefault('MODE', 'ga_staged')
 os.environ.setdefault('GA_ESTIMATOR', 'sa_bandit')
 
@@ -75,7 +81,14 @@ def ensure_crosswalk() -> None:
         print(f"Using existing crosswalk: {CROSSWALK_CSV}")
         return
     print("Zone crosswalk not found — building it now (see build_dynust_zone_crosswalk.py)...")
-    cw = build_crosswalk(DTA_DIR, 'seq_zone_ids_.csv')
+    # ZONE MIGRATION (371): SA2-native scope — map the 371 SA2 zones (by sa2_code
+    # + centroid) to DynusT network zones. sa2_zones_reference_357.csv has the
+    # 'sa2_code' column build_crosswalk keys on, replacing the legacy 330-zone
+    # seq_zone_ids_.csv (ORDER-based).
+    _abm_zone_csv = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        '..', 'demand_', 'sa2_zones_reference_357.csv'))
+    cw = build_crosswalk(DTA_DIR, _abm_zone_csv)
     os.makedirs(os.path.dirname(CROSSWALK_CSV), exist_ok=True)
     cw.to_csv(CROSSWALK_CSV, index=False)
     n_in = int(cw['in_network'].sum())

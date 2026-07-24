@@ -72,6 +72,43 @@ _DIST_WALK_CORR_WARNED: set = set()
 # WARNING (so it's visible), repeats are demoted to DEBUG.
 _WARNED_COLLINEAR_CA_PAIRS: set = set()
 
+# ── ZONE MIGRATION (371): default zone universe ──────────────────────────────
+# Fallback zone list when a data-derived one isn't available. In SA2-native mode
+# OTAZ/DTAZ are 9-digit SA2 codes, so the legacy `range(1, 330)` (ORDER 1..329)
+# is the wrong id space entirely. Read the real 371 SA2 codes from the migration
+# reference (saved_data/seq_zone_ids_371.csv, else the demand_ reference); cache.
+_ZONE_UNIVERSE_CACHE = None
+
+
+def _default_zone_universe() -> list:
+    """The active zone id universe (371 SA2 codes), as a sorted list."""
+    global _ZONE_UNIVERSE_CACHE
+    if _ZONE_UNIVERSE_CACHE is not None:
+        return _ZONE_UNIVERSE_CACHE
+    _here = os.path.dirname(os.path.abspath(__file__))
+    for _cand, _col in (
+        (os.path.join(_here, 'saved_data', 'seq_zone_ids_371.csv'), 'SA2_MAIN16'),
+        (os.path.normpath(os.path.join(_here, '..', 'demand_',
+                                       'sa2_zones_reference_357.csv')), 'sa2_code'),
+    ):
+        try:
+            if os.path.exists(_cand):
+                _z = sorted(int(x) for x in pd.read_csv(_cand)[_col]
+                            if pd.notna(x) and int(x) > 0)
+                if _z:
+                    _ZONE_UNIVERSE_CACHE = _z
+                    return _z
+        except Exception:
+            continue
+    # Last-resort legacy fallback (should never hit in a real 371 run).
+    _ZONE_UNIVERSE_CACHE = list(range(1, 330))
+    return _ZONE_UNIVERSE_CACHE
+
+
+def _default_n_zones() -> int:
+    """Count of zones in the active universe (371)."""
+    return len(_default_zone_universe())
+
 # ── Industry-of-employment → mode affinity group ─────────────────────────────
 # Source: ANZSIC 1-digit codes stored in 'indp' column (census/HHTS).
 # Groups industrial/agri workers as strong DA captives (remote sites, no transit).
@@ -1935,7 +1972,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
             mapping = dict(skims.mapping(skims.listMappings()[0]))
             zone_ids = sorted([int(k) for k in mapping.keys()])
         except Exception:
-            zone_ids = list(range(1, 330))
+            zone_ids = _default_zone_universe()
 
     if hasattr(logsums, 'values'):
         ls_vals  = logsums.values
@@ -7119,7 +7156,7 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
                 dt_mode['tour']['DTAZ'].to_series().unique().tolist())
             zone_ids = [int(z) for z in zone_ids if int(z) > 0 and int(z) != 330]
         except Exception:
-            zone_ids = list(range(1, 330))
+            zone_ids = _default_zone_universe()
 
     # If the DataTree only has one unique DTAZ (e.g. work/edu batch where all
     # persons share the same usual-location zone) the logsum matrix would be
@@ -7140,7 +7177,7 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
             pass
         # Final fallback: sequential 1-329
         if len(zone_ids) < 10:
-            zone_ids = list(range(1, 330))
+            zone_ids = _default_zone_universe()
         logger.debug(f"_logsums: zone list was <10 - expanded to {len(zone_ids)} zones")
 
     if verbose:
@@ -10261,7 +10298,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     _zone_ids_for_is = (
         [int(z) for z in ls.coords['zones'].values]
         if hasattr(ls, 'coords') and 'zones' in ls.coords
-        else list(range(1, 330))
+        else _default_zone_universe()
     )
     _n_zone_ids = len(_zone_ids_for_is)
     _n_obs_seg  = seg_acdc['ptour_id'].nunique() if 'ptour_id' in seg_acdc.columns else len(seg_acdc)
@@ -14270,7 +14307,7 @@ def _build_activitysim_location_observations(
     return out
 
 
-def _model_predicted_zone_shares(model, n_zones_hint: int = 330) -> pd.Series:
+def _model_predicted_zone_shares(model, n_zones_hint: int = None) -> pd.Series:
     """
     Compute model-predicted destination zone shares across all choosers.
 

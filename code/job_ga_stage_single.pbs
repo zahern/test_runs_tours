@@ -63,12 +63,29 @@ echo "Restarts    : ${GA_N_RESTARTS}"
 echo "Started     : $(date)"
 echo "=========================================="
 
-python -u -X utf8 _run_ga_single_stage.py \
-  --stage-id "${STAGE_ID}" \
-  --run-root "${RUN_ROOT}" \
-  --run-tag "${RUN_TAG}"
-
-EXIT_CODE=$?
+GA_PROFILE=${GA_PROFILE:-0}
+if [ "${GA_PROFILE}" = "1" ]; then
+  # cProfile only sees work in THIS process, and the SA search farms segments
+  # out to spawn-mode workers — so force serial here or the model fits stay
+  # hidden. Slower than a production run; use it for the call-tree shape, not
+  # wall time. Per-stage .pstats land in the code dir; combine them afterwards
+  # with:  python profile_report.py profile_estimation_stage*.pstats
+  export GA_PARALLEL_SEGMENTS=1
+  PSTATS="profile_estimation_stage${STAGE_ID}_${RUN_TAG}.pstats"
+  echo "GA_PROFILE=1 → cProfile (serial, GA_PARALLEL_SEGMENTS=1) → ${PSTATS}"
+  python -u -X utf8 -m cProfile -o "${PSTATS}" _run_ga_single_stage.py \
+    --stage-id "${STAGE_ID}" \
+    --run-root "${RUN_ROOT}" \
+    --run-tag "${RUN_TAG}"
+  EXIT_CODE=$?
+  python profile_report.py "${PSTATS}" 50 || true
+else
+  python -u -X utf8 _run_ga_single_stage.py \
+    --stage-id "${STAGE_ID}" \
+    --run-root "${RUN_ROOT}" \
+    --run-tag "${RUN_TAG}"
+  EXIT_CODE=$?
+fi
 
 echo "Finished: $(date) exit_code=${EXIT_CODE}"
 exit "${EXIT_CODE}"

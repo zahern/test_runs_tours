@@ -44,14 +44,24 @@ import re
 import numpy as np
 import pandas as pd
 
-DEMAND_DIR = r"Z:\test_runs_tours\demand_"
+# Portable paths: derive from this script's location so the job runs on the
+# Linux HPC (paths under ~/) as well as the Windows Z:\ checkout. The former
+# hardcoded Z:\ / z:\ paths only existed on Windows and broke every HPC run
+# (FileNotFoundError on sa2_zones_reference_357.csv). External roots
+# (activity_sim_resources, Paper_Plan) are siblings of test_runs_tours under the
+# home root, and are env-overridable.
+DEMAND_DIR = os.path.dirname(os.path.abspath(__file__))
+_TRT_ROOT  = os.path.normpath(os.path.join(DEMAND_DIR, ".."))
+_HOME_ROOT = os.path.normpath(os.path.join(_TRT_ROOT, ".."))
 ZONE_REF_357 = os.path.join(DEMAND_DIR, "sa2_zones_reference_357.csv")
-SOURCE_LANDUSE = (r"z:\activity_sim_resources\new_asim\SEQ-STM-ASIM\SEQ-STM-ASIM"
-                   r"\#Model_Masters\ActivitySim\asim_model_inputs\land_use_resciacre_test.csv")
+SOURCE_LANDUSE = os.environ.get("SOURCE_LANDUSE") or os.path.join(
+    _HOME_ROOT, "activity_sim_resources", "new_asim", "SEQ-STM-ASIM", "SEQ-STM-ASIM",
+    "#Model_Masters", "ActivitySim", "asim_model_inputs", "land_use_resciacre_test.csv")
 EXPANDED_CROSSWALK = os.path.join(DEMAND_DIR, "sa2_crosswalk_507_expanded.csv")
-LEGACY_LANDUSE = r"Z:\test_runs_tours\code\zone_order_and_landuse.csv"
-CENSUS_CONTROLS_DIR = r"Z:\Paper_Plan\synth_pop\data_sa2_controls"
-OUT_DIR = r"Z:\test_runs_tours\new_pop\saved_data"
+LEGACY_LANDUSE = os.path.join(_TRT_ROOT, "code", "zone_order_and_landuse.csv")
+CENSUS_CONTROLS_DIR = os.environ.get("CENSUS_CONTROLS_DIR") or os.path.join(
+    _HOME_ROOT, "Paper_Plan", "synth_pop", "data_sa2_controls")
+OUT_DIR = os.path.join(_TRT_ROOT, "new_pop", "saved_data")
 OUT_PATH = os.path.join(OUT_DIR, "zone_landuse_357.csv")
 
 # EMME-source employment columns pulled straight through, PLUS the parcel-area

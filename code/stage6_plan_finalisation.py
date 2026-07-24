@@ -51,6 +51,7 @@ import numpy as np
 import pandas as pd
 import logging
 import os
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -196,27 +197,39 @@ def validate_and_fix(plan: pd.DataFrame,
                     print(f"  WARNING: {z330.sum()} rows use catch-all zone 330 for {col}")
 
     # ── 4. schedule gap repair (per person) ───────────────────────────────
-    if {'STARTIME', 'ENDTIME', 'row_type'}.issubset(df.columns):
-        repaired = 0
+    # ── Tier-1 time-window scheduler: conflict-free per-person day ───────────
+    # A person cannot be in two places at once. Sweep each person's rows in time
+    # order with a running "cursor" (earliest free minute); any row that starts
+    # before the cursor (an OVERLAP / conflict) is pushed forward to begin at the
+    # cursor, PRESERVING its own duration (unlike the old fix, which truncated
+    # activities to prev_end+travtime). Consumed time thus makes later slots
+    # unavailable — the availability-propagation you asked for. Disable with
+    # GA_RESOLVE_CONFLICTS=0.
+    if ({'STARTIME', 'ENDTIME'}.issubset(df.columns)
+            and os.environ.get('GA_RESOLVE_CONFLICTS', '1').strip() != '0'):
         df = df.sort_values(['person_id', 'STARTIME']).reset_index(drop=True)
-        for pid, grp in df.groupby('person_id', sort=False):
-            idx_list = grp.index.tolist()
-            for k in range(1, len(idx_list)):
-                prev_idx = idx_list[k - 1]
-                curr_idx = idx_list[k]
-                prev_end  = df.at[prev_idx, 'ENDTIME']
-                curr_start = df.at[curr_idx, 'STARTIME']
-                if curr_start < prev_end - 1:   # gap > 1 min
-                    df.at[curr_idx, 'STARTIME'] = prev_end
-                    df.at[curr_idx, 'ENDTIME']  = max(
-                        prev_end + df.at[curr_idx, 'travtime']
-                        if 'travtime' in df.columns else prev_end + 5,
-                        prev_end + 1
-                    )
-                    _flag(pd.Index([curr_idx]), 'schedule_gap')
-                    repaired += 1
-        if verbose and repaired:
-            print(f"  Repaired {repaired} schedule gaps")
+        _st = pd.to_numeric(df['STARTIME'], errors='coerce').fillna(0.0).to_numpy(float)
+        _en = pd.to_numeric(df['ENDTIME'], errors='coerce').fillna(0.0).to_numpy(float)
+        _pid = df['person_id'].to_numpy()
+        _conf = []
+        _cursor, _cur = -1.0, None
+        for _i in range(len(df)):
+            if _pid[_i] != _cur:
+                _cur, _cursor = _pid[_i], -1.0
+            _dur = max(_en[_i] - _st[_i], 0.0)
+            if _cursor >= 0 and _st[_i] < _cursor - 1e-6:      # overlap → shift, keep duration
+                _st[_i] = _cursor
+                _en[_i] = min(_st[_i] + _dur, 1439.0)
+                _conf.append(_i)
+            else:
+                _en[_i] = min(_en[_i], 1439.0)
+            _cursor = _en[_i]
+        df['STARTIME'], df['ENDTIME'] = _st, _en
+        if _conf:
+            _flag(pd.Index(_conf), 'time_conflict')
+            if verbose:
+                print(f"  Tier-1 scheduler: resolved {len(_conf)} time-overlap "
+                      f"conflict(s) (duration-preserving)")
 
     # ── 5. mode-distance mismatch ─────────────────────────────────────────
     if 'dist' in df.columns and 'mode_name' in df.columns:
@@ -667,8 +680,11 @@ def apply_dynust_zone_crosswalk(motorised_trips: dict, crosswalk_path: str) -> d
     cw = pd.read_csv(crosswalk_path)
     order_to_dynust = cw.set_index('ORDER')['dynust_zone'].to_dict()
     in_network = set(cw.loc[cw['in_network'], 'ORDER'])
+    _zone_name = (cw.set_index('ORDER')['SA2_NAME16'].to_dict()
+                  if 'SA2_NAME16' in cw.columns else {})
 
     remapped = {}
+    _oon_rows = []   # out-of-network audit rows, written next to vehicle.dat
     for label, df in motorised_trips.items():
         if df is None or len(df) == 0:
             remapped[label] = df
@@ -678,6 +694,24 @@ def apply_dynust_zone_crosswalk(motorised_trips: dict, crosswalk_path: str) -> d
         dtaz = pd.to_numeric(d['DTAZ'], errors='coerce')
         keep = otaz.isin(in_network) & dtaz.isin(in_network)
         n_before = len(d)
+
+        # ── audit the trips that FAIL the coverage test, per offending zone,
+        # before dropping them - so vehicle.dat ships with an explicit
+        # account of what demand the DTA network is not seeing.
+        if (~keep).any():
+            _bad = pd.concat([
+                otaz[~otaz.isin(in_network)].rename('zone'),
+                dtaz[~dtaz.isin(in_network)].rename('zone'),
+            ])
+            for z, n in _bad.value_counts().items():
+                _oon_rows.append({
+                    'segment': label, 'abm_zone': int(z) if pd.notna(z) else -1,
+                    'zone_name': _zone_name.get(z, ''),
+                    'n_trip_ends': int(n),
+                    'reason': ('not in crosswalk' if z not in order_to_dynust
+                               else 'in_network=False (outside DTA coverage)'),
+                })
+
         d = d.loc[keep].copy()
         d['OTAZ'] = otaz.loc[keep].map(order_to_dynust).astype(int)
         d['DTAZ'] = dtaz.loc[keep].map(order_to_dynust).astype(int)
@@ -686,6 +720,25 @@ def apply_dynust_zone_crosswalk(motorised_trips: dict, crosswalk_path: str) -> d
             f"kept (both endpoints inside target network's coverage)"
         )
         remapped[label] = d
+
+    # Sidecar report next to the crosswalk: which zones carried demand that
+    # never reached vehicle.dat, and how much. This is the "inform" channel
+    # for out-of-network vehicles - read it whenever DTA volumes look light.
+    if _oon_rows:
+        _rep = pd.DataFrame(_oon_rows).sort_values('n_trip_ends', ascending=False)
+        _rep_path = os.path.join(os.path.dirname(os.path.abspath(crosswalk_path)),
+                                 'vehicle_dat_out_of_network.csv')
+        try:
+            _rep.to_csv(_rep_path, index=False)
+            _tot = int(_rep['n_trip_ends'].sum())
+            _top = _rep.head(5)[['abm_zone', 'zone_name', 'n_trip_ends']].to_dict('records')
+            logger.warning(
+                f"apply_dynust_zone_crosswalk: {_tot:,} trip-ends touched zones "
+                f"outside the DTA network and were EXCLUDED from vehicle.dat. "
+                f"Top zones: {_top}. Full report: {_rep_path}"
+            )
+        except Exception as _rep_e:
+            logger.warning(f"out-of-network report write failed: {_rep_e}")
     return remapped
 
 
@@ -1161,6 +1214,20 @@ MIN_DWELL = {
 # How much to tighten the distance constraint each repair iteration
 REPAIR_TT_REDUCTION = 0.75   # multiply max_tt by this each pass
 
+# Runaway protection for the per-activity Larch repair loop. Each repair
+# attempt builds a 1-case DataTree and triggers a fresh sharrow flow compile
+# (nb.TypingError → recompile → numpy fallback, ~1.5-2 s per call). Job
+# 23540863 spent ~17 h doing 32,586 such calls inside chunk 1/91 of Stage 6
+# and was killed by the 24 h walltime without writing any output. These caps
+# bound the damage: the loop stops after the time budget and reports how many
+# persons were left unrepaired instead of silently burning the walltime.
+REPAIR_TIME_BUDGET_S   = float(os.environ.get('STAGE6_REPAIR_TIME_BUDGET_S', '300'))
+# If the first sampled activities average more than this many seconds per
+# Larch call and nothing has been repaired yet, the per-case path is in the
+# recompile-every-call failure mode — abandon instead of limping through.
+REPAIR_SLOW_CALL_S     = float(os.environ.get('STAGE6_REPAIR_SLOW_CALL_S', '2.0'))
+REPAIR_SLOW_CALL_PROBE = 10   # activities to sample before the slow-call check
+
 
 def repair_compressed_dwells(
     plan: pd.DataFrame,
@@ -1252,8 +1319,40 @@ def repair_compressed_dwells(
 
     repaired   = 0
     unresolved = 0
+    n_attempt_errors = 0
+    _first_attempt_error = None
+    _n_acts_tried = 0
+    _t_start = time.monotonic()
+    _aborted_reason = None
 
-    for pid in bad_pids:
+    # The per-case Larch calls below re-trigger sharrow flow compilation on
+    # every activity; larch/sharrow log an 18-line "nb.TypingError" ERROR
+    # block plus "writing fresh flow code" INFO lines on each one (job
+    # 23540863 produced a 1M-line log this way). Suppress third-party log
+    # noise for the duration of the loop and restore afterwards.
+    _muted_loggers = {}
+    for _ln in ('larch', 'sharrow'):
+        _lg = logging.getLogger(_ln)
+        _muted_loggers[_ln] = _lg.level
+        _lg.setLevel(logging.CRITICAL)
+
+    try:
+      for pid in bad_pids:
+        if time.monotonic() - _t_start > REPAIR_TIME_BUDGET_S:
+            _aborted_reason = (
+                f"time budget exhausted ({REPAIR_TIME_BUDGET_S:.0f}s, "
+                f"override with STAGE6_REPAIR_TIME_BUDGET_S)"
+            )
+            break
+        if (_n_acts_tried >= REPAIR_SLOW_CALL_PROBE and repaired == 0
+                and (time.monotonic() - _t_start) / _n_acts_tried > REPAIR_SLOW_CALL_S):
+            _aborted_reason = (
+                f"first {_n_acts_tried} activities averaged "
+                f"{(time.monotonic() - _t_start) / _n_acts_tried:.1f}s/repair with 0 "
+                "repaired — per-case Larch path is recompiling its flow on every "
+                "call (see STAGE6_REPAIR_SLOW_CALL_S); not viable at this scale"
+            )
+            break
         person_rows = df[df['person_id'] == pid].copy()
         person_acts = person_rows[person_rows['row_type'] == 'activity']
         person_comp = compressed[compressed['person_id'] == pid]
@@ -1285,6 +1384,7 @@ def repair_compressed_dwells(
 
             current_max_tt = float(MODE_TT_CAP.get(1, 120.0))  # start from DA cap
             success = False
+            _n_acts_tried += 1
 
             for attempt in range(max_iterations):
                 # tighten distance constraint
@@ -1355,16 +1455,42 @@ def repair_compressed_dwells(
                         break
 
                 except Exception as e:
-                    logger.debug(f"Repair attempt {attempt+1} failed "
-                                 f"pid={pid} purpose={purpose}: {e}")
+                    n_attempt_errors += 1
+                    if _first_attempt_error is None:
+                        # First failure at WARNING with full context; the rest at
+                        # DEBUG (they are almost always the same root cause and
+                        # job 23540863 showed what per-attempt spam does to logs).
+                        _first_attempt_error = repr(e)
+                        logger.warning(
+                            f"Repair attempt failed (first of possibly many) "
+                            f"pid={pid} purpose={purpose}: {e!r} — further "
+                            f"attempt errors logged at DEBUG"
+                        )
+                    else:
+                        logger.debug(f"Repair attempt {attempt+1} failed "
+                                     f"pid={pid} purpose={purpose}: {e}")
                     continue
 
             if not success:
                 unresolved += 1
+    finally:
+        for _ln, _lvl in _muted_loggers.items():
+            logging.getLogger(_ln).setLevel(_lvl)
 
+    if _aborted_reason is not None:
+        _n_skipped = len(bad_pids) - repaired - unresolved
+        logger.warning(
+            f"repair_compressed_dwells ABORTED: {_aborted_reason}. "
+            f"{repaired} repaired, {unresolved} unresolvable, "
+            f"~{max(_n_skipped, 0)} persons left unrepaired (their compressed "
+            f"dwells pass through unchanged — same outcome as --no-repair)."
+        )
+    _summary = (f"  Repair loop: {repaired} activities repaired, "
+                f"{unresolved} unresolvable, {n_attempt_errors} attempt errors"
+                + (f", ABORTED ({_aborted_reason})" if _aborted_reason else ""))
     if verbose:
-        print(f"  Repair loop: {repaired} activities repaired, "
-              f"{unresolved} unresolvable")
+        print(_summary)
+    logger.info(_summary.strip())
 
     return df
 

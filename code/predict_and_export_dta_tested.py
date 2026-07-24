@@ -62,6 +62,14 @@ import os
 os.environ.setdefault('NEW_POP_MAPPED', '1')
 os.environ.setdefault('NEW_POP', '0')       # keep HHTS + landuse on the standard 330-zone scope
 os.environ.setdefault('MODE', 'predict_only')
+# Full-SEQ zone scope (incl. Tweed + NSW Richmond Valley): NEW_POP=1 switches
+# pipeline_logger to the SA2-direct zone universe (OTAZ IS the SA2 code) with
+# the 371-zone skims/landuse, instead of the legacy 330-zone ORDER scope whose
+# seq_zone_ids_.csv never carried the NSW zones ("100 SA2 codes not in zone
+# mapping ... defaulted to TAZ 330"). Must be set BEFORE pipeline_logger is
+# imported - it resolves scope at module level. Override with NEW_POP=0 to
+# reproduce a legacy-scope export.
+os.environ.setdefault('NEW_POP', '1')
 
 import gc
 import shutil
@@ -75,21 +83,54 @@ from stage6_plan_finalisation import run_stage6
 from spatial_assignment import get_zone_centroids_rich
 from build_dynust_zone_crosswalk import build_crosswalk
 
-DTA_DIR       = r'Z:\test_runs_tours\DTA\DTA_Brisbane_tested'
+# Target network switched 2026-07: DTA_Brisbane_tested's zone files were
+# stale from 2019-01; SEQ_Running_UE is the actively-maintained network
+# (349 zones, full SEQ coverage). Its zone geometry comes from
+# demand_/dta_349_zones.gpkg (EPSG:4326, zone_id matches network.dat) since
+# it ships no GIS_Network.xls. Env overrides let a run target the old
+# network without code edits.
+# Paths resolved relative to this file so they work both on the HPC
+# (/mnt/hpccs01/home/ahernz/test_runs_tours/...) and on the Z:-mounted
+# Windows checkout - never hardcode the drive letter here.
+_CODE_DIR     = os.path.dirname(os.path.abspath(__file__))
+_TRT_ROOT     = os.path.normpath(os.path.join(_CODE_DIR, '..'))
+DTA_DIR       = os.environ.get('DTA_DIR',
+                               os.path.join(_TRT_ROOT, 'DTA', 'SEQ_Running_UE'))
+DTA_ZONE_GPKG = os.environ.get('DTA_ZONE_GPKG',
+                               os.path.join(_TRT_ROOT, 'demand_', 'dta_349_zones.gpkg'))
 SCRATCH_DIR   = 'runs/predict_dta_tested'
-CROSSWALK_CSV = 'saved_data/abm_to_dynust_zone_crosswalk.csv'
+CROSSWALK_CSV = os.environ.get('DTA_CROSSWALK_CSV',
+                               'saved_data/abm_to_seq_running_ue_crosswalk.csv')
 
 
 def ensure_crosswalk() -> None:
     if os.path.exists(CROSSWALK_CSV):
         print(f"Using existing crosswalk: {CROSSWALK_CSV}")
         return
-    print("Zone crosswalk not found — building it now (see build_dynust_zone_crosswalk.py)...")
-    cw = build_crosswalk(DTA_DIR, 'seq_zone_ids_.csv')
+    print("Zone crosswalk not found — building it now (see build_dynus_zone_crosswalk.py)...")
+    # SEQ_Running_UE covers all of SEQ, so a generous match radius keeps
+    # every ABM zone; genuinely-external zones still fall out via dist_m.
+    # Zone list follows scope: NEW_POP=1 uses the SA2-keyed 371-zone
+    # reference (matching OTAZ=SA2-code trips), legacy uses seq_zone_ids_.
+    _abm_zones = (os.path.join(_TRT_ROOT, 'demand_', 'sa2_zones_reference_357.csv')
+                  if os.environ.get('NEW_POP', '0') == '1'
+                  else 'seq_zone_ids_.csv')
+    # SEQ_Running_UE has no origin.dat/GIS_Network.xls - the gpkg is the ONLY
+    # centroid source for it, so a missing gpkg must fail loudly here rather
+    # than fall back to the legacy parser and confuse the traceback.
+    _gpkg = DTA_ZONE_GPKG if os.path.exists(DTA_ZONE_GPKG) else None
+    if _gpkg is None and not os.path.exists(os.path.join(DTA_DIR, 'origin.dat')):
+        raise FileNotFoundError(
+            f"Neither zone gpkg ({DTA_ZONE_GPKG}) nor {DTA_DIR}/origin.dat "
+            "exists - cannot build zone centroids for this DTA network. "
+            "Set DTA_ZONE_GPKG to the network's zone-polygon GeoPackage."
+        )
+    cw = build_crosswalk(DTA_DIR, _abm_zones, max_dist_m=15000.0,
+                         zone_gpkg=_gpkg)
     os.makedirs(os.path.dirname(CROSSWALK_CSV), exist_ok=True)
     cw.to_csv(CROSSWALK_CSV, index=False)
     n_in = int(cw['in_network'].sum())
-    print(f"  {n_in}/{len(cw)} ABM zones kept (inside DTA_Brisbane_tested's coverage)")
+    print(f"  {n_in}/{len(cw)} ABM zones matched to {os.path.basename(DTA_DIR)}'s zones")
 
 
 def main() -> None:

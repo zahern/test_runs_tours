@@ -1,4 +1,4 @@
-\begin{thebibliography}{21}
+\begin{thebibliography}{26}
 \providecommand{\natexlab}[1]{#1}
 
 \bibitem[{{World Health Organization}(2023)}]{who2023}
@@ -42,10 +42,6 @@ Hyd{\'e}n, C., \emph{The development of a method for traffic safety evaluation:
   The Swedish Traffic Conflicts Technique}. Ph.D. thesis, Lund University,
   1987.
 
-\bibitem[{Heinrich(1931)}]{heinrich1931}
-Heinrich, H.~W., \emph{Industrial Accident Prevention: A Scientific Approach}.
-  McGraw-Hill, 1931.
-
 \bibitem[{Xu et~al.(2024)Xu, Gao, Zuo, and Ozbay}]{Xu2024}
 Xu, C., J.~Gao, F.~Zuo, and K.~Ozbay, Estimating Urban Traffic Safety and
   Analyzing Spatial Patterns through the Integration of City-Wide Near-Miss
@@ -75,6 +71,28 @@ Nie, Y., M.~Zhang, B.~Wang, C.~Zhang, and Y.~Zhao, Vehicle trajectory fractal
   theory for macro-level highway crash rate analysis. \emph{Accident Analysis
   \& Prevention}, Vol. 215, 2025, p. 107989.
 
+\bibitem[{Yasmin et~al.(2018)Yasmin, Momtaz, Nashad, and Eluru}]{Yasmin2018}
+Yasmin, S., S.~U. Momtaz, T.~Nashad, and N.~Eluru, A multivariate copula-based
+  macro-level crash count model. \emph{Transportation Research Record}, Vol.
+  2672, No.~30, 2018, pp. 64--75.
+
+\bibitem[{Mothafer et~al.(2018)Mothafer, Yamamoto, and Shankar}]{Mothafer2018}
+Mothafer, G. I. M.~A., T.~Yamamoto, and V.~N. Shankar, A multivariate
+  heterogeneous-dispersion count model for asymmetric interdependent freeway
+  crash types. \emph{Transportation Research Part B: Methodological}, Vol. 108,
+  2018, pp. 84--105.
+
+\bibitem[{Park et~al.(2021)Park, Oh, Ahn, and Oh}]{Park2021}
+Park, E.~S., R.~Oh, J.~Y. Ahn, and M.~S. Oh, Bayesian analysis of multivariate
+  crash counts using copulas. \emph{Accident Analysis and Prevention}, Vol.
+  149, 2021, p. 105431.
+
+\bibitem[{Bhowmik et~al.(2021)Bhowmik, Rahman, Yasmin, and Eluru}]{Bhowmik2021}
+Bhowmik, T., M.~Rahman, S.~Yasmin, and N.~Eluru, Exploring analytical,
+  simulation-based, and hybrid model structures for multivariate crash
+  frequency modeling. \emph{Analytic Methods in Accident Research}, Vol.~31,
+  2021, p. 100167.
+
 \bibitem[{Yang et~al.(2021)Yang, Xie, Ozbay, Zhao, and Yang}]{Yang2021}
 Yang, D., K.~Xie, K.~Ozbay, Z.~Zhao, and H.~Yang, Copula-based joint modeling
   of crash count and conflict risk measures with accommodation of mixed
@@ -86,6 +104,18 @@ Ahmad, N., V.~V. Gayah, and E.~T. Donnell, Copula-based bivariate count data
   regression models for simultaneous estimation of crash counts based on
   severity and number of vehicles. \emph{Accident Analysis and Prevention},
   Vol. 181, 2023, p. 106928.
+
+\bibitem[{Lian et~al.(2025)Lian, Yasmin, and Haque}]{Lian2025}
+Lian, Y., S.~Yasmin, and M.~M. Haque, Influence of road safety policies on the
+  long-term trends in fatal crashes: A Gaussian copula-based time series count
+  model with an autoregressive moving average process. \emph{Accident Analysis
+  and Prevention}, Vol. 211, 2025, p. 107795.
+
+\bibitem[{Song and Sze(2026)}]{Song2026}
+Song, P. and N.~N. Sze, Joint modeling of collision type and driver injury
+  severities in truck-involved crashes: A copula-based multivariate approach.
+  \emph{Transportation Research Part A: Policy and Practice}, Vol. 211, 2026,
+  p. 105136.
 
 \bibitem[{Calder\'in-Ojeda and G\'omez-D\'eniz(2019)}]{CaldronOjeda2019}
 Calder\'in-Ojeda, E. and E.~G\'omez-D\'eniz, The multivariate negative
@@ -99,12 +129,6 @@ Zheng, L., T.~Sayed, and M.~Essa, Validating the bivariate extreme value
   indicators. \emph{Accident Analysis \& Prevention}, Vol. 123, 2019, pp.
   314--323.
 
-\bibitem[{Geedipally and Lord(2010)}]{Geedipally2010}
-Geedipally, S.~R. and D.~Lord, Investigating the effect of modeling
-  single-vehicle and multi-vehicle crashes separately on confidence intervals
-  of Poisson-gamma models. \emph{Accident Analysis and Prevention}, Vol.~42,
-  No.~4, 2010, pp. 1273--1282.
-
 \bibitem[{Prentice(1989)}]{prentice1989}
 Prentice, R.~L., Surrogate endpoints in clinical trials: Definition and
   operational criteria. \emph{Statistics in Medicine}, Vol.~8, No.~4, 1989, pp.
@@ -113,5 +137,10 @@ Prentice, R.~L., Surrogate endpoints in clinical trials: Definition and
 \bibitem[{Vuong(1989)}]{vuong1989}
 Vuong, Q.~H., \emph{Likelihood ratio tests for model selection and non-nested
   hypotheses}, 1989.
+
+\bibitem[{Davis and Gao(2025)}]{Davis2025}
+Davis, G.~A. and J.~Gao, Transferring crash modification factors to automated
+  vehicle environments using surrogate endpoints: Theoretical considerations.
+  \emph{Accident Analysis and Prevention}, Vol. 220, 2025, p. 108112.
 
 \end{thebibliography}

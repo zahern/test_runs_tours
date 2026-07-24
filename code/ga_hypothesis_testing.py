@@ -1297,6 +1297,28 @@ class GeneticAlgorithm:
         stagnation_count = 0
         invalid_warned = False
 
+        # ── Hard early-stop on convergence ───────────────────────────────────
+        # Most segments find their best solution within a handful of generations
+        # (e.g. by gen ~11) and then run the full n_generations budget re-searching
+        # a converged space — the dominant, avoidable cost of a staged run. Stop
+        # once the best fitness has not improved for `patience` generations, after
+        # a `min_gens` exploration floor (so the diversity-injection / mutation
+        # boost above still get a chance to escape a local optimum first).
+        # Disable with GA_EARLY_STOP=0; tune with GA_EARLY_STOP_PATIENCE /
+        # GA_EARLY_STOP_MIN_GENS.
+        import os as _os
+        _early_stop = _os.environ.get('GA_EARLY_STOP', '1').strip() != '0'
+
+        def _env_int(_name: str, _default: int) -> int:
+            try:
+                _v = int(_os.environ.get(_name, '0'))
+                return _v if _v > 0 else _default
+            except ValueError:
+                return _default
+
+        _es_patience = _env_int('GA_EARLY_STOP_PATIENCE', max(3 * self.stagnation_limit, 24))
+        _es_min_gens = _env_int('GA_EARLY_STOP_MIN_GENS', max(2 * self.stagnation_limit, 20))
+
         for gen in range(self.n_generations):
             print(f"Gen {gen:3d} | evaluating population... ", end='', flush=True)
             fitnesses = [ind.fitness for ind in pop]
@@ -1366,6 +1388,17 @@ class GeneticAlgorithm:
                           f"n_feat={int(gen_best.genes.sum())} "
                           f"div={div:.2f} mut={cur_rate:.3f} "
                           f"stag={stagnation_count}")
+
+            # ── Early-stop: best converged, no improvement for `patience` gens ──
+            if (_early_stop and gen >= _es_min_gens
+                    and stagnation_count >= _es_patience):
+                label = f" [{self.progress_label}]" if self.progress_label else ""
+                _metric = (f"BIC/n={-best_ever.fitness:.4f}"
+                           if best_ever.fitness > -1e8 else f"fitness={best_ever.fitness:.4f}")
+                print(f"  Early stop{label} at gen {gen}/{self.n_generations}: "
+                      f"best unchanged for {stagnation_count} gens "
+                      f"(patience={_es_patience}); {_metric}")
+                break
 
             # elitism
             elites  = sorted(pop, key=lambda x: x.fitness, reverse=True)[:self.elitism_k]
@@ -1818,6 +1851,16 @@ class BanditFeatureSearcher:
         alpha0:              float = 1.0,   # Beta prior α  (pseudocount for "on")
         beta0:               float = 1.0,   # Beta prior β  (pseudocount for "off")
         t_initial:           float = None,  # SA: None = auto-calibrate from first batch
+        # Mixed-model search: features listed here get a SECOND gene appended
+        # to the chromosome - "estimate this coefficient as a random (normal)
+        # parameter" - with its own Thompson arm, so fixed-vs-random becomes a
+        # searched decision instead of the post-hoc greedy toggle
+        # (_greedy_randvar_search). Only meaningful when the fitness function
+        # decodes the extra genes (see decode_rand_genes()); fitness functions
+        # that zip() genes against the candidate list simply never read them.
+        rand_param_features: Optional[List[str]] = None,
+        never_random:        Optional[List[str]] = None,
+        force_random:        Optional[List[str]] = None,
         # Accept and silently ignore GA-only kwargs for interface compatibility
         mutation_rate:       float = 0.18,
         mutation_rate_max:   float = 0.35,
@@ -1852,12 +1895,30 @@ class BanditFeatureSearcher:
         self._opt_idx: List[int] = [
             i for i in range(n_features) if i not in self._fixed_idx
         ]
+        # Random-parameter gene block (appended after the include/exclude
+        # genes). Indices into feature_names of features eligible for a
+        # random-parameter bit; never_random names excluded, force_random
+        # names pinned ON whenever the feature itself is included.
+        _never = set(never_random or [])
+        _names = self.feature_names or []
+        self._rand_feat_idx: List[int] = [
+            i for i, nm in enumerate(_names)
+            if rand_param_features and nm in set(rand_param_features)
+            and nm not in _never
+        ]
+        self.n_rand = len(self._rand_feat_idx)
+        self._force_rand_pos: set = {
+            j for j, fi in enumerate(self._rand_feat_idx)
+            if _names[fi] in set(force_random or [])
+        }
+        self.n_genes = n_features + self.n_rand
         # Fitness cache — shared across restarts
         self._cache: dict = {}
         self.cache_hits     = 0
-        # Beta arm posteriors — one entry per feature (fixed features never updated)
-        self._alpha = np.full(n_features, alpha0, dtype=float)
-        self._beta  = np.full(n_features, beta0,  dtype=float)
+        # Beta arm posteriors — one per include gene + one per rand gene
+        # (fixed features never updated)
+        self._alpha = np.full(self.n_genes, alpha0, dtype=float)
+        self._beta  = np.full(self.n_genes, beta0,  dtype=float)
         # Running mean of valid (> -1e8) fitness values for reward threshold
         self._fit_sum   = 0.0
         self._fit_count = 0
@@ -1865,6 +1926,46 @@ class BanditFeatureSearcher:
         self._weakness: dict = {}
 
     # ── sampling helpers ────────────────────────────────────────────────────
+
+    def _split_genes(self, genes: np.ndarray):
+        """Full chromosome -> (include block, rand block). Rand block may be
+        empty when rand_param_features wasn't given (n_rand == 0)."""
+        return genes[:self.n_features], genes[self.n_features:]
+
+    def _attach_rand_genes(self, base: np.ndarray, tail: np.ndarray = None,
+                           sample_missing: bool = True) -> np.ndarray:
+        """Append the rand-param gene block to a repaired include block.
+
+        Gating: a rand gene can only be 1 when its feature is included;
+        force_random positions are pinned to 1 whenever the feature is on.
+        When tail is None the block is Thompson-sampled from its own arms.
+        """
+        if self.n_rand == 0:
+            return base
+        out = np.zeros(self.n_genes, dtype=int)
+        out[:self.n_features] = base
+        for j, fi in enumerate(self._rand_feat_idx):
+            gpos = self.n_features + j
+            if base[fi] != 1:
+                continue                      # feature off -> rand bit off
+            if j in self._force_rand_pos:
+                out[gpos] = 1
+            elif tail is not None and len(tail) == self.n_rand:
+                out[gpos] = int(tail[j])
+            elif sample_missing:
+                theta = float(self.rng.beta(
+                    max(self._alpha[gpos], 1e-6), max(self._beta[gpos], 1e-6)))
+                out[gpos] = int(self.rng.random() < theta)
+        return out
+
+    def decode_rand_genes(self, genes: np.ndarray) -> List[str]:
+        """Feature names whose random-parameter gene is ON in this chromosome.
+        For fitness functions that estimate mixed models."""
+        if self.n_rand == 0 or len(genes) <= self.n_features:
+            return []
+        tail = genes[self.n_features:]
+        return [self.feature_names[fi]
+                for j, fi in enumerate(self._rand_feat_idx) if tail[j] == 1]
 
     def _sample_chromosome(self) -> np.ndarray:
         """Sample one chromosome via Thompson sampling."""
@@ -1894,7 +1995,82 @@ class BanditFeatureSearcher:
                 self.rng, protected_idx=self._fixed_idx,
                 collinear_groups=self.collinear_groups,
             )
-        return genes
+        return self._attach_rand_genes(genes)
+
+    def _directed_candidate(self, cur_genes: np.ndarray) -> np.ndarray:
+        """
+        Analyst-like local move: drop the weakest active feature (near-zero
+        coefficient, insignificant, never moved from its start value, or
+        pinned at a bound - see _update_feature_weakness) and, if it belongs
+        to a collinear/require-one group, try turning on a currently-inactive
+        group-mate instead of just leaving a gap. Mirrors how an analyst
+        reworks a spec - "this term isn't pulling its weight, let me try a
+        different form of the same idea" - instead of a blind random flip.
+
+        Always mixed in as a MINORITY of proposals (see run()), alongside
+        Thompson sampling and plain random local flips, so the search stays
+        mostly stochastic/exploratory and doesn't collapse into pure greedy
+        hill-climbing that gets stuck at the first local optimum.
+        """
+        cand_base, cand_tail = self._split_genes(cur_genes.copy())
+        cand_genes = cand_base
+        if not self.feature_names or not self._weakness:
+            return self._attach_rand_genes(cand_genes, cand_tail)
+        active_opt = [i for i in self._opt_idx if cand_genes[i] == 1]
+        if not active_opt:
+            return self._attach_rand_genes(cand_genes, cand_tail)
+        weights = np.array([
+            self._weakness.get(self.feature_names[i], 0.0) for i in active_opt
+        ])
+        if weights.max() <= 0:
+            # nothing known to be weak yet - nothing to do
+            return self._attach_rand_genes(cand_genes, cand_tail)
+        drop_idx = active_opt[int(np.argmax(weights))]
+        # Redundant-by-construction safety net: active_opt is built from
+        # self._opt_idx, which already excludes every fixed/protected index
+        # (CRASH, etc. - see fixed_features in __init__), so this can never
+        # actually fire. Kept explicit anyway since dropping the safety
+        # variable this search exists to test would be a silent, serious bug.
+        assert drop_idx not in self._fixed_idx, (
+            f"_directed_candidate tried to drop fixed feature "
+            f"{self.feature_names[drop_idx]!r} - this must never happen"
+        )
+        cand_genes[drop_idx] = 0
+        dropped_name = self.feature_names[drop_idx]
+
+        # Look for a substitute: another member of the same collinear/
+        # require-one group that's currently off - "try a different form of
+        # the same idea" rather than just deleting the concept outright.
+        substitute_pool: List[str] = []
+        for group in list(self.collinear_groups or []) + list(self.require_one_groups or []):
+            if dropped_name in group:
+                substitute_pool.extend(f for f in group if f != dropped_name)
+        feat_idx = {f: i for i, f in enumerate(self.feature_names)}
+        candidates = [
+            feat_idx[f] for f in dict.fromkeys(substitute_pool)
+            if f in feat_idx and feat_idx[f] in self._opt_idx
+            and cand_genes[feat_idx[f]] == 0
+        ]
+        if candidates:
+            pick = int(self.rng.choice(candidates))
+            cand_genes[pick] = 1
+
+        cand_genes = _enforce_feature_bounds(
+            cand_genes, self.min_features, self.max_features,
+            self.rng, protected_idx=self._fixed_idx,
+        )
+        if self.collinear_groups and self.feature_names:
+            cand_genes = _repair_collinearity(
+                cand_genes, self.feature_names, self.collinear_groups,
+                self.rng, protected_idx=self._fixed_idx,
+            )
+        if self.require_one_groups and self.feature_names:
+            cand_genes = _repair_require_one(
+                cand_genes, self.feature_names, self.require_one_groups,
+                self.rng, protected_idx=self._fixed_idx,
+                collinear_groups=self.collinear_groups,
+            )
+        return self._attach_rand_genes(cand_genes, cand_tail)
 
     def _evaluate_one(self, ind: Individual) -> Individual:
         key = tuple(ind.genes.tolist())
@@ -1951,6 +2127,22 @@ class BanditFeatureSearcher:
             else:  # genes[i] == 0
                 if above_avg:
                     self._beta[i] += 0.04  # feature absent from good model
+
+        # Random-parameter arms: only informative when the feature itself was
+        # in the model (rand gene is gated on the include gene), so absent
+        # features contribute no signal either way.
+        if self.n_rand and len(genes) >= self.n_genes:
+            for j, fi in enumerate(self._rand_feat_idx):
+                gpos = self.n_features + j
+                if genes[fi] != 1 or j in self._force_rand_pos:
+                    continue
+                if genes[gpos] == 1:
+                    if above_avg:
+                        self._alpha[gpos] += 0.4
+                    else:
+                        self._beta[gpos] += 0.4
+                elif above_avg:
+                    self._beta[gpos] += 0.04
 
         # Update running mean
         self._fit_sum   += fitness
@@ -2049,14 +2241,24 @@ class BanditFeatureSearcher:
             n_accepted = 0
 
             for _ in range(self.pop_size):
-                # Propose candidate: mix local bit-flip (30 % of steps) with
-                # Thompson sampling to maintain neighbourhood search alongside
-                # global exploration and prevent flat convergence when the
-                # posterior collapses to a small corner of chromosome space.
-                if (self._opt_idx and len(self._opt_idx) >= 2
-                        and self.rng.random() < 0.30):
+                # Propose candidate: mix three move types so the search stays
+                # mostly stochastic (avoids getting stuck at a local optimum)
+                # while still spending some steps on analyst-like moves:
+                #   20% directed  - drop the weakest active feature, try a
+                #                   collinear/require-one group-mate instead
+                #                   ("this term isn't pulling its weight, try
+                #                   a different form of the same idea")
+                #   30% local     - plain random 1-2 bit flip from cur_genes
+                #   50% global    - Thompson sample from the full posterior
+                _move_r = self.rng.random()
+                if (self._opt_idx and len(self._opt_idx) >= 2 and _move_r < 0.20):
+                    cand_genes = self._directed_candidate(cur_genes)
+                elif (self._opt_idx and len(self._opt_idx) >= 2 and _move_r < 0.50):
                     # Local perturbation: flip 1–2 optional bits from cur_genes
-                    cand_genes = cur_genes.copy()
+                    # (include block only; rand block re-gated after repair,
+                    # occasionally flipping one rand bit as its own local move)
+                    _lp_base, _lp_tail = self._split_genes(cur_genes.copy())
+                    cand_genes = _lp_base
                     n_flips = int(self.rng.integers(
                         1, max(2, min(3, len(self._opt_idx) // 3 + 1))
                     ))
@@ -2082,6 +2284,12 @@ class BanditFeatureSearcher:
                             protected_idx=self._fixed_idx,
                             collinear_groups=self.collinear_groups,
                         )
+                    if self.n_rand and len(_lp_tail) == self.n_rand \
+                            and self.rng.random() < 0.5:
+                        _lp_tail = _lp_tail.copy()
+                        _j = int(self.rng.integers(0, self.n_rand))
+                        _lp_tail[_j] = 1 - _lp_tail[_j]
+                    cand_genes = self._attach_rand_genes(cand_genes, _lp_tail)
                 else:
                     # Global Thompson sample (standard path)
                     cand_genes = self._sample_chromosome()
@@ -2224,6 +2432,7 @@ def _make_searcher(
     require_one_groups: List[List[str]] = None,
     fixed_features:     Optional[List[str]] = None,
     fitness_metric:     str = 'mean(-BIC/n)',
+    stage_id:           Optional[str] = None,
 ) -> 'GeneticAlgorithm | SimulatedAnnealing | BanditFeatureSearcher':
     """
     Factory: return the appropriate searcher class.
@@ -2236,6 +2445,14 @@ def _make_searcher(
 
     All three classes share the run_with_restarts() interface so callers
     require no changes.
+
+    stage_id: when given (e.g. 'stage4', 'stage5_mode', 'stage5_dest') the
+    stage's declared constraints from ga_constraints.PIPELINE_CONSTRAINTS
+    (SearchLibrium ConstraintBuilder format) are merged into the searcher's
+    native constraint kwargs — force_include → fixed_features,
+    mutually_exclusive → collinear_groups, min_behavioral →
+    require_one_groups — and force_exclude vars are masked to 0 in a fitness
+    wrapper (the searchers have no native banned-feature support).
     """
     _force_sa     = os.environ.get('GA_USE_SA',     '0').strip() == '1'
     _force_bandit = (os.environ.get('GA_USE_BANDIT',    '0').strip() == '1'
@@ -2246,10 +2463,61 @@ def _make_searcher(
         cls = SimulatedAnnealing
     else:
         cls = GeneticAlgorithm
+
+    feature_names = feature_names or []
+    try:
+        from ga_constraints import searcher_constraint_kwargs
+        _ck = searcher_constraint_kwargs(
+            stage_id, feature_names,
+            fixed_features=fixed_features,
+            collinear_groups=collinear_groups,
+            require_one_groups=require_one_groups,
+        )
+        fixed_features     = _ck['fixed_features']
+        collinear_groups   = _ck['collinear_groups']
+        require_one_groups = _ck['require_one_groups']
+        _banned            = _ck['banned_features']
+    except Exception as _ce:
+        logger.debug(f"_make_searcher: constraint merge skipped ({_ce})")
+        _banned = []
+
+    if _banned and feature_names:
+        _banned_idx = np.array(
+            [i for i, n in enumerate(feature_names) if n in set(_banned)],
+            dtype=int,
+        )
+        _inner_fitness = fitness_fn
+
+        def fitness_fn(genes, _inner=_inner_fitness, _idx=_banned_idx):
+            g = np.asarray(genes).copy()
+            g[_idx] = 0
+            return _inner(g)
+
+    # ── Mixed-model (random-parameter) gene search ────────────────────────
+    # GA_MXL_GENE_SEARCH=1 appends a "fixed vs random (normal)" gene per
+    # eligible feature to the bandit-SA chromosome (BanditFeatureSearcher
+    # rand_param_features), making random-parameter choice a first-class
+    # searched decision instead of the post-hoc greedy toggle
+    # (GA_RAND_PARAM_SEARCH). Only effective when (a) the searcher is the
+    # bandit (GA class ignores the kwargs) and (b) the stage's fitness
+    # function decodes the extra genes via searcher.decode_rand_genes() and
+    # fits an MXL - a fitness that ignores them just wastes the extra arms.
+    # force_random / never_random come from ga_constraints' new_features().
+    if (os.environ.get('GA_MXL_GENE_SEARCH', '0').strip() == '1'
+            and cls is BanditFeatureSearcher and feature_names):
+        try:
+            from ga_constraints import random_var_constraints
+            _never_r, _force_r = random_var_constraints(stage_id)
+        except Exception:
+            _never_r, _force_r = [], []
+        ga_kwargs.setdefault('rand_param_features', list(feature_names))
+        ga_kwargs.setdefault('never_random', list(_never_r))
+        ga_kwargs.setdefault('force_random', list(_force_r))
+
     return cls(
         n_features,
         fitness_fn,
-        feature_names      = feature_names or [],
+        feature_names      = feature_names,
         collinear_groups   = collinear_groups or [],
         require_one_groups = require_one_groups or [],
         fixed_features     = fixed_features or [],
@@ -2356,6 +2624,7 @@ def _ga_segment_worker(payload: dict) -> dict:
         require_one_groups  = require_one_groups,
         fixed_features      = fixed_feats,
         fitness_metric      = fitness_metric,
+        stage_id            = f'stage{stage_id}',
     )
     print(f"\n  [{label}] Running per-segment search (worker pid={os.getpid()}) ...")
     t0 = time.time()
@@ -2815,6 +3084,34 @@ def _stage5_dest_only_fitness(
 # ESTIMATION ONLY   no prediction over synthetic population.
 # Calls _run_segment which uses only HHTS tours.
 
+# Held-out aggregate-fit penalty for _stage5_fitness_larch. In-sample BIC +
+# significance penalty alone reward specs that maximise discrete-choice
+# likelihood on the estimation sample; they have no way to notice a spec that
+# simultaneously collapses the aggregate destination-share distribution onto
+# a handful of zones (see 2026-07 sa_bandit_staged validation report - dest
+# rho^2 up to 0.68 "excellent" while top25 zone overlap was only 8-16%). The
+# JSD term below is evaluated on a held-out split so a spec can't buy a good
+# score just by overfitting the split it's scored on.
+_STAGE5_HOLDOUT_FRAC   = float(os.environ.get('STAGE5_HOLDOUT_FRAC', '0.2'))
+_STAGE5_HOLDOUT_MIN_N  = int(os.environ.get('STAGE5_HOLDOUT_MIN_N', '100'))
+_STAGE5_JS_LAMBDA      = float(os.environ.get('STAGE5_JS_LAMBDA', '3.0'))
+
+
+def _js_divergence_shares(p: np.ndarray, q: np.ndarray) -> float:
+    """Jensen-Shannon divergence (base e) between two nonnegative count/share vectors."""
+    p = np.nan_to_num(np.asarray(p, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    q = np.nan_to_num(np.asarray(q, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    p = p / max(p.sum(), 1e-12)
+    q = q / max(q.sum(), 1e-12)
+    m = 0.5 * (p + q)
+    def _kl(a, b):
+        mask = (a > 0) & (b > 0)
+        if not np.any(mask):
+            return 0.0
+        return float(np.sum(a[mask] * np.log(a[mask] / b[mask])))
+    return 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
+
+
 def _stage5_fitness_larch(
     mode_genes:      np.ndarray,
     dest_genes:      np.ndarray,
@@ -2828,16 +3125,26 @@ def _stage5_fitness_larch(
     skim_df:         pd.DataFrame,
 ) -> float:
     """
-    Estimation-only fitness: fit mode + destination model on HHTS and
-    return mode_LL + dest_LL.  No prediction over synth population.
+    Estimation-only fitness: fit mode + destination model on a TRAIN split of
+    HHTS tours, scored as -BIC/n - significance_penalty - JS_LAMBDA * held_out_JSD.
 
-    Uses _run_segment which is already the HHTS-only estimation path.
+    held_out_JSD is the Jensen-Shannon divergence between the fitted dest
+    model's predicted destination-zone shares and the OBSERVED destination-zone
+    shares on a disjoint TEST split (not used for fitting) - this penalises
+    specs that fit well in-sample but collapse the aggregate destination
+    distribution, which plain BIC/significance can't detect (see module note
+    above _STAGE5_HOLDOUT_FRAC). If the held-out evaluation itself fails for
+    any reason, it contributes zero penalty rather than failing the genome.
+
+    Uses _run_segment's building blocks (mode/dest tree + Larch estimation),
+    HHTS-only - no prediction over synth population.
     """
     from stage5_destination_choice import (
         _filter_seg, _prep_hhts_tours,
         _build_mode_model, _build_dest_model,
         _estimate, _logsums, _mode_tree, _dest_tree,
         _attach_size_term, _attach_acdc_terms,
+        _dest_probs_numpy,
         skim_lookup_to_df,
         MODE_UEC, DEST_UEC, DEST_COND,
     )
@@ -2851,6 +3158,20 @@ def _stage5_fitness_larch(
     if len(seg_tours) < 50:
         return -1e9
 
+    # Deterministic train/held-out split - fixed seed so every genome in every
+    # generation is scored against the SAME split (comparable JSD across the GA
+    # run; not meant as a statistical guarantee, just a consistent yardstick).
+    if len(seg_tours) >= _STAGE5_HOLDOUT_MIN_N:
+        _rng_split = np.random.RandomState(42)
+        _perm = _rng_split.permutation(len(seg_tours))
+        _n_test = max(int(len(seg_tours) * _STAGE5_HOLDOUT_FRAC), 20)
+        _test_idx, _train_idx = _perm[:_n_test], _perm[_n_test:]
+        train_tours = seg_tours.iloc[_train_idx].reset_index(drop=True)
+        test_tours  = seg_tours.iloc[_test_idx].reset_index(drop=True)
+    else:
+        train_tours = seg_tours
+        test_tours  = None
+
     # Use JAX engine for bandit fitness eval on GPU — removes numba override.
     # _lx_model() auto-detects: JAX first on Linux, falls back to numba if
     # covariance computation fails (cusolver_gesvdj_ffi on CUDA 13).
@@ -2858,20 +3179,20 @@ def _stage5_fitness_larch(
     _prev_ga_engine = os.environ.get('GA_LARCH_ENGINE', '')
     os.environ.pop('GA_LARCH_ENGINE', None)  # let _lx_model auto-detect
     try:
-        # Mode model on HHTS
-        dt_m     = _mode_tree(seg_tours, persons, landuse, skims)
+        # Mode model on TRAIN
+        dt_m     = _mode_tree(train_tours, persons, landuse, skims)
         mode_mdl = _build_mode_model(dt_m, segment, custom_mode_vars=mode_vars,
-                                     avail_vars_hint=list(seg_tours.columns))
+                                     avail_vars_hint=list(train_tours.columns))
         mode_mdl = _estimate(mode_mdl)
         mode_ll  = float(mode_mdl.loglike())
 
         # Logsums for destination tree
         ls = _logsums(mode_mdl, dt_m, skims=skims, verbose=False)
 
-        # Destination model on HHTS
+        # Destination model on TRAIN
         lu_st = _attach_size_term(landuse, segment)
         lu_st, seg_acdc = _attach_acdc_terms(
-            lu_st, seg_tours,
+            lu_st, train_tours,
             skim_df if skim_df is not None else pd.DataFrame(),
             segment
         )
@@ -2880,9 +3201,8 @@ def _stage5_fitness_larch(
         dest_mdl = _estimate(dest_mdl)
         dest_ll  = float(dest_mdl.loglike())
 
-        # Proper BIC: ÔÇô2┬ÀLL + k┬Àln(n), then normalise per observation
-        # Proper BIC normalised per observation
-        n   = len(seg_tours)
+        # Proper BIC: -2*LL + k*ln(n), then normalise per observation
+        n   = len(train_tours)
         k   = int(mode_genes.sum() + dest_genes.sum())
         bic = -2.0 * (mode_ll + dest_ll) + k * np.log(max(n, 2))
         # Significance penalty: discourage near-zero / insignificant features
@@ -2895,7 +3215,33 @@ def _stage5_fitness_larch(
                      + _metacount_significance_penalty(dest_rows)) / 2.0
         _update_feature_weakness(mode_rows, mode_vars)
         _update_feature_weakness(dest_rows, dest_vars)
-        return -bic / max(n, 1) - sig_pen           # -BIC/n - penalty, higher is better
+
+        # ── Held-out aggregate destination-share penalty ────────────────────
+        js_pen = 0.0
+        if test_tours is not None and len(test_tours) >= 10:
+            try:
+                dt_m_test  = _mode_tree(test_tours, persons, landuse, skims)
+                ls_test    = _logsums(mode_mdl, dt_m_test, skims=skims, verbose=False)
+                lu_st_test, seg_acdc_test = _attach_acdc_terms(
+                    lu_st, test_tours,
+                    skim_df if skim_df is not None else pd.DataFrame(),
+                    segment
+                )
+                dt_d_test  = _dest_tree(seg_acdc_test, persons, lu_st_test, skims, ls_test)
+                zone_ids   = list(ls_test.coords['zones'].values)
+                probs_test = _dest_probs_numpy(dest_mdl, dt_d_test, ls_test, zone_ids, persons,
+                                               landuse=lu_st_test, skim_df=skim_df)
+                if probs_test is not None:
+                    pred_share = probs_test.sum(axis=0)
+                    obs_counts = (seg_acdc_test['DTAZ'].astype(int)
+                                  .value_counts().reindex(zone_ids).fillna(0.0).to_numpy())
+                    jsd = _js_divergence_shares(obs_counts, pred_share)
+                    js_pen = _STAGE5_JS_LAMBDA * jsd
+            except Exception as _jse:
+                logger.debug(f"Stage5 fitness [{segment}]: held-out JSD penalty skipped ({_jse})")
+                js_pen = 0.0
+
+        return -bic / max(n, 1) - sig_pen - js_pen   # -BIC/n - penalty - JSD, higher is better
 
     except Exception as e:
         logger.debug(f"Stage5 fitness [{segment}]: {e}")
@@ -3146,6 +3492,17 @@ def _cdap_fitness(
     Returns McFadden rho┬▓ (higher = better).
     Fitness is penalised by number of active features (parsimony).
     """
+    # SEARCH fitness uses the sklearn multinomial logit by default: same
+    # unpenalized MLE surface and same -BIC/n metric as the Larch path, but
+    # milliseconds per fit with no compilation. The Larch path rebuilds a
+    # DataTree and triggers fresh sharrow/jax flow compiles for EVERY
+    # candidate spec — run guided03 spent 16h 57m on Stage 0 alone, with
+    # 356,129 "writing fresh flow code" lines (~100 compiles per evaluation,
+    # ~9 s each). Larch remains the engine for the FINAL CDAP model after
+    # selection; set GA_CDAP_FITNESS=larch to restore the old behaviour.
+    if os.environ.get('GA_CDAP_FITNESS', 'sklearn').strip().lower() != 'larch':
+        return _cdap_fitness_sklearn(genes, data, feature_names)
+
     try:
         import larch as lx
     except ImportError:
@@ -3167,8 +3524,12 @@ def _cdap_fitness(
         ca_idx = pd.MultiIndex.from_product(
             [case_ids, alt_ids], names=['person_id', '_altid_'])
         ca_df  = pd.DataFrame({'chosen': 0}, index=ca_idx)
-        for _, row in data.iterrows():
-            ca_df.loc[(str(row['person_id']), int(row['cdap_obs'])), 'chosen'] = 1
+        # vectorised chosen-flag assignment (was a per-row iterrows loop over
+        # every HHTS person, per candidate evaluation)
+        _chosen_idx = pd.MultiIndex.from_arrays(
+            [data['person_id'].astype(str), data['cdap_obs'].astype(int)],
+            names=['person_id', '_altid_'])
+        ca_df.loc[ca_df.index.isin(_chosen_idx), 'chosen'] = 1
         ds_ca = lx.Dataset.construct.from_idca(ca_df)
 
         co_df = data.set_index(data['person_id'].astype(str))[available].fillna(0).copy()
@@ -3367,7 +3728,10 @@ def _cdap_candidates(data: pd.DataFrame) -> List[str]:
     access    = ['has_vehicle', 'has_licence']
     work_vars = ['is_female', 'wfh', 'income_midplus', 'mandatory_role',
                  'income_hi', 'income_lo']   # census_bridge income flags
-    acc_cols  = ['auto_work_acc', 'walk_acc', 'transit_acc', 'auto_nonmand_acc']
+    acc_cols  = ['auto_work_acc', 'walk_acc', 'transit_acc', 'auto_nonmand_acc',
+                 'crash_acc']   # home-zone crash exposure - lets the search test
+                                # safety in CDAP/generation, not only mode/dest
+                                # utilities (ATRF reviewer request)
     raw_synth = ['vehrd', 'nprd', 'incp', 'sexp',
                  'workstat_fulltime', 'workstat_parttime', 'workstat_notworking',
                  'studying_none', 'studying_primary', 'studying_secondary',
@@ -4065,6 +4429,31 @@ def _stage4_feature_spec(data: pd.DataFrame, purpose: str) -> Tuple[List[str], L
     return list(dict.fromkeys(core + optional)), list(dict.fromkeys(core))
 
 
+# ActivitySim-style interaction ("perturbation character") candidate genes,
+# materialised by _ensure_stage_interactions(). Listed in every stage's
+# candidate pool; the `c in data.columns` filter keeps only those whose column
+# actually exists for that stage (e.g. timing interactions only in stage 4).
+_ACCESS_INTERACTIONS = [
+    f'{pfx}_x_{acc}'
+    for acc in ('walk_acc', 'transit_acc', 'auto_work_acc', 'auto_shop_acc',
+                'auto_nonmand_acc', 'bike_acc')
+    for pfx in ('noveh', 'incp')
+]
+_LIFECYCLE_INTERACTIONS = ['child_x_working', 'child_x_female', 'older_x_noveh',
+                           'senior_x_veh', 'retired_x_veh']
+_OCC_WFH_INTERACTIONS = ['wfh_flag', 'wfh_x_worker', 'wfh_x_inchi',
+                         'occ_whitecollar', 'occ_bluecollar', 'occ_x_incp']
+_COUNT_TIMING_INTERACTIONS = ['ntotal_x_veh', 'ntours_x_worker',
+                              'timeremain_x_worker', 'daypos_x_child']
+# Extra search options: mobility / affordability / lifestage interactions.
+_MOBILITY_INTERACTIONS = ['worker_x_autoacc', 'worker_x_transitacc',
+                          'child_x_walkacc', 'incp_x_veh', 'incp_per_person',
+                          'workers_x_veh', 'senior_x_transitacc']
+_STAGE_INTERACTION_CANDIDATES = (_ACCESS_INTERACTIONS + _LIFECYCLE_INTERACTIONS
+                                 + _OCC_WFH_INTERACTIONS + _COUNT_TIMING_INTERACTIONS
+                                 + _MOBILITY_INTERACTIONS)
+
+
 def _stage1_candidates(data: pd.DataFrame) -> List[str]:
     """Stage 1 (activity frequency) — binary-first candidate set.
 
@@ -4088,6 +4477,7 @@ def _stage1_candidates(data: pd.DataFrame) -> List[str]:
                'auto_nonmand_acc', 'bike_acc']
     return list(dict.fromkeys(
         c for c in base + age_grp + extra + profile + abs_ + acc + ptype
+        + _STAGE_INTERACTION_CANDIDATES
         if c in data.columns
     ))
 
@@ -4111,6 +4501,7 @@ def _stage2_candidates(data: pd.DataFrame) -> List[str]:
     ptype   = [c for c in data.columns if c.startswith('ptype_')]
     return list(dict.fromkeys(
         c for c in counts + base + profile + abs_ + acc + ptype
+        + _STAGE_INTERACTION_CANDIDATES
         if c in data.columns
     ))
 
@@ -4132,6 +4523,7 @@ def _stage3_candidates(data: pd.DataFrame) -> List[str]:
     ptype    = [c for c in data.columns if c.startswith('ptype_')]
     return list(dict.fromkeys(
         c for c in act_vars + counts + base + profile + abs_ + ptype
+        + _STAGE_INTERACTION_CANDIDATES
         if c in data.columns
     ))
 
@@ -4153,6 +4545,7 @@ def _stage4_candidates(data: pd.DataFrame) -> List[str]:
     ptype   = [c for c in data.columns if c.startswith('ptype_')]
     return list(dict.fromkeys(
         c for c in timing + base + profile + abs_ + purp + ptype
+        + _STAGE_INTERACTION_CANDIDATES
         if c in data.columns
     ))
 
@@ -4203,7 +4596,13 @@ def _stage5_mode_candidates() -> List[str]:
         'ptype_SchoolChild', 'ptype_Retired',
     ]
     # ÔöÇÔöÇ ABS census (method of travel to work, employment status) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
-    abs_vars = ['mtwp', 'empp', 'bikes', 'WFHWEEK', 'wfh']
+    abs_vars = ['mtwp', 'empp', 'bikes', 'WFHWEEK', 'wfh',
+                'ebikes', 'escooter']    # micromobility ownership (HHTS/synth cols)
+    # ÔöÇÔöÇ Home-zone accessibility (attached from landuse at the person's home
+    # SA2) ÔöÇ strong mode-captivity signals: high walk/transit accessibility at
+    # home shifts mode share away from car regardless of the specific OD.
+    acc_origin = ['walk_acc', 'bike_acc', 'transit_acc', 'auto_work_acc',
+                  'crash_acc']   # home-zone crash exposure (reviewer: safety upstream of mode utility)
     # WORKSTAT / STUDYING as per-category binary dummies — complementary indicators
     # (a model may select workstat_fulltime AND workstat_parttime simultaneously
     # since FT workers differ from PT workers in mode choice, not just more of
@@ -4214,9 +4613,27 @@ def _stage5_mode_candidates() -> List[str]:
     studying_vars = ['studying_tertiary_pt', 'studying_tertiary_ft',
                      'studying_secondary', 'studying_primary']
     misc = ['mandatory_role']
+    dest_lu_vars = ['is_cbd', 'transit_walk_acc']
+
+    # ── ActivitySim-inspired GA genes (gated in MODE_UEC / _COEFF_GATE) ──────
+    # Generic-vs-alternative-specific toggles (ga_constraints.generic_groups):
+    #   selecting the *_generic gene applies ONE shared effect across modes
+    #   instead of the per-mode block (mutex-guarded against the ASV genes).
+    generic_genes = ['incp_generic', 'veh_generic', 'crash_generic',
+                     'age_active_generic']
+    # Cost / tolls & extra time-of-day IVT periods (mutex: one auto IVT period)
+    cost_tod = ['SOVTOLL_TOLL__AM', 'auto_toll', 'auto_cost',
+                'SOVTOLL_TIME__MD', 'SOVTOLL_TIME__EV',
+                'WLK_LOC_DRV_DTIM__AM']
+    # Auto-sufficiency / short-distance active-mode dummies
+    captivity_dist = ['auto_deficient', 'short_dist_active']
+    # Occupation / job-type ("job_tup") × mode
+    occ_genes = ['occp_group', 'occp_mgr', 'occp_trades', 'occp_prof']
 
     return (skim_extra + veh_vars + inc_vars + age_gender +
-            hh_vars + ptype_vars + abs_vars + workstat_vars + studying_vars + misc)
+            hh_vars + ptype_vars + abs_vars + acc_origin +
+            workstat_vars + studying_vars + misc + dest_lu_vars +
+            generic_genes + cost_tod + captivity_dist + occ_genes)
 
 
 def _stage5_dest_candidates() -> List[str]:
@@ -4265,9 +4682,17 @@ def _stage5_dest_candidates() -> List[str]:
     ]
     # ÔöÇÔöÇ Population / area ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
     pop_area = ['TOTPOP', 'TOTHH', 'residential', 'retail',
-                'construction', 'sa2_area']
+                'construction', 'sa2_area',
+                # further OSM/zoning landuse columns present in
+                # zone_landuse_507.csv but previously not searchable:
+                'institutional', 'logistics', 'communications',
+                'airport', 'harbour', 'trees', 'utility']
     # ÔöÇÔöÇ Accessibility at destination (zone-level, not person-level) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
-    acc_dest = ['auto_work_acc', 'auto_shop_acc', 'walk_acc', 'transit_acc']
+    # full set of computed accessibility measures (pipeline_logger
+    # accessibility step) - previously only 4 of the 8 were searchable.
+    acc_dest = ['auto_work_acc', 'auto_edu_acc', 'auto_shop_acc',
+                'auto_nonmand_acc', 'walk_acc', 'bike_acc', 'transit_acc',
+                'recreation_acc', 'crash_acc']
     # ÔöÇÔöÇ Person attributes tested as interaction terms with destination ÔöÇÔöÇÔöÇÔöÇ
     # (person-by-destination interactions already in fixed backbone for income,
     # vehicles; GA tests additional demographics)
@@ -4286,10 +4711,38 @@ def _stage5_dest_candidates() -> List[str]:
         'income_lo',      # low-income x affordable / community destinations
         'income_mid',     # middle-income x mixed-use zones
     ]
+    # -- ACDC themed agglomeration variants (mutex with c_aggl) --
+    acdc_themed = ['acdc_aggl_retail', 'acdc_aggl_office',
+                   'acdc_aggl_edu', 'acdc_aggl_leisure']
+    # -- Home-pull gravity (mutex: home_pull vs home_pull_late) --
+    home_pull_vars = ['home_pull', 'home_pull_late']
+    # -- Mode-relevant landuse columns (CBD flag, transit walk access) --
+    mode_lu_vars = ['is_cbd', 'transit_walk_acc']
+    # -- ActivitySim-inspired dest genes (coeff-name gated in DEST_UEC_FLAT) --
+    #    piecewise distance spline (replaces c_dist) + CBD/urban-core attractor.
+    dist_spline = ['c_dist_0_2', 'c_dist_2_5', 'c_dist_5_10', 'c_cbd_dest']
     return list(dict.fromkeys(
         skim_extra + emp_work + emp_edu + emp_nonmand + pop_area +
-        acc_dest + person_dest_int
+        acc_dest + person_dest_int + acdc_themed + home_pull_vars +
+        mode_lu_vars + dist_spline + _overlay_dest_interaction_genes()
     ))
+
+
+def _overlay_dest_interaction_genes(segment: str = None) -> List[str]:
+    """ptype×land interaction coefficient names declared in the user constraint
+    overlay (constraint_gui.py). Added to the dest candidate pool so the GA can
+    select them; the coefficients are built by stage5_destination_choice._dest_tree.
+    Filtered to `segment` when the affinity names one."""
+    try:
+        from stage5_destination_choice import _overlay_dest_interactions
+        out = []
+        for it in _overlay_dest_interactions():
+            segs = it.get('segments')
+            if segment is None or not segs or segment in segs:
+                out.append(it['coeff'])
+        return out
+    except Exception:
+        return []
 
 
 def _stage5_mode_candidates_for_segment(segment: str) -> List[str]:
@@ -4304,6 +4757,14 @@ def _stage5_mode_candidates_for_segment(segment: str) -> List[str]:
         'age_working', 'age_older', 'nprd', 'hh_child', 'n_workers_hh',
         'hh_couple', 'hh_medium',
         'mandatory_role',
+        'is_cbd', 'transit_walk_acc',
+        # ActivitySim-inspired genes (all gated in MODE_UEC / _COEFF_GATE)
+        'incp_generic', 'veh_generic', 'crash_generic', 'age_active_generic',
+        'auto_cost', 'SOVTOLL_TOLL__AM', 'SOVTOLL_TIME__MD', 'SOVTOLL_TIME__EV',
+        'WLK_LOC_DRV_DTIM__AM',
+        'auto_deficient', 'short_dist_active',
+        'occp_group', 'occp_mgr', 'occp_trades', 'occp_prof',
+        'safety_sensitivity',   # per-agent crash-aversion x crash (active modes)
     }
     by_seg = {
         # ── Work tours: who you are, household structure, WFH patterns ───────
@@ -4344,12 +4805,22 @@ def _stage5_dest_candidates_for_segment(segment: str) -> List[str]:
         'TOTPOP', 'TOTHH', 'sa2_area',
         'auto_work_acc', 'auto_shop_acc', 'walk_acc', 'transit_acc',
         'incp', 'has_vehicle', 'n_workers_hh', 'is_female',
+        'acdc_aggl_retail', 'acdc_aggl_office',
+        'acdc_aggl_edu', 'acdc_aggl_leisure',
+        # ActivitySim-inspired dest genes (gated by coeff-name in DEST_UEC_FLAT):
+        #   piecewise distance spline (replaces c_dist) + CBD/urban-core pull.
+        'c_dist_0_2', 'c_dist_2_5', 'c_dist_5_10', 'c_cbd_dest', 'is_cbd',
+        'c_dist_decay', 'c_dist_decay_slow',   # non-linear gravity distance-decay
+        'c_crash_safety_dest',   # per-agent safety utility x destination crash
     }
     by_seg = {
         'work': {
             'TOTEMP', 'FPSEMPN', 'HEREMPN', 'RETEMPN', 'AGREMPN', 'MWTEMPN',
             'commercial', 'industrial', 'government', 'governmental',
             'ptype_FullTimeWorker', 'income_hi',
+            # additional industry-sector attractor coefficients (coeff-name gated)
+            'c_indp_agri', 'c_indp_mfg', 'c_indp_construction', 'c_indp_govt',
+            'c_indp_industrial', 'c_indp_education',
         },
         'edu': {
             'Education', 'Primary', 'Secondary', 'HSENROLL', 'AGE0519',
@@ -4362,9 +4833,11 @@ def _stage5_dest_candidates_for_segment(segment: str) -> List[str]:
             'recreation_ground', 'sport', 'park', 'community', 'civic',
             'residential', 'retail', 'construction',
             'age_older',
+            'home_pull', 'home_pull_late',
         },
     }
-    return list(dict.fromkeys(sorted(common | by_seg.get(segment, set()))))
+    return list(dict.fromkeys(sorted(common | by_seg.get(segment, set()))
+                              + _overlay_dest_interaction_genes(segment)))
 
 
 def _stage6_candidates(data: pd.DataFrame) -> List[str]:
@@ -4739,7 +5212,105 @@ def _enrich_ga_data(data: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame:
         if 'hh_medium' not in data.columns:
             data['hh_medium']     = (data['nprd'] == 3).astype(int)
 
+    data = _ensure_stage_interactions(data)
     return data
+
+
+def _ensure_stage_interactions(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add ActivitySim-style interaction ("perturbation character") columns for the
+    stage 1-4 GA candidate pools, mirroring the alternative-specific enrichment
+    added to stage 5. Each interaction is created ONLY when its base columns are
+    already present, so the same helper is safe across every stage's dataframe
+    (a candidate gene whose column is absent is silently dropped by the
+    `c in data.columns` filter in the _stageN_candidates functions).
+
+    Families (matching the user-selected enrichment set):
+      A. accessibility/density x person   (captivity-conditioned accessibility)
+      B. person-type / lifecycle          (children x age, retired x vehicles, ...)
+      C. occupation / industry & WFH      (job-type and work-from-home effects)
+      D. activity-count / timing          (added where those base columns exist)
+    """
+    d = data.copy()   # never mutate a caller-shared frame
+
+    def _set(col, series):
+        if col not in d.columns:
+            d[col] = np.asarray(series).astype(np.float32)
+
+    def has(*cols):
+        return all(c in d.columns for c in cols)
+
+    # ── A. Accessibility x captivity / income ────────────────────────────────
+    # Home-zone accessibility matters more for car-less / lower-income persons.
+    _noveh = (d['vehrd'] <= 0).astype(float) if 'vehrd' in d.columns else None
+    for _acc in ('walk_acc', 'transit_acc', 'auto_work_acc', 'auto_shop_acc',
+                 'auto_nonmand_acc', 'bike_acc'):
+        if _acc not in d.columns:
+            continue
+        if _noveh is not None:
+            _set(f'noveh_x_{_acc}', _noveh * d[_acc].astype(float))
+        if 'incp' in d.columns:
+            _set(f'incp_x_{_acc}', d['incp'].astype(float) * d[_acc].astype(float))
+
+    # ── B. Person-type / lifecycle interactions ──────────────────────────────
+    if has('hh_child', 'age_working'):
+        _set('child_x_working', d['hh_child'].astype(float) * d['age_working'].astype(float))
+    if has('hh_child') and 'is_female' in d.columns:
+        _set('child_x_female', d['hh_child'].astype(float) * d['is_female'].astype(float))
+    if has('age_older', 'no_vehicle'):
+        _set('older_x_noveh', d['age_older'].astype(float) * d['no_vehicle'].astype(float))
+    if has('age_senior', 'has_vehicle'):
+        _set('senior_x_veh', d['age_senior'].astype(float) * d['has_vehicle'].astype(float))
+    if 'ptype_Retired' in d.columns and 'has_vehicle' in d.columns:
+        _set('retired_x_veh', d['ptype_Retired'].astype(float) * d['has_vehicle'].astype(float))
+
+    # ── C. Occupation / industry & work-from-home ────────────────────────────
+    _wfh = None
+    for _wc in ('wfh', 'WFHWEEK', 'WFHDAY'):
+        if _wc in d.columns:
+            _wfh = (d[_wc].astype(float) > 0).astype(float)
+            break
+    if _wfh is not None:
+        _set('wfh_flag', _wfh)
+        if 'mandatory_role' in d.columns:
+            _set('wfh_x_worker', _wfh * d['mandatory_role'].astype(float))
+        if 'income_hi' in d.columns:
+            _set('wfh_x_inchi', _wfh * d['income_hi'].astype(float))
+    if 'occp_group' in d.columns:
+        _oc = d['occp_group'].astype(float)
+        _set('occ_whitecollar', (_oc == 1).astype(float))
+        _set('occ_bluecollar',  (_oc >= 4).astype(float))
+        if 'incp' in d.columns:
+            _set('occ_x_incp', _oc * d['incp'].astype(float))
+
+    # ── D. Activity-count / timing interactions (stage 2/3/4) ────────────────
+    # Only fire where the stage actually carries these base columns.
+    if 'n_total' in d.columns and 'has_vehicle' in d.columns:
+        _set('ntotal_x_veh', d['n_total'].astype(float) * d['has_vehicle'].astype(float))
+    if 'n_tours' in d.columns and 'mandatory_role' in d.columns:
+        _set('ntours_x_worker', d['n_tours'].astype(float) * d['mandatory_role'].astype(float))
+    if 'time_remaining' in d.columns and 'mandatory_role' in d.columns:
+        _set('timeremain_x_worker', d['time_remaining'].astype(float) * d['mandatory_role'].astype(float))
+    if 'day_position' in d.columns and 'hh_child' in d.columns:
+        _set('daypos_x_child', d['day_position'].astype(float) * d['hh_child'].astype(float))
+
+    # ── E. Extra search options: mobility / affordability / lifestage ────────
+    if has('age_working', 'auto_work_acc'):
+        _set('worker_x_autoacc', d['age_working'].astype(float) * d['auto_work_acc'].astype(float))
+    if has('age_working', 'transit_acc'):
+        _set('worker_x_transitacc', d['age_working'].astype(float) * d['transit_acc'].astype(float))
+    if has('hh_child', 'walk_acc'):
+        _set('child_x_walkacc', d['hh_child'].astype(float) * d['walk_acc'].astype(float))
+    if 'incp' in d.columns and 'has_vehicle' in d.columns:
+        _set('incp_x_veh', d['incp'].astype(float) * d['has_vehicle'].astype(float))
+    if 'incp' in d.columns and 'nprd' in d.columns:
+        _set('incp_per_person', d['incp'].astype(float) / (d['nprd'].astype(float) + 1.0))
+    if has('n_workers_hh', 'has_vehicle'):
+        _set('workers_x_veh', d['n_workers_hh'].astype(float) * d['has_vehicle'].astype(float))
+    if 'age_senior' in d.columns and 'transit_acc' in d.columns:
+        _set('senior_x_transitacc', d['age_senior'].astype(float) * d['transit_acc'].astype(float))
+
+    return d
 
 
 def _run_ga_stage1(tours, persons, ga_kwargs, n_restarts=2, landuse=None) -> GAResult:
@@ -5611,6 +6182,7 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
             require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get('5_mode', []),
             fixed_features   = _mode_fixed,
             fitness_metric   = 'mean(-BIC/n) [Larch NL]',
+            stage_id         = 'stage5_mode',
         )
         _bl_mode_key = tuple(int(x) for x in _bl_mode_genes.tolist())
         mode_searcher._cache[_bl_mode_key] = _bl_mode_fitness
@@ -5679,6 +6251,7 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
                 require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get('5_dest', []),
                 fixed_features   = _dest_fixed,
                 fitness_metric   = 'mean(-BIC/n) [Larch NL]',
+                stage_id         = 'stage5_dest',
             )
             _bl_dest_key = tuple(int(x) for x in _bl_dest_genes.tolist())
             dest_searcher._cache[_bl_dest_key] = _bl_dest_fitness
@@ -5853,6 +6426,23 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
         seg_dest_cands = _filter_candidates_by_signal(seg_tours, _stage5_dest_candidates_for_segment(seg))
         seg_mode_cands = [c for c in seg_mode_cands if c in mode_cands]
         seg_dest_cands = [c for c in seg_dest_cands if c in dest_cands]
+
+        # CRASH is the safety-testing variable this run exists to evaluate
+        # (see safety_baseline/safety_nosafety experiment modes). Force it
+        # back in even if _filter_candidates_by_signal dropped it for looking
+        # near-constant in this segment's data, so it's never silently
+        # missing from the mode model. It's marked fixed_features below
+        # (see _mode_fixed), which makes it structurally impossible for the
+        # GA/SA/Bandit search - including the directed move - to remove it:
+        # _opt_idx (the only index set any perturbation touches) excludes
+        # every fixed index by construction.
+        if 'CRASH' in mode_cands and 'CRASH' not in seg_mode_cands:
+            logger.warning(
+                f"[{seg}] CRASH failed the candidate-signal filter (looks "
+                "near-constant in this segment's data) - force-included "
+                "anyway so it's never silently absent from the mode model."
+            )
+            seg_mode_cands = seg_mode_cands + ['CRASH']
 
         if not seg_mode_cands:
             seg_mode_cands = mode_cands[:]
@@ -6784,11 +7374,29 @@ def apply_ga_results_to_pipeline(
 
     _write_ga_vs_main_tex(ga_results, save_dir)
 
-    # Metacount final-model HTML (when GA_ESTIMATOR includes metacount) 
-    # Re-run the best-selected features through the mixed metacount estimator
-    # at full draw count and save the NB2/lognormal coefficients as HTML.
+    # Metacount mixed (random-coefficient) FINAL models for stages 1-3.
+    # Re-run the best GA-selected features through the mixed metacount estimator
+    # at full draw count → NB2 (stage 1) / lognormal (stages 2-3) with RANDOM
+    # coefficients, saved as coefficient HTML.
+    #
+    # Runs when the base estimator is a metacount variant OR whenever random-
+    # coefficient search is enabled (default-on, see ga_constraints.
+    # rand_search_enabled) — so a plain `default` staged run still produces the
+    # mixed random-coefficient finals for stages 1-3. Requires metacountregressor
+    # to be importable; falls back silently (each stage is wrapped in try/except)
+    # when it is not, and the primary OrderedLogit/Tobit prediction models are
+    # untouched.
     _mc_est = os.environ.get('GA_ESTIMATOR', 'default').strip().lower()
-    if _mc_est in ('metacount', 'both', 'hybrid', 'sa_bandit'):
+    try:
+        from ga_constraints import rand_search_enabled as _rse_gate
+        from ga_external_estimators import _METACOUNT_OK as _mc_ok_gate
+        _run_mixed_finals = (
+            (_mc_est in ('metacount', 'both', 'hybrid', 'sa_bandit') or _rse_gate())
+            and _mc_ok_gate
+        )
+    except Exception:
+        _run_mixed_finals = _mc_est in ('metacount', 'both', 'hybrid', 'sa_bandit')
+    if _run_mixed_finals:
         try:
             from ga_external_estimators import (
                 stage1_final_mixed_metacount  as _s1_mc,

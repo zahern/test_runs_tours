@@ -1,0 +1,75 @@
+ 
+Ite #:  1, Epoch #:  1, Epoch Len:   10.00, TravelTime:  112.53, ProjPerd%: 0.95, ProjPerd(min):  113.00
+Epoch:      1 SOV:        198
+Ite #:  1, Epoch #:  2, Epoch Len:   10.00, TravelTime:  101.87, ProjPerd%: 0.95, ProjPerd(min):  102.00
+Epoch:      2 SOV:        199
+Ite #:  1, Epoch #:  3, Epoch Len:   10.00, TravelTime:   92.97, ProjPerd%: 0.95, ProjPerd(min):   93.00
+Epoch:      3 SOV:        212
+Ite #:  1, Epoch #:  4, Epoch Len:   10.00, TravelTime:   83.31, ProjPerd%: 0.95, ProjPerd(min):   84.00
+Epoch:      4 SOV:        184
+Ite #:  1, Epoch #:  5, Epoch Len:   10.00, TravelTime:   71.98, ProjPerd%: 0.95, ProjPerd(min):   72.00
+Epoch:      5 SOV:        195
+Ite #:  1, Epoch #:  6, Epoch Len:   10.00, TravelTime:   63.73, ProjPerd%: 0.95, ProjPerd(min):   64.00
+Epoch:      6 SOV:        206
+Ite #:  1, Epoch #:  7, Epoch Len:   10.00, TravelTime:   53.88, ProjPerd%: 0.95, ProjPerd(min):   54.00
+Epoch:      7 SOV:        205
+Ite #:  1, Epoch #:  8, Epoch Len:   10.00, TravelTime:   43.87, ProjPerd%: 0.95, ProjPerd(min):   44.00
+Epoch:      8 SOV:        172
+Ite #:  1, Epoch #:  9, Epoch Len:   10.00, TravelTime:   32.40, ProjPerd%: 0.95, ProjPerd(min):   33.00
+Epoch:      9 SOV:        167
+Ite #:  1, Epoch #: 10, Epoch Len:   10.00, TravelTime:   23.61, ProjPerd%: 0.95, ProjPerd(min):   24.00
+Epoch:     10 SOV:        203
+Ite #:  1, Epoch #: 11, Epoch Len:   10.00, TravelTime:   13.50, ProjPerd%: 0.95, ProjPerd(min):   14.00
+Epoch:     11 SOV:        212
+Ite #:  1, Epoch #: 12, Epoch Len:   10.00, TravelTime:    3.90, ProjPerd%: 0.95, ProjPerd(min):   10.00
+Epoch:     12 SOV:        192
+ 
+Ite #:  2, Epoch #:  1, Epoch Len:   10.00, TravelTime:  112.53, ProjPerd%: 0.95, ProjPerd(min):  113.00
+Epoch:      1 SOV:        198
+Ite #:  2, Epoch #:  2, Epoch Len:   10.00, TravelTime:  102.28, ProjPerd%: 0.95, ProjPerd(min):  103.00
+Epoch:      2 SOV:        199
+Ite #:  2, Epoch #:  3, Epoch Len:   10.00, TravelTime:   92.97, ProjPerd%: 0.95, ProjPerd(min):   93.00
+Epoch:      3 SOV:        212
+Ite #:  2, Epoch #:  4, Epoch Len:   10.00, TravelTime:   83.31, ProjPerd%: 0.95, ProjPerd(min):   84.00
+Epoch:      4 SOV:        184
+Ite #:  2, Epoch #:  5, Epoch Len:   10.00, TravelTime:   73.71, ProjPerd%: 0.95, ProjPerd(min):   74.00
+Epoch:      5 SOV:        195
+Ite #:  2, Epoch #:  6, Epoch Len:   10.00, TravelTime:   63.73, ProjPerd%: 0.95, ProjPerd(min):   64.00
+Epoch:      6 SOV:        206
+Ite #:  2, Epoch #:  7, Epoch Len:   10.00, TravelTime:   53.69, ProjPerd%: 0.95, ProjPerd(min):   54.00
+Epoch:      7 SOV:        205
+Ite #:  2, Epoch #:  8, Epoch Len:   10.00, TravelTime:   43.90, ProjPerd%: 0.95, ProjPerd(min):   44.00
+Epoch:      8 SOV:        172
+Ite #:  2, Epoch #:  9, Epoch Len:   10.00, TravelTime:   33.81, ProjPerd%: 0.95, ProjPerd(min):   34.00
+Epoch:      9 SOV:        167
+Ite #:  2, Epoch #: 10, Epoch Len:   10.00, TravelTime:   23.98, ProjPerd%: 0.95, ProjPerd(min):   24.00
+Epoch:     10 SOV:        203
+Ite #:  2, Epoch #: 11, Epoch Len:   10.00, TravelTime:   13.82, ProjPerd%: 0.95, ProjPerd(min):   14.00
+Epoch:     11 SOV:        212
+Ite #:  2, Epoch #: 12, Epoch Len:   10.00, TravelTime:    3.90, ProjPerd%: 0.95, ProjPerd(min):   10.00
+Epoch:     12 SOV:        192
+ 
+Ite #:  3, Epoch #:  1, Epoch Len:   10.00, TravelTime:  113.64, ProjPerd%: 0.95, ProjPerd(min):  114.00
+Epoch:      1 SOV:        198
+Ite #:  3, Epoch #:  2, Epoch Len:   10.00, TravelTime:  102.28, ProjPerd%: 0.95, ProjPerd(min):  103.00
+Epoch:      2 SOV:        199
+Ite #:  3, Epoch #:  3, Epoch Len:   10.00, TravelTime:   92.88, ProjPerd%: 0.95, ProjPerd(min):   93.00
+Epoch:      3 SOV:        212
+Ite #:  3, Epoch #:  4, Epoch Len:   10.00, TravelTime:   83.40, ProjPerd%: 0.95, ProjPerd(min):   84.00
+Epoch:      4 SOV:        184
+Ite #:  3, Epoch #:  5, Epoch Len:   10.00, TravelTime:   73.71, ProjPerd%: 0.95, ProjPerd(min):   74.00
+Epoch:      5 SOV:        195
+Ite #:  3, Epoch #:  6, Epoch Len:   10.00, TravelTime:   63.73, ProjPerd%: 0.95, ProjPerd(min):   64.00
+Epoch:      6 SOV:        206
+Ite #:  3, Epoch #:  7, Epoch Len:   10.00, TravelTime:   53.88, ProjPerd%: 0.95, ProjPerd(min):   54.00
+Epoch:      7 SOV:        205
+Ite #:  3, Epoch #:  8, Epoch Len:   10.00, TravelTime:   43.82, ProjPerd%: 0.95, ProjPerd(min):   44.00
+Epoch:      8 SOV:        172
+Ite #:  3, Epoch #:  9, Epoch Len:   10.00, TravelTime:   33.81, ProjPerd%: 0.95, ProjPerd(min):   34.00
+Epoch:      9 SOV:        167
+Ite #:  3, Epoch #: 10, Epoch Len:   10.00, TravelTime:   23.98, ProjPerd%: 0.95, ProjPerd(min):   24.00
+Epoch:     10 SOV:        203
+Ite #:  3, Epoch #: 11, Epoch Len:   10.00, TravelTime:   13.82, ProjPerd%: 0.95, ProjPerd(min):   14.00
+Epoch:     11 SOV:        212
+Ite #:  3, Epoch #: 12, Epoch Len:   10.00, TravelTime:    3.90, ProjPerd%: 0.95, ProjPerd(min):   10.00
+Epoch:     12 SOV:        192

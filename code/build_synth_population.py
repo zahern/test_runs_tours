@@ -85,7 +85,11 @@ OUT_SUMMARY  = 'saved_data/synth_population_summary.csv'
 
 # new_pop / 507-SA2-zone scope (zone_<sa2>.csv files, OTAZ = SA2 code directly,
 # no ORDER indirection). Override root with env var NEW_POP_DIR.
-NEW_POP_DIR        = os.environ.get('NEW_POP_DIR', r'Z:\test_runs_tours\new_pop')
+# Repo-relative default (a Z:\ literal only resolves on the Windows mount)
+NEW_POP_DIR        = (os.environ.get('NEW_POP_DIR')
+                      or os.path.normpath(os.path.join(
+                          os.path.dirname(os.path.abspath(__file__)),
+                          '..', 'new_pop')))
 NEW_POP_SYNTH_DIR  = os.path.join(NEW_POP_DIR, 'saved_data', 'zone_ids_sa2')
 NEW_POP_OUT_FULL    = os.path.join(NEW_POP_DIR, 'saved_data', 'synth_population.csv')
 NEW_POP_OUT_PERSONS = os.path.join(NEW_POP_DIR, 'saved_data', 'synth_persons.csv')

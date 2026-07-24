@@ -117,10 +117,50 @@ def build_dynust_zone_centroids(dta_dir: str) -> pd.DataFrame:
     return zc
 
 
-def build_crosswalk(dta_dir: str, abm_zone_csv: str, max_dist_m: float = 8000.0) -> pd.DataFrame:
-    zc = build_dynust_zone_centroids(dta_dir)
+def build_zone_centroids_from_gpkg(zone_gpkg: str) -> pd.DataFrame:
+    """Zone centroids from a georeferenced zone-polygon GeoPackage.
 
-    abm = pd.read_csv(abm_zone_csv)[['SA2_MAIN16', 'ORDER', 'SA2_NAME16', 'longitude', 'latitude']]
+    Path for networks that ship no GIS_Network.xls — e.g. SEQ_Running_UE,
+    whose xy.dat is in an unidentified local grid, but whose 349 zones are
+    already georeferenced in demand_/dta_349_zones.gpkg (EPSG:4326,
+    column zone_id, count matches network.dat's header exactly).
+    Returns the same frame shape as build_dynust_zone_centroids.
+    """
+    import geopandas as gpd
+    gdf = gpd.read_file(zone_gpkg)
+    zid_col = 'zone_id' if 'zone_id' in gdf.columns else gdf.columns[0]
+    proj = gdf.to_crs(NETWORK_CRS)
+    cent = proj.geometry.centroid
+    zc = pd.DataFrame({
+        'zone':    pd.to_numeric(gdf[zid_col], errors='coerce').astype(int),
+        'utm_e':   cent.x.values,
+        'utm_n':   cent.y.values,
+        'n_nodes': 0,
+    })
+    t = Transformer.from_crs(NETWORK_CRS, WGS84, always_xy=True)
+    zc['lon'], zc['lat'] = t.transform(zc['utm_e'].values, zc['utm_n'].values)
+    return zc
+
+
+def build_crosswalk(dta_dir: str, abm_zone_csv: str, max_dist_m: float = 8000.0,
+                    zone_gpkg: str = None) -> pd.DataFrame:
+    zc = (build_zone_centroids_from_gpkg(zone_gpkg) if zone_gpkg
+          else build_dynust_zone_centroids(dta_dir))
+
+    _raw = pd.read_csv(abm_zone_csv)
+    if 'sa2_code' in _raw.columns:
+        # Full-SEQ reference schema (sa2_zones_reference_357.csv, 371 zones):
+        # the ABM zone id IS the SA2 code (NEW_POP=1 scope). Output column
+        # stays named ORDER because apply_dynust_zone_crosswalk matches its
+        # values against whatever OTAZ/DTAZ carry - SA2 codes in this scope.
+        abm = pd.DataFrame({
+            'ORDER':      pd.to_numeric(_raw['sa2_code'], errors='coerce').astype(int),
+            'SA2_NAME16': _raw.get('sa2_name', ''),
+            'longitude':  pd.to_numeric(_raw['centroid_lon'], errors='coerce'),
+            'latitude':   pd.to_numeric(_raw['centroid_lat'], errors='coerce'),
+        }).dropna(subset=['longitude', 'latitude'])
+    else:
+        abm = _raw[['SA2_MAIN16', 'ORDER', 'SA2_NAME16', 'longitude', 'latitude']]
     t = Transformer.from_crs(WGS84, NETWORK_CRS, always_xy=True)
     abm['utm_e'], abm['utm_n'] = t.transform(abm['longitude'].values, abm['latitude'].values)
 
@@ -142,6 +182,11 @@ def build_crosswalk(dta_dir: str, abm_zone_csv: str, max_dist_m: float = 8000.0)
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--dta-dir', default=r'Z:\test_runs_tours\DTA\DTA_Brisbane_tested')
+    ap.add_argument('--zone-gpkg', default=None,
+                    help='Zone-polygon GeoPackage with a zone_id column - use '
+                         'instead of origin.dat+GIS_Network.xls for networks '
+                         'without the xls (SEQ_Running_UE: '
+                         '../demand_/dta_349_zones.gpkg).')
     ap.add_argument('--abm-zones', default='seq_zone_ids_.csv')
     ap.add_argument('--max-dist-m', type=float, default=8000.0,
                      help='ABM zones farther than this from any DynusT zone centroid '
@@ -150,7 +195,8 @@ if __name__ == '__main__':
     ap.add_argument('--out', default='saved_data/abm_to_dynust_zone_crosswalk.csv')
     args = ap.parse_args()
 
-    cw = build_crosswalk(args.dta_dir, args.abm_zones, args.max_dist_m)
+    cw = build_crosswalk(args.dta_dir, args.abm_zones, args.max_dist_m,
+                         zone_gpkg=args.zone_gpkg)
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     cw.to_csv(args.out, index=False)
     n_in = int(cw['in_network'].sum())

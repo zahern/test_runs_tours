@@ -15,12 +15,16 @@ import matplotlib.pyplot as plt
 warnings.filterwarnings('ignore')
 
 
-def _latest_run_dir(prefix: str, base: str = 'runs') -> str:
+def _latest_run_dir(prefix: str, base: str = None) -> str:
     """
     Return the most-recently-modified run directory whose name starts with
     ``prefix`` (e.g. 'safety_baseline').  Falls back to ``runs/<prefix>``
     (the old fixed name) if nothing with a job-tag suffix exists.
     """
+    if base is None:
+        # Honor the PBS runner's RUN_ROOT (e.g. runs/ga_parallel) so arms
+        # submitted with RUN_ROOT!=runs are still found; fall back to 'runs'.
+        base = os.environ.get('PIPELINE_RUN_ROOT', 'runs')
     import glob as _glob
     pattern = os.path.join(base, prefix + '__*')
     candidates = sorted(
@@ -399,6 +403,104 @@ Baseline: {DIR_BASE} | No-safety: {DIR_NOSA}</p>
     print(f"\n  HTML report → {out_path}")
     return out_path
 
+# ── Presentation injection ───────────────────────────────────────────────────
+_SLIDE_START = '<!--SAFETY_OUTCOME_SLIDE_START-->'
+_SLIDE_END   = '<!--SAFETY_OUTCOME_SLIDE_END-->'
+_PRESENTATIONS = [
+    os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  '..', 'abm_safety', 'intergrade_model_treivewal.html')),
+    os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  '..', 'abm_safety', 'model_review_deck.html')),
+]
+
+
+def inject_presentation_slide(summary, plot_files):
+    """Copy the comparison figures into abm_safety/Figures/safety_plots and
+    inject (or refresh) a 'safety vs no-safety outcome' slide into the
+    presentation decks. Both decks use the same track/section.slide pattern,
+    and their nav JS builds dots from track.children, so an appended section
+    is picked up automatically. Sentinel-wrapped so reruns replace in place.
+    Non-fatal: presentation refresh must never fail the analysis."""
+    import shutil, re as _re
+    try:
+        fig_dir = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            '..', 'abm_safety', 'Figures', 'safety_plots'))
+        os.makedirs(fig_dir, exist_ok=True)
+        for p in plot_files:
+            if os.path.exists(p):
+                shutil.copy2(p, os.path.join(fig_dir, os.path.basename(p)))
+
+        # headline deltas: summary rows are [baseline, nosafety, delta]
+        _d = summary.iloc[2] if len(summary) >= 3 else {}
+        def _g(key):
+            return str(_d.get(key, 'n/a')).replace('%', '') if hasattr(_d, 'get') else 'n/a'
+        stats = [
+            (_g('Active mode %'), 'active-mode share (walk+bike), pp change when crash risk is removed'),
+            (_g('Drive Alone'),   'drive-alone share, pp change'),
+            (_g('Walk'),          'walk share, pp change'),
+            (_g('Bike'),          'bike share, pp change'),
+        ]
+        tiles = ''.join(
+            f"<div class='stat'><div class='value'>{v}</div><div class='label'>{l}</div></div>"
+            for v, l in stats)
+        coef_rows = ''.join(
+            f"<li><code>{n}</code>: {v:.4f} "
+            f"({'deters exposure-weighted travel' if v < -0.01 else 'negligible / wrong sign - flagged'})</li>"
+            for n, v in list(SAFETY_COEFFS.items())[:6])
+        slide = f"""{_SLIDE_START}
+      <section class="slide" id="safety-outcome-slide">
+        <h2 class="slide-kicker">Experiment Outcome · auto-refreshed by safety_experiment_analysis.py</h2>
+        <h1 class="slide-title">Safety vs no-safety: what the crash skims change</h1>
+        <div class="body-area" style="gap:1.2vh;">
+          <div class="grid" style="grid-template-columns: repeat(4, 1fr);">{tiles}</div>
+          <div class="grid" style="grid-template-columns: 1fr 1fr; flex:1; min-height:0;">
+            <div class="card" style="min-height:0;">
+              <h3 style="margin-top:0;">Mode share: crash skims on vs off</h3>
+              <img src="Figures/safety_plots/01_mode_shares.png" style="max-width:100%; max-height:38vh; object-fit:contain;">
+            </div>
+            <div class="card" style="min-height:0;">
+              <h3 style="margin-top:0;">Where active travel shifts (by zone)</h3>
+              <img src="Figures/safety_plots/05_zone_active_shift.png" style="max-width:100%; max-height:38vh; object-fit:contain;">
+            </div>
+          </div>
+          <div class="card">
+            <h3 style="margin-top:0;">Implications for intended use</h3>
+            <ul class="plain" style="font-size:0.8rem; gap:0.4em;">
+              <li>The gap between the two runs is the demand suppressed by crash risk — zones with the largest active-mode shift are where safety infrastructure buys the most mode change, and are the priority list for the DTA scenario runs (vehicle.dat demand differs between arms).</li>
+              <li>Crash coefficients in the fitted models: <ul style="font-size:0.95em;">{coef_rows}</ul></li>
+              <li>Full detail: <code>safety_report.html</code> in the safety_analysis run dir.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+      {_SLIDE_END}"""
+
+        for deck in _PRESENTATIONS:
+            if not os.path.exists(deck):
+                continue
+            with open(deck, 'r', encoding='utf-8') as fh:
+                html = fh.read()
+            pat = _re.compile(_re.escape(_SLIDE_START) + '.*?' + _re.escape(_SLIDE_END),
+                              _re.DOTALL)
+            if pat.search(html):
+                html = pat.sub(slide, html)
+            else:
+                # append as the deck's final slide: after the last </section>
+                # inside the track (nav JS enumerates track.children)
+                idx = html.rfind('</section>')
+                if idx < 0:
+                    print(f'  [slide] no </section> in {deck} - skipped')
+                    continue
+                insert_at = idx + len('</section>')
+                html = html[:insert_at] + '\n\n' + slide + html[insert_at:]
+            with open(deck, 'w', encoding='utf-8') as fh:
+                fh.write(html)
+            print(f'  [slide] safety outcome slide -> {deck}')
+    except Exception as _e:
+        print(f'  [slide] presentation injection failed (non-fatal): {_e}')
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     print('='*60)
@@ -425,4 +527,5 @@ if __name__ == '__main__':
     print(f'\nSummary:\n{summary.to_string(index=False)}')
 
     write_report(summary, plots)
+    inject_presentation_slide(summary, plots)
     print(f'\n{"="*60}\nDONE — see {DIR_OUT}/safety_report.html\n{"="*60}')

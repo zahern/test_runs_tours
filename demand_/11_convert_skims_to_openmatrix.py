@@ -71,14 +71,15 @@ def convert(in_path, crash_path, out_path):
             n = len(zone_ids)
             crash_mat = np.zeros((n, n), dtype=np.float32)
             src = crash_matrices["crash_rate_total"]
-            for oi, oz in enumerate(zone_ids):
-                ci = crash_idx.get(oz)
-                if ci is None:
-                    continue
-                for di, dz in enumerate(zone_ids):
-                    cj = crash_idx.get(dz)
-                    if cj is not None:
-                        crash_mat[oi, di] = src[ci, cj]
+            # vectorised gather: positions of skim zones inside the crash scope
+            skim_pos = [i for i, z in enumerate(zone_ids) if z in crash_idx]
+            crash_pos = [crash_idx[zone_ids[i]] for i in skim_pos]
+            crash_mat[np.ix_(skim_pos, skim_pos)] = src[np.ix_(crash_pos, crash_pos)]
+            # THE assignment the original code was missing: crash_mat was
+            # built and logged as "Merged" but never placed into the output
+            # dict, so every converted file silently shipped without CRASH
+            # (and the ABM's whole safety component read as absent).
+            matrices["CRASH"] = crash_mat
             n_nonzero = int((crash_mat > 0).sum())
             print(f"Merged crash_rate_total from {crash_path} as matrix 'CRASH' "
                   f"(crash scope={len(crash_zone_ids)}, skim scope={n}, "

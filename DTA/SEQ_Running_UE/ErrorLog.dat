@@ -1,0 +1,4 @@
+ Reading Peak Spreak Switch Flag in PARAMETER.dat error
+ Please delete the PARAMETER.dat in the data folder
+ Re-run through GUI
+ IF directly run from dynust.exe, copy PARAMETER.dat from the program folder

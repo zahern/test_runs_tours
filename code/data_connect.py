@@ -9,6 +9,13 @@ import random
 import re
 from pathlib import Path
 import os
+
+# Repo-relative default for the new_pop scope - a literal Z:\ drive path
+# here broke every NEW_POP=1 run executed on the Linux HPC (Z: is only the
+# Windows mount of /mnt/hpccs01/home/ahernz).
+_TRT_ROOT_DC = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+_DEFAULT_NEW_POP_DIR = os.path.join(_TRT_ROOT_DC, 'new_pop')
 def time_hour(time):
     '''returns the time of starting..'''
     return int(time/60)
@@ -147,6 +154,74 @@ income_mapping = {'Negative income': 0,
 'Not applicable':17,
 "Prefer not to say / can't say":16
 }
+
+# Income codes that represent NON-RESPONSE rather than a real income band.
+_INCOME_NONRESPONSE = {16, 17}
+
+
+def _impute_income(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
+    """
+    Impute personal income band (incp, 1..15) for NON-RESPONSE records from the
+    person's profile, so the income coefficient is estimable and applies
+    sensibly to the population.
+
+    In this HHTS ~88% of INCOME is 'Select One' / 'Not applicable' / 'Prefer not
+    to say' → mapped to 16/17, which the income-band logic wrongly reads as high
+    income (incp>=8). Left alone, every income band collapses (perfect
+    correlation). We replace those non-response codes with a band drawn from a
+    profile-conditioned distribution:
+
+        expected band = base(WORKSTAT) + industry uplift + student penalty
+        incp ~ round( Normal(expected, sd) ), clipped to [1, 15]
+
+    Real responses (bands 1..15) are kept untouched. A per-person seed makes the
+    draw reproducible. An 'incp_imputed' 0/1 flag marks which rows were filled.
+    Disable via GA_IMPUTE_INCOME=0.
+    """
+    incp = pd.to_numeric(df.get('incp', pd.Series(17, index=df.index)),
+                         errors='coerce')
+    nonresp = incp.isin(_INCOME_NONRESPONSE) | incp.isna()
+    n_nonresp = int(nonresp.sum())
+    if n_nonresp == 0:
+        df['incp_imputed'] = 0
+        return df
+
+    ws  = pd.to_numeric(df.get('WORKSTAT', 0), errors='coerce').fillna(0).values
+    ind = pd.to_numeric(df.get('indp', 20),   errors='coerce').fillna(20).values
+
+    # base expected band by work status: FT high, PT mid, not-working low
+    mu = np.where(ws == 1, 9.0, np.where(ws == 2, 6.5, 4.0)).astype(float)
+    # industry uplift: professional/finance/public/education → higher;
+    # agriculture/manufacturing/utilities/construction → slightly lower
+    mu += np.where(np.isin(ind, [10, 11, 12, 13, 14, 15, 16]), 2.0,
+           np.where(np.isin(ind, [1, 2, 3, 4, 5, 6]), -0.5, 0.0))
+    if 'STUDYING' in df.columns:
+        st = pd.to_numeric(df['STUDYING'], errors='coerce').fillna(0).values
+        mu += np.where(st > 0, -2.0, 0.0)   # students earn less
+
+    # reproducible per-person draw (seed from a stable person id if available)
+    _idcol = next((c for c in ('PERSID', 'person_id', 'PERSONID') if c in df.columns), None)
+    if _idcol is not None:
+        base = pd.util.hash_pandas_object(df[_idcol].astype(str), index=False).values
+        rng_seed = (base % (2 ** 31)).astype(np.int64)
+        noise = np.array([np.random.default_rng(int(s) + seed).normal(0.0, 2.5)
+                          for s in rng_seed])
+    else:
+        noise = np.random.default_rng(seed).normal(0.0, 2.5, size=len(df))
+
+    draw = np.clip(np.round(mu + noise), 1, 15).astype(int)
+    out = incp.values.astype(float).copy()
+    out[nonresp.values] = draw[nonresp.values]
+    df = df.copy()
+    df['incp'] = out.astype(int)
+    df['incp_imputed'] = nonresp.astype(int).values
+    try:
+        logging.info(f"_impute_income: imputed {n_nonresp}/{len(df)} "
+                     f"({100.0 * n_nonresp / max(len(df), 1):.1f}%) non-response "
+                     f"income records from profile")
+    except Exception:
+        pass
+    return df
     
     
 study_map = {
@@ -1091,7 +1166,7 @@ class Synth_Connect:
         # and prediction even without knowing the respondent's exact Level4 zone.
         import os as _os
         _lvl4_xwalk_path = _os.path.join(
-            _os.environ.get('NEW_POP_DIR', r'Z:\test_runs_tours\new_pop'),
+            (_os.environ.get('NEW_POP_DIR') or _DEFAULT_NEW_POP_DIR),
             '..', 'demand_', 'lvl4_to_emme_crosswalk.csv'
         )
         _lvl4_xwalk_path = _os.path.normpath(_lvl4_xwalk_path)
@@ -1123,14 +1198,25 @@ class Synth_Connect:
             # working unchanged in new_pop mode.
             import os as _os
             EXTERNAL_TAZ = 330
-            _zone_list_path = _os.path.join(
-                _os.environ.get('NEW_POP_DIR', r'Z:\test_runs_tours\new_pop'),
-                '..', 'demand_', 'sa2_crosswalk_507.csv'
-            )
-            _zone_list_path = _os.path.normpath(_zone_list_path)
-            _valid_zones = None
-            if _os.path.exists(_zone_list_path):
-                _valid_zones = set(pd.read_csv(_zone_list_path)['sa2_code'].astype(int))
+            # Valid-zone universe: the UNION of the operative crosswalk list
+            # (sa2_crosswalk_507.csv, 324 zones) and the full-SEQ reference
+            # (sa2_zones_reference_357.csv, 371 zones after the 2026-07
+            # extension). Validating against the crosswalk alone wrongly
+            # externalised every trip touching the 47 newly-added zones
+            # (Jimboomba, Toowoomba SA4 317, NSW Richmond Valley, ...).
+            _demand_dir = _os.path.normpath(_os.path.join(
+                (_os.environ.get('NEW_POP_DIR') or _DEFAULT_NEW_POP_DIR),
+                '..', 'demand_'))
+            _valid_zones = set()
+            for _zl_name, _zl_col in [('sa2_crosswalk_507.csv', 'sa2_code'),
+                                       ('sa2_zones_reference_357.csv', 'sa2_code')]:
+                _zl_path = _os.path.join(_demand_dir, _zl_name)
+                if _os.path.exists(_zl_path):
+                    _valid_zones |= set(
+                        pd.to_numeric(pd.read_csv(_zl_path)[_zl_col],
+                                      errors='coerce').dropna().astype(int))
+            if not _valid_zones:
+                _valid_zones = None
 
             def _to_otaz(sa2_series):
                 sa2 = pd.to_numeric(sa2_series, errors='coerce')
@@ -1144,9 +1230,20 @@ class Synth_Connect:
 
             _n_external = int((trips['OTAZ'] == EXTERNAL_TAZ).sum() + (trips['DTAZ'] == EXTERNAL_TAZ).sum())
             if _n_external:
+                # name the genuinely-external codes so a coverage regression
+                # (like the 324-vs-371 one) is visible at a glance instead of
+                # hiding behind an aggregate count
+                _ext_codes = pd.concat([
+                    pd.to_numeric(trips['ORIGSA2_2021'], errors='coerce'),
+                    pd.to_numeric(trips['DESTSA2_2021'], errors='coerce'),
+                ]).dropna().astype(int)
+                _ext_codes = sorted(set(_ext_codes[~_ext_codes.isin(_valid_zones)])) \
+                    if _valid_zones else []
                 logging.warning(
                     f"process_survey (new_pop): {_n_external} trip endpoints outside "
-                    f"the 507-zone list (defaulted to TAZ {EXTERNAL_TAZ})"
+                    f"the {len(_valid_zones or [])}-zone SEQ universe -> external "
+                    f"sentinel {EXTERNAL_TAZ} (excluded from zone choice). "
+                    f"{len(_ext_codes)} distinct external SA2s, first 10: {_ext_codes[:10]}"
                 )
         else:
             # FIX 1: TAZ zone lookup (was missing entirely from process_survey)
@@ -2302,7 +2399,7 @@ class Synth_Connect:
         else:
             import os as _os
             if self.new_pop:
-                _new_pop_dir = _os.environ.get('NEW_POP_DIR', r'Z:\test_runs_tours\new_pop')
+                _new_pop_dir = (_os.environ.get('NEW_POP_DIR') or _DEFAULT_NEW_POP_DIR)
                 _landuse_path = _os.path.join(_new_pop_dir, 'saved_data', 'zone_landuse_507.csv')
                 _osm_path = _os.path.join(_new_pop_dir, 'saved_data', 'SA2_2016_OSM_counts_507.csv')
                 self.land = pd.read_csv(_landuse_path)
@@ -2818,6 +2915,13 @@ class Synth_Connect:
         df['WORKSTAT'] = df['WORKSTATUS'].map(work_map).fillna(0)
         df['indp'] = df['INDUSTRY'].map(industy_map).fillna(20)
         df['sexp'] = df['SEX'].map(sex_map)
+        # ── Impute non-response income (codes 16/17 = "prefer not to say" /
+        # "select one" / "not applicable") from the person's profile so the
+        # income coefficient is estimable. ~88% of HHTS income is non-response,
+        # which otherwise collapses every income band. Disable with
+        # GA_IMPUTE_INCOME=0.
+        if os.environ.get('GA_IMPUTE_INCOME', '1').strip() != '0':
+            df = _impute_income(df)
         df = df.rename(columns={'BIKES': 'bikes', 'HHSIZE': 'nprd'})
         df['vehrd'] = df['HHVEH'].clip(upper=4)
         # CARLICENCE is boolean True/False in QTS — convert to 0/1

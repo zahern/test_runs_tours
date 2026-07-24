@@ -122,6 +122,70 @@ def main():
     print(f"\nZones with no legacy activity-purpose/OSM-category data "
           f"({len(legacy_extra_cols)} columns: {legacy_extra_cols[:5]}...): {n_gap}/{n_sa2}")
 
+    # ── Fill the gap zones from the fresh OSM POI counts ───────────────────
+    # 10_build_osm_counts_507.py fetches per-zone POI tag-value counts for
+    # the FULL zone list (SA2_2016_OSM_counts_507.csv), so zones the legacy
+    # 330-zone file never covered (Toowoomba SA4 317, NSW Richmond Valley,
+    # the 2021-vintage infill SA2s) get real attractor data instead of NaN→0.
+    _osm_path = os.path.join(OUT_DIR_NEWPOP, "SA2_2016_OSM_counts_507.csv") \
+        if 'OUT_DIR_NEWPOP' in dir() else \
+        os.path.join(os.path.dirname(OUT_PATH), "SA2_2016_OSM_counts_507.csv")
+    if os.path.exists(_osm_path) and n_gap:
+        osm = pd.read_csv(_osm_path)
+        osm["SA2_MAIN16"] = osm["SA2_MAIN16"].astype(int)
+        osm = osm.set_index("SA2_MAIN16")
+
+        def _osm_sum(row_zone, cols):
+            if row_zone not in osm.index:
+                return np.nan
+            vals = [osm.at[row_zone, c] for c in cols if c in osm.columns]
+            return float(np.nansum(vals)) if vals else np.nan
+
+        # Composite activity-purpose columns approximated from standard
+        # POI groupings; direct-name columns (park, sport, retail, ...)
+        # copy straight across. Conservative: only fills where legacy is NaN.
+        _COMPOSites = {
+            'EATOUT':      ['cafe', 'restaurant', 'fast_food', 'pub', 'bar', 'food_court'],
+            'Shopping':    ['supermarket', 'mall', 'department_store', 'convenience',
+                            'clothes', 'bakery', 'butcher', 'greengrocer', 'chemist'],
+            'Entertainment': ['cinema', 'theatre', 'nightclub', 'arts_centre', 'casino'],
+            'Healthcare':  ['hospital', 'clinic', 'doctors', 'dentist', 'pharmacy',
+                            'physiotherapist'],
+            'Education':   ['school', 'university', 'college', 'language_school'],
+            'ESCORT':      ['school', 'kindergarten', 'childcare'],
+            'childcare':   ['kindergarten', 'childcare'],
+            'Public_Services': ['townhall', 'courthouse', 'police', 'fire_station',
+                                'library', 'post_office'],
+            'OTHERMAINTENANCE': ['bank', 'car_repair', 'laundry', 'post_office',
+                                 'fuel', 'atm'],
+            'OTHERDISCRFacilities': ['place_of_worship', 'community_centre',
+                                     'sports_centre', 'fitness_centre', 'swimming_pool'],
+        }
+        _gap_mask = out[legacy_extra_cols[0]].isna()
+        _n_filled_cols = 0
+        for col in legacy_extra_cols:
+            if col in ('SA4_NAME16',):
+                continue
+            if col in _COMPOSites:
+                srcs = _COMPOSites[col]
+            elif col in osm.columns:
+                srcs = [col]
+            else:
+                continue
+            fill_vals = out.loc[_gap_mask, "SA2_MAIN16"].map(
+                lambda z, s=srcs: _osm_sum(z, s))
+            out.loc[_gap_mask, col] = out.loc[_gap_mask, col].fillna(fill_vals)
+            _n_filled_cols += 1
+        # tally against a column the fill can actually populate (the first
+        # legacy col is school enrollment, which has no OSM equivalent)
+        _tally_col = next((c for c in ('EATOUT', 'park', 'Shopping')
+                           if c in out.columns), None)
+        _still_gap = (int(out.loc[_gap_mask, _tally_col].isna().sum())
+                      if _tally_col else -1)
+        print(f"OSM gap-fill: {_n_filled_cols} columns filled for "
+              f"{int(_gap_mask.sum())} gap zones from {os.path.basename(_osm_path)} "
+              f"(zones still lacking OSM attractors: {_still_gap})")
+
     # ── Reconcile TOTHH/TOTPOP with the actual exported synthetic population ──
     # The SEQ-STM landuse source is a different model vintage/scenario (see
     # plan caveat) and its household/population totals don't exactly match

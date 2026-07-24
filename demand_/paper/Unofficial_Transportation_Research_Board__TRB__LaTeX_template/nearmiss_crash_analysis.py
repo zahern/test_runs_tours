@@ -447,6 +447,14 @@ def differential_evolution_feature_search(
         _score, bounds=[(0.0, 1.0)] * Kf,
         maxiter=maxiter, popsize=popsize, seed=seed,
         mutation=(0.4, 1.4), recombination=0.7,
+        # tol=0 disables scipy's population-variance early-stopping check
+        # (default tol=0.01), which was firing after 1-2 generations here
+        # -- the binary-via-threshold feature-selection landscape has large
+        # flat regions (many masks collapse to the same score), so the
+        # population looked "converged" almost immediately and the
+        # convergence plot only ever got 1-2 points. This forces the full
+        # maxiter generations to run every time.
+        tol=0.0,
         polish=False, callback=_callback,
     )
     history.append(_score(res.x))
@@ -503,7 +511,8 @@ def model_to_latex(model, filename, caption, label):
     # Format columns
     latex_rows = []
     for _, row in tbl.iterrows():
-        var = row["Variable"].replace("_", "\\_").replace("%", "\\%")
+        var = row["Variable"].replace("_", "\\_")
+        var = var.replace("\\%", "%").replace("%", "\\%")  # avoid double-escaping labels already containing \%
         est = f"{row['Estimate']:+.4f}"
         irr = f"{row['IRR']:.4f}"
         zs = f"{row['z']:.2f}" if np.isfinite(row['z']) else "--"
@@ -786,7 +795,9 @@ def _frank_cop(u, v, theta):
     return -np.log1p(np.expm1(-theta * u) * np.expm1(-theta * v) / denom) / theta
 
 def _normal_cop(u, v, rho):
-    """Gaussian copula C(u,v;rho). Uses bivariate normal CDF (vectorized)."""
+    """Gaussian copula C(u,v;rho). rho=0 → independence (u*v)."""
+    if abs(rho) < 1e-8:
+        return u * v
     from scipy.stats import norm, multivariate_normal
     eps = 1e-10
     u = np.clip(u, eps, 1 - eps)
@@ -854,10 +865,15 @@ def fit_bivariate_copula(df, nm_col, nm_model, crash_model, copula_name="kimeldo
     u2p = np.where(y2 > 0,
                    np.clip(_nb_cdf(y2 - 1, mu2, alpha2), 0.0, 1 - eps), 0.0)
 
-    # Independence baseline (sum of marginal NB log-likelihoods)
-    ll_1    = float(np.sum(np.log(np.maximum(_nb_pmf(y1, mu1, alpha1), eps))))
-    ll_2    = float(np.sum(np.log(np.maximum(_nb_pmf(y2, mu2, alpha2), eps))))
-    ll_indep = ll_1 + ll_2
+    # Independence baseline via copula rectangle formula at theta=0
+    # (NOT via _nb_pmf directly) to guarantee numerical consistency:
+    # the rectangle formula recovers independence exactly at theta=0 for
+    # all copulas (C(u,v;0)=u*v), so the copula-optimised LL can NEVER be
+    # worse than independence.
+    indep_pmf = _joint_pmf_vec(u1c, u1p, u2c, u2p,
+                                lambda u, v, t: u * v,  # theta=0 → C(u,v) = u*v
+                                0.0)
+    ll_indep = float(np.sum(np.log(np.maximum(indep_pmf, eps))))
 
     cop_fn = _COPULA_FNS[copula_name]
     lo, hi = _COPULA_BOUNDS[copula_name]
@@ -1017,14 +1033,17 @@ def fit_joint_copula_full(df, nm_col, nm_model, crash_model, copula_name="kimeld
     u2c_opt = np.clip(_nb_cdf(y2, mu2_opt, alpha2_opt), eps, 1 - eps)
     u2p_opt = np.where(y2 > 0, np.clip(_nb_cdf(y2 - 1, mu2_opt, alpha2_opt), 0, 1 - eps), 0.0)
 
-    k_nm_r  = nm_r["k"]  if nm_r  else nm_model["k"]
-    k_cr_r  = cr_r["k"]  if cr_r  else crash_model["k"]
-    ll_marg = ((nm_r["ll"] if nm_r else nm_model["ll"]) +
-               (cr_r["ll"] if cr_r else crash_model["ll"]))
+    # Independence baseline via the SAME rectangle formula with
+    # C(u,v;0)=u*v — numerically consistent with the copula LL path.
+    # This guarantees ll_joint >= ll_indep (LR >= 0) because the
+    # copula optimiser can always return to theta=0.
+    indep_pmf = _joint_pmf_vec(u1c_opt, u1p_opt, u2c_opt, u2p_opt,
+                                lambda u, v, t: u * v, 0.0)
+    ll_indep = float(np.sum(np.log(np.maximum(indep_pmf, eps))))
     k_indep  = k_nm_r + k_cr_r
-    bic_indep = k_indep  * np.log(n) - 2 * ll_marg
+    bic_indep = k_indep  * np.log(n) - 2 * ll_indep
     bic_joint = K_total  * np.log(n) - 2 * ll_joint
-    lr_stat   = 2.0 * (ll_joint - ll_marg)
+    lr_stat   = 2.0 * (ll_joint - ll_indep)
     df_lr     = K_total - k_indep
     p_lr      = float(1 - scipy_stats.chi2.cdf(lr_stat, df=max(df_lr, 1)))
 
@@ -1318,7 +1337,7 @@ def bivariate_copula_analysis(df, nm_col, nm_model, crash_model, out_dir):
 def differential_evolution_copula_search(
     df, candidates, nm_col, offset_col, copula_name="kimeldorf",
     init_nm_feats=None, init_crash_feats=None,
-    maxiter=20, popsize=6, n_runs=2, seed=42, plot_path=None,
+    maxiter=60, popsize=15, n_runs=3, seed=42, plot_path=None,
 ):
     """Jointly search NM and Crash feature subsets to minimise the FULL
     joint-MLE copula BIC (fit_joint_copula_full), using scipy's
@@ -1402,6 +1421,9 @@ def differential_evolution_copula_search(
             _objective, bounds=[(0.0, 1.0)] * n_genes,
             maxiter=maxiter, popsize=popsize, seed=run_seed,
             mutation=(0.4, 1.4), recombination=0.7,
+            # See differential_evolution_feature_search() for why tol=0 is
+            # needed -- without it this also stopped after 1-2 generations.
+            tol=0.0,
             init=init_pop, polish=False, callback=_callback,
         )
         final_score, final_payload = _score(res.x)
@@ -1427,6 +1449,26 @@ def differential_evolution_copula_search(
           f"theta={fit_best['theta']:.4f}  copula={copula_name}")
     print(f"  NM features    ({len(nm_feats_best)}): {[_V(f) for f in nm_feats_best]}")
     print(f"  Crash features ({len(crash_feats_best)}): {[_V(f) for f in crash_feats_best]}")
+
+    # ── Final model coefficient tables ────────────────────────────────
+    print(f"\n  {'─' * 60}")
+    print(f"  FINAL JOINT MODEL — NM marginal ({copula_name} copula)")
+    print(f"  {'─' * 60}")
+    print(nm_model_best["coef_table"].to_string(index=False))
+    print(f"\n  NM: LL={nm_model_best['ll']:.2f}  BIC={nm_model_best['bic']:.2f}  "
+          f"k={nm_model_best['k']}  dispersion(alpha)={nm_model_best['alpha']:.4f}")
+
+    print(f"\n  {'─' * 60}")
+    print(f"  FINAL JOINT MODEL — Crash marginal ({copula_name} copula)")
+    print(f"  {'─' * 60}")
+    print(crash_model_best["coef_table"].to_string(index=False))
+    print(f"\n  Crash: LL={crash_model_best['ll']:.2f}  BIC={crash_model_best['bic']:.2f}  "
+          f"k={crash_model_best['k']}  dispersion(alpha)={crash_model_best['alpha']:.4f}")
+    print(f"  Copula theta={fit_best['theta']:.4f}  "
+          f"Joint-BIC={fit_best['bic_joint']:.2f}  "
+          f"Indep-BIC={fit_best['bic_indep']:.2f}  "
+          f"dBIC={fit_best['bic_indep'] - fit_best['bic_joint']:+.1f}")
+    print(f"  {'─' * 60}\n")
 
     if plot_path:
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -1530,7 +1572,7 @@ def fit_random_params_nb(df, fixed_feats, rdm_feats, y_col, offset_col, label="R
         return None
 
 
-def random_params_analysis(df, nm_col, sa_nm_feats, sa_crash_feats, full_nm, full_crash, out_dir,
+def random_params_analysis(df, nm_col, sel_nm_feats, sel_crash_feats, full_nm, full_crash, out_dir,
                            mcr_nm=None, mcr_crash=None):
     """Run random-parameters NB for both responses.
 
@@ -1546,9 +1588,9 @@ def random_params_analysis(df, nm_col, sa_nm_feats, sa_crash_feats, full_nm, ful
     print("="*70)
 
     results = {}
-    for y_col, sa_feats, full_model, tag, mcr_result in [
-        (nm_col,      sa_nm_feats,    full_nm,    "NM",    mcr_nm),
-        ("ObsCrashes", sa_crash_feats, full_crash, "Crash", mcr_crash),
+    for y_col, sel_feats, full_model, tag, mcr_result in [
+        (nm_col,      sel_nm_feats,    full_nm,    "NM",    mcr_nm),
+        ("ObsCrashes", sel_crash_feats, full_crash, "Crash", mcr_crash),
     ]:
         rdm = fixed = None
         if mcr_result is not None:
@@ -1564,17 +1606,17 @@ def random_params_analysis(df, nm_col, sa_nm_feats, sa_crash_feats, full_nm, ful
 
         if rdm is None:
             # Fallback: MCR result unavailable/degenerate for this response —
-            # pick top-k features by |coef| from the SA model as random candidates
+            # pick top-k features by |coef| from the full model as random candidates
             # (exclude intercept and dispersion row).
             print(f"  [{tag}] MCR roles unavailable; falling back to top-4-|coef| heuristic")
-            ct    = full_model["coef_table"]
-            feat_rows = ct.iloc[1:]
-            if ct["Variable"].iloc[-1].startswith("ln("): feat_rows = feat_rows.iloc[:-1]
-            feat_rows  = feat_rows[feat_rows["Variable"].isin([_V(f) for f in sa_feats])]
+            feat_rows = full_model["coef_table"].copy()
+            if feat_rows["Variable"].iloc[-1].startswith("ln("):
+                feat_rows = feat_rows.iloc[:-1]
+            feat_rows  = feat_rows[feat_rows["Variable"].isin([_V(f) for f in sel_feats])]
             feat_rows  = feat_rows.reindex(feat_rows["Estimate"].abs().sort_values(ascending=False).index)
             top_feats_labels = feat_rows["Variable"].head(4).tolist()
-            rdm = [f for f in sa_feats if _V(f) in top_feats_labels]
-            fixed = [f for f in sa_feats if f not in rdm]
+            rdm = [f for f in sel_feats if _V(f) in top_feats_labels]
+            fixed = [f for f in sel_feats if f not in rdm]
 
         if len(rdm) < 1 or len(fixed) < 1:
             print(f"  [{tag}] Insufficient features for RP-NB, skipping.")
@@ -1585,7 +1627,7 @@ def random_params_analysis(df, nm_col, sa_nm_feats, sa_crash_feats, full_nm, ful
             results[tag] = None
             continue
 
-        # LR test vs fixed-parameters SA model
+        # LR test vs fixed-parameters baseline model
         ll_fixed = full_model["ll"]
         k_fixed  = full_model["k"]
         lr_stat  = 2 * (rp["ll"] - ll_fixed)
@@ -1624,14 +1666,18 @@ def random_params_analysis(df, nm_col, sa_nm_feats, sa_crash_feats, full_nm, ful
 # ===================================================================
 
 def mcr_model_search(df, y_col, feats_subset, offset_col,
-                     label="MCR-SA", n_starts=2, max_iter=500,
+                     label="MCR-DE", n_starts=2, max_iter=500,
                      R=5, max_latent_classes=1, out_dir=None,
-                     N_max=1500, max_time_per_start=1800):
+                     N_max=1500, max_time_per_start=1800,
+                     solver="de", pop_size=30):
     """Search over parameter roles (fixed / random-indep / random-corr) for a
-    given feature set using metacountregressor StructureEvaluatorLC + SA.
+    given feature set using metacountregressor StructureEvaluatorLC.
 
+    solver='de' uses NSGA2Engine + AdaptiveDE (differential evolution).
+    solver='sa' uses AdvancedSimulatedAnnealing (legacy).
+    
     Data is subsampled to N_max rows for tractable JAX compilation cost.
-    Each SA start is capped at max_time_per_start seconds.
+    Each start is capped at max_time_per_start seconds.
     """
     try:
         from metacountregressor.experiment_package import StructureEvaluatorLC
@@ -1640,8 +1686,7 @@ def mcr_model_search(df, y_col, feats_subset, offset_col,
         print(f"  mcr_model_search: import failed ({e}); skipping.")
         return None
 
-    # Re-patch generate_neighbor with the version that defines D before the LC
-    # block.  The installed MCR on some clusters has the old ordering (NameError).
+    # Re-patch generate_neighbor for SA path (when used)
     def _fixed_generate_neighbor(self, solution, T=None, max_attempts=20, min_active=2):
         for _ in range(max_attempts):
             neighbor = solution.copy()
@@ -1652,7 +1697,7 @@ def mcr_model_search(df, y_col, feats_subset, offset_col,
             mut_rate = float(np.clip(mut_rate, 0.0, 1.0))
             n_changes = np.random.randint(self.min_changes, self.max_changes + 1)
             indices   = list(np.random.choice(self.dim, size=n_changes, replace=False))
-            D = self.dim_core          # must be before LC block (fixes NameError)
+            D = self.dim_core
             if getattr(self.evaluator, "max_latent_classes", 1) > 1:
                 mask_start   = 2 * D + 2
                 mask_end     = 3 * D + 1
@@ -1693,25 +1738,20 @@ def mcr_model_search(df, y_col, feats_subset, offset_col,
             neighbor = self.repair(neighbor)
             if changed and not self.is_same(neighbor, solution):
                 return neighbor
-        # fallback
         neighbor = solution.copy()
         idx = np.random.randint(0, self.dim_core)
         neighbor[idx] = self.sample_allowed_role(idx)
         return neighbor
 
     _sol.AdvancedSimulatedAnnealing.generate_neighbor = _fixed_generate_neighbor
-    AdvSA = _sol.AdvancedSimulatedAnnealing
 
-    print(f"\n  MCR STRUCTURE SEARCH [{label}] — y = {y_col}")
+    print(f"\n  MCR STRUCTURE SEARCH [{label}] — y = {y_col}  solver={solver.upper()}")
     print(f"  {len(feats_subset)} features, roles={{0,1,2,3}}, "
           f"R={R}, max_iter={max_iter}×{n_starts}, max_LC={max_latent_classes}, "
           f"N_max={N_max}, time_cap={max_time_per_start}s")
 
     df_m = df.dropna(subset=feats_subset + [y_col, offset_col]).reset_index(drop=True).copy()
 
-    # Subsample for tractable JAX compilation cost (each unique model structure
-    # triggers a full XLA recompilation; smaller N means smaller arrays and
-    # faster compilation, reducing both time and peak memory).
     if len(df_m) > N_max:
         df_m = df_m.sample(n=N_max, random_state=42).reset_index(drop=True)
         print(f"  Subsampled to {N_max} rows (from {len(df.dropna(subset=feats_subset + [y_col, offset_col]))})")
@@ -1740,17 +1780,12 @@ def mcr_model_search(df, y_col, feats_subset, offset_col,
         return None
 
     D   = len(std_cols)
-    # 3D+2 when LC enabled: roles(D)+dists(D)+disp_bit+lc_code+class_masks(D)
-    # 2D+2 for single-class: roles(D)+dists(D)+disp_bit+lc_code(always 0)
     dim = 3 * D + 2 if max_latent_classes > 1 else 2 * D + 2
 
     best_sol = None
     best_bic = 1e12
 
     for start in range(n_starts):
-        # Clear JAX JIT cache between starts to prevent unbounded memory growth.
-        # Each unique model structure compiles a new XLA program; without clearing,
-        # dozens of compiled programs accumulate and exhaust RAM.
         try:
             import gc
             jax.clear_caches()
@@ -1760,19 +1795,39 @@ def mcr_model_search(df, y_col, feats_subset, offset_col,
 
         np.random.seed(42 + start * 13)
         try:
-            sa = AdvSA(
-                evaluator=evaluator,
-                dimension=dim,
-                max_iter=max_iter,
-                max_time=max_time_per_start,
-                alpha=0.97,
-                mutation_rate=0.35,
-                min_changes=1,
-                max_changes=3,
-            )
-            archive, scores = sa.optimize()
+            if solver == "de":
+                operator = _sol.AdaptiveDE(F=0.5, CR=0.7)
+                ng = _sol.NSGA2Engine(
+                    evaluator=evaluator,
+                    operator=operator,
+                    dimension=dim,
+                    pop_size=pop_size,
+                    max_iter=max_iter,
+                    n_jobs=1,
+                    save_history=True,
+                )
+                archive, scores = ng.optimize()
+                # Single-objective NSGA2Engine.optimize() returns a single
+                # (best_individual, best_score) pair, not population-sized
+                # arrays like AdvancedSimulatedAnnealing.optimize() does.
+                # Normalise shapes so the argmin/indexing below works for both.
+                archive = np.atleast_2d(archive)
+                scores  = np.atleast_1d(scores)
+            else:
+                AdvSA = _sol.AdvancedSimulatedAnnealing
+                sa = AdvSA(
+                    evaluator=evaluator,
+                    dimension=dim,
+                    max_iter=max_iter,
+                    max_time=max_time_per_start,
+                    alpha=0.97,
+                    mutation_rate=0.35,
+                    min_changes=1,
+                    max_changes=3,
+                )
+                archive, scores = sa.optimize()
         except Exception as e:
-            print(f"  [Start {start+1}] SA failed: {e}")
+            print(f"  [Start {start+1}] solver failed: {e}")
             import traceback; traceback.print_exc()
             continue
 
@@ -1812,7 +1867,7 @@ def mcr_model_search(df, y_col, feats_subset, offset_col,
     lc         = best_spec.get("latent_classes", 1)
     nb         = bool(best_spec.get("dispersion", 1))
 
-    print(f"\n  BEST MCR-SA [{label}]: BIC = {best_bic:.2f}")
+    print(f"\n  BEST MCR [{label}]: BIC = {best_bic:.2f}")
     print(f"  Fixed params:     {[_V(f) for f in fixed_orig]}")
     rdm_labels = [_V(r.split(':')[0]) for r in rdm_i_orig]
     cor_labels = [_V(r.split(':')[0]) for r in rdm_c_orig]
@@ -1854,59 +1909,55 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # ============================================================
-    # STEP 1: DUAL SIMULATED ANNEALING (coarse feature pre-filter)
+    # STEP 1: DIFFERENTIAL EVOLUTION (coarse feature pre-filter)
     # ============================================================
     # Narrows the 30-feature GEO pool down to a tractable candidate set for
-    # each response before the more expensive MCR role search below. Trimmed
-    # from 1200 to 700 iterations: the cooling schedule (T_start=8.0,
-    # cooling_rate=0.995) reaches T<0.4 by iteration ~600, after which the
-    # search is effectively greedy and every restart was landing on the
-    # identical BIC for the remaining 500+ iterations — pure wasted compute.
+    # each response before the more expensive MCR role search below.
     print("\n\n" + "#"*70)
-    print("#  STEP 1: SIMULATED ANNEALING — Best geometry for NM vs crashes")
+    print("#  STEP 1: DIFFERENTIAL EVOLUTION — Best geometry for NM vs crashes")
     print("#  (coarse pre-filter; STEP 2 below does the real role search)")
     print("#"*70)
 
-    hs_nm, hs_nm_feats, hs_nm_hist = simulated_annealing_search(
+    hs_nm, hs_nm_feats, hs_nm_hist = differential_evolution_feature_search(
         df, GEO, nm_col, "log_len",
         label="NM_response", p_threshold=0.10, penalty_per_insig=10.0,
-        max_iter=700, cooling_rate=0.996,
-        plot_path=os.path.join(OUTPUT_DIR, "sa_convergence_nm.png")
+        maxiter=40, popsize=10, seed=42,
+        plot_path=os.path.join(OUTPUT_DIR, "de_convergence_nm.png")
     )
-    hs_crash, hs_crash_feats, hs_crash_hist = simulated_annealing_search(
+    hs_crash, hs_crash_feats, hs_crash_hist = differential_evolution_feature_search(
         df, GEO, "ObsCrashes", "log_len",
         label="Crash_response", p_threshold=0.10, penalty_per_insig=10.0,
-        max_iter=700, cooling_rate=0.996,
-        plot_path=os.path.join(OUTPUT_DIR, "sa_convergence_crash.png")
+        maxiter=40, popsize=10, seed=43,
+        plot_path=os.path.join(OUTPUT_DIR, "de_convergence_crash.png")
     )
 
     # Overall convergence plot (both on one)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    ax1.plot(range(1, len(hs_nm_hist)+1), hs_nm_hist, "b-", linewidth=0.8, alpha=0.8)
+    ax1.plot(range(1, len(hs_nm_hist)+1), hs_nm_hist, "darkorange", linewidth=0.8, alpha=0.8)
     ax1.axhline(y=min(hs_nm_hist), color="red", linestyle="--", alpha=0.5)
-    ax1.set_title("SA: NM Response\n(penalised BIC best so far)")
-    ax1.set_xlabel("Iteration"); ax1.set_ylabel("Penalised BIC"); ax1.grid(True, alpha=0.3)
+    ax1.set_title("DE: NM Response\n(penalised BIC best so far)")
+    ax1.set_xlabel("Generation"); ax1.set_ylabel("Penalised BIC"); ax1.grid(True, alpha=0.3)
 
-    ax2.plot(range(1, len(hs_crash_hist)+1), hs_crash_hist, "g-", linewidth=0.8, alpha=0.8)
+    ax2.plot(range(1, len(hs_crash_hist)+1), hs_crash_hist, "darkorange", linewidth=0.8, alpha=0.8)
     ax2.axhline(y=min(hs_crash_hist), color="red", linestyle="--", alpha=0.5)
-    ax2.set_title("SA: Crash Response\n(penalised BIC best so far)")
-    ax2.set_xlabel("Iteration"); ax2.set_ylabel("Penalised BIC"); ax2.grid(True, alpha=0.3)
+    ax2.set_title("DE: Crash Response\n(penalised BIC best so far)")
+    ax2.set_xlabel("Generation"); ax2.set_ylabel("Penalised BIC"); ax2.grid(True, alpha=0.3)
 
-    fig.suptitle("Simulated Annealing Convergence (NB, 700 iters × 3 restarts, significance-penalised)", fontsize=13)
+    fig.suptitle("Differential Evolution Convergence (NB, popsize=10×40 gen, significance-penalised)", fontsize=13)
     fig.tight_layout()
-    hs_plot = os.path.join(OUTPUT_DIR, "sa_convergence_combined.png")
-    fig.savefig(hs_plot, dpi=150)
+    de_plot = os.path.join(OUTPUT_DIR, "de_convergence_combined.png")
+    fig.savefig(de_plot, dpi=150)
     plt.close(fig)
 
-    # Save the SA models as LaTeX tables
+    # Save the DE models as LaTeX tables
     model_to_latex(hs_nm,
-                   os.path.join(OUTPUT_DIR, "sa_best_nm.tex"),
-                   "Simulated Annealing Best Model: Near-Miss Response",
-                   "tab:sa_nm")
+                   os.path.join(OUTPUT_DIR, "de_best_nm.tex"),
+                   "Differential Evolution Best Model: Near-Miss Response",
+                   "tab:de_nm")
     model_to_latex(hs_crash,
-                   os.path.join(OUTPUT_DIR, "sa_best_crash.tex"),
-                   "Simulated Annealing Best Model: Crash Response",
-                   "tab:sa_crash")
+                   os.path.join(OUTPUT_DIR, "de_best_crash.tex"),
+                   "Differential Evolution Best Model: Crash Response",
+                   "tab:de_crash")
 
     # ============================================================
     # STEP 2: MCR STRUCTURE SEARCH — roles: fixed / rdm-ind / rdm-corr
@@ -1918,28 +1969,25 @@ def main():
     # cruder fixed-effects-only selection.
     print("\n\n" + "#"*70)
     print("#  STEP 2: MCR STRUCTURE SEARCH — roles: fixed / rdm-ind / rdm-corr")
-    print("#  Uses metacountregressor StructureEvaluatorLC + patched SA neighbor")
+    print("#  Uses metacountregressor StructureEvaluatorLC + NSGA2Engine DE")
     print("#"*70)
 
-    # MCR search: N_max=1500 subsample + R=5 draws + no LC keeps each JAX
-    # compilation small enough to finish within the PBS walltime.
-    # max_time_per_start caps each SA run at 30 min regardless of max_iter.
     mcr_nm = mcr_model_search(
         df, nm_col, hs_nm_feats, "log_len",
         label="NM", n_starts=2, max_iter=500, R=5,
         max_latent_classes=1, out_dir=OUTPUT_DIR,
-        N_max=1500, max_time_per_start=1800,
+        N_max=1500, solver="de", pop_size=20,
     )
     mcr_crash = mcr_model_search(
         df, "ObsCrashes", hs_crash_feats, "log_len",
         label="Crash", n_starts=2, max_iter=500, R=5,
         max_latent_classes=1, out_dir=OUTPUT_DIR,
-        N_max=1500, max_time_per_start=1800,
+        N_max=1500, solver="de", pop_size=20,
     )
 
     def _mcr_final_feats(mcr_result, fallback_feats):
         """Union of MCR's fixed + random-independent + random-correlated
-        variable names, falling back to the Step 1 SA feature set when the
+        variable names, falling back to the Step 1 feature set when the
         MCR search failed or returned a degenerate (<2 feature) result."""
         if mcr_result is None:
             return list(fallback_feats)
@@ -1968,6 +2016,19 @@ def main():
                                  label="Final: Crash (searched spec)", verbose=False)
     print(f"  Final NM model:    LL={spec_nm_model['ll']:.2f}, BIC={spec_nm_model['bic']:.2f}, "
           f"k={spec_nm_model['k']}")
+
+    # Export the final (DE pre-filter + MCR-condensed) specs to LaTeX. These
+    # are the models the rest of the pipeline (Steps 5-10) actually builds
+    # on, so they -- not the Step-1 DE pre-filter -- are what the paper's
+    # "best model" tables should show.
+    model_to_latex(spec_nm_model,
+                   os.path.join(OUTPUT_DIR, "final_spec_nm.tex"),
+                   "MCR-Searched Final Model: Near-Miss Response",
+                   "tab:final_nm")
+    model_to_latex(spec_crash_model,
+                   os.path.join(OUTPUT_DIR, "final_spec_crash.tex"),
+                   "MCR-Searched Final Model: Crash Response",
+                   "tab:final_crash")
     print(f"  Final Crash model: LL={spec_crash_model['ll']:.2f}, BIC={spec_crash_model['bic']:.2f}, "
           f"k={spec_crash_model['k']}")
 
@@ -2056,24 +2117,57 @@ def main():
     # so the two specs can trade off against each other and against the
     # dependence parameter — answering "what's the best COUPLED model"
     # rather than "given these two independently-best marginals, is there
-    # leftover dependence". Solved with differential_evolution rather than
-    # the hand-rolled SA used elsewhere in this script.
+    # leftover dependence".
     # ============================================================
     print("\n\n" + "#"*70)
     print("#  STEP 10: DE JOINT-MODEL COPULA STRUCTURE SEARCH")
     print("#  Searches both specs together against the full joint-MLE copula BIC")
     print("#"*70)
 
-    copula_search_candidates = sorted(
-        set(hs_nm_feats) | set(hs_crash_feats) | set(nm_final_feats) | set(crash_final_feats)
-    )
-    copula_search = differential_evolution_copula_search(
-        df, copula_search_candidates, nm_col, "log_len",
-        copula_name=cop["best_copula"],
-        init_nm_feats=nm_final_feats, init_crash_feats=crash_final_feats,
-        maxiter=40, popsize=12, n_runs=1,
-        plot_path=os.path.join(OUTPUT_DIR, "copula_search_convergence.png"),
-    )
+    cs_output_csv = os.path.join(OUTPUT_DIR, "copula_search_best.csv")
+    cs_convergence_plot = os.path.join(OUTPUT_DIR, "copula_search_convergence.png")
+
+    # ── Resume support: skip if previous run already saved best csv ──
+    copula_search = None
+    if os.path.exists(cs_output_csv):
+        print(f"  STEP 10 already completed; loading from {cs_output_csv}")
+        try:
+            cs_df = pd.read_csv(cs_output_csv)
+            if len(cs_df) > 0:
+                row = cs_df.iloc[0]
+                # Reconstruct a minimal dict so evidence logic works downstream
+                copula_search = {
+                    "nm_features":    row["nm_features"].split(";"),
+                    "crash_features": row["crash_features"].split(";"),
+                    "fit": {
+                        "theta":    row["theta"],
+                        "bic_joint": row["bic_joint"],
+                        "bic_indep": row["bic_indep"],
+                        "lr_stat":  row.get("lr_stat", float("nan")),
+                        "p_lr":     row.get("p_lr", float("nan")),
+                    },
+                }
+                print(f"  Loaded: theta={row['theta']:.4f}, "
+                      f"BIC={row['bic_joint']:.2f}, "
+                      f"dBIC={row['bic_indep'] - row['bic_joint']:+.1f}")
+        except Exception as e:
+            print(f"  Failed to load {cs_output_csv}: {e}")
+            copula_search = None
+
+    if copula_search is None:
+        copula_search_candidates = sorted(
+            set(hs_nm_feats) | set(hs_crash_feats) | set(nm_final_feats) | set(crash_final_feats)
+        )
+        print(f"  {len(copula_search_candidates)} candidates. "
+              f"maxiter=40, popsize=10, n_runs=2 "
+              f"(note: runs ~2-4 hours; increase walltime if needed)")
+        copula_search = differential_evolution_copula_search(
+            df, copula_search_candidates, nm_col, "log_len",
+            copula_name=cop["best_copula"],
+            init_nm_feats=nm_final_feats, init_crash_feats=crash_final_feats,
+            maxiter=40, popsize=10, n_runs=2,
+            plot_path=cs_convergence_plot,
+        )
 
     if copula_search is not None:
         cs_fit = copula_search["fit"]
@@ -2183,10 +2277,11 @@ def main():
         os.path.join(OUTPUT_DIR, "proxy_evidence.csv"), index=False
     )
     print(f"\n  All outputs in: {OUTPUT_DIR}")
-    print(f"  SA plots:     sa_convergence_nm.png, sa_convergence_crash.png, "
-          f"sa_convergence_combined.png")
+    print(f"  DE plots:     de_convergence_nm.png, de_convergence_crash.png, "
+          f"de_convergence_combined.png")
     print(f"  MCR search:   mcr_search_NM.csv, mcr_search_Crash.csv")
-    print(f"  Model tables: sa_best_nm.tex, sa_best_crash.tex")
+    print(f"  Model tables: de_best_nm.tex, de_best_crash.tex, "
+          f"final_spec_nm.tex, final_spec_crash.tex")
     print(f"  Diagnostics:  coefficient_proportionality.png, bivariate_residuals.png")
     print(f"  Copula (IFM): copula_comparison.csv, copula_conditional_predictions.csv, "
           f"copula_prediction_comparison.png")

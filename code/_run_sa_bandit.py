@@ -93,9 +93,12 @@ RUN_PREDICTION = os.environ.get('RUN_PREDICTION', '1').strip() == '1'
 # Override via env: qsub -v NEW_POP=1 job_sa_bandit_507.pbs
 os.environ.setdefault('NEW_POP', os.environ.get('NEW_POP', '0'))
 NEW_POP = os.environ['NEW_POP'].strip() == '1'
-NEW_POP_DIR = os.environ.get('NEW_POP_DIR', r'Z:\test_runs_tours\new_pop')
+# Repo-relative defaults (a Z:\ literal only resolves on the Windows mount)
+_TRT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+NEW_POP_DIR = os.environ.get('NEW_POP_DIR') or os.path.join(_TRT, 'new_pop')
 if NEW_POP:
-    os.environ.setdefault('PIPELINE_SKIMS_PATH', r'Z:\test_runs_tours\demand_\sa2_skims_507_omxspec.omx')
+    os.environ.setdefault('PIPELINE_SKIMS_PATH',
+                          os.path.join(_TRT, 'demand_', 'sa2_skims_507_omxspec.omx'))
 
 # ─────────────────────────────── ENV SETUP ───────────────────────────────────
 # All env-vars MUST be set before any pipeline or JAX import.
@@ -837,8 +840,9 @@ def _run_prediction(out: dict, landuse, all_ga: AllStagesResult, run_dir: str):
         scheduled_dest = stage5b(out, scheduled_dest, landuse)
     except Exception as _s5b_e:
         import traceback as _tb_s5b
-        logger.warning(f"Stage 5b failed (non-fatal): {_s5b_e}")
-        logger.debug(_tb_s5b.format_exc())
+        logger.warning(
+            f"Stage 5b failed (non-fatal): {_s5b_e!r}\n{_tb_s5b.format_exc(limit=8)}"
+        )
 
     # ── Stage 6 (plan finalisation + export) ──────────────────────────
     plan, _ = stage6(out, scheduled_dest, landuse,

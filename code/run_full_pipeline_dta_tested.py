@@ -63,7 +63,8 @@ from stage6_plan_finalisation import run_stage6
 from spatial_assignment import get_zone_centroids_rich
 from build_dynust_zone_crosswalk import build_crosswalk
 
-DTA_DIR        = r'Z:\test_runs_tours\DTA\DTA_Brisbane_tested'
+DTA_DIR        = os.environ.get('DTA_DIR') or os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '..', 'DTA', 'DTA_Brisbane_tested'))
 SAVE_DIR       = 'runs/full_pipeline_dta_tested'
 CROSSWALK_CSV  = 'saved_data/abm_to_dynust_zone_crosswalk.csv'
 GA_RESULTS_PKL = os.environ.get('GA_RESULTS_PKL', 'runs/ga_parallel/run06/merged/ga_results.pkl')

@@ -578,7 +578,7 @@ class OrderedLogit:
         return np.cumsum(np.concatenate([[raw_cuts[0]],
                                           np.exp(raw_cuts[1:])]))
 
-    def _log_likelihood(self, params, X, y, K):
+    def _log_likelihood(self, params, X, y, K, ridge=0.0):
         from scipy.special import expit
         beta, raw_cuts = self._unpack(params, K)
         cuts = self._cuts_from_raw(raw_cuts)
@@ -599,7 +599,17 @@ class OrderedLogit:
             p = np.clip(p, 1e-10, 1.0)
             ll += np.sum(np.log(p))
 
-        return -ll   # minimise negative LL
+        nll = -ll   # minimise negative LL
+        # ── Ridge (L2) penalty on slopes (NOT thresholds) ────────────────────
+        # Quasi-complete separation in tiny (purpose, ptype) segments otherwise
+        # sends coefficients to ±hundreds (e.g. walk_acc=-404 with t≈0). A small
+        # absolute ridge adds curvature 2·ridge to the objective: negligible for
+        # a well-identified coefficient (LL curvature ~ N dominates) but it pins
+        # a coefficient the data cannot identify toward 0. Slopes only — the
+        # ordinal thresholds must stay free.
+        if ridge:
+            nll = nll + 0.5 * float(ridge) * float(np.dot(beta, beta))
+        return nll
 
     def fit(self, X: np.ndarray, y: np.ndarray):
         from scipy.optimize import minimize
@@ -625,11 +635,18 @@ class OrderedLogit:
                                     np.log(np.diff(init_cuts) + 1e-4)])
         init = np.concatenate([np.zeros(K), raw_cuts])
 
+        # Ridge weight + hard slope bounds guard against separation blow-up in
+        # tiny segments. GA_S1_RIDGE tunes shrinkage; GA_S1_COEF_CAP the bound.
+        _ridge = float(os.environ.get('GA_S1_RIDGE', '2.0'))
+        _cap   = float(os.environ.get('GA_S1_COEF_CAP', '10.0'))
+        _bounds = [(-_cap, _cap)] * K + [(None, None)] * (len(init) - K)
+
         res = minimize(
             self._log_likelihood,
             init,
-            args=(X, y, K),
+            args=(X, y, K, _ridge),
             method='L-BFGS-B',
+            bounds=_bounds,
             options={'maxiter': 500, 'ftol': 1e-9},
         )
 
@@ -641,7 +658,7 @@ class OrderedLogit:
         # null LL: uniform probabilities
         self.ll0_        = float(len(y) * np.log(1.0 / J))
         try:
-            hess = _numerical_hessian(lambda p: self._log_likelihood(p, X, y, K), res.x)
+            hess = _numerical_hessian(lambda p: self._log_likelihood(p, X, y, K, _ridge), res.x)
             cov = np.linalg.pinv(hess)
             params = np.concatenate([self.coef_, self.thresholds_])
             raw_se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
@@ -776,6 +793,25 @@ def estimate_frequency_models(
                 continue
 
             X_raw = subset[feature_cols].fillna(0).values.astype(float)
+            # ── Drop zero-variance columns BEFORE fitting ────────────────────
+            # A feature that is constant within this (purpose, ptype) segment
+            # (e.g. ptype_FullTimeWorker inside the WorkingStudent segment, or a
+            # workstat_* dummy that is all-0 here) carries no information: its
+            # coefficient is stuck at 0.0 with p≈1/NaN and it survives the
+            # magnitude/p-value prune below because removing it can fail the
+            # threshold-gap acceptance check. Removing it up front is the only
+            # reliable way to keep these dead 0.0 terms out of the final model.
+            _sd0 = X_raw.std(axis=0)
+            _keep0 = _sd0 > 1e-9
+            if not _keep0.all():
+                _dropped0 = [feature_cols[i] for i in range(len(feature_cols)) if not _keep0[i]]
+                logger.info(f"  {purpose}/{ptype}: dropping {len(_dropped0)} zero-variance "
+                            f"feature(s): {_dropped0}")
+                feature_cols = [feature_cols[i] for i in range(len(feature_cols)) if _keep0[i]]
+                X_raw = X_raw[:, _keep0]
+            if X_raw.shape[1] == 0:
+                logger.info(f"  {purpose}/{ptype}: all features zero-variance — skipping")
+                continue
             mu = X_raw.mean(axis=0)
             sd = X_raw.std(axis=0)
             sd[sd == 0] = 1.0

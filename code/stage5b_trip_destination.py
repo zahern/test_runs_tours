@@ -85,6 +85,14 @@ DETOUR_MAX_KM = 50.0
 # Minimum number of stop observations required to estimate a segment model.
 MIN_STOP_OBS = 30
 
+# Maximum stop observations used to *estimate* a segment's MNL. The idca
+# expansion in _estimate_mnl_segment is dense (n_obs x n_zones), so at
+# full-population scale (millions of stop trips - e.g. job 23661073 OOM'd
+# at ~261GB estimating n=2,600,393 home stops) it must be bounded to a
+# calibration-sized sample. Prediction (_predict_stop_dest) still runs over
+# every stop trip, just batched, so this only affects parameter estimation.
+MAX_ESTIMATION_OBS = 50_000
+
 # Zone sample size for importance sampling (0 = all zones).
 SAMPLE_SIZE = 0
 
@@ -497,29 +505,37 @@ def _predict_stop_dest(
     taz_index: dict[int, int],
     zone_id_col: str = "zone_id",
     rng: np.random.Generator = None,
+    batch_size: int = 20_000,
 ) -> pd.Series:
     """
     Predict destination TAZ for stop trips using estimated model parameters.
 
     Returns a pd.Series indexed like stop_trips with predicted dest_taz.
+
+    Processes ``stop_trips`` in batches of ``batch_size`` observations: the
+    observations x zones expansion below is dense, so at full-population
+    scale (millions of stop trips) building it in one shot exhausts memory
+    the same way full re-estimation did (job 23661073: OOM at ~261GB
+    estimating n=2,600,393 home stops - the identical expansion pattern
+    used here for prediction would reproduce that on the very next stage).
+    Batching bounds peak memory to batch_size x n_zones regardless of the
+    total population size.
     """
     if rng is None:
         rng = np.random.default_rng()
 
-    m = model_result.get("model")
-    if m is None:
-        logger.warning("No model available for prediction; keeping observed destinations")
+    # Prediction only needs the fitted parameter values (below); the live
+    # Larch model object is never called on. This also lets prediction run
+    # against a reused/pickled model_result whose "model" key was stripped
+    # before saving (see run_stage5b's reuse_models_path path).
+    pf_result = model_result.get("params")
+    if pf_result is None or (hasattr(pf_result, "empty") and pf_result.empty):
+        logger.warning("No fitted parameters available for prediction; keeping observed destinations")
         return stop_trips["dest_taz"].copy()
 
     zones = all_zones[[zone_id_col]].reset_index(drop=True)
-    n_obs   = len(stop_trips)
-    n_zones = len(zones)
-
-    obs_idx = np.repeat(np.arange(n_obs), n_zones)
-    alt_idx = np.tile(np.arange(n_zones), n_obs)
-
-    obs_rows = stop_trips.iloc[obs_idx].reset_index(drop=True)
-    alt_rows = zones.iloc[alt_idx].reset_index(drop=True)
+    n_obs_total = len(stop_trips)
+    n_zones     = len(zones)
 
     # Build utility terms using fitted parameters
     pf = model_result["params"]["value"]
@@ -527,54 +543,67 @@ def _predict_stop_dest(
     def _p(name: float) -> float:
         return float(pf.get(name, 0.0))
 
-    if "NetworkDist" in skims:
-        o_i = obs_rows["origin_taz"].map(taz_index).fillna(0).astype(int).values
-        a_i = alt_rows[zone_id_col].map(taz_index).fillna(0).astype(int).values
-        anc_i = obs_rows["anchor_down_taz"].map(taz_index).fillna(0).astype(int).values
-        d_oa = _skim_lookup(skims["NetworkDist"], o_i, a_i)
-        d_aa = _skim_lookup(skims["NetworkDist"], a_i, anc_i)
-        d_oo = _skim_lookup(skims["NetworkDist"], o_i, anc_i)
-        detour = np.maximum(d_oa + d_aa - d_oo, 0.0)
-    else:
-        detour = np.zeros(len(obs_rows))
+    results: list[pd.Series] = []
+    for batch_start in range(0, n_obs_total, batch_size):
+        batch = stop_trips.iloc[batch_start:batch_start + batch_size]
+        n_obs = len(batch)
 
-    # Filter infeasible alternatives (detour > threshold)
-    feasible = detour <= DETOUR_MAX_KM
+        obs_idx = np.repeat(np.arange(n_obs), n_zones)
+        alt_idx = np.tile(np.arange(n_zones), n_obs)
 
-    log_size = compute_size_term(
-        alt_rows.assign(**{zone_id_col: alt_rows[zone_id_col]}),
-        model_result["purpose"], landuse, zone_id_col,
-    )
+        obs_rows = batch.iloc[obs_idx].reset_index(drop=True)
+        alt_rows = zones.iloc[alt_idx].reset_index(drop=True)
 
-    V = (
-        _p("detour_dist_km") * detour
-        + _p("log_size") * log_size
-    )
-    if "AutoCrashRisk" in skims and "AutoCrashRisk" in pf.index:
-        V += _p("AutoCrashRisk") * _skim_lookup(
-            skims["AutoCrashRisk"],
-            obs_rows["origin_taz"].map(taz_index).fillna(0).astype(int).values,
-            alt_rows[zone_id_col].map(taz_index).fillna(0).astype(int).values,
+        if "NetworkDist" in skims:
+            o_i = obs_rows["origin_taz"].map(taz_index).fillna(0).astype(int).values
+            a_i = alt_rows[zone_id_col].map(taz_index).fillna(0).astype(int).values
+            anc_i = obs_rows["anchor_down_taz"].map(taz_index).fillna(0).astype(int).values
+            d_oa = _skim_lookup(skims["NetworkDist"], o_i, a_i)
+            d_aa = _skim_lookup(skims["NetworkDist"], a_i, anc_i)
+            d_oo = _skim_lookup(skims["NetworkDist"], o_i, anc_i)
+            detour = np.maximum(d_oa + d_aa - d_oo, 0.0)
+        else:
+            detour = np.zeros(len(obs_rows))
+
+        # Filter infeasible alternatives (detour > threshold)
+        feasible = detour <= DETOUR_MAX_KM
+
+        log_size = compute_size_term(
+            alt_rows.assign(**{zone_id_col: alt_rows[zone_id_col]}),
+            model_result["purpose"], landuse, zone_id_col,
         )
 
-    # Mask infeasible alts
-    V[~feasible] = -np.inf
+        V = (
+            _p("detour_dist_km") * detour
+            + _p("log_size") * log_size
+        )
+        if "AutoCrashRisk" in skims and "AutoCrashRisk" in pf.index:
+            V += _p("AutoCrashRisk") * _skim_lookup(
+                skims["AutoCrashRisk"],
+                obs_rows["origin_taz"].map(taz_index).fillna(0).astype(int).values,
+                alt_rows[zone_id_col].map(taz_index).fillna(0).astype(int).values,
+            )
 
-    # Softmax per observation → draw
-    V_matrix = V.reshape(n_obs, n_zones)
-    V_matrix -= V_matrix.max(axis=1, keepdims=True)
-    exp_V = np.exp(V_matrix)
-    # Zero out any all-infeasible rows to avoid /0 — fall back to uniform
-    row_sums = exp_V.sum(axis=1, keepdims=True)
-    row_sums = np.where(row_sums == 0, 1.0, row_sums)
-    probs = exp_V / row_sums
+        # Mask infeasible alts
+        V[~feasible] = -np.inf
 
-    chosen_zone_indices = np.array([
-        rng.choice(n_zones, p=probs[i])
-        for i in range(n_obs)
-    ])
-    chosen_taz = zones.iloc[chosen_zone_indices][zone_id_col].values
-    return pd.Series(chosen_taz, index=stop_trips.index, name="dest_taz_predicted")
+        # Softmax per observation → draw
+        V_matrix = V.reshape(n_obs, n_zones)
+        V_matrix -= V_matrix.max(axis=1, keepdims=True)
+        exp_V = np.exp(V_matrix)
+        # Zero out any all-infeasible rows to avoid /0 — fall back to uniform
+        row_sums = exp_V.sum(axis=1, keepdims=True)
+        row_sums = np.where(row_sums == 0, 1.0, row_sums)
+        probs = exp_V / row_sums
+
+        chosen_zone_indices = np.array([
+            rng.choice(n_zones, p=probs[i])
+            for i in range(n_obs)
+        ])
+        chosen_taz = zones.iloc[chosen_zone_indices][zone_id_col].values
+        results.append(pd.Series(chosen_taz, index=batch.index, name="dest_taz_predicted"))
+
+    return pd.concat(results) if results else pd.Series(dtype=object, name="dest_taz_predicted")
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +673,7 @@ def run_stage5b(
     validate: bool = True,
     save_models: bool = True,
     output_dir: str = "saved_data",
+    reuse_models_path: Optional[str] = None,
 ) -> dict:
     """
     Run Stage 5b: trip-level intermediate-stop destination choice.
@@ -663,6 +693,15 @@ def run_stage5b(
     validate    : if True, compute validation statistics
     save_models : if True, pickle model results to output_dir
     output_dir  : directory for saving outputs
+    reuse_models_path : path to a previously-saved stage5b_models.pkl. When
+                  given and the file exists, estimation is skipped entirely
+                  and these fitted per-purpose parameters are used for
+                  prediction instead. Needed for full-population runs: the
+                  per-purpose MNL estimation builds a dense
+                  observations x zones design matrix (see
+                  ``_estimate_mnl_segment``), which is fine for a HHTS-scale
+                  calibration sample but exhausts memory when ``trips`` is
+                  the entire predicted population (millions of stop rows).
 
     Returns
     -------
@@ -676,6 +715,12 @@ def run_stage5b(
     os.makedirs(output_dir, exist_ok=True)
     logger.info("Stage 5b: trip-level destination choice starting")
 
+    # Plan-format bookkeeping: when the input is a Stage-5 plan (trip AND
+    # activity rows, OTAZ/DTAZ/travtime names), work on the trip rows with
+    # renamed columns internally, but hand the caller back a frame with the
+    # original plan shape and dest_taz_predicted merged on.
+    _plan_full = None
+
     # ── Guard: is_outbound is required for tour structure; derive if missing ─
     if 'is_outbound' not in trips.columns:
         if 'tour_id' in trips.columns and 'trip_num_in_tour' in trips.columns:
@@ -686,7 +731,31 @@ def run_stage5b(
         elif 'ptour_id' in trips.columns and 'seq' in trips.columns:
             # Plan-format input from predict_stage5: seq is position in person's day.
             # Trips before the midpoint of the tour's seq range are outbound.
+            # The plan interleaves activity rows with trip rows and uses
+            # OTAZ/DTAZ/travtime column names — previously this branch derived
+            # is_outbound but skipped both the row filter and the rename, so
+            # build_trip_records() crashed with "['dest_taz'] not in index"
+            # (job 23540863: Stage 5b FAILED after 27.7s, swallowed non-fatal).
+            _plan_full = trips
             trips = trips.copy()
+            if 'row_type' in trips.columns:
+                trips = trips[trips['row_type'] == 'trip'].copy()
+            trips['_plan_row_idx'] = trips.index   # survives the persons merge
+            _renames = {src: dst for src, dst in {
+                'OTAZ': 'origin_taz', 'DTAZ': 'dest_taz',
+                'travtime': 'travel_time_min',
+                'STARTIME': 'depart_time_min', 'ENDTIME': 'arrive_time_min',
+            }.items() if src in trips.columns and dst not in trips.columns}
+            if _renames:
+                trips = trips.rename(columns=_renames)
+            _missing = [c for c in ('origin_taz', 'dest_taz', 'purpose')
+                        if c not in trips.columns]
+            if _missing:
+                logger.error(
+                    f"Stage 5b: plan-format input still missing {_missing} "
+                    f"after column mapping (had: {sorted(_plan_full.columns)[:20]}…) — aborting"
+                )
+                return {'trips': _plan_full, 'models': {}, 'validation': None, 'bic_total': 0.0}
             min_seq = trips.groupby('ptour_id')['seq'].transform('min')
             max_seq = trips.groupby('ptour_id')['seq'].transform('max')
             mid_seq = (min_seq + max_seq) / 2.0
@@ -740,32 +809,75 @@ def run_stage5b(
 
     # ── Estimation: one MNL per purpose, on stop trips only ────────────────
     stop_mask = trips_aug["is_tour_dest_leg"] == 0
+    # Return-home legs are not intermediate stops: their destination is the
+    # home zone by construction, so they must never enter stop-destination
+    # estimation or prediction. In plan-format input they carry
+    # purpose == 'home' and dominate the trip table (2.6M rows in job
+    # 23661073, whose estimation attempt on them was OOM-killed at 250 GB).
+    if "purpose" in trips_aug.columns:
+        stop_mask &= trips_aug["purpose"].astype(str).str.lower() != "home"
     stop_trips = trips_aug[stop_mask].copy()
 
     models: dict[str, dict] = {}
     purposes = stop_trips["purpose"].dropna().unique().tolist()
 
-    for purpose in purposes:
-        seg = stop_trips[stop_trips["purpose"] == purpose].copy()
+    if reuse_models_path and os.path.isfile(reuse_models_path):
+        import pickle
         logger.info(
-            "Stage 5b: estimating %s stop destination (n=%d)", purpose, len(seg)
+            "Stage 5b: reusing fitted models from %s — skipping re-estimation "
+            "(predict-only; stop_trips n=%d)",
+            reuse_models_path, len(stop_trips),
         )
-        result = _estimate_mnl_segment(
-            stop_trips   = seg,
-            all_zones    = all_zones,
-            skims        = skims,
-            landuse      = landuse,
-            purpose      = purpose,
-            taz_index    = taz_index,
-            g_tripdest   = g_tripdest,
-            zone_id_col  = zone_id_col,
-        )
-        if result is not None:
-            models[purpose] = result
+        with open(reuse_models_path, "rb") as fh:
+            models = pickle.load(fh)
+        # Older pickles may lack diagnostic keys (job 23726229 died here on a
+        # KeyError('log_likelihood') raised by this *logging* loop, killing the
+        # whole predict-only path). Log defensively and drop entries that lack
+        # what prediction actually needs.
+        _unusable = [p for p, r in models.items()
+                     if not isinstance(r, dict) or "params" not in r]
+        for p in _unusable:
+            logger.warning("Stage 5b: reused model '%s' lacks 'params' — dropped", p)
+            models.pop(p, None)
+        for purpose, result in models.items():
+            result.setdefault("purpose", purpose)   # _predict_stop_dest needs it
             logger.info(
-                "  %s: LL=%.1f  BIC=%.1f  n=%d",
-                purpose, result["log_likelihood"], result["bic"], result["n_obs"],
+                "  %s: LL=%.1f  BIC=%.1f  n=%s (reused)",
+                purpose,
+                float(result.get("log_likelihood", float("nan"))),
+                float(result.get("bic", float("nan"))),
+                result.get("n_obs", "?"),
             )
+    else:
+        for purpose in purposes:
+            seg = stop_trips[stop_trips["purpose"] == purpose].copy()
+            if len(seg) > MAX_ESTIMATION_OBS:
+                logger.info(
+                    "Stage 5b: estimating %s stop destination (n=%d, sampled down "
+                    "from %d — idca expansion is dense at n x n_zones)",
+                    purpose, MAX_ESTIMATION_OBS, len(seg),
+                )
+                seg = seg.sample(n=MAX_ESTIMATION_OBS, random_state=42)
+            else:
+                logger.info(
+                    "Stage 5b: estimating %s stop destination (n=%d)", purpose, len(seg)
+                )
+            result = _estimate_mnl_segment(
+                stop_trips   = seg,
+                all_zones    = all_zones,
+                skims        = skims,
+                landuse      = landuse,
+                purpose      = purpose,
+                taz_index    = taz_index,
+                g_tripdest   = g_tripdest,
+                zone_id_col  = zone_id_col,
+            )
+            if result is not None:
+                models[purpose] = result
+                logger.info(
+                    "  %s: LL=%.1f  BIC=%.1f  n=%d",
+                    purpose, result["log_likelihood"], result["bic"], result["n_obs"],
+                )
 
     # ── Prediction ─────────────────────────────────────────────────────────
     rng = np.random.default_rng(seed=42)
@@ -822,8 +934,23 @@ def run_stage5b(
     trips_aug.to_csv(trip_path, index=False)
     logger.info("Stage 5b trip table written to %s", trip_path)
 
+    # ── Plan-format input: return the caller's plan shape, not the internal
+    # trips-only working table. Downstream (Stage 6) expects the full plan
+    # with activity rows intact; only dest_taz_predicted is added here.
+    trips_out = trips_aug
+    if _plan_full is not None:
+        trips_out = _plan_full.copy()
+        if "dest_taz_predicted" in trips_aug.columns and "_plan_row_idx" in trips_aug.columns:
+            _pred_by_row = (trips_aug.dropna(subset=["dest_taz_predicted"])
+                            .set_index("_plan_row_idx")["dest_taz_predicted"])
+            trips_out["dest_taz_predicted"] = trips_out.index.map(_pred_by_row)
+            logger.info(
+                "Stage 5b: %d stop-trip destination predictions merged back "
+                "onto plan (%d rows)", int(_pred_by_row.notna().sum()), len(trips_out)
+            )
+
     return {
-        "trips":      trips_aug,
+        "trips":      trips_out,
         "models":     models,
         "validation": validation_df,
         "bic_total":  bic_total,

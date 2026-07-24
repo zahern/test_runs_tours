@@ -12,6 +12,8 @@ Produces one figure per stage plus a combined summary HTML report.
 
 from __future__ import annotations
 import os, logging, warnings
+import base64, glob as _glob, html as _htmlmod, json, re
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import matplotlib; matplotlib.use('Agg')
@@ -42,6 +44,7 @@ def validate_stage1(out: dict, models: dict, save_dir: str) -> dict:
     """
     from stage1_activity_frequency import (
         prepare_frequency_data, predict_activity_frequency, calibrate_activity_rates,
+        predict_nonmand_split,
         PURPOSES as S1_PURPS,
         PTYPE_PREDICTION_MAP,
     )
@@ -52,6 +55,17 @@ def validate_stage1(out: dict, models: dict, save_dir: str) -> dict:
     # the majority probability for low-frequency activities is class=0.
     # Sampled prediction gives the full distribution, matching observed means.
     pred = predict_activity_frequency(data.copy(), models, sample=True, seed=42)
+    # Split the combined n_nonmand_out into escort/shopping/social/othmaint/
+    # othdiscr/eat, mirroring run_stage1() (stage1_activity_frequency.py:1596-1599).
+    # Without this, all six nonmand purposes start at pred==0 going into
+    # calibration below; for most of them calibrate_activity_rates' low-mean
+    # skip guard doesn't trigger so it reconstructs sensible values anyway,
+    # but othdiscr's HHTS mean is itself <0.01 so it hit the skip guard and
+    # was left at 0 for every segment in this report (production is unaffected
+    # since run_stage1() always calls this split).
+    if '_nonmand_split' in models and '_nonmand' in models and bool(models['_nonmand']):
+        pred = predict_nonmand_split(pred, models['_nonmand_split'],
+                                      rng=np.random.default_rng(44))
     # Use the same post-prediction ptype-purpose calibration as pipeline_logger
     # so validation reflects production predictions.
     pred = calibrate_activity_rates(

@@ -24,8 +24,12 @@ import json
 import os
 import time
 import requests
-import geopandas as gpd
 import pandas as pd
+
+try:
+    import geopandas as gpd
+except ImportError:
+    gpd = None   # pyshp fallback in _load_zone_geoms (Windows dev venv)
 
 SHP_PATH = r"Z:\test_runs_tours\SA2_2021_AUST_SHP_GDA2020\SA2_2021_AUST_GDA2020.shp"
 ZONE_LIST_507 = r"Z:\Paper_Plan\synth_pop\zone_ids_sa_only_507.txt"
@@ -98,6 +102,34 @@ def fetch_zone_counts(sa2_code, geom):
     return tags_seen
 
 
+def _load_zone_geoms(zone_ids):
+    """{sa2_code: shapely geometry} for the target zones, via geopandas when
+    available, else pyshp (pure python - the Windows dev venv has shapely but
+    not geopandas/fiona)."""
+    wanted = set(zone_ids)
+    if gpd is not None:
+        gdf = gpd.read_file(SHP_PATH)
+        gdf["SA2_CODE21"] = pd.to_numeric(gdf["SA2_CODE21"], errors="coerce")
+        gdf = gdf.dropna(subset=["SA2_CODE21"])
+        gdf["SA2_CODE21"] = gdf["SA2_CODE21"].astype(int)
+        gdf = gdf[gdf["SA2_CODE21"].isin(wanted)]
+        return dict(zip(gdf["SA2_CODE21"], gdf["geometry"]))
+    import shapefile  # pyshp
+    from shapely.geometry import shape
+    geoms = {}
+    with shapefile.Reader(SHP_PATH) as r:
+        fields = [f[0] for f in r.fields[1:]]
+        code_i = fields.index("SA2_CODE21")
+        for sr in r.iterShapeRecords():
+            try:
+                code = int(sr.record[code_i])
+            except (TypeError, ValueError):
+                continue
+            if code in wanted:
+                geoms[code] = shape(sr.shape.__geo_interface__)
+    return geoms
+
+
 def main():
     os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -105,24 +137,20 @@ def main():
         zone_ids_507 = sorted(int(x) for x in f.read().split())
     print(f"Target SA2 zones: {len(zone_ids_507)}")
 
-    gdf = gpd.read_file(SHP_PATH)
-    gdf["SA2_CODE21"] = pd.to_numeric(gdf["SA2_CODE21"], errors="coerce")
-    gdf = gdf.dropna(subset=["SA2_CODE21"])
-    gdf["SA2_CODE21"] = gdf["SA2_CODE21"].astype(int)
-    gdf = gdf[gdf["SA2_CODE21"].isin(zone_ids_507)].set_index("SA2_CODE21")
-    missing_geom = [z for z in zone_ids_507 if z not in gdf.index]
+    geoms = _load_zone_geoms(zone_ids_507)
+    missing_geom = [z for z in zone_ids_507 if z not in geoms]
     if missing_geom:
         print(f"WARNING: {len(missing_geom)} zones have no shapefile geometry, skipped: {missing_geom}")
 
     all_counts = {}
     n_done = 0
     for sa2_code in zone_ids_507:
-        if sa2_code not in gdf.index:
+        if sa2_code not in geoms:
             all_counts[sa2_code] = {}
             continue
         cache_path = os.path.join(CACHE_DIR, f"{sa2_code}.json")
         already = os.path.exists(cache_path)
-        tags_seen = fetch_zone_counts(sa2_code, gdf.loc[sa2_code, "geometry"])
+        tags_seen = fetch_zone_counts(sa2_code, geoms[sa2_code])
 
         counts = {}
         for tags in tags_seen:

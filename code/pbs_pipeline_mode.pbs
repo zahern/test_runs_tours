@@ -87,8 +87,40 @@ if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_metacount" = "1" ]; then
         pip install --upgrade --no-cache-dir -q "metacountregressor" \
             && echo "[pkg] MetaCount installed (PyPI latest)"
     fi
-    pip install --upgrade --no-cache-dir -q jax jaxlib jaxopt \
-        && echo "[pkg] jax/jaxlib/jaxopt installed"
+    # Only (re)install jax/jaxlib/jaxopt if the CURRENT env can't already import
+    # them. Previously this ran an unconditional `pip install --upgrade jax
+    # jaxlib jaxopt` on every job (INSTALL_ESTIMATORS defaults to 1, so this
+    # fired on every submission) - that installs the generic, non-CUDA-bundled
+    # jaxlib, silently overwriting a manually-fixed `jax[cuda12]` GPU install
+    # with a CPU/mismatched one on the very next job. job_sa_bandit.pbs and
+    # job_sa_bandit_507.pbs already use this same "skip if importable" guard;
+    # this brings pbs_pipeline_mode.pbs in line with them. If a real (re)install
+    # is ever needed, request jax[cuda12] explicitly (matching the known-good
+    # recipe: CUDA bundled in the wheel, not the system module) rather than
+    # bare jax/jaxlib, and run it on a GPU node - see PBS_RUN_GUIDE.md.
+    if ! python -c "import jax, jaxlib, jaxopt" 2>/dev/null; then
+        pip install --no-cache-dir -q "jax[cuda12]" jaxopt \
+            && echo "[pkg] jax[cuda12]/jaxopt installed"
+    else
+        echo "[pkg] jax/jaxlib/jaxopt already importable — skipping (not touching an existing GPU install)"
+    fi
+    # h5py is required for the SA1-resolution walk/bike skims
+    # (load_sa1_walk_skims). Without it every stage-5 evaluation logs
+    # "No module named 'h5py'" and silently falls back to SA2-level skims,
+    # degrading walk/bike accessibility fidelity (seen throughout job 23726229).
+    if ! python -c "import h5py" 2>/dev/null; then
+        pip install --no-cache-dir -q h5py \
+            && echo "[pkg] h5py installed (SA1 walk/bike skims)"
+    fi
+    # Exactly ONE CUDA plugin generation. jax[cuda12] is the pinned recipe;
+    # a stray cuda13 plugin (pulled in by an unpinned jax upgrade) races the
+    # cuda12 one at PJRT registration and one of them fails ALREADY_EXISTS in
+    # every process (job 23926202). Remove the cuda13 pair when both exist.
+    if python -c "import jax_plugins.xla_cuda13" 2>/dev/null \
+       && python -c "import jax_plugins.xla_cuda12" 2>/dev/null; then
+        pip uninstall -y -q jax-cuda13-plugin jax-cuda13-pjrt 2>/dev/null \
+            && echo "[pkg] removed duplicate cuda13 jax plugin (cuda12 is the pinned recipe)"
+    fi
     # Clear stale bytecode — stale .pyc files persist across pip upgrades and cause
     # wrong-line-number tracebacks and runtime errors from old bytecode.
     python - <<'PYEOF' 2>/dev/null || true
@@ -126,6 +158,15 @@ export OMP_NUM_THREADS="$THREADS"
 export OPENBLAS_NUM_THREADS="$THREADS"
 export MKL_NUM_THREADS="$THREADS"
 export NUMEXPR_NUM_THREADS="$THREADS"
+# Pure-CPU jax on CPU jobs: skip PJRT GPU plugin discovery entirely. The env
+# has had BOTH xla_cuda12 and xla_cuda13 plugins installed; whichever
+# registered second crashed with "ALREADY_EXISTS: PJRT_Api" in every process
+# (main + all spawned workers, job 23926202), and whichever won registered a
+# CUDA client on a node with ngpus=0. JAX_PLATFORMS=cpu sidesteps both and
+# removes any GPU-plugin memory overhead from CPU-only search workers.
+if [ "${PIPELINE_ACCELERATOR:-cpu}" = "cpu" ]; then
+    export JAX_PLATFORMS=cpu
+fi
 export STAGE5_WORKERS="$S5_WORKERS"
 # Zones per Stage-5 prediction batch. 1 zone/batch re-triggers Larch/sharrow
 # flow compilation per zone (~15 min each × 330 zones ≈ days — job 23300124
@@ -586,5 +627,23 @@ else
 fi
 EXIT_CODE=$?
 set -e
+
+# ── Refresh the SA2 travel-pattern slide in the model-review deck ─────────
+# Aggregates the newest stage5/stage6 plan output by person attribute and
+# injects the stats into ../abm_safety/model_review_deck.html (sentinel
+# replace — see generate_sa2_pattern_slide.py). Non-fatal: a slide refresh
+# failure must never fail the pipeline job.
+python generate_sa2_pattern_slide.py \
+    || echo "[deck] SA2 pattern slide refresh failed (non-fatal)"
+# Archive this run's validation reports and refresh the deck's diagnostics
+# gallery (see collect_run_reports.py). Also non-fatal.
+python collect_run_reports.py \
+    || echo "[deck] run-report gallery refresh failed (non-fatal)"
+# Person-day exemplars for the zones dashboard "Person Day" tab + the deck's
+# "day in the life" slide. Only meaningful after stage6 output exists; the
+# script exits quietly when it doesn't. Non-fatal like the slide above.
+python generate_person_day_samples.py \
+    || echo "[deck] person-day sample refresh failed (non-fatal)"
+
 echo "Finished: $(date)  exit_code=${EXIT_CODE}"
 exit "$EXIT_CODE"

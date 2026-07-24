@@ -200,6 +200,55 @@ def _bounded_padded_fit(X, y, active_mask, family, start_vector=None):
     }
 
 
+def _own_cgroup_mem_limit_bytes() -> int | None:
+    """Memory limit of THIS process's cgroup (walking up ancestors), or None.
+
+    PBS/SLURM put the job in a nested cgroup (e.g. .../pbs_jobs/23972276.aqua);
+    the root-level memory.max is usually 'max', so checking only the root files
+    misses the real per-job limit and the caller falls back to the 32 GB
+    default even on a 128 GB job (job 23972276 post-mortem).
+    """
+    import pathlib
+    try:
+        cg_lines = pathlib.Path('/proc/self/cgroup').read_text().splitlines()
+    except Exception:
+        return None
+    candidates: list[pathlib.Path] = []
+    for line in cg_lines:
+        parts = line.split(':', 2)
+        if len(parts) != 3:
+            continue
+        hier_id, controllers, rel = parts
+        rel = rel.lstrip('/')
+        if hier_id == '0':      # cgroup v2 unified hierarchy
+            root = pathlib.Path('/sys/fs/cgroup')
+            leaf = root / rel if rel else root
+            for p in [leaf, *leaf.parents]:
+                candidates.append(p / 'memory.max')
+                if p == root:
+                    break
+        elif 'memory' in controllers.split(','):   # cgroup v1 memory controller
+            root = pathlib.Path('/sys/fs/cgroup/memory')
+            leaf = root / rel if rel else root
+            for p in [leaf, *leaf.parents]:
+                candidates.append(p / 'memory.limit_in_bytes')
+                if p == root:
+                    break
+    for c in candidates:
+        try:
+            if not c.is_file():
+                continue
+            val = c.read_text().strip()
+            if val in ('', 'max'):
+                continue
+            limit = int(val)
+            if 0 < limit < (1 << 50):
+                return limit
+        except Exception:
+            continue
+    return None
+
+
 def _detect_mem_limit_bytes() -> int:
     """Return the effective memory limit for this process in bytes."""
     # 1) explicit env var
@@ -209,7 +258,11 @@ def _detect_mem_limit_bytes() -> int:
             return int(float(env_gb) * 1_073_741_824)
         except ValueError:
             pass
-    # 2) try cgroup v1 memory limit (PBS/Torque/SLURM on linux)
+    # 2) this process's own (possibly nested) cgroup — finds the PBS job limit
+    own = _own_cgroup_mem_limit_bytes()
+    if own is not None:
+        return own
+    # 3) try root cgroup v1 memory limit (PBS/Torque/SLURM on linux)
     try:
         import pathlib
         cg_v1 = pathlib.Path('/sys/fs/cgroup/memory/memory.limit_in_bytes')
@@ -219,7 +272,7 @@ def _detect_mem_limit_bytes() -> int:
                 return limit
     except Exception:
         pass
-    # 3) try cgroup v2
+    # 4) try root cgroup v2
     try:
         import pathlib
         cg_v2 = pathlib.Path('/sys/fs/cgroup/memory.max')
@@ -231,17 +284,27 @@ def _detect_mem_limit_bytes() -> int:
                     return limit
     except Exception:
         pass
-    # 4) fallback: 32 GB
+    # 5) fallback: 32 GB
     return 32 * 1_073_741_824
 
 
 _JAX_CACHE_MEM_LIMIT_BYTES = _detect_mem_limit_bytes()
 
+# Anti-thrash state: once resident data (not caches) keeps RSS above the
+# threshold, clearing frees ~nothing but forces JAX to recompile everything.
+# Job 23972276 spent its whole run re-clearing every check interval.
+_CLEAR_COOLDOWN_MIN_S: float = 60.0
+_CLEAR_COOLDOWN_MAX_S: float = 1800.0
+_CLEAR_COOLDOWN_S: float = _CLEAR_COOLDOWN_MIN_S
+_LAST_CLEAR_TS: float = 0.0
+
 
 def _maybe_clear_jax_caches() -> None:
     """Check RSS every _JAX_CACHE_CHECK_EVERY fits; clear JAX caches + gc
-    only when memory usage exceeds 80% of the detected limit."""
+    only when memory usage exceeds 80% of the detected limit. Clears are
+    rate-limited and back off exponentially when they free no memory."""
     global _FIT_CALL_COUNT, _LAST_RSS_CHECK, _LAST_RSS_BYTES
+    global _CLEAR_COOLDOWN_S, _LAST_CLEAR_TS
     _FIT_CALL_COUNT += 1
     if _FIT_CALL_COUNT - _LAST_RSS_CHECK < _JAX_CACHE_CHECK_EVERY:
         return
@@ -256,6 +319,11 @@ def _maybe_clear_jax_caches() -> None:
     _LAST_RSS_BYTES = rss
     threshold = int(_JAX_CACHE_MEM_LIMIT_BYTES * 0.80)
     if rss > threshold:
+        import time
+        now = time.monotonic()
+        if now - _LAST_CLEAR_TS < _CLEAR_COOLDOWN_S:
+            return
+        _LAST_CLEAR_TS = now
         logger.warning(
             "JAX cache: RSS %.1f GB / limit %.1f GB (>80%%), clearing JAX caches",
             rss / 1e9, _JAX_CACHE_MEM_LIMIT_BYTES / 1e9,
@@ -276,6 +344,20 @@ def _maybe_clear_jax_caches() -> None:
         except Exception:
             pass
         gc.collect()
+        try:
+            rss_after = psutil.Process().memory_info().rss
+        except Exception:
+            rss_after = rss
+        freed = rss - rss_after
+        if freed < int(0.05 * _JAX_CACHE_MEM_LIMIT_BYTES):
+            _CLEAR_COOLDOWN_S = min(_CLEAR_COOLDOWN_S * 2.0, _CLEAR_COOLDOWN_MAX_S)
+            logger.warning(
+                "JAX cache: clear freed only %.1f GB (RSS is data, not caches) - "
+                "backing off, next clear in >= %.0f s",
+                freed / 1e9, _CLEAR_COOLDOWN_S,
+            )
+        else:
+            _CLEAR_COOLDOWN_S = _CLEAR_COOLDOWN_MIN_S
 
 # ---------------------------------------------------------------------------
 # Availability checks (graceful import — missing package → fall back to default)
@@ -395,14 +477,20 @@ def _update_feature_weakness(
     p_thresh:  float = 0.10,
 ) -> None:
     """
-    Update per-feature weakness scores after a MetaCount fit.
+    Update per-feature weakness scores after a model fit.
 
     A parameter is "weak" if EITHER:
       - |coef_value| < coef_zero  (coefficient is effectively zero), OR
       - p_value > p_thresh        (not statistically significant at 10%)
+    A parameter is "stuck" if _estimate() (stage5_destination_choice.py)
+    flagged it as never having moved from its starting value or as pinned at
+    a bound (see 'stuck'/'at_bound' keys in _larch_coef_rows) - stronger
+    evidence of a bad specification than mere insignificance, since it means
+    the optimizer found no usable gradient at all for that term.
 
-    Weak  → score += 2.0
-    Strong (neither condition) → score -= 0.5, clamped at 0
+    Stuck/at-bound → score += 5.0
+    Weak (near-zero or insignificant), not stuck → score += 2.0
+    Strong (none of the above) → score -= 0.5, clamped at 0
 
     All scores decay by _WEAKNESS_DECAY each call so recent evidence dominates.
     """
@@ -410,9 +498,11 @@ def _update_feature_weakness(
     for k in list(_FEATURE_WEAKNESS.keys()):
         _FEATURE_WEAKNESS[k] *= _WEAKNESS_DECAY
 
-    # Build value + p-value maps; lower-case keys for robust matching
+    # Build value + p-value + stuck/at-bound maps; lower-case keys for
+    # robust matching against selected_vars (which may differ in case).
     vmap: Dict[str, float] = {}
     pmap: Dict[str, float] = {}
+    stuck_map: Dict[str, bool] = {}
     for r in coef_rows:
         name = str(r.get('param', '')).lower().strip()
         if not name:
@@ -429,18 +519,23 @@ def _update_feature_weakness(
             vmap[name] = v
         if np.isfinite(p):
             pmap[name] = p
+        if r.get('stuck') or r.get('at_bound'):
+            stuck_map[name] = True
 
     for var in selected_vars:
         key = var.lower().strip()
         v = vmap.get(key, np.nan)
         p = pmap.get(key, np.nan)
+        stuck = stuck_map.get(key, False)
         # Need at least one signal
-        if not np.isfinite(v) and not np.isfinite(p):
+        if not np.isfinite(v) and not np.isfinite(p) and not stuck:
             continue
         near_zero  = np.isfinite(v) and abs(v) < coef_zero
         insig      = np.isfinite(p) and p > p_thresh
         current    = _FEATURE_WEAKNESS.get(var, 0.0)
-        if near_zero or insig:
+        if stuck:
+            _FEATURE_WEAKNESS[var] = current + 5.0
+        elif near_zero or insig:
             _FEATURE_WEAKNESS[var] = current + 2.0
         else:
             _FEATURE_WEAKNESS[var] = max(0.0, current - 0.5)
@@ -516,6 +611,13 @@ def _larch_coef_rows(mdl) -> list:
         from scipy.stats import norm as _snorm
         import pandas as _pd
 
+        # Params _estimate() (stage5_destination_choice.py) flagged as never
+        # having moved from their starting value, or pinned at a bound -
+        # stronger evidence of a bad specification than mere insignificance.
+        # See _estimate()'s "Stuck / at-bound parameter diagnostics" block.
+        _stuck_set = set(getattr(mdl, '_stuck_params', None) or [])
+        _at_bound_set = set(getattr(mdl, '_at_bound_params', None) or [])
+
         # --- primary path: parameter_summary() DataFrame --------------------
         try:
             ps = mdl.parameter_summary()
@@ -539,7 +641,9 @@ def _larch_coef_rows(mdl) -> list:
                         p = (float(2.0 * _snorm.sf(abs(t)))
                              if np.isfinite(t) else float('nan'))
                         rows.append({'param': str(pname), 'value': val,
-                                     'std_err': se, 't_stat': t, 'p_value': p})
+                                     'std_err': se, 't_stat': t, 'p_value': p,
+                                     'stuck': str(pname) in _stuck_set,
+                                     'at_bound': str(pname) in _at_bound_set})
                     if rows:
                         return rows
         except Exception:
@@ -564,7 +668,9 @@ def _larch_coef_rows(mdl) -> list:
                         p_val = float('nan')
                     rows.append({'param': str(pname), 'value': float('nan'),
                                  'std_err': float('nan'),
-                                 't_stat': t_val, 'p_value': p_val})
+                                 't_stat': t_val, 'p_value': p_val,
+                                 'stuck': str(pname) in _stuck_set,
+                                 'at_bound': str(pname) in _at_bound_set})
             except Exception:
                 pass
     except Exception:
@@ -1827,7 +1933,16 @@ def stage4_fitness_searchlibrium_mixed(
             )
             n_obs    = len(sub)
             alts     = np.arange(n_alts)
-            _rdm_set = set(rand_vars) if rand_vars is not None else set(avail_feats)
+            if rand_vars is not None:
+                _rdm_set = set(rand_vars)
+            else:
+                # Central random-coefficient policy (force_random/never_random
+                # from ga_constraints — SearchLibrium ConstraintBuilder format)
+                try:
+                    from ga_constraints import random_var_policy
+                    _rdm_set = set(random_var_policy('stage4', avail_feats, rand_dist))
+                except Exception:
+                    _rdm_set = set(avail_feats)
             rv       = ({v: rand_dist for v in avail_feats if v in _rdm_set}
                         or {v: rand_dist for v in avail_feats})
 
@@ -1871,6 +1986,82 @@ def stage4_fitness_searchlibrium_mixed(
     return float(np.mean(scores)) if scores else -1e9
 
 
+def _fit_bic_rv(long, avail_feats, alts, rv, n_obs, n_draws=50):
+    """Fit a SearchLibrium MXL (or MNL when rv is empty) and return its BIC.
+
+    Used by the greedy random-parameter search below; np.inf on any failure
+    so a failed trial can never be selected.
+    """
+    try:
+        if rv:
+            m = MixedLogit()
+            m.setup(
+                X        = long[avail_feats].values.astype(float),
+                y        = long['chosen'].values.astype(int),
+                varnames = avail_feats,
+                alts     = alts,
+                ids      = long['case_id'].values.astype(int),
+                randvars = rv,
+                n_draws  = n_draws,
+                halton   = True,
+            )
+        else:
+            m = MultinomialLogit()
+            m.setup(
+                X        = long[avail_feats].values.astype(float),
+                y        = long['chosen'].values.astype(int),
+                varnames = avail_feats,
+                alts     = alts,
+                ids      = long['case_id'].values.astype(int),
+                base_alt = alts[0],
+            )
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            res = _fit_searchlib_model(m)
+        if not _result_success(res):
+            return float('inf')
+        ll = -float(res.fun)
+        k  = (len(avail_feats) - len(rv)) + 2 * len(rv)
+        return -2.0 * ll + k * np.log(max(n_obs, 1))
+    except Exception:
+        return float('inf')
+
+
+def _greedy_randvar_search(long, avail_feats, alts, rv0, rand_dist, n_obs,
+                           purpose='', n_draws=50, never_random=()):
+    """
+    Single-pass greedy search over each variable's random-vs-fixed status.
+
+    Makes random-coefficient treatment a searched DECISION rather than a
+    blanket default: starting from the policy assignment rv0, each variable
+    is toggled (random ↔ fixed) and the toggle is kept when it improves BIC.
+    never_random variables are never given a random coefficient. Runs at a
+    low draw count (default 50) — the production refit afterwards uses the
+    full draw budget with the chosen assignment. Enabled with
+    GA_RAND_PARAM_SEARCH=1 (see ga_constraints.rand_param_search_enabled).
+    """
+    never = set(never_random)
+    best_rv  = {v: d for v, d in dict(rv0).items() if v not in never}
+    best_bic = _fit_bic_rv(long, avail_feats, alts, best_rv, n_obs, n_draws)
+    n_trials = 0
+    for v in avail_feats:
+        trial = dict(best_rv)
+        if v in trial:
+            trial.pop(v)
+        elif v not in never:
+            trial[v] = rand_dist
+        else:
+            continue
+        bic = _fit_bic_rv(long, avail_feats, alts, trial, n_obs, n_draws)
+        n_trials += 1
+        if bic < best_bic - 1e-6:
+            best_rv, best_bic = trial, bic
+    print(f"  [{purpose}] greedy random-param search: "
+          f"{len(best_rv)}/{len(avail_feats)} random after {n_trials} trials, "
+          f"BIC={best_bic:.1f}")
+    return best_rv
+
+
 def stage4_final_mixed_logit(
     data: pd.DataFrame,
     selected_vars: List[str],
@@ -1908,9 +2099,22 @@ def stage4_final_mixed_logit(
         return {}
 
     results = {}
-    _rdm_set = set(rand_vars) if rand_vars is not None else set(selected_vars)
+    if rand_vars is not None:
+        _rdm_set = set(rand_vars)
+    else:
+        try:
+            from ga_constraints import random_var_policy
+            _rdm_set = set(random_var_policy('stage4', selected_vars, rand_dist))
+        except Exception:
+            _rdm_set = set(selected_vars)
     randvars = ({v: rand_dist for v in selected_vars if v in _rdm_set}
                 or {v: rand_dist for v in selected_vars})
+    try:
+        from ga_constraints import rand_param_search_enabled, get_constraints
+        _rand_search = rand_param_search_enabled()
+        _never_random = tuple(get_constraints('stage4').get('never_random', ()))
+    except Exception:
+        _rand_search, _never_random = False, ()
 
     for purpose in purposes:
         sub = data[data['purpose'] == purpose] if 'purpose' in data.columns else data
@@ -1927,6 +2131,22 @@ def stage4_final_mixed_logit(
             )
             alts = np.arange(n_alts)
             rv   = {v: rand_dist for v in avail_feats if v in randvars} or {v: rand_dist for v in avail_feats}
+            if _rand_search and len(avail_feats) >= 2:
+                # Random-parameter treatment as a searched decision, not a
+                # blanket default (GA_RAND_PARAM_SEARCH=1): greedy BIC toggle
+                # at low draws, then the production fit below uses n_draws.
+                rv = _greedy_randvar_search(
+                    long, avail_feats, alts, rv, rand_dist,
+                    n_obs=len(sub), purpose=purpose,
+                    never_random=_never_random,
+                )
+                if not rv:
+                    # MixedLogit.setup requires ≥1 random var; keep the first
+                    # eligible one so the production fit below stays valid.
+                    _elig = [v for v in avail_feats if v not in set(_never_random)]
+                    rv = {(_elig[0] if _elig else avail_feats[0]): rand_dist}
+                    logger.info(f"[{purpose}] greedy search kept no random params - "
+                                f"retaining minimal mixture on '{list(rv)[0]}'")
             seed_key = _searchlib_start_key(purpose, avail_feats, n_alts)
             seed_vector = _SEARCHLIB_START_VALUES.get(seed_key)
 

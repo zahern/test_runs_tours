@@ -1,0 +1,523 @@
+ **********************************************
+ **  Summaries for mtc Iteration Procedures  **
+ **********************************************
+  SIMULATION START  DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   7  13  10   4  19
+  SIMULATION FINISH DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   7  13  10   6  44
+  BASIC PARAMETERS
+  Planning Horizon:    120.0000    
+  Iterations Limt.:            3
+  Loading Factor  :    100.0000    
+  Start Time of Collecting Stats:  0.0000000E+00
+  End   Time of Collecting Stats:   120.0000    
+  Iteration:           0
+  RoundPass:           0
+ -----------------------------------------------
+  
+   Vehicles Still in the Network   
+     Number of Vehicles             =             818
+     Total Travel Time w/o queueing =       23973.104
+     Total Trip Distances           =       34189.539
+     Total STOP Time                =           0.000
+     Average Travel Time            =          29.307
+     Average Trip Distance          =          41.797
+     Average STOP Time              =           0.000
+     Average travel Speed           =          85.570
+ -----------------------------------------------
+   Vehicles Outside the Network   
+     Number of Vehicles             =            1527
+     Total Travel Time w/o queueing =       47381.023
+     Total Travel Time w queueing   =       47452.988
+     Total Trip Distances           =       66516.055
+     Total STOP Time                =           0.000
+     Average Travel Time            =          31.029
+     Average Trip Distance          =          43.560
+     Average STOP Time              =           0.000
+     Average travel Speed           =          84.231
+ -----------------------------------------------
+ 
+  For All Vehicles in the Network   
+     Number of Vehicles             =            2345
+     Total Travel Time w/o queueing =       71354.125
+     Total Trip Distances           =      100705.594
+     Total STOP Time                =           0.000
+     Average Travel Time            =          30.428
+     Average Trip Distance          =          42.945
+     Average STOP Time              =           0.000
+     Average travel Speed           =          84.681
+ -------------------------------------------------
+ The following mtc information is only for	    
+ Those vehicles that have reached the destinations
+ -------------------------------------------------
+ 
+ 
+  LOV Vehicle -------------------------
+  ----------------------------------------------
+ Class Number                 =               1
+  ----------------------------------------------
+ Class Number                 =               2
+  ----------------------------------------------
+ Class Number                 =               3
+ number of vehicles           =            1527
+ ------------------
+Total Overall Travel Time(min)=       47452.949
+Total Trip Times(min)         =       47381.023
+Total Entry Queue Time(min)   =          71.892
+Total Trip Distance(ml)       =       66516.055
+Total STOP Time(min)          =           0.000
+Average Overall Trip Time(min)=          31.076
+Average Trip Times(min)       =          31.029
+Average Entry Q Time(min)     =           0.047
+Average STOP Time(min)        =           0.000
+Average Trip Distance(ml)     =          43.560
+ ----------------------------------
+  ----------------------------------------------
+ Class Number                 =               4
+  ----------------------------------------------
+ Class Number                 =               5
+ 
+ 
+  HOV Vehicle -------------------------
+  ----------------------------------------------
+ Class Number                 =               1
+  ----------------------------------------------
+ Class Number                 =               2
+  ----------------------------------------------
+ Class Number                 =               3
+  ----------------------------------------------
+ Class Number                 =               4
+  ----------------------------------------------
+ Class Number                 =               5
+ -------------------------------------------------
+ The following MUT information is only for	    
+ Those vehicles that have reached the destinations
+ -------------------------------------------------
+ 
+  Auto  Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               1
+ number of vehicles           =            1527
+ ------------------
+Total Overall Travel Time(min)=       47452.949
+Total Trip Times(min)         =       47381.023
+Total Entry Queue Time(min)   =          71.892
+Total Trip Distance(ml)       =       66516.055
+Total STOP Time(min)          =           0.000
+Average Overall Trip Time(min)=          31.076
+Average Trip Times(min)       =          31.029
+Average Entry Q Time(min)     =           0.047
+Average STOP Time(min)        =           0.000
+Average Trip Distance(ml)     =          43.560
+Average Toll Expense($)       =           0.000
+ ----------------------------------
+  Truck Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               2
+  HOV   Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               3
+  --------------------------------------------------
+ Type Number                 =               4
+  --------------------------------------------------
+ Type Number                 =               5
+  --------------------------------------------------
+ Type Number                 =               6
+  --------------------------------------------------
+ Type Number                 =               7
+ 
+ Number of Epochs =           12
+ # of re-assigned vehicles and re-assignment rate =           857.0      36.55%
+  ASSIGNMENT COMPLETION DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   7  13  10   6  57
+ 
+ **********************************************
+ **  Summaries for mtc Iteration Procedures  **
+ **********************************************
+  SIMULATION START  DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   7  13  10   7   0
+  SIMULATION FINISH DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   7  13  10   9  31
+  BASIC PARAMETERS
+  Planning Horizon:    120.0000    
+  Iterations Limt.:            3
+  Loading Factor  :    100.0000    
+  Start Time of Collecting Stats:  0.0000000E+00
+  End   Time of Collecting Stats:   120.0000    
+  Iteration:           1
+  RoundPass:           0
+ -----------------------------------------------
+  
+   Vehicles Still in the Network   
+     Number of Vehicles             =             821
+     Total Travel Time w/o queueing =       24282.354
+     Total Trip Distances           =       34627.492
+     Total STOP Time                =           0.000
+     Average Travel Time            =          29.577
+     Average Trip Distance          =          42.177
+     Average STOP Time              =           0.000
+     Average travel Speed           =          85.562
+ -----------------------------------------------
+   Vehicles Outside the Network   
+     Number of Vehicles             =            1524
+     Total Travel Time w/o queueing =       47003.574
+     Total Travel Time w queueing   =       47074.719
+     Total Trip Distances           =       66072.711
+     Total STOP Time                =           0.000
+     Average Travel Time            =          30.842
+     Average Trip Distance          =          43.355
+     Average STOP Time              =           0.000
+     Average travel Speed           =          84.342
+ -----------------------------------------------
+ 
+  For All Vehicles in the Network   
+     Number of Vehicles             =            2345
+     Total Travel Time w/o queueing =       71285.930
+     Total Trip Distances           =      100700.203
+     Total STOP Time                =           0.000
+     Average Travel Time            =          30.399
+     Average Trip Distance          =          42.943
+     Average STOP Time              =           0.000
+     Average travel Speed           =          84.757
+ -------------------------------------------------
+ The following mtc information is only for	    
+ Those vehicles that have reached the destinations
+ -------------------------------------------------
+ 
+ 
+  LOV Vehicle -------------------------
+  ----------------------------------------------
+ Class Number                 =               1
+  ----------------------------------------------
+ Class Number                 =               2
+  ----------------------------------------------
+ Class Number                 =               3
+ number of vehicles           =            1524
+ ------------------
+Total Overall Travel Time(min)=       47074.711
+Total Trip Times(min)         =       47003.574
+Total Entry Queue Time(min)   =          71.109
+Total Trip Distance(ml)       =       66072.711
+Total STOP Time(min)          =           0.000
+Average Overall Trip Time(min)=          30.889
+Average Trip Times(min)       =          30.842
+Average Entry Q Time(min)     =           0.047
+Average STOP Time(min)        =           0.000
+Average Trip Distance(ml)     =          43.355
+ ----------------------------------
+  ----------------------------------------------
+ Class Number                 =               4
+  ----------------------------------------------
+ Class Number                 =               5
+ 
+ 
+  HOV Vehicle -------------------------
+  ----------------------------------------------
+ Class Number                 =               1
+  ----------------------------------------------
+ Class Number                 =               2
+  ----------------------------------------------
+ Class Number                 =               3
+  ----------------------------------------------
+ Class Number                 =               4
+  ----------------------------------------------
+ Class Number                 =               5
+ -------------------------------------------------
+ The following MUT information is only for	    
+ Those vehicles that have reached the destinations
+ -------------------------------------------------
+ 
+  Auto  Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               1
+ number of vehicles           =            1524
+ ------------------
+Total Overall Travel Time(min)=       47074.711
+Total Trip Times(min)         =       47003.574
+Total Entry Queue Time(min)   =          71.109
+Total Trip Distance(ml)       =       66072.711
+Total STOP Time(min)          =           0.000
+Average Overall Trip Time(min)=          30.889
+Average Trip Times(min)       =          30.842
+Average Entry Q Time(min)     =           0.047
+Average STOP Time(min)        =           0.000
+Average Trip Distance(ml)     =          43.355
+Average Toll Expense($)       =           0.000
+ ----------------------------------
+  Truck Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               2
+  HOV   Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               3
+  --------------------------------------------------
+ Type Number                 =               4
+  --------------------------------------------------
+ Type Number                 =               5
+  --------------------------------------------------
+ Type Number                 =               6
+  --------------------------------------------------
+ Type Number                 =               7
+ 
+ Number of Epochs =           12
+ # of re-assigned vehicles and re-assignment rate =           655.0      27.93%
+  ASSIGNMENT COMPLETION DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   7  13  10   9  44
+ 
+ **********************************************
+ **  Summaries for mtc Iteration Procedures  **
+ **********************************************
+  SIMULATION START  DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   7  13  10   9  47
+  SIMULATION FINISH DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   7  13  10  12  17
+  BASIC PARAMETERS
+  Planning Horizon:    120.0000    
+  Iterations Limt.:            3
+  Loading Factor  :    100.0000    
+  Start Time of Collecting Stats:  0.0000000E+00
+  End   Time of Collecting Stats:   120.0000    
+  Iteration:           2
+  RoundPass:           0
+ -----------------------------------------------
+  
+   Vehicles Still in the Network   
+     Number of Vehicles             =             815
+     Total Travel Time w/o queueing =       23896.172
+     Total Trip Distances           =       34101.266
+     Total STOP Time                =           0.000
+     Average Travel Time            =          29.320
+     Average Trip Distance          =          41.842
+     Average STOP Time              =           0.000
+     Average travel Speed           =          85.624
+ -----------------------------------------------
+   Vehicles Outside the Network   
+     Number of Vehicles             =            1530
+     Total Travel Time w/o queueing =       47228.945
+     Total Travel Time w queueing   =       47300.184
+     Total Trip Distances           =       66486.109
+     Total STOP Time                =           0.000
+     Average Travel Time            =          30.869
+     Average Trip Distance          =          43.455
+     Average STOP Time              =           0.000
+     Average travel Speed           =          84.464
+ -----------------------------------------------
+ 
+  For All Vehicles in the Network   
+     Number of Vehicles             =            2345
+     Total Travel Time w/o queueing =       71125.117
+     Total Trip Distances           =      100587.375
+     Total STOP Time                =           0.000
+     Average Travel Time            =          30.331
+     Average Trip Distance          =          42.894
+     Average STOP Time              =           0.000
+     Average travel Speed           =          84.854
+ -------------------------------------------------
+ The following mtc information is only for	    
+ Those vehicles that have reached the destinations
+ -------------------------------------------------
+ 
+ 
+  LOV Vehicle -------------------------
+  ----------------------------------------------
+ Class Number                 =               1
+  ----------------------------------------------
+ Class Number                 =               2
+  ----------------------------------------------
+ Class Number                 =               3
+ number of vehicles           =            1530
+ ------------------
+Total Overall Travel Time(min)=       47300.195
+Total Trip Times(min)         =       47228.945
+Total Entry Queue Time(min)   =          71.196
+Total Trip Distance(ml)       =       66486.109
+Total STOP Time(min)          =           0.000
+Average Overall Trip Time(min)=          30.915
+Average Trip Times(min)       =          30.869
+Average Entry Q Time(min)     =           0.047
+Average STOP Time(min)        =           0.000
+Average Trip Distance(ml)     =          43.455
+ ----------------------------------
+  ----------------------------------------------
+ Class Number                 =               4
+  ----------------------------------------------
+ Class Number                 =               5
+ 
+ 
+  HOV Vehicle -------------------------
+  ----------------------------------------------
+ Class Number                 =               1
+  ----------------------------------------------
+ Class Number                 =               2
+  ----------------------------------------------
+ Class Number                 =               3
+  ----------------------------------------------
+ Class Number                 =               4
+  ----------------------------------------------
+ Class Number                 =               5
+ -------------------------------------------------
+ The following MUT information is only for	    
+ Those vehicles that have reached the destinations
+ -------------------------------------------------
+ 
+  Auto  Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               1
+ number of vehicles           =            1530
+ ------------------
+Total Overall Travel Time(min)=       47300.195
+Total Trip Times(min)         =       47228.945
+Total Entry Queue Time(min)   =          71.196
+Total Trip Distance(ml)       =       66486.109
+Total STOP Time(min)          =           0.000
+Average Overall Trip Time(min)=          30.915
+Average Trip Times(min)       =          30.869
+Average Entry Q Time(min)     =           0.047
+Average STOP Time(min)        =           0.000
+Average Trip Distance(ml)     =          43.455
+Average Toll Expense($)       =           0.000
+ ----------------------------------
+  Truck Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               2
+  HOV   Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               3
+  --------------------------------------------------
+ Type Number                 =               4
+  --------------------------------------------------
+ Type Number                 =               5
+  --------------------------------------------------
+ Type Number                 =               6
+  --------------------------------------------------
+ Type Number                 =               7
+ 
+ Number of Epochs =           12
+ # of re-assigned vehicles and re-assignment rate =           507.0      21.62%
+  ASSIGNMENT COMPLETION DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   7  13  10  12  30
+ 
+ **********************************************
+ **  Summaries for mtc Iteration Procedures  **
+ **********************************************
+  SIMULATION START  DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   7  13  10  12  32
+  SIMULATION FINISH DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   7  13  10  15  34
+  BASIC PARAMETERS
+  Planning Horizon:    120.0000    
+  Iterations Limt.:            3
+  Loading Factor  :    100.0000    
+  Start Time of Collecting Stats:  0.0000000E+00
+  End   Time of Collecting Stats:   120.0000    
+  Iteration:           3
+  RoundPass:           0
+ -----------------------------------------------
+  
+   Vehicles Still in the Network   
+     Number of Vehicles             =             816
+     Total Travel Time w/o queueing =       23998.881
+     Total Trip Distances           =       34259.266
+     Total STOP Time                =           0.000
+     Average Travel Time            =          29.410
+     Average Trip Distance          =          41.984
+     Average STOP Time              =           0.000
+     Average travel Speed           =          85.652
+ -----------------------------------------------
+   Vehicles Outside the Network   
+     Number of Vehicles             =            1529
+     Total Travel Time w/o queueing =       47130.629
+     Total Travel Time w queueing   =       47202.191
+     Total Trip Distances           =       66373.602
+     Total STOP Time                =           0.000
+     Average Travel Time            =          30.824
+     Average Trip Distance          =          43.410
+     Average STOP Time              =           0.000
+     Average travel Speed           =          84.497
+ -----------------------------------------------
+ 
+  For All Vehicles in the Network   
+     Number of Vehicles             =            2345
+     Total Travel Time w/o queueing =       71129.508
+     Total Trip Distances           =      100632.867
+     Total STOP Time                =           0.000
+     Average Travel Time            =          30.332
+     Average Trip Distance          =          42.914
+     Average STOP Time              =           0.000
+     Average travel Speed           =          84.887
+ -------------------------------------------------
+ The following mtc information is only for	    
+ Those vehicles that have reached the destinations
+ -------------------------------------------------
+ 
+ 
+  LOV Vehicle -------------------------
+  ----------------------------------------------
+ Class Number                 =               1
+  ----------------------------------------------
+ Class Number                 =               2
+  ----------------------------------------------
+ Class Number                 =               3
+ number of vehicles           =            1529
+ ------------------
+Total Overall Travel Time(min)=       47202.172
+Total Trip Times(min)         =       47130.629
+Total Entry Queue Time(min)   =          71.569
+Total Trip Distance(ml)       =       66373.602
+Total STOP Time(min)          =           0.000
+Average Overall Trip Time(min)=          30.871
+Average Trip Times(min)       =          30.824
+Average Entry Q Time(min)     =           0.047
+Average STOP Time(min)        =           0.000
+Average Trip Distance(ml)     =          43.410
+ ----------------------------------
+  ----------------------------------------------
+ Class Number                 =               4
+  ----------------------------------------------
+ Class Number                 =               5
+ 
+ 
+  HOV Vehicle -------------------------
+  ----------------------------------------------
+ Class Number                 =               1
+  ----------------------------------------------
+ Class Number                 =               2
+  ----------------------------------------------
+ Class Number                 =               3
+  ----------------------------------------------
+ Class Number                 =               4
+  ----------------------------------------------
+ Class Number                 =               5
+ -------------------------------------------------
+ The following MUT information is only for	    
+ Those vehicles that have reached the destinations
+ -------------------------------------------------
+ 
+  Auto  Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               1
+ number of vehicles           =            1529
+ ------------------
+Total Overall Travel Time(min)=       47202.172
+Total Trip Times(min)         =       47130.629
+Total Entry Queue Time(min)   =          71.569
+Total Trip Distance(ml)       =       66373.602
+Total STOP Time(min)          =           0.000
+Average Overall Trip Time(min)=          30.871
+Average Trip Times(min)       =          30.824
+Average Entry Q Time(min)     =           0.047
+Average STOP Time(min)        =           0.000
+Average Trip Distance(ml)     =          43.410
+Average Toll Expense($)       =           0.000
+ ----------------------------------
+  Truck Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               2
+  HOV   Vehicle ------------------------
+  --------------------------------------------------
+ Type Number                 =               3
+  --------------------------------------------------
+ Type Number                 =               4
+  --------------------------------------------------
+ Type Number                 =               5
+  --------------------------------------------------
+ Type Number                 =               6
+  --------------------------------------------------
+ Type Number                 =               7
+ Writing Out CPU Time. Note to get actual clock time please subtract from time stamps printed for each iteration. 
+ 
+ CPU Times of operation were         638.55 seconds  
+ CPU Times of simulation were        617.27 seconds   96.67 % of total)
+ CPU Times of assignment were         21.28 seconds    3.33 % of total)
+ CPU Times of others were              0.00 seconds    0.00 % of total)
+ CPU Time of operation was                   638.55 seconds by DTime
+ User and System Time of operation was       144.25      494.30 seconds by DTime

@@ -1,0 +1,273 @@
+\usetheme{metropolis} %set theme
+\beamertemplatenavigationsymbolsempty
+\usepackage[english]{babel}
+\setbeamercovered{transparent}
+\setbeamercolor{frametitle}{bg=black,fg=white} 
+\setbeamertemplate{frame footer}{}
+\setbeamertemplate{frame numbering}[none]
+
+\usepackage{mathtools} 
+\usepackage{epstopdf}
+\usepackage[pro]{fontawesome5}
+\usepackage{manfnt}
+\usepackage{natbib}
+\setcitestyle{authoryear-comp} % set the citation style to ``numbers''.
+\bibliographystyle{plainnat}
+\usepackage{cleveref}
+%\usepackage[shortlabels]{enumitem} %items
+\usepackage[acronym]{glossaries}
+\usepackage{amsmath, amsthm, amssymb} %math writing
+
+\usepackage[default]{gillius} %font design
+\usepackage{sfmath}
+\usepackage{sansmathaccent} 
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.4}
+\usepackage{tikz} %drawing
+\usetikzlibrary{pgfplots.statistics}
+\usetikzlibrary{arrows.meta,shapes.arrows,hobby}
+\usetikzlibrary{shapes, mindmap, trees, chains, decorations.pathreplacing, quotes, shadows, arrows}
+\usetikzlibrary{shapes,shapes.geometric,arrows,chains,backgrounds,calc,fit,matrix,arrows,positioning}
+
+\usepackage{smartdiagram}
+
+% =================================================
+% Set up a few colours
+
+% -------------------------------------------------
+% Set up a new layer for the debugging marks, and make sure it is on
+% top
+\pgfdeclarelayer{background}
+\pgfdeclarelayer{marx}
+\pgfsetlayers{background,main,marx}
+% A macro for marking coordinates (specific to the coordinate naming
+% scheme used here). Swap the following 2 definitions to deactivate
+% marks.
+\providecommand{\cmark}[2][]{%
+  \begin{pgfonlayer}{marx}
+    \node [nmark] at (c#2#1) {#2};
+  \end{pgfonlayer}{marx}
+  } 
+\providecommand{\cmark}[2][]{\relax} 
+
+\usepackage{svg}
+\usepackage{forest}
+\usepackage{authoraftertitle} %for title use in doc
+%\usepackage{fourier}
+\usepackage{animate}
+%\usepackage{multimedia}
+\usepackage{media9}
+\usepackage{hyperref} %references, links, etc 
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage[most]{tcolorbox} %boxes
+\tcbuselibrary{skins} 
+\tcbuselibrary{listings,breakable}
+
+
+
+\newcommand{\C}{\mathbb{C}} %easy math set commands
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Q}{\mathbb{Q}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\N}{\mathbb{N}}
+
+
+\usepackage{ragged2e}
+\tolerance=1
+\emergencystretch=\maxdimen
+\hyphenpenalty=10000
+\hbadness=10000
+
+
+\usepackage{subfig}
+\usepackage{marvosym} % \MVRIGHTarrow
+%\usepackage{capt-of}
+
+\usepackage{multirow}
+\usepackage{pbox}
+\usepackage{multicol}
+\usepackage{animate}
+\usepackage{soul}
+\makeatletter
+\let\HL\hl
+\renewcommand\hl{%
+  \let\set@color\beamerorig@set@color
+  \let\reset@color\beamerorig@reset@color
+  \HL}
+\def\hlinewd#1{%
+\noalign{\ifnum0=`}\fi\hrule \@height #1 %
+\futurelet\reserved@a\@xhline}   
+\makeatother
+%\renewcommand{\theenumi}{\Alph{enumi}}
+
+\usepackage[utf8]{inputenc}
+%\usepackage{enumitem}
+\usepackage{times}
+\usepackage[T1]{fontenc}
+%\usepackage{natbib}
+\usepackage{csquotes}
+\usepackage{mathtools}
+%\usepackage[dvipsnames,x11names]{xcolor}
+%\usepackage{xcolor}
+
+%\usepackage{siunitx}
+\usepackage{pifont}
+
+\definecolor{ForestGreen}{RGB}{34,139,34}
+\colorlet{lcfree}{Green3}
+\colorlet{lcnorm}{Blue3}
+\colorlet{lccong}{Red3}
+\definecolor{QUTDB}{RGB}{0,59,113}
+
+\tcbset{enhanced,attach boxed title to top left={xshift=4mm,yshift=-3mm,yshifttext=-1mm},
+colback=white,
+colframe=QUTDB,
+colbacktitle=QUTDB,
+coltitle=white,
+arc=4mm,boxrule=2pt,
+fonttitle = \fontfamily{qag}\selectfont\large\bfseries,
+halign=flush left,
+boxed title style={size=small,colframe=white,arc=2mm}}
+
+\tcbsetforeverylayer{enhanced,attach boxed title to top left={xshift=4mm,yshift=-3mm,yshifttext=-1mm},
+colback=QUTDB,
+colframe=QUTDB,
+colbacktitle=QUTDB,
+coltitle=white,
+arc=4mm,boxrule=2pt,
+fonttitle = \fontfamily{qag}\selectfont\bfseries,
+halign=flush center,
+boxed title style={size=small,colframe=white,arc=2mm}}
+
+
+\newtcolorbox{tbee}[1][] %minimalist box design
+{
+enhanced,attach boxed title to top left={xshift=4mm,yshift=-3mm,yshifttext=-1mm},
+colback=white,
+colframe=QUTDB,
+colbacktitle=QUTDB,
+coltitle=white,
+arc=4mm,boxrule=2pt,
+title= #1,
+fonttitle = \fontfamily{qag}\selectfont\large\bfseries,
+halign=flush left,
+boxed title style={size=small,colframe=white,arc=2mm}
+}
+
+
+
+\newtcolorbox{qbee}[1][] %minimalist box design
+{
+enhanced,attach boxed title to top left={xshift=4mm,yshift=-3mm,yshifttext=-1mm},
+colback=QUTDB,
+colframe=QUTDB,
+colbacktitle=QUTDB,
+coltitle=white,
+coltext = white,
+arc=4mm,boxrule=2pt,
+title= #1,
+fonttitle = \fontfamily{qag}\selectfont\bfseries,
+halign=flush center,
+boxed title style={size=small,colframe=white,arc=2mm}
+}
+
+
+
+\setbeamercolor{item}{fg=QUTDB}
+\newenvironment{bee}[1][]{
+    \begin{tbee}[#1]
+ }{
+   \end{tbee}
+}
+
+\newenvironment{bee2}[1][]{
+    \begin{qbee}[#1]
+ }{
+   \end{qbee}
+}
+\setbeamercolor{frametitle}{bg=QUTDB,fg=white} 
+
+\usepackage{physics} %Gradient
+\usepackage{stmaryrd} %short arrows
+\usepackage{mathtools}
+\usepackage[export]{adjustbox}
+
+\usepackage{booktabs}
+\newcommand{\tabitem}{~~\llap{\textbullet}~~}
+
+
+% defs
+\def\cmd#1{\texttt{\color{red}\footnotesize $\backslash$#1}}
+\def\env#1{\texttt{\color{blue}\footnotesize #1}}
+\definecolor{deepblue}{rgb}{0,0,0.5}
+\definecolor{deepred}{rgb}{0.6,0,0}
+\definecolor{deepgreen}{rgb}{0,0.5,0}
+\definecolor{halfgray}{gray}{0.55}
+
+
+\setbeamertemplate{blocks}[rounded][shadow=false]
+\definecolor{mylightgray}{gray}{0.9}
+%\setbeamercolor{block title}{bg=blue!60,fg=white}
+%\setbeamercolor{block body}{bg=mylightgray,fg=black}
+
+% from newtxmath
+\DeclareFontFamily{U}{ntxmia}{}
+\DeclareFontShape{U}{ntxmia}{m}{it}{<-> ntxmia }{}
+\DeclareFontShape{U}{ntxmia}{b}{it}{<-> ntxbmia }{}
+\DeclareSymbolFont{lettersA}{U}{ntxmia}{m}{it}
+\SetSymbolFont{lettersA}{bold}{U}{ntxmia}{b}{it}
+
+\AtBeginDocument{\let\mathbb\varmathbb}
+
+\ExplSyntaxOn
+\NewDocumentCommand{\varmathbb}{m}
+ {
+  \tl_map_inline:nn { #1 }
+   {
+    \use:c { varbb##1 }
+   }
+ }
+\cs_new_protected:Nn \__mathbb_define:Nn
+ {
+  \DeclareMathSymbol{#1}{\mathord}{lettersA}{#2}
+ }
+\cs_generate_variant:Nn \__mathbb_define:Nn {ce}
+\tl_map_inline:nn { ABCDEFGHIJKLMNOPQRSTUVWXYZ }
+ {
+  \__mathbb_define:ce { varbb#1 } { \int_eval:n { `#1+67 } }
+ }
+\tl_map_inline:nn { abcdefghijklmnopqrstuvwxyz }
+ {
+  \__mathbb_define:ce { varbb#1 } { \int_eval:n { `#1+61 } }
+ }
+\DeclareMathSymbol{\varbbimath}{\mathord}{lettersA}{'270}
+\DeclareMathSymbol{\varbbjmath}{\mathord}{lettersA}{'271}
+\ExplSyntaxOff
+
+
+\def\checkmark{\tikz\fill[scale=0.4](0,.35) -- (.25,0) -- (1,.7) -- (.25,.15) -- cycle;} 
+\def\scalecheck{\resizebox{\widthof{\checkmark}*\ratio{\widthof{x}}{\widthof{\normalsize x}}}{!}{\checkmark}}
+
+
+
+
+\title
+{\color{white} Analysis of Crash Frequency Data Considering Simultaneously Multiple Objectives and Advanced Modelling Aspects}
+
+\author
+{\small \color{white} \large Zeke Ahern \\ \small Prof. Paul Corry \and Prof. Alexander Paz}
+
+\institute[QUT]
+{
+  %\inst{*}
+  \color{white}
+   School of Civil and Environmental Engineering, Queensland University of Technology, Queensland, Australia
+  }
+\date
+{\color{white} Final seminar, \today}
+
+\subject{Final Seminar}
+
+

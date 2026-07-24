@@ -1,2 +1,2 @@
-n_persons,n_zones,n_files_loaded,n_files_missing,ptype_FullTimeWorker,ptype_PartTimeWorker,ptype_School,ptype_NonWorker,ptype_JointWorkStudy,ptype_Student,ptype_Preschool,ptype_Retired,WORKSTAT_1,WORKSTAT_2,WORKSTAT_0
-2735747,321,324,0,1038983,841765,369367,259893,93845,65362,55238,11294,1341037,1047391,347319
+n_persons,n_zones,n_files_loaded,n_files_missing,ptype_NonWorker,ptype_FullTimeWorker,ptype_PartTimeWorker,ptype_SchoolChild,ptype_UniversityStudent,ptype_WorkingStudent,ptype_Preschool,ptype_Retired,WORKSTAT_0,WORKSTAT_1,WORKSTAT_2
+3820161,354,354,0,1154471,1096251,643528,573379,160270,85922,81501,24839,1769115,1256861,794185

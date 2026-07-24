@@ -856,8 +856,29 @@ sa2_code,sa2_name,emme_zone_id
 309071256,Oxenford - Maudsland,1385
 309071256,Oxenford - Maudsland,1386
 309071256,Oxenford - Maudsland,1387
+309071553,Ormeau (West) - Yatala,1405
+309071553,Ormeau (West) - Yatala,1406
+309071553,Ormeau (West) - Yatala,1407
+309071553,Ormeau (West) - Yatala,1408
+309071553,Ormeau (West) - Yatala,1409
+309071553,Ormeau (West) - Yatala,1410
+309071553,Ormeau (West) - Yatala,1411
+309071553,Ormeau (West) - Yatala,1412
+309071553,Ormeau (West) - Yatala,1413
+309071553,Ormeau (West) - Yatala,1414
+309071553,Ormeau (West) - Yatala,1415
+309071553,Ormeau (West) - Yatala,1416
+309071553,Ormeau (West) - Yatala,1417
+309071553,Ormeau (West) - Yatala,1418
+309071553,Ormeau (West) - Yatala,1419
+309071553,Ormeau (West) - Yatala,1420
+309071553,Ormeau (West) - Yatala,1421
+309071553,Ormeau (West) - Yatala,1422
 309081259,Clear Island Waters,1554
 309081259,Clear Island Waters,1555
+309081260,Merrimac,1570
+309081260,Merrimac,1571
+309081260,Merrimac,1572
 309081262,Varsity Lakes,1545
 309081262,Varsity Lakes,1546
 309081262,Varsity Lakes,1547
@@ -924,6 +945,32 @@ sa2_code,sa2_name,emme_zone_id
 309101268,Bundall,1525
 309101269,Main Beach,1543
 309101269,Main Beach,1544
+309101561,Surfers Paradise - North,1530
+309101561,Surfers Paradise - North,1531
+309101561,Surfers Paradise - North,1532
+309101561,Surfers Paradise - North,1533
+309101561,Surfers Paradise - North,1534
+309101561,Surfers Paradise - North,1535
+309101561,Surfers Paradise - North,1536
+309101561,Surfers Paradise - North,1537
+309101561,Surfers Paradise - North,1538
+309101561,Surfers Paradise - North,1539
+309101561,Surfers Paradise - North,1540
+309101561,Surfers Paradise - North,1541
+309101561,Surfers Paradise - North,1542
+309101562,Surfers Paradise - South,1530
+309101562,Surfers Paradise - South,1531
+309101562,Surfers Paradise - South,1532
+309101562,Surfers Paradise - South,1533
+309101562,Surfers Paradise - South,1534
+309101562,Surfers Paradise - South,1535
+309101562,Surfers Paradise - South,1536
+309101562,Surfers Paradise - South,1537
+309101562,Surfers Paradise - South,1538
+309101562,Surfers Paradise - South,1539
+309101562,Surfers Paradise - South,1540
+309101562,Surfers Paradise - South,1541
+309101562,Surfers Paradise - South,1542
 310011271,Darra - Sumner,692
 310011271,Darra - Sumner,693
 310011271,Darra - Sumner,694
@@ -1274,6 +1321,18 @@ sa2_code,sa2_name,emme_zone_id
 313021369,Wamuran,1032
 313021369,Wamuran,1060
 313021369,Wamuran,1061
+313021572,Caboolture - East,1035
+313021572,Caboolture - East,1044
+313021572,Caboolture - East,1045
+313021572,Caboolture - East,1053
+313021572,Caboolture - East,1054
+313021572,Caboolture - East,1055
+313021573,Caboolture - West,1035
+313021573,Caboolture - West,1044
+313021573,Caboolture - West,1045
+313021573,Caboolture - West,1053
+313021573,Caboolture - West,1054
+313021573,Caboolture - West,1055
 313031370,Kilcoy,1082
 313031370,Kilcoy,1083
 313031370,Kilcoy,1084
@@ -1336,6 +1395,7 @@ sa2_code,sa2_name,emme_zone_id
 314011383,Cashmere,960
 314011383,Cashmere,961
 314011383,Cashmere,962
+314011385,Eatons Hill,1093
 314011386,The Hills District,1088
 314011386,The Hills District,1089
 314011386,The Hills District,1090
@@ -1349,6 +1409,11 @@ sa2_code,sa2_name,emme_zone_id
 314021389,Murrumba Downs - Griffin,993
 314021389,Murrumba Downs - Griffin,994
 314021389,Murrumba Downs - Griffin,995
+314021578,Mango Hill,665
+314021578,Mango Hill,666
+314021578,Mango Hill,863
+314021578,Mango Hill,868
+314021578,Mango Hill,869
 314031391,Bray Park,972
 314031391,Bray Park,973
 314031391,Bray Park,974
@@ -1562,3 +1627,16 @@ sa2_code,sa2_name,emme_zone_id
 316081549,Noosa Hinterland,238
 316081549,Noosa Hinterland,239
 316081549,Noosa Hinterland,240
+317011446,Darling Heights,875
+317011448,Gatton,1103
+317011448,Gatton,1104
+317011448,Gatton,1111
+317011448,Gatton,1112
+317011451,Lockyer Valley - West,1105
+317011451,Lockyer Valley - West,1106
+317011451,Lockyer Valley - West,1107
+317011451,Lockyer Valley - West,1108
+317011451,Lockyer Valley - West,1109
+317011451,Lockyer Valley - West,1110
+317011459,Wilsonton,534
+317011459,Wilsonton,535

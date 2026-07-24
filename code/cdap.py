@@ -90,6 +90,14 @@ MNL_FEATURES = [
     'hh_child', 'hh_spouse', 'hh_alone', 'hh_size_large',
     'wfh',
     'income_midplus',
+    # Home-zone accessibility, attached in prepare_cdap_data. crash_acc is
+    # the time-decayed expected crash exposure reachable from home
+    # (compute_accessibility) - embedding it HERE means safety shapes the
+    # day-pattern decision itself, and therefore cascades into every
+    # downstream stage a CDAP letter gates (activity generation, timing,
+    # mode, destination). walk/transit accessibility enter alongside so the
+    # crash coefficient is not proxying general urbanity.
+    'crash_acc', 'walk_acc', 'transit_acc',
 ]
 
 MXL_RANDOM = ['ptype_FullTimeWorker', 'age_norm', 'has_vehicle']
@@ -400,6 +408,26 @@ def prepare_cdap_data(persons: pd.DataFrame) -> pd.DataFrame:
     df.loc[anystops &  is_mandatory, 'cdap_obs'] = 2
 
     df = build_person_profiles(df)
+
+    # Attach home-zone accessibility (incl. crash_acc) so safety enters the
+    # CDAP utility. Non-fatal: _nonconstant_features silently drops the
+    # columns when the accessibility CSV hasn't been built yet.
+    try:
+        _acc_csv = os.path.join('saved_data', 'accessibility.csv')
+        _acc_wanted = ['crash_acc', 'walk_acc', 'transit_acc']
+        if os.path.exists(_acc_csv) and not all(c in df.columns for c in _acc_wanted):
+            _acc = pd.read_csv(_acc_csv).set_index('zone_id')
+            _home = pd.to_numeric(
+                df.get('OTAZ', df.get('HOMETAZ')), errors='coerce'
+            ).fillna(-1).astype(int)
+            for c in _acc_wanted:
+                if c in _acc.columns and c not in df.columns:
+                    df[c] = _home.map(_acc[c]).fillna(float(_acc[c].median()))
+            print(f"  CDAP: attached home-zone accessibility "
+                  f"({[c for c in _acc_wanted if c in df.columns]})")
+    except Exception as _acc_e:
+        logger.warning(f"CDAP accessibility attach skipped: {_acc_e}")
+
     dist = df['cdap_obs'].value_counts().sort_index()
     print(f"  CDAP observed: H={dist.get(0,0)}  N={dist.get(1,0)}  M={dist.get(2,0)}")
     print(f"  Person type dist: {df['ptype'].value_counts().to_dict()}")
@@ -470,7 +498,8 @@ MXL random coefficients (s_*) show taste heterogeneity — significant std dev m
 
 
 def estimate_cdap(persons: pd.DataFrame,
-                  save_path: str = 'saved_data/cdap_model.pkl') -> dict:
+                  save_path: str = 'saved_data/cdap_model.pkl',
+                  feature_override: list = None) -> dict:
     """
     Estimate CDAP model on QTS HHTS persons using Larch MNL + MXL.
 
@@ -480,11 +509,17 @@ def estimate_cdap(persons: pd.DataFrame,
     footprint is negligible.  With XLA_PYTHON_CLIENT_PREALLOCATE=false
     (set in pbs_pipeline_mode.pbs for bandit+GPU), JAX allocates GPU
     memory on-demand rather than pre-allocating.
+
+    feature_override: when given (e.g. the bandit-SA/GA feature-search
+    winner for stage 0), replaces the hardcoded MNL_FEATURES list. Without
+    this, the GA search that already runs for CDAP had no way to affect
+    the production model — its result was written to a diagnostic JSON only.
     """
     print("\n[1/2] Estimating from HHTS...")
     data = prepare_cdap_data(persons)
-    feat_cols = _nonconstant_features(data, [c for c in MNL_FEATURES if c in data.columns])
-    print(f"  Features ({len(feat_cols)}): {feat_cols}")
+    _candidates = feature_override if feature_override else MNL_FEATURES
+    feat_cols = _nonconstant_features(data, [c for c in _candidates if c in data.columns])
+    print(f"  Features ({len(feat_cols)}){' [GA-selected]' if feature_override else ''}: {feat_cols}")
 
     import larch as lx
 
@@ -537,36 +572,72 @@ def estimate_cdap(persons: pd.DataFrame,
     _fill_larch_inference(mnl)
     _print_larch_table(mnl, "CDAP MNL")
 
-    # ── MXL (JAX engine, full sample) ──────────────────────────────────────
-    print(f"\n  Estimating Mixed Logit (200 draws, JAX)...")
-    mxl = mnl.copy()
-    for feat in MXL_RANDOM:
-        for prefix in ['b_N_', 'b_M_']:
-            pname = f'{prefix}{feat}'
-            if pname in mxl.pf.index:
-                mxl.mixtures.append(
-                    lx.mixtures.Normal(pname, f's_{prefix[2:-1]}_{feat}'))
-    mxl.n_draws = 200
-    mxl.seed    = 42
-    try:
-        mxl.weight_co_var = 'weight'
-    except (TypeError, AttributeError):
-        pass
+    # ── MXL (JAX engine, bounded sample) ───────────────────────────────────
+    # The full-sample 200-draw JAX MXL OOM-killed the 250GB prediction node
+    # (job 23970303: cgroup SIGKILL at ~259GB — uncatchable, so the except
+    # below never fires). The MXL is report-only (predict_cdap uses the MNL),
+    # so estimate it on a bounded sample with fewer draws. CDAP_MXL=0 skips
+    # it entirely; CDAP_MXL_MAX_N / CDAP_MXL_DRAWS tune the bounds.
+    mxl = None
     mxl_ok = False
-    try:
-        with elasticnet_objective(mxl):
-            r2 = mxl.maximize_loglike(stderr=True, options={'ftol': 1e-8})
-        mxl._cached_ll = float(r2.loglike)
+    if os.environ.get('CDAP_MXL', '1') == '0':
+        print("\n  CDAP_MXL=0 — skipping Mixed Logit (MNL only)")
+    else:
+        _mxl_draws = int(os.environ.get('CDAP_MXL_DRAWS', '100'))
+        _mxl_max_n = int(os.environ.get('CDAP_MXL_MAX_N', '5000'))
         try:
-            mxl.calculate_parameter_covariance()
-        except Exception:
-            pass
-        _fill_larch_inference(mxl)
-        _print_larch_table(mxl, "CDAP Mixed Logit")
-        mxl_ok = True
-    except Exception as e:
-        logger.warning(f"MXL failed: {e} — MNL only")
-        mxl = None
+            if len(data) > _mxl_max_n:
+                mxl_sub = data.sample(n=_mxl_max_n, random_state=42)
+                print(f"\n  Estimating Mixed Logit ({_mxl_draws} draws, JAX, "
+                      f"subsample n={len(mxl_sub)}/{len(data)})...")
+                sub_ids = mxl_sub['person_id'].astype(str).tolist()
+                ds_ca_s = lx.Dataset.construct.from_idca(ca_df.loc[sub_ids])
+                ds_co_s = lx.Dataset.construct.from_idco(co_df.loc[sub_ids])
+                dt_s = lx.DataTree(
+                    base=ds_ca_s, person=ds_co_s,
+                    relationships=('base.person_id @ person.person_id',))
+                mxl = lx.Model(dt_s, compute_engine='jax')
+                mxl.choice_ca_var = 'chosen'
+                mxl.utility_co[1] = lx.P('ASC_N')
+                mxl.utility_co[2] = lx.P('ASC_M')
+                for feat in feat_cols:
+                    mxl.utility_co[1] += lx.P(f'b_N_{feat}') * lx.X(f'person.{feat}')
+                    mxl.utility_co[2] += lx.P(f'b_M_{feat}') * lx.X(f'person.{feat}')
+                mxl.set_cap(10)
+                # warm-start at the full-sample MNL estimates
+                for _p in mnl.pf.index:
+                    try:
+                        mxl.set_value(_p, float(mnl.pf.loc[_p, 'value']))
+                    except Exception:
+                        pass
+            else:
+                print(f"\n  Estimating Mixed Logit ({_mxl_draws} draws, JAX)...")
+                mxl = mnl.copy()
+            for feat in MXL_RANDOM:
+                for prefix in ['b_N_', 'b_M_']:
+                    pname = f'{prefix}{feat}'
+                    if pname in mxl.pf.index:
+                        mxl.mixtures.append(
+                            lx.mixtures.Normal(pname, f's_{prefix[2:-1]}_{feat}'))
+            mxl.n_draws = _mxl_draws
+            mxl.seed    = 42
+            try:
+                mxl.weight_co_var = 'weight'
+            except (TypeError, AttributeError):
+                pass
+            with elasticnet_objective(mxl):
+                r2 = mxl.maximize_loglike(stderr=True, options={'ftol': 1e-8})
+            mxl._cached_ll = float(r2.loglike)
+            try:
+                mxl.calculate_parameter_covariance()
+            except Exception:
+                pass
+            _fill_larch_inference(mxl)
+            _print_larch_table(mxl, "CDAP Mixed Logit")
+            mxl_ok = True
+        except Exception as e:
+            logger.warning(f"MXL failed: {e} — MNL only")
+            mxl = None
 
     result = {
         'mnl':      mnl,
@@ -776,6 +847,27 @@ def predict_cdap(synth: pd.DataFrame, result: dict, seed: int = 42) -> pd.DataFr
     sklearn_mdl = result.get('sklearn')
     feat_cols   = result.get('features', MNL_FEATURES)
 
+    # Prediction-side accessibility attach (mirrors prepare_cdap_data): the
+    # estimated model may carry crash_acc/walk_acc/transit_acc coefficients;
+    # a synth population without those columns would silently predict with
+    # them zero-filled (reindex(...).fillna(0) below), biasing everyone
+    # toward the reference pattern.
+    try:
+        _acc_needed = [c for c in feat_cols
+                       if c.endswith('_acc') and c not in df.columns]
+        _acc_csv = os.path.join('saved_data', 'accessibility.csv')
+        if _acc_needed and os.path.exists(_acc_csv):
+            _acc = pd.read_csv(_acc_csv).set_index('zone_id')
+            _home = pd.to_numeric(
+                df.get('OTAZ', df.get('HOMETAZ')), errors='coerce'
+            ).fillna(-1).astype(int)
+            for c in _acc_needed:
+                if c in _acc.columns:
+                    df[c] = _home.map(_acc[c]).fillna(float(_acc[c].median()))
+            print(f"  predict_cdap: attached home-zone accessibility {_acc_needed}")
+    except Exception as _acc_e:
+        logger.warning(f"predict_cdap accessibility attach skipped: {_acc_e}")
+
     if mnl is not None:
         try:
             import larch as lx
@@ -941,10 +1033,33 @@ def predict_cdap(synth: pd.DataFrame, result: dict, seed: int = 42) -> pd.DataFr
 def run_cdap(persons: pd.DataFrame,
              synth: pd.DataFrame,
              save_path: str = 'saved_data/cdap_model.pkl',
-             seed: int = 42) -> pd.DataFrame:
+             seed: int = 42,
+             feature_override: list = None) -> pd.DataFrame:
     print("=" * 55)
     print("CDAP — Coordinated Daily Activity Pattern")
     print("=" * 55)
+
+    if feature_override and os.path.exists(save_path):
+        # save_path is a single shared cache reused across all runs
+        # regardless of mode. If this run supplies a GA-selected feature
+        # set that differs from what's cached, the cache is stale for our
+        # purposes — re-estimate rather than silently keep serving the old
+        # (hardcoded-MNL_FEATURES) model.
+        try:
+            with open(save_path, 'rb') as _f:
+                _cached = pickle.load(_f)
+            _cached_feats = _cached.get('features') if isinstance(_cached, dict) else None
+            if _cached_feats is not None and set(_cached_feats) != set(feature_override):
+                logger.info(
+                    "CDAP cache features differ from GA-selected feature_override "
+                    f"({len(_cached_feats)} cached vs {len(feature_override)} requested) "
+                    "— re-estimating"
+                )
+                os.remove(save_path)
+        except Exception:
+            # Unreadable/legacy cache format — leave the existing validity
+            # check below to decide whether to delete it.
+            pass
 
     if os.path.exists(save_path):
         # Patch Larch __setstate__ before loading so removed attributes
@@ -981,9 +1096,9 @@ def run_cdap(persons: pd.DataFrame,
             except (ImportError, Exception):
                 continue
         if not loaded:
-            result = estimate_cdap(persons, save_path)
+            result = estimate_cdap(persons, save_path, feature_override=feature_override)
     else:
-        result = estimate_cdap(persons, save_path)
+        result = estimate_cdap(persons, save_path, feature_override=feature_override)
 
     print("\n[2/2] Predicting synthetic population...")
     synth = predict_cdap(synth, result, seed=seed)

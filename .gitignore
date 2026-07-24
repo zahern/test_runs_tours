@@ -72,7 +72,7 @@ code/pddopulation_by_order_with_osm_and_landuse.csv
 *.log
 *.exe
 *.pkl
-
+*.dat
 
 # ── Known large binary / data files (> 100 MB) ──────────────
 # Uncomment or add any file whose size exceeds GitHub's 100 MB limit.

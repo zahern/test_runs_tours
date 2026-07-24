@@ -471,7 +471,12 @@ from ga_hypothesis_testing      import run_ga_all_stages
 # NEW_POP_DIR/saved_data/zone_ids_sa2 (NEW_POP_DIR defaults to
 # Z:\test_runs_tours\new_pop).
 NEW_POP = os.environ.get('NEW_POP', '0').strip() == '1'
-NEW_POP_DIR = os.environ.get('NEW_POP_DIR', r'Z:\test_runs_tours\new_pop')
+# Repo-relative default so it resolves on both the HPC
+# (/mnt/hpccs01/home/ahernz/test_runs_tours/new_pop) and the Z:-mounted
+# Windows checkout - a literal drive letter here broke every NEW_POP=1 run
+# executed on Linux.
+_TRT_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+NEW_POP_DIR = os.environ.get('NEW_POP_DIR') or os.path.join(_TRT_ROOT, 'new_pop')
 
 # NEW_POP_MAPPED=1: load from new_pop 507-zone files but remap OTAZ from SA2
 # code → ORDER number via demand_/sa2_to_order_crosswalk.csv, so the existing
@@ -481,23 +486,46 @@ NEW_POP_DIR = os.environ.get('NEW_POP_DIR', r'Z:\test_runs_tours\new_pop')
 # build_synth_population.py --new-pop-mapped to pre-build the population CSV.
 NEW_POP_MAPPED = os.environ.get('NEW_POP_MAPPED', '0').strip() == '1'
 
+
+def _resolve_507_skims() -> str:
+    """Canonical 371-zone skim path (507 SA2 system).
+
+    ZONE MIGRATION (371): the legacy 330-zone downcasted_matrices_base.omx has
+    been retired — every mode now uses the 371-zone sa2_skims_507 skims. Prefer
+    the omx-spec-compliant re-encode (11_convert_skims_to_openmatrix.py output,
+    Blosc2-safe for PyTables) and fall back to the raw aggregation. read_skims
+    hard-errors if whatever loads here is not 371×371, so the 330 system can
+    never be silently reintroduced.
+    """
+    _p = os.path.join(_TRT_ROOT, 'demand_', 'sa2_skims_507_omxspec.omx')
+    if not os.path.exists(_p):
+        _raw = os.path.join(_TRT_ROOT, 'demand_', 'sa2_skims_507.omx')
+        if os.path.exists(_raw):
+            _p = _raw
+    return _p
+
+
+_SKIMS_507 = _resolve_507_skims()
+
 if NEW_POP:
     SYNTH_DIR = os.path.join(NEW_POP_DIR, 'saved_data', 'zone_ids_sa2')
     DEFAULT_SYNTH = os.path.join(SYNTH_DIR, 'zone_301011001.csv')
-    _DEFAULT_SKIMS_PATH = r'Z:\test_runs_tours\demand_\sa2_skims_507_omxspec.omx'
+    _DEFAULT_SKIMS_PATH = _SKIMS_507
 elif NEW_POP_MAPPED:
     # Population: loaded on-the-fly from new_pop zone_<sa2>.csv with SA2→ORDER
     # remapping (build_synth_population.build_synth_population_mapped).
-    # Skims: 329-zone ORDER system unchanged — downcasted_matrices_base.omx.
+    # ZONE MIGRATION (371): skims are now the 371-zone 507 system (was the
+    # 330-zone downcasted_matrices_base.omx). The SA2→ORDER remap targets the
+    # 371-zone seq_zone_ids_371.csv ORDER scheme.
     SYNTH_DIR = os.path.join(
         os.environ.get('NEW_POP_DIR', NEW_POP_DIR), 'saved_data', 'zone_ids_sa2'
     )
     DEFAULT_SYNTH = 'saved_data/synth_persons_mapped.csv'
-    _DEFAULT_SKIMS_PATH = 'downcasted_matrices_base.omx'
+    _DEFAULT_SKIMS_PATH = _SKIMS_507
 else:
     SYNTH_DIR = 'saved_data/zone_ids_sa2'
     DEFAULT_SYNTH = f'{SYNTH_DIR}/order_40.csv'
-    _DEFAULT_SKIMS_PATH = 'downcasted_matrices_base.omx'
+    _DEFAULT_SKIMS_PATH = _SKIMS_507
 
 # Single source of truth for the skims path, overridable per-run via
 # PIPELINE_SKIMS_PATH (e.g. qsub -v PIPELINE_SKIMS_PATH=...).
@@ -540,6 +568,7 @@ def load_data():
         landuse,
         skims=PIPELINE_SKIMS_PATH,
         save_path='saved_data/accessibility.csv',
+        plot_dir=os.path.join(OUT_DIR, 'plots'),
     )
     return sc, out, landuse
 
@@ -825,7 +854,20 @@ def _audit_hhts_synth_consistency(hhts_persons: pd.DataFrame,
 
 
 @timer("CDAP — daily activity pattern")
-def cdap(out, synth, landuse=None):
+def cdap(out, synth, landuse=None, feature_override=None):
+    # ── Impute HHTS-only attributes into the synth population ────────
+    # bikes (and ebikes/escooter if HHTS ever carries ownership columns)
+    # exist in HHTS but not in the synth files; stage-5 UEC terms
+    # reference them on the person table. Stratified sampling from the
+    # HHTS conditional distribution (vehicles × household size), one
+    # draw per household. Done here because this is the first point
+    # where HHTS persons and synth coexist, ahead of every model stage.
+    try:
+        from synth_attributes import sample_hhts_attributes
+        synth = sample_hhts_attributes(synth, out["persons"])
+    except Exception as _shx:
+        logger.warning(f"HHTS attribute sampling skipped: {_shx}")
+
     # ── Validate cached model before use ─────────────────────────────
     # The cached cdap_model.pkl may be a null model (dill failed at save
     # time, fallback pickle saved a None or un-fitted object).  If the
@@ -893,7 +935,7 @@ def cdap(out, synth, landuse=None):
                 os.remove(_cache)
             except OSError:
                 pass
-    synth = run_cdap(out["persons"], synth)
+    synth = run_cdap(out["persons"], synth, feature_override=feature_override)
     synth.to_csv(os.path.join(OUT_DIR, 'cdap_output.csv'), index=False)
     return synth
 
@@ -3757,20 +3799,51 @@ def stage5(out, synth_persons, scheduled, landuse):
     return scheduled_dest, models, skims, sk_lookup
 
 
+def _resolve_stage5b_reuse_path() -> Optional[str]:
+    """Locate a previously-estimated stage5b_models.pkl to reuse for predict-only mode.
+
+    Mirrors the GA_STAGED_REUSE_ESTIMATOR resolution used for ga_results.pkl
+    (see main_ga_staged): a full-population run's Stage 5b would otherwise
+    re-estimate a fresh MNL per purpose on the *entire* predicted trip table
+    (`_estimate_mnl_segment` builds a dense observations x zones design
+    matrix), which for millions of stop trips exceeds typical job memory
+    budgets (job 23661073: OOM-killed at ~261GB estimating n=2,600,393 home
+    stops). When a prior lighter estimation run already produced
+    stage5b_models.pkl, reuse it and predict-only instead.
+    """
+    if os.environ.get('GA_STAGED_REUSE_ESTIMATOR', '0').strip() != '1':
+        return None
+    candidates = []
+    _ga_dir = os.environ.get('GA_STAGED_GA_DIR', '').strip()
+    if _ga_dir:
+        candidates.append(os.path.join(_ga_dir, 'stage5b_models.pkl'))
+    candidates.append(os.path.join(OUT_DIR, 'stage5b_models.pkl'))
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
 @timer("Stage 5b — trip-level destination choice")
-def stage5b(out, scheduled_dest, landuse):
+def stage5b(out, scheduled_dest, landuse, reuse_models_path=None):
     """Estimate + predict trip-level intermediate-stop destination choice.
 
     Used by GA_main / GA_STAGED (combined estimate+predict pattern).
     In the two-phase main() pipeline, stage5b is called inline with travellers
     as the persons source.
+
+    When GA_STAGED_REUSE_ESTIMATOR=1 and a prior stage5b_models.pkl can be
+    resolved, skips re-estimation and predicts using the reused coefficients.
     """
+    if reuse_models_path is None:
+        reuse_models_path = _resolve_stage5b_reuse_path()
     result = run_stage5b(
-        trips       = scheduled_dest,
-        persons     = out["persons"],
-        skims_path  = PIPELINE_SKIMS_PATH,
-        landuse     = landuse,
-        output_dir  = OUT_DIR,
+        trips              = scheduled_dest,
+        persons            = out["persons"],
+        skims_path         = PIPELINE_SKIMS_PATH,
+        landuse            = landuse,
+        output_dir         = OUT_DIR,
+        reuse_models_path  = reuse_models_path,
     )
     # run_stage5b always returns a dict {'trips': df, ...}; extract the DataFrame
     # so callers (stage6, GA paths) always receive a DataFrame, not a dict.
@@ -6184,8 +6257,9 @@ def main(filepath: str = None):
         logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 5b]")
     except Exception as _s5b_e:
         import traceback as _tb_s5b
-        logger.warning(f"Stage 5b failed (non-fatal): {_s5b_e}")
-        logger.debug(_tb_s5b.format_exc())
+        logger.warning(
+            f"Stage 5b failed (non-fatal): {_s5b_e!r}\n{_tb_s5b.format_exc(limit=8)}"
+        )
     gc.collect()
 
     # ── Stage 6 (chunked by persons) ─────────────────────────────────────
@@ -6314,7 +6388,8 @@ def GA_main(filepath: str = None):
              else load_synth_all_zones(SYNTH_DIR, landuse=landuse))
 
     synth = usual_locations(synth, landuse, hhts_tours=out.get('tours'))
-    synth = cdap(out, synth)
+    _s0_res = ga_results.results.get(0) if ga_results is not None else None
+    synth = cdap(out, synth, feature_override=getattr(_s0_res, 'best_features', None))
     travellers = synth[synth['CDAP'].isin(['M', 'N'])].copy()
     print(f"  CDAP filter: {len(travellers):,}/{len(synth):,} persons are travellers")
 
@@ -6366,8 +6441,9 @@ def GA_main(filepath: str = None):
         scheduled_dest = stage5b(out, scheduled_dest, landuse)
     except Exception as _s5b_e:
         import traceback as _tb_s5b
-        logger.warning(f"Stage 5b failed (non-fatal): {_s5b_e}")
-        logger.debug(_tb_s5b.format_exc())
+        logger.warning(
+            f"Stage 5b failed (non-fatal): {_s5b_e!r}\n{_tb_s5b.format_exc(limit=8)}"
+        )
     plan, _   = stage6(out, scheduled_dest, landuse,
                        stage5_models=s5_models, skims=skims, skim_lookup=sk)
     plot(plan)
@@ -6495,7 +6571,8 @@ def GA_STAGED(filepath: str = None):
              else load_synth_all_zones(SYNTH_DIR, landuse=landuse))
 
     synth = usual_locations(synth, landuse, hhts_tours=out.get('tours'))
-    synth = cdap(out, synth)
+    _s0_res = all_ga.results.get(0) if all_ga is not None else None
+    synth = cdap(out, synth, feature_override=getattr(_s0_res, 'best_features', None))
     travellers = synth[synth['CDAP'].isin(['M', 'N'])].copy()
     print(f"  CDAP filter: {len(travellers):,}/{len(synth):,} persons are travellers")
 
@@ -6535,8 +6612,9 @@ def GA_STAGED(filepath: str = None):
         scheduled_dest = stage5b(out, scheduled_dest, landuse)
     except Exception as _s5b_e:
         import traceback as _tb_s5b
-        logger.warning(f"Stage 5b failed (non-fatal): {_s5b_e}")
-        logger.debug(_tb_s5b.format_exc())
+        logger.warning(
+            f"Stage 5b failed (non-fatal): {_s5b_e!r}\n{_tb_s5b.format_exc(limit=8)}"
+        )
     plan, _ = stage6(out, scheduled_dest, landuse,
                      stage5_models=s5_models, skims=skims, skim_lookup=sk)
     plot(plan)

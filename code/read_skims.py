@@ -51,6 +51,32 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# ZONE MIGRATION (371) — hard guard against the retired 330-zone system.
+# The pipeline now runs exclusively on the 371-zone SA2 skims (sa2_skims_507).
+# read_omx_skims() raises if a loaded skim does not have this many zones, so
+# the legacy 330-zone downcasted_matrices_base.omx can never be silently used.
+# Overridable via ZONE_SYSTEM_N_ZONES for a deliberate alternate zone set.
+# ---------------------------------------------------------------------------
+EXPECTED_N_ZONES = int(os.environ.get('ZONE_SYSTEM_N_ZONES', '371'))
+
+
+def _active_zone_ref_csv() -> Optional[str]:
+    """Path to the active ORDER↔SA2 zone reference CSV.
+
+    ZONE MIGRATION (371): prefer the 371-zone seq_zone_ids_371.csv; fall back to
+    the legacy seq_zone_ids_.csv only if the 371 file is absent. Both expose
+    SA2_MAIN16 + ORDER columns, so callers building an ORDER→col bridge work
+    unchanged against whichever is active.
+    """
+    _here = os.path.dirname(os.path.abspath(__file__))
+    for _cand in (os.path.join(_here, 'saved_data', 'seq_zone_ids_371.csv'),
+                  os.path.join(_here, 'seq_zone_ids_.csv')):
+        if os.path.exists(_cand):
+            return _cand
+    return None
+
+
+# ---------------------------------------------------------------------------
 # CONFIGURATION — skim matrix name candidates
 # (the module searches for these names in the OMX file)
 # ---------------------------------------------------------------------------
@@ -108,9 +134,8 @@ def load_lvl4_walk_skims(path: Optional[str] = None) -> Optional[dict]:
         sa2_to_col = {int(c): i for i, c in enumerate(sa2_codes)}
         order_to_col = {}
         try:
-            _seq_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    'seq_zone_ids_.csv')
-            if os.path.exists(_seq_csv):
+            _seq_csv = _active_zone_ref_csv()
+            if _seq_csv and os.path.exists(_seq_csv):
                 _sdf = pd.read_csv(_seq_csv, usecols=['SA2_MAIN16', 'ORDER'])
                 _sdf = _sdf[pd.to_numeric(_sdf['SA2_MAIN16'], errors='coerce').fillna(0) > 0]
                 for _, row in _sdf.iterrows():
@@ -122,7 +147,7 @@ def load_lvl4_walk_skims(path: Optional[str] = None) -> Optional[dict]:
         logger.info(
             f"Loaded Level4 walk/bike skims: {len(lvl4_ids)} Level4 origins x "
             f"{len(sa2_codes)} SA2 destinations "
-            f"(ORDER→col coverage: {len(order_to_col)}/330)"
+            f"(ORDER→col coverage: {len(order_to_col)}/{EXPECTED_N_ZONES})"
         )
         return {
             'DISTWALK':    distwalk,
@@ -185,9 +210,8 @@ def load_sa1_walk_skims(path: Optional[str] = None) -> Optional[dict]:
         # zones) to build the bridge so stage5 can look up either zone system.
         order_to_col = {}
         try:
-            _seq_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    'seq_zone_ids_.csv')
-            if os.path.exists(_seq_csv):
+            _seq_csv = _active_zone_ref_csv()
+            if _seq_csv and os.path.exists(_seq_csv):
                 _sdf = pd.read_csv(_seq_csv, usecols=['SA2_MAIN16', 'ORDER'])
                 _sdf = _sdf[pd.to_numeric(_sdf['SA2_MAIN16'], errors='coerce').fillna(0) > 0]
                 for _, row in _sdf.iterrows():
@@ -199,7 +223,7 @@ def load_sa1_walk_skims(path: Optional[str] = None) -> Optional[dict]:
         logger.info(
             f"Loaded SA1 walk/bike skims: {len(sa1_codes)} SA1 origins × "
             f"{len(sa2_codes)} SA2 destinations "
-            f"(ORDER→col coverage: {len(order_to_col)}/330)"
+            f"(ORDER→col coverage: {len(order_to_col)}/{EXPECTED_N_ZONES})"
         )
         return {
             'DISTWALK':    distwalk,
@@ -628,6 +652,26 @@ def read_omx_skims(
     """
     df = omx_to_dataframe(omx_path, matrices=matrices,
                           zone_index=zone_index)
+
+    # ── ZONE MIGRATION (371) hard guard ───────────────────────────────────
+    # Refuse any skim that is not the active 371-zone system. This is the
+    # single choke point every stage's skim load passes through, so a stray
+    # 330-zone downcasted_matrices_base.omx (or any wrong-sized OMX) fails
+    # loudly here instead of silently misaligning DTAZ/OTAZ downstream.
+    try:
+        _n_dtaz = int(df['DTAZ'].nunique()) if 'DTAZ' in df.columns else 0
+        _n_otaz = int(df['OTAZ'].nunique()) if 'OTAZ' in df.columns else 0
+        _n_zones_seen = max(_n_dtaz, _n_otaz)
+    except Exception:
+        _n_zones_seen = 0
+    if _n_zones_seen != EXPECTED_N_ZONES:
+        raise ValueError(
+            f"read_omx_skims: '{os.path.basename(omx_path)}' has "
+            f"{_n_zones_seen} zones, expected {EXPECTED_N_ZONES} (the 371-zone "
+            f"SA2 system). The legacy 330-zone downcasted_matrices_base.omx has "
+            f"been retired — point PIPELINE_SKIMS_PATH at sa2_skims_507(_omxspec)"
+            f".omx, or set ZONE_SYSTEM_N_ZONES if you intend a different zone set."
+        )
 
     if add_derived:
         # ── average travel time ───────────────────────────────────────

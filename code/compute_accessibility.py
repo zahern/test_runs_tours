@@ -252,7 +252,14 @@ def compute_accessibility(
     else:
         zone_ids = lu.index.astype(int).values
 
-    zone_ids = zone_ids[zone_ids != 330]
+    # ZONE MIGRATION (371): ORDER 330 was a dummy/external zone in the retired
+    # 330-zone system; in the 371-zone SA2 system every ORDER is a real zone, so
+    # the old hardcoded `!= 330` drop is gone. Any genuine external stations to
+    # exclude can be listed in EXCLUDE_ZONES (comma-separated ORDER ids).
+    _excl = os.environ.get('EXCLUDE_ZONES', '').strip()
+    if _excl:
+        _excl_ids = {int(x) for x in _excl.split(',') if x.strip()}
+        zone_ids = zone_ids[~np.isin(zone_ids, list(_excl_ids))]
     zone_ids = np.sort(zone_ids)
     n_zones  = len(zone_ids)
     zone_idx = {int(z): i for i, z in enumerate(zone_ids)}
@@ -329,6 +336,35 @@ def compute_accessibility(
               f"mean={acc_vals.mean():.3f}  "
               f"max={acc_vals.max():.3f}")
 
+    # ── crash-exposure accessibility (safety as an upstream determinant) ──
+    # ATRF reviewers: safety should enter decision layers beyond mode/
+    # destination utilities. crash_acc summarises the expected crash
+    # frequency a resident of zone i is exposed to across reachable
+    # destinations, time-decayed like every other measure:
+    #     crash_acc_i = log1p( Σ_j exp(-b·tt_ij) · CRASH_ij )
+    # Unlike the spec-driven measures the "attractor" here is the OD-level
+    # CRASH skim itself (crash exposure is a property of the OD movement,
+    # not of the destination zone), hence the dedicated block. Joining this
+    # onto persons via their home zone lets the GA test crash exposure in
+    # CDAP, activity frequency, and duration models - not just in the
+    # mode/destination utilities where the CRASH term already lives.
+    if 'CRASH' in sk.columns:
+        try:
+            _crash_piv = np.zeros((n_zones, n_zones), dtype=np.float32)
+            _oi = sk['OTAZ'].map(zone_idx).values
+            _di = sk['DTAZ'].map(zone_idx).values
+            _crash_piv[_oi, _di] = pd.to_numeric(
+                sk['CRASH'], errors='coerce').fillna(0).clip(lower=0).values
+            _tt_col = ('SOVTOLL_TIME__AM' if 'SOVTOLL_TIME__AM' in skim_matrices
+                       else next(iter(skim_matrices)))
+            _w = _decay(np.minimum(skim_matrices[_tt_col], 90.0), 'exp', 0.05)
+            crash_vals = np.log1p((_w * _crash_piv).sum(axis=1))
+            results['crash_acc'] = crash_vals
+            print(f"  {'crash_acc':20s}: min={crash_vals.min():.3f}  "
+                  f"mean={crash_vals.mean():.3f}  max={crash_vals.max():.3f}")
+        except Exception as _ce:
+            logger.warning(f"crash_acc computation failed (non-fatal): {_ce}")
+
     acc_df = pd.DataFrame(results, index=zone_ids)
     acc_df.index.name = 'zone_id'
 
@@ -363,11 +399,103 @@ def attach_to_landuse(landuse: pd.DataFrame,
     return lu
 
 
+# Accessibility measure → the landuse attractor that most directly drives it.
+# Used by plot_accessibility to show the acc↔landuse linkage explicitly.
+_ACC_LANDUSE_PAIRS = [
+    ('auto_work_acc',   'TOTEMP',     'total employment'),
+    ('auto_edu_acc',    'Education',  'education facilities'),
+    ('auto_shop_acc',   'Shopping',   'shopping attractors'),
+    ('walk_acc',        'retail',     'retail landuse area'),
+    ('bike_acc',        'TOTEMP',     'total employment'),
+    ('transit_acc',     'TOTEMP',     'total employment'),
+    ('recreation_acc',  'park',       'park landuse area'),
+    ('auto_nonmand_acc', 'TOTPOP',    'population'),
+]
+
+
+def plot_accessibility(landuse_enriched: pd.DataFrame,
+                       acc_cols: list,
+                       plot_dir: str) -> None:
+    """
+    Two diagnostic figures for the zone-level accessibility measures:
+
+    accessibility_distributions.png — per-measure histogram across zones, so
+        a degenerate measure (all zones alike → useless in a choice model)
+        is visible at a glance.
+    accessibility_vs_landuse.png — each measure scattered against the landuse
+        attractor that feeds it (Pearson r annotated). Low r flags a measure
+        whose decay/attractor wiring isn't actually transmitting the landuse
+        signal.
+
+    Non-fatal: any failure logs and returns (plots must never kill a run).
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        os.makedirs(plot_dir, exist_ok=True)
+        cols = [c for c in acc_cols if c in landuse_enriched.columns]
+        if not cols:
+            return
+
+        # ── 1. distributions ─────────────────────────────────────────────
+        ncols = 4
+        nrows = int(np.ceil(len(cols) / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3 * nrows))
+        axes = np.atleast_1d(axes).flatten()
+        fig.suptitle('Zone accessibility measures — distribution across zones',
+                     fontweight='bold')
+        for i, c in enumerate(cols):
+            v = pd.to_numeric(landuse_enriched[c], errors='coerce').dropna()
+            axes[i].hist(v, bins=30, color='#2E86AB', alpha=0.85)
+            axes[i].set_title(f'{c}\nmean={v.mean():.2f}  std={v.std():.2f}', fontsize=9)
+            axes[i].grid(alpha=0.3)
+        for j in range(len(cols), len(axes)):
+            axes[j].set_visible(False)
+        fig.tight_layout()
+        p1 = os.path.join(plot_dir, 'accessibility_distributions.png')
+        fig.savefig(p1, dpi=110)
+        plt.close(fig)
+        print(f"[Accessibility] plot → {p1}")
+
+        # ── 2. accessibility vs landuse attractors ───────────────────────
+        pairs = [(a, lc, lbl) for a, lc, lbl in _ACC_LANDUSE_PAIRS
+                 if a in landuse_enriched.columns and lc in landuse_enriched.columns]
+        if pairs:
+            nrows2 = int(np.ceil(len(pairs) / ncols))
+            fig, axes = plt.subplots(nrows2, ncols, figsize=(4 * ncols, 3.2 * nrows2))
+            axes = np.atleast_1d(axes).flatten()
+            fig.suptitle('Accessibility vs landuse attractor (per zone)',
+                         fontweight='bold')
+            for i, (a, lc, lbl) in enumerate(pairs):
+                x = pd.to_numeric(landuse_enriched[lc], errors='coerce')
+                y = pd.to_numeric(landuse_enriched[a], errors='coerce')
+                ok = x.notna() & y.notna()
+                r = float(np.corrcoef(np.log1p(x[ok].clip(lower=0)), y[ok])[0, 1]) if ok.sum() > 2 else float('nan')
+                axes[i].scatter(np.log1p(x[ok].clip(lower=0)), y[ok],
+                                s=12, alpha=0.55, color='#1C7293')
+                axes[i].set_xlabel(f'log1p({lc})', fontsize=8)
+                axes[i].set_ylabel(a, fontsize=8)
+                axes[i].set_title(f'{a} vs {lbl}\nr = {r:.2f}', fontsize=9)
+                axes[i].grid(alpha=0.3)
+            for j in range(len(pairs), len(axes)):
+                axes[j].set_visible(False)
+            fig.tight_layout()
+            p2 = os.path.join(plot_dir, 'accessibility_vs_landuse.png')
+            fig.savefig(p2, dpi=110)
+            plt.close(fig)
+            print(f"[Accessibility] plot → {p2}")
+    except Exception as e:
+        logger.warning(f"plot_accessibility failed (non-fatal): {e}")
+
+
 def run_accessibility(
     landuse: pd.DataFrame,
     skims,
     spec: dict = None,
     save_path: str = 'saved_data/accessibility.csv',
+    plot_dir: str = None,
 ) -> pd.DataFrame:
     from stage5_destination_choice import _skim_flat, _open_skims
 
@@ -379,9 +507,27 @@ def run_accessibility(
     print("\nReading skims...")
     skim_df = _skim_flat(skims)
     print(f"  {len(skim_df)} OD pairs, {len(skim_df.columns)-2} skim columns")
+    if len(skim_df) == 0 or 'OTAZ' not in skim_df.columns:
+        # Fail HERE with the real cause instead of a KeyError('OTAZ') three
+        # frames deeper. The usual culprit: an LZF-compressed raw OMX
+        # (sa2_skims_507.omx) that PyTables cannot decode - "required filter
+        # 'lzf' is not registered" in the warning above. The readable,
+        # omx-spec-compliant conversion is produced by
+        # demand_/11_convert_skims_to_openmatrix.py.
+        raise RuntimeError(
+            "Skims could not be read (0 OD pairs) - see the HDF5 warning "
+            "above. If it mentions the 'lzf' filter, generate the readable "
+            "conversion first:  cd ../demand_ && "
+            "python 11_convert_skims_to_openmatrix.py  "
+            "(writes sa2_skims_507_omxspec.omx, which pipeline_logger "
+            "prefers automatically)."
+        )
 
     acc_df = compute_accessibility(landuse, skim_df, spec=spec, save_path=save_path)
     landuse_enriched = attach_to_landuse(landuse, acc_df)
+
+    if plot_dir:
+        plot_accessibility(landuse_enriched, list(acc_df.columns), plot_dir)
 
     if close_it:
         skims.close()

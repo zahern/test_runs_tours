@@ -1,0 +1,58 @@
+#!/bin/bash -l
+# Build the real OSM walk/bike distance skim over the 371-zone SA2 system
+# (demand_/21_build_osm_walk_bike_skims.py). Produces walk_bike_osm_sa2_371.omx
+# with a genuine pedestrian-network DISTWALK and DISTBIKE = DISTWALK * detour.
+#
+# Submit from the code dir:
+#   qsub job_osm_walk_bike.pbs
+# Override params via -v, e.g.:
+#   qsub -v WB_CUTOFF_KM=20,WB_BIKE_DETOUR=1.10 job_osm_walk_bike.pbs
+#
+# ⚠ NEEDS INTERNET EGRESS (osmnx -> Overpass API). HPC compute nodes are often
+#   air-gapped; if this job fails at graph download, run the script on a LOGIN
+#   node instead, or set HTTP(S)_PROXY below to QUT's proxy.
+
+#PBS -N osm_walk_bike_371
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -l walltime=24:00:00
+
+set -euo pipefail
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# Serial routing loop — keep BLAS single-threaded.
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+
+# If compute nodes need a proxy for OSM egress, uncomment and set:
+# export HTTPS_PROXY=http://proxy.qut.edu.au:8080
+# export HTTP_PROXY=http://proxy.qut.edu.au:8080
+
+# Fail fast with a clear message if osmnx isn't in the env.
+python -c "import osmnx, networkx" 2>/dev/null || {
+  echo "FATAL: osmnx/networkx not installed in conda env '$CONDA_ENV'."
+  echo "       conda activate $CONDA_ENV && pip install osmnx networkx"
+  exit 3
+}
+
+WB_CUTOFF_KM=${WB_CUTOFF_KM:-20}
+WB_BIKE_DETOUR=${WB_BIKE_DETOUR:-1.10}
+WB_FILL_NONDIRECT=${WB_FILL_NONDIRECT:-1.30}
+
+echo "Building OSM walk/bike skim: cutoff=${WB_CUTOFF_KM}km detour=${WB_BIKE_DETOUR}"
+python ../demand_/21_build_osm_walk_bike_skims.py \
+    --cutoff-km "$WB_CUTOFF_KM" \
+    --bike-detour "$WB_BIKE_DETOUR" \
+    --fill-nondirect "$WB_FILL_NONDIRECT"
+
+echo "Done. Output: ../demand_/walk_bike_osm_sa2_371.omx"

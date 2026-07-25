@@ -4399,6 +4399,15 @@ def _filter_candidates_by_signal(
     return list(dict.fromkeys(keep))
 
 
+# Structural (activity-count / budget) candidates shared by every Stage 3 purpose.
+_S3_STRUCTURAL = [
+    'start_hr', 'log_dist', 'B', 'budget_per_activity_hr', 'day_span_hr',
+    'n_mandatory', 'n_discretionary',
+    'n_work_out', 'n_edu_out', 'n_social_out', 'n_escort_out',
+    'n_shopping_out', 'n_othmaint_out', 'n_othdiscr_out', 'n_eat_out',
+]
+
+
 def _stage2_feature_spec(data: pd.DataFrame, target: str) -> Tuple[List[str], List[str]]:
     core = _available_feature_list(data, _S2_CORE_BY_TARGET.get(target, []))
     optional = _available_feature_list(data, _S2_OPTIONAL_BY_TARGET.get(target, []))
@@ -4406,16 +4415,63 @@ def _stage2_feature_spec(data: pd.DataFrame, target: str) -> Tuple[List[str], Li
 
 
 def _stage3_feature_spec(data: pd.DataFrame, purpose: str) -> Tuple[List[str], List[str]]:
-    structural = _available_feature_list(
-        data,
-        ['start_hr', 'log_dist', 'B', 'budget_per_activity_hr', 'day_span_hr',
-         'n_mandatory', 'n_discretionary',
-         'n_work_out', 'n_edu_out', 'n_social_out', 'n_escort_out',
-         'n_shopping_out', 'n_othmaint_out', 'n_othdiscr_out', 'n_eat_out'],
-    )
+    structural = _available_feature_list(data, _S3_STRUCTURAL)
     core = structural + _available_feature_list(data, _S3_PURPOSE_PERSON_CORE.get(purpose, []))
     optional = _available_feature_list(data, _S3_PURPOSE_OPTIONAL.get(purpose, []))
     return list(dict.fromkeys(core + optional)), list(dict.fromkeys(core))
+
+
+def _raw_stage_candidates(stage: int, key: str) -> List[str]:
+    """Full candidate list for a Stage 2 target / Stage 3 purpose BEFORE any
+    data-column or signal filtering — the denominator for availability."""
+    if stage == 2:
+        return list(dict.fromkeys(list(_S2_CORE_BY_TARGET.get(key, []))
+                                  + list(_S2_OPTIONAL_BY_TARGET.get(key, []))))
+    if stage == 3:
+        return list(dict.fromkeys(list(_S3_STRUCTURAL)
+                                  + list(_S3_PURPOSE_PERSON_CORE.get(key, []))
+                                  + list(_S3_PURPOSE_OPTIONAL.get(key, []))))
+    return []
+
+
+def _record_candidate_availability(stage, label, key, kept, data):
+    """Log + persist which candidate predictors were kept vs dropped (and why)
+    for one Stage 2/3 target/purpose. Lets a flat search be diagnosed as
+    BIC-parsimony (terms present but penalised out — lower GA_COMPLEXITY_PENALTY)
+    vs missing data columns (fix the synth-pop attributes). Appends
+    candidate_availability_stage<N>.csv into GA_CHECKPOINT_DIR (or CWD)."""
+    raw = _raw_stage_candidates(stage, key)
+    if not raw:
+        return
+    cols = set(getattr(data, 'columns', []))
+    keptset = set(kept)
+    not_in_data = [c for c in raw if c not in cols]
+    near_const  = [c for c in raw if c in cols and c not in keptset]
+    n_search = len(raw) - len(not_in_data) - len(near_const)
+    print(f"    [{label}] candidate availability: {len(raw)} defined -> "
+          f"{n_search} searchable | {len(not_in_data)} not-in-data | "
+          f"{len(near_const)} near-constant/filtered")
+    if not_in_data:
+        print(f"        not-in-data: {not_in_data}")
+    if near_const:
+        print(f"        near-constant/filtered: {near_const}")
+    _dir = os.environ.get('GA_CHECKPOINT_DIR') or '.'
+    try:
+        import csv as _csv
+        os.makedirs(_dir, exist_ok=True)
+        _path = os.path.join(_dir, f'candidate_availability_stage{stage}.csv')
+        _new = not os.path.exists(_path)
+        with open(_path, 'a', newline='', encoding='utf-8') as _fh:
+            _w = _csv.writer(_fh)
+            if _new:
+                _w.writerow(['stage', 'target', 'term', 'status'])
+            for c in raw:
+                st = ('searchable' if c in keptset
+                      else 'not_in_data' if c not in cols
+                      else 'near_constant')
+                _w.writerow([stage, label, c, st])
+    except Exception:
+        pass
 
 
 def _stage4_feature_spec(data: pd.DataFrame, purpose: str) -> Tuple[List[str], List[str]]:
@@ -5581,6 +5637,7 @@ def _run_ga_stage2(tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
         feat_names, fixed_feats = _stage2_feature_spec(data, target)
         feat_names = _filter_candidates_by_signal(data, feat_names)
         fixed_feats = [f for f in fixed_feats if f in feat_names]
+        _record_candidate_availability(2, tgt_label, target, feat_names, data)
         if not feat_names:
             print(f"    ! {tgt_label}: no usable candidates after filtering, skipping")
             continue
@@ -5737,6 +5794,7 @@ def _run_ga_stage3(tours, persons, ga_kwargs, trips=None, n_restarts=2) -> GARes
 
         _seg_data = _data_by_seg.get(purpose, data)
         feat_names, fixed_feats = _stage3_feature_spec(_seg_data, purpose)
+        _record_candidate_availability(3, purp_label, purpose, feat_names, _seg_data)
         if not feat_names:
             continue
 

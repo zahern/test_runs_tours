@@ -83,7 +83,37 @@ def _annotate(term, con, ptype_land_terms):
     return a
 
 
-def build_rows(schema, get_constraints, ptype_land_terms):
+def load_availability(search_dirs):
+    """Aggregate candidate_availability_stage<N>.csv (written by the Stage 2/3 GA
+    diagnostic) into {(stageN, term): status}. A term counts as 'searchable' if
+    it was searchable in ANY target/purpose, else the worst status seen."""
+    import csv
+    import glob
+    rank = {'searchable': 3, 'near_constant': 2, 'not_in_data': 1}
+    best = {}
+    seen_files = set()
+    for d in search_dirs:
+        if not d:
+            continue
+        for path in glob.glob(os.path.join(d, 'candidate_availability_stage*.csv')):
+            rp = os.path.realpath(path)
+            if rp in seen_files:
+                continue
+            seen_files.add(rp)
+            try:
+                with open(path, encoding='utf-8') as fh:
+                    for r in csv.DictReader(fh):
+                        key = (f"stage{r['stage']}", r['term'])
+                        st = r['status']
+                        if key not in best or rank.get(st, 0) > rank.get(best[key], 0):
+                            best[key] = st
+            except Exception:
+                continue
+    return best
+
+
+def build_rows(schema, get_constraints, ptype_land_terms, avail=None):
+    avail = avail or {}
     rows = []
     for stage, sdef in schema.get('stages', {}).items():
         try:
@@ -93,6 +123,8 @@ def build_rows(schema, get_constraints, ptype_land_terms):
         segs = sdef.get('segments') or ['-']
         for term in sdef.get('candidates', []):
             ann = _annotate(term, con, ptype_land_terms)
+            # Availability only exists for stages 2/3 (where the diagnostic runs).
+            ann['availability'] = avail.get((stage, term), '')
             for seg in segs:
                 rows.append({
                     'stage': stage,
@@ -108,8 +140,9 @@ def build_rows(schema, get_constraints, ptype_land_terms):
 def write_csv(rows, path):
     import csv
     cols = ['stage', 'label', 'name_kind', 'segment', 'term', 'status',
-            'force_include', 'force_random', 'never_random', 'collinear_group',
-            'require_one_group', 'protected_backbone', 'ptype_land', 'sign']
+            'availability', 'force_include', 'force_random', 'never_random',
+            'collinear_group', 'require_one_group', 'protected_backbone',
+            'ptype_land', 'sign']
     with open(path, 'w', newline='', encoding='utf-8') as fh:
         w = csv.DictWriter(fh, fieldnames=cols)
         w.writeheader()
@@ -155,13 +188,19 @@ def write_html(rows, schema, path):
         parts.append(f"<h2>{html.escape(label)} "
                      f"<small>({html.escape(kind)} names)</small></h2>")
         parts.append("<table><tr><th>term</th><th>segment</th><th>status</th>"
-                     "<th>force_incl</th><th>random</th><th>never_rand</th>"
-                     "<th>collin#</th><th>req-one#</th><th>sign</th>"
-                     "<th>ptype×land</th></tr>")
+                     "<th>availability</th><th>force_incl</th><th>random</th>"
+                     "<th>never_rand</th><th>collin#</th><th>req-one#</th>"
+                     "<th>sign</th><th>ptype×land</th></tr>")
         for r in rs:
+            av = r.get('availability', '')
+            av_cell = (f"<td style='background:#ffcdd2'>{av}</td>"
+                       if av == 'not_in_data'
+                       else f"<td style='background:#fff9c4'>{av}</td>"
+                       if av == 'near_constant' else f"<td>{av}</td>")
             parts.append(
                 f"<tr class='{r['status']}'><td><code>{html.escape(r['term'])}</code></td>"
                 f"<td>{html.escape(str(r['segment']))}</td><td>{r['status']}</td>"
+                f"{av_cell}"
                 f"<td>{'Y' if r['force_include'] else ''}</td>"
                 f"<td>{html.escape(str(r['force_random']))}</td>"
                 f"<td>{'Y' if r['never_random'] else ''}</td>"
@@ -179,6 +218,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--schema', default=os.path.join(HERE, 'constraint_schema.json'))
     ap.add_argument('--out-dir', default=HERE)
+    ap.add_argument('--availability-dir', default='',
+                    help='Extra dir to search for candidate_availability_stage*.csv '
+                         '(also searches out-dir, its parent, and GA_CHECKPOINT_DIR).')
     args = ap.parse_args()
 
     if not os.path.exists(args.schema):
@@ -189,6 +231,19 @@ def main():
 
     schema = json.load(open(args.schema, encoding='utf-8'))
     from ga_constraints import get_constraints
+
+    # Availability (Stage 2/3): fold in candidate_availability_stage*.csv from
+    # the out-dir, its parent (run dir), and GA_CHECKPOINT_DIR if set.
+    avail = load_availability([
+        args.out_dir,
+        os.path.dirname(os.path.abspath(args.out_dir)),
+        os.environ.get('GA_CHECKPOINT_DIR', ''),
+        args.availability_dir,
+    ])
+    if avail:
+        na = sum(1 for v in avail.values() if v == 'not_in_data')
+        print(f"Availability data found: {len(avail)} terms "
+              f"({na} not-in-data) — folded into the report.\n")
 
     # ptype×land interaction terms (from the GUI overlay / schema default).
     pl = schema.get('default_ptype_land') or []
@@ -202,7 +257,7 @@ def main():
         ptype_land_terms.add(rule.get('ptype', ''))
         ptype_land_terms.add(rule.get('land', ''))
 
-    rows = build_rows(schema, get_constraints, ptype_land_terms)
+    rows = build_rows(schema, get_constraints, ptype_land_terms, avail)
     csv_path = os.path.join(args.out_dir, 'constraint_report.csv')
     html_path = os.path.join(args.out_dir, 'constraint_report.html')
     write_csv(rows, csv_path)

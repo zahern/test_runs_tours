@@ -416,7 +416,16 @@ def _configure_metacount_backend() -> None:
 _configure_metacount_backend()
 
 try:
-    from metacountregressor import ExperimentBuilder, ModelConstraints
+    # metacountregressor prints an ASCII-art splash + version banner to stdout on
+    # import, which clutters every GA .o log. Suppress stdout/stderr during the
+    # import, mirroring the SearchLibrium import below.
+    import io as _io, sys as _sys
+    _mc_old_out, _mc_old_err = _sys.stdout, _sys.stderr
+    _sys.stdout = _io.StringIO(); _sys.stderr = _io.StringIO()
+    try:
+        from metacountregressor import ExperimentBuilder, ModelConstraints
+    finally:
+        _sys.stdout, _sys.stderr = _mc_old_out, _mc_old_err
     _METACOUNT_OK = True
 except Exception as exc:
     _METACOUNT_OK = False

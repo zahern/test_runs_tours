@@ -22,6 +22,10 @@ module load Anaconda3/2024.02-1
 conda activate "$CONDA_ENV"
 module unload Anaconda3
 
+# Force UTF-8 I/O so box-drawing/arrows/checkmarks in logs never mojibake.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
 echo "=========================================="
 echo "Merge GA results job"
 echo "PBS job     : ${PBS_JOBID:-unknown}"

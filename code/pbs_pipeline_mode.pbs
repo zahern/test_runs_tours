@@ -48,6 +48,10 @@ module load Anaconda3/2024.02-1
 conda activate "$CONDA_ENV"
 module unload Anaconda3
 
+# Force UTF-8 I/O so box-drawing/arrows/checkmarks in logs never mojibake.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
 # ── Ensure MetaCount + SearchLibrium are installed ─────────────────────────
 # INSTALL_ESTIMATORS=1  → force (re-)install regardless of current state.
 # ESTIMATOR_SOURCE=pypi (default) always installs latest published releases.

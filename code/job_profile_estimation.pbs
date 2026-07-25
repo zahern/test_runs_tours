@@ -35,6 +35,10 @@ module load Anaconda3/2024.02-1
 conda activate "$CONDA_ENV"
 module unload Anaconda3
 
+# Force UTF-8 I/O so box-drawing/arrows/checkmarks in logs never mojibake.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
 export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
 export PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}

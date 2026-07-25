@@ -47,6 +47,16 @@ from larch_regularization import (elasticnet_objective, nl_identification_priors
 
 logger = logging.getLogger(__name__)
 
+# Larch re-emits "chosen_but_not_available" (and similar troubleshooting notes)
+# on EVERY model fit. The SA/GA search does thousands of fits per segment, so
+# these flood the .e log into a wall of identical warnings that looks like a
+# massive failure. We already repair chosen_but_not_available at build time
+# (mode_mdl.doctor(repair_ch_av="+")) and again inside _estimate, so the issue
+# is handled — demote Larch's troubleshooting logger to ERROR to stop the spam.
+# Set GA_LARCH_TROUBLESHOOT=1 to restore the per-fit warnings for debugging.
+if os.environ.get('GA_LARCH_TROUBLESHOOT', '0') != '1':
+    logging.getLogger('larch.model.troubleshooting').setLevel(logging.ERROR)
+
 PURPOSES     = ['work', 'edu', 'social', 'escort',
                 'shopping', 'othmaint', 'othdiscr', 'eat']
 NON_MANDATORY = ['social', 'escort', 'shopping', 'othmaint', 'othdiscr', 'eat']

@@ -1347,7 +1347,13 @@ class Synth_Connect:
         )
 
         # FIX 3: merge person demographics onto tours
-        person_cols = ['person_id', 'sexp', 'vehrd', 'nprd', 'OTAZ', 'HOME_SA2_2021', 'HHID']
+        # CARLICENCE carried through (process_hhts_person builds it, but it was
+        # being dropped here) so the Stage 5 mode model can gate DA availability
+        # (licence AND vehicle) instead of falling back to always-available —
+        # that was the "availability vars missing [CARLICENCE, vehrd, ...]"
+        # warning. Guarded below, so it's skipped if absent from persons.
+        person_cols = ['person_id', 'sexp', 'vehrd', 'nprd', 'OTAZ', 'HOME_SA2_2021',
+                       'HHID', 'CARLICENCE']
         person_cols = [c for c in person_cols if c in persons.columns]
         as_tours = as_tours.merge(persons[person_cols], on='person_id', how='left')
 

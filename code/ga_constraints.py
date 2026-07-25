@@ -310,12 +310,24 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             # piecewise distance-bin spline, never both (they span the same
             # distance axis and are collinear together).
             ['c_dist', 'c_dist_0_2', 'c_dist_2_5', 'c_dist_5_10'],
+            # Accessibility form: the mode-choice logsum and the raw log-distance
+            # term both encode OD separation and are collinear, so at most ONE is
+            # active. Combined with the require-one group below this means EXACTLY
+            # one of {c_logsum, c_log_dist} — which stops the logsum coefficient
+            # being holdfast-at-0 / pruned for collinearity with c_log_dist.
+            ['c_logsum', 'c_log_dist'],
         ],
         # Semantic pairing: when occupation-type person terms steer work
         # destinations, at least one matching industry attractor must be
         # present so job types can actually point at same-industry employment
         # on the map (occupation x distance alone has nothing to aim at).
-        'min_behavioral': (1, ['c_indp_finance', 'c_indp_health', 'c_indp_retail']),
+        'min_behavioral': [
+            (1, ['c_indp_finance', 'c_indp_health', 'c_indp_retail']),
+            # At least one accessibility/distance term must survive; with the
+            # c_logsum/c_log_dist mutex above this guarantees EXACTLY one is
+            # present, so the destination model never loses distance signal.
+            (1, ['c_logsum', 'c_log_dist']),
+        ],
         # size_term and log_correction are structural (fixed priors /
         # sampling correction) — never random, never searched out.
         'never_random': ['c_size_term', 'log_correction'],
@@ -332,10 +344,16 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             'c_aggl': 'pos', 'c_aggl_retail': 'pos', 'c_aggl_office': 'pos',
             'c_aggl_edu': 'pos', 'c_aggl_leisure': 'pos',
             'c_walk_acc': 'pos', 'c_transit_acc': 'pos', 'c_auto_work_acc': 'pos',
+            # Mode-choice logsum: better accessibility -> more attractive dest.
+            'c_logsum': 'pos',
         },
         # ── Protected backbone (never removed by _prune_and_refit) ───────────
         'protected_backbone': [
-            'c_log_dist', 'c_size_term', 'log_correction', 'c_crash',
+            # c_log_dist is intentionally NOT forced here anymore: it now shares an
+            # exactly-one accessibility group with c_logsum (mutex + require-one).
+            # Forcing it would permanently exclude the logsum; the require-one
+            # group guarantees one of the two is always present regardless.
+            'c_size_term', 'log_correction', 'c_crash',
         ],
     },
 }

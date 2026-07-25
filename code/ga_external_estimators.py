@@ -1438,8 +1438,23 @@ def stage1_fitness_metacount(
 # For B (day duration) we fit OLS on log(B) which is the lognormal approximation.
 # BIC = n*log(RSS/n) + k*log(n) — computed analytically via numpy.
 
+# Complexity-penalty scale for the Stage 2/3 fast GA oracle (_ols_bic).
+# 1.0 = exact BIC (k*ln(n) penalty — conservative, favours sparse models, which
+# is why Stage 2/3 searches converge flat with few predictors). Lower it to let
+# the GA keep more predictors:
+#   GA_COMPLEXITY_PENALTY=0.5   ~half the BIC penalty (looser)
+#   GA_COMPLEXITY_PENALTY=0.2   near AIC-like for large n (2/ln(n) ≈ 0.17 @ n=100k)
+# Only affects the GA search oracle for stages 2 & 3; the final model fit and all
+# other stages are unchanged. Read at import so spawn-mode workers pick it up.
+_GA_COMPLEXITY_PENALTY = max(0.0, float(os.environ.get('GA_COMPLEXITY_PENALTY', '1.0')))
+
+
 def _ols_bic(y: np.ndarray, X: np.ndarray) -> float:
-    """Return –BIC/n for an OLS regression y ~ X (intercept already in X)."""
+    """Return –BIC/n for an OLS regression y ~ X (intercept already in X).
+
+    The complexity penalty is scaled by GA_COMPLEXITY_PENALTY (default 1.0 =
+    standard BIC); lower values keep more predictors in the Stage 2/3 search.
+    """
     n, k = X.shape
     if n < k + 2:
         return -1e9
@@ -1452,7 +1467,7 @@ def _ols_bic(y: np.ndarray, X: np.ndarray) -> float:
             rss = float(res[0])
         if rss <= 0 or not np.isfinite(rss):
             return -1e9
-        bic = n * np.log(rss / n) + k * np.log(n)
+        bic = n * np.log(rss / n) + _GA_COMPLEXITY_PENALTY * k * np.log(n)
         return -bic / n
     except Exception:
         return -1e9

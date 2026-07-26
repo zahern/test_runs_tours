@@ -6860,19 +6860,48 @@ def _model_bic(model, ll=None, n=None) -> float:
 
 
 def _param_tstats(model) -> dict:
-    """{param_name: t-statistic} from the model's final parameter frame."""
+    """{param_name: t-statistic} from the model's final parameter frame.
+
+    Prefers value/std_err; falls back to any precomputed t-stat column
+    (t_stat, t_stat_opg) or a p-value column (pval, pval_opg -> |t|) so that
+    insignificance pruning still fires when std_err isn't on the frame being
+    read (the silent case that left insignificant coefficients un-pruned)."""
     out: dict = {}
     try:
         pf = getattr(model, '_final_pf', None)
         if pf is None:
             pf = model.pf
+        _cols = set(pf.columns)
         for p in pf.index:
+            t = float('nan')
             try:
-                v = float(pf.loc[p, 'value']) if 'value' in pf.columns else float('nan')
-                se = float(pf.loc[p, 'std_err']) if 'std_err' in pf.columns else float('nan')
-                out[p] = (v / se) if (np.isfinite(v) and np.isfinite(se) and se > 0) else float('nan')
+                v = float(pf.loc[p, 'value']) if 'value' in _cols else float('nan')
+                se = float(pf.loc[p, 'std_err']) if 'std_err' in _cols else float('nan')
+                if np.isfinite(v) and np.isfinite(se) and se > 0:
+                    t = v / se
             except Exception:
-                out[p] = float('nan')
+                t = float('nan')
+            if not np.isfinite(t):
+                for _tc in ('t_stat', 't_stat_opg'):
+                    if _tc in _cols:
+                        try:
+                            _tv = float(pf.loc[p, _tc])
+                            if np.isfinite(_tv):
+                                t = _tv
+                                break
+                        except Exception:
+                            pass
+            if not np.isfinite(t):
+                for _pc in ('pval', 'pval_opg'):
+                    if _pc in _cols:
+                        try:
+                            _pv = float(pf.loc[p, _pc])
+                            if np.isfinite(_pv):
+                                t = float(norm.isf(min(max(_pv, 1e-12), 1.0) / 2.0))
+                                break
+                        except Exception:
+                            pass
+            out[p] = t
     except Exception:
         pass
     return out
@@ -6970,12 +6999,21 @@ def _prune_and_refit(model, estimate_fn, stage: str, *,
         protected = set()
 
     _tag = f"[prune {label or stage}]"
+    try:
+        _pf0 = getattr(model, '_final_pf', None)
+        _pf0 = model.pf if _pf0 is None else _pf0
+        _nfree0 = int((~_pf0.get('holdfast', pd.Series(False, index=_pf0.index))
+                       .fillna(False).astype(bool)).sum())
+    except Exception:
+        _nfree0 = -1
+    logger.info(f"{_tag} entering: {_nfree0} free params, tmin={tmin:.2f}, zero_eps={zero_eps:g}")
     for _it in range(max_iters):
         try:
             pf = getattr(model, '_final_pf', None)
             if pf is None:
                 pf = model.pf
-        except Exception:
+        except Exception as _pf_e:
+            logger.warning(f"{_tag} cannot read param frame ({_pf_e!r}) — prune skipped")
             break
         tstats = _param_tstats(model)
         bic_before = _model_bic(model)

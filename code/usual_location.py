@@ -100,15 +100,21 @@ INDUSTRY_ATTRACTOR = {
 
 EDU_ATTRACTOR_COLS = {
     # STUDYING code → columns
-    1: {'Primary':  1.0},           # primary school
-    2: {'Secondary': 1.0},          # secondary school
-    3: {'Education': 0.5},          # tertiary PT
-    4: {'Education': 1.0},          # tertiary FT
+    1: {'Primary':  1.0, 'HSENROLL': 0.3, 'AGE0519': 0.15},     # primary school (local)
+    2: {'Secondary': 1.0, 'HSENROLL': 0.5, 'AGE0519': 0.2},     # secondary school
+    3: {'Education': 0.5, 'HSENROLL': 0.3, 'TOTEMP': 0.05},     # tertiary PT
+    4: {'Education': 1.0, 'HSENROLL': 0.5, 'TOTEMP': 0.1},      # tertiary FT
 }
 
 # Decay coefficients (exp(-b * tt_minutes))
+# Primary → very local catchment, Secondary → wider, Tertiary → region-wide
 WORK_DECAY_B   = 0.04   # ~30 min mean commute
-SCHOOL_DECAY_B = 0.06   # ~20 min mean school trip
+SCHOOL_DECAY_B = {
+    1: 0.15,   # primary: ~7 min mean (strict local catchment)
+    2: 0.10,   # secondary: ~10 min mean
+    3: 0.04,   # tertiary PT: ~25 min mean (commuter students)
+    4: 0.04,   # tertiary FT: ~25 min mean
+}
 
 
 # =============================================================================
@@ -161,10 +167,12 @@ def _edu_attractor(landuse: pd.DataFrame,
                 found_any = True
 
     # Fallback: if education-specific columns are missing or all-zero,
-    # use school_enrol (combined) or TOTEMP as a proxy attractor.
-    # This prevents all students being sent to the same 1-4 zones.
+    # use school-age population or enrolment proxies rather than TOTEMP.
+    # Primary/secondary schools cluster where children live, not where
+    # jobs are — TOTEMP is a poor proxy for school locations.
     if not found_any:
-        for fallback in ['school_enrol', 'HSENROLL', 'AGE0519', 'TOTEMP']:
+        for fallback in ['HSENROLL', 'AGE0519', 'school_enrol', 'Education',
+                         'Secondary', 'Primary', 'TOTEMP']:
             if fallback in lu.columns:
                 vals = lu.reindex(zone_ids)[fallback].fillna(0).clip(lower=0).values
                 if vals.sum() > 0:
@@ -294,11 +302,19 @@ def assign_usual_locations(
     df['WORK_TAZ']   = 0
     df['SCHOOL_TAZ'] = 0
 
-    # zone universe (exclude catch-all zone 330)
+    # Zone universe for work/school assignment, taken from the landuse — so in
+    # NEW_POP=1 (371 SA2) mode these are the 371 SA2 zones, matching skims and
+    # accessibility. ZONE MIGRATION (371): the old hardcoded `!= 330` (drop the
+    # 330-ORDER catch-all) is gone; any genuine external stations go in
+    # EXCLUDE_ZONES (comma-separated). Harmless no-op on SA2 codes anyway.
     lu = landuse.copy()
     zone_col = 'ORDER' if 'ORDER' in lu.columns else lu.columns[0]
     zone_ids = lu[zone_col].astype(int).values
-    zone_ids = zone_ids[(zone_ids > 0) & (zone_ids != 330)]
+    zone_ids = zone_ids[zone_ids > 0]
+    _excl = os.environ.get('EXCLUDE_ZONES', '').strip()
+    if _excl:
+        _excl_ids = {int(x) for x in _excl.split(',') if x.strip()}
+        zone_ids = zone_ids[~np.isin(zone_ids, list(_excl_ids))]
     zone_ids = np.sort(zone_ids)
     if len(zone_ids) == 0:
         raise ValueError("assign_usual_locations: no valid zone ids found in landuse")
@@ -404,7 +420,7 @@ def assign_usual_locations(
             key = (int(otaz), int(studying))
             tt  = get_tt(int(otaz))
             att = _edu_attractor(lu, zone_ids, studying=int(studying))
-            school_probs[key] = _zone_probs(att, tt, SCHOOL_DECAY_B)
+            school_probs[key] = _zone_probs(att, tt, SCHOOL_DECAY_B.get(int(studying), 0.06))
 
         school_assign = np.zeros(len(student_df), dtype=np.int32)
         for i, (otaz, studying) in enumerate(student_df[[otaz_col, 'STUDYING']].itertuples(index=False, name=None)):
@@ -415,7 +431,7 @@ def assign_usual_locations(
             else:
                 tt = get_tt(int(otaz))
                 att = _edu_attractor(lu, zone_ids, studying=int(studying))
-                school_assign[i] = _sample_zone(att, tt, zone_ids, SCHOOL_DECAY_B, rng)
+                school_assign[i] = _sample_zone(att, tt, zone_ids, SCHOOL_DECAY_B.get(int(studying), 0.06), rng)
 
         df.loc[is_student, 'SCHOOL_TAZ'] = school_assign
 
@@ -649,7 +665,10 @@ def _save_location_html(df, landuse, is_worker, is_student, otaz_col, path,
         ]
         decay_rows = [
             ('WORK_DECAY_B', WORK_DECAY_B),
-            ('SCHOOL_DECAY_B', SCHOOL_DECAY_B),
+            ('SCHOOL_DECAY_B (primary)', SCHOOL_DECAY_B.get(1, 0.06)),
+            ('SCHOOL_DECAY_B (secondary)', SCHOOL_DECAY_B.get(2, 0.06)),
+            ('SCHOOL_DECAY_B (tertiary PT)', SCHOOL_DECAY_B.get(3, 0.06)),
+            ('SCHOOL_DECAY_B (tertiary FT)', SCHOOL_DECAY_B.get(4, 0.06)),
         ]
 
         html = f"""<!DOCTYPE html>

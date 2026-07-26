@@ -1,0 +1,62 @@
+#!/bin/bash -l
+# Merge per-stage GA artifacts into one ga_results.pkl.
+
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=1:mem=8GB
+#PBS -l walltime=01:00:00
+
+set -euo pipefail
+
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:?RUN_TAG is required}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+STAGE_IDS=${STAGE_IDS:-1,2,3,4,5}
+STAGE_IDS=${STAGE_IDS//_/,}
+STRICT_MERGE=${STRICT_MERGE:-1}
+
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# Force UTF-8 I/O so box-drawing/arrows/checkmarks in logs never mojibake.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+echo "=========================================="
+echo "Merge GA results job"
+echo "PBS job     : ${PBS_JOBID:-unknown}"
+echo "Run root    : ${RUN_ROOT}"
+echo "Run tag     : ${RUN_TAG}"
+echo "Stage ids   : ${STAGE_IDS}"
+echo "Strict      : ${STRICT_MERGE}"
+echo "Started     : $(date)"
+echo "=========================================="
+
+if [ "${STRICT_MERGE}" = "1" ]; then
+  python -u -X utf8 merge_ga_results.py --run-root "${RUN_ROOT}" --run-tag "${RUN_TAG}" --stage-ids "${STAGE_IDS}" --strict
+else
+  python -u -X utf8 merge_ga_results.py --run-root "${RUN_ROOT}" --run-tag "${RUN_TAG}" --stage-ids "${STAGE_IDS}"
+fi
+
+EXIT_CODE=$?
+
+# ── Snapshot the GA search space + active constraints for this run ───────────
+# Writes constraint_report.{csv,html} next to the merged results, so every run
+# records exactly which candidate terms were searchable and how they were
+# constrained (defaults + ga_constraints_user.json overlay). Non-fatal, and it
+# does not touch the merge exit code. Uses the committed constraint_schema.json;
+# rebuild that with build_constraint_schema.py when the candidate pools change.
+REPORT_DIR="${RUN_ROOT}/${RUN_TAG}/merged"
+mkdir -p "${REPORT_DIR}" 2>/dev/null || true
+if python -u -X utf8 constraint_report.py --out-dir "${REPORT_DIR}"; then
+  echo "Constraint/search report -> ${REPORT_DIR}/constraint_report.{csv,html}"
+else
+  echo "constraint_report skipped (non-fatal)"
+fi
+
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+exit "${EXIT_CODE}"

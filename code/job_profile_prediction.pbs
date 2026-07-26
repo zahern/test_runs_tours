@@ -1,0 +1,50 @@
+#!/bin/bash -l
+# Profile the full build+predict pipeline (mode models + destination choice +
+# activity prediction) for the 371-zone system, under cProfile.
+# Writes profile_prediction.pstats + a printed top-N hotspot report (see the
+# job's .o log). Open the pstats locally:  snakeviz profile_prediction.pstats
+#
+# Submit from the code dir:  qsub job_profile_prediction.pbs
+#
+# ── Lower-overhead alternative: SAMPLING a live run with py-spy ───────────────
+# cProfile adds overhead on a multi-hour run. To profile the REAL run instead,
+# submit the pipeline normally, then from a shell on the same node:
+#     py-spy record -o profile_pred.svg --pid <python_pid> --duration 300
+#     py-spy dump  --pid <python_pid>          # instant stack snapshot
+# (py-spy needs no code changes and produces a flamegraph SVG.)
+
+#PBS -N profile_pred_371
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=8:mem=128GB
+#PBS -l walltime=36:00:00
+
+set -euo pipefail
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# Force UTF-8 I/O so box-drawing/arrows/checkmarks in logs never mojibake.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+# Match the pipeline's stable CPU defaults.
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-1}
+# 371-zone SA2-native run.
+export NEW_POP=${NEW_POP:-1}
+export NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+
+echo "Profiling full build+predict under cProfile (371, NEW_POP=$NEW_POP)..."
+python profile_prediction.py
+
+echo "Done. profile_prediction.pstats written; hotspot report above."

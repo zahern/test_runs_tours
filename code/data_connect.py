@@ -9,6 +9,13 @@ import random
 import re
 from pathlib import Path
 import os
+
+# Repo-relative default for the new_pop scope - a literal Z:\ drive path
+# here broke every NEW_POP=1 run executed on the Linux HPC (Z: is only the
+# Windows mount of /mnt/hpccs01/home/ahernz).
+_TRT_ROOT_DC = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+_DEFAULT_NEW_POP_DIR = os.path.join(_TRT_ROOT_DC, 'new_pop')
 def time_hour(time):
     '''returns the time of starting..'''
     return int(time/60)
@@ -147,6 +154,74 @@ income_mapping = {'Negative income': 0,
 'Not applicable':17,
 "Prefer not to say / can't say":16
 }
+
+# Income codes that represent NON-RESPONSE rather than a real income band.
+_INCOME_NONRESPONSE = {16, 17}
+
+
+def _impute_income(df: pd.DataFrame, seed: int = 42) -> pd.DataFrame:
+    """
+    Impute personal income band (incp, 1..15) for NON-RESPONSE records from the
+    person's profile, so the income coefficient is estimable and applies
+    sensibly to the population.
+
+    In this HHTS ~88% of INCOME is 'Select One' / 'Not applicable' / 'Prefer not
+    to say' → mapped to 16/17, which the income-band logic wrongly reads as high
+    income (incp>=8). Left alone, every income band collapses (perfect
+    correlation). We replace those non-response codes with a band drawn from a
+    profile-conditioned distribution:
+
+        expected band = base(WORKSTAT) + industry uplift + student penalty
+        incp ~ round( Normal(expected, sd) ), clipped to [1, 15]
+
+    Real responses (bands 1..15) are kept untouched. A per-person seed makes the
+    draw reproducible. An 'incp_imputed' 0/1 flag marks which rows were filled.
+    Disable via GA_IMPUTE_INCOME=0.
+    """
+    incp = pd.to_numeric(df.get('incp', pd.Series(17, index=df.index)),
+                         errors='coerce')
+    nonresp = incp.isin(_INCOME_NONRESPONSE) | incp.isna()
+    n_nonresp = int(nonresp.sum())
+    if n_nonresp == 0:
+        df['incp_imputed'] = 0
+        return df
+
+    ws  = pd.to_numeric(df.get('WORKSTAT', 0), errors='coerce').fillna(0).values
+    ind = pd.to_numeric(df.get('indp', 20),   errors='coerce').fillna(20).values
+
+    # base expected band by work status: FT high, PT mid, not-working low
+    mu = np.where(ws == 1, 9.0, np.where(ws == 2, 6.5, 4.0)).astype(float)
+    # industry uplift: professional/finance/public/education → higher;
+    # agriculture/manufacturing/utilities/construction → slightly lower
+    mu += np.where(np.isin(ind, [10, 11, 12, 13, 14, 15, 16]), 2.0,
+           np.where(np.isin(ind, [1, 2, 3, 4, 5, 6]), -0.5, 0.0))
+    if 'STUDYING' in df.columns:
+        st = pd.to_numeric(df['STUDYING'], errors='coerce').fillna(0).values
+        mu += np.where(st > 0, -2.0, 0.0)   # students earn less
+
+    # reproducible per-person draw (seed from a stable person id if available)
+    _idcol = next((c for c in ('PERSID', 'person_id', 'PERSONID') if c in df.columns), None)
+    if _idcol is not None:
+        base = pd.util.hash_pandas_object(df[_idcol].astype(str), index=False).values
+        rng_seed = (base % (2 ** 31)).astype(np.int64)
+        noise = np.array([np.random.default_rng(int(s) + seed).normal(0.0, 2.5)
+                          for s in rng_seed])
+    else:
+        noise = np.random.default_rng(seed).normal(0.0, 2.5, size=len(df))
+
+    draw = np.clip(np.round(mu + noise), 1, 15).astype(int)
+    out = incp.values.astype(float).copy()
+    out[nonresp.values] = draw[nonresp.values]
+    df = df.copy()
+    df['incp'] = out.astype(int)
+    df['incp_imputed'] = nonresp.astype(int).values
+    try:
+        logging.info(f"_impute_income: imputed {n_nonresp}/{len(df)} "
+                     f"({100.0 * n_nonresp / max(len(df), 1):.1f}%) non-response "
+                     f"income records from profile")
+    except Exception:
+        pass
+    return df
     
     
 study_map = {
@@ -162,8 +237,8 @@ sex_map = {'male':1,
            'female':2}
 
 
-work_map = {'workPartTime':1,
-            'workFullTime':2,
+work_map = {'workFullTime':1,
+            'workPartTime':2,
             'otherReason':3,
             'carer':4,
             'retired':5,
@@ -225,7 +300,107 @@ rl_map = {'child':3,
 }
 
 ###############################################################################
-# HELPER FUNCTIONS - 
+# BINARY DUMMY ENCODING
+# Called after any person DataFrame is assembled (HHTS or synth pop).
+# Adds proper binary indicator columns for marital status, household type,
+# and industry sector so the GA can select them without ordinal bias.
+###############################################################################
+
+# ABS MSTP (marital status) codes used in the synthetic population
+_MSTP_MARRIED   = {1}           # married (registered)
+_MSTP_DEFACTO   = {2}           # de facto / common-law
+_MSTP_SEPARATED = {3}           # separated
+_MSTP_DIVORCED  = {4}           # divorced
+_MSTP_WIDOWED   = {5}           # widowed
+_MSTP_SINGLE    = {6}           # never married
+
+# Industry (indp) groupings derived from industy_map
+_IND_PROFESSIONAL  = {13}           # professional/scientific/technical
+_IND_FINANCIAL     = {11, 12}       # financial services + real estate
+_IND_IT            = {10}           # information & communication
+_IND_HEALTH        = {17}           # health & social assistance
+_IND_EDUCATION     = {16}           # education & training
+_IND_PUBLIC_ADMIN  = {14, 15}       # public administration + administrative services
+_IND_CONSTRUCTION  = {5}            # construction
+_IND_MANUFACTURING = {3}            # manufacturing
+_IND_BLUE_COLLAR   = {1, 2, 3, 4, 5}  # agriculture/mining/manufacturing/utilities/construction
+_IND_RETAIL        = {6, 7}         # retail + wholesale trade
+_IND_HOSPITALITY   = {8}            # accommodation & food
+_IND_TRANSPORT     = {9}            # transport, postal, warehousing
+_IND_ARTS_OTHER    = {18, 19}       # arts, recreation, other services
+_IND_NOT_WORKING   = {20}           # not applicable / unknown
+
+
+def add_person_binary_dummies(df: 'pd.DataFrame') -> 'pd.DataFrame':
+    """
+    Add binary dummy columns for marital status, household size type,
+    and industry sector to a person DataFrame.
+
+    Safe to call on both HHTS and synthetic-population DataFrames; each
+    block only runs when the required source column is present.
+
+    Columns added
+    -------------
+    Marital status (from 'mstp', ABS MSTP coding 1-6):
+        is_married, is_defacto, is_separated, is_divorced,
+        is_widowed, is_never_married, is_partnered
+
+    Household size type (from 'nprd'):
+        hh_1person, hh_couple, hh_small_group, hh_large_group
+
+    Industry sector (from 'indp', derived from INDUSTRY text):
+        ind_professional, ind_financial, ind_it,
+        ind_health, ind_education, ind_public_admin,
+        ind_construction, ind_manufacturing, ind_blue_collar,
+        ind_retail, ind_hospitality, ind_transport,
+        ind_arts_other, ind_not_working
+    """
+    import pandas as _pd
+    import numpy as _np
+
+    # -- Marital status -------------------------------------------------------
+    if 'mstp' in df.columns:
+        m = _pd.to_numeric(df['mstp'], errors='coerce').fillna(0).astype(int)
+        df['is_married']      = m.isin(_MSTP_MARRIED).astype(int)
+        df['is_defacto']      = m.isin(_MSTP_DEFACTO).astype(int)
+        df['is_separated']    = m.isin(_MSTP_SEPARATED).astype(int)
+        df['is_divorced']     = m.isin(_MSTP_DIVORCED).astype(int)
+        df['is_widowed']      = m.isin(_MSTP_WIDOWED).astype(int)
+        df['is_never_married']= m.isin(_MSTP_SINGLE).astype(int)
+        # Convenience: currently partnered (married or de facto)
+        df['is_partnered']    = m.isin(_MSTP_MARRIED | _MSTP_DEFACTO).astype(int)
+
+    # -- Household size type (from nprd = household size count) ---------------
+    if 'nprd' in df.columns:
+        n = _pd.to_numeric(df['nprd'], errors='coerce').fillna(0).astype(int)
+        df['hh_1person']    = (n == 1).astype(int)    # single-person
+        df['hh_couple']     = (n == 2).astype(int)    # couple or lone-parent+1
+        df['hh_small_group']= n.isin([3, 4]).astype(int)  # small family/group
+        df['hh_large_group']= (n >= 5).astype(int)    # large family/houseshare
+
+    # -- Industry sector (from indp numeric code) -----------------------------
+    if 'indp' in df.columns:
+        i = _pd.to_numeric(df['indp'], errors='coerce').fillna(20).astype(int)
+        df['ind_professional'] = i.isin(_IND_PROFESSIONAL).astype(int)
+        df['ind_financial']    = i.isin(_IND_FINANCIAL).astype(int)
+        df['ind_it']           = i.isin(_IND_IT).astype(int)
+        df['ind_health']       = i.isin(_IND_HEALTH).astype(int)
+        df['ind_education']    = i.isin(_IND_EDUCATION).astype(int)
+        df['ind_public_admin'] = i.isin(_IND_PUBLIC_ADMIN).astype(int)
+        df['ind_construction'] = i.isin(_IND_CONSTRUCTION).astype(int)
+        df['ind_manufacturing']= i.isin(_IND_MANUFACTURING).astype(int)
+        df['ind_blue_collar']  = i.isin(_IND_BLUE_COLLAR).astype(int)
+        df['ind_retail']       = i.isin(_IND_RETAIL).astype(int)
+        df['ind_hospitality']  = i.isin(_IND_HOSPITALITY).astype(int)
+        df['ind_transport']    = i.isin(_IND_TRANSPORT).astype(int)
+        df['ind_arts_other']   = i.isin(_IND_ARTS_OTHER).astype(int)
+        df['ind_not_working']  = i.isin(_IND_NOT_WORKING).astype(int)
+
+    return df
+
+
+###############################################################################
+# HELPER FUNCTIONS -
 ###############################################################################
 def count_stops(df):
     rows = []
@@ -829,7 +1004,13 @@ class Synth_Connect:
     
     
     
-    def __init__(self):
+    def __init__(self, new_pop=False):
+        # new_pop=True switches to the 507-SA2-zone scope (Z:/test_runs_tours/new_pop):
+        # OTAZ/DTAZ/ORDER are the SA2 code itself (no ORDER indirection), landuse comes
+        # from zone_landuse_507.csv, and OSM size-term columns come from
+        # SA2_2016_OSM_counts_507.csv. See export_zone_sa2_files() in
+        # synth_pop/run_pipeline.py for how the population side is keyed the same way.
+        self.new_pop = new_pop
         self.data = None
         self.trips = None
         self.land = None
@@ -968,12 +1149,120 @@ class Synth_Connect:
         trips['ORIGSA2_2021'] = trips['ORIGSA1_2021'].map(sa1_to_sa2)
         persons['HOME_SA2_2021'] = persons['HOME_SA1_2021'].map(sa1_to_sa2)
 
-        # FIX 1: TAZ zone lookup (was missing entirely from process_survey)
-        sa2_to_order = pd.read_csv('seq_zone_ids_.csv')[['SA2_MAIN16', 'ORDER']]
-        o = sa2_to_order.set_index('SA2_MAIN16')['ORDER']
-        trips['OTAZ'] = trips['ORIGSA2_2021'].map(o).fillna(330).astype(int)
-        trips['DTAZ'] = trips['DESTSA2_2021'].map(o).fillna(330).astype(int)
-        persons['OTAZ'] = persons['HOME_SA2_2021'].map(o).fillna(330).astype(int)
+        # Preserve SA1 code as HOME_SA1 (ABS sub-zone, fallback for Level4).
+        if 'HOME_SA1_2021' in persons.columns:
+            import numpy as _np
+            persons['HOME_SA1'] = (
+                pd.to_numeric(persons['HOME_SA1_2021'], errors='coerce')
+                .fillna(0).astype(_np.int64)
+            )
+
+        # Assign HOME_LVL4 (SEQ-STM Level4 micro-zone) to HHTS respondents so
+        # the walk/bike mode choice is TRAINED at the same fine-grain resolution
+        # it is PREDICTED — avoiding a training/prediction LOS mismatch.
+        # Strategy: sample uniformly from Level4 zones within each respondent's
+        # home SA2 (the same approach as assign_lvl4_to_population.py), which
+        # is consistent and produces the same within-SA2 distribution in training
+        # and prediction even without knowing the respondent's exact Level4 zone.
+        import os as _os
+        _lvl4_xwalk_path = _os.path.join(
+            (_os.environ.get('NEW_POP_DIR') or _DEFAULT_NEW_POP_DIR),
+            '..', 'demand_', 'lvl4_to_emme_crosswalk.csv'
+        )
+        _lvl4_xwalk_path = _os.path.normpath(_lvl4_xwalk_path)
+        if _os.path.exists(_lvl4_xwalk_path):
+            import numpy as _np
+            _lxw = pd.read_csv(_lvl4_xwalk_path)
+            _lxw['sa2_code'] = pd.to_numeric(_lxw['sa2_code'], errors='coerce')
+            _lxw = _lxw.dropna(subset=['sa2_code'])
+            _lxw['sa2_code'] = _lxw['sa2_code'].astype(int)
+            _sa2_to_lvl4s = _lxw.groupby('sa2_code')['LvL4_ID'].apply(list).to_dict()
+
+            def _sample_lvl4(sa2):
+                opts = _sa2_to_lvl4s.get(int(sa2) if not pd.isna(sa2) else -1)
+                if opts:
+                    return int(_np.random.choice(opts))
+                return 0
+
+            persons['HOME_LVL4'] = persons['HOME_SA2_2021'].apply(
+                lambda s: _sample_lvl4(pd.to_numeric(s, errors='coerce') if s else -1)
+            ).astype(_np.int64)
+
+        if self.new_pop:
+            # 507-SA2-zone scope: OTAZ/DTAZ are the SA2 code directly, no ORDER
+            # lookup. Deliberately reuse 330 as the external/catch-all sentinel
+            # (not e.g. 999999999): SA2 codes are always 9-digit (>100,000,000),
+            # so 330 can never collide with a real new_pop zone either, and
+            # every existing "!= 330" catch-all check already scattered through
+            # stage5_destination_choice.py / stage6_plan_finalisation.py keeps
+            # working unchanged in new_pop mode.
+            import os as _os
+            EXTERNAL_TAZ = 330
+            # Valid-zone universe: the UNION of the operative crosswalk list
+            # (sa2_crosswalk_507.csv, 324 zones) and the full-SEQ reference
+            # (sa2_zones_reference_357.csv, 371 zones after the 2026-07
+            # extension). Validating against the crosswalk alone wrongly
+            # externalised every trip touching the 47 newly-added zones
+            # (Jimboomba, Toowoomba SA4 317, NSW Richmond Valley, ...).
+            _demand_dir = _os.path.normpath(_os.path.join(
+                (_os.environ.get('NEW_POP_DIR') or _DEFAULT_NEW_POP_DIR),
+                '..', 'demand_'))
+            _valid_zones = set()
+            for _zl_name, _zl_col in [('sa2_crosswalk_507.csv', 'sa2_code'),
+                                       ('sa2_zones_reference_357.csv', 'sa2_code')]:
+                _zl_path = _os.path.join(_demand_dir, _zl_name)
+                if _os.path.exists(_zl_path):
+                    _valid_zones |= set(
+                        pd.to_numeric(pd.read_csv(_zl_path)[_zl_col],
+                                      errors='coerce').dropna().astype(int))
+            if not _valid_zones:
+                _valid_zones = None
+
+            def _to_otaz(sa2_series):
+                sa2 = pd.to_numeric(sa2_series, errors='coerce')
+                if _valid_zones is not None:
+                    sa2 = sa2.where(sa2.isin(_valid_zones))
+                return sa2.fillna(EXTERNAL_TAZ).astype(int)
+
+            trips['OTAZ'] = _to_otaz(trips['ORIGSA2_2021'])
+            trips['DTAZ'] = _to_otaz(trips['DESTSA2_2021'])
+            persons['OTAZ'] = _to_otaz(persons['HOME_SA2_2021'])
+
+            _n_external = int((trips['OTAZ'] == EXTERNAL_TAZ).sum() + (trips['DTAZ'] == EXTERNAL_TAZ).sum())
+            if _n_external:
+                # name the genuinely-external codes so a coverage regression
+                # (like the 324-vs-371 one) is visible at a glance instead of
+                # hiding behind an aggregate count
+                _ext_codes = pd.concat([
+                    pd.to_numeric(trips['ORIGSA2_2021'], errors='coerce'),
+                    pd.to_numeric(trips['DESTSA2_2021'], errors='coerce'),
+                ]).dropna().astype(int)
+                _ext_codes = sorted(set(_ext_codes[~_ext_codes.isin(_valid_zones)])) \
+                    if _valid_zones else []
+                logging.warning(
+                    f"process_survey (new_pop): {_n_external} trip endpoints outside "
+                    f"the {len(_valid_zones or [])}-zone SEQ universe -> external "
+                    f"sentinel {EXTERNAL_TAZ} (excluded from zone choice). "
+                    f"{len(_ext_codes)} distinct external SA2s, first 10: {_ext_codes[:10]}"
+                )
+        else:
+            # FIX 1: TAZ zone lookup (was missing entirely from process_survey)
+            sa2_to_order = pd.read_csv('seq_zone_ids_.csv')[['SA2_MAIN16', 'ORDER']]
+            o = sa2_to_order.set_index('SA2_MAIN16')['ORDER']
+            trips['OTAZ'] = trips['ORIGSA2_2021'].map(o).fillna(330).astype(int)
+            trips['DTAZ'] = trips['DESTSA2_2021'].map(o).fillna(330).astype(int)
+            persons['OTAZ'] = persons['HOME_SA2_2021'].map(o).fillna(330).astype(int)
+
+            _unmapped_o = trips['ORIGSA2_2021'].dropna().astype(int)
+            _unmapped_origs = set(_unmapped_o[_unmapped_o.map(o).isna()])
+            _unmapped_d = trips['DESTSA2_2021'].dropna().astype(int)
+            _unmapped_dests = set(_unmapped_d[_unmapped_d.map(o).isna()])
+            _unmapped = _unmapped_origs | _unmapped_dests
+            if _unmapped:
+                logging.warning(
+                    f"process_survey: {len(_unmapped)} SA2 codes not in zone mapping "
+                    f"(defaulted to TAZ 330): {sorted(_unmapped)[:10]}"
+                )
 
         # -------------------------------
         # MODE & PURPOSE CLEANING
@@ -1058,7 +1347,13 @@ class Synth_Connect:
         )
 
         # FIX 3: merge person demographics onto tours
-        person_cols = ['person_id', 'sexp', 'vehrd', 'nprd', 'OTAZ', 'HOME_SA2_2021', 'HHID']
+        # CARLICENCE carried through (process_hhts_person builds it, but it was
+        # being dropped here) so the Stage 5 mode model can gate DA availability
+        # (licence AND vehicle) instead of falling back to always-available —
+        # that was the "availability vars missing [CARLICENCE, vehrd, ...]"
+        # warning. Guarded below, so it's skipped if absent from persons.
+        person_cols = ['person_id', 'sexp', 'vehrd', 'nprd', 'OTAZ', 'HOME_SA2_2021',
+                       'HHID', 'CARLICENCE']
         person_cols = [c for c in person_cols if c in persons.columns]
         as_tours = as_tours.merge(persons[person_cols], on='person_id', how='left')
 
@@ -2108,10 +2403,32 @@ class Synth_Connect:
         if self.land is not None:
             return self.land
         else:
-            self.land = pd.read_csv('zone_order_and_landuse.csv')
-            # Convert everything possible to numeric
+            import os as _os
+            if self.new_pop:
+                _new_pop_dir = (_os.environ.get('NEW_POP_DIR') or _DEFAULT_NEW_POP_DIR)
+                # ZONE MIGRATION (371): prefer the 09b build (zone_landuse_357.csv),
+                # which census-fills the ~49 non-EMME fringe zones (Toowoomba/Tweed)
+                # so they carry real work/education attraction. Fall back to the
+                # older zone_landuse_507.csv (same 371 zones, but sparse on the
+                # fringe) only if the 357 build is absent. Override via LANDUSE_CSV.
+                _landuse_path = _os.environ.get('LANDUSE_CSV') or _os.path.join(
+                    _new_pop_dir, 'saved_data', 'zone_landuse_357.csv')
+                if not _os.path.exists(_landuse_path):
+                    _landuse_path = _os.path.join(_new_pop_dir, 'saved_data',
+                                                  'zone_landuse_507.csv')
+                _osm_path = _os.path.join(_new_pop_dir, 'saved_data', 'SA2_2016_OSM_counts_507.csv')
+                self.land = pd.read_csv(_landuse_path)
+                # ORDER == SA2 code in the 507-zone scope (no ORDER indirection) so
+                # every downstream .merge(..., on='ORDER') keeps working unchanged.
+                self.land['ORDER'] = self.land['SA2_MAIN16']
+            else:
+                self.land = pd.read_csv('zone_order_and_landuse.csv')
+            # Convert everything possible to numeric (keep column as-is if it can't)
             for col in self.land.columns:
-                self.land[col] = pd.to_numeric(self.land[col], errors="ignore")
+                try:
+                    self.land[col] = pd.to_numeric(self.land[col])
+                except (ValueError, TypeError):
+                    pass
 
             # Replace inf with NaN
             self.land = self.land.replace([np.inf, -np.inf], np.nan)
@@ -2124,9 +2441,11 @@ class Synth_Connect:
             self.land[numeric_cols] = self.land[numeric_cols].fillna(0)
 
             # ── Enrich with OSM POI counts needed by size terms ───────────────
-            # zone_order_and_landuse.csv lacks these OSM POI count columns.
-            # They live in pddopulation_by_order_with_osm_and_landuse.csv and are
-            # merged in once here so all downstream stages see them.
+            # zone_order_and_landuse.csv (or zone_landuse_507.csv in new_pop mode)
+            # lacks these OSM POI count columns. They live in
+            # pddopulation_by_order_with_osm_and_landuse.csv (legacy, ORDER-keyed)
+            # or SA2_2016_OSM_counts_507.csv (new_pop, SA2-keyed) and are merged
+            # in once here so all downstream stages see them.
             #   university    edu:     zone 40 CBD has 5 (QUT, TAFE etc) — edu rank 259/330 without it
             #   college       edu:     community colleges / TAFE campuses (38 nz)
             #   kindergarten  escort:  early childhood centres (222 nz; lu 'childcare' = 1 nz)
@@ -2146,15 +2465,16 @@ class Synth_Connect:
             ]
             _missing_osm = [c for c in _OSM_SIZE_COLS if c not in self.land.columns]
             if _missing_osm:
-                _pop_file = 'pddopulation_by_order_with_osm_and_landuse.csv'
+                _pop_file = _osm_path if self.new_pop else 'pddopulation_by_order_with_osm_and_landuse.csv'
+                _key_col = 'SA2_MAIN16' if self.new_pop else 'ORDER'
                 try:
-                    import os as _os
                     if _os.path.exists(_pop_file):
-                        _pop = pd.read_csv(_pop_file, usecols=['ORDER'] + _missing_osm)
-                        for c in _missing_osm:
+                        _avail = [c for c in _missing_osm if c in pd.read_csv(_pop_file, nrows=0).columns]
+                        _pop = pd.read_csv(_pop_file, usecols=[_key_col] + _avail)
+                        for c in _avail:
                             _pop[c] = pd.to_numeric(_pop[c], errors='coerce').fillna(0)
-                        self.land = self.land.merge(_pop[['ORDER'] + _missing_osm], on='ORDER', how='left')
-                        for c in _missing_osm:
+                        self.land = self.land.merge(_pop[[_key_col] + _avail], on=_key_col, how='left')
+                        for c in _avail:
                             self.land[c] = self.land[c].fillna(0)
                 except Exception as _e:
                     import logging as _log
@@ -2162,11 +2482,12 @@ class Synth_Connect:
                     for c in _missing_osm:
                         if c not in self.land.columns:
                             self.land[c] = 0.0
+            # ── Validate OSM merge completeness ───────────────────────────────
+            for c in _OSM_SIZE_COLS:
+                if c not in self.land.columns:
+                    self.land[c] = 0.0
             # ──────────────────────────────────────────────────────────────────
 
-            print('todo make sure this is converted right')
-            #self.land = pd.read_csv('Z:/lanuse/landuse_final.csv')
-            #self.land = pd.read_csv('seq_zone_ids.csv')
             return self.land
         
     def get_tours(self):
@@ -2191,30 +2512,32 @@ class Synth_Connect:
                 
                 
             MODES = {
-            'Car driver': 'DA',
-            'Walking': 'Walk',
-            'Car passenger': 'SR',
-            'Public Bus': 'Transit',
-            'Motorcycle driver': 'DA',
-            'Truck passenger': 'SR',
-            'Charter/Courtesy/Other bus':'Transit',
-            'Light rail':'Transit',
-            'Public bus':'Transit',
-            'School bus (with route number)': 'Transit',
-            'E-bike or E-scooter': 'Bike',
-            'Truck driver':'DA',
-            'Uber / Other Ride Share':'SR',
-            'Train': 'Transit',
-            'Other method':'DA',
-            'Motorcycle passenger':'SR',
-            'Taxi':'SR',
-            'Bicycle':'Bike',
-            'Mobility scooter':'Walk',
-            'Ferry':'Transit',
-            'School bus (private/chartered)': 'Transit'
+                'Car driver': 'DA',
+                'Walking': 'Walk',
+                'Car passenger': 'SR',
+                'Public Bus': 'Transit',
+                'Motorcycle driver': 'DA',
+                'Truck passenger': 'SR',
+                'Charter/Courtesy/Other bus':'Transit',
+                'Light rail':'Transit',
+                'Public bus':'Transit',
+                'School bus (with route number)': 'Transit',
+                'E-bike or E-scooter': 'Bike',
+                'Truck driver':'DA',
+                'Uber / Other Ride Share':'SR',
+                'Train': 'Transit',
+                'Other method':'DA',
+                'Motorcycle passenger':'SR',
+                'Taxi':'SR',
+                'Bicycle':'Bike',
+                'Mobility scooter':'Walk',
+                'Ferry':'Transit',
+                'School bus (private/chartered)': 'Transit',
+                'Car driver ': 'DA',
+                'Walking ': 'Walk',
+                'Bicycle ': 'Bike',
+                'Public Bus ': 'Transit',
             }
-            
-            
             self.trips['MODE1'] = self.trips['MODE1'].map(MODES)
             self.trips['OTAZ'] = self.trips['OTAZ'].astype(int)
             self.trips['DTAZ'] = self.trips['DTAZ'].astype(int)
@@ -2607,6 +2930,13 @@ class Synth_Connect:
         df['WORKSTAT'] = df['WORKSTATUS'].map(work_map).fillna(0)
         df['indp'] = df['INDUSTRY'].map(industy_map).fillna(20)
         df['sexp'] = df['SEX'].map(sex_map)
+        # ── Impute non-response income (codes 16/17 = "prefer not to say" /
+        # "select one" / "not applicable") from the person's profile so the
+        # income coefficient is estimable. ~88% of HHTS income is non-response,
+        # which otherwise collapses every income band. Disable with
+        # GA_IMPUTE_INCOME=0.
+        if os.environ.get('GA_IMPUTE_INCOME', '1').strip() != '0':
+            df = _impute_income(df)
         df = df.rename(columns={'BIKES': 'bikes', 'HHSIZE': 'nprd'})
         df['vehrd'] = df['HHVEH'].clip(upper=4)
         # CARLICENCE is boolean True/False in QTS — convert to 0/1
@@ -2620,9 +2950,10 @@ class Synth_Connect:
             warnings.filterwarnings('ignore', category=DeprecationWarning)
             warnings.filterwarnings('ignore', message='.*DataFrameGroupBy.*')
             df = df.groupby('HHID', group_keys=False).apply(update_rlhp)
-        logging.info(f'length of list after processing: {len(df)}') 
+        logging.info(f'length of list after processing: {len(df)}')
         df['rlhp'] = df['RELATIONSHIP'].map(rl_map).fillna(5).astype(int)
         df['STUDYING'] = df['STUDYING'].map(study_map).fillna(0).astype(int)
+        df = add_person_binary_dummies(df)
         return df
     
     def synth_filter_function(self, persons, filter_function):
@@ -2640,7 +2971,8 @@ class Synth_Connect:
         persons['person_id'] = persons['PERSID']
         persons['STUDYING'] = persons.apply(get_studying, axis=1)
         persons['WORKSTAT'] = persons.apply(get_workstat, axis=1)
-        persons['CARLICENCE'] = persons.apply(get_licence, axis = 1)
+        persons['CARLICENCE'] = persons.apply(get_licence, axis=1)
+        persons = add_person_binary_dummies(persons)
         persons['chosen'] = 1 #dummy
         if filter_function is not None: #
             mask = filter_function(persons)
@@ -2892,7 +3224,8 @@ class Synth_Connect:
         persons['person_id'] = persons['PERSID']
         persons['STUDYING'] = persons.apply(get_studying, axis=1)
         persons['WORKSTAT'] = persons.apply(get_workstat, axis=1)
-        persons['CARLICENCE'] = persons.apply(get_licence, axis = 1)
+        persons['CARLICENCE'] = persons.apply(get_licence, axis=1)
+        persons = add_person_binary_dummies(persons)
         persons['HHSIZE'] = persons['nprd']
         persons['chosen'] = 1 #dummy
         
@@ -2951,7 +3284,8 @@ class Synth_Connect:
         persons['person_id'] = persons['PERSID']
         persons['STUDYING'] = persons.apply(get_studying, axis=1)
         persons['WORKSTAT'] = persons.apply(get_workstat, axis=1)
-        persons['CARLICENCE'] = persons.apply(get_licence, axis = 1)
+        persons['CARLICENCE'] = persons.apply(get_licence, axis=1)
+        persons = add_person_binary_dummies(persons)
         persons['HHSIZE'] = persons['nprd']
         persons['chosen'] = 1 #dummy
         persons = persons.rename(columns ={
@@ -2996,7 +3330,8 @@ class Synth_Connect:
         persons['person_id'] = persons['PERSID']
         persons['STUDYING'] = persons.apply(get_studying, axis=1)
         persons['WORKSTAT'] = persons.apply(get_workstat, axis=1)
-        persons['CARLICENCE'] = persons.apply(get_licence, axis = 1)
+        persons['CARLICENCE'] = persons.apply(get_licence, axis=1)
+        persons = add_person_binary_dummies(persons)
         persons['HHSIZE'] = persons['nprd']
         persons['chosen'] = 1 #dummy
         persons['tour_mode'] = 'DA'
@@ -3077,7 +3412,8 @@ class Synth_Connect:
         persons['PERSID'] = persons['abspid']  # Ensure PERSID starts from 1
         persons['STUDYING'] = persons.apply(get_studying, axis=1)
         persons['WORKSTAT'] = persons.apply(get_workstat, axis=1)
-        persons['CARLICENCE'] = persons.apply(get_licence, axis = 1)
+        persons['CARLICENCE'] = persons.apply(get_licence, axis=1)
+        persons = add_person_binary_dummies(persons)
         persons['HHSIZE'] = persons['nprd']
         persons['chosen'] = 1 #dummy
         persons['tour_mode'] = 'DA'

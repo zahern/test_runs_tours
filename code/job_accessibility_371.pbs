@@ -1,0 +1,41 @@
+#!/bin/bash -l
+# Recompute zone-level accessibility over the 371-zone SA2 system
+# (run_accessibility_371.py -> compute_accessibility.run_accessibility).
+# Uses the 371 land use (job_landuse_371.pbs output) + the 507 SA2 skims.
+# No internet needed. Output: saved_data/accessibility_371.csv
+#
+# Submit from the code dir (AFTER land use is built):
+#   qsub job_accessibility_371.pbs
+# Override inputs via -v, e.g.:
+#   qsub -v PIPELINE_SKIMS_PATH=../demand_/sa2_skims_507_omxspec.omx job_accessibility_371.pbs
+
+#PBS -N accessibility_371
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -l walltime=03:00:00
+
+set -euo pipefail
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# Force UTF-8 I/O so box-drawing/arrows/checkmarks in logs never mojibake.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+# Match the pipeline's numeric defaults; jax x64 for consistent skim reads.
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+
+echo "Recomputing 371-zone accessibility..."
+python run_accessibility_371.py
+
+echo "Done. Output: saved_data/accessibility_371.csv"

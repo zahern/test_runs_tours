@@ -1,0 +1,36 @@
+#!/bin/bash -l
+# Rebuild per-SA2 land use over the 371-zone SA2 system
+# (demand_/09b_build_landuse_357.py). No arguments, no internet needed — pure
+# data aggregation from the EMME land use + ABS census tables.
+# Output: ../new_pop/saved_data/zone_landuse_357.csv
+#
+# Submit from the code dir:  qsub job_landuse_371.pbs
+
+#PBS -N landuse_371
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=2:mem=16GB
+#PBS -l walltime=02:00:00
+
+set -euo pipefail
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# Force UTF-8 I/O so box-drawing/arrows/checkmarks in logs never mojibake.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+
+echo "Rebuilding 371-zone land use (09b_build_landuse_357.py)..."
+python ../demand_/09b_build_landuse_357.py
+
+echo "Done. Output: ../new_pop/saved_data/zone_landuse_357.csv"

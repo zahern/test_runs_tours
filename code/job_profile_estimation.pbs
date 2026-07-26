@@ -1,0 +1,65 @@
+#!/bin/bash -l
+# Profile ONE stage of the GA/SA-bandit ESTIMATION batch.
+#
+# IMPORTANT: the estimation runs segments in a spawn-mode ProcessPoolExecutor
+# (GA_PARALLEL_SEGMENTS workers), so cProfile on the parent would miss the real
+# model-fitting work in the child processes. This job forces
+# GA_PARALLEL_SEGMENTS=1 (serial) so cProfile captures the full call tree of one
+# stage's SA search + larch estimation. That gives a clean function-level
+# profile; wall time will differ from the parallel production run.
+#
+# Submit (pick the stage you want to profile):
+#   qsub -v STAGE_ID=5,RUN_TAG=prof5 job_profile_estimation.pbs
+#
+# ── To profile the REAL parallel run instead (no serial slowdown) ────────────
+# Submit the estimation normally, then sample ALL worker processes with py-spy:
+#   py-spy record --subprocesses -o est_stage5.svg --pid <parent_python_pid> --duration 300
+# --subprocesses is essential here — without it you only see the idle parent.
+
+#PBS -N profile_est_371
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=8:mem=128GB
+#PBS -l walltime=36:00:00
+
+set -euo pipefail
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+STAGE_ID=${STAGE_ID:?STAGE_ID required (1..5)}
+RUN_TAG=${RUN_TAG:-prof_${STAGE_ID}}
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# Force UTF-8 I/O so box-drawing/arrows/checkmarks in logs never mojibake.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+# Serial so cProfile sees all the work (see header).
+export GA_PARALLEL_SEGMENTS=1
+# Same SA/bandit estimator settings as the production batch.
+export GA_ESTIMATOR=${GA_ESTIMATOR:-default}
+export GA_USE_SA=${GA_USE_SA:-1}
+export GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-1}
+# 371-zone SA2-native.
+export NEW_POP=${NEW_POP:-1}
+export NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+
+OUT="profile_estimation_stage${STAGE_ID}.pstats"
+echo "Profiling GA/SA estimation stage ${STAGE_ID} (serial) under cProfile -> ${OUT}"
+python -u -X utf8 -m cProfile -o "${OUT}" _run_ga_single_stage.py \
+    --stage-id "${STAGE_ID}" --run-tag "${RUN_TAG}" --run-root "${RUN_ROOT}"
+
+echo "=== hotspot report ==="
+python profile_report.py "${OUT}" 50
+
+echo "Done. Open locally:  snakeviz ${OUT}"

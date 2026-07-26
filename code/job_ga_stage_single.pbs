@@ -1,0 +1,95 @@
+#!/bin/bash -l
+# Run one GA stage (1-5) as an independent PBS job.
+
+#PBS -m n
+#PBS -r y
+#PBS -l walltime=24:00:00
+
+set -euo pipefail
+
+STAGE_ID=${STAGE_ID:?STAGE_ID is required, expected 1..5}
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:-${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+
+GA_BUDGET=${GA_BUDGET:-fast}
+GA_ESTIMATOR=${GA_ESTIMATOR:-sa_bandit}
+GA_USE_SA=${GA_USE_SA:-1}
+GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-1}
+GA_N_RESTARTS=${GA_N_RESTARTS:-0}
+GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-4}
+STAGE23_JOINT=${STAGE23_JOINT:-0}
+GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT:-1.50}
+GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH:-0.05}
+
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# Force UTF-8 I/O so box-drawing/arrows/checkmarks in logs never mojibake.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+# Stable CPU defaults for multi-worker SA jobs.
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+export GA_METACOUNT_FORCE_CPU=${GA_METACOUNT_FORCE_CPU:-1}
+export TF_CPP_MIN_LOG_LEVEL=${TF_CPP_MIN_LOG_LEVEL:-3}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-1}
+# Suppress JAX cuda-plugin version-mismatch warnings (cosmetic; plugin just unused)
+export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
+
+export GA_BUDGET
+export GA_ESTIMATOR
+export GA_USE_SA
+export GA_USE_BANDIT_SA
+export GA_N_RESTARTS
+export GA_PARALLEL_SEGMENTS
+export STAGE23_JOINT
+export GA_SIG_PENALTY_WEIGHT
+export GA_SIG_PVAL_THRESH
+
+echo "=========================================="
+echo "Single-stage GA job"
+echo "PBS job     : ${PBS_JOBID:-unknown}"
+echo "Stage       : ${STAGE_ID}"
+echo "Run root    : ${RUN_ROOT}"
+echo "Run tag     : ${RUN_TAG}"
+echo "Budget      : ${GA_BUDGET}"
+echo "Estimator   : ${GA_ESTIMATOR}"
+echo "Restarts    : ${GA_N_RESTARTS}"
+echo "Started     : $(date)"
+echo "=========================================="
+
+GA_PROFILE=${GA_PROFILE:-0}
+if [ "${GA_PROFILE}" = "1" ]; then
+  # cProfile only sees work in THIS process, and the SA search farms segments
+  # out to spawn-mode workers — so force serial here or the model fits stay
+  # hidden. Slower than a production run; use it for the call-tree shape, not
+  # wall time. Per-stage .pstats land in the code dir; combine them afterwards
+  # with:  python profile_report.py profile_estimation_stage*.pstats
+  export GA_PARALLEL_SEGMENTS=1
+  PSTATS="profile_estimation_stage${STAGE_ID}_${RUN_TAG}.pstats"
+  echo "GA_PROFILE=1 → cProfile (serial, GA_PARALLEL_SEGMENTS=1) → ${PSTATS}"
+  python -u -X utf8 -m cProfile -o "${PSTATS}" _run_ga_single_stage.py \
+    --stage-id "${STAGE_ID}" \
+    --run-root "${RUN_ROOT}" \
+    --run-tag "${RUN_TAG}"
+  EXIT_CODE=$?
+  python profile_report.py "${PSTATS}" 50 || true
+else
+  python -u -X utf8 _run_ga_single_stage.py \
+    --stage-id "${STAGE_ID}" \
+    --run-root "${RUN_ROOT}" \
+    --run-tag "${RUN_TAG}"
+  EXIT_CODE=$?
+fi
+
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+exit "${EXIT_CODE}"

@@ -302,11 +302,19 @@ def assign_usual_locations(
     df['WORK_TAZ']   = 0
     df['SCHOOL_TAZ'] = 0
 
-    # zone universe (exclude catch-all zone 330)
+    # Zone universe for work/school assignment, taken from the landuse — so in
+    # NEW_POP=1 (371 SA2) mode these are the 371 SA2 zones, matching skims and
+    # accessibility. ZONE MIGRATION (371): the old hardcoded `!= 330` (drop the
+    # 330-ORDER catch-all) is gone; any genuine external stations go in
+    # EXCLUDE_ZONES (comma-separated). Harmless no-op on SA2 codes anyway.
     lu = landuse.copy()
     zone_col = 'ORDER' if 'ORDER' in lu.columns else lu.columns[0]
     zone_ids = lu[zone_col].astype(int).values
-    zone_ids = zone_ids[(zone_ids > 0) & (zone_ids != 330)]
+    zone_ids = zone_ids[zone_ids > 0]
+    _excl = os.environ.get('EXCLUDE_ZONES', '').strip()
+    if _excl:
+        _excl_ids = {int(x) for x in _excl.split(',') if x.strip()}
+        zone_ids = zone_ids[~np.isin(zone_ids, list(_excl_ids))]
     zone_ids = np.sort(zone_ids)
     if len(zone_ids) == 0:
         raise ValueError("assign_usual_locations: no valid zone ids found in landuse")

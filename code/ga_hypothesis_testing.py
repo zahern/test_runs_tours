@@ -3013,7 +3013,24 @@ def _stage5_mode_only_fitness(
         mode_mdl = _build_mode_model(dt_m, segment, custom_mode_vars=mode_vars,
                                      avail_vars_hint=list(seg_tours.columns))
         mode_mdl = _estimate(mode_mdl)
+        # Force the CHOSEN alternative available before scoring. With DA now gated
+        # on (CARLICENCE>0)*(vehrd>0), a chosen-DA record in a zero-vehicle
+        # household otherwise gets ~0 probability and drives loglike() to ~-1e35,
+        # which poisons the GA fitness and gets the whole segment rejected as
+        # "invalid" — this is why work/nonmand disappeared while edu (non-DA-heavy)
+        # survived. _run_segment already does this repair at build time; the mode
+        # fitness path did not.
+        try:
+            mode_mdl.doctor(repair_ch_av="+")
+        except Exception:
+            pass
         mode_ll  = float(mode_mdl.loglike())
+        if not np.isfinite(mode_ll) or mode_ll < -1e12:
+            # Degenerate even after the chosen-availability repair (e.g. utility
+            # overflow): treat as a failed candidate with a finite score instead
+            # of letting a -1e35 pollute BIC comparisons across the search.
+            logger.debug(f"Stage5 mode-only [{segment}]: non-finite/blown LL={mode_ll}")
+            return -1e9
         n   = len(seg_tours)
         k   = int(mode_genes.sum())
         _seen = getattr(_stage5_mode_only_fitness, '_valid_logged', set())

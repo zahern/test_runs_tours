@@ -655,12 +655,12 @@ def estimate_day_models(person_day: pd.DataFrame,
             break
         _pv = getattr(m_start, 'p_value_', None)
         _co = np.asarray(m_start.coef_).ravel()
-        if _pv is None or len(_pv) < len(start_cols) + 1:
-            break
-        _fv = _pv[1:len(start_cols) + 1]
+        # p-values optional: prune near-zero coefs even when SEs are missing.
+        _have_pv = _pv is not None and len(_pv) >= len(start_cols) + 1
+        _fv = _pv[1:len(start_cols) + 1] if _have_pv else None
         _ki = [i for i in range(len(start_cols))
                if not ((i < len(_co) and abs(_co[i]) < _s2_zthresh)
-                       or (np.isfinite(_fv[i]) and _fv[i] > _s2_pthresh))]
+                       or (_have_pv and np.isfinite(_fv[i]) and _fv[i] > _s2_pthresh))]
         if len(_ki) == 0 or len(_ki) == len(start_cols):
             break
         X_start = X_start[:, _ki]
@@ -691,13 +691,13 @@ def estimate_day_models(person_day: pd.DataFrame,
             break
         _pv = getattr(m_end, 'p_value_', None)
         _co = np.asarray(m_end.coef_).ravel()
-        if _pv is None or len(_pv) < len(end_cols) + 1:
-            break
-        _fv = _pv[1:len(end_cols) + 1]
+        # p-values optional: prune near-zero coefs even when SEs are missing.
+        _have_pv = _pv is not None and len(_pv) >= len(end_cols) + 1
+        _fv = _pv[1:len(end_cols) + 1] if _have_pv else None
         _ki = [i for i in range(len(end_cols))
                if end_cols[i] == 'start_pred'
                or not ((i < len(_co) and abs(_co[i]) < _s2_zthresh)
-                       or (np.isfinite(_fv[i]) and _fv[i] > _s2_pthresh))]
+                       or (_have_pv and np.isfinite(_fv[i]) and _fv[i] > _s2_pthresh))]
         if len(_ki) == 0 or len(_ki) == len(end_cols):
             break
         X_end = X_end[:, _ki]
@@ -724,12 +724,12 @@ def estimate_day_models(person_day: pd.DataFrame,
             break
         _pv = getattr(m_budget, 'p_value_', None)
         _co = np.asarray(m_budget.coef_).ravel()
-        if _pv is None or len(_pv) < len(budget_cols) + 1:
-            break
-        _fv = _pv[1:len(budget_cols) + 1]
+        # p-values optional: prune near-zero coefs even when SEs are missing.
+        _have_pv = _pv is not None and len(_pv) >= len(budget_cols) + 1
+        _fv = _pv[1:len(budget_cols) + 1] if _have_pv else None
         _ki = [i for i in range(len(budget_cols))
                if not ((i < len(_co) and abs(_co[i]) < _s2_zthresh)
-                       or (np.isfinite(_fv[i]) and _fv[i] > _s2_pthresh))]
+                       or (_have_pv and np.isfinite(_fv[i]) and _fv[i] > _s2_pthresh))]
         if len(_ki) == 0 or len(_ki) == len(budget_cols):
             break
         X_budget = X_budget[:, _ki]

@@ -891,13 +891,18 @@ def estimate_timing_models(
         for _s4_round in range(3):
             _s4_pv = getattr(m, 'p_value_', None)
             _s4_coef = getattr(m, 'coef_', None)
-            if _s4_pv is None or _s4_coef is None:
+            if _s4_coef is None:
                 break
             _s4_F = _s4_coef.shape[1]
             _s4_K1 = _s4_coef.shape[0]
-            if _s4_F <= 1 or len(_s4_pv) < _s4_K1 * _s4_F:
+            if _s4_F <= 1:
                 break
-            _s4_pv_mat = np.asarray(_s4_pv[:_s4_K1 * _s4_F]).reshape(_s4_K1, _s4_F)
+            # p-values optional: when missing/short (Hessian failed) still prune
+            # on coefficient magnitude instead of bailing out — so zero-fit terms
+            # are removed regardless of whether SEs were computed.
+            _s4_have_pv = _s4_pv is not None and len(_s4_pv) >= _s4_K1 * _s4_F
+            _s4_pv_mat = (np.asarray(_s4_pv[:_s4_K1 * _s4_F]).reshape(_s4_K1, _s4_F)
+                          if _s4_have_pv else None)
             _s4_coef_mat = np.asarray(_s4_coef)
             _s4_fnames = m.feature_names_ or []
             _s4_keep = np.ones(_s4_F, dtype=bool)
@@ -905,10 +910,10 @@ def estimate_timing_models(
                 _s4_fn = _s4_fnames[_s4_fi] if _s4_fi < len(_s4_fnames) else ''
                 if _s4_fn.startswith('purp_') or _s4_fn in _S4_STRUCTURAL:
                     continue
-                _s4_fi_pv = _s4_pv_mat[:, _s4_fi]
                 _s4_fi_co = _s4_coef_mat[:, _s4_fi]
-                _all_insig = np.all(~np.isfinite(_s4_fi_pv) | (_s4_fi_pv > _s4_pthresh))
                 _all_small = np.all(np.abs(_s4_fi_co) < _s4_zthresh)
+                _all_insig = bool(_s4_have_pv) and np.all(
+                    ~np.isfinite(_s4_pv_mat[:, _s4_fi]) | (_s4_pv_mat[:, _s4_fi] > _s4_pthresh))
                 if _all_insig or _all_small:
                     _s4_keep[_s4_fi] = False
             _s4_keep_idx = np.where(_s4_keep)[0]

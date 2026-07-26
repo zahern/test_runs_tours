@@ -647,14 +647,17 @@ def estimate_duration_models(
                 break
             _pvals = getattr(m, 'p_value_', None)
             _coefs = np.asarray(m.coef_).ravel()
-            if _pvals is None or len(_pvals) < len(X_cols) + 1:
-                break
+            # Robustness: still prune near-zero coefficients even when p-values
+            # are unavailable (Hessian failed). Previously this `break`'d on a
+            # missing p_value_, leaving zero-fit terms in the model.
+            _have_pv = _pvals is not None and len(_pvals) >= len(X_cols) + 1
             # layout: [0]=intercept, [1:n+1]=features, [-1]=log_sigma
-            _feat_pvals = _pvals[1:len(X_cols) + 1]
+            _feat_pvals = _pvals[1:len(X_cols) + 1] if _have_pv else None
             _keep = np.ones(len(X_cols), dtype=bool)
             for _fi in range(len(X_cols)):
                 _near_zero = _fi < len(_coefs) and abs(_coefs[_fi]) < _s3_zthresh
-                _insig = (np.isfinite(_feat_pvals[_fi]) and _feat_pvals[_fi] > _s3_pthresh)
+                _insig = (_have_pv and np.isfinite(_feat_pvals[_fi])
+                          and _feat_pvals[_fi] > _s3_pthresh)
                 if _near_zero or _insig:
                     _keep[_fi] = False
             _keep_idx = np.where(_keep)[0]

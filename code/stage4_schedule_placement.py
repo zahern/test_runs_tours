@@ -396,14 +396,31 @@ class MNLTimingModel:
         self.include_person_features_ = True
         self.fit_status_ = 'not_fit'
         self.purpose_ = None
+        # Purpose dummies actually kept for this model (the ones that VARY in the
+        # fit data). Decided once at fit-time in _build_X and reused at predict so
+        # the design is consistent. None => not yet computed.
+        self.kept_purposes_ = None
 
     def _build_X(self, df: pd.DataFrame) -> np.ndarray:
         """Build feature matrix for MNL estimation / prediction."""
         arrays = []
         cols   = []
 
-        # purpose dummies
-        for p in PURPOSES:
+        # purpose dummies — keep only purposes that VARY in the fit data. A
+        # per-purpose segment (e.g. a work-tour timing model) has no shopping
+        # activities, so purp_shopping is all-zero -> a holdfast-0 junk term.
+        # Building only the informative dummies removes those "_other purpose"
+        # coefficients the user flagged. The kept set is decided once (first
+        # _build_X call = fit) and reused at predict for a consistent design.
+        if self.kept_purposes_ is None:
+            _kp = []
+            for p in PURPOSES:
+                _c = (df['purpose'] == p).astype(float).values
+                if _c.size and _c.min() != _c.max():   # non-constant => informative
+                    _kp.append(p)
+            self.kept_purposes_ = _kp if _kp else (
+                [self.purpose_] if self.purpose_ in PURPOSES else list(PURPOSES))
+        for p in self.kept_purposes_:
             arrays.append((df['purpose'] == p).astype(float).values)
             cols.append(f'purp_{p}')
 
@@ -911,6 +928,9 @@ def estimate_timing_models(
                              and not n.startswith('ptype_')]
             _s4_mp = MNLTimingModel()
             _s4_mp.purpose_ = m.purpose_
+            # Inherit the kept-purpose set so the pruned refit builds the SAME
+            # purpose-dummy columns as the pre-built pruned matrix (and predict).
+            _s4_mp.kept_purposes_ = m.kept_purposes_
             _s4_mp.ptypes_ = _s4_kept_ptypes
             _s4_mp.include_person_features_ = False
             _s4_mp.feature_override_ = _s4_kept_cont

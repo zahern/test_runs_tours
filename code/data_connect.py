@@ -2406,7 +2406,16 @@ class Synth_Connect:
             import os as _os
             if self.new_pop:
                 _new_pop_dir = (_os.environ.get('NEW_POP_DIR') or _DEFAULT_NEW_POP_DIR)
-                _landuse_path = _os.path.join(_new_pop_dir, 'saved_data', 'zone_landuse_507.csv')
+                # ZONE MIGRATION (371): prefer the 09b build (zone_landuse_357.csv),
+                # which census-fills the ~49 non-EMME fringe zones (Toowoomba/Tweed)
+                # so they carry real work/education attraction. Fall back to the
+                # older zone_landuse_507.csv (same 371 zones, but sparse on the
+                # fringe) only if the 357 build is absent. Override via LANDUSE_CSV.
+                _landuse_path = _os.environ.get('LANDUSE_CSV') or _os.path.join(
+                    _new_pop_dir, 'saved_data', 'zone_landuse_357.csv')
+                if not _os.path.exists(_landuse_path):
+                    _landuse_path = _os.path.join(_new_pop_dir, 'saved_data',
+                                                  'zone_landuse_507.csv')
                 _osm_path = _os.path.join(_new_pop_dir, 'saved_data', 'SA2_2016_OSM_counts_507.csv')
                 self.land = pd.read_csv(_landuse_path)
                 # ORDER == SA2 code in the 507-zone scope (no ORDER indirection) so

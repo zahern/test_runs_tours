@@ -447,8 +447,15 @@ except Exception as exc:
 
 
 def ga_estimator() -> str:
-    """Read GA_ESTIMATOR env var; default to 'default'."""
+    """Read GA_ESTIMATOR env var; default to 'default'.
+
+    'metacount_mv' selects the Stage-1 MULTIVARIATE activity-count model
+    (handled in pipeline_logger.ga_stage1); the per-segment GA feature SEARCH
+    itself uses the default univariate estimators, so it maps to 'default' here.
+    """
     v = os.environ.get('GA_ESTIMATOR', 'default').strip().lower()
+    if v == 'metacount_mv':
+        return 'default'
     if v not in ('default', 'metacount', 'searchlibrium', 'both', 'hybrid', 'sa_bandit'):
         logger.warning(f"Unknown GA_ESTIMATOR='{v}'; using 'default'")
         return 'default'

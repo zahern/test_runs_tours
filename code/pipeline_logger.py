@@ -4736,6 +4736,20 @@ def ga_stage0(out):
 @timer("GA — Stage 1 (activity frequency)")
 def ga_stage1(out, landuse=None):
     from census_bridge import run_ga_stage1
+    # MULTIVARIATE option: GA_ESTIMATOR=metacount_mv also fits MetaCount's joint
+    # multivariate activity-count model (per-purpose counts estimated together
+    # with a copula) and writes stage1_multivariate_* reports to OUT_DIR. It runs
+    # alongside the normal per-purpose search (which still produces the models
+    # prediction needs); it's fully guarded so it can't break the stage.
+    if os.environ.get('GA_ESTIMATOR', '').strip().lower() == 'metacount_mv':
+        try:
+            from stage1_multivariate import fit_stage1_multivariate
+            logger.info("Stage 1: fitting MetaCount multivariate activity-count model "
+                        "(GA_ESTIMATOR=metacount_mv) ...")
+            fit_stage1_multivariate(out["tours"], out["persons"], landuse=landuse,
+                                    out_dir=OUT_DIR)
+        except Exception as _mv_e:
+            logger.error(f"Stage 1 multivariate fit skipped: {_mv_e!r}")
     _bp = _ga_budget_params()
     res = run_ga_stage1(out["tours"], out["persons"], landuse=landuse, **_bp)
     _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage1.png'))

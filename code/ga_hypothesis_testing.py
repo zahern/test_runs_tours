@@ -2548,10 +2548,64 @@ def _ga_max_workers(n_segments: int) -> int:
     env = os.environ.get('GA_PARALLEL_SEGMENTS', '').strip()
     if env:
         try:
-            return max(1, min(int(env), n_segments))
+            want = max(1, min(int(env), n_segments))
         except ValueError:
+            want = max(1, min(n_segments, os.cpu_count() or 1, 4))
+    else:
+        want = max(1, min(n_segments, os.cpu_count() or 1, 4))
+
+    # Memory-aware cap (opt-in): spawn-mode workers each load the full data, so
+    # N workers × per-worker footprint can exceed the job's cgroup limit and the
+    # pool gets OOM-killed (BrokenProcessPool) — this is what silently failed
+    # Stage 1 on the 371 data at 96GB. If GA_MEM_PER_WORKER_GB is set, cap the
+    # worker count to what the detected memory limit can hold.
+    _pw = os.environ.get('GA_MEM_PER_WORKER_GB', '').strip()
+    if _pw:
+        try:
+            per_worker = float(_pw)
+            mem_gb = _detect_mem_limit_gb()
+            if mem_gb and per_worker > 0:
+                cap = max(1, int(mem_gb // per_worker))
+                if cap < want:
+                    logger.warning(
+                        f"_ga_max_workers: capping {want} -> {cap} workers "
+                        f"(mem limit {mem_gb:.0f}GB / {per_worker:.0f}GB per worker) "
+                        "to avoid OOM")
+                    want = cap
+        except Exception:
             pass
-    return max(1, min(n_segments, os.cpu_count() or 1, 4))
+    return want
+
+
+def _detect_mem_limit_gb() -> float:
+    """Best-effort memory limit in GB: PBS resource, cgroup v2/v1, else psutil."""
+    _pbs = os.environ.get('PBS_VMEM') or os.environ.get('PBS_MEM')
+    if _pbs:
+        try:
+            s = _pbs.lower().rstrip('b')
+            mult = {'g': 1, 'm': 1 / 1024, 'k': 1 / 1024 / 1024, 't': 1024}
+            for u, m in mult.items():
+                if s.endswith(u):
+                    return float(s[:-1]) * m
+            return float(s) / (1024 ** 3)
+        except Exception:
+            pass
+    for _p in ('/sys/fs/cgroup/memory.max',
+               '/sys/fs/cgroup/memory/memory.limit_in_bytes'):
+        try:
+            with open(_p) as _fh:
+                v = _fh.read().strip()
+            if v and v != 'max':
+                b = float(v)
+                if b < 1e18:   # ignore the "unlimited" sentinel
+                    return b / (1024 ** 3)
+        except Exception:
+            continue
+    try:
+        import psutil
+        return psutil.virtual_memory().total / (1024 ** 3)
+    except Exception:
+        return 0.0
 
 
 def _ga_segment_worker(payload: dict) -> dict:

@@ -480,12 +480,14 @@ def _enforce_feature_bounds(
     feature_names: Optional[List[str]] = None,
     collinear_groups: Optional[List[List[str]]] = None,
     protected_idx: Optional[set[int]] = None,
+    blocked_features: Optional[set[str]] = None,
 ) -> np.ndarray:
     """Repair active-feature count after any other chromosome repair."""
     genes = genes.copy()
     protected_idx = protected_idx or set()
     feature_names = feature_names or []
     collinear_groups = collinear_groups or []
+    blocked_features = blocked_features or set()
 
     # If min==max, strict enforcement can collapse diversity. Keep a small
     # buffer so the GA can still explore nearby feature sets.
@@ -507,7 +509,9 @@ def _enforce_feature_bounds(
     attempts = 0
     while int(genes.sum()) < min_features and attempts < max_attempts:
         attempts += 1
-        inactive = [idx for idx in np.where(genes == 0)[0] if idx not in protected_idx]
+        inactive = [idx for idx in np.where(genes == 0)[0]
+                    if idx not in protected_idx
+                    and (not feature_names or feature_names[idx] not in blocked_features)]
         if not inactive:
             break
         pick = int(rng.choice(inactive))
@@ -1605,7 +1609,7 @@ class SimulatedAnnealing:
         weights = np.ones(len(mutable), dtype=float)
         if self.feature_names:
             try:
-                from ga_external_estimators import get_feature_weakness
+                from ga_external_estimators import get_feature_weakness, is_feature_blacklisted
                 weakness = get_feature_weakness()
                 if weakness:
                     for wi, feat_idx in enumerate(mutable):
@@ -1618,6 +1622,15 @@ class SimulatedAnnealing:
                             weights[wi] += w * 0.4
                         else:
                             weights[wi] = max(0.05, 1.0 - w * 0.15)
+                # Permanently blacklisted features: prevent flipping ON
+                for wi, feat_idx in enumerate(mutable):
+                    if feat_idx >= len(self.feature_names):
+                        continue
+                    if is_feature_blacklisted(self.feature_names[feat_idx]):
+                        if g[feat_idx] == 0:
+                            weights[wi] = 0.0  # never flip ON a blacklisted feature
+                        else:
+                            weights[wi] += 50.0  # strongly favour flipping OFF
             except ImportError:
                 pass
         weights = weights / weights.sum()
@@ -1924,6 +1937,8 @@ class BanditFeatureSearcher:
         self._fit_count = 0
         # Per-feature weakness scores (populated from ga_external_estimators)
         self._weakness: dict = {}
+        # Features permanently blacklisted after repeated stuck/at-bound occurrences
+        self._blocked: set = set()
 
     # ── sampling helpers ────────────────────────────────────────────────────
 
@@ -1974,13 +1989,19 @@ class BanditFeatureSearcher:
         for i in self._fixed_idx:
             genes[i] = 1
         # Optional features: sample theta_i ~ Beta(α_i, β_i)
+        # Permanently blacklisted features are forced OFF regardless of posterior.
+        _blocked = getattr(self, '_blocked', set())
         for i in self._opt_idx:
+            if self.feature_names and self.feature_names[i] in _blocked:
+                genes[i] = 0
+                continue
             theta    = float(self.rng.beta(
                 max(self._alpha[i], 1e-6), max(self._beta[i], 1e-6)))
             genes[i] = int(self.rng.random() < theta)
         # Enforce min/max bounds (may add/remove optional features)
         genes = _enforce_feature_bounds(
             genes, self.min_features, self.max_features, self.rng,
+            blocked_features=_blocked,
             protected_idx=self._fixed_idx,
         )
         # Repair collinearity
@@ -2050,6 +2071,7 @@ class BanditFeatureSearcher:
             feat_idx[f] for f in dict.fromkeys(substitute_pool)
             if f in feat_idx and feat_idx[f] in self._opt_idx
             and cand_genes[feat_idx[f]] == 0
+            and f not in getattr(self, '_blocked', set())
         ]
         if candidates:
             pick = int(self.rng.choice(candidates))
@@ -2058,6 +2080,8 @@ class BanditFeatureSearcher:
         cand_genes = _enforce_feature_bounds(
             cand_genes, self.min_features, self.max_features,
             self.rng, protected_idx=self._fixed_idx,
+            feature_names=self.feature_names,
+            blocked_features=getattr(self, '_blocked', set()),
         )
         if self.collinear_groups and self.feature_names:
             cand_genes = _repair_collinearity(
@@ -2151,10 +2175,15 @@ class BanditFeatureSearcher:
     def _refresh_weakness(self) -> None:
         """Pull the latest per-feature weakness snapshot from the estimator module."""
         try:
-            from ga_external_estimators import get_feature_weakness
+            from ga_external_estimators import get_feature_weakness, is_feature_blacklisted
             self._weakness = get_feature_weakness()
+            self._blocked = {
+                self.feature_names[i] for i in self._opt_idx
+                if is_feature_blacklisted(self.feature_names[i])
+            } if self.feature_names else set()
         except ImportError:
             self._weakness = {}
+            self._blocked = set()
 
     def _active_feature_names(self, genes: np.ndarray, limit: int = 8) -> str:
         if not self.feature_names:
@@ -2265,11 +2294,16 @@ class BanditFeatureSearcher:
                     flip_idx = self.rng.choice(
                         self._opt_idx, size=n_flips, replace=False
                     )
+                    _blocked = getattr(self, '_blocked', set())
                     for fi in flip_idx:
+                        if self.feature_names[fi] in _blocked:
+                            continue
                         cand_genes[fi] = 1 - cand_genes[fi]
                     cand_genes = _enforce_feature_bounds(
                         cand_genes, self.min_features, self.max_features,
                         self.rng, protected_idx=self._fixed_idx,
+                        feature_names=self.feature_names,
+                        blocked_features=_blocked,
                     )
                     if self.collinear_groups and self.feature_names:
                         cand_genes = _repair_collinearity(
@@ -3078,11 +3112,20 @@ def _stage5_mode_only_fitness(
             mode_mdl.doctor(repair_ch_av="+")
         except Exception:
             pass
-        mode_ll  = float(mode_mdl.loglike())
+        # Score from the estimation's OWN reported LL (result.loglike, cached on
+        # the model as _cached_ll), which is finite and well-fitted (e.g. work
+        # phase-1 LL≈-5230). A fresh mode_mdl.loglike() can blow up to ~-1e35 even
+        # for a well-fitted model, because DA availability is an EXPRESSION
+        # ((CARLICENCE>0)*(vehrd>0)) that doctor(repair_ch_av) doesn't materialise,
+        # so a chosen-DA/zero-vehicle record floors to ~0 probability on rescoring.
+        # That mis-scoring is why work/nonmand mode never produced a valid model
+        # while edu (non-DA) did. Fall back to loglike() only if no cached LL.
+        _cached = getattr(mode_mdl, '_cached_ll', None)
+        if _cached is not None and np.isfinite(_cached) and _cached > -1e12:
+            mode_ll = float(_cached)
+        else:
+            mode_ll = float(mode_mdl.loglike())
         if not np.isfinite(mode_ll) or mode_ll < -1e12:
-            # Degenerate even after the chosen-availability repair (e.g. utility
-            # overflow): treat as a failed candidate with a finite score instead
-            # of letting a -1e35 pollute BIC comparisons across the search.
             logger.debug(f"Stage5 mode-only [{segment}]: non-finite/blown LL={mode_ll}")
             return -1e9
         n   = len(seg_tours)

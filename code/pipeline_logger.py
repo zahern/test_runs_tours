@@ -4338,15 +4338,25 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                         _mode_mdl = _build_mode_model(_dt_m, _seg,
                                                        custom_mode_vars=_s5_mode_feats)
                         _mode_mdl = _estimate(_mode_mdl)
-                        _ls = _logsums(_mode_mdl, _dt_m, skims=_skims_hdl, verbose=False)
-                        _lu_st = _attach_size_term(_lu, _seg)
-                        _lu_st, _seg_acdc = _attach_acdc_terms(_lu_st, _st, _skim_df, _seg)
-                        _dt_d = _dest_tree(_seg_acdc, out['persons'], _lu_st, _skims_hdl, _ls)
-                        _dest_mdl = _build_dest_model(_dt_d, _seg,
-                                                       custom_dest_vars=_s5_dest_feats)
-                        _dest_mdl = _estimate(_dest_mdl)
+                        # Capture the mode model immediately — the dest re-estimate
+                        # below can hit a sharrow/numba flow-compile error on the
+                        # logsum/walk_feasible column (1D indexed 2D) for some
+                        # segments; that must NOT drop the mode coefficients too.
                         _s5_models[f'{_seg}_mode'] = _mode_mdl
-                        _s5_models[f'{_seg}_dest'] = _dest_mdl
+                        try:
+                            _ls = _logsums(_mode_mdl, _dt_m, skims=_skims_hdl, verbose=False)
+                            _lu_st = _attach_size_term(_lu, _seg)
+                            _lu_st, _seg_acdc = _attach_acdc_terms(_lu_st, _st, _skim_df, _seg)
+                            _dt_d = _dest_tree(_seg_acdc, out['persons'], _lu_st, _skims_hdl, _ls)
+                            _dest_mdl = _build_dest_model(_dt_d, _seg,
+                                                           custom_dest_vars=_s5_dest_feats)
+                            _dest_mdl = _estimate(_dest_mdl)
+                            _s5_models[f'{_seg}_dest'] = _dest_mdl
+                        except Exception as _dest_exc:
+                            logger.warning(
+                                f"GA stage 5 coef HTML [{_seg}]: dest re-estimate "
+                                f"skipped (mode report kept); non-fatal — the saved "
+                                f"stage5_models.pkl has the real models: {_dest_exc}")
                     except Exception as _seg_exc:
                         logger.warning(f"GA stage 5 coef HTML [{_seg}]: {_seg_exc}")
             finally:

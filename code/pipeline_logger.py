@@ -4344,7 +4344,24 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                         # segments; that must NOT drop the mode coefficients too.
                         _s5_models[f'{_seg}_mode'] = _mode_mdl
                         try:
-                            _ls = _logsums(_mode_mdl, _dt_m, skims=_skims_hdl, verbose=False)
+                            # Force the FULL zone universe as the logsum /
+                            # destination alternative set. Without an override,
+                            # _logsums derives its zones from only the segment's
+                            # OBSERVED DTAZs (work=324, edu=270, nonmand=323); when
+                            # that subset is smaller than the OD skim's zone set,
+                            # aligning walk_feasible/logsum from the full skim down
+                            # to the subset yields a 1D array and the sharrow flow's
+                            # 2-index access fails ("cannot index array 1d with 2
+                            # indices") — which is why edu/nonmand failed but work
+                            # (324 ≈ full) did not. A consistent full-zone set fixes
+                            # it and is also the correct destination choice set.
+                            try:
+                                from stage5_destination_choice import _default_zone_universe as _dzu
+                                _zov = _dzu()
+                            except Exception:
+                                _zov = None
+                            _ls = _logsums(_mode_mdl, _dt_m, skims=_skims_hdl,
+                                           verbose=False, zone_ids_override=_zov)
 
                             # ── LOGSUM-SHAPE DIAGNOSTICS ─────────────────────────
                             # The dest sharrow/numba flow fails compiling the

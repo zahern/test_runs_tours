@@ -4345,9 +4345,62 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                         _s5_models[f'{_seg}_mode'] = _mode_mdl
                         try:
                             _ls = _logsums(_mode_mdl, _dt_m, skims=_skims_hdl, verbose=False)
+
+                            # ── LOGSUM-SHAPE DIAGNOSTICS ─────────────────────────
+                            # The dest sharrow/numba flow fails compiling the
+                            # logsum/walk_feasible column as 1D-indexed-2D for some
+                            # segments. Log the recomputed logsum's shape + the
+                            # relevant CA columns so the 1D source is pinpointable.
+                            def _shp(_x):
+                                try:
+                                    return (f"type={type(_x).__name__} "
+                                            f"ndim={getattr(_x, 'ndim', '?')} "
+                                            f"shape={getattr(_x, 'shape', '?')} "
+                                            f"dims={getattr(_x, 'dims', '-')}")
+                                except Exception as _pe:
+                                    return f"<probe failed: {_pe!r}>"
+                            try:
+                                _ncase = len(_st) if hasattr(_st, '__len__') else '?'
+                                _uz = (_st['DTAZ'].nunique() if isinstance(_st, pd.DataFrame)
+                                       and 'DTAZ' in _st.columns else '?')
+                                logger.warning(
+                                    f"[LOGSUM DIAG {_seg}] _ls {_shp(_ls)} | "
+                                    f"n_tours(cases)={_ncase} uniq_DTAZ={_uz}")
+                            except Exception:
+                                pass
+
                             _lu_st = _attach_size_term(_lu, _seg)
                             _lu_st, _seg_acdc = _attach_acdc_terms(_lu_st, _st, _skim_df, _seg)
+                            try:
+                                if isinstance(_seg_acdc, pd.DataFrame):
+                                    _cols = [c for c in ('walk_feasible', 'bike_feasible',
+                                                         'logsum', 'DIST', 'DISTWALK')
+                                             if c in _seg_acdc.columns]
+                                    logger.warning(
+                                        f"[LOGSUM DIAG {_seg}] _seg_acdc rows={len(_seg_acdc)} "
+                                        f"cols_present={_cols} "
+                                        + " ".join(f"{c}.ndim={np.asarray(_seg_acdc[c]).ndim}"
+                                                   f"/shape={np.asarray(_seg_acdc[c]).shape}"
+                                                   for c in _cols))
+                            except Exception as _de:
+                                logger.warning(f"[LOGSUM DIAG {_seg}] acdc probe: {_de!r}")
+
                             _dt_d = _dest_tree(_seg_acdc, out['persons'], _lu_st, _skims_hdl, _ls)
+                            # Probe the assembled dest CA dataset's logsum/walk cols.
+                            try:
+                                _dsd = (getattr(_dt_d, 'root_dataset', None)
+                                        or getattr(_dt_d, 'dataset', None))
+                                for _cn in ('logsum', 'walk_feasible', 'bike_feasible'):
+                                    try:
+                                        _cv = _dsd[_cn] if _dsd is not None and _cn in _dsd else None
+                                    except Exception:
+                                        _cv = None
+                                    if _cv is not None:
+                                        logger.warning(f"[LOGSUM DIAG {_seg}] dest-tree "
+                                                       f"'{_cn}': {_shp(_cv)}")
+                            except Exception as _dte:
+                                logger.warning(f"[LOGSUM DIAG {_seg}] dest-tree probe: {_dte!r}")
+
                             _dest_mdl = _build_dest_model(_dt_d, _seg,
                                                            custom_dest_vars=_s5_dest_feats)
                             _dest_mdl = _estimate(_dest_mdl)

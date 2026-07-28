@@ -4299,6 +4299,7 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                 _prep_hhts_tours, _filter_seg, _mode_tree, _build_mode_model,
                 _estimate, _logsums, _attach_size_term, _attach_acdc_terms,
                 _dest_tree, _build_dest_model, _skim_flat,
+                _importance_sample_dest_alts, DEST_EST_SAMPLE_SIZE,
             )
             _skims_path = PIPELINE_SKIMS_PATH
             if not os.path.isabs(_skims_path):
@@ -4402,7 +4403,38 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                             except Exception as _de:
                                 logger.warning(f"[LOGSUM DIAG {_seg}] acdc probe: {_de!r}")
 
-                            _dt_d = _dest_tree(_seg_acdc, out['persons'], _lu_st, _skims_hdl, _ls)
+                            # ── ActivitySim-style importance sampling ────────────
+                            # Sample DEST_EST_SAMPLE_SIZE alternatives per chooser
+                            # (observed DTAZ always kept) with the Manski-Lerman
+                            # log_correction, matching _run_segment. This is the
+                            # correct estimator AND gives each chooser a fixed small
+                            # alt set, so the dest CA columns (walk_feasible/logsum)
+                            # stay consistently 2D and the sharrow flow no longer
+                            # crashes on the variable full-zone set.
+                            _sampled_alts = None
+                            if DEST_EST_SAMPLE_SIZE > 0:
+                                try:
+                                    _zids = ([int(z) for z in _ls.coords['zones'].values]
+                                             if hasattr(_ls, 'coords') and 'zones' in _ls.coords
+                                             else (_zov or None))
+                                    _tsrc = (_seg_acdc if isinstance(_seg_acdc, pd.DataFrame)
+                                             and {'ptour_id', 'DTAZ'} <= set(_seg_acdc.columns)
+                                             else _st)
+                                    _sampled_alts = _importance_sample_dest_alts(
+                                        tours_df=_tsrc[['ptour_id', 'DTAZ']].copy(),
+                                        landuse=_lu_st, zone_ids=_zids,
+                                        sample_size=DEST_EST_SAMPLE_SIZE, seed=42)
+                                    logger.warning(
+                                        f"[LOGSUM DIAG {_seg}] importance-sampled "
+                                        f"{DEST_EST_SAMPLE_SIZE} alts -> "
+                                        f"{len(_sampled_alts)} (case,alt) rows")
+                                except Exception as _ise:
+                                    logger.warning(
+                                        f"GA stage 5 coef HTML [{_seg}]: importance "
+                                        f"sampling failed ({_ise}); using all zones")
+                                    _sampled_alts = None
+                            _dt_d = _dest_tree(_seg_acdc, out['persons'], _lu_st,
+                                               _skims_hdl, _ls, sampled_alts=_sampled_alts)
                             # Probe the assembled dest CA dataset's logsum/walk cols.
                             try:
                                 _dsd = (getattr(_dt_d, 'root_dataset', None)

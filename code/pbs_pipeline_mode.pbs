@@ -20,6 +20,9 @@ PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
 PIPELINE_RUN_TAG=${PIPELINE_RUN_TAG:-${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}
 GA_ESTIMATOR=${GA_ESTIMATOR:-default}
 INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS:-1}
+# Record whether the caller set ESTIMATOR_SOURCE explicitly (so an explicit
+# 'pypi' can override the bandit-SA editable forcing below — "always PyPI").
+_ESRC_SET=${ESTIMATOR_SOURCE:+1}
 ESTIMATOR_SOURCE=${ESTIMATOR_SOURCE:-pypi}
 
 # 507-zone SA2 population scope — forward to pipeline_logger.py via os.environ.
@@ -64,11 +67,20 @@ export PYTHONIOENCODING=utf-8
 #
 _HPC_MC=/mnt/hpccs01/home/ahernz/source/MetaCount
 _HPC_SL=/mnt/hpccs01/home/ahernz/source/SearchLibrium
-# Canonical upstreams — override with METACOUNT_GIT_URL / SEARCHLIBRIUM_GIT_URL.
-# PyPI's metacountregressor is stuck at 0.0.138; the GitHub repos carry the
-# newest (>=1.0.51), so both install paths below always fetch latest from git.
-_MC_GIT=${METACOUNT_GIT_URL:-git+https://github.com/zahern/MetaCount}
-_SL_GIT=${SEARCHLIBRIUM_GIT_URL:-git+https://github.com/zahern/SearchLibrium}
+
+# ── Always keep estimators current from PyPI ───────────────────────────────
+# PyPI has the newest releases (metacountregressor >=1.0.107,
+# SearchLibrium >=0.0.154). The 0.0.138 seen before was a STALE installed copy
+# that never upgraded — the guarded blocks below only ran for metacount/*
+# GA_ESTIMATOR modes. This unconditional step force-upgrades both from PyPI on
+# every job so the version is always latest. Set ESTIMATORS_SKIP_UPGRADE=1 to
+# skip, or ESTIMATOR_SOURCE=editable to use local dev checkouts instead.
+if [ "$ESTIMATOR_SOURCE" != "editable" ] && [ "${ESTIMATORS_SKIP_UPGRADE:-0}" != "1" ]; then
+    echo "[pkg] Upgrading MetaCount + SearchLibrium to latest PyPI release..."
+    pip install --upgrade -q metacountregressor SearchLibrium \
+        && echo "[pkg] MetaCount + SearchLibrium upgraded (PyPI latest)" \
+        || echo "[pkg] WARNING: PyPI estimator upgrade failed (offline?) — using whatever is installed"
+fi
 
 _need_metacount=0
 _need_searchlib=0
@@ -79,10 +91,11 @@ case "$GA_ESTIMATOR" in
     hybrid)        _need_metacount=1; _need_searchlib=1 ;;
     sa_bandit)     _need_metacount=1; _need_searchlib=1 ;;
 esac
-# Bandit SA mode requires upstream editable installs that contain banditsa/adaptive_search.
-# Force ESTIMATOR_SOURCE=editable when GA_USE_BANDIT_SA=1.
+# Bandit SA mode historically needed editable installs for banditsa/adaptive_search.
+# PyPI (>=1.0.107) now ships these, so only auto-force editable when the caller
+# did NOT explicitly pick a source. Pass ESTIMATOR_SOURCE=pypi to stay on PyPI.
 if [ "${GA_USE_BANDIT_SA:-0}" = "1" ]; then
-    ESTIMATOR_SOURCE=editable
+    [ "$_ESRC_SET" != "1" ] && ESTIMATOR_SOURCE=editable
     _need_metacount=1
     _need_searchlib=1
 fi
@@ -98,12 +111,10 @@ if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_metacount" = "1" ]; then
         pip install -e "$_HPC_MC" --upgrade -q \
             && echo "[pkg] MetaCount installed (editable: $_HPC_MC)"
     else
-        # Install the newest from GitHub (PyPI is stuck at 0.0.138); fall back
-        # to PyPI only if the git fetch fails.
-        pip install --upgrade --force-reinstall --no-deps --no-cache-dir -q "$_MC_GIT" \
-            && echo "[pkg] MetaCount installed (GitHub latest: $_MC_GIT)" \
-            || { pip install --upgrade --no-cache-dir -q "metacountregressor" \
-                 && echo "[pkg] MetaCount installed (PyPI fallback 0.0.138)"; }
+        # PyPI latest (already upgraded by the unconditional step above; this
+        # re-asserts it when INSTALL_ESTIMATORS/GA_ESTIMATOR forces a metacount run).
+        pip install --upgrade -q "metacountregressor" \
+            && echo "[pkg] MetaCount installed (PyPI latest)"
     fi
     # Only (re)install jax/jaxlib/jaxopt if the CURRENT env can't already import
     # them. Previously this ran an unconditional `pip install --upgrade jax
@@ -162,10 +173,8 @@ if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_searchlib" = "1" ]; then
         pip install -e "$_HPC_SL" --upgrade -q \
             && echo "[pkg] SearchLibrium installed (editable: $_HPC_SL)"
     else
-        pip install --upgrade --force-reinstall --no-deps --no-cache-dir -q "$_SL_GIT" \
-            && echo "[pkg] SearchLibrium installed (GitHub latest: $_SL_GIT)" \
-            || { pip install --upgrade --no-cache-dir -q "SearchLibrium" \
-                 && echo "[pkg] SearchLibrium installed (PyPI fallback)"; }
+        pip install --upgrade -q "SearchLibrium" \
+            && echo "[pkg] SearchLibrium installed (PyPI latest)"
     fi
 fi
 

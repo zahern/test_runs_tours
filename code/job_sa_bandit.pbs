@@ -93,10 +93,8 @@ if [ -d "$_HPC_MC" ]; then
         echo "[pkg] MetaCount already linked (editable, refreshed via git pull)"
     fi
 else
-    pip install --upgrade --force-reinstall --no-deps --no-cache-dir -q \
-        "${METACOUNT_GIT_URL:-git+https://github.com/zahern/MetaCount}" \
-        && echo "[pkg] MetaCount installed (GitHub latest)" \
-        || { pip install --no-cache-dir -q metacountregressor && echo "[pkg] MetaCount installed (PyPI fallback 0.0.138)"; }
+    # Always take the latest published release from PyPI (>=1.0.107).
+    pip install --upgrade -q metacountregressor && echo "[pkg] MetaCount installed (PyPI latest)"
 fi
 
 echo "[pkg] Checking jax/jaxlib/jaxopt..."
@@ -117,10 +115,7 @@ if [ -d "$_HPC_SL" ]; then
         echo "[pkg] SearchLibrium already linked (editable, refreshed via git pull)"
     fi
 else
-    pip install --upgrade --force-reinstall --no-deps --no-cache-dir -q \
-        "${SEARCHLIBRIUM_GIT_URL:-git+https://github.com/zahern/SearchLibrium}" \
-        && echo "[pkg] SearchLibrium installed (GitHub latest)" \
-        || { pip install --no-cache-dir -q SearchLibrium && echo "[pkg] SearchLibrium installed (PyPI fallback)"; }
+    pip install --upgrade -q SearchLibrium && echo "[pkg] SearchLibrium installed (PyPI latest)"
 fi
 
 echo "[pkg] Package versions:"

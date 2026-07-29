@@ -64,6 +64,11 @@ export PYTHONIOENCODING=utf-8
 #
 _HPC_MC=/mnt/hpccs01/home/ahernz/source/MetaCount
 _HPC_SL=/mnt/hpccs01/home/ahernz/source/SearchLibrium
+# Canonical upstreams — override with METACOUNT_GIT_URL / SEARCHLIBRIUM_GIT_URL.
+# PyPI's metacountregressor is stuck at 0.0.138; the GitHub repos carry the
+# newest (>=1.0.51), so both install paths below always fetch latest from git.
+_MC_GIT=${METACOUNT_GIT_URL:-git+https://github.com/zahern/MetaCount}
+_SL_GIT=${SEARCHLIBRIUM_GIT_URL:-git+https://github.com/zahern/SearchLibrium}
 
 _need_metacount=0
 _need_searchlib=0
@@ -85,11 +90,20 @@ fi
 if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_metacount" = "1" ]; then
     echo "[pkg] Installing MetaCount estimator (${ESTIMATOR_SOURCE})..."
     if [ "$ESTIMATOR_SOURCE" = "editable" ] && [ -d "$_HPC_MC" ]; then
+        # Refresh the local checkout first — a stale clone keeps reporting an
+        # old version (0.0.138) no matter how often `pip install -e` re-runs.
+        git -C "$_HPC_MC" pull --ff-only 2>/dev/null \
+            && echo "[pkg] MetaCount source pulled ($(git -C "$_HPC_MC" rev-parse --short HEAD 2>/dev/null))" \
+            || echo "[pkg] MetaCount git pull skipped (not a clean git checkout)"
         pip install -e "$_HPC_MC" --upgrade -q \
             && echo "[pkg] MetaCount installed (editable: $_HPC_MC)"
     else
-        pip install --upgrade --no-cache-dir -q "metacountregressor" \
-            && echo "[pkg] MetaCount installed (PyPI latest)"
+        # Install the newest from GitHub (PyPI is stuck at 0.0.138); fall back
+        # to PyPI only if the git fetch fails.
+        pip install --upgrade --force-reinstall --no-deps --no-cache-dir -q "$_MC_GIT" \
+            && echo "[pkg] MetaCount installed (GitHub latest: $_MC_GIT)" \
+            || { pip install --upgrade --no-cache-dir -q "metacountregressor" \
+                 && echo "[pkg] MetaCount installed (PyPI fallback 0.0.138)"; }
     fi
     # Only (re)install jax/jaxlib/jaxopt if the CURRENT env can't already import
     # them. Previously this ran an unconditional `pip install --upgrade jax
@@ -142,11 +156,16 @@ fi
 if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_searchlib" = "1" ]; then
     echo "[pkg] Installing SearchLibrium estimator (${ESTIMATOR_SOURCE})..."
     if [ "$ESTIMATOR_SOURCE" = "editable" ] && [ -d "$_HPC_SL" ]; then
+        git -C "$_HPC_SL" pull --ff-only 2>/dev/null \
+            && echo "[pkg] SearchLibrium source pulled ($(git -C "$_HPC_SL" rev-parse --short HEAD 2>/dev/null))" \
+            || echo "[pkg] SearchLibrium git pull skipped (not a clean git checkout)"
         pip install -e "$_HPC_SL" --upgrade -q \
             && echo "[pkg] SearchLibrium installed (editable: $_HPC_SL)"
     else
-        pip install --upgrade --no-cache-dir -q "SearchLibrium" \
-            && echo "[pkg] SearchLibrium installed (PyPI latest)"
+        pip install --upgrade --force-reinstall --no-deps --no-cache-dir -q "$_SL_GIT" \
+            && echo "[pkg] SearchLibrium installed (GitHub latest: $_SL_GIT)" \
+            || { pip install --upgrade --no-cache-dir -q "SearchLibrium" \
+                 && echo "[pkg] SearchLibrium installed (PyPI fallback)"; }
     fi
 fi
 

@@ -82,17 +82,21 @@ _pkg_needs_install() {
 
 echo "[pkg] Checking MetaCount..."
 if [ -d "$_HPC_MC" ]; then
+    # Editable installs are live — a git pull alone refreshes the code, so the
+    # reported version can't get stuck at an old checkout (0.0.138).
+    git -C "$_HPC_MC" pull --ff-only 2>/dev/null \
+        && echo "[pkg] MetaCount source pulled ($(git -C "$_HPC_MC" rev-parse --short HEAD 2>/dev/null))" \
+        || echo "[pkg] MetaCount git pull skipped (not a clean git checkout)"
     if _pkg_needs_install metacountregressor "$_HPC_MC"; then
         pip install -e "$_HPC_MC" -q && echo "[pkg] MetaCount installed (editable: $_HPC_MC)"
     else
-        echo "[pkg] MetaCount already installed (editable) — skipping"
+        echo "[pkg] MetaCount already linked (editable, refreshed via git pull)"
     fi
 else
-    if _pkg_needs_install metacountregressor ""; then
-        pip install --no-cache-dir -q metacountregressor && echo "[pkg] MetaCount installed (PyPI)"
-    else
-        echo "[pkg] MetaCount already installed — skipping"
-    fi
+    pip install --upgrade --force-reinstall --no-deps --no-cache-dir -q \
+        "${METACOUNT_GIT_URL:-git+https://github.com/zahern/MetaCount}" \
+        && echo "[pkg] MetaCount installed (GitHub latest)" \
+        || { pip install --no-cache-dir -q metacountregressor && echo "[pkg] MetaCount installed (PyPI fallback 0.0.138)"; }
 fi
 
 echo "[pkg] Checking jax/jaxlib/jaxopt..."
@@ -104,17 +108,19 @@ fi
 
 echo "[pkg] Checking SearchLibrium..."
 if [ -d "$_HPC_SL" ]; then
+    git -C "$_HPC_SL" pull --ff-only 2>/dev/null \
+        && echo "[pkg] SearchLibrium source pulled ($(git -C "$_HPC_SL" rev-parse --short HEAD 2>/dev/null))" \
+        || echo "[pkg] SearchLibrium git pull skipped (not a clean git checkout)"
     if _pkg_needs_install SearchLibrium "$_HPC_SL"; then
         pip install -e "$_HPC_SL" -q && echo "[pkg] SearchLibrium installed (editable: $_HPC_SL)"
     else
-        echo "[pkg] SearchLibrium already installed (editable) — skipping"
+        echo "[pkg] SearchLibrium already linked (editable, refreshed via git pull)"
     fi
 else
-    if _pkg_needs_install SearchLibrium ""; then
-        pip install --no-cache-dir -q SearchLibrium && echo "[pkg] SearchLibrium installed (PyPI)"
-    else
-        echo "[pkg] SearchLibrium already installed — skipping"
-    fi
+    pip install --upgrade --force-reinstall --no-deps --no-cache-dir -q \
+        "${SEARCHLIBRIUM_GIT_URL:-git+https://github.com/zahern/SearchLibrium}" \
+        && echo "[pkg] SearchLibrium installed (GitHub latest)" \
+        || { pip install --no-cache-dir -q SearchLibrium && echo "[pkg] SearchLibrium installed (PyPI fallback)"; }
 fi
 
 echo "[pkg] Package versions:"

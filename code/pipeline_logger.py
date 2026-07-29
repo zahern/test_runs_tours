@@ -4300,6 +4300,7 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                 _estimate, _logsums, _attach_size_term, _attach_acdc_terms,
                 _dest_tree, _build_dest_model, _skim_flat,
                 _importance_sample_dest_alts, DEST_EST_SAMPLE_SIZE,
+                _estimate_dest_coefficients_alt, _default_zone_universe,
             )
             _skims_path = PIPELINE_SKIMS_PATH
             if not os.path.isabs(_skims_path):
@@ -4345,114 +4346,80 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                         # segments; that must NOT drop the mode coefficients too.
                         _s5_models[f'{_seg}_mode'] = _mode_mdl
                         try:
-                            # Force the FULL zone universe as the logsum /
-                            # destination alternative set. Without an override,
-                            # _logsums derives its zones from only the segment's
-                            # OBSERVED DTAZs (work=324, edu=270, nonmand=323); when
-                            # that subset is smaller than the OD skim's zone set,
-                            # aligning walk_feasible/logsum from the full skim down
-                            # to the subset yields a 1D array and the sharrow flow's
-                            # 2-index access fails ("cannot index array 1d with 2
-                            # indices") — which is why edu/nonmand failed but work
-                            # (324 ≈ full) did not. A consistent full-zone set fixes
-                            # it and is also the correct destination choice set.
-                            try:
-                                from stage5_destination_choice import _default_zone_universe as _dzu
-                                _zov = _dzu()
-                            except Exception:
-                                _zov = None
-                            _ls = _logsums(_mode_mdl, _dt_m, skims=_skims_hdl,
-                                           verbose=False, zone_ids_override=_zov)
-
-                            # ── LOGSUM-SHAPE DIAGNOSTICS ─────────────────────────
-                            # The dest sharrow/numba flow fails compiling the
-                            # logsum/walk_feasible column as 1D-indexed-2D for some
-                            # segments. Log the recomputed logsum's shape + the
-                            # relevant CA columns so the 1D source is pinpointable.
-                            def _shp(_x):
-                                try:
-                                    return (f"type={type(_x).__name__} "
-                                            f"ndim={getattr(_x, 'ndim', '?')} "
-                                            f"shape={getattr(_x, 'shape', '?')} "
-                                            f"dims={getattr(_x, 'dims', '-')}")
-                                except Exception as _pe:
-                                    return f"<probe failed: {_pe!r}>"
-                            try:
-                                _ncase = len(_st) if hasattr(_st, '__len__') else '?'
-                                _uz = (_st['DTAZ'].nunique() if isinstance(_st, pd.DataFrame)
-                                       and 'DTAZ' in _st.columns else '?')
-                                logger.warning(
-                                    f"[LOGSUM DIAG {_seg}] _ls {_shp(_ls)} | "
-                                    f"n_tours(cases)={_ncase} uniq_DTAZ={_uz}")
-                            except Exception:
-                                pass
-
+                            _ls = _logsums(_mode_mdl, _dt_m, skims=_skims_hdl, verbose=False)
                             _lu_st = _attach_size_term(_lu, _seg)
                             _lu_st, _seg_acdc = _attach_acdc_terms(_lu_st, _st, _skim_df, _seg)
-                            try:
-                                if isinstance(_seg_acdc, pd.DataFrame):
-                                    _cols = [c for c in ('walk_feasible', 'bike_feasible',
-                                                         'logsum', 'DIST', 'DISTWALK')
-                                             if c in _seg_acdc.columns]
-                                    logger.warning(
-                                        f"[LOGSUM DIAG {_seg}] _seg_acdc rows={len(_seg_acdc)} "
-                                        f"cols_present={_cols} "
-                                        + " ".join(f"{c}.ndim={np.asarray(_seg_acdc[c]).ndim}"
-                                                   f"/shape={np.asarray(_seg_acdc[c]).shape}"
-                                                   for c in _cols))
-                            except Exception as _de:
-                                logger.warning(f"[LOGSUM DIAG {_seg}] acdc probe: {_de!r}")
 
-                            # ── ActivitySim-style importance sampling ────────────
+                            # ── ActivitySim Manski-Lerman importance sampling ────
                             # Sample DEST_EST_SAMPLE_SIZE alternatives per chooser
-                            # (observed DTAZ always kept) with the Manski-Lerman
-                            # log_correction, matching _run_segment. This is the
-                            # correct estimator AND gives each chooser a fixed small
-                            # alt set, so the dest CA columns (walk_feasible/logsum)
-                            # stay consistently 2D and the sharrow flow no longer
-                            # crashes on the variable full-zone set.
+                            # (observed DTAZ always kept) with the log_correction
+                            # offset. Feeds both the Larch idca tree and — if Larch's
+                            # sharrow flow can't compile — the JAX fallback below.
                             _sampled_alts = None
                             if DEST_EST_SAMPLE_SIZE > 0:
                                 try:
                                     _zids = ([int(z) for z in _ls.coords['zones'].values]
                                              if hasattr(_ls, 'coords') and 'zones' in _ls.coords
-                                             else (_zov or None))
-                                    _tsrc = (_seg_acdc if isinstance(_seg_acdc, pd.DataFrame)
-                                             and {'ptour_id', 'DTAZ'} <= set(_seg_acdc.columns)
-                                             else _st)
+                                             else _default_zone_universe())
                                     _sampled_alts = _importance_sample_dest_alts(
-                                        tours_df=_tsrc[['ptour_id', 'DTAZ']].copy(),
+                                        tours_df=_seg_acdc[['ptour_id', 'DTAZ']].copy(),
                                         landuse=_lu_st, zone_ids=_zids,
                                         sample_size=DEST_EST_SAMPLE_SIZE, seed=42)
-                                    logger.warning(
-                                        f"[LOGSUM DIAG {_seg}] importance-sampled "
-                                        f"{DEST_EST_SAMPLE_SIZE} alts -> "
-                                        f"{len(_sampled_alts)} (case,alt) rows")
                                 except Exception as _ise:
                                     logger.warning(
                                         f"GA stage 5 coef HTML [{_seg}]: importance "
                                         f"sampling failed ({_ise}); using all zones")
                                     _sampled_alts = None
+
+                            # Build the dest idca tree with the SAME argument set as
+                            # _run_segment: skim_df + segment are REQUIRED so the flat
+                            # assembly expands size_term to per-(case,alt) 2D and the
+                            # edu/nonmand size_term override runs. Omitting them (the
+                            # earlier bug) left size_term 1D → sharrow "index 1d with
+                            # 2 indices" crash and an empty dest report.
                             _dt_d = _dest_tree(_seg_acdc, out['persons'], _lu_st,
-                                               _skims_hdl, _ls, sampled_alts=_sampled_alts)
-                            # Probe the assembled dest CA dataset's logsum/walk cols.
-                            try:
-                                _dsd = (getattr(_dt_d, 'root_dataset', None)
-                                        or getattr(_dt_d, 'dataset', None))
-                                for _cn in ('logsum', 'walk_feasible', 'bike_feasible'):
-                                    try:
-                                        _cv = _dsd[_cn] if _dsd is not None and _cn in _dsd else None
-                                    except Exception:
-                                        _cv = None
-                                    if _cv is not None:
-                                        logger.warning(f"[LOGSUM DIAG {_seg}] dest-tree "
-                                                       f"'{_cn}': {_shp(_cv)}")
-                            except Exception as _dte:
-                                logger.warning(f"[LOGSUM DIAG {_seg}] dest-tree probe: {_dte!r}")
+                                               _skims_hdl, _ls, sampled_alts=_sampled_alts,
+                                               skim_df=_skim_df, crash_skims=None,
+                                               segment=_seg)
 
                             _dest_mdl = _build_dest_model(_dt_d, _seg,
-                                                           custom_dest_vars=_s5_dest_feats)
-                            _dest_mdl = _estimate(_dest_mdl)
+                                                          custom_dest_vars=_s5_dest_feats)
+                            _dest_coef = {}
+                            try:
+                                _dest_mdl = _estimate(_dest_mdl)
+                                try:
+                                    _pf = _dest_mdl.pf
+                                    _dest_coef = {n: float(_pf.loc[n, 'value'])
+                                                  for n in _pf.index
+                                                  if not np.isnan(float(_pf.loc[n, 'value']))}
+                                except Exception:
+                                    _dest_coef = {}
+                            except Exception as _le:
+                                logger.warning(
+                                    f"GA stage 5 coef HTML [{_seg}]: Larch dest "
+                                    f"estimation failed ({_le}); trying JAX fallback")
+
+                            # If Larch produced no usable coefficients (sharrow flow
+                            # crash), estimate the compact importance-sampled
+                            # conditional logit with JAX — the exact _run_segment
+                            # fallback. log_correction enters as a FIXED offset there,
+                            # so it can't go collinear with size_term. This guarantees
+                            # the report shows real coefficients, never an empty table.
+                            if not _dest_coef:
+                                try:
+                                    _dest_coef = _estimate_dest_coefficients_alt(
+                                        seg_tours=_seg_acdc, landuse=_lu_st,
+                                        logsums=_ls, sampled_alts=_sampled_alts,
+                                        skim_df=(_skim_df if _skim_df is not None else pd.DataFrame()),
+                                        crash_source=None)
+                                    _dest_mdl._coef_cache = dict(_dest_coef)
+                                    logger.info(
+                                        f"GA stage 5 coef HTML [{_seg}]: JAX fallback "
+                                        f"estimated {len(_dest_coef)} dest coefficients")
+                                except Exception as _alte:
+                                    logger.warning(
+                                        f"GA stage 5 coef HTML [{_seg}]: JAX dest "
+                                        f"fallback also failed ({_alte})")
                             _s5_models[f'{_seg}_dest'] = _dest_mdl
                         except Exception as _dest_exc:
                             logger.warning(

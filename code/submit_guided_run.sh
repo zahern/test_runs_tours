@@ -12,9 +12,9 @@
 # What this chain verifies (grep the .o files for these):
 #   1. Constraint-guided search        → "[constraints:stage" lines from
 #      ga_constraints.searcher_constraint_kwargs (fixed/banned/mutex/require-one)
-#   2. SearchLibrium 0.0.138 editable  → "[pkg] SearchLibrium installed (editable"
-#      (GA_USE_BANDIT_SA=1 forces ESTIMATOR_SOURCE=editable; source tree is at
-#       ~/source/SearchLibrium)
+#   2. Estimators from PyPI latest     → "[pkg] MetaCount + SearchLibrium
+#      upgraded (PyPI latest)" (ESTIMATOR_SOURCE=pypi; metacountregressor
+#      >=1.0.107, SearchLibrium >=0.0.154 — no longer the stale 0.0.138 editable)
 #   3. Random params as a decision     → "greedy random-param search:" lines
 #      (GA_RAND_PARAM_SEARCH=1) and stage-5 MXL policy lines
 #   4. Zero-gradient guard, both ways  → "_estimate ... retry done: LL=..."
@@ -53,6 +53,11 @@ COMMON="CONDA_ENV=zigenv,RUN_ROOT=runs/ga_parallel,THREADS=1,S5_WORKERS=8"
 # the search needs a longer run to explore the bigger space. ~2-3x the fast
 # walltime; 24h walltime still comfortably covers it.
 COMMON+=",GA_ESTIMATOR=sa_bandit,GA_USE_SA=1,GA_USE_BANDIT_SA=1,GA_BUDGET=standard"
+# Always take estimators from PyPI latest (metacountregressor>=1.0.107,
+# SearchLibrium>=0.0.154) — explicit ESTIMATOR_SOURCE=pypi overrides the
+# bandit-SA editable default. If a run ever needs the local dev trees instead,
+# change this to editable.
+COMMON+=",ESTIMATOR_SOURCE=pypi"
 COMMON+=",INSTALL_ESTIMATORS=1,PIPELINE_ACCELERATOR=cpu,GA_N_RESTARTS=0"
 COMMON+=",GA_SIG_PENALTY_WEIGHT=1.50,GA_SIG_PVAL_THRESH=0.05"
 # 8 → 4 workers + per-worker JAX cache budget. Job 23926202 OOM'd at 202 GB /

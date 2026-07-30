@@ -4526,6 +4526,22 @@ def _prune_zero_coef_features(
     return pruned_feats, coef_arr[feat_mask], pruned_X
 
 
+# ── Shared per-person latent as an OPTIONAL candidate in every stage ─────────
+# person_latent (person_latent.py) is one standardised "travel style" index
+# threaded through the whole pipeline, so the same individual is consistently
+# mobile/immobile across stages. It's only a candidate when the column is
+# actually present (attached under PIPELINE_PERSON_LATENT), and _available_
+# feature_list filters it out otherwise — so this is a no-op for runs that don't
+# enable it. Added to every purpose/target OPTIONAL list (GA-selectable, not
+# forced) so each stage can estimate its own loading on the shared latent.
+from person_latent import PERSON_LATENT_COL as _PLATENT
+for _opt_dict in (_S1_OPTIONAL_BY_PURPOSE, _S2_OPTIONAL_BY_TARGET,
+                  _S3_PURPOSE_OPTIONAL, _S4_PURPOSE_OPTIONAL):
+    for _k in list(_opt_dict):
+        if _PLATENT not in _opt_dict[_k]:
+            _opt_dict[_k].append(_PLATENT)
+
+
 def _stage1_feature_spec(data: pd.DataFrame, purpose: str) -> Tuple[List[str], List[str]]:
     core = _available_feature_list(data, _S1_CORE_BY_PURPOSE.get(purpose, []))
     optional = _available_feature_list(data, _S1_OPTIONAL_BY_PURPOSE.get(purpose, []))

@@ -570,6 +570,44 @@ def load_data():
         save_path='saved_data/accessibility.csv',
         plot_dir=os.path.join(OUT_DIR, 'plots'),
     )
+
+    # ── Shared per-person latent on the HHTS estimation frame (gated) ─────────
+    # Every stage job calls load_data(), so attaching here makes person_latent a
+    # candidate for the GA search on the SAME frame the stages estimate on. It's
+    # built by the same person_latent.compute_person_latent as the synth side, so
+    # the loading each stage estimates transfers to prediction. Observed activity
+    # counts are derived from out['tours'] when a person key + purpose exist, so
+    # the count enrichment matches the synth side's predicted counts.
+    if os.environ.get('PIPELINE_PERSON_LATENT', '0') == '1':
+        try:
+            from person_latent import ensure_person_latent, PERSON_LATENT_COL
+            _pers = out.get('persons')
+            if isinstance(_pers, pd.DataFrame) and len(_pers):
+                # Derive observed n_<purpose>_out counts from HHTS tours if absent.
+                _tt = out.get('tours')
+                _pkey = next((c for c in ('person_id', 'PERSID', 'persid', 'abspid')
+                              if isinstance(_pers, pd.DataFrame) and c in _pers.columns
+                              and _tt is not None and c in _tt.columns), None)
+                _purp = next((c for c in ('purpose', 'PURPOSE', 'tour_purpose', 'MAINACT')
+                              if _tt is not None and c in _tt.columns), None)
+                if (_pkey and _purp
+                        and not any(c.startswith('n_') and c.endswith('_out')
+                                    for c in _pers.columns)):
+                    _cnt = (_tt.groupby([_pkey, _purp]).size().unstack(fill_value=0))
+                    _cnt.columns = [f'n_{str(c).lower()}_out' for c in _cnt.columns]
+                    _pers = _pers.merge(_cnt, left_on=_pkey, right_index=True, how='left')
+                    for _c in _cnt.columns:
+                        _pers[_c] = _pers[_c].fillna(0.0)
+                _cdap_c = 'CDAP' if 'CDAP' in _pers.columns else None
+                out['persons'] = ensure_person_latent(_pers, cdap_col=_cdap_c, force=True)
+                if PERSON_LATENT_COL in out['persons'].columns:
+                    logger.info(
+                        f"person_latent attached to HHTS estimation frame "
+                        f"(cdap={'yes' if _cdap_c else 'no'}): "
+                        f"std={out['persons'][PERSON_LATENT_COL].std():.3f}")
+        except Exception as _ple:
+            logger.warning(f"person_latent estimation attach skipped ({_ple})")
+
     return sc, out, landuse
 
 
@@ -974,6 +1012,22 @@ def cdap(out, synth, landuse=None, feature_override=None):
                     f"in synth (have hh={_hhcol}, pid={_pcol}) — coordination skipped")
         except Exception as _hhc_e:
             logger.warning(f"CDAP household coordination skipped ({_hhc_e})")
+
+    # ── Shared per-person latent (Layer-1 cross-stage link, gated) ────────────
+    # Attach the standardised "travel style" latent now that CDAP is realized, so
+    # downstream stages can condition on it. It's enriched again after stage 1
+    # (activity counts) via ensure_person_latent(force=True). Off by default.
+    if os.environ.get('PIPELINE_PERSON_LATENT', '0') == '1':
+        try:
+            from person_latent import ensure_person_latent, PERSON_LATENT_COL
+            synth = ensure_person_latent(synth, cdap_col='CDAP', force=True)
+            if PERSON_LATENT_COL in synth.columns:
+                logger.info(
+                    f"person_latent attached (attrs+CDAP): "
+                    f"mean={synth[PERSON_LATENT_COL].mean():.3f} "
+                    f"std={synth[PERSON_LATENT_COL].std():.3f}")
+        except Exception as _ple:
+            logger.warning(f"person_latent attach skipped ({_ple})")
 
     synth.to_csv(os.path.join(OUT_DIR, 'cdap_output.csv'), index=False)
     return synth
@@ -3736,6 +3790,15 @@ def predict_stage5(activities, models=None, out=None, landuse=None, skims=None, 
 def stage1(out, synth):
     synth_s1, models = run_stage1(out["tours"], out["persons"], synth,
                                     save_path=os.path.join(OUT_DIR, 'stage1_models.pkl'))
+    # Enrich the shared person latent with realized activity counts (gated), so
+    # stages 2-4 condition on how much this person actually travels, not just
+    # attributes + CDAP. force=True recomputes over the now-present n_*_out cols.
+    if os.environ.get('PIPELINE_PERSON_LATENT', '0') == '1':
+        try:
+            from person_latent import ensure_person_latent
+            synth_s1 = ensure_person_latent(synth_s1, cdap_col='CDAP', force=True)
+        except Exception as _ple:
+            logger.warning(f"person_latent stage-1 enrichment skipped ({_ple})")
     _save_stage_coef_csv(models, 'stage1', OUT_DIR)
     synth_s1.to_csv(os.path.join(OUT_DIR, 'stage1_output.csv'), index=False)
     _write_stage_checkpoint_report(

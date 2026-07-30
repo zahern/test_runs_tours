@@ -76,6 +76,29 @@ class HouseholdCdapConfig:
     # TODO(estimate): these encode coordination.
     adult_home_boosts_child_N: float = 0.5   # a home adult → child more N (escortable)
     more_workers_boost_M: float = 0.15        # each additional worker → slightly more M
+
+    # ── ActivitySim-style 2-way interaction coefficients ─────────────────────
+    # Added to a household pattern COMBINATION for every member pair, keyed by
+    # (pair_class, {sorted pattern pair}). pair_class ∈ {AA adult-adult,
+    # AC adult-child, CC child-child}. These are what make a household's members
+    # co-determine their patterns (a true joint logit, not independent draws).
+    # Priors below are behaviourally signed; TODO(estimate) from HHTS overwrites
+    # them via cdap_households_estimation. Absent (class,pair) keys default to 0.
+    n_cdap_persons: int = 5   # members modelled JOINTLY (ActivitySim cap); rest
+                              # are drawn conditionally on the modelled members.
+    interaction: dict = field(default_factory=lambda: {
+        # both mandatory — schedule alignment among workers / students / pupils
+        ('AA', 'M', 'M'): 0.30, ('AC', 'M', 'M'): 0.20, ('CC', 'M', 'M'): 0.40,
+        # both non-mandatory — joint discretionary / shopping / social travel
+        ('AA', 'N', 'N'): 0.35, ('AC', 'N', 'N'): 0.25, ('CC', 'N', 'N'): 0.20,
+        # both home — shared at-home day
+        ('AA', 'H', 'H'): 0.20,
+        # escort: an at-home / non-mandatory adult lets a child travel N (escorted)
+        ('AC', 'H', 'N'): 0.45, ('AC', 'M', 'N'): 0.15,
+        # supervision: child home while every adult is mandatory is discouraged,
+        # and two children home alone together even more so
+        ('AC', 'M', 'H'): -0.30, ('CC', 'H', 'H'): -0.25,
+    })
     # Joint-tour frequency: base Poisson rate + per-feature increments.
     joint_base_rate: float = 0.25
     joint_rate_per_child: float = 0.20
@@ -99,6 +122,77 @@ def _softmax_choice(util: dict, rng: np.random.Generator) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ActivitySim-style joint-logit helpers
+# ---------------------------------------------------------------------------
+_CHILD_PTYPES = ('SchoolChild', 'Preschool')
+
+
+def _pair_class(is_child_i: bool, is_child_j: bool) -> str:
+    """Adult-Adult / Adult-Child / Child-Child bucket for a member pair."""
+    n_child = int(is_child_i) + int(is_child_j)
+    return 'CC' if n_child == 2 else ('AC' if n_child == 1 else 'AA')
+
+
+def _interaction_util(cfg: 'HouseholdCdapConfig', cls: str,
+                      d_i: str, d_j: str) -> float:
+    """Symmetric 2-way interaction lookup (pattern order doesn't matter)."""
+    a, b = sorted((d_i, d_j))
+    return float(cfg.interaction.get((cls, a, b),
+                 cfg.interaction.get((cls, b, a), 0.0)))
+
+
+def _person_dap_utilities(row, cfg: 'HouseholdCdapConfig', n_workers: int) -> dict:
+    """Individual M/N/H utility for one person.
+
+    Uses per-person model utilities if the caller attached them as columns
+    cdap_util_M / cdap_util_N / cdap_util_H (so this coordination layer sits ON
+    TOP of the fitted individual CDAP, ActivitySim-style); otherwise falls back
+    to the ptype utility priors. The household-worker count enters as an
+    individual-level composition covariate; pairwise coordination is handled by
+    the interaction terms, not here.
+    """
+    if all(f'cdap_util_{d}' in row.index for d in DAP_CLASSES):
+        u = {d: float(row[f'cdap_util_{d}']) for d in DAP_CLASSES}
+    else:
+        pt = row[cfg.ptype_col]
+        u = dict(cfg.dap_utility.get(pt, cfg.dap_utility['NonWorker']))
+    u['M'] += cfg.more_workers_boost_M * max(n_workers - 1, 0)
+    return u
+
+
+def _joint_cdap_draw(members: list, cfg: 'HouseholdCdapConfig',
+                     rng: np.random.Generator) -> dict:
+    """Draw a coordinated pattern for a set of household members via the joint
+    logit over the Cartesian product of their {M,N,H} patterns:
+
+        U(combo) = Σ_i u_i(d_i) + Σ_{i<j} interaction(class_ij, d_i, d_j)
+
+    `members` is a list of (key, util_dict, is_child). Returns {key: pattern}.
+    """
+    import itertools
+    n = len(members)
+    keys      = [m[0] for m in members]
+    utils     = [m[1] for m in members]
+    children  = [m[2] for m in members]
+    combos    = list(itertools.product(DAP_CLASSES, repeat=n))
+    logits    = np.empty(len(combos), dtype=float)
+    for c, combo in enumerate(combos):
+        s = 0.0
+        for i in range(n):
+            s += utils[i][combo[i]]
+        for i in range(n):
+            for j in range(i + 1, n):
+                s += _interaction_util(cfg, _pair_class(children[i], children[j]),
+                                       combo[i], combo[j])
+        logits[c] = s
+    logits -= logits.max()
+    p = np.exp(logits)
+    p /= p.sum()
+    combo = combos[int(rng.choice(len(combos), p=p))]
+    return {keys[i]: combo[i] for i in range(n)}
+
+
+# ---------------------------------------------------------------------------
 # 1. Coordinated household CDAP
 # ---------------------------------------------------------------------------
 def coordinate_household_cdap(persons: pd.DataFrame,
@@ -115,23 +209,43 @@ def coordinate_household_cdap(persons: pd.DataFrame,
     if cfg.ptype_col not in df.columns:
         raise KeyError(f"coordinate_household_cdap: missing '{cfg.ptype_col}'")
 
-    is_child = df[cfg.ptype_col].isin(['SchoolChild', 'Preschool'])
-    is_worker = df[cfg.ptype_col].isin(['FullTimeWorker', 'PartTimeWorker', 'WorkingStudent'])
+    is_child  = df[cfg.ptype_col].isin(_CHILD_PTYPES)
+    is_worker = df[cfg.ptype_col].isin(
+        ['FullTimeWorker', 'PartTimeWorker', 'WorkingStudent'])
 
     daps = np.empty(len(df), dtype=object)
     for hh, grp in df.groupby(cfg.hh_id_col, sort=False):
         n_workers = int(is_worker.loc[grp.index].sum())
-        # a "home adult" = a non-child predicted toward Home/NonMandatory
-        adult_home = ((~is_child.loc[grp.index]) &
-                      grp[cfg.ptype_col].isin(['Retired', 'NonWorker'])).any()
-        for i in grp.index:
-            pt = grp.at[i, cfg.ptype_col]
-            base = dict(cfg.dap_utility.get(pt, cfg.dap_utility['NonWorker']))
-            base['M'] += cfg.more_workers_boost_M * max(n_workers - 1, 0)
-            if is_child.loc[i] and adult_home:
-                base['N'] += cfg.adult_home_boosts_child_N
-            daps[df.index.get_loc(i)] = _softmax_choice(
-                base, _rng(cfg.seed, 'cdap', hh, df.at[i, cfg.person_id_col]))
+        hh_rng = _rng(cfg.seed, 'cdap', hh)
+        # Build (index, util, is_child) for every member.
+        members = [
+            (i, _person_dap_utilities(grp.loc[i], cfg, n_workers),
+             bool(is_child.loc[i]))
+            for i in grp.index
+        ]
+        # ActivitySim caps the JOINTLY-modelled set (default 5). When a household
+        # is larger, model the highest-priority members jointly (adults first,
+        # then children) and draw the remainder conditionally — each remaining
+        # member joins the joint set one at a time so it still co-determines with
+        # the already-fixed members (keeps coordination, bounds 3^n blow-up).
+        order = sorted(range(len(members)),
+                       key=lambda k: (members[k][2],  # adults (False) first
+                                      str(grp.at[members[k][0], cfg.person_id_col])))
+        cap = max(1, int(cfg.n_cdap_persons))
+        core = [members[k] for k in order[:cap]]
+        drawn = _joint_cdap_draw(core, cfg, hh_rng)
+        for k in order[cap:]:
+            idx, util, child = members[k]
+            # condition on the already-drawn members via their interaction terms
+            cond = {d: util[d] for d in DAP_CLASSES}
+            for dkey, dval in drawn.items():
+                dchild = bool(is_child.loc[dkey])
+                cls = _pair_class(child, dchild)
+                for d in DAP_CLASSES:
+                    cond[d] += _interaction_util(cfg, cls, d, dval)
+            drawn[idx] = _softmax_choice(cond, hh_rng)
+        for idx, pattern in drawn.items():
+            daps[df.index.get_loc(idx)] = pattern
     df['dap'] = daps
     df['dap_coordinated'] = True
     return df

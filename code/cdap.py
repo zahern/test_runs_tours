@@ -947,6 +947,25 @@ def predict_cdap(synth: pd.DataFrame, result: dict, seed: int = 42) -> pd.DataFr
             else:
                 df['CDAP'] = pd.Series(cdap_idx, index=df.index).map(CDAP_LABELS)
 
+            # Expose the per-person M/N/H log-utilities so an optional household
+            # coordination layer (cdap_households.coordinate_household_cdap) can
+            # sit ON TOP of this fitted individual model, ActivitySim-style,
+            # rather than re-drawing from crude ptype priors. probs columns are
+            # ordered [H, N, M] per CDAP_LABELS.
+            try:
+                _lp = np.log(np.clip(probs, 1e-9, None))
+                _util = {d: _lp[:, k] for k, d in CDAP_LABELS.items()}  # {'H':..,'N':..,'M':..}
+                if pid_col is not None:
+                    _ids = df_uniq[pid_col].astype(str).values
+                    for d in ('M', 'N', 'H'):
+                        _m = {pid: _util[d][i] for i, pid in enumerate(_ids)}
+                        df[f'cdap_util_{d}'] = df[pid_col].astype(str).map(_m)
+                else:
+                    for d in ('M', 'N', 'H'):
+                        df[f'cdap_util_{d}'] = pd.Series(_util[d], index=df.index)
+            except Exception as _ue:
+                logger.debug(f"CDAP per-person utility export skipped: {_ue}")
+
             dist = df['CDAP'].value_counts()
             print(f"  CDAP: H={dist.get('H',0)} ({dist.get('H',0)/len(df)*100:.1f}%)  "
                   f"N={dist.get('N',0)} ({dist.get('N',0)/len(df)*100:.1f}%)  "

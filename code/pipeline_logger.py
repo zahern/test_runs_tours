@@ -936,6 +936,45 @@ def cdap(out, synth, landuse=None, feature_override=None):
             except OSError:
                 pass
     synth = run_cdap(out["persons"], synth, feature_override=feature_override)
+
+    # ── Optional ActivitySim-style household coordination (gated) ─────────────
+    # Off by default (independent per-person CDAP above). CDAP_HOUSEHOLD_COORD=1
+    # re-draws each household's members JOINTLY via a 2-way interaction logit
+    # (cdap_households.coordinate_household_cdap), so members co-determine their
+    # M/N/H patterns (worker schedule alignment, child escort, home supervision)
+    # instead of being independent. It sits on top of the fitted individual model
+    # by consuming its per-person log-utilities (cdap_util_M/N/H) as the
+    # individual utilities; interaction coefficients are priors until estimated
+    # from HHTS (cdap_households_estimation).
+    if os.environ.get('CDAP_HOUSEHOLD_COORD', '0') == '1':
+        try:
+            from cdap_households import (coordinate_household_cdap,
+                                         HouseholdCdapConfig)
+            _hhcol = next((c for c in ('household_id', 'HHID', 'hhid', 'abshid')
+                           if c in synth.columns), None)
+            _pcol = next((c for c in ('person_id', 'PERSONID', 'pid')
+                          if c in synth.columns), None)
+            if _hhcol and _pcol and 'ptype' in synth.columns:
+                _cfg = HouseholdCdapConfig(hh_id_col=_hhcol, person_id_col=_pcol,
+                                           ptype_col='ptype')
+                _before = synth['CDAP'].value_counts(normalize=True).to_dict() \
+                    if 'CDAP' in synth.columns else {}
+                _coord = coordinate_household_cdap(synth, _cfg)
+                synth['CDAP'] = _coord['dap'].values
+                _after = synth['CDAP'].value_counts(normalize=True).to_dict()
+                logger.info(
+                    "CDAP household coordination applied "
+                    f"(hh='{_hhcol}'): shares before={{"
+                    + ", ".join(f"{k}:{v:.3f}" for k, v in sorted(_before.items()))
+                    + "}} after={{"
+                    + ", ".join(f"{k}:{v:.3f}" for k, v in sorted(_after.items())) + "}}")
+            else:
+                logger.warning(
+                    "CDAP_HOUSEHOLD_COORD=1 but missing household_id/person_id/ptype "
+                    f"in synth (have hh={_hhcol}, pid={_pcol}) — coordination skipped")
+        except Exception as _hhc_e:
+            logger.warning(f"CDAP household coordination skipped ({_hhc_e})")
+
     synth.to_csv(os.path.join(OUT_DIR, 'cdap_output.csv'), index=False)
     return synth
 

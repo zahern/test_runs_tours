@@ -622,7 +622,12 @@ def _dest_uec_from_feature_list(custom_vars: list) -> dict:
 
     always_include = {
         "c_logsum", "c_log_dist", "c_dist", "c_size_term",
-        "c_aggl", "c_crash",   # c_comp removed from always-in: it is ~perfectly
+        "c_crash",             # c_aggl NO LONGER force-included: the blended
+                               # composite is collinear with the per-type themed
+                               # ACDC (retail/office/edu/leisure/parks/health/food/
+                               # civic) and, when forced, holdfast-zeroed them all.
+                               # Agglomeration is now carried by the themed genes
+                               # (require-one in ga_constraints). c_comp also out:
                                # collinear with c_aggl (|r|≈0.9998) and, when both
                                # are forced, the pair blows up to huge equal-and-
                                # opposite values (+4.5/−4.5). It stays GA-selectable
@@ -2264,6 +2269,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     _lu_cols_to_join = [
         'size_term', 'acdc_aggl', 'acdc_comp',
         'acdc_aggl_retail', 'acdc_aggl_office', 'acdc_aggl_edu', 'acdc_aggl_leisure',
+        'acdc_aggl_parks', 'acdc_aggl_health', 'acdc_aggl_food', 'acdc_aggl_civic',
         'is_cbd', 'transit_walk_acc',
         'auto_work_acc', 'auto_shop_acc', 'auto_edu_acc', 'auto_nonmand_acc',
         'walk_acc', 'transit_acc',
@@ -3542,6 +3548,10 @@ DEST_UEC = {
     "c_aggl_office":        ("emp.acdc_aggl_office",        None),
     "c_aggl_edu":           ("emp.acdc_aggl_edu",           None),
     "c_aggl_leisure":       ("emp.acdc_aggl_leisure",       None),
+    "c_aggl_parks":         ("emp.acdc_aggl_parks",         None),
+    "c_aggl_health":        ("emp.acdc_aggl_health",        None),
+    "c_aggl_food":          ("emp.acdc_aggl_food",          None),
+    "c_aggl_civic":         ("emp.acdc_aggl_civic",         None),
 
     # ── Home-pull gravity ────────────────────────────────────────────────
     # home_pull_j = -log(1 + dist(home_zone, j)) — negative because farther
@@ -4737,7 +4747,12 @@ def _dest_spec_custom(mm, segment: str, custom_vars: list):
     # predictions unstable and overly concentrated in a single zone.
     always_include = {
         "c_logsum", "c_log_dist", "c_dist", "c_size_term",
-        "c_aggl", "c_crash",   # c_comp removed from always-in: it is ~perfectly
+        "c_crash",             # c_aggl NO LONGER force-included: the blended
+                               # composite is collinear with the per-type themed
+                               # ACDC (retail/office/edu/leisure/parks/health/food/
+                               # civic) and, when forced, holdfast-zeroed them all.
+                               # Agglomeration is now carried by the themed genes
+                               # (require-one in ga_constraints). c_comp also out:
                                # collinear with c_aggl (|r|≈0.9998) and, when both
                                # are forced, the pair blows up to huge equal-and-
                                # opposite values (+4.5/−4.5). It stays GA-selectable
@@ -4850,11 +4865,15 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
         # (e.g. work DA 0.1% vs 75.5% observed).  mu < 0.1 has no plausible
         # behavioural interpretation; at the 0.10 bound the model is still
         # near-deterministic within the nest but numerically sane.
-        _pf_set(m, "Mu_Car",      "minimum", 0.10)
+        # Override via STAGE5_MU_LOWER_BOUND env var if estimation diagnostics
+        # show consistent boundary solutions (warnings about params "ended AT
+        # A BOUND").  Values below 0.05 are strongly discouraged.
+        _mu_floor = float(os.environ.get('STAGE5_MU_LOWER_BOUND', '0.10'))
+        _pf_set(m, "Mu_Car",      "minimum", _mu_floor)
         _pf_set(m, "Mu_Car",      "maximum", 1.0)
-        _pf_set(m, "Mu_Motor",    "minimum", 0.10)
+        _pf_set(m, "Mu_Motor",    "minimum", _mu_floor)
         _pf_set(m, "Mu_Motor",    "maximum", 1.0)
-        _pf_set(m, "Mu_NonMotor", "minimum", 0.10)
+        _pf_set(m, "Mu_NonMotor", "minimum", _mu_floor)
         _pf_set(m, "Mu_NonMotor", "maximum", 1.0)
     except Exception as e:
         logger.debug(f"Could not set nesting bounds: {e}")
@@ -4991,6 +5010,10 @@ DEST_UEC_FLAT = {
     "c_aggl_office":        ("acdc_aggl_office",        None),
     "c_aggl_edu":           ("acdc_aggl_edu",           None),
     "c_aggl_leisure":       ("acdc_aggl_leisure",       None),
+    "c_aggl_parks":         ("acdc_aggl_parks",         None),
+    "c_aggl_health":        ("acdc_aggl_health",        None),
+    "c_aggl_food":          ("acdc_aggl_food",          None),
+    "c_aggl_civic":         ("acdc_aggl_civic",         None),
     "c_home_pull":          ("home_pull",               ["nonmand"]),
     "c_home_pull_late":     ("home_pull_late",          ["nonmand"]),
     "c_incp_dist":          ("incp_x_log_dist",         None),
@@ -7864,12 +7887,24 @@ def compute_themed_acdc_terms(
     Returns a dict mapping column name ('acdc_aggl_retail', etc.) to pd.Series
     indexed by zone_id.
     """
+    # Per-type ACDC agglomeration (the imove/gonzalo decomposition), mapped to
+    # the land-use columns that actually exist in zone_landuse_357/507.csv. Each
+    # theme is log(Σ_{k≠j} Σ_col size_col[k] · exp(-λ·time[j,k])), standardised.
+    # The old leisure theme referenced cafe/pub/restaurant/sports_centre columns
+    # that are NOT in this landuse (silently zero); replaced with real columns.
+    # The GA/SA search + ga_constraints pick among these (they are correlated),
+    # letting the model say WHICH destination character drives each segment.
     themes = {
-        'acdc_aggl_retail':  ['RETEMPN'],
-        'acdc_aggl_office':  ['FPSEMPN'],
-        'acdc_aggl_edu':     ['Education', 'Primary', 'Secondary', 'HSENROLL'],
-        'acdc_aggl_leisure': ['Entertainment', 'sports_centre', 'fitness_centre',
-                              'restaurant', 'cafe', 'pub'],
+        'acdc_aggl_retail':  ['RETEMPN', 'retail', 'Shopping'],
+        'acdc_aggl_office':  ['FPSEMPN', 'commercial', 'institutional'],
+        'acdc_aggl_edu':     ['Education', 'Primary', 'Secondary', 'HSENROLL',
+                              'university', 'college', 'childcare', 'education'],
+        'acdc_aggl_leisure': ['Entertainment', 'sport'],
+        'acdc_aggl_parks':   ['park', 'recreation_ground', 'village_green', 'trees'],
+        'acdc_aggl_health':  ['Healthcare', 'HEREMPN'],
+        'acdc_aggl_food':    ['EATOUT'],
+        'acdc_aggl_civic':   ['civic', 'civic_admin', 'community',
+                              'Public_Services', 'government'],
     }
     result = {}
     N = len(zone_ids)
@@ -8222,7 +8257,9 @@ def _attach_acdc_terms(
             lu = lu.reset_index()
     except Exception as _themed_e:
         logger.warning(f"_attach_acdc_terms [{segment}]: themed ACDC failed ({_themed_e})")
-        for _tc in ['acdc_aggl_retail', 'acdc_aggl_office', 'acdc_aggl_edu', 'acdc_aggl_leisure']:
+        for _tc in ['acdc_aggl_retail', 'acdc_aggl_office', 'acdc_aggl_edu',
+                    'acdc_aggl_leisure', 'acdc_aggl_parks', 'acdc_aggl_health',
+                    'acdc_aggl_food', 'acdc_aggl_civic']:
             if _tc not in lu.columns:
                 lu[_tc] = 0.0
 
@@ -9460,6 +9497,8 @@ def _build_sa3_aggregates(landuse: pd.DataFrame) -> pd.DataFrame:
                  'acdc_aggl', 'acdc_comp',
                  'acdc_aggl_retail', 'acdc_aggl_office',
                  'acdc_aggl_edu', 'acdc_aggl_leisure',
+                 'acdc_aggl_parks', 'acdc_aggl_health',
+                 'acdc_aggl_food', 'acdc_aggl_civic',
                  'size_term', 'is_cbd', 'transit_walk_acc']
 
     sum_cols = [c for c in sum_cols if c in lu.columns]
@@ -11026,6 +11065,12 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
         c_size_term = _pv('c_size_term', 1.0)
         c_aggl = _pv('c_aggl', 0.0)
         c_comp = _pv('c_comp', 0.0)
+        # Per-type ACDC agglomeration (imove/gonzalo decomposition). Previously
+        # the prediction utility only applied the blended c_aggl and IGNORED
+        # these, so the themed coefficients had no effect even when estimated.
+        _ACDC_THEMES = ('retail', 'office', 'edu', 'leisure',
+                        'parks', 'health', 'food', 'civic')
+        c_aggl_themed = {t: _pv(f'c_aggl_{t}', 0.0) for t in _ACDC_THEMES}
         c_incp_dist = _pv('c_incp_dist', 0.0)
         c_age_dist = _pv('c_age_dist', 0.0)
         c_veh_dist = _pv('c_veh_dist', 0.0)
@@ -11127,6 +11172,10 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
         size_term_j = _emp_col('size_term', 0.0)
         acdc_aggl_j = _emp_col('acdc_aggl', 0.0)
         acdc_comp_j = _emp_col('acdc_comp', 0.0)
+        # Per-type ACDC agglomeration columns (zero if the theme wasn't built).
+        acdc_aggl_themed_j = {
+            t: _emp_col(f'acdc_aggl_{t}', 0.0) for t in _ACDC_THEMES
+        }
         auto_work_j = _emp_col('auto_work_acc', 0.0)
         auto_shop_j = _emp_col('auto_shop_acc', 0.0)
         walk_acc_j = _emp_col('walk_acc', 0.0)
@@ -11417,6 +11466,12 @@ def _dest_utility_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids, persons,
             + _size_term_term
             + c_aggl * acdc_aggl_j[np.newaxis, :]
             + c_comp * acdc_comp_j[np.newaxis, :]
+            # Per-type ACDC agglomeration (only nonzero themes contribute).
+            + sum(
+                (c_aggl_themed[_t] * acdc_aggl_themed_j[_t][np.newaxis, :]
+                 for _t in _ACDC_THEMES if c_aggl_themed[_t] != 0.0),
+                np.zeros((1, len(zone_arr)), dtype=np.float32),
+            )
             + c_auto_work * auto_work_j[np.newaxis, :]
             + c_auto_shop * auto_shop_j[np.newaxis, :]
             + c_walk_acc * walk_acc_j[np.newaxis, :]

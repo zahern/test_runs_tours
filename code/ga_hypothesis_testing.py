@@ -4887,9 +4887,12 @@ def _stage5_dest_candidates() -> List[str]:
         'income_lo',      # low-income x affordable / community destinations
         'income_mid',     # middle-income x mixed-use zones
     ]
-    # -- ACDC themed agglomeration variants (mutex with c_aggl) --
+    # -- ACDC themed agglomeration variants (imove/gonzalo per-type decomposition;
+    #    free to co-occur now, require-one over the family in ga_constraints) --
     acdc_themed = ['acdc_aggl_retail', 'acdc_aggl_office',
-                   'acdc_aggl_edu', 'acdc_aggl_leisure']
+                   'acdc_aggl_edu', 'acdc_aggl_leisure',
+                   'acdc_aggl_parks', 'acdc_aggl_health',
+                   'acdc_aggl_food', 'acdc_aggl_civic']
     # -- Home-pull gravity (mutex: home_pull vs home_pull_late) --
     home_pull_vars = ['home_pull', 'home_pull_late']
     # -- Mode-relevant landuse columns (CBD flag, transit walk access) --
@@ -4983,6 +4986,8 @@ def _stage5_dest_candidates_for_segment(segment: str) -> List[str]:
         'incp', 'has_vehicle', 'n_workers_hh', 'is_female',
         'acdc_aggl_retail', 'acdc_aggl_office',
         'acdc_aggl_edu', 'acdc_aggl_leisure',
+        'acdc_aggl_parks', 'acdc_aggl_health',
+        'acdc_aggl_food', 'acdc_aggl_civic',
         # ActivitySim-inspired dest genes (gated by coeff-name in DEST_UEC_FLAT):
         #   piecewise distance spline (replaces c_dist) + CBD/urban-core pull.
         'c_dist_0_2', 'c_dist_2_5', 'c_dist_5_10', 'c_cbd_dest', 'is_cbd',

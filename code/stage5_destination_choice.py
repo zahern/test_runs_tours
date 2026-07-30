@@ -70,7 +70,10 @@ MAX_MXL_OBS = 2500              # skip MXL on large segments that were causing O
 DEST_EST_SAMPLE_SIZE = int(os.environ.get('STAGE5_DEST_SAMPLE_SIZE', '20'))
 # Mixed logit is optional; default off because some Larch/sharrow builds
 # produce rewrite/Inf-loglike failures on large CA tables.
-STAGE5_ENABLE_MXL = os.environ.get('STAGE5_ENABLE_MXL', '0') == '1'
+# GSE (Gradient Score Enhanced) mixed logit — systematic γ·g loadings on top of
+# the Normal mixtures. Enabling GSE implies MXL (GSE lives inside the MXL path).
+STAGE5_ENABLE_GSE = os.environ.get('STAGE5_ENABLE_GSE', '0') == '1'
+STAGE5_ENABLE_MXL = (os.environ.get('STAGE5_ENABLE_MXL', '0') == '1') or STAGE5_ENABLE_GSE
 # Module-level flag: print the DISTWALK==DIST banner only once (it fires per segment)
 _DIST_WALK_BANNER_SHOWN = False
 # Track which segments have already been warned about DIST/DISTWALK correlation
@@ -8389,6 +8392,34 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
                                   index=seg.index)), errors='coerce').fillna(30.0)
         ivt_median = max(float(ivt_vals.median()), 1.0)
 
+        # ── GSE gradient score g_n (Gradient Score Enhanced mixed logit) ──────
+        # SearchLibrium's MixedLogitGSE fits β_nk = μ_k + γ_k·g_nk + σ_k·η_nk,
+        # where g_nk is a per-person exogenous "gradient score" (origin
+        # accessibility / land-use context). In Larch this decomposes exactly:
+        #   μ_k·x_k        → the ordinary term (already in utility_ca)
+        #   γ_k·(g_n·x_k)  → a SYSTEMATIC interaction column (added below)
+        #   σ_k·(η_nk·x_k) → the Normal mixture (added in Step 2, mxl.mixtures)
+        # so enabling GSE + the existing mixtures reproduces the full GSE model.
+        # g_n here = standardised origin accessibility (the mode-choice analogue
+        # of the imove/gonzalo per-type ACDC-at-origin gradient score).
+        _gse_enabled = os.environ.get('STAGE5_ENABLE_GSE', '0') == '1'
+        _gse_map = {}
+        if _gse_enabled:
+            _gcands = [c for c in ('auto_work_acc', 'walk_acc', 'transit_acc',
+                                   'auto_shop_acc', 'auto_nonmand_acc', 'incp')
+                       if c in seg.columns]
+            if _gcands:
+                _gser = pd.to_numeric(seg[_gcands[0]], errors='coerce').fillna(0.0)
+                _gmu, _gsd = float(_gser.mean()), float(_gser.std())
+                _gz = (_gser - _gmu) / (_gsd + 1e-8)   # standardised, O(1)
+                _gse_map = dict(zip(seg['ptour_id'].astype(str), _gz))
+                logger.info(f"[{segment}] GSE enabled: gradient score = "
+                            f"standardised '{_gcands[0]}' over {len(_gse_map)} tours")
+            else:
+                _gse_enabled = False
+                logger.warning(f"[{segment}] GSE requested but no origin "
+                               "accessibility/income column present — disabled")
+
         for _, tour in seg.iterrows():
             pid     = str(tour['ptour_id'])
             chosen  = int(tour.get('tour_mode', 1))
@@ -8480,6 +8511,7 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
                     'alt_id':       alt,
                     'chosen':       int(chosen == alt),
                     'avail':        avail,
+                    'gse_g':        float(_gse_map.get(pid, 0.0)),  # GSE gradient score
                     'mxl_ca_ivt_h':   ivt_h,        # hours (auto/transit)
                     'mxl_ca_walk_h':  walk_logmin,  # log-minutes (walk)
                     'mxl_ca_bike_h':  bike_logmin,  # log-minutes (bike); keep names unique to avoid rewrite collisions
@@ -8603,6 +8635,28 @@ def _estimate_mixed_logit(seg: pd.DataFrame, segment: str,
         for alt, name in [(2,'ASC_SR'),(3,'ASC_Walk'),(4,'ASC_Bike'),(5,'ASC_Transit')]:
             mnl.utility_co[alt] = P(name)
         mnl.utility_co[1] = P('c_da_aff')   # DA affinity (fixed in MNL, random in MXL)
+
+        # ── GSE systematic gradient loadings γ_k·(g_n·x_k) ────────────────────
+        # Add the gradient-score interaction for each random taste parameter, so
+        # its mean shifts systematically with the person's origin context before
+        # the Normal mixture (Step 2) adds σ_k·η_nk on top. Together this is the
+        # exact MixedLogitGSE decomposition, estimated natively in Larch.
+        if _gse_enabled:
+            mnl.utility_ca = (
+                mnl.utility_ca
+                + P('g_ivt')  * X('mxl_ca_ivt_h * gse_g')
+                + P('g_walk') * X('mxl_ca_walk_h * gse_g')
+                + P('g_bike') * X('mxl_ca_bike_h * gse_g')
+            )
+            # DA affinity gradient loading (g_n shifts the person-specific DA ASC)
+            mnl.utility_co[1] = P('c_da_aff') + P('g_da') * X('gse_g')
+            for _gp in ('g_ivt', 'g_walk', 'g_bike', 'g_da'):
+                try:
+                    mnl.set_value(_gp, 0.0)
+                except Exception:
+                    pass
+            logger.info(f"[{segment}] GSE systematic loadings added "
+                        "(g_ivt, g_walk, g_bike, g_da) — full GSE = μ + γ·g + σ·η")
 
         # Starting values from SEGMENT_COEFFICIENTS if available, else defaults.
         seg_init = SEGMENT_COEFFICIENTS.get(segment, {})

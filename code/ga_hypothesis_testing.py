@@ -1322,6 +1322,13 @@ class GeneticAlgorithm:
 
         _es_patience = _env_int('GA_EARLY_STOP_PATIENCE', max(3 * self.stagnation_limit, 24))
         _es_min_gens = _env_int('GA_EARLY_STOP_MIN_GENS', max(2 * self.stagnation_limit, 20))
+        # Fraction of the population replaced by fresh random individuals on each
+        # stagnation-limit-multiple plateau generation (partial reheat). 0 = off.
+        try:
+            _reheat_frac = float(_os.environ.get('GA_REHEAT_FRACTION', '0.3'))
+        except ValueError:
+            _reheat_frac = 0.3
+        _reheat_frac = min(max(_reheat_frac, 0.0), 0.9)  # keep at least 10% + elites
 
         for gen in range(self.n_generations):
             print(f"Gen {gen:3d} | evaluating population... ", end='', flush=True)
@@ -1366,6 +1373,36 @@ class GeneticAlgorithm:
                     label = f" [{self.progress_label}]" if self.progress_label else ""
                     print(f" ~ Diversity injection at gen {gen}{label}: reinitialised "
                           f"{len(fresh)} members (div was 0, stag={stagnation_count})")
+
+            # ── Stagnation reheat (partial restart on a plateau) ─────────────
+            # The full-collapse injection above only fires at div==0, but the
+            # common failure mode is a plateau at MODERATE diversity (e.g. best
+            # unchanged for 45 gens while div≈0.45) — there the boosted mutation
+            # alone can't escape and the run just early-stops. On each multiple of
+            # stagnation_limit gens without improvement, replace the weakest
+            # GA_REHEAT_FRACTION of the population with fresh random individuals
+            # (elites always kept), injecting new genetic material so the search
+            # keeps improving over time instead of flatlining. GA_REHEAT_FRACTION=0
+            # disables it. Skips the gen the div==0 path already handled.
+            elif (_reheat_frac > 0.0
+                  and stagnation_count > 0
+                  and stagnation_count % self.stagnation_limit == 0
+                  # leave ≥ one stagnation_limit window after the last reheat so
+                  # it can actually recover before early-stop fires.
+                  and stagnation_count <= max(_es_patience - self.stagnation_limit,
+                                              self.stagnation_limit)):
+                ranked = sorted(pop, key=lambda x: x.fitness, reverse=True)
+                n_keep = max(self.elitism_k,
+                             int(round(self.pop_size * (1.0 - _reheat_frac))))
+                survivors = ranked[:n_keep]
+                fresh = [self._random_individual()
+                         for _ in range(self.pop_size - len(survivors))]
+                pop = self._evaluate(survivors + fresh)
+                if self.verbose:
+                    label = f" [{self.progress_label}]" if self.progress_label else ""
+                    print(f" ~ Stagnation reheat at gen {gen}{label}: replaced "
+                          f"{len(fresh)}/{self.pop_size} weakest members "
+                          f"(stag={stagnation_count}, div={div:.2f})")
 
             history.append({
                 'generation':    gen,
@@ -2851,8 +2888,12 @@ def _stage1_fitness(
 
     n   = len(y)
     k   = len(feats) + len(classes) - 1          # coef + thresholds
-    bic = -2.0 * ll_fit + k * np.log(max(n, 2))
-    return -bic / max(n, 1)
+    # _bic_per_obs scales the k·ln(n) term by GA_COMPLEXITY_PENALTY so the
+    # search isn't forced to full-BIC parsimony (which flattens the landscape
+    # to pure feature-shedding); <1 keeps more predictors and gives the
+    # perturbations real gradient to improve on.
+    from ga_external_estimators import _bic_per_obs
+    return _bic_per_obs(ll_fit, k, n)
 
 
 def _stage1_fitness_aggregate(
@@ -2920,8 +2961,8 @@ def _stage2_fitness(
     n, k   = len(y), len(feats) + 1              # feats + intercept
     sigma2 = ss_res / max(n, 1)
     ll_ols = -0.5 * n * (np.log(2 * np.pi * max(sigma2, 1e-12)) + 1.0)
-    bic    = -2.0 * ll_ols + k * np.log(max(n, 2))
-    return -bic / max(n, 1)
+    from ga_external_estimators import _bic_per_obs
+    return _bic_per_obs(ll_ols, k, n)   # GA_COMPLEXITY_PENALTY-scaled -BIC/n
 
 
 def _stage2_fitness_aggregate(
@@ -2991,8 +3032,8 @@ def _stage3_fitness(
               - log_y.sum())
     n   = len(y)
     k   = len(feats) + 2                         # coefs + intercept + sigma
-    bic = -2.0 * ll + k * np.log(max(n, 2))
-    return -bic / max(n, 1)                      # -BIC/n, higher is better
+    from ga_external_estimators import _bic_per_obs
+    return _bic_per_obs(ll, k, n)                # GA_COMPLEXITY_PENALTY-scaled -BIC/n
 
 
 def _stage3_fitness_aggregate(
@@ -3049,8 +3090,8 @@ def _stage4_fitness(
     ll = float(m.ll_)
     n  = len(y)
     k  = (len(TIME_PERIODS) - 1) * X.shape[1]
-    bic = -2.0 * ll + k * np.log(max(n, 2))
-    return -bic / max(n, 1)                      # -BIC/n, higher is better
+    from ga_external_estimators import _bic_per_obs
+    return _bic_per_obs(ll, k, n)                # GA_COMPLEXITY_PENALTY-scaled -BIC/n
 
 
 def _stage4_fitness_aggregate(

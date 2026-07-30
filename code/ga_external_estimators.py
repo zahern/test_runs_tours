@@ -467,8 +467,14 @@ def ga_estimator() -> str:
 # ---------------------------------------------------------------------------
 
 def _bic_per_obs(log_lik: float, k: int, n: int) -> float:
-    """–BIC/n  (higher = better, matches ga_hypothesis_testing convention)."""
-    bic = -2.0 * log_lik + k * np.log(max(n, 2))
+    """–BIC/n  (higher = better, matches ga_hypothesis_testing convention).
+
+    The k·ln(n) complexity term is scaled by GA_COMPLEXITY_PENALTY (default 1.0
+    = standard BIC) exactly like the OLS path in _ols_bic, so the MNL stages
+    (stage-5 mode/dest) can be loosened below full-BIC parsimony. Values <1 keep
+    more behavioural coefficients; e.g. 0.4 ≈ between AIC and BIC at large n.
+    """
+    bic = -2.0 * log_lik + _GA_COMPLEXITY_PENALTY * k * np.log(max(n, 2))
     return -bic / max(n, 1)
 
 
@@ -484,6 +490,16 @@ def _bic_per_obs(log_lik: float, k: int, n: int) -> float:
 
 _FEATURE_WEAKNESS: Dict[str, float] = {}
 _WEAKNESS_DECAY = 0.95   # multiply all scores by this on each update call
+
+# Track cumulative stuck/at-bound/dropped occurrence count per feature.
+# When a feature reaches _MAX_STUCK_BEFORE_BLACKLIST, the bandit permanently
+# stops proposing it for the remainder of this stage.
+_STUCK_BLACKLIST: Dict[str, int] = {}
+_MAX_STUCK_BEFORE_BLACKLIST = 5
+
+# Higher penalty for stuck/dropped features so weakness accumulates faster
+# and the bandit's Beta posteriors move more aggressively away from them.
+_STUCK_PENALTY = 10.0  # was 5.0
 
 
 def _update_feature_weakness(
@@ -504,7 +520,8 @@ def _update_feature_weakness(
     evidence of a bad specification than mere insignificance, since it means
     the optimizer found no usable gradient at all for that term.
 
-    Stuck/at-bound → score += 5.0
+    Stuck/at-bound → score += 10.0  (and increments blacklist counter;
+                    after 5 occurrences the feature is permanently excluded)
     Weak (near-zero or insignificant), not stuck → score += 2.0
     Strong (none of the above) → score -= 0.5, clamped at 0
 
@@ -550,7 +567,8 @@ def _update_feature_weakness(
         insig      = np.isfinite(p) and p > p_thresh
         current    = _FEATURE_WEAKNESS.get(var, 0.0)
         if stuck:
-            _FEATURE_WEAKNESS[var] = current + 5.0
+            _FEATURE_WEAKNESS[var] = current + _STUCK_PENALTY
+            _STUCK_BLACKLIST[var] = _STUCK_BLACKLIST.get(var, 0) + 1
         elif near_zero or insig:
             _FEATURE_WEAKNESS[var] = current + 2.0
         else:
@@ -562,9 +580,20 @@ def get_feature_weakness() -> Dict[str, float]:
     return dict(_FEATURE_WEAKNESS)
 
 
+def get_stuck_blacklist() -> Dict[str, int]:
+    """Return a snapshot of features permanently blacklisted after repeated stuck/at-bound occurrences."""
+    return {k: v for k, v in _STUCK_BLACKLIST.items() if v >= _MAX_STUCK_BEFORE_BLACKLIST}
+
+
+def is_feature_blacklisted(name: str) -> bool:
+    """Check whether a feature has been permanently blacklisted for this stage."""
+    return _STUCK_BLACKLIST.get(name, 0) >= _MAX_STUCK_BEFORE_BLACKLIST
+
+
 def reset_feature_weakness() -> None:
-    """Clear weakness scores at the start of a new search stage."""
+    """Clear weakness scores and blacklist at the start of a new search stage."""
     _FEATURE_WEAKNESS.clear()
+    _STUCK_BLACKLIST.clear()
 
 
 def _metacount_significance_penalty(rows: list) -> float:
@@ -599,6 +628,12 @@ def _metacount_significance_penalty(rows: list) -> float:
         if not np.isfinite(v) and not np.isfinite(p):
             continue
         tested += 1
+        # Stuck/at-bound is stronger evidence of a bad specification than
+        # mere insignificance — a parameter pinned at its start value or at a
+        # bound means the optimizer found zero usable gradient for that term.
+        if r.get('stuck') or r.get('at_bound'):
+            n_weak += 1
+            continue
         near_zero = np.isfinite(v) and abs(v) < coef_zero
         insig     = np.isfinite(p) and p > p_thresh
         if near_zero or insig:

@@ -3137,12 +3137,15 @@ def _stage5_mode_only_fitness(
             _stage5_mode_only_fitness._valid_logged = _seen
         from ga_external_estimators import (_larch_coef_rows,
                                              _metacount_significance_penalty,
-                                             _update_feature_weakness)
+                                             _update_feature_weakness,
+                                             _bic_per_obs)
         coef_rows = _larch_coef_rows(mode_mdl)
         sig_pen   = _metacount_significance_penalty(coef_rows)
         _update_feature_weakness(coef_rows, mode_vars)
-        bic = -2.0 * mode_ll + k * np.log(max(n, 2))
-        return -bic / max(n, 1) - sig_pen
+        # _bic_per_obs scales the k·ln(n) term by GA_COMPLEXITY_PENALTY so the
+        # mode search isn't forced to full-BIC parsimony (which shed ~half the
+        # behavioural coefficients); sig_pen still evicts insignificant terms.
+        return _bic_per_obs(float(mode_ll), k, n) - sig_pen
     except Exception as e:
         logger.debug(f"Stage5 mode-only [{segment}]: {e}")
         return -1e9
@@ -3183,12 +3186,12 @@ def _stage5_dest_only_fitness(
             _stage5_dest_only_fitness._valid_logged = _seen
         from ga_external_estimators import (_larch_coef_rows,
                                              _metacount_significance_penalty,
-                                             _update_feature_weakness)
+                                             _update_feature_weakness,
+                                             _bic_per_obs)
         coef_rows = _larch_coef_rows(dest_mdl)
         sig_pen   = _metacount_significance_penalty(coef_rows)
         _update_feature_weakness(coef_rows, dest_vars)
-        bic = -2.0 * dest_ll + k * np.log(max(n, 2))
-        return -bic / max(n, 1) - sig_pen
+        return _bic_per_obs(float(dest_ll), k, n) - sig_pen
     except Exception as e:
         logger.debug(f"Stage5 dest-only [{segment}]: {e}")
         return -1e9
@@ -3315,10 +3318,13 @@ def _stage5_fitness_larch(
         dest_mdl = _estimate(dest_mdl)
         dest_ll  = float(dest_mdl.loglike())
 
-        # Proper BIC: -2*LL + k*ln(n), then normalise per observation
+        # Proper BIC: -2*LL + GA_COMPLEXITY_PENALTY*k*ln(n), normalised per obs.
+        # The penalty scale lets stage 5 relax full-BIC parsimony (which shed
+        # ~half the behavioural coefficients) without editing code.
+        from ga_external_estimators import _GA_COMPLEXITY_PENALTY as _gcp
         n   = len(train_tours)
         k   = int(mode_genes.sum() + dest_genes.sum())
-        bic = -2.0 * (mode_ll + dest_ll) + k * np.log(max(n, 2))
+        bic = -2.0 * (mode_ll + dest_ll) + _gcp * k * np.log(max(n, 2))
         # Significance penalty: discourage near-zero / insignificant features
         from ga_external_estimators import (_larch_coef_rows,
                                              _metacount_significance_penalty,

@@ -29,6 +29,21 @@ module load Anaconda3/2024.02-1
 conda activate "$CONDA_ENV"
 module unload Anaconda3
 
+# ── Keep estimators current from PyPI ──────────────────────────────────────
+# The per-stage jobs previously did NO install, so they ran on whatever was
+# already in the conda env (stale metacountregressor 0.0.138). Upgrade both to
+# the latest PyPI release (metacountregressor>=1.0.107, SearchLibrium>=0.0.154)
+# on every stage job. Skip with ESTIMATORS_SKIP_UPGRADE=1; use local dev trees
+# with ESTIMATOR_SOURCE=editable.
+if [ "${ESTIMATOR_SOURCE:-pypi}" != "editable" ] && [ "${ESTIMATORS_SKIP_UPGRADE:-0}" != "1" ]; then
+    echo "[pkg] Upgrading MetaCount + SearchLibrium to latest PyPI release..."
+    pip install --upgrade -q metacountregressor SearchLibrium \
+        && echo "[pkg] MetaCount + SearchLibrium upgraded (PyPI latest)" \
+        || echo "[pkg] WARNING: PyPI estimator upgrade failed (offline?) — using installed"
+    pip show metacountregressor 2>/dev/null | awk '/^Version:/{print "[pkg] metacountregressor " $0}'
+    pip show SearchLibrium      2>/dev/null | awk '/^Version:/{print "[pkg] SearchLibrium " $0}'
+fi
+
 # Force UTF-8 I/O so box-drawing/arrows/checkmarks in logs never mojibake.
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8

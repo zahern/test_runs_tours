@@ -655,7 +655,7 @@ class GAResult:
             best_so_far = [-v for v in best_so_far]
             mean        = [-v for v in mean]
             worst       = [-v for v in worst]
-            ylabel = 'BIC / n  (lower = better)'
+            ylabel = 'BIC / n'
             fill_lo, fill_hi = worst, best_so_far   # worst=high BIC (top), best=low BIC (bottom)
         else:
             ylabel = self.fitness_metric
@@ -727,24 +727,20 @@ class GAResult:
         slabel = stage_labels.get(self.stage, f'Stage {self.stage}')
         if segment_label:
             slabel += f'  [{segment_label}]'
-        improvement = (best_so_far[-1] - best_so_far[0]) if len(best_so_far) >= 2 else 0.0
-        impr_sign   = 'v' if is_bic else '^'
-        ax.set_title(
-            f'{slabel}\n'
-            f'restarts={self.n_restarts}  cache_hits={self.cache_hits}  '
-            f'delta={impr_sign}{abs(improvement):.4f}',
-            fontsize=9, fontweight='normal', pad=4,
-        )
-        ax.set_xlabel('Generation', fontsize=9)
-        ax.set_ylabel(ylabel, fontsize=9)
+        ax.set_title(slabel, fontsize=12, fontweight='bold', pad=8)
+        ax.set_xlabel('Generation', fontsize=10)
+        ax.set_ylabel(ylabel, fontsize=10)
 
-        # Restart boundary markers ÔÇö vertical dashed lines at each restart start
-        restart_marks = [h['generation'] for h in self.history
-                         if h.get('is_restart_start', False)]
-        for i, rg in enumerate(restart_marks):
-            ax.axvline(rg, color='#CC5533', linewidth=1.0, linestyle='--',
-                       alpha=0.55, zorder=2,
-                       label='restart' if i == 0 else '_nolegend_')
+        # Journal-ready convergence annotation: show the framework's gain as the
+        # feature-search drives the selection score down, start → converged, in a
+        # neutral corner caption (no restart/cache/delta engine internals).
+        if len(best_so_far) >= 2 and np.isfinite(best_so_far[0]) and np.isfinite(best_so_far[-1]):
+            _metric_name = 'BIC/n' if is_bic else self.fitness_metric
+            _cap = (f'{_metric_name}  {best_so_far[0]:.3f} → {best_so_far[-1]:.3f}'
+                    f'   ({len(gens)} generations)')
+            ax.text(0.98, 0.04, _cap, transform=ax.transAxes,
+                    ha='right', va='bottom', fontsize=8.5, color='#555555',
+                    style='italic')
 
         # Y-axis: centre tightly around the data so convergence is visible.
         # For BIC plots the full y-range is often tiny (< 0.1 BIC/n units) so
@@ -1329,6 +1325,14 @@ class GeneticAlgorithm:
         except ValueError:
             _reheat_frac = 0.3
         _reheat_frac = min(max(_reheat_frac, 0.0), 0.9)  # keep at least 10% + elites
+        # Hard mutation floor: the effective mutation rate never drops below this,
+        # so the search ALWAYS perturbs and the population can't freeze/collapse
+        # to a single genotype — important now that stages 1-3 run more generations.
+        try:
+            _mut_min = float(_os.environ.get('GA_MUTATION_MIN', '0.05'))
+        except ValueError:
+            _mut_min = 0.05
+        _mut_min = min(max(_mut_min, 0.0), 0.9)
 
         for gen in range(self.n_generations):
             print(f"Gen {gen:3d} | evaluating population... ", end='', flush=True)
@@ -1361,6 +1365,8 @@ class GeneticAlgorithm:
                 # linearly scale between base and max based on diversity
                 t        = max(0.0, 1.0 - div / max(self.diversity_threshold, 1e-6))
                 cur_rate = self.mutation_rate + t * (self.mutation_rate_max - self.mutation_rate)
+            # Never let mutation stop entirely (guards against population collapse).
+            cur_rate = max(cur_rate, _mut_min)
 
             # Diversity injection: when population has fully collapsed (div==0)
             # for at least stagnation_limit gens, reinitialise all non-elite

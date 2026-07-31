@@ -4722,7 +4722,7 @@ def _run_ga_stages_with_checkpoints(out, landuse):
     return all_ga
 
 
-def _ga_budget_params() -> dict:
+def _ga_budget_params(stage: int = None) -> dict:
     """
     Read GA_BUDGET env var and return pop/gens/restarts.
 
@@ -4789,6 +4789,21 @@ def _ga_budget_params() -> dict:
             params['n_restarts'] = max(0, int(_n_restarts_env))
         except ValueError:
             logger.warning(f"Ignoring invalid GA_N_RESTARTS={_n_restarts_env!r}; expected integer >= 0")
+
+    # Stages 1-3 are cheap per evaluation (seconds), so give them more
+    # generations to converge richer models and clearer convergence plots.
+    # GA_STAGE123_GENS_MULT scales n_generations for those stages only
+    # (default 2.0; set 1.0 to disable). Stage 5 (the expensive one) is untouched.
+    if stage in (1, 2, 3):
+        try:
+            _mult = float(os.environ.get('GA_STAGE123_GENS_MULT', '2.0'))
+        except ValueError:
+            _mult = 2.0
+        if _mult and _mult > 1.0:
+            _old_g = params['n_generations']
+            params['n_generations'] = int(round(_old_g * _mult))
+            logger.info(f"Stage {stage}: GA_STAGE123_GENS_MULT={_mult} → "
+                        f"gens {_old_g} → {params['n_generations']}")
 
     logger.info(f"GA budget level: {level!r} → pop={params['pop_size']}  "
                 f"gens={params['n_generations']}  restarts={params['n_restarts']}")
@@ -4946,7 +4961,7 @@ def ga_stage1(out, landuse=None):
                                     out_dir=OUT_DIR)
         except Exception as _mv_e:
             logger.error(f"Stage 1 multivariate fit skipped: {_mv_e!r}")
-    _bp = _ga_budget_params()
+    _bp = _ga_budget_params(stage=1)
     res = run_ga_stage1(out["tours"], out["persons"], landuse=landuse, **_bp)
     _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage1.png'))
     return res
@@ -4955,7 +4970,7 @@ def ga_stage1(out, landuse=None):
 @timer("GA — Stage 2 (day duration)")
 def ga_stage2(out):
     from census_bridge import run_ga_stage2
-    _bp = _ga_budget_params()
+    _bp = _ga_budget_params(stage=2)
     res = run_ga_stage2(out["tours"], out["persons"], **_bp)
     _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage2.png'))
     return res
@@ -4964,7 +4979,7 @@ def ga_stage2(out):
 @timer("GA — Stage 3 (activity duration)")
 def ga_stage3(out):
     from census_bridge import run_ga_stage3
-    _bp = _ga_budget_params()
+    _bp = _ga_budget_params(stage=3)
     res = run_ga_stage3(out["tours"], out["persons"], trips=out["trips"], **_bp)
     _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage3.png'))
     return res

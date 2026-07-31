@@ -5103,6 +5103,19 @@ def _write_smoke_models_html(models: dict, save_dir: str, title: str = 'Stage 5 
                         rows = ""
                         for p in params:
                                 val = coef.get(str(p), float('nan'))
+                                # Print ONLY parameters actually in the fitted model:
+                                # skip candidates that weren't estimated (blank value)
+                                # and terms holdfast at 0 (dropped / not selected).
+                                # Non-zero structural constants (e.g. Mu_Root=1,
+                                # log_correction=1) are kept.
+                                _hf = False
+                                if pf is not None and p in pf.index and 'holdfast' in getattr(pf, 'columns', []):
+                                        try:
+                                                _hf = bool(pf.loc[p, 'holdfast'])
+                                        except Exception:
+                                                _hf = False
+                                if not np.isfinite(pd.to_numeric(val, errors='coerce')) or (_hf and abs(float(val)) < 1e-9):
+                                        continue
                                 se = tstat = pval = float('nan')
                                 if pf is not None and p in pf.index:
                                         row = pf.loc[p]

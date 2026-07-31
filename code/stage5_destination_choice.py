@@ -6613,6 +6613,13 @@ def _estimate(model, two_phase: bool = False):
                      if 'holdfast' in _pf_d.columns
                      else pd.Series(False, index=_pf_d.index))
             _cur_d = _pf_d['value'].astype(float)
+            # Only ZERO-drop a stuck component when it is ALSO effectively zero.
+            # A parameter stuck at a NON-zero value (e.g. an availability/ASC-like
+            # term the optimiser left at its start) carries real utility — forcing
+            # it to 0 floored the chosen alternative to ~0 probability and blew the
+            # refit LL to -4.5e34 (poisoning the search fitness AND leaving the
+            # final model degenerate → singular Hessian → all-OPG t≈const p-values).
+            _drop_zero = float(os.environ.get('STAGE5_DROP_STUCK_ZERO', '0.05'))
             _dropped_stuck = [
                 p for p in _pf_d.index
                 if not _hf_d.get(p, False)
@@ -6620,10 +6627,14 @@ def _estimate(model, two_phase: bool = False):
                 and p in _start_vals.index
                 and np.isfinite(_cur_d[p])
                 and abs(_cur_d[p] - float(_start_vals[p])) < 1e-12
+                and abs(_cur_d[p]) < _drop_zero          # dead term only
             ]
             if _dropped_stuck:
+                # Snapshot the pre-drop optimum so a degrading refit can be reverted.
+                _predrop_ll = float(getattr(result, 'loglike', float('nan')))
+                _predrop_vals = _cur_d.copy()
                 logger.warning(
-                    f"_estimate: dropping {len(_dropped_stuck)} stuck (never-moved) "
+                    f"_estimate: dropping {len(_dropped_stuck)} stuck near-zero "
                     f"component(s) and refitting without them: {_dropped_stuck}"
                 )
                 for _p in _dropped_stuck:
@@ -6637,8 +6648,31 @@ def _estimate(model, two_phase: bool = False):
                         _pf_set(model, _p, 'holdfast', True)
                 try:
                     result = model.maximize_loglike(options=est_options)
-                    _compute_inference()
-                    print(f"    _estimate stuck-drop refit done: LL={getattr(result, 'loglike', '?')}")
+                    _new_ll = float(getattr(result, 'loglike', float('nan')))
+                    # Revert if the refit is non-finite, the blown-LL sentinel, or
+                    # materially worse than the pre-drop fit. Dropping a genuinely
+                    # dead term should leave LL essentially unchanged.
+                    if (not np.isfinite(_new_ll) or _new_ll < -1e12
+                            or (np.isfinite(_predrop_ll)
+                                and _new_ll < _predrop_ll - 1e-3)):
+                        logger.warning(
+                            f"_estimate: stuck-drop refit worsened LL "
+                            f"({_predrop_ll:.2f} → {_new_ll:.2e}) — reverting to "
+                            "the pre-drop fit (terms left free)")
+                        for _p in _dropped_stuck:
+                            try:
+                                _pf_set(model, _p, 'holdfast', False)
+                            except Exception:
+                                pass
+                        for _p in _predrop_vals.index:
+                            try:
+                                model.set_value(_p, float(_predrop_vals[_p]))
+                            except Exception:
+                                pass
+                        _compute_inference()
+                    else:
+                        _compute_inference()
+                        print(f"    _estimate stuck-drop refit done: LL={_new_ll}")
                 except Exception as _rf_e:
                     logger.warning(
                         f"_estimate: stuck-drop refit failed ({_rf_e!r}) - "

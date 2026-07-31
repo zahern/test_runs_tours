@@ -6706,6 +6706,19 @@ def _estimate(model, two_phase: bool = False):
     # (std errors, covariance, diagnostics) must reflect the real likelihood.
     _ennet_ctx.__exit__(None, None, None)
 
+    # RE-COMPUTE inference on the UNPENALIZED likelihood. Every _compute_inference()
+    # call above ran while the elastic-net (L1/L2) penalty was still active, so
+    # calculate_parameter_covariance() saw the penalized objective — its Hessian is
+    # ill-defined under the non-smooth L1 term, which failed silently (every fit
+    # logged "Hessian: 0") and fell back to OPG on the penalized scores, producing
+    # the degenerate near-constant t≈0.65 (all coefficients spuriously
+    # "insignificant"). Recomputing here, with the penalty removed, gives the real
+    # observed-information Hessian and correct standard errors / p-values.
+    try:
+        _compute_inference()
+    except Exception as _post_inf_e:
+        logger.debug(f"_estimate: unpenalized inference recompute failed ({_post_inf_e})")
+
     # ── Build definitive parameter frame (nuclear guarantee + final cache) ──────
     #
     # IMPORTANT: in Larch 6.x + pandas 2.x, model.pf is a PROPERTY that

@@ -3021,7 +3021,8 @@ def _estimate_dest_coefficients_alt(
     sampled_alts: pd.DataFrame,
     skim_df: pd.DataFrame,
     crash_source=None,
-) -> dict:
+    return_stats: bool = False,
+):
     """
     Alternative destination estimation when Larch destination fit fails.
 
@@ -3263,21 +3264,39 @@ def _estimate_dest_coefficients_alt(
     if not np.all(np.isfinite(opt)):
         raise RuntimeError("alt dest estimation (jax) produced non-finite coefficients")
 
-    coef = {
-        'c_log_dist': float(opt[0]),
-        'c_dist': float(opt[1]),
-        'c_size_term': float(opt[2]),
-        'c_logsum': float(opt[3]),
-        'c_crash': float(opt[4]),
-    }
+    _names = ['c_log_dist', 'c_dist', 'c_size_term', 'c_logsum', 'c_crash']
+    coef = {_names[i]: float(opt[i]) for i in range(len(_names))}
+
+    # ── Standard errors from the observed information matrix ──────────────────
+    # This fallback previously returned point estimates only, so its dest
+    # coefficients showed NaN std_err/t/p in the reports. Compute the Hessian of
+    # the SUM negative log-likelihood at the optimum (=(n_cases)·Hessian of the
+    # mean NLL that _loss returns), invert for the covariance, and derive SE/t/p.
+    stats = {k: {'std_err': float('nan'), 't_stat': float('nan'),
+                 'pval': float('nan')} for k in coef}
+    try:
+        _H_mean = np.asarray(jax.hessian(_loss)(best_theta), dtype=np.float64)
+        _H_sum = _H_mean * float(n_cases)
+        _cov = np.linalg.inv(_H_sum)
+        _se = np.sqrt(np.clip(np.diag(_cov), 0.0, None))
+        from scipy.stats import norm as _norm
+        for _i, _nm in enumerate(_names):
+            _s = float(_se[_i])
+            _t = float(opt[_i] / _s) if (np.isfinite(_s) and _s > 0) else float('nan')
+            _p = float(2.0 * _norm.sf(abs(_t))) if np.isfinite(_t) else float('nan')
+            stats[_nm] = {'std_err': _s, 't_stat': _t, 'pval': _p}
+    except Exception as _se_e:
+        logger.debug(f"_estimate_dest_coefficients_alt: SE computation failed ({_se_e})")
+
     logger.info(
         "_estimate_dest_coefficients_alt: estimated JAX fallback coefficients on "
         f"{len(datasets)} cases "
         f"(c_log_dist={coef['c_log_dist']:.4f}, c_dist={coef['c_dist']:.4f}, "
         f"c_size_term={coef['c_size_term']:.4f}, c_logsum={coef['c_logsum']:.4f}, "
-        f"c_crash={coef['c_crash']:.4f}, best_nll={best_loss:.6f})"
+        f"c_crash={coef['c_crash']:.4f}, best_nll={best_loss:.6f}; "
+        f"SE {'computed' if np.isfinite(stats['c_dist']['std_err']) else 'unavailable'})"
     )
-    return coef
+    return (coef, stats) if return_stats else coef
 
 
 # ===========================================================================

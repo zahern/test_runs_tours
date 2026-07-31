@@ -4509,15 +4509,30 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                             # the report shows real coefficients, never an empty table.
                             if not _dest_coef:
                                 try:
-                                    _dest_coef = _estimate_dest_coefficients_alt(
+                                    _dest_coef, _dest_stats = _estimate_dest_coefficients_alt(
                                         seg_tours=_seg_acdc, landuse=_lu_st,
                                         logsums=_ls, sampled_alts=_sampled_alts,
                                         skim_df=(_skim_df if _skim_df is not None else pd.DataFrame()),
-                                        crash_source=None)
+                                        crash_source=None, return_stats=True)
                                     _dest_mdl._coef_cache = dict(_dest_coef)
+                                    # Attach a parameter frame carrying the Hessian-
+                                    # based SEs so the coef CSV/HTML report real
+                                    # std_err/t/p for the fallback dest terms instead
+                                    # of NaN (the writers read _final_pf first).
+                                    _dest_mdl._final_pf = pd.DataFrame({
+                                        'value':    {k: _dest_coef[k] for k in _dest_coef},
+                                        'std_err':  {k: _dest_stats[k]['std_err'] for k in _dest_coef},
+                                        't_stat':   {k: _dest_stats[k]['t_stat'] for k in _dest_coef},
+                                        'pval':     {k: _dest_stats[k]['pval'] for k in _dest_coef},
+                                        'holdfast': {k: False for k in _dest_coef},
+                                    })
+                                    _n_sig = sum(1 for k in _dest_coef
+                                                 if np.isfinite(_dest_stats[k]['pval'])
+                                                 and _dest_stats[k]['pval'] < 0.05)
                                     logger.info(
                                         f"GA stage 5 coef HTML [{_seg}]: JAX fallback "
-                                        f"estimated {len(_dest_coef)} dest coefficients")
+                                        f"estimated {len(_dest_coef)} dest coefficients "
+                                        f"with SEs ({_n_sig} significant at 5%)")
                                 except Exception as _alte:
                                     logger.warning(
                                         f"GA stage 5 coef HTML [{_seg}]: JAX dest "

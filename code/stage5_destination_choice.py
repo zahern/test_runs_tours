@@ -57,6 +57,16 @@ logger = logging.getLogger(__name__)
 if os.environ.get('GA_LARCH_TROUBLESHOOT', '0') != '1':
     logging.getLogger('larch.model.troubleshooting').setLevel(logging.ERROR)
 
+# The flat destination model can fail to compile under sharrow/numba (a 1D-column
+# vs 3D-result dtype mismatch in the generated dim*_filler), which sharrow logs as
+# a wall of "ERROR:sharrow: <col> = __main__<col>[...]" + "nb.TypingError in N
+# functions". This is EXPECTED and HANDLED — _estimate/_build_dest_model catch it
+# and fall back to the JAX importance-sampled dest estimator (a WARNING is still
+# logged), so the run is fine. Demote sharrow's logger to CRITICAL to stop the
+# spam that looks like a hard failure. Set STAGE5_SHARROW_VERBOSE=1 to restore it.
+if os.environ.get('STAGE5_SHARROW_VERBOSE', '0') != '1':
+    logging.getLogger('sharrow').setLevel(logging.CRITICAL)
+
 PURPOSES     = ['work', 'edu', 'social', 'escort',
                 'shopping', 'othmaint', 'othdiscr', 'eat']
 NON_MANDATORY = ['social', 'escort', 'shopping', 'othmaint', 'othdiscr', 'eat']

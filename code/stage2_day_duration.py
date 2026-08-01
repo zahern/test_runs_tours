@@ -840,7 +840,12 @@ def predict_day_budget(
                 arrays.append(df[col].fillna(0).values.astype(float))
             else:
                 arrays.append(np.zeros(len(df), dtype=float))
-        return np.column_stack(arrays) if arrays else np.ones((len(df), 1))
+        # Return EXACTLY len(cols) columns so X aligns with model.coef_. When the
+        # feature list is empty (e.g. the end model whose only feature is the
+        # appended start_pred) this must be a 0-column matrix, NOT ones((n,1)) —
+        # the stray column made X_end 2-wide against a 1-long coef_ and crashed
+        # the whole population prediction with a matmul dimension mismatch.
+        return np.column_stack(arrays) if arrays else np.zeros((len(df), 0))
 
     # â”€â”€ predict start_of_day â”€â”€
     X_start = _build_X_exact(df, models['start']['model'])

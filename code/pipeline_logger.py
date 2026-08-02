@@ -671,7 +671,18 @@ def load_synth_all_zones(synth_dir: str = SYNTH_DIR,
     pd.DataFrame  — full synthetic population with OTAZ set correctly.
     """
     # ── NEW_POP_MAPPED: load from pre-built mapped CSV or build on-the-fly ──
-    if NEW_POP_MAPPED:
+    # NEW_POP (SA2-direct 371) takes PRECEDENCE over NEW_POP_MAPPED — the module
+    # already selects the SA2-direct branch for DEFAULT_SYNTH/SYNTH_DIR, and the
+    # mapped path collapses the population onto the RETIRED 330-system ORDER
+    # (sa2_to_order_crosswalk.csv → max ORDER 329) which is misaligned with the
+    # 371-SA2 landuse+skim (the 485 / 324-vs-371 mismatch). So only take the
+    # mapped path when NEW_POP is OFF. Warn if both were set (contradictory).
+    if NEW_POP and NEW_POP_MAPPED:
+        logger.warning(
+            "NEW_POP=1 and NEW_POP_MAPPED=1 are contradictory — using the "
+            "SA2-direct 371 population (NEW_POP wins). Set NEW_POP_MAPPED=0 to "
+            "silence this, or NEW_POP=0 to use the legacy mapped-ORDER scope.")
+    if NEW_POP_MAPPED and not NEW_POP:
         from build_synth_population import (
             build_synth_population_mapped,
             OUT_MAPPED_PERSONS,
@@ -3939,11 +3950,17 @@ def stage5b(out, scheduled_dest, landuse, reuse_models_path=None):
     """
     if reuse_models_path is None:
         reuse_models_path = _resolve_stage5b_reuse_path()
+    # Pass the actual zone-id column ('ORDER' == SA2 code in new_pop landuse) so
+    # run_stage5b builds taz_index from the 371-zone LANDUSE (aligned to the
+    # skim) instead of falling back to the trips' TAZ codes — that fallback keyed
+    # on a >371 zone range and overflowed the 371×371 skim (index 485 crash).
+    _s5b_zone_col = 'ORDER' if 'ORDER' in getattr(landuse, 'columns', []) else 'zone_id'
     result = run_stage5b(
         trips              = scheduled_dest,
         persons            = out["persons"],
         skims_path         = PIPELINE_SKIMS_PATH,
         landuse            = landuse,
+        zone_id_col        = _s5b_zone_col,
         output_dir         = OUT_DIR,
         reuse_models_path  = reuse_models_path,
     )

@@ -392,10 +392,18 @@ def build_synth_population(
 # 324-ZONE MAPPED POPULATION  (new_pop files → ORDER-based OTAZ)
 # ---------------------------------------------------------------------------
 
-#: Crosswalk produced by demand_/20_build_sa2_to_order_crosswalk.py
-_DEFAULT_CROSSWALK = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                 '..', 'demand_', 'sa2_to_order_crosswalk.csv')
+#: SA2->ORDER crosswalk. Prefer the 371-zone rebuild
+#: (demand_/20b_build_sa2_to_order_crosswalk_371.py) so mapped-ORDER lines up
+#: with the 371 landuse+skim; fall back to the legacy 330-system crosswalk
+#: (demand_/20_build_sa2_to_order_crosswalk.py) only if the 371 file is absent.
+#: Override explicitly with SA2_ORDER_CROSSWALK.
+_demand_dir = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'demand_'))
+_xwalk_371 = os.path.join(_demand_dir, 'sa2_to_order_crosswalk_371.csv')
+_xwalk_legacy = os.path.join(_demand_dir, 'sa2_to_order_crosswalk.csv')
+_DEFAULT_CROSSWALK = (
+    os.environ.get('SA2_ORDER_CROSSWALK')
+    or (_xwalk_371 if os.path.exists(_xwalk_371) else _xwalk_legacy)
 )
 
 OUT_MAPPED_FULL    = 'saved_data/synth_population_mapped.csv'

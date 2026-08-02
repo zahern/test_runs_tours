@@ -271,12 +271,31 @@ def compute_detour(
 
     Returns a pd.Series with the same index as df.
     """
+    # Skim is N×N (N = number of zones in the skim, e.g. 371). taz_index maps a
+    # zone id to its 0-based position, but when it is built from a landuse table
+    # that carries MORE zones than the skim (or a different ordering), the mapped
+    # position can exceed N-1 and overflow the skim (IndexError: index 485 out of
+    # bounds for size 371). Guard every mapped index to the valid [0, N-1] range;
+    # out-of-range / unmapped zones fall back to 0 (their detour contribution is
+    # dropped rather than crashing the whole trip-destination stage).
+    _n_skim = int(skim_dist.shape[0])
+    _oor_total = 0
+
     def _idx(col: str) -> np.ndarray:
-        return df[col].map(taz_index).fillna(0).astype(int).values
+        nonlocal _oor_total
+        raw = df[col].map(taz_index)
+        bad = ~(raw.notna() & (raw >= 0) & (raw < _n_skim))
+        _oor_total += int(bad.sum())
+        return raw.where(~bad, 0).astype(int).values
 
     o_idx  = _idx("origin_taz")
     s_idx  = _idx("dest_taz")
     a_idx  = _idx("anchor_down_taz")
+    if _oor_total:
+        logger.warning(
+            f"compute_detour: {_oor_total} zone index(es) were unmapped or outside "
+            f"the {_n_skim}-zone skim and were set to 0 (detour dropped for those). "
+            "Check that taz_index/landuse zone set matches the skim zone set.")
 
     d_os = _skim_lookup(skim_dist, o_idx, s_idx)
     d_sa = _skim_lookup(skim_dist, s_idx, a_idx)

@@ -24,10 +24,14 @@ RUN_TAG=${RUN_TAG:-ga_parallel_${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}
 CONDA_ENV=${CONDA_ENV:-zigenv}
 
 # Estimation settings propagated to stage jobs.
-GA_BUDGET=${GA_BUDGET:-fast}
-GA_ESTIMATOR=${GA_ESTIMATOR:-sa_bandit}
+# Defaults are the aligned 371 + search-quality config (a bare
+#   qsub -v "RUN_TAG=xxx" job_submit_ga_parallel_chain.pbs
+# now runs the intended metacount_mv / GA-engine 371 pipeline). Override any of
+# these via -v as needed.
+GA_BUDGET=${GA_BUDGET:-standard}
+GA_ESTIMATOR=${GA_ESTIMATOR:-metacount_mv}
 GA_USE_SA=${GA_USE_SA:-1}
-GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-1}
+GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-0}   # 0 = GA engine (gets reheat/mutation floor)
 GA_N_RESTARTS=${GA_N_RESTARTS:-0}
 GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-4}
 # GA_PROFILE=1 runs every stage job (and the predict job) under cProfile,
@@ -36,7 +40,7 @@ GA_PROFILE=${GA_PROFILE:-0}
 # GA_COMPLEXITY_PENALTY scales the BIC complexity penalty in the Stage 2/3 fast
 # GA oracle. 1.0 = standard BIC (sparse); lower (e.g. 0.3-0.5) keeps more
 # predictors — use it to "open up" flat Stage 2/3 searches.
-GA_COMPLEXITY_PENALTY=${GA_COMPLEXITY_PENALTY:-1.0}
+GA_COMPLEXITY_PENALTY=${GA_COMPLEXITY_PENALTY:-0.4}
 # GA_REHEAT_FRACTION: fraction of the population replaced by fresh random
 # individuals on each plateau generation (partial reheat) so the search keeps
 # perturbing/improving instead of flatlining. 0 disables; 0.3 is the default.
@@ -62,7 +66,7 @@ GA_RESOLVE_CONFLICTS=${GA_RESOLVE_CONFLICTS:-1}
 STAGE5_ENABLE_MXL=${STAGE5_ENABLE_MXL:-0}
 # GSE (Gradient Score Enhanced) mixed logit: systematic γ·g_origin loadings on
 # the random taste params. Implies MXL. Enable with STAGE5_ENABLE_GSE=1.
-STAGE5_ENABLE_GSE=${STAGE5_ENABLE_GSE:-0}
+STAGE5_ENABLE_GSE=${STAGE5_ENABLE_GSE:-1}
 # ActivitySim-style household CDAP coordination (joint 2-way logit).
 # Off by default; CDAP_HOUSEHOLD_COORD=1 coordinates M/N/H at household level.
 CDAP_HOUSEHOLD_COORD=${CDAP_HOUSEHOLD_COORD:-0}
@@ -97,17 +101,15 @@ S5_WORKERS=${S5_WORKERS:-8}
 PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
 INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS:-1}
 
-# 507-zone SA2 population scope.  Set NEW_POP=1 to activate the new_pop
-# zoning system (OTAZ = SA2 code directly, matched to the GAN synth pop).
-# NEW_POP_MAPPED=1 is the production default - matches job_full_pipeline_dta_tested.pbs
-# and job_predict_dta_tested.pbs (both hardcode NEW_POP_MAPPED=1), so a bare
-# `qsub job_submit_ga_parallel_chain.pbs` produces GA results on the same
-# population scope the vehicle.dat pipeline expects, with no -v flags needed.
+# Zone scope. Default = the fully-aligned SA2-direct 371 system: population
+# (OTAZ = 9-digit SA2), landuse (ORDER = SA2) and the 371 skim are all one zone
+# space — no legacy-ORDER remap, no 485/{371,324} mismatch. NEW_POP=1 wins over
+# NEW_POP_MAPPED in the loader. Set NEW_POP_MAPPED=1 (with the regenerated 371
+# crosswalk, demand_/sa2_to_order_crosswalk_371.csv) only if you need integer
+# 1..371 ORDER ids in the DynusT export.
 # NEW_POP_DIR: parent of saved_data/zone_ids_sa2/ (relative to PBS_O_WORKDIR).
-# PIPELINE_SKIMS_PATH: openmatrix-spec OMX for stage 5 (run
-#   demand_/11_convert_skims_to_openmatrix.py on HPC to generate it first).
-NEW_POP=${NEW_POP:-0}
-NEW_POP_MAPPED=${NEW_POP_MAPPED:-1}
+NEW_POP=${NEW_POP:-1}
+NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
 NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
 # Skim path default depends on mode:
 #   NEW_POP=1 (507-zone SA2 direct) : the openmatrix-spec converted OMX is

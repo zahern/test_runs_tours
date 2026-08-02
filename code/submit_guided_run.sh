@@ -60,6 +60,10 @@ COMMON+=",GA_ESTIMATOR=sa_bandit,GA_USE_SA=1,GA_USE_BANDIT_SA=1,GA_BUDGET=standa
 COMMON+=",ESTIMATOR_SOURCE=pypi"
 COMMON+=",INSTALL_ESTIMATORS=1,PIPELINE_ACCELERATOR=cpu,GA_N_RESTARTS=0"
 COMMON+=",GA_SIG_PENALTY_WEIGHT=1.50,GA_SIG_PVAL_THRESH=0.05"
+# Search-quality defaults (aligned with job_submit_ga_parallel_chain.pbs):
+# looser complexity penalty keeps behavioural terms, more gens for the cheap
+# stages 1-3, GSE gradient loadings on the stage-5 mode model.
+COMMON+=",GA_COMPLEXITY_PENALTY=0.4,GA_STAGE123_GENS_MULT=2.0,STAGE5_ENABLE_GSE=1"
 # 8 → 4 workers + per-worker JAX cache budget. Job 23926202 OOM'd at 202 GB /
 # 194 GB in Stage 1: _maybe_clear_jax_caches checks EACH worker's own RSS
 # against 80% of GA_JAX_CACHE_MEM_LIMIT_GB (which the PBS script defaulted to

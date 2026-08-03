@@ -4514,9 +4514,16 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                                 except Exception:
                                     _dest_coef = {}
                             except Exception as _le:
+                                # Keep only the first line — the full numba
+                                # TypingError traceback (sharrow flat-flow compile
+                                # of the dest CA columns) is expected here and was
+                                # flooding the .e log; the JAX fallback handles it.
+                                _le1 = str(_le).splitlines()[0] if str(_le) else repr(_le)
                                 logger.warning(
                                     f"GA stage 5 coef HTML [{_seg}]: Larch dest "
-                                    f"estimation failed ({_le}); trying JAX fallback")
+                                    f"estimation failed ({_le1[:160]}); using JAX "
+                                    "importance-sampled fallback (STAGE5_SHARROW_VERBOSE=1 "
+                                    "for the full trace)")
 
                             # If Larch produced no usable coefficients (sharrow flow
                             # crash), estimate the compact importance-sampled

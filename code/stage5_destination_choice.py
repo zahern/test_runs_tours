@@ -2864,9 +2864,42 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
         ca_df = ca_df.drop(columns=_drop_from_ca)
         logger.info(f"_dest_tree: dropped {_drop_from_ca} from CA (kept in CO only)")
     ca_df_indexed = ca_df.set_index(['ptour_id', '_altid_']).sort_index()
+    # ── dtype coercion: force every numeric CA column to float64 ──────────────
+    # The sharrow/numba flow fills a float64 3-D result buffer; float32 columns
+    # made the generated dim*_filler emit setitem(float64-3d <- float32-1d), which
+    # numba can't type -> the whole dest flow fails to compile and falls back to
+    # the JAX estimator. Matching the buffer dtype removes the dtype half of that
+    # mismatch. Set STAGE5_DEST_F32=1 to keep float32 (debugging).
+    if os.environ.get('STAGE5_DEST_F32', '0') != '1':
+        _num32 = [c for c in ca_df_indexed.columns
+                  if str(ca_df_indexed[c].dtype) in ('float32', 'float16')]
+        if _num32:
+            ca_df_indexed[_num32] = ca_df_indexed[_num32].astype(np.float64)
     d_ca = lx.Dataset.construct.from_idca(ca_df_indexed)
     logger.info(f"_dest_tree: d_ca built - {len(d_ca.data_vars)} vars, "
                 f"dims={dict(d_ca.dims)}")
+
+    # ── Per-variable shape/dtype diagnostic ──────────────────────────────────
+    # The flat dest flow crashes when a CA variable comes out 1-D (indexed by
+    # case only) while the filler expects 2-D (case x alt). Dump each var's
+    # dims/ndim/dtype once so the offending column is identifiable from the log.
+    # Gated by STAGE5_DEST_DIAG (default on until the flat flow is fixed).
+    if os.environ.get('STAGE5_DEST_DIAG', '1') == '1':
+        try:
+            _ca_dim = None
+            for _v in d_ca.data_vars:
+                _da = d_ca[_v]
+                if _ca_dim is None:
+                    _ca_dim = tuple(_da.dims)
+            _oned = [str(_v) for _v in d_ca.data_vars if d_ca[_v].ndim < 2]
+            _f32  = [str(_v) for _v in d_ca.data_vars
+                     if str(d_ca[_v].dtype) in ('float32', 'float16')]
+            logger.info(
+                f"[DEST DIAG] d_ca vars={len(d_ca.data_vars)} dims={dict(d_ca.dims)} "
+                f"| 1-D vars ({len(_oned)}): {_oned[:25]} "
+                f"| non-float64 vars ({len(_f32)}): {_f32[:25]}")
+        except Exception as _dd_e:
+            logger.info(f"[DEST DIAG] diagnostic failed: {_dd_e!r}")
 
     # Merge tour co-data
     tour_co = tour_df.copy()
@@ -2973,6 +3006,7 @@ def _importance_sample_dest_alts(
     draw_size   = sample_size - 1       # extra draws beyond chosen
 
     rows = []
+    _n_chosen_out = 0
     for _, tour in tours_df.iterrows():
         pid = str(tour['ptour_id'])
         try:
@@ -2980,46 +3014,64 @@ def _importance_sample_dest_alts(
         except (ValueError, TypeError):
             chosen = -1
 
-        chosen_valid = (chosen in zone_set)
+        chosen_in_universe = (chosen in zone_set)
 
-        # Draw draw_size alternatives from q, excluding chosen if it's valid
-        if chosen_valid and draw_size > 0:
-            # Draw from the full distribution; we'll replace the chosen zone
-            # with a substitute if it happens to appear (keep set diversity)
-            candidate_idx = zone_to_idx[chosen]
-            # probability vector excluding chosen zone
-            q_excl = q.copy()
-            q_excl[candidate_idx] = 0.0
-            q_excl_sum = q_excl.sum()
-            if q_excl_sum > 0:
-                q_excl = q_excl / q_excl_sum
-            else:
-                q_excl = np.ones(n_zones, dtype=np.float64) / n_zones
+        # ── The CHOSEN alternative is ALWAYS included (Manski-Lerman requires
+        #    the observed alternative to be in every sampled set for a consistent
+        #    MLE). It is emitted FIRST, then the remaining alternatives are drawn
+        #    from q without replacement (excluding the chosen so it's never a
+        #    duplicate). This holds even when sample_size==1 or when the chosen
+        #    zone is OUTSIDE the sampling universe (external/fringe DTAZ).
+        if chosen in zone_to_idx:
+            c_idx = zone_to_idx[chosen]
+            rows.append({'ptour_id': pid, 'alt_zone': chosen,
+                         'log_correction': float(-log_q[c_idx])})
+        elif chosen >= 0:
+            # Out-of-universe chosen: still forced in, deterministic inclusion →
+            # log_correction 0 (its downstream size/skim terms default; the point
+            # is the observed alt is present so the MLE is consistent).
+            rows.append({'ptour_id': pid, 'alt_zone': chosen, 'log_correction': 0.0})
+            _n_chosen_out += 1
 
-            sampled_idx = rng.choice(
-                n_zones, size=min(draw_size, n_zones - 1),
-                replace=False, p=q_excl,
-            )
-            alt_indices = [candidate_idx] + sampled_idx.tolist()
-        elif draw_size > 0:
-            # No valid chosen - draw sample_size alternatives freely
-            alt_indices = rng.choice(n_zones, size=sample_size, replace=False, p=q).tolist()
-        else:
-            # sample_size == 1 and no valid chosen
-            alt_indices = [int(rng.choice(n_zones, p=q))]
-
-        for idx in alt_indices:
-            rows.append({
-                'ptour_id':       pid,
-                'alt_zone':       int(zone_arr[idx]),
-                'log_correction': float(-log_q[idx]),   # Manski-Lerman: −log(q_j)
-            })
+        # Remaining draws from q, excluding the chosen zone to avoid duplicates.
+        n_drawn = draw_size if (chosen in zone_to_idx or chosen >= 0) else sample_size
+        n_drawn = min(n_drawn, n_zones - (1 if chosen in zone_to_idx else 0))
+        if n_drawn > 0:
+            q_draw = q.copy()
+            if chosen in zone_to_idx:
+                q_draw[zone_to_idx[chosen]] = 0.0
+            s = q_draw.sum()
+            q_draw = q_draw / s if s > 0 else np.ones(n_zones) / n_zones
+            for idx in rng.choice(n_zones, size=n_drawn, replace=False, p=q_draw):
+                rows.append({
+                    'ptour_id':       pid,
+                    'alt_zone':       int(zone_arr[idx]),
+                    'log_correction': float(-log_q[idx]),   # Manski-Lerman: −log(q_j)
+                })
 
     result = pd.DataFrame(rows, columns=['ptour_id', 'alt_zone', 'log_correction'])
     n_obs = tours_df['ptour_id'].nunique() if 'ptour_id' in tours_df.columns else len(tours_df)
+    # Verify the invariant: every observation's chosen DTAZ is in its sampled set.
+    _chosen_present = True
+    try:
+        _obs = tours_df[['ptour_id', 'DTAZ']].dropna().copy()
+        _obs['ptour_id'] = _obs['ptour_id'].astype(str)
+        _obs['DTAZ'] = pd.to_numeric(_obs['DTAZ'], errors='coerce').astype('Int64')
+        _pairs = set(zip(result['ptour_id'].astype(str), result['alt_zone'].astype(int)))
+        _missing = sum(1 for p, d in zip(_obs['ptour_id'], _obs['DTAZ'])
+                       if pd.notna(d) and int(d) >= 0 and (p, int(d)) not in _pairs)
+        _chosen_present = (_missing == 0)
+        if _missing:
+            logger.error(f"_importance_sample_dest_alts: {_missing} observations "
+                         "have their chosen DTAZ MISSING from the sample set (bug)")
+    except Exception:
+        pass
     logger.info(
         f"_importance_sample_dest_alts: {n_obs} observations × {sample_size} alts "
-        f"= {len(result)} rows; q range=[{q.min():.2e},{q.max():.2e}]"
+        f"= {len(result)} rows; q range=[{q.min():.2e},{q.max():.2e}]; "
+        f"chosen-in-set={'OK' if _chosen_present else 'FAILED'}"
+        + (f"; {_n_chosen_out} chosen out-of-universe (forced in, corr=0)"
+           if _n_chosen_out else "")
     )
     return result
 

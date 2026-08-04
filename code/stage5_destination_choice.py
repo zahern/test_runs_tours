@@ -2902,16 +2902,21 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                 _vals2d = np.repeat(np.asarray(_da.values)[:, None], _n_alt, axis=1)
                 d_ca[_v] = (('ptour_id', '_altid_'), _vals2d)
                 _bcast.append(str(_v))
-        if _bcast:
-            logger.warning(f"_dest_tree: broadcast {len(_bcast)} collapsed 1-D CA "
-                           f"vars back to 2-D so the flat flow compiles: {_bcast[:20]}")
+        if _bcast and not getattr(_dest_tree, '_bcast_logged', False):
+            # (informational, logged once) NOT an error — from_idca collapses
+            # per-case-constant columns to 1-D; we re-expand them to 2-D so the
+            # numba CA flow compiles and the full Larch dest model can estimate.
+            logger.info(f"_dest_tree: re-expanded {len(_bcast)} per-case CA vars to "
+                        f"2-D for the flat flow (e.g. {_bcast[:8]})")
+            _dest_tree._bcast_logged = True
 
     # ── Per-variable shape/dtype diagnostic ──────────────────────────────────
     # The flat dest flow crashes when a CA variable comes out 1-D (indexed by
     # case only) while the filler expects 2-D (case x alt). Dump each var's
     # dims/ndim/dtype once so the offending column is identifiable from the log.
-    # Gated by STAGE5_DEST_DIAG (default on until the flat flow is fixed).
-    if os.environ.get('STAGE5_DEST_DIAG', '1') == '1':
+    # Gated by STAGE5_DEST_DIAG (default OFF now that the flat flow is fixed;
+    # set STAGE5_DEST_DIAG=1 to re-enable the per-build shape dump).
+    if os.environ.get('STAGE5_DEST_DIAG', '0') == '1':
         try:
             _ca_dim = None
             for _v in d_ca.data_vars:

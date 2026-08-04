@@ -2894,7 +2894,9 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
             _oned = [str(_v) for _v in d_ca.data_vars if d_ca[_v].ndim < 2]
             _f32  = [str(_v) for _v in d_ca.data_vars
                      if str(d_ca[_v].dtype) in ('float32', 'float16')]
-            logger.info(
+            # WARNING level so it lands in the .e log (INFO is written nowhere
+            # accessible in the stage jobs).
+            logger.warning(
                 f"[DEST DIAG] d_ca vars={len(d_ca.data_vars)} dims={dict(d_ca.dims)} "
                 f"| 1-D vars ({len(_oned)}): {_oned[:25]} "
                 f"| non-float64 vars ({len(_f32)}): {_f32[:25]}")

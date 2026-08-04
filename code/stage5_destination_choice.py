@@ -2879,6 +2879,33 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     logger.info(f"_dest_tree: d_ca built - {len(d_ca.data_vars)} vars, "
                 f"dims={dict(d_ca.dims)}")
 
+    # ── Force every CA variable to be 2-D (ptour_id × _altid_) ───────────────
+    # from_idca() COLLAPSES any column that is constant across alternatives to a
+    # 1-D (ptour_id,) variable (a memory optimisation). But the model's numba CA
+    # flow generates a dim3_filler that assigns each column into a scalar slot
+    # result[case, alt, k] — with a 1-D source that becomes
+    #   setitem(float64-3d, (i,j,k), float64-1d)   → numba TypingError
+    # and the ENTIRE dest flow fails to compile (→ JAX fallback, 5-param dest).
+    # Broadcasting the collapsed vars back to full 2-D (same value across alts,
+    # which is exactly right for person/case-level terms) makes the flat flow
+    # compile and lets the full Larch dest model estimate. Disable with
+    # STAGE5_DEST_NO_BROADCAST=1.
+    if (os.environ.get('STAGE5_DEST_NO_BROADCAST', '0') != '1'
+            and 'ptour_id' in d_ca.dims and '_altid_' in d_ca.dims):
+        _n_alt = int(d_ca.sizes['_altid_'])
+        _bcast = []
+        for _v in list(d_ca.data_vars):
+            _da = d_ca[_v]
+            if _da.ndim < 2 and _da.dims == ('ptour_id',):
+                # np.repeat is dask-free and avoids coord-alignment fragility:
+                # tile the per-case value across every alternative → 2-D.
+                _vals2d = np.repeat(np.asarray(_da.values)[:, None], _n_alt, axis=1)
+                d_ca[_v] = (('ptour_id', '_altid_'), _vals2d)
+                _bcast.append(str(_v))
+        if _bcast:
+            logger.warning(f"_dest_tree: broadcast {len(_bcast)} collapsed 1-D CA "
+                           f"vars back to 2-D so the flat flow compiles: {_bcast[:20]}")
+
     # ── Per-variable shape/dtype diagnostic ──────────────────────────────────
     # The flat dest flow crashes when a CA variable comes out 1-D (indexed by
     # case only) while the filler expects 2-D (case x alt). Dump each var's

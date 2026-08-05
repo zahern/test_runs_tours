@@ -78,9 +78,17 @@ SKIM_ALIAS = {
     "AutoCrashRisk":    "CRASH",
 }
 
-# Detour penalty: stops with Δd > this threshold are excluded from the
-# choice set (mirrors ActivitySim CLEANUP logic for infeasible stops).
-DETOUR_MAX_KM = 50.0
+# ── Trip-boundary (trip-square) constraint for intermediate stops ────────────
+# A stop must lie within the trip's own origin↔anchor spatial envelope: its
+# detour Δd = d(o→s)+d(s→a)−d(o→a) cannot exceed a bound that SCALES WITH the
+# direct origin→anchor distance (the per-trip "square"/ellipse), plus a small
+# base so short trips still allow a nearby stop — capped by an absolute maximum.
+# Previously only the absolute cap applied, so a 2 km trip could detour 50 km to
+# a cross-city zone; the per-trip term keeps predicted stops geographically
+# plausible. All three are env-tunable.
+DETOUR_MAX_KM    = float(os.environ.get('STAGE5B_DETOUR_MAX_KM',    '50.0'))  # absolute cap
+DETOUR_MAX_RATIO = float(os.environ.get('STAGE5B_DETOUR_MAX_RATIO', '1.0'))   # Δd ≤ ratio·d(o→a)
+DETOUR_BASE_KM   = float(os.environ.get('STAGE5B_DETOUR_BASE_KM',   '3.0'))   # + slack for short trips
 
 # Minimum number of stop observations required to estimate a segment model.
 MIN_STOP_OBS = 30
@@ -584,8 +592,13 @@ def _predict_stop_dest(
         else:
             detour = np.zeros(len(obs_rows))
 
-        # Filter infeasible alternatives (detour > threshold)
-        feasible = detour <= DETOUR_MAX_KM
+        # Trip-boundary ("trip square") constraint: a stop is feasible only if its
+        # detour stays within a PER-TRIP envelope scaled by the direct origin→anchor
+        # distance (ratio·d_oa + base), capped by the absolute maximum. So a short
+        # trip gets a tight square and a long trip a proportionally larger one —
+        # no cross-city stop for a 2 km trip. d_oo here is d(origin→anchor).
+        _trip_bound = np.minimum(DETOUR_MAX_KM, DETOUR_MAX_RATIO * d_oo + DETOUR_BASE_KM)
+        feasible = detour <= _trip_bound
 
         log_size = compute_size_term(
             alt_rows.assign(**{zone_id_col: alt_rows[zone_id_col]}),

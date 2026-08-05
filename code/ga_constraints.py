@@ -286,17 +286,20 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         'mutually_exclusive': [
             ['c_incp_dist', 'c_incp_band_dist'],
             ['c_age_dist', 'c_age_band_dist'],
-            # Agglomeration: the blended composite (c_aggl) and its collinear
-            # twin (c_comp, |r|≈0.9998) stay a mutex PAIR. The per-type themed
-            # variants (retail/office/edu/leisure/parks/health/food/civic) are
-            # NO LONGER mutually exclusive with each other — the imove/gonzalo
-            # decomposition is the whole point: the search is meant to pick which
-            # MIX of land-use components drives each segment (retail+parks+food
-            # together, say). c_aggl is also no longer force-included, so the
-            # blended term can't collinear-kill the components; residual
-            # themed-themed collinearity is handled by the post-mutation
-            # collinearity repair + the significance penalty.
-            ['c_aggl', 'c_comp'],
+            # Agglomeration: the blended composite (c_aggl), its collinear twin
+            # (c_comp, |r|≈0.9998) AND all 8 per-type themed variants
+            # (retail/office/edu/leisure/parks/health/food/civic) share the SAME
+            # spatial decay kernel, so they are mutually collinear. Letting them
+            # co-occur made the dest Hessian singular — every agglomeration term
+            # ended AT A BOUND with a degenerate proxy SE (fake p-values), and the
+            # GA penalty then couldn't tell them apart. Keep the WHOLE family a
+            # single at-most-one mutex; combined with the require-one below this
+            # forces EXACTLY ONE agglomeration term, so the search still identifies
+            # WHICH land-use component drives each segment ("mapping to
+            # components") but with a real, significant, identified coefficient.
+            ['c_aggl', 'c_comp', 'c_aggl_retail', 'c_aggl_office', 'c_aggl_edu',
+             'c_aggl_leisure', 'c_aggl_parks', 'c_aggl_health', 'c_aggl_food',
+             'c_aggl_civic'],
             # Home-pull: at most one of the two time-scaling variants.
             ['c_home_pull', 'c_home_pull_late'],
             # Accessibility: walk/transit accessibility is either conditioned

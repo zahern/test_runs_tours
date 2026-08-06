@@ -608,6 +608,28 @@ def load_data():
         except Exception as _ple:
             logger.warning(f"person_latent estimation attach skipped ({_ple})")
 
+    # ── Mobility usage covariates on the HHTS estimation frame (gated) ─────────
+    # Every stage job calls load_data(), so attaching here makes the mobility
+    # covariates candidates for the GA on the SAME frame the stages estimate on
+    # (stages 1-4 use the OBSERVED raw counts n_transit/n_car/n_bike; stage-5 mode
+    # uses the smooth propensity transit_prop/car_prop/bike_prop). The propensity
+    # is (1-π)μ from the model fit here on HHTS, so what each stage estimates
+    # transfers to the synth side (mobility_assign fits the same models).
+    if os.environ.get('PIPELINE_MOBILITY', '0') == '1':
+        try:
+            from mobility_models import (attach_observed_counts, fit_person_models,
+                                         attach_propensities)
+            _pers = out.get('persons'); _trips = out.get('trips')
+            if isinstance(_pers, pd.DataFrame) and len(_pers) and _trips is not None:
+                _pers = attach_observed_counts(_pers, _trips)   # raw counts (stages 1-4)
+                _mmodels = fit_person_models(_pers)
+                out['persons'] = attach_propensities(_pers, _mmodels)  # propensity (mode)
+                logger.info("mobility covariates attached to HHTS estimation frame: "
+                            f"counts={[c for c in ('n_transit','n_car','n_bike') if c in out['persons'].columns]} "
+                            f"props={[c for c in ('transit_prop','car_prop','bike_prop') if c in out['persons'].columns]}")
+        except Exception as _mme:
+            logger.warning(f"mobility estimation attach skipped ({_mme})")
+
     return sc, out, landuse
 
 
@@ -1128,22 +1150,28 @@ def mobility_assign(synth, out):
     if os.environ.get('PIPELINE_MOBILITY', '0') != '1':
         return synth
     try:
-        from mobility_models import run_mobility_models, attach_observed_counts
+        from mobility_models import (run_mobility_models, attach_observed_counts,
+                                      attach_propensities)
         hhts = out.get('persons') if isinstance(out, dict) else None
         if hhts is None or not len(hhts):
             logger.warning("mobility: no HHTS persons in `out` — skipping")
             return synth
-        synth = run_mobility_models(
+        synth, _models = run_mobility_models(
             hhts, synth,
             hhts_trips=out.get('trips'),
             households=out.get('households'),
             out_dir=OUT_DIR,
-            seed=int(os.environ.get('PIPELINE_SEED', '42')))
-        # symmetry: attach OBSERVED mode counts onto HHTS persons so the stage
-        # 1-4 / stage-5-mode estimators see the same n_transit/n_car/n_bike
-        # covariates that predict_counts assigned onto synth.
+            seed=int(os.environ.get('PIPELINE_SEED', '42')),
+            return_models=True)
+        # Symmetry for the estimation frame:
+        #  • stages 1-4 use the raw counts — attach OBSERVED n_transit/n_car/n_bike
+        #    onto HHTS persons (matching the sampled counts on synth);
+        #  • stage-5 mode uses the propensity — attach transit_prop/car_prop/
+        #    bike_prop (smooth (1-π)μ from the fitted model, exogenous, non-
+        #    circular) onto HHTS persons, matching the propensities on synth.
         if isinstance(out, dict) and out.get('trips') is not None:
-            out['persons'] = attach_observed_counts(hhts, out['trips'])
+            _hp = attach_observed_counts(hhts, out['trips'])
+            out['persons'] = attach_propensities(_hp, _models)
         return synth
     except Exception as e:
         logger.warning(f"mobility assignment skipped ({e})")

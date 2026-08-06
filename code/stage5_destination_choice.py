@@ -1699,13 +1699,13 @@ _PERSON_BEHAVIOURAL_DEFAULTS = {
     # moves (flagged by the NEVER-MOVED warning) instead of crashing stage 5.
     'ebikes':            0,
     'escooter':          0,
-    # Habitual weekly mode-usage counts from mobility_models (MODE_UEC
+    # Habitual mode-usage propensity from mobility_models (MODE_UEC
     # c_transit_use_transit / c_car_use_da / c_bike_use_bike, GA-gated on the
     # matching gene). Zero-filled when the pre-day mobility module didn't run, so
     # the term is constant and its coefficient simply never moves (never crashes).
-    'n_transit':         0,
-    'n_car':             0,
-    'n_bike':            0,
+    'transit_prop':      0.0,
+    'car_prop':          0.0,
+    'bike_prop':         0.0,
     'incp':              8,     # mid income band
     'indp':              19,    # not employed industry
     'travel_propensity': 0.0,   # CDAP logsum proxy; computed by _travel_propensity_score
@@ -3508,11 +3508,13 @@ MODE_UEC = {
     # ── Bicycle ownership ─────────────────────────────────────────────────
     "c_bikes_bike":     ("person.bikes",                  {"Bike": None}),
 
-    # ── Habitual mode-usage captivity (mobility_models weekly trips by mode) ──
-    # Same-mode habit terms; see the endogeneity note in _stage5_mode_candidates.
-    "c_transit_use_transit": ("person.n_transit",         {"Transit": None}),
-    "c_car_use_da":          ("person.n_car",             {"DA": None}),
-    "c_bike_use_bike":       ("person.n_bike",            {"Bike": None}),
+    # ── Habitual mode-usage captivity (mobility_models propensity) ────────────
+    # Same-mode captivity index = the mobility model's (1-π)μ expected weekly
+    # trips, a smooth function of EXOGENOUS person attributes (not the realised
+    # trip count), so it is non-circular with the tour's observed mode.
+    "c_transit_use_transit": ("person.transit_prop",      {"Transit": None}),
+    "c_car_use_da":          ("person.car_prop",          {"DA": None}),
+    "c_bike_use_bike":       ("person.bike_prop",         {"Bike": None}),
 
     # ── Sex ───────────────────────────────────────────────────────────────
     "c_female_transit": ("(person.sexp == 2)",            {"Transit": None}),
@@ -4163,7 +4165,7 @@ def preprocess_tours(tours: pd.DataFrame,
     for col, default in [('bikes', 0), ('age5p', 6),
                           ('CARLICENCE', 1), ('occp_group', 0),
                           ('outbound_stops', 0), ('n_shopping_out', 0),
-                          ('n_transit', 0), ('n_car', 0), ('n_bike', 0)]:
+                          ('transit_prop', 0.0), ('car_prop', 0.0), ('bike_prop', 0.0)]:
         if col not in t.columns:
             t[col] = default
 
@@ -4745,10 +4747,10 @@ def _mode_spec_custom(m, Mode, custom_vars: list, segment: str = 'all'):
                              'hh_size_large', 'hh_child', 'n_workers_hh'},
         # Bicycles
         'c_bikes_bike':     {'bikes'},
-        # Habitual mode-usage captivity (mobility_models weekly trips by mode)
-        'c_transit_use_transit': {'n_transit'},
-        'c_car_use_da':          {'n_car'},
-        'c_bike_use_bike':       {'n_bike'},
+        # Habitual mode-usage captivity (mobility_models propensity index)
+        'c_transit_use_transit': {'transit_prop'},
+        'c_car_use_da':          {'car_prop'},
+        'c_bike_use_bike':       {'bike_prop'},
         # Work status / person type
         # Gate on both the new binary dummies AND the legacy candidates so models
         # estimated before the WORKSTAT→binary migration still activate these terms.

@@ -4881,13 +4881,12 @@ def _stage5_mode_candidates() -> List[str]:
     captivity_dist = ['auto_deficient', 'short_dist_active']
     # Occupation / job-type ("job_tup") × mode
     occ_genes = ['occp_group', 'occp_mgr', 'occp_trades', 'occp_prof']
-    # Habitual mode-usage captivity (mobility_models weekly trips by mode): a
-    # person who habitually uses transit/car/bike is more likely to on this tour.
-    # NOTE endogeneity — at estimation these are the survey's OWN mode counts, so
-    # the same-mode coefficient is partly mechanical; kept GA-searchable (BIC +
-    # significance penalty judge them) and gated to 0 when the columns are absent.
-    # Exclude via ga_constraints force_exclude if you want a clean-instruments spec.
-    mobility_use = ['n_transit', 'n_car', 'n_bike']
+    # Habitual mode-usage captivity from mobility_models — the (1-π)μ propensity
+    # (transit_prop/car_prop/bike_prop), a smooth function of EXOGENOUS person
+    # attributes rather than the realised trip count, so it is non-circular with
+    # the tour's observed mode. GA-searchable and gated to 0 when the pre-day
+    # mobility module did not run.
+    mobility_use = ['transit_prop', 'car_prop', 'bike_prop']
 
     return (skim_extra + veh_vars + inc_vars + age_gender +
             hh_vars + ptype_vars + abs_vars + acc_origin +

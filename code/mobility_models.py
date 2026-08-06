@@ -393,16 +393,67 @@ def predict_counts(df, model: ZeroInflatedCount, feats_fn, colname: str,
 # ─────────────────────────────────────────────────────────────────────────────
 # Orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
+# Mode-usage propensity column names: the smooth expected value (1-π)·μ, a
+# function of EXOGENOUS person attributes only (not the realised trip count).
+# Used as the non-circular mode-choice captivity index (person.<mode>_prop),
+# computed identically on HHTS and synth.
+_PROP_COL = {'n_transit': 'transit_prop', 'n_car': 'car_prop', 'n_bike': 'bike_prop'}
+
+
+def fit_person_models(persons: pd.DataFrame) -> dict:
+    """Fit the three person-level mode-usage models on a persons frame that
+    already carries observed n_transit/n_car/n_bike (see attach_observed_counts).
+    Returns {ycol: ZeroInflatedCount}. Used to attach propensities to the HHTS
+    estimation frame in load_data without re-deriving counts from trips."""
+    models: dict = {}
+    if not _SCIPY_OK:
+        return models
+    for ycol, est in [('n_transit', estimate_transit_usage),
+                      ('n_car', estimate_car_usage),
+                      ('n_bike', estimate_bike_usage)]:
+        if ycol not in persons.columns:
+            continue
+        try:
+            y = pd.to_numeric(persons[ycol], errors='coerce').fillna(0).values
+            models[ycol] = est(persons, y)
+        except Exception as e:
+            logger.warning(f"fit_person_models {ycol} failed: {e}")
+    return models
+
+
+def attach_propensities(persons: pd.DataFrame, models: dict) -> pd.DataFrame:
+    """Attach transit_prop/car_prop/bike_prop = model.predict_expected(person
+    features) onto a persons frame. Smooth exogenous captivity indices — safe to
+    use as mode-choice covariates without the endogeneity of the raw counts.
+    Idempotent; a no-op for modes whose model is missing."""
+    if persons is None or not models:
+        return persons
+    out = persons
+    X = _person_features(out)[0]
+    for ycol, prop in _PROP_COL.items():
+        m = models.get(ycol)
+        if m is None or m.beta_ is None:
+            continue
+        out = out.copy() if out is persons else out
+        out[prop] = m.predict_expected(X, X)
+    return out
+
+
 def run_mobility_models(hhts_persons: pd.DataFrame, synth: pd.DataFrame,
                         hhts_trips: Optional[pd.DataFrame] = None,
                         households: Optional[pd.DataFrame] = None,
                         synth_households: Optional[pd.DataFrame] = None,
-                        out_dir: Optional[str] = None, seed: int = 42) -> pd.DataFrame:
+                        out_dir: Optional[str] = None, seed: int = 42,
+                        return_models: bool = False):
     """Estimate the mobility models on HHTS, assign onto synth, write validation
-    reports. Returns synth with n_transit/n_car/n_bike (+ hh_vehicles/hh_bikes)."""
+    reports. Returns synth with n_transit/n_car/n_bike raw counts + transit_prop/
+    car_prop/bike_prop propensities (+ hh_vehicles/hh_bikes). With
+    return_models=True returns (synth, {ycol: ZeroInflatedCount}) so the caller
+    can attach matching propensities to the HHTS estimation frame."""
+    person_models: dict = {}
     if not _SCIPY_OK:
         logger.warning("mobility_models: scipy unavailable — skipping")
-        return synth
+        return (synth, person_models) if return_models else synth
     rep_dir = os.path.join(out_dir, 'mobility') if out_dir else None
     synth = synth.copy()
 
@@ -416,14 +467,17 @@ def run_mobility_models(hhts_persons: pd.DataFrame, synth: pd.DataFrame,
             specs = [('transit_usage', 'n_transit', estimate_transit_usage),
                      ('car_usage', 'n_car', estimate_car_usage),
                      ('bike_usage', 'n_bike', estimate_bike_usage)]
+            Xs = _person_features(synth)[0]
             for name, ycol, est in specs:
                 try:
                     m = est(hp, hp[ycol].values)
+                    person_models[ycol] = m
                     yp = m.predict_expected(*[_person_features(hp)[0]] * 2)
                     ys = m.sample(_person_features(hp)[0], _person_features(hp)[0],
                                   np.random.default_rng(seed))
                     validation_report(name, hp[ycol].values, yp, m, rep_dir, y_sampled=ys)
                     synth[ycol] = predict_counts(synth, m, _person_features, ycol, seed=seed)
+                    synth[_PROP_COL[ycol]] = m.predict_expected(Xs, Xs)  # captivity index
                 except Exception as e:
                     logger.warning(f"mobility {name} failed: {e}")
     else:
@@ -455,7 +509,7 @@ def run_mobility_models(hhts_persons: pd.DataFrame, synth: pd.DataFrame,
                     synth = synth.merge(hh_out[[hhid, synth_col]], on=hhid, how='left')
         except Exception as e:
             logger.warning(f"mobility {name} failed: {e}")
-    return synth
+    return (synth, person_models) if return_models else synth
 
 
 def _persons_to_households(persons: Optional[pd.DataFrame]):

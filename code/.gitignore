@@ -1,0 +1,62 @@
+# =============================================================================
+# .gitignore — keep heavy / ephemeral artifacts out of git so `git status`,
+# `git add`, and especially `git push` stay fast. Git on this network (Z:) mount
+# is slow to walk the tree, and large binaries bloat the pack that push must
+# transfer to GitHub — both are dramatically reduced by ignoring the below.
+#
+# NOTE: .gitignore only stops NEW files being tracked. For files ALREADY tracked
+# (e.g. large saved_data/*.pkl), untrack them once with:
+#     git rm -r --cached <path>        # keeps the file on disk, unstages from git
+#     git commit -m "stop tracking large artifacts"
+# then `git gc --aggressive` to shrink .git. Decide per-file whether you still
+# want it versioned before untracking.
+# =============================================================================
+
+# ── Run outputs (huge, regenerated every job; pruned by the submit script) ───
+runs/
+saved_data/osm_cache/
+*.omx
+
+# ── PBS scheduler logs (<name>.o<jobid> / <name>.e<jobid>) ───────────────────
+*.o[0-9][0-9][0-9][0-9]*
+*.e[0-9][0-9][0-9][0-9]*
+*.pbs.o*
+*.pbs.e*
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+
+# ── Large model / data binaries (uncomment to ignore if not versioning them) ─
+# saved_data/*.pkl
+# *.pkl
+# *.h5
+# *.parquet
+# *.npy
+
+# ── LaTeX build artifacts ────────────────────────────────────────────────────
+*.aux
+*.bbl
+*.blg
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+*.out
+*.toc
+*.lof
+*.lot
+*.log
+*.nav
+*.snm
+*.vrb
+
+# ── Scratch / editor / OS ────────────────────────────────────────────────────
+scratchpad/
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db

@@ -4692,6 +4692,19 @@ _STAGE_INTERACTION_CANDIDATES = (_ACCESS_INTERACTIONS + _LIFECYCLE_INTERACTIONS
                                  + _OCC_WFH_INTERACTIONS + _COUNT_TIMING_INTERACTIONS
                                  + _MOBILITY_INTERACTIONS)
 
+# Pre-day mobility attributes from mobility_models.py — habitual weekly mode-usage
+# counts (a "mobility style" level signal). These are made symmetric across
+# estimation and prediction: OBSERVED counts on HHTS persons (from HHTS trips) and
+# MODELED counts on the synth population, so a coefficient fit on HHTS transfers.
+# Present only when PIPELINE_MOBILITY ran; the `c in data.columns` filter keeps
+# them inert otherwise. The modeled household ownership (hh_vehicles_pred /
+# hh_bikes_pred) and the tour-sequence length (n_tours_seq) are deliberately NOT
+# here — they are synth-only predictions whose observed twins (vehrd, bikes,
+# n_tours) are already in the pools, so they'd be asymmetric and redundant as
+# day-model covariates. (Defensive mutex groups for them still live in
+# ga_constraints in case they are ever attached symmetrically.)
+_MOBILITY_ATTR_CANDIDATES = ['n_transit', 'n_car', 'n_bike']
+
 
 def _stage1_candidates(data: pd.DataFrame) -> List[str]:
     """Stage 1 (activity frequency) — binary-first candidate set.
@@ -4716,7 +4729,7 @@ def _stage1_candidates(data: pd.DataFrame) -> List[str]:
                'auto_nonmand_acc', 'bike_acc']
     return list(dict.fromkeys(
         c for c in base + age_grp + extra + profile + abs_ + acc + ptype
-        + _STAGE_INTERACTION_CANDIDATES
+        + _STAGE_INTERACTION_CANDIDATES + _MOBILITY_ATTR_CANDIDATES
         if c in data.columns
     ))
 
@@ -4740,7 +4753,7 @@ def _stage2_candidates(data: pd.DataFrame) -> List[str]:
     ptype   = [c for c in data.columns if c.startswith('ptype_')]
     return list(dict.fromkeys(
         c for c in counts + base + profile + abs_ + acc + ptype
-        + _STAGE_INTERACTION_CANDIDATES
+        + _STAGE_INTERACTION_CANDIDATES + _MOBILITY_ATTR_CANDIDATES
         if c in data.columns
     ))
 
@@ -4762,7 +4775,7 @@ def _stage3_candidates(data: pd.DataFrame) -> List[str]:
     ptype    = [c for c in data.columns if c.startswith('ptype_')]
     return list(dict.fromkeys(
         c for c in act_vars + counts + base + profile + abs_ + ptype
-        + _STAGE_INTERACTION_CANDIDATES
+        + _STAGE_INTERACTION_CANDIDATES + _MOBILITY_ATTR_CANDIDATES
         if c in data.columns
     ))
 
@@ -4784,7 +4797,7 @@ def _stage4_candidates(data: pd.DataFrame) -> List[str]:
     ptype   = [c for c in data.columns if c.startswith('ptype_')]
     return list(dict.fromkeys(
         c for c in timing + base + profile + abs_ + purp + ptype
-        + _STAGE_INTERACTION_CANDIDATES
+        + _STAGE_INTERACTION_CANDIDATES + _MOBILITY_ATTR_CANDIDATES
         if c in data.columns
     ))
 
@@ -4868,11 +4881,19 @@ def _stage5_mode_candidates() -> List[str]:
     captivity_dist = ['auto_deficient', 'short_dist_active']
     # Occupation / job-type ("job_tup") × mode
     occ_genes = ['occp_group', 'occp_mgr', 'occp_trades', 'occp_prof']
+    # Habitual mode-usage captivity (mobility_models weekly trips by mode): a
+    # person who habitually uses transit/car/bike is more likely to on this tour.
+    # NOTE endogeneity — at estimation these are the survey's OWN mode counts, so
+    # the same-mode coefficient is partly mechanical; kept GA-searchable (BIC +
+    # significance penalty judge them) and gated to 0 when the columns are absent.
+    # Exclude via ga_constraints force_exclude if you want a clean-instruments spec.
+    mobility_use = ['n_transit', 'n_car', 'n_bike']
 
     return (skim_extra + veh_vars + inc_vars + age_gender +
             hh_vars + ptype_vars + abs_vars + acc_origin +
             workstat_vars + studying_vars + misc + dest_lu_vars +
-            generic_genes + cost_tod + captivity_dist + occ_genes)
+            generic_genes + cost_tod + captivity_dist + occ_genes +
+            mobility_use)
 
 
 def _stage5_dest_candidates() -> List[str]:

@@ -347,6 +347,24 @@ def person_mode_counts(trips: pd.DataFrame, person_col: str = 'person_id') -> pd
                                   'bike': 'n_bike'})[['n_transit', 'n_car', 'n_bike']]
 
 
+def attach_observed_counts(persons: pd.DataFrame, trips: pd.DataFrame) -> pd.DataFrame:
+    """Attach OBSERVED weekly n_transit/n_car/n_bike onto a persons frame (from its
+    trips), so estimation data carries the same mobility-usage covariates that
+    predict_counts assigns onto synth. Idempotent; 0-fills persons with no trips."""
+    if persons is None or trips is None or not len(trips):
+        return persons
+    pid = next((c for c in ['person_id', 'PERSID', 'persid'] if c in persons.columns), None)
+    if pid is None:
+        return persons
+    counts = person_mode_counts(trips, person_col=pid if pid in trips.columns else 'person_id')
+    if not len(counts):
+        return persons
+    out = persons.drop(columns=[c for c in ['n_transit', 'n_car', 'n_bike']
+                                if c in persons.columns], errors='ignore')
+    out = out.merge(counts, left_on=pid, right_index=True, how='left')
+    return out.fillna({'n_transit': 0, 'n_car': 0, 'n_bike': 0})
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Model instantiations
 # ─────────────────────────────────────────────────────────────────────────────

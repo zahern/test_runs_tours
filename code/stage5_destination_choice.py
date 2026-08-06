@@ -73,6 +73,18 @@ NON_MANDATORY = ['social', 'escort', 'shopping', 'othmaint', 'othdiscr', 'eat']
 MODE_MAP     = {'DA': 1, 'SR': 2, 'Walk': 3, 'Bike': 4, 'Transit': 5}
 MODE_NAMES   = {1: 'DA', 2: 'SR', 3: 'Walk', 4: 'Bike', 5: 'Transit'}
 DEST_CHOICE_SAMPLE_SIZE = 0    # 0 = use ALL zones during prediction (no sampling)
+# Polaris-style runtime destination choice.  The model remains a zone-level
+# MNL; these settings only control the simulation choice set and feasibility.
+POLARIS_DEST_CHOICE = os.environ.get('STAGE5_POLARIS_DEST_CHOICE', '1') == '1'
+POLARIS_DEST_STRATA = 4
+POLARIS_DEST_ALTS_PER_STRATUM = int(
+    os.environ.get('STAGE5_POLARIS_ALTS_PER_STRATUM', '200')
+)
+POLARIS_PLANNING_CONSTRAINED = (
+    os.environ.get('STAGE5_POLARIS_PLANNING', '1') == '1'
+)
+POLARIS_DAY_START_MIN = float(os.environ.get('STAGE5_DAY_START_MIN', '0'))
+POLARIS_DAY_END_MIN = float(os.environ.get('STAGE5_DAY_END_MIN', '1440'))
 MAX_MXL_OBS = 2500              # skip MXL on large segments that were causing OOM/NaN estimates
 # Importance sampling for destination choice estimation.
 # 0 = use ALL zones; >0 = Manski-Lerman with N alternatives per observation.
@@ -1687,6 +1699,13 @@ _PERSON_BEHAVIOURAL_DEFAULTS = {
     # moves (flagged by the NEVER-MOVED warning) instead of crashing stage 5.
     'ebikes':            0,
     'escooter':          0,
+    # Habitual weekly mode-usage counts from mobility_models (MODE_UEC
+    # c_transit_use_transit / c_car_use_da / c_bike_use_bike, GA-gated on the
+    # matching gene). Zero-filled when the pre-day mobility module didn't run, so
+    # the term is constant and its coefficient simply never moves (never crashes).
+    'n_transit':         0,
+    'n_car':             0,
+    'n_bike':            0,
     'incp':              8,     # mid income band
     'indp':              19,    # not employed industry
     'travel_propensity': 0.0,   # CDAP logsum proxy; computed by _travel_propensity_score
@@ -3489,6 +3508,12 @@ MODE_UEC = {
     # ── Bicycle ownership ─────────────────────────────────────────────────
     "c_bikes_bike":     ("person.bikes",                  {"Bike": None}),
 
+    # ── Habitual mode-usage captivity (mobility_models weekly trips by mode) ──
+    # Same-mode habit terms; see the endogeneity note in _stage5_mode_candidates.
+    "c_transit_use_transit": ("person.n_transit",         {"Transit": None}),
+    "c_car_use_da":          ("person.n_car",             {"DA": None}),
+    "c_bike_use_bike":       ("person.n_bike",            {"Bike": None}),
+
     # ── Sex ───────────────────────────────────────────────────────────────
     "c_female_transit": ("(person.sexp == 2)",            {"Transit": None}),
     "c_female_walk":    ("(person.sexp == 2)",            {"Walk": None}),
@@ -4137,7 +4162,8 @@ def preprocess_tours(tours: pd.DataFrame,
     #  on the tour table as well avoids errors in some Larch API paths)
     for col, default in [('bikes', 0), ('age5p', 6),
                           ('CARLICENCE', 1), ('occp_group', 0),
-                          ('outbound_stops', 0), ('n_shopping_out', 0)]:
+                          ('outbound_stops', 0), ('n_shopping_out', 0),
+                          ('n_transit', 0), ('n_car', 0), ('n_bike', 0)]:
         if col not in t.columns:
             t[col] = default
 
@@ -4719,6 +4745,10 @@ def _mode_spec_custom(m, Mode, custom_vars: list, segment: str = 'all'):
                              'hh_size_large', 'hh_child', 'n_workers_hh'},
         # Bicycles
         'c_bikes_bike':     {'bikes'},
+        # Habitual mode-usage captivity (mobility_models weekly trips by mode)
+        'c_transit_use_transit': {'n_transit'},
+        'c_car_use_da':          {'n_car'},
+        'c_bike_use_bike':       {'n_bike'},
         # Work status / person type
         # Gate on both the new binary dummies AND the legacy candidates so models
         # estimated before the WORKSTAT→binary migration still activate these terms.
@@ -11802,6 +11832,295 @@ def _activitysim_make_sample_choices(probs_np: np.ndarray, zone_ids, sample_size
     return pd.DataFrame(rows)
 
 
+def _polaris_destination_time_matrix(
+    case_origins, zone_ids, skim_lookup, depart_times=None
+) -> np.ndarray:
+    """Return case-by-zone auto travel times for Polaris stratification."""
+    origins = np.asarray(case_origins, dtype=int)
+    zones = np.asarray(zone_ids, dtype=int)
+    times = np.full((len(origins), len(zones)), np.nan, dtype=np.float64)
+    if not skim_lookup:
+        return times
+    if depart_times is None:
+        depart_times = np.full(len(origins), 480.0, dtype=float)
+    else:
+        depart_times = np.asarray(depart_times, dtype=float)
+
+    def _period_key(minutes):
+        try:
+            minutes = float(minutes)
+        except (TypeError, ValueError):
+            minutes = 480.0
+        if minutes < 540:
+            return 'AM'
+        if minutes < 900:
+            return 'MD'
+        if minutes < 1080:
+            return 'PM'
+        return 'EV'
+
+    for i, origin in enumerate(origins):
+        period = _period_key(depart_times[i] if i < len(depart_times) else 480.0)
+        for j, zone in enumerate(zones):
+            values = skim_lookup.get((int(origin), int(zone)), {})
+            value = values.get(f'SOVTOLL_TIME__{period}')
+            if value is None:
+                value = values.get('SOVTOLL_TIME__AM')
+            if value is None:
+                value = values.get('tt_am', values.get('tt_avg'))
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value) and value >= 0:
+                times[i, j] = value
+    return times
+
+
+def _polaris_destination_employment(landuse: pd.DataFrame, zone_ids) -> np.ndarray:
+    """Return log(1 + employment) aligned to the destination zone order."""
+    zones = np.asarray(zone_ids, dtype=int)
+    try:
+        zone_col = 'ORDER' if 'ORDER' in landuse.columns else landuse.columns[0]
+        lu = landuse.copy()
+        lu[zone_col] = pd.to_numeric(lu[zone_col], errors='coerce')
+        if 'TOTEMP' not in lu.columns:
+            emp_cols = [c for c in ['FPSEMPN', 'HEREMPN', 'RETEMPN',
+                                    'MWTEMPN', 'OTHEMP', 'AGREMPN']
+                        if c in lu.columns]
+            if emp_cols:
+                lu['TOTEMP'] = sum(
+                    pd.to_numeric(lu[c], errors='coerce').fillna(0.0)
+                    for c in emp_cols
+                )
+        employment = pd.to_numeric(
+            lu.set_index(zone_col).get('TOTEMP', pd.Series(dtype=float)),
+            errors='coerce'
+        ).fillna(0.0).clip(lower=0.0)
+        values = employment.reindex(zones).fillna(0.0).to_numpy(dtype=float)
+        return np.log1p(values)
+    except Exception as exc:
+        logger.debug(f'_polaris_destination_employment failed: {exc}')
+        return np.zeros(len(zones), dtype=float)
+
+
+def _polaris_stratified_sample_choices(
+    zone_ids,
+    travel_time: np.ndarray,
+    employment: np.ndarray,
+    feasible: np.ndarray,
+    rng: np.random.Generator,
+    n_strata: int = POLARIS_DEST_STRATA,
+    alternatives_per_stratum: int = POLARIS_DEST_ALTS_PER_STRATUM,
+) -> pd.DataFrame:
+    """Sample a Polaris-style 2x2 travel-time/employment choice set.
+
+    The four strata are low/high travel time crossed with low/high employment.
+    Alternatives are sampled without replacement within each stratum.  ``prob``
+    stores the inclusion probability under the equal-stratum sampling design so
+    the existing sampled-choice simulator can apply a log correction.
+    """
+    zones = np.asarray(zone_ids, dtype=int)
+    travel_time = np.asarray(travel_time, dtype=float)
+    employment = np.asarray(employment, dtype=float)
+    feasible = np.asarray(feasible, dtype=bool)
+    if n_strata != 4 or travel_time.ndim != 2 or travel_time.shape[1] != len(zones):
+        return pd.DataFrame(columns=['chooser_row', 'alt_dest', 'prob', 'pick_count'])
+    emp_cut = float(np.nanmedian(employment)) if len(employment) else 0.0
+    rows = []
+    for chooser, row_time in enumerate(travel_time):
+        valid = feasible[chooser].copy()
+        finite_time = np.isfinite(row_time)
+        if not valid.any():
+            valid = finite_time.copy()
+        if not valid.any():
+            valid = np.ones(len(zones), dtype=bool)
+        time_cut = float(np.nanmedian(row_time[finite_time])) if finite_time.any() else 0.0
+        time_high = np.where(finite_time, row_time >= time_cut, False)
+        emp_high = employment >= emp_cut
+        strata = time_high.astype(int) * 2 + emp_high.astype(int)
+        inclusion_prob = np.zeros(len(zones), dtype=float)
+        selected = []
+        for stratum in range(4):
+            pool = np.flatnonzero(valid & (strata == stratum))
+            if len(pool) == 0:
+                pool = np.flatnonzero(valid)
+            if len(pool) == 0:
+                continue
+            draw_count = min(max(int(alternatives_per_stratum), 1), len(pool))
+            picked = rng.choice(pool, size=draw_count, replace=False)
+            inclusion_prob[pool] += (1.0 / 4.0) * draw_count / len(pool)
+            selected.extend(int(pos) for pos in np.asarray(picked).ravel())
+        if not selected:
+            continue
+        picked, counts = np.unique(np.asarray(selected, dtype=int), return_counts=True)
+        for pos, count in zip(picked, counts):
+            probability = max(float(inclusion_prob[pos]), 1e-300)
+            rows.append({
+                'chooser_row': chooser,
+                'alt_dest': int(zones[pos]),
+                'prob': probability,
+                'pick_count': int(count),
+            })
+    return pd.DataFrame(rows)
+
+
+def _polaris_space_time_mask(
+    current_rows: pd.DataFrame,
+    schedule_rows: pd.DataFrame,
+    zone_ids,
+    origin_zones,
+    skim_lookup,
+) -> np.ndarray:
+    """Build a reachable-zone mask from scheduled activity windows.
+
+    Known work/school destinations provide intermediate anchors.  Missing
+    anchors fall back to the person's home/origin zone, making the constraint
+    conservative for first/last activities while still enforcing both sides of
+    a work-to-home non-routine stop.
+    """
+    zones = np.asarray(zone_ids, dtype=int)
+    origins = np.asarray(origin_zones, dtype=int)
+    n_cases = len(current_rows)
+    mask = np.ones((n_cases, len(zones)), dtype=bool)
+    if n_cases == 0 or not skim_lookup:
+        return mask
+
+    schedule = schedule_rows.copy()
+    if 'person_id' not in current_rows.columns or 'person_id' not in schedule.columns:
+        return mask
+    schedule['_start_'] = pd.to_numeric(schedule.get('STARTIME', 0), errors='coerce').fillna(0.0)
+    schedule['_end_'] = pd.to_numeric(
+        schedule.get('ENDTIME', schedule['_start_']), errors='coerce'
+    ).fillna(schedule['_start_'])
+    schedule_segment = schedule.get(
+        'segment', pd.Series('', index=schedule.index, dtype=object)
+    )
+    schedule_assigned = schedule.get(
+        '_polaris_assigned_dest_', pd.Series(False, index=schedule.index)
+    )
+    schedule['_known_dest_'] = (
+        (schedule_segment.isin(['work', 'edu']) | schedule_assigned.astype(bool))
+        & pd.to_numeric(schedule.get('DTAZ', 0), errors='coerce').fillna(0).gt(0)
+    )
+    schedule['_person_'] = schedule['person_id'].astype(str)
+    current = current_rows.copy()
+    current['_start_'] = pd.to_numeric(current.get('STARTIME', 0), errors='coerce').fillna(0.0)
+    current['_end_'] = pd.to_numeric(
+        current.get('ENDTIME', current['_start_']), errors='coerce'
+    ).fillna(current['_start_'])
+    current['_person_'] = current['person_id'].astype(str)
+
+    for i, (_, row) in enumerate(current.iterrows()):
+        same_person = schedule[schedule['_person_'] == row['_person_']]
+        prior = same_person[
+            same_person['_known_dest_'] & (same_person['_start_'] < row['_start_'])
+        ].sort_values('_start_').tail(1)
+        following = same_person[
+            same_person['_known_dest_'] & (same_person['_start_'] > row['_start_'])
+        ].sort_values('_start_').head(1)
+        home = int(origins[i]) if i < len(origins) else 0
+        if not prior.empty:
+            prev_zone = int(pd.to_numeric(prior.iloc[0]['DTAZ'], errors='coerce'))
+            prev_end = float(prior.iloc[0]['_end_'])
+        else:
+            prev_zone = home
+            prev_end = POLARIS_DAY_START_MIN
+        if not following.empty:
+            next_zone = int(pd.to_numeric(following.iloc[0]['DTAZ'], errors='coerce'))
+            next_start = float(following.iloc[0]['_start_'])
+        else:
+            next_zone = home
+            next_start = POLARIS_DAY_END_MIN
+
+        prev_time = _polaris_destination_time_matrix(
+            [prev_zone], zones, skim_lookup, [prev_end]
+        )[0]
+        next_time = _polaris_destination_time_matrix(
+            [next_zone], zones, skim_lookup, [row['_end_']]
+        )[0]
+        outbound_budget = max(float(row['_start_']) - prev_end, 0.0)
+        inbound_budget = max(next_start - float(row['_end_']), 0.0)
+        prev_known = np.isfinite(prev_time)
+        next_known = np.isfinite(next_time)
+        mask[i] = ((~prev_known) | (prev_time <= outbound_budget + 1e-6)) & (
+            (~next_known) | (next_time <= inbound_budget + 1e-6)
+        )
+        if not mask[i].any():
+            mask[i] = np.ones(len(zones), dtype=bool)
+    return mask
+
+
+def _polaris_sequential_destination_draw(
+    utilities: np.ndarray,
+    current_rows: pd.DataFrame,
+    schedule_rows: pd.DataFrame,
+    zone_ids,
+    origin_zones,
+    skim_lookup,
+    landuse: pd.DataFrame,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Draw non-routine destinations in schedule order with rolling anchors."""
+    zones = np.asarray(zone_ids, dtype=int)
+    origins = np.asarray(origin_zones, dtype=int)
+    n_cases = len(current_rows)
+    chosen = np.full(n_cases, -1, dtype=int)
+    valid = np.zeros(n_cases, dtype=bool)
+    if n_cases == 0:
+        return chosen, valid
+
+    order_frame = current_rows.copy()
+    order_frame['_polaris_start_'] = pd.to_numeric(
+        order_frame.get('STARTIME', 0), errors='coerce'
+    ).fillna(0.0)
+    order_frame['_polaris_person_'] = order_frame['person_id'].astype(str)
+    order = sorted(
+        range(n_cases),
+        key=lambda pos: (
+            order_frame.iloc[pos]['_polaris_person_'],
+            float(order_frame.iloc[pos]['_polaris_start_']),
+            pos,
+        ),
+    )
+    mutable_schedule = schedule_rows.copy()
+    employment = _polaris_destination_employment(landuse, zones)
+    for pos in order:
+        row = current_rows.iloc[[pos]].copy()
+        row_mask = _polaris_space_time_mask(
+            row,
+            mutable_schedule,
+            zones,
+            origins[pos:pos + 1],
+            skim_lookup,
+        )
+        row_tt = _polaris_destination_time_matrix(
+            origins[pos:pos + 1], zones, skim_lookup,
+            [row.iloc[0].get('STARTIME', 480.0)]
+        )
+        row_alts = _polaris_stratified_sample_choices(
+            zones, row_tt, employment, row_mask, rng
+        )
+        row_utility = np.where(row_mask, utilities[pos:pos + 1], -np.inf)
+        if not row_alts.empty:
+            row_choice, row_valid = _activitysim_simulate_sampled_destinations(
+                row_utility, row_alts, zones, rng
+            )
+        else:
+            row_choice = np.full(1, -1, dtype=int)
+            row_valid = np.zeros(1, dtype=bool)
+        if row_valid[0]:
+            chosen[pos] = int(row_choice[0])
+            valid[pos] = True
+            assigned = row.iloc[0].copy()
+            assigned['DTAZ'] = chosen[pos]
+            assigned['_polaris_assigned_dest_'] = True
+            mutable_schedule = pd.concat(
+                [mutable_schedule, assigned.to_frame().T], ignore_index=True
+            )
+    return chosen, valid
+
+
 def _activitysim_simulate_sampled_destinations(V_full: np.ndarray, sampled_alts: pd.DataFrame, zone_ids, rng: np.random.Generator):
     """Final destination simulate on sampled alternatives with sample correction."""
     n_cases = V_full.shape[0] if V_full is not None else 0
@@ -12607,7 +12926,12 @@ def _predict_batch(
     # ── vectorised prediction per segment ─────────────────────────────
     # Only nonmand needs destination MNL; work/edu already have anchors.
     # Mode choice runs for ALL segments (including work/edu with fixed dest).
-    for seg, seg_models in models.items():
+    _prediction_segment_order = (
+        [seg for seg in ('work', 'edu', 'nonmand') if seg in models]
+        + [seg for seg in models if seg not in ('work', 'edu', 'nonmand')]
+    )
+    for seg in _prediction_segment_order:
+        seg_models = models[seg]
         if not seg_models:
             continue
         mode_mdl = seg_models.get('mode_model')
@@ -12947,8 +13271,30 @@ def _predict_batch(
                       f"any_inf={None if V_full is None else bool(np.isinf(V_full).any())}")
 
                 if V_full is not None and np.isfinite(V_full).any():
-                    _probs_full = _softmax_from_utilities(V_full)
                     zone_arr_pred = np.asarray(zone_ids_pred, dtype=int)
+                    _polaris_sampling = POLARIS_DEST_CHOICE and seg == 'nonmand'
+                    _planning_mask = None
+                    if _polaris_sampling and POLARIS_PLANNING_CONSTRAINED:
+                        _planning_origins = (
+                            _case_otaz_arr
+                            if _case_otaz_arr is not None
+                            else pred_seg_rows['OTAZ'].astype(int).to_numpy()
+                        )
+                        _planning_mask = _polaris_space_time_mask(
+                            pred_seg_rows.reset_index(drop=True),
+                            df,
+                            zone_arr_pred,
+                            _planning_origins,
+                            skim_lookup,
+                        )
+                        if _planning_mask.shape == V_full.shape:
+                            V_full = np.where(_planning_mask, V_full, -np.inf)
+                            logger.info(
+                                f"Dest Polaris planning constraint [{seg}]: "
+                                f"mean reachable zones={_planning_mask.sum(axis=1).mean():.1f}/"
+                                f"{_planning_mask.shape[1]}"
+                            )
+                    _probs_full = _softmax_from_utilities(V_full)
 
                     # Diagnostics on probabilities
                     _top_zone_prob  = float(_probs_full.max(axis=1).mean())
@@ -12956,7 +13302,35 @@ def _predict_batch(
                     print(f"      [{seg}] prob diagnostics: mean_top_zone_prob={_top_zone_prob:.4f}, "
                           f"mean_zones_with_nonzero_prob={_n_nonzero_mean:.1f}/{len(zone_ids_pred)}")
 
-                    if DEST_CHOICE_SAMPLE_SIZE > 0:
+                    if _polaris_sampling:
+                        _polaris_origins = (
+                            _case_otaz_arr
+                            if _case_otaz_arr is not None
+                            else pred_seg_rows['OTAZ'].astype(int).to_numpy()
+                        )
+                        chosen_zone, valid_rows = _polaris_sequential_destination_draw(
+                            V_full,
+                            pred_seg_rows.reset_index(drop=True),
+                            df,
+                            zone_arr_pred,
+                            _polaris_origins,
+                            skim_lookup,
+                            landuse,
+                            rng,
+                        )
+                        needs_gravity = False
+                        df.loc[pred_seg_rows.index[valid_rows], 'DTAZ'] = chosen_zone[valid_rows]
+                        if (~valid_rows).any():
+                            gravity_rows = pred_seg_rows.loc[pred_seg_rows.index[~valid_rows]].copy()
+                            df.loc[gravity_rows.index, 'DTAZ'] = df.loc[gravity_rows.index, 'OTAZ'].astype(int)
+                            logger.warning(f"Dest Polaris sampled simulate invalid for {int((~valid_rows).sum())}/{len(pred_seg_rows)} rows [{seg}]")
+                        logger.info(
+                            f"Dest Polaris sampled simulate succeeded [{seg}]: "
+                            f"strata={POLARIS_DEST_STRATA}, "
+                            f"alts_per_stratum={POLARIS_DEST_ALTS_PER_STRATUM}, "
+                            f"choosers={len(pred_seg_rows)}"
+                        )
+                    elif DEST_CHOICE_SAMPLE_SIZE > 0:
                         # ActivitySim two-step: sample without logsums, resimulate with
                         sample_probs = _dest_probs_numpy(dest_mdl, dt_d_batch, ls_batch, zone_ids_pred, pp,
                                                              include_logsum=False,

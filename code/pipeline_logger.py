@@ -1128,17 +1128,23 @@ def mobility_assign(synth, out):
     if os.environ.get('PIPELINE_MOBILITY', '0') != '1':
         return synth
     try:
-        from mobility_models import run_mobility_models
+        from mobility_models import run_mobility_models, attach_observed_counts
         hhts = out.get('persons') if isinstance(out, dict) else None
         if hhts is None or not len(hhts):
             logger.warning("mobility: no HHTS persons in `out` — skipping")
             return synth
-        return run_mobility_models(
+        synth = run_mobility_models(
             hhts, synth,
             hhts_trips=out.get('trips'),
             households=out.get('households'),
             out_dir=OUT_DIR,
             seed=int(os.environ.get('PIPELINE_SEED', '42')))
+        # symmetry: attach OBSERVED mode counts onto HHTS persons so the stage
+        # 1-4 / stage-5-mode estimators see the same n_transit/n_car/n_bike
+        # covariates that predict_counts assigned onto synth.
+        if isinstance(out, dict) and out.get('trips') is not None:
+            out['persons'] = attach_observed_counts(hhts, out['trips'])
+        return synth
     except Exception as e:
         logger.warning(f"mobility assignment skipped ({e})")
         return synth

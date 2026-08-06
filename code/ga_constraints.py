@@ -81,7 +81,7 @@ _ENCODING_FAMILIES = {
     'income':    (['incp', 'incp_generic'],
                   ['income_verylo', 'income_lo', 'income_mid', 'income_midplus',
                    'income_midhi', 'income_hi', 'income_veryhi']),
-    'vehicle':   (['vehrd', 'veh_generic'],
+    'vehicle':   (['vehrd', 'veh_generic', 'hh_vehicles_pred'],
                   ['no_vehicle', 'one_vehicle', 'has_vehicle', 'multi_vehicle']),
     'household': (['nprd', 'HHSIZE'],
                   ['hh_alone', 'hh_couple', 'hh_medium', 'hh_size_large']),
@@ -94,6 +94,13 @@ _ENCODING_FAMILIES = {
 _ALTERNATIVE_ENCODINGS = [
     ['wfh', 'wfh_flag', 'WFHWEEK', 'WFHDAY'],
     ['sexp', 'is_female'],
+    # Modeled household bike count (mobility_models) vs the observed 'bikes'
+    # count — the prediction is a smooth function of the same attributes, so the
+    # two are collinear; at most one in a spec.
+    ['bikes', 'hh_bikes_pred'],
+    # Tour-sequence length (tour_sequence) vs the observed tour count — both are
+    # counts of tours per person, mechanically near-identical.
+    ['n_tours', 'n_tours_seq'],
 ]
 
 
@@ -269,6 +276,11 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             'c_xwait_transit': 'neg', 'c_drv_transit': 'neg',
             'c_crash_safety': 'neg',
             'ASC_Walk': 'neg',
+            # Habitual mode-usage captivity: more habitual use of a mode raises
+            # its utility (≥ 0). Also blocks a perverse sign from any residual
+            # collinearity with ownership terms.
+            'c_transit_use_transit': 'pos', 'c_car_use_da': 'pos',
+            'c_bike_use_bike': 'pos',
         },
         # ── Protected backbone (never removed by _prune_and_refit) ───────────
         'protected_backbone': [

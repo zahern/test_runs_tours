@@ -4802,9 +4802,27 @@ def _stage4_candidates(data: pd.DataFrame) -> List[str]:
     ))
 
 
-def _stage5_mode_candidates() -> List[str]:
+def _series_varies(s: pd.Series) -> bool:
+    """True when a column carries real signal (≥2 distinct non-null values) — used
+    to gate mobility-propensity genes so a constant-0 fallback column (pre-day
+    module off) is never offered to the mode search."""
+    try:
+        col = pd.to_numeric(s, errors='coerce') if s.dtype == object else s
+        return int(pd.Series(col).nunique(dropna=True)) >= 2
+    except Exception:
+        return False
+
+
+def _stage5_mode_candidates(data: pd.DataFrame = None) -> List[str]:
     """
     Candidate variables for Stage 5 (tour-level) and Stage 51 (trip-level) mode choice.
+
+    When `data` is supplied, the mobility-propensity genes (transit_prop/car_prop/
+    bike_prop) are offered ONLY if their column is present AND actually varies in
+    `data` — i.e. the pre-day mobility module ran. Otherwise the term would be a
+    constant-0 column and waste a never-moving coefficient, so it is dropped from
+    the search entirely. All other genes are unconditional (they rely on the
+    MODE_UEC 0-defaults + _COEFF_GATE mechanism and must stay in the pool).
 
     Split into two sub-pools:
     ALWAYS FIXED (backbone)   kept regardless of GA selection:
@@ -4884,9 +4902,13 @@ def _stage5_mode_candidates() -> List[str]:
     # Habitual mode-usage captivity from mobility_models — the (1-π)μ propensity
     # (transit_prop/car_prop/bike_prop), a smooth function of EXOGENOUS person
     # attributes rather than the realised trip count, so it is non-circular with
-    # the tour's observed mode. GA-searchable and gated to 0 when the pre-day
-    # mobility module did not run.
+    # the tour's observed mode. Offered only when the column is present and varies
+    # (see `data` gating below) so the OFF path never wastes a never-moving gene.
     mobility_use = ['transit_prop', 'car_prop', 'bike_prop']
+    if data is not None:
+        _cols = set(getattr(data, 'columns', []))
+        mobility_use = [c for c in mobility_use
+                        if c in _cols and _series_varies(data[c])]
 
     return (skim_extra + veh_vars + inc_vars + age_gender +
             hh_vars + ptype_vars + abs_vars + acc_origin +
@@ -6633,7 +6655,8 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
     except Exception as e:
         logger.warning(f"Stage 5 GA: could not build skim_df: {e}")
 
-    mode_cands = _stage5_mode_candidates()
+    # gate mobility genes on the PERSON frame (the mode UEC reads person.<mode>_prop)
+    mode_cands = _stage5_mode_candidates(persons)
     dest_cands = _stage5_dest_candidates()
     n_mode     = len(mode_cands)
 
@@ -6906,7 +6929,7 @@ def _run_ga_stage5_trip(trips, persons, skims, landuse, ga_kwargs,
         logger.warning(f"Stage 51 GA: could not build skim_df: {e}")
         skim_df = pd.DataFrame()
 
-    mode_cands = _stage5_mode_candidates()
+    mode_cands = _stage5_mode_candidates(persons)   # gate mobility genes on data
     dest_cands = _stage5_dest_candidates()
     n_mode     = len(mode_cands)
 

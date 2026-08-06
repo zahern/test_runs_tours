@@ -404,6 +404,32 @@ def _resolve_default_crash_source() -> Optional[str]:
     return None
 
 
+_ZONE_CENTROIDS_CACHE: Optional[dict] = None
+
+
+def _load_zone_centroids_cached() -> dict:
+    """{int(ORDER): (lat, lon)} from the cached zone-centroids CSV, for the
+    GP crash smoother (STAGE5_CRASH_SMOOTH). Cached; returns {} if unavailable."""
+    global _ZONE_CENTROIDS_CACHE
+    if _ZONE_CENTROIDS_CACHE is not None:
+        return _ZONE_CENTROIDS_CACHE
+    out: dict = {}
+    for _p in (os.environ.get('STAGE5_ZONE_CENTROIDS', '').strip(),
+               'saved_data/osm_cache/zone_centroids.csv'):
+        if _p and os.path.isfile(_p):
+            try:
+                _c = pd.read_csv(_p)
+                _zc = next((x for x in ('ORDER', 'zone', 'DTAZ', 'taz') if x in _c.columns), None)
+                if _zc and 'lat' in _c.columns and 'lon' in _c.columns:
+                    out = {int(float(r[_zc])): (float(r['lat']), float(r['lon']))
+                           for _, r in _c[[_zc, 'lat', 'lon']].dropna().iterrows()}
+                    break
+            except Exception as _e:
+                logger.warning(f"_load_zone_centroids_cached: failed to read {_p} ({_e})")
+    _ZONE_CENTROIDS_CACHE = out
+    return out
+
+
 def _dataset_var_names(ds_like) -> set:
     """Return variable/column names from xarray-like or pandas-like datasets."""
     # DataTree nodes often expose the underlying dataset as .ds/.dataset.
@@ -2074,12 +2100,42 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                 if _oi is not None and _di is not None:
                     _mat[_oi, _di] = float(_c)
 
+            # ── Impute the crash matrix: unmeasured→max, intrazonal→min ──────
+            # Crash exposure ACCUMULATES along a route (roughly with distance):
+            #   • A literal off-diagonal 0 means "no crash record for this OD
+            #     pair", NOT "risk-free" — every real OD trip carries exposure.
+            #     Treating unknowns as worst-case (max) is the conservative safety
+            #     stance and removes the sparse-zero mass that left c_crash a
+            #     near-constant, unidentified column (pval≈1.0).
+            #   • The diagonal (origin→self, intrazonal) is the SHORTEST trip, so
+            #     it accumulates the least exposure → set it to the MIN crash.
+            # The matrix is built over `od`'s zone set, so it is already the SAME
+            # shape as the time/skim matrix (N×N over the same zones). Toggle with
+            # STAGE5_CRASH_ZERO_TO_MAX=0.
+            if os.environ.get('STAGE5_CRASH_ZERO_TO_MAX', '1') == '1':
+                _pos = _mat[_mat > 0]
+                _cmax = float(_pos.max()) if _pos.size else 0.0
+                _cmin = float(_pos.min()) if _pos.size else 0.0
+                if _cmax > 0:
+                    _off0 = (_mat == 0.0)
+                    np.fill_diagonal(_off0, False)      # exclude the diagonal
+                    _n0 = int(_off0.sum())
+                    _mat[_off0] = _cmax                 # unmeasured off-diagonal → max
+                    np.fill_diagonal(_mat, _cmin)       # intrazonal → min
+                    logger.info(f"_dest_tree: crash imputation — {_n0} unmeasured OD "
+                                f"pairs → max={_cmax:.4g}; diagonal (intrazonal) → "
+                                f"min={_cmin:.4g}")
+                else:
+                    logger.warning("_dest_tree: crash matrix is all-zero — imputation "
+                                   "skipped (no crash source?)")
+
             _da = xr.DataArray(
                 _mat, dims=['otaz', 'dtaz'],
                 coords={'otaz': _zones, 'dtaz': _zones},
             )
             od = od.assign(CRASH=_da)
-            logger.info("_dest_tree: CRASH matrix loaded into od dataset")
+            logger.info(f"_dest_tree: CRASH matrix loaded into od dataset "
+                        f"(shape {_mat.shape[0]}×{_mat.shape[1]}, matches time-matrix zones)")
         except Exception as _ce:
             logger.warning(f"_dest_tree: failed to load CRASH values ({_ce}) - "
                            "c_crash will use zero values")
@@ -2233,13 +2289,56 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     if _od_dist_mat is not None:
         _dist_vals_ca = np.where(_valid_od_vec, _od_dist_mat[_oi_safe_vec, _di_safe_vec], 30.0).astype(np.float32)
     if _od_crash_mat is not None:
-        _crash_vals_ca = np.where(_valid_od_vec, _od_crash_mat[_oi_safe_vec, _di_safe_vec], 0.0).astype(np.float32)
+        # invalid-OD fallback: treat as unmeasured → max (never zero-crash),
+        # consistent with the matrix imputation above.
+        _crash_fallback = (float(_od_crash_mat.max())
+                           if os.environ.get('STAGE5_CRASH_ZERO_TO_MAX', '1') == '1'
+                           else 0.0)
+        _crash_vals_ca = np.where(_valid_od_vec, _od_crash_mat[_oi_safe_vec, _di_safe_vec],
+                                  _crash_fallback).astype(np.float32)
 
     ca_df['DIST'] = _dist_vals_ca
     ca_df['CRASH'] = _crash_vals_ca
     # Pre-compute log transforms used in utility expressions
     ca_df['log_DIST_1'] = np.log(np.clip(ca_df['DIST'].values, 0.0, None) + 1.0).astype(np.float32)
     ca_df['log_CRASH_1'] = np.log(np.clip(ca_df['CRASH'].values, 0.0, None) + 1.0).astype(np.float32)
+
+    # ── Optional GP-over-space crash smoothing (alternative to 0→max) ─────────
+    # A second, independent treatment for the crash signal: kernel-smooth the
+    # per-destination crash EXPOSURE over zone centroids (= GP posterior mean),
+    # borrowing strength across neighbouring zones. This is the "GP-over-OD"
+    # alternative to the 0→max densification above. OFF by default; when enabled
+    # it OVERWRITES log_CRASH_1 (so the existing c_crash coefficient uses the
+    # smooth field — no extra coefficient needed). For the pure GP form, disable
+    # the imputation (STAGE5_CRASH_ZERO_TO_MAX=0) so the kernel smooths the raw
+    # sparse counts rather than the already-densified matrix.
+    if os.environ.get('STAGE5_CRASH_SMOOTH', '0') == '1' and _od_crash_mat is not None:
+        try:
+            from crash_smoothing import smooth_zone_field
+            _dest_zone_ids = np.asarray(_od_dtaz)
+            _dest_exposure = np.asarray(_od_crash_mat, dtype=float).sum(axis=0)  # sum over origins
+            _cent = _load_zone_centroids_cached()
+            _lat = np.array([_cent.get(int(z), (np.nan, np.nan))[0] for z in _dest_zone_ids])
+            _lon = np.array([_cent.get(int(z), (np.nan, np.nan))[1] for z in _dest_zone_ids])
+            _ok = np.isfinite(_lat) & np.isfinite(_lon)
+            if int(_ok.sum()) > 5 and np.any(_dest_exposure[_ok] > 0):
+                _ls = float(os.environ.get('STAGE5_CRASH_SMOOTH_LS', '5.0'))
+                _noise = float(os.environ.get('STAGE5_CRASH_SMOOTH_NOISE', '1.0'))
+                _sm = np.zeros(len(_dest_zone_ids))
+                _sm[_ok] = smooth_zone_field(_dest_exposure[_ok], _lat[_ok], _lon[_ok],
+                                             length_scale_km=_ls, noise=_noise)
+                _z2s = {int(z): float(s) for z, s in zip(_dest_zone_ids, _sm)}
+                _cs_ca = np.array([_z2s.get(int(d), 0.0) for d in _dtaz_arr], dtype=np.float32)
+                ca_df['CRASH'] = _cs_ca
+                ca_df['log_CRASH_1'] = np.log(np.clip(_cs_ca, 0.0, None) + 1.0).astype(np.float32)
+                logger.info(f"_dest_tree: crash GP-smoothed (ℓ={_ls}km) — raw nonzero "
+                            f"{int((_dest_exposure > 0).sum())}/{len(_dest_zone_ids)} zones → "
+                            f"smoothed nonzero {int((_sm > 1e-9).sum())}; c_crash now uses it")
+            else:
+                logger.warning("_dest_tree: crash smoothing skipped (too few zone centroids "
+                               "or no positive crash exposure) — using log_CRASH_1 as-is")
+        except Exception as _cse:
+            logger.warning(f"_dest_tree: crash smoothing failed ({_cse}) — using log_CRASH_1 as-is")
 
     # ── Piecewise-linear distance spline (ActivitySim distance-band pattern) ─
     # A continuous linear spline in km with knots at 2 and 5 km, so the GA can

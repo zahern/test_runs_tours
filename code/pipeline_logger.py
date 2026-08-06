@@ -1119,6 +1119,53 @@ def wfh_assign(synth, out):
         return synth
 
 
+@timer("Mobility attributes — zero-inflated usage/ownership")
+def mobility_assign(synth, out):
+    """Estimate the zero-inflated mobility models (transit/car/bike weekly trips +
+    household vehicles/bikes) on HHTS and assign onto the synth population before
+    CDAP, writing a validation report per model to {OUT_DIR}/mobility/. Gated by
+    PIPELINE_MOBILITY; a no-op when off or when HHTS trips/persons are missing."""
+    if os.environ.get('PIPELINE_MOBILITY', '0') != '1':
+        return synth
+    try:
+        from mobility_models import run_mobility_models
+        hhts = out.get('persons') if isinstance(out, dict) else None
+        if hhts is None or not len(hhts):
+            logger.warning("mobility: no HHTS persons in `out` — skipping")
+            return synth
+        return run_mobility_models(
+            hhts, synth,
+            hhts_trips=out.get('trips'),
+            households=out.get('households'),
+            out_dir=OUT_DIR,
+            seed=int(os.environ.get('PIPELINE_SEED', '42')))
+    except Exception as e:
+        logger.warning(f"mobility assignment skipped ({e})")
+        return synth
+
+
+@timer("Tour-purpose sequencing — CDAP tour-level")
+def tour_sequence_assign(synth, out):
+    """CDAP tour-level operation: generate an ordered tour_purposes list per active
+    person from a first-order Markov purpose chain fit on HHTS tours. Runs AFTER
+    cdap() (needs the CDAP column). Gated by PIPELINE_TOUR_SEQ; validation report
+    to {OUT_DIR}/mobility/tour_sequence_validation.html."""
+    if os.environ.get('PIPELINE_TOUR_SEQ', '0') != '1':
+        return synth
+    try:
+        from tour_sequence import run_tour_sequences
+        hhts_tours = out.get('tours') if isinstance(out, dict) else None
+        if hhts_tours is None or not len(hhts_tours):
+            logger.warning("tour_sequence: no HHTS tours in `out` — skipping")
+            return synth
+        return run_tour_sequences(
+            hhts_tours, synth, cdap_col='CDAP', out_dir=OUT_DIR,
+            seed=int(os.environ.get('PIPELINE_SEED', '42')))
+    except Exception as e:
+        logger.warning(f"tour_sequence assignment skipped ({e})")
+        return synth
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # COEFFICIENT CSV HELPER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6540,7 +6587,9 @@ def main(filepath: str = None):
     # usual_locations must run BEFORE cdap so work/school zones are known
     synth      = usual_locations(synth, landuse, hhts_tours=_hhts_tours_for_val)
     synth      = wfh_assign(synth, _out_for_cdap)   # lr4: WFH before CDAP
+    synth      = mobility_assign(synth, _out_for_cdap)   # zero-inflated mobility
     synth      = cdap(_out_for_cdap, synth)
+    synth      = tour_sequence_assign(synth, _out_for_cdap)   # tour-level purposes
     _audit_hhts_synth_consistency(_out_for_cdap.get('persons'), synth, landuse,
                                   label='post_usual_locations')
 
@@ -6878,8 +6927,10 @@ def GA_main(filepath: str = None):
 
     synth = usual_locations(synth, landuse, hhts_tours=out.get('tours'))
     synth = wfh_assign(synth, out)   # lr4: WFH before CDAP
+    synth = mobility_assign(synth, out)   # zero-inflated mobility attributes
     _s0_res = ga_results.results.get(0) if ga_results is not None else None
     synth = cdap(out, synth, feature_override=getattr(_s0_res, 'best_features', None))
+    synth = tour_sequence_assign(synth, out)   # tour-level purpose sequencing
     travellers = synth[synth['CDAP'].isin(['M', 'N'])].copy()
     print(f"  CDAP filter: {len(travellers):,}/{len(synth):,} persons are travellers")
 
@@ -7062,8 +7113,10 @@ def GA_STAGED(filepath: str = None):
 
     synth = usual_locations(synth, landuse, hhts_tours=out.get('tours'))
     synth = wfh_assign(synth, out)   # lr4: WFH before CDAP
+    synth = mobility_assign(synth, out)   # zero-inflated mobility attributes
     _s0_res = all_ga.results.get(0) if all_ga is not None else None
     synth = cdap(out, synth, feature_override=getattr(_s0_res, 'best_features', None))
+    synth = tour_sequence_assign(synth, out)   # tour-level purpose sequencing
     travellers = synth[synth['CDAP'].isin(['M', 'N'])].copy()
     print(f"  CDAP filter: {len(travellers):,}/{len(synth):,} persons are travellers")
 

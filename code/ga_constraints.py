@@ -194,6 +194,15 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             ['c_work_walk', 'c_age_walk'],
             ['c_work_bike', 'c_age_bike'],
             ['c_work_transit', 'c_notwork_transit'],
+            # Worker-status encodings (GENE names actually in the mode pool): the
+            # WORKSTAT-derived binary and the equivalent ptype_* dummy encode the
+            # SAME construct and both gate the SAME c_*work_* coefficient, so
+            # co-selecting them just wastes a gene and muddies identification of
+            # the (already fragile) worker×mode captivity term. At most one each.
+            # (workstat_notworking vs ptype_Retired are NOT paired — retired is a
+            # subset of not-working, a legitimately distinct captivity signal.)
+            ['workstat_fulltime', 'ptype_FullTimeWorker'],
+            ['workstat_parttime', 'ptype_PartTimeWorker'],
             # CBD proximity: at most one of {c_cbd_transit, c_cbd_da, c_cbd_sr}
             # is independently identifiable (all reference emp.is_cbd).
             ['c_cbd_transit', 'c_cbd_da', 'c_cbd_sr'],
@@ -285,7 +294,7 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         # ── Protected backbone (never removed by _prune_and_refit) ───────────
         'protected_backbone': [
             'ASC_SR', 'ASC_Walk', 'ASC_Bike', 'ASC_Transit',
-            'Mu_Car', 'Mu_Motor', 'Mu_NonMotor', 'Mu_Root',
+            'Mu_Motor', 'Mu_NonMotor', 'Mu_Root',
             'c_ivt_auto', 'c_ivt_transit', 'c_walk_time', 'c_bike_time',
         ],
     },

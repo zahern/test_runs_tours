@@ -4222,6 +4222,13 @@ def postprocess_plan(plan: pd.DataFrame) -> pd.DataFrame:
 
 
 
+# Worker-type × mode captivity coefficients that only identify in the POOLED
+# ('all') model — near-constant (hence collinear with the mode ASC) inside the
+# single-purpose 'work' segment where their gene is offered. Dropped outside
+# segment=='all' by _build_mode_utility (fixes the 637 "NEVER MOVED" diagnostic).
+_POOLED_ONLY_MODE_COEFFS = {'c_ftwork_da', 'c_ptwork_sr'}
+
+
 def _build_mode_utility(m, Mode, segment: str,
                          uec: dict = None) -> object:
     """
@@ -4252,6 +4259,18 @@ def _build_mode_utility(m, Mode, segment: str,
         # signal in a POOLED model (segment == 'all'); drop them otherwise so a
         # work mode model never contains edu components and vice-versa.
         if segment != 'all' and 'main_purpose ==' in expr:
+            continue
+        # ── Skip worker-type × mode dummies in single-purpose segments ───────
+        # c_ftwork_da / c_ptwork_sr (person.workstat_fulltime / _parttime) only
+        # enter the 'work' segment pool, where the population is worker-status
+        # homogeneous (workstat_fulltime ≈ 1) → the column is near-constant →
+        # collinear with the mode ASC → the coefficient never moves (the 637
+        # "NEVER MOVED" diagnostic). Full-time-vs-part-time captivity only
+        # identifies in the POOLED model that spans all purposes; drop it in any
+        # single-purpose segment. (c_notwork_transit is unaffected — its gene
+        # workstat_notworking is only offered in the heterogeneous nonmand
+        # segment, where it does carry signal.)
+        if segment != 'all' and coeff in _POOLED_ONLY_MODE_COEFFS:
             continue
 
         if mode_filter is None:
@@ -4991,36 +5010,47 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
     else:
         m = _build_mode_utility(m, Mode, segment)
 
-    # Nested logit: Motorised (Car / Transit) and NonMotorised (Walk / Bike)
-    # Parameter names use _ not : to avoid sharrow expression-compiler issues
-    Car      = m.graph.new_node(parameter="Mu_Car",      children=[Mode.DA, Mode.SR])
+    # Nested logit: Motorised (DA / SR / Transit) and NonMotorised (Walk / Bike).
+    # Two-level tree only: the intermediate Car{DA,SR} nest (Mu_Car) was removed
+    # because it was not identified by the data (Mu_Car collapsed to its 0.10
+    # floor in edu with |t| < 0.7).  DA and SR now sit directly inside the
+    # Motorised nest.  Parameter names use _ not : to avoid sharrow
+    # expression-compiler issues.
     NonMotor = m.graph.new_node(parameter="Mu_NonMotor", children=[Mode.Walk, Mode.Bike])
-    Motor    = m.graph.new_node(parameter="Mu_Motor",    children=[Car, Mode.Transit])
+    Motor    = m.graph.new_node(parameter="Mu_Motor",    children=[Mode.DA, Mode.SR, Mode.Transit])
     m.graph.new_node(parameter="Mu_Root", children=[Motor, NonMotor])
 
     # Mu_Root = 1 is the normalisation constraint for the nested logit.
     # It must be locked (holdfast=True) - if it's free, the hessian is
     # singular because the root scale is not separately identified.
-    # Nesting params (Mu_Car, Mu_Motor, Mu_NonMotor) must be in (0, 1].
+    # Mu_Motor and Mu_NonMotor are FIXED (holdfast) rather than estimated:
+    # freeing them produced censored at-bound estimates (Mu_NonMotor=1.0 cap,
+    # Mu_Car=0.10 floor) with |t| < 0.7, i.e. the nesting scales were not
+    # identified by the data.  Holding both at a fixed mid-range value keeps
+    # the intended motorised/non-motorised correlation structure without
+    # reporting a censored estimate as if it were structural.
+    # Override the fixed value via STAGE5_MU_FIXED_VALUE (default 0.8).
+    _mu_fixed = float(os.environ.get('STAGE5_MU_FIXED_VALUE', '0.8'))
     m.set_value("Mu_Root",     1.0)
-    m.set_value("Mu_Car",      0.8)
-    m.set_value("Mu_Motor",    0.8)
-    m.set_value("Mu_NonMotor", 0.8)
+    m.set_value("Mu_Motor",    _mu_fixed)
+    m.set_value("Mu_NonMotor", _mu_fixed)
     try:
-        m.lock_value("Mu_Root", 1.0)  # holdfast
-        # Floor raised 0.001 → 0.10: run06/23300124 models collapsed Mu_Car to
-        # the 0.001 bound, scaling in-nest utilities by 1/mu = 1000×.  That
-        # made the Hessian non-invertible (every model fell back to OPG SEs →
-        # unreliable p-values) and produced degenerate predicted shares
-        # (e.g. work DA 0.1% vs 75.5% observed).  mu < 0.1 has no plausible
-        # behavioural interpretation; at the 0.10 bound the model is still
+        m.lock_value("Mu_Root",     1.0)      # holdfast
+        m.lock_value("Mu_Motor",    _mu_fixed)  # holdfast
+        m.lock_value("Mu_NonMotor", _mu_fixed)  # holdfast
+        # Keep bounds on the fixed Mu params for self-documentation and as a
+        # guard if anyone flips holdfast off later.  Floor raised 0.001 → 0.10:
+        # run06/23300124 models collapsed Mu_Car to the 0.001 bound, scaling
+        # in-nest utilities by 1/mu = 1000×.  That made the Hessian
+        # non-invertible (every model fell back to OPG SEs → unreliable
+        # p-values) and produced degenerate predicted shares (e.g. work DA 0.1%
+        # vs 75.5% observed).  mu < 0.1 has no plausible behavioural
+        # interpretation; at the 0.10 bound the model is still
         # near-deterministic within the nest but numerically sane.
         # Override via STAGE5_MU_LOWER_BOUND env var if estimation diagnostics
         # show consistent boundary solutions (warnings about params "ended AT
         # A BOUND").  Values below 0.05 are strongly discouraged.
         _mu_floor = float(os.environ.get('STAGE5_MU_LOWER_BOUND', '0.10'))
-        _pf_set(m, "Mu_Car",      "minimum", _mu_floor)
-        _pf_set(m, "Mu_Car",      "maximum", 1.0)
         _pf_set(m, "Mu_Motor",    "minimum", _mu_floor)
         _pf_set(m, "Mu_Motor",    "maximum", 1.0)
         _pf_set(m, "Mu_NonMotor", "minimum", _mu_floor)
@@ -5956,7 +5986,7 @@ def _prefit_mode_model(mode_mdl, seg_df, persons_df, skims, segment):
     """Pre-condition NL mode model starting values before gradient estimation.
 
     Step 1 — Mu interior initialization:
-      Reset any Mu_Car / Mu_Motor / Mu_NonMotor that sits at or near its
+      Reset any Mu_Motor / Mu_NonMotor that sits at or near its
       bound (≥ 0.95 or ≤ 0.05) to 0.7.  Starting at Mu=1 immediately
       collapses the nest gradient to zero; BFGS then stays on the boundary
       for the entire optimisation, blowing up all standard errors.
@@ -5991,8 +6021,11 @@ def _prefit_mode_model(mode_mdl, seg_df, persons_df, skims, segment):
     DE while keeping Steps 1+2).
     """
     # ── Step 1: Mu interior initialization ────────────────────────────────
+    # Both remaining Mu params (Mu_Motor, Mu_NonMotor) are holdfasted in
+    # _build_mode_model, so this loop should never find a free Mu; kept for
+    # robustness if holdfast is ever relaxed.
     try:
-        for _mu_p in ('Mu_Car', 'Mu_Motor', 'Mu_NonMotor'):
+        for _mu_p in ('Mu_Motor', 'Mu_NonMotor'):
             if _mu_p not in mode_mdl.pf.index:
                 continue
             _is_hf = bool(mode_mdl.pf.loc[_mu_p].get('holdfast', False))
@@ -6086,7 +6119,6 @@ def _prefit_mode_model(mode_mdl, seg_df, persons_df, skims, segment):
                 'ASC_Walk':    (-6.0, 3.0),
                 'ASC_Bike':    (-7.0, 2.0),
                 'ASC_Transit': (-5.0, 3.0),
-                'Mu_Car':      (0.10, 0.95),
                 'Mu_Motor':    (0.10, 0.95),
                 'Mu_NonMotor': (0.10, 0.95),
             }
@@ -6747,7 +6779,7 @@ def _estimate(model, two_phase: bool = False):
             # per the nest policy, and the destination backbone (size term,
             # Manski-Lerman correction, logsum, distance) must always remain.
             _NEVER_DROP = {
-                'Mu_Root', 'Mu_Car', 'Mu_Motor', 'Mu_NonMotor',
+                'Mu_Root', 'Mu_Motor', 'Mu_NonMotor',
                 'ASC_SR', 'ASC_Walk', 'ASC_Bike', 'ASC_Transit',
                 # Level-of-service impedance backbone (mode model)
                 'c_ivt_auto', 'c_ivt_transit', 'c_walk_time', 'c_bike_time',
@@ -9281,16 +9313,14 @@ def _compute_frozen_probs(seg_df: pd.DataFrame, mxl_result: dict,
               + pv('c_fts_bk', 0.0) * is_ft_student)
         V_BK = np.where(bike_avail_arr > 0, V_BK, -1e9)
 
-        # ── Nested logit (Root{Motor{Car{DA,SR}, Transit}, NonMotor{Walk,Bike}}) ──
-        # Was a flat 5-way softmax; see _nested_mode_probs for why that's
-        # mathematically inconsistent with coefficients fit under the real
-        # nested structure (it was collapsing SR/Bike/Transit toward Walk).
-        mu_car      = _sanitize_mu(pv('Mu_Car',      1.0), 'Mu_Car')
+        # ── Nested logit (Root{Motor{DA,SR,Transit}, NonMotor{Walk,Bike}}) ──
+        # Two-level tree: the intermediate Car{DA,SR} nest was removed (Mu_Car
+        # was not identified).  See _nested_mode_probs for the structure.
         mu_motor    = _sanitize_mu(pv('Mu_Motor',    1.0), 'Mu_Motor')
         mu_nonmotor = _sanitize_mu(pv('Mu_NonMotor', 1.0), 'Mu_NonMotor')
         probs = np.asarray(_nested_mode_probs(
             V_DA, V_SR, V_WK, V_BK, V_TR,
-            mu_car=mu_car, mu_motor=mu_motor, mu_nonmotor=mu_nonmotor, xp=np,
+            mu_motor=mu_motor, mu_nonmotor=mu_nonmotor, xp=np,
         ))  # (n, 5) - DA, SR, Walk, Bike, Transit
 
         # ── Cell membership ────────────────────────────────────────────────
@@ -10228,15 +10258,14 @@ def _run_segment(segment: str, tours: pd.DataFrame,
 
     # ── Post-estimation: nest scale (Mu) and collinear income parameters ──────
     #
-    # (A) Nest scale Mu: the nest scale parameters (Mu_Car / Mu_Motor /
-    #     Mu_NonMotor) are kept FREE and are never holdfasted. Previously, when a
-    #     Mu landed at a bound (≈1.0 = MNL limit, or ≈0.10) the code locked it at
-    #     that boundary value and re-estimated "to fix the Hessian". That hid the
-    #     nest as an estimated quantity and reported a censored value as if it
-    #     were structural. A Mu sitting at a bound is a legitimate (if
-    #     near-degenerate) estimate; it is reported honestly and its standard
-    #     error comes from the OPG/proxy fallback in _estimate when the Hessian
-    #     row is flat. No holdfast, no forced re-estimation from the Mu check.
+    # (A) Nest scale Mu: BOTH remaining nest-scale parameters (Mu_Motor /
+    #     Mu_NonMotor) are holdfasted in _build_mode_model (fixed at
+    #     STAGE5_MU_FIXED_VALUE, default 0.8), so neither is ever estimated.
+    #     This avoids the earlier failure mode where a Mu landed at a bound
+    #     (≈1.0 = MNL limit, or ≈0.10) — a censored, near-degenerate value
+    #     reported as if it were structural.  With the intermediate Car nest
+    #     removed and both scales fixed, nesting correlation is preserved as a
+    #     structural assumption rather than an unidentified free parameter.
     #
     # (B) Income collinearity: if c_incp_da/sr/transit/active all converge to
     #     nearly identical values (spread < 30 % of |mean|), they form a
@@ -10244,7 +10273,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     #     c_incp_da to the mean and re-estimate with one generic income param.
     _mode_reestimate_needed = False
     try:
-        for _mu_p in ('Mu_Car', 'Mu_Motor', 'Mu_NonMotor'):
+        for _mu_p in ('Mu_Motor', 'Mu_NonMotor'):
             if _mu_p in mode_mdl.pf.index:
                 _is_hf = bool(mode_mdl.pf.loc[_mu_p].get('holdfast', False))
                 _mu_v  = float(mode_mdl.pf.loc[_mu_p, 'value'])
@@ -12251,26 +12280,29 @@ def _sanitize_mu(mu, name=''):
 
 
 def _nested_mode_probs(V_DA, V_SR, V_WK, V_BK, V_TR,
-                       mu_car=1.0, mu_motor=1.0, mu_nonmotor=1.0, xp=np):
+                       mu_motor=1.0, mu_nonmotor=1.0, xp=np):
     """
     GEV nested-logit choice probabilities for the 5-mode tree estimated by
-    _build_mode_model (stage5_destination_choice.py:4336-4341):
+    _build_mode_model:
 
         Root (mu_root=1, fixed)
-          Motor (mu_motor)
-            Car (mu_car): DA, SR
-            Transit
+          Motor (mu_motor): DA, SR, Transit
           NonMotor (mu_nonmotor): Walk, Bike
+
+    Two-level tree only: the intermediate Car{DA,SR} nest (Mu_Car) was removed
+    because it was not identified by the data (Mu_Car collapsed to its 0.10
+    floor in edu with |t| < 0.7).  DA and SR now sit directly inside the
+    Motorised nest, which also contains Transit.
 
     _mode_probs_numpy and _compute_frozen_probs used to take these same
     utilities straight into a single flat 5-way softmax, which is only
-    correct when mu_car=mu_motor=mu_nonmotor=1 (see the degenerate-case
-    derivation in the fix commit). Reusing coefficients fit under the real
-    nested structure inside a flat softmax systematically misallocates
-    share away from whichever alternatives sit in a tightly-scaled nest
-    (SR inside Car/Motor, Bike/Walk inside NonMotor) — this was collapsing
-    EDU-tour SR to ~0% and NONMAND-tour bike/transit to ~0% at prediction
-    time despite the underlying models fitting well (rho2 0.45-0.55).
+    correct when mu_motor=mu_nonmotor=1 (see the degenerate-case derivation in
+    the fix commit). Reusing coefficients fit under the real nested structure
+    inside a flat softmax systematically misallocates share away from
+    whichever alternatives sit in a tightly-scaled nest (SR inside Motor,
+    Bike/Walk inside NonMotor) — this was collapsing EDU-tour SR to ~0% and
+    NONMAND-tour bike/transit to ~0% at prediction time despite the underlying
+    models fitting well (rho2 0.45-0.55).
 
     When a mu isn't found in the coefficient source it defaults to 1.0,
     which makes the nest a no-op and the formula below reduce exactly to
@@ -12297,19 +12329,17 @@ def _nested_mode_probs(V_DA, V_SR, V_WK, V_BK, V_TR,
         iv = mu * (xp.log(totals_safe) + row_max[:, 0])     # inclusive value (utils)
         return cond_probs, iv
 
-    car_cond,      iv_car      = _logsum([V_DA, V_SR], mu_car)
+    motor_cond,    iv_motor    = _logsum([V_DA, V_SR, V_TR], mu_motor)
     nonmotor_cond, iv_nonmotor = _logsum([V_WK, V_BK], mu_nonmotor)
-    motor_cond,    iv_motor    = _logsum([iv_car, V_TR], mu_motor)
     root_cond,     _iv_root    = _logsum([iv_motor, iv_nonmotor], 1.0)
 
     p_motor, p_nonmotor = root_cond[:, 0], root_cond[:, 1]
-    p_car_motor, p_tr_motor = motor_cond[:, 0], motor_cond[:, 1]
-    p_da_car, p_sr_car = car_cond[:, 0], car_cond[:, 1]
+    p_da_m, p_sr_m, p_tr_m = motor_cond[:, 0], motor_cond[:, 1], motor_cond[:, 2]
     p_wk_nm, p_bk_nm = nonmotor_cond[:, 0], nonmotor_cond[:, 1]
 
-    p_DA = p_motor * p_car_motor * p_da_car
-    p_SR = p_motor * p_car_motor * p_sr_car
-    p_TR = p_motor * p_tr_motor
+    p_DA = p_motor * p_da_m
+    p_SR = p_motor * p_sr_m
+    p_TR = p_motor * p_tr_m
     p_WK = p_nonmotor * p_wk_nm
     p_BK = p_nonmotor * p_bk_nm
 
@@ -12787,17 +12817,15 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
             errors='coerce').fillna(1).values.astype(float)
         V_BK = xp.where(bike_avail > 0, xp.asarray(V_BK), -1e9)
 
-        # ── 6. Nested logit (Root{Motor{Car{DA,SR}, Transit}, NonMotor{Walk,Bike}}) ──
-        # Was a flat 5-way softmax; see _nested_mode_probs for why that's
-        # mathematically inconsistent with coefficients fit under the real
-        # nested structure (it was collapsing SR/Bike/Transit toward Walk).
-        mu_car      = _sanitize_mu(_pv('Mu_Car',      1.0), 'Mu_Car')
+        # ── 6. Nested logit (Root{Motor{DA,SR,Transit}, NonMotor{Walk,Bike}}) ──
+        # Two-level tree: the intermediate Car{DA,SR} nest was removed (Mu_Car
+        # was not identified).  See _nested_mode_probs for the structure.
         mu_motor    = _sanitize_mu(_pv('Mu_Motor',    1.0), 'Mu_Motor')
         mu_nonmotor = _sanitize_mu(_pv('Mu_NonMotor', 1.0), 'Mu_NonMotor')
         probs_raw = _nested_mode_probs(
             xp.asarray(V_DA), xp.asarray(V_SR), xp.asarray(V_WK),
             xp.asarray(V_BK), xp.asarray(V_TR),
-            mu_car=mu_car, mu_motor=mu_motor, mu_nonmotor=mu_nonmotor, xp=xp,
+            mu_motor=mu_motor, mu_nonmotor=mu_nonmotor, xp=xp,
         )
         exp_V = np.asarray(probs_raw)   # already-normalised probs (sums to ~1 per row)
 

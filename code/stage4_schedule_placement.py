@@ -949,6 +949,88 @@ def _fit_rrm_timing_model(subset: pd.DataFrame, purpose: str):
     return model if model.rrm_ is not None else None
 
 
+class RegretTimingModel(RRMTimeModel):
+    """POLARIS-style activity-timing (start-period) choice via the in-house
+    regret_choice engine. Reuses RRMTimeModel._build_X / predict_sampled /
+    fit_within_period_offsets, but fits one of:
+        'rum'    — utility maximisation over periods
+        'rrm'    — classic Random Regret
+        'hybrid' — the Golshani et al. (2018) hybrid RUM-RRM used in POLARIS
+                   (a convex blend with an estimated weight λ; λ says how
+                   regret-driven the timing decision is)
+    Pure numpy/scipy (no SearchLibrium dependency), so it always runs and, unlike
+    the SearchLibrium path, exposes a BIC for the auto decision."""
+
+    def __init__(self, purpose: str, rule: str = 'hybrid'):
+        super().__init__(purpose)
+        self.rule_ = rule
+        self.model_ = None
+        self.lam_ = float('nan')
+        self.bic_ = float('nan')
+
+    def fit(self, df: pd.DataFrame) -> None:
+        from regret_choice import RegretChoiceModel
+        y = pd.to_numeric(df.get('period'), errors='coerce')
+        fit_df = df.loc[y.notna()].copy()
+        y = y.dropna().astype(int).to_numpy()
+        if len(fit_df) < 30 or len(np.unique(y)) < 2:
+            return
+        X = self._build_X(fit_df)
+        if len(X) > 20000:
+            keep = np.linspace(0, len(X) - 1, 20000).astype(int)
+            X, y = X[keep], y[keep]
+        try:
+            m = RegretChoiceModel(rule=self.rule_, fit_ascs=True).fit(
+                X, y, names=list(self.FEATURE_NAMES))
+        except Exception as exc:
+            logger.warning(f'  timing/{self.purpose_}: regret ({self.rule_}) failed: {exc}')
+            return
+        if not np.isfinite(m.ll_):
+            return
+        self.model_ = m
+        self.n_obs_ = int(m.n_)
+        self.ll_ = float(m.ll_)
+        self.bic_ = float(m.bic)
+        self.lam_ = float(getattr(m, 'lam_', float('nan')))
+        counts = np.bincount(y, minlength=self.n_periods_).astype(float)
+        self.observed_period_shares_ = counts / max(float(counts.sum()), 1.0)
+        self.converged_ = True
+        self.fit_status_ = f'ok:{self.rule_}'
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if self.model_ is None:
+            return np.full((len(X), self.n_periods_), 1.0 / self.n_periods_)
+        p = self.model_.predict_proba(np.asarray(X, dtype=float))
+        return np.nan_to_num(p, nan=1.0 / self.n_periods_)
+
+
+def _fit_regret_timing_model(subset: pd.DataFrame, purpose: str, mode: str):
+    """Fit an engine-based timing model. mode ∈ {'rum','rrm','hybrid'} fits that
+    single rule; mode == 'auto' fits all three and keeps the best-BIC one — the
+    decision rule becomes a data-driven (searched) choice, POLARIS-style."""
+    rules = ('rum', 'rrm', 'hybrid') if mode == 'auto' else (mode,)
+    best, best_bic = None, np.inf
+    _bics = {}
+    for r in rules:
+        mdl = RegretTimingModel(purpose, rule=r)
+        try:
+            mdl.fit(subset)
+        except Exception as exc:
+            logger.warning(f'  timing/{purpose}: regret {r} failed: {exc}')
+            continue
+        if mdl.model_ is None or not np.isfinite(mdl.bic_):
+            continue
+        _bics[r] = mdl.bic_
+        if mdl.bic_ < best_bic:
+            best, best_bic = mdl, mdl.bic_
+    if best is not None and mode == 'auto':
+        logger.info(f'  timing/{purpose}: decision-rule search BIC='
+                    f'{{{", ".join(f"{r}:{b:.1f}" for r, b in _bics.items())}}} '
+                    f'→ {best.rule_}' + (f' (λ={best.lam_:.2f})'
+                                         if best.rule_ == "hybrid" else ""))
+    return best
+
+
 # ---------------------------------------------------------------------------
 # 3.  ESTIMATE — ONE MODEL PER PURPOSE
 # ---------------------------------------------------------------------------
@@ -1006,6 +1088,25 @@ def estimate_timing_models(
                     f"  timing/{purpose}: SearchLibrium RRM, n={rrm_model.n_obs_}, "
                     f"status={rrm_model.fit_status_}, "
                     f"blend_alpha={rrm_model.period_blend_alpha_:.2f}"
+                )
+                continue
+
+        # POLARIS-style hybrid RUM-RRM (or pure rum/rrm), and 'auto' which searches
+        # the decision rule by BIC — via the in-house regret_choice engine.
+        if _timing_estimator in ('hybrid', 'rum', 'auto'):
+            reg_model = _fit_regret_timing_model(subset, purpose, _timing_estimator)
+            if reg_model is not None:
+                reg_model.fit_within_period_offsets(subset)
+                reg_model.period_blend_alpha_ = float(
+                    np.clip(_purpose_alpha.get(purpose, 0.20) * _alpha_scale, 0.0, 0.60)
+                )
+                models[purpose] = reg_model
+                _lam = (f", λ={reg_model.lam_:.2f}"
+                        if reg_model.rule_ == 'hybrid' and np.isfinite(reg_model.lam_) else "")
+                logger.info(
+                    f"  timing/{purpose}: regret[{reg_model.rule_}], n={reg_model.n_obs_}, "
+                    f"BIC={reg_model.bic_:.1f}{_lam}, "
+                    f"blend_alpha={reg_model.period_blend_alpha_:.2f}"
                 )
                 continue
 

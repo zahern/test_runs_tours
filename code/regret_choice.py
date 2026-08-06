@@ -16,6 +16,12 @@ Decision rules implemented (all as a softmax over available alternatives):
   • 'prrm' — Pure/Profit RRM (van Cranenburgh & Prato): the attributes are
         transformed once (x̂ depends on the attribute sign, not on β) so regret is
         LINEAR-in-parameters, R_i = Σ_k β_k x̂_ik, hence estimable as an MNL on −x̂.
+  • 'hybrid' — the POLARIS / Golshani et al. (2018) hybrid RUM-RRM used in the
+        activity-timing (start-time) choice: a convex blend of the two rules with
+        a SHARED β and an estimated weight λ∈(0,1),
+            V_i = ASC_i + (1−λ) Σ_k β_k x_ik  +  λ (−R_i).
+        λ=0 recovers RUM, λ=1 recovers classic RRM; estimating λ lets the data say
+        how regret-driven the timing decision is.
 An optional scale μ ('mu_rrm') multiplies the regret.
 
 X is a dense (n_cases, n_alts, n_attrs) array; `chosen` a (n_cases,) alt index;
@@ -38,7 +44,7 @@ except Exception:                                    # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-_VALID_RULES = ('rum', 'rrm', 'prrm', 'mu_rrm')
+_VALID_RULES = ('rum', 'rrm', 'prrm', 'mu_rrm', 'hybrid')
 
 
 def _softplus(z):
@@ -72,27 +78,35 @@ class RegretChoiceModel:
     beta_: Optional[np.ndarray] = None
     asc_: Optional[np.ndarray] = None            # length n_alts, asc_[0]=0 reference
     mu_: float = 1.0
+    lam_: float = 1.0                                # hybrid RUM-RRM weight (0=RUM,1=RRM)
     names_: list = field(default_factory=list)
     n_: int = 0
     k_: int = 0
     ll_: float = np.nan
 
-    # -- systematic values V_i (pre-softmax) for a parameter vector -----------
-    def _utilities(self, X, asc, beta, mu, xhat=None):
+    def _classic_regret(self, X, beta):
         n, a, kk = X.shape
+        xi = X[:, :, None, :]
+        xj = X[:, None, :, :]
+        d = (xj - xi) * beta[None, None, None, :]
+        sp = _softplus(d)                            # (n,i,j,k)
+        eye = np.eye(a, dtype=bool)[None, :, :, None]
+        sp = np.where(eye, 0.0, sp)
+        return sp.sum(axis=(2, 3))                   # R (n,i)
+
+    # -- systematic values V_i (pre-softmax) for a parameter vector -----------
+    def _utilities(self, X, asc, beta, mu, lam=1.0, xhat=None):
         if self.rule == 'rum':
             V = X @ beta
         elif self.rule == 'prrm':
-            V = -(xhat @ beta)                      # regret is linear; V = −R
+            V = -(xhat @ beta)                        # regret is linear; V = −R
+        elif self.rule == 'hybrid':
+            # convex RUM-RRM blend with shared β: (1−λ)·V_rum + λ·(−R)
+            Vrum = X @ beta
+            R = self._classic_regret(X, beta)
+            V = (1.0 - lam) * Vrum + lam * (-R)
         else:  # 'rrm' / 'mu_rrm' classic
-            xi = X[:, :, None, :]
-            xj = X[:, None, :, :]
-            d = (xj - xi) * beta[None, None, None, :]
-            sp = _softplus(d)                        # (n,i,j,k)
-            eye = np.eye(a, dtype=bool)[None, :, :, None]
-            sp = np.where(eye, 0.0, sp)
-            R = sp.sum(axis=(2, 3))                  # (n,i)
-            V = -mu * R
+            V = -mu * self._classic_regret(X, beta)
         return V + asc[None, :]
 
     def _neg_ll(self, theta, X, y, avail, xhat):
@@ -103,10 +117,12 @@ class RegretChoiceModel:
             asc[1:] = theta[:a - 1]
             off = a - 1
         beta = theta[off:off + kk]
-        mu = 1.0
+        mu, lam = 1.0, 1.0
         if self.rule == 'mu_rrm':
             mu = np.exp(np.clip(theta[off + kk], -3, 3))
-        V = self._utilities(X, asc, beta, mu, xhat=xhat)
+        elif self.rule == 'hybrid':
+            lam = 1.0 / (1.0 + np.exp(-theta[off + kk]))   # logistic → (0,1)
+        V = self._utilities(X, asc, beta, mu, lam=lam, xhat=xhat)
         V = np.where(avail > 0, V, -1e20)
         V = V - V.max(axis=1, keepdims=True)
         eV = np.exp(V) * (avail > 0)
@@ -126,7 +142,8 @@ class RegretChoiceModel:
         xhat = prrm_transform(X, self.attr_sign) if self.rule == 'prrm' else None
         self.names_ = list(names) if names is not None else [f'x{k}' for k in range(kk)]
 
-        n_par = (a - 1 if self.fit_ascs else 0) + kk + (1 if self.rule == 'mu_rrm' else 0)
+        _extra = 1 if self.rule in ('mu_rrm', 'hybrid') else 0
+        n_par = (a - 1 if self.fit_ascs else 0) + kk + _extra
         theta0 = np.zeros(n_par)
         if not _SCIPY_OK:
             logger.warning("regret_choice: scipy unavailable — returning zero fit")
@@ -142,6 +159,8 @@ class RegretChoiceModel:
         self.beta_ = theta[off:off + kk]
         if self.rule == 'mu_rrm':
             self.mu_ = float(np.exp(np.clip(theta[off + kk], -3, 3)))
+        elif self.rule == 'hybrid':
+            self.lam_ = float(1.0 / (1.0 + np.exp(-theta[off + kk])))
         self.n_, self.k_ = n, n_par
         self.ll_ = float(-res.fun)
         return self
@@ -151,7 +170,7 @@ class RegretChoiceModel:
         n, a, kk = X.shape
         avail = np.ones((n, a)) if avail is None else np.asarray(avail, dtype=float)
         xhat = prrm_transform(X, self.attr_sign) if self.rule == 'prrm' else None
-        V = self._utilities(X, self.asc_, self.beta_, self.mu_, xhat=xhat)
+        V = self._utilities(X, self.asc_, self.beta_, self.mu_, lam=self.lam_, xhat=xhat)
         V = np.where(avail > 0, V, -1e20)
         V = V - V.max(axis=1, keepdims=True)
         eV = np.exp(V) * (avail > 0)
@@ -207,17 +226,27 @@ if __name__ == '__main__':
     beta_true = np.array([-1.2, -0.8])
     sign = np.array([-1.0, -1.0])  # both more-is-worse
 
-    def _draw(rule):
+    def _draw(rule, lam=1.0):
         m = RegretChoiceModel(rule=rule, attr_sign=sign)
-        m.asc_ = np.zeros(a); m.beta_ = beta_true; m.mu_ = 1.0
+        m.asc_ = np.zeros(a); m.beta_ = beta_true; m.mu_ = 1.0; m.lam_ = lam
         P = m.predict_proba(X)
         u = rng.random(n)
         return (P.cumsum(1) > u[:, None]).argmax(1)
 
     for dgp in ('rrm', 'rum'):
         y = _draw(dgp)
-        best, bics = search_decision_rule(X, y, rules=('rum', 'rrm', 'prrm'),
+        best, bics = search_decision_rule(X, y, rules=('rum', 'rrm', 'prrm', 'hybrid'),
                                           attr_sign=sign, names=['time', 'cost'])
-        print(f"DGP={dgp:4s} → chosen rule={best.rule:5s} "
+        print(f"DGP={dgp:4s} → chosen rule={best.rule:6s} "
               f"beta={np.round(best.beta_, 2)}  "
-              f"BIC(rum={bics['rum']:.0f}, rrm={bics['rrm']:.0f}, prrm={bics['prrm']:.0f})")
+              f"BIC(rum={bics['rum']:.0f}, rrm={bics['rrm']:.0f}, prrm={bics['prrm']:.0f}, "
+              f"hybrid={bics['hybrid']:.0f})")
+
+    # Hybrid DGP (λ=0.6): the fitted hybrid should recover λ≈0.6 and win/tie the
+    # pure rules — the POLARIS activity-timing case.
+    yh = _draw('hybrid', lam=0.6)
+    mh = fit_choice(X, yh, rule='hybrid', attr_sign=sign, names=['time', 'cost'])
+    besth, bicsh = search_decision_rule(X, yh, rules=('rum', 'rrm', 'hybrid'),
+                                        attr_sign=sign, names=['time', 'cost'])
+    print(f"DGP=hybrid(λ=0.6) → fitted λ={mh.lam_:.2f}  chosen rule={besth.rule} "
+          f"BIC(rum={bicsh['rum']:.0f}, rrm={bicsh['rrm']:.0f}, hybrid={bicsh['hybrid']:.0f})")

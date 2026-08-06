@@ -60,3 +60,8 @@ scratchpad/
 *.swp
 .DS_Store
 Thumbs.db
+
+# ── Un-ignore the pipeline diagram source ────────────────────────────────────
+# The repo-root .gitignore ignores *.tex (paper build churn), which also hid the
+# pipeline workflow diagram so its edits never reached GitHub. Re-include it.
+!pipeline_model_workflow_tikz.tex

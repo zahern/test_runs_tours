@@ -1,0 +1,180 @@
+% pipeline_model_workflow_tikz.tex
+% =============================================================================
+% SEQ Activity-Based Model (ABM) — model workflow diagram
+%
+% A single top-to-bottom flow: data inputs (left) feed a pre-day band, which
+% feeds the CDAP / tour-generation layer, then the sequential stage chain
+% (1..6), then the outputs and the DTA assignment loop that returns updated
+% skims. One GA hypothesis-testing "bus" on the right couples to every
+% GA-searched stage. One clean spine — no matrix, no detail panels, no islands.
+%
+% Source files (node -> file):
+%   compute_accessibility.py   mobility_models.py     usual_location.py
+%   wfh_telecommute.py         cdap.py / cdap_households.py   person_latent.py
+%   tour_sequence.py           stage1_activity_frequency.py
+%   stage2_day_duration.py     stage3_activity_duration.py
+%   stage4_schedule_placement.py   stage5_destination_choice.py
+%   stage5b_trip_destination.py    stage6_mode_choice.py
+%   ga_hypothesis_testing.py   ga_constraints.py   regret_choice.py
+%   crash_smoothing.py         run_full_pipeline_dta_tested.py
+%
+% Compile:  pdflatex pipeline_model_workflow_tikz.tex   (run twice)
+% Packages: tikz, standalone
+% =============================================================================
+\documentclass[border=12pt]{standalone}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit,backgrounds,calc}
+
+\tikzset{
+  box/.style   = {draw, rounded corners=2pt, align=center, text width=#1,
+                  minimum height=1.0cm, font=\small, inner sep=4pt},
+  data/.style  = {box=3.2cm, fill=blue!10,   draw=blue!55,   text=blue!70!black,
+                  font=\scriptsize},
+  preday/.style= {box=6.2cm, fill=purple!12, draw=purple!65, thick},
+  coord/.style = {box=6.2cm, fill=teal!12,   draw=teal!60!black, thick},
+  count/.style = {box=6.2cm, fill=orange!15, draw=orange!70},
+  cont/.style  = {box=6.2cm, fill=green!12,  draw=green!60!black},
+  choice/.style= {box=6.2cm, fill=red!10,    draw=red!65},
+  out/.style   = {box=6.2cm, fill=gray!14,   draw=gray!60!black, font=\scriptsize},
+  sim/.style   = {box=6.2cm, fill=gray!18,   draw=gray!60!black, thick},
+  ga/.style    = {box=4.0cm, fill=red!7,     draw=red!75, thick, dashed,
+                  text=red!55!black, font=\scriptsize},
+  file/.style  = {font=\scriptsize, text=red!50},
+  arrow/.style = {->, >=Stealth, thick},
+  feed/.style  = {->, >=Stealth, dashed, thick, blue!45},
+  bus/.style   = {->, >=Stealth, dashed, thick, red!70},
+}
+
+\begin{document}
+\begin{tikzpicture}[node distance=0.55cm and 2.2cm]
+
+% ======================= MAIN VERTICAL SPINE ================================
+\node[preday] (acc)  {\textbf{lr2 \textperiodcentered\ Accessibility}\\
+   auto / walk / bike / transit logsums from skims + landuse\\
+   {\ttfamily\textcolor{black!55}{compute\_accessibility.py}}};
+\node[preday, below=of acc]  (mob) {\textbf{Mobility attributes}\\
+   zero-inflated (probit-gate) transit / car / bike usage\\
+   + household vehicles / bikes \textperiodcentered\ validation per model\\
+   {\ttfamily\textcolor{black!55}{mobility\_models.py}}};
+\node[preday, below=of mob]  (loc) {\textbf{lr3 \textperiodcentered\ Usual locations}\\
+   work / school anchors (capacity equilibrium)\\
+   {\ttfamily\textcolor{black!55}{usual\_location.py}}};
+\node[preday, below=of loc]  (wfh) {\textbf{lr4 \textperiodcentered\ WFH / telecommute}\\
+   P(WFH) on workers $\rightarrow$ shifts mandatory + day budget\\
+   {\ttfamily\textcolor{black!55}{wfh\_telecommute.py}}};
+\node[coord,  below=of wfh]  (cdap){\textbf{Stage 0 \textperiodcentered\ CDAP + household coordination}\\
+   joint M/N/H logit, vehicle allocation, escort;\\
+   shared person latent threaded to all stages\\
+   {\ttfamily\textcolor{black!55}{cdap.py \textperiodcentered\ cdap\_households.py \textperiodcentered\ person\_latent.py}}};
+\node[coord,  below=of cdap] (seq) {\textbf{Tour-purpose sequencing}\\
+   ordered tour list per active person (Markov)\\
+   {\ttfamily\textcolor{black!55}{tour\_sequence.py}}};
+\node[count,  below=of seq]  (s1)  {\textbf{Stage 1 \textperiodcentered\ Activity frequency}\\
+   per-purpose counts: Ordered Logit, NB2, ZIP / ZINB\\
+   {\ttfamily\textcolor{black!55}{stage1\_activity\_frequency.py}}};
+\node[cont,   below=of s1]   (s2)  {\textbf{Stage 2 \textperiodcentered\ Day budget $B$}\\
+   Tobit start / end of day; lognormal budget\\
+   {\ttfamily\textcolor{black!55}{stage2\_day\_duration.py}}};
+\node[cont,   below=of s2]   (s3)  {\textbf{Stage 3 \textperiodcentered\ Activity duration}\\
+   lognormal / MDCEV / AFT hazard / planning-order RRM\\
+   {\ttfamily\textcolor{black!55}{stage3\_activity\_duration.py}}};
+\node[choice, below=of s3]   (s4)  {\textbf{Stage 4 \textperiodcentered\ Schedule / timing}\\
+   hybrid RUM--RRM (POLARIS) \textperiodcentered\ rule searched by BIC\\
+   {\ttfamily\textcolor{black!55}{stage4\_schedule\_placement.py \textperiodcentered\ regret\_choice.py}}};
+\node[choice, below=of s4]   (s5)  {\textbf{Stage 5 \textperiodcentered\ Tour destination + mode}\\
+   MNL-gravity dest; nested / flat MNL mode (searched);\\
+   importance sampling, crash impute + GP logsum smooth\\
+   {\ttfamily\textcolor{black!55}{stage5\_destination\_choice.py \textperiodcentered\ crash\_smoothing.py}}};
+\node[choice, below=of s5]   (s5b) {\textbf{Stage 5b \textperiodcentered\ Trip destinations}\\
+   intermediate stops, detour / trip-square bound\\
+   {\ttfamily\textcolor{black!55}{stage5b\_trip\_destination.py}}};
+\node[choice, below=of s5b]  (s6)  {\textbf{Stage 6 \textperiodcentered\ Trip mode choice}\\
+   nested logit + ActivitySim ASC calibration\\
+   {\ttfamily\textcolor{black!55}{stage6\_mode\_choice.py}}};
+\node[out,    below=of s6]   (outp){\textbf{Outputs} \textperiodcentered\
+   {\ttfamily stage6\_output.csv} \textperiodcentered\ {\ttfamily trips\_for\_aimsun.csv}\\
+   multilevel validation (trip / tour / work / edu)};
+
+% spine arrows (one clean chain)
+\foreach \a/\b in {acc/mob, mob/loc, loc/wfh, wfh/cdap, cdap/seq, seq/s1,
+                   s1/s2, s2/s3, s3/s4, s4/s5, s5/s5b, s5b/s6, s6/outp}
+  \draw[arrow] (\a) -- (\b);
+
+% ======================= DATA INPUTS (left column) =========================
+% Each input sits at the row it feeds, so every feed is a short horizontal arrow.
+\node[data, left=of acc]  (land)  {\textbf{Land use}\\
+   employment, OSM, size terms, ACDC};
+\node[data, above=of land] (synth){\textbf{Synthetic population}\\
+   persons, households, vehrd, bikes\\
+   {\ttfamily build\_synth\_population.py}};
+\node[data, above=of synth] (hhts){\textbf{HHTS survey}\\
+   persons, tours, trips \textperiodcentered\ estimation data};
+\node[data, left=of s5]   (skims) {\textbf{Skims (OMX)}\\
+   time, cost, distance, safety};
+
+\draw[feed] (land.east)  -- (acc.west);
+\draw[feed] (synth.east) -- (mob.west);
+\draw[feed] (hhts.east)  -- ([yshift=3pt]cdap.west);
+\draw[feed] (skims.east) -- (s5.west);
+\draw[feed] (skims.east) |- (s6.west);
+
+% ======================= GA WORKBENCH (right bus) ==========================
+% One vertical dashed bus spanning the GA-searched stages (loc .. s6); each of
+% those stubs to it, so there are no dangling connectors.
+\coordinate (busT) at ([xshift=1.1cm]loc.east);
+\coordinate (busB) at ([xshift=1.1cm]s6.east);
+\draw[bus,dash pattern=on 4pt off 3pt] (busT) -- (busB);
+\foreach \s in {loc,cdap,s1,s2,s3,s4,s5,s5b,s6}
+  \draw[bus,<->] (\s.east) -- (\s.east -| busT);
+
+\node[ga, right=1.0cm of busT, yshift=-0.2cm, anchor=north west] (gac)
+  {\textbf{Search constraints}\\
+   collinearity mutex, sign priors,\\
+   require-one, random-coef policy\\
+   {\ttfamily ga\_constraints.py}};
+\node[ga, below=of gac] (ga) {\textbf{GA hypothesis testing}\\
+   per stage: model family, feature set,\\
+   parameter vector, ASC, decision rule\\
+   {\ttfamily ga\_hypothesis\_testing.py}};
+\node[ga, below=of ga]  (gav) {\textbf{Validation / calibration}\\
+   BIC + significance penalty,\\
+   ASC rescale to observed shares};
+\draw[bus] (gac) -- (ga);
+\draw[bus] (ga)  -- (gav);
+\draw[bus,<->] (ga.west) -- (ga.west -| busT);
+
+% ======================= ASSIGNMENT LOOP (bottom) ==========================
+\node[sim, below=of outp] (asg) {\textbf{DTA / assignment}\\
+   multimodal routing, congestion\\
+   {\ttfamily run\_full\_pipeline\_dta\_tested.py}};
+\draw[arrow] (outp) -- (asg);
+
+% updated-skims loop: routed around the far-left margin, no crossings
+\draw[feed, red!45] (asg.west) -| ([xshift=-0.9cm]hhts.west |- skims)
+      -- (skims.west) node[file, midway, above]{updated skims};
+
+% ============================ ENCLOSURE + LEGEND ============================
+\begin{scope}[on background layer]
+  \node[fit=(hhts)(land)(skims)(acc)(outp)(asg)(gac)(ga)(gav),
+        inner sep=0.5cm, draw=black!25, fill=white, rounded corners=4pt] (frame) {};
+\end{scope}
+
+\node[below=0.35cm of frame.south, anchor=north, text width=20cm, align=center,
+      font=\small] {
+  \textcolor{blue!70!black}{$\blacksquare$~data}\quad
+  \textcolor{purple!60}{$\blacksquare$~pre-day / long-run}\quad
+  \textcolor{teal!60!black}{$\blacksquare$~Stage 0 / tour generation}\quad
+  \textcolor{orange!70}{$\blacksquare$~frequency}\quad
+  \textcolor{green!50!black}{$\blacksquare$~duration / budget}\quad
+  \textcolor{red!65}{$\blacksquare$~discrete choice}\quad
+  \textcolor{gray!65}{$\blacksquare$~output / assignment}\\[2pt]
+  \textcolor{red!70}{red dashed} = GA hypothesis-testing bus (model family,
+  features, parameters, decision rule loaned to every GA-searched stage)\quad
+  \textcolor{blue!45}{blue dashed} = data feeds \& the skim-update loop.
+};
+
+\end{tikzpicture}
+\end{document}

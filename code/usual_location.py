@@ -116,6 +116,33 @@ SCHOOL_DECAY_B = {
     4: 0.04,   # tertiary FT: ~25 min mean
 }
 
+# =============================================================================
+# LAND-USE CAPACITY (workplace / school place equilibrium)
+# =============================================================================
+# The model is a doubly-constrained gravity / spatial-interaction equilibrium:
+# every home zone's workers (students) must be placed somewhere (origin totals
+# preserved), while no zone may absorb more workers than it has jobs, nor more
+# students than it has school places. The balancing is done with destination
+# shadow prices (ARC-style), iterated so that:
+#
+#     expected_j = Σ_o origin_totals[o] · p[o, j]  ≤  capacity[j]
+#
+# for every zone j, exactly the equilibrium concept used by the stage-5
+# destination model — but with land-use capacity as the target instead of
+# observed HHTS marginals. Set CAPACITY_CONSTRAINED=0 to disable.
+WORK_CAPACITY_COLS = ['TOTEMP', 'FPSEMPN', 'HEREMPN', 'RETEMPN',
+                      'AGREMPN', 'MWTEMPN', 'OTHEMP']
+# school_enrol = Primary + Secondary (see compute_accessibility.enrich_landuse);
+# tertiary capacity enters via Education per the equilibrium design decision.
+SCHOOL_CAPACITY_COLS = ['school_enrol', 'Education', 'Primary', 'Secondary']
+
+# IPF / shadow-price tuning for the capacity equilibrium.
+CAP_N_ITER   = 400     # max Furness-style iterations
+CAP_ALPHA    = 0.6     # shadow-price step damping (0-1)
+CAP_TOL      = 0.005   # allowed relative overshoot band before a zone "binds"
+CAP_ABS_TOL  = 0.5     # absolute expected-count floor for (near-)zero capacity zones
+CAP_CLIP_SP  = 6.0     # max |shadow price| (log balancing factor)
+
 
 # =============================================================================
 # ATTRACTOR VECTORS
@@ -256,6 +283,242 @@ def _zone_probs(attractor: np.ndarray,
 
 
 # =============================================================================
+# LAND-USE CAPACITY / EQUILIBRIUM HELPERS
+# =============================================================================
+
+def _zone_capacity(landuse: pd.DataFrame,
+                   zone_ids: np.ndarray,
+                   kind: str) -> np.ndarray:
+    """
+    Per-zone land-use capacity (an upper bound on assignments).
+
+    kind == 'work'   → TOTEMP (jobs/zone) if present, else the sum of the six
+                       sectoral employment columns (RETEMPN, FPSEMPN, ...).
+    kind == 'school' → school_enrol (Primary + Secondary) plus Education
+                       (tertiary) if present, else the raw enrolment columns.
+
+    Returns a float array aligned with ``zone_ids``, NaN-safe, clipped at 0.
+    """
+    lu = landuse.set_index('ORDER') if 'ORDER' in landuse.columns else landuse
+    if kind == 'work':
+        if 'TOTEMP' in lu.columns:
+            cols = ['TOTEMP']
+        else:
+            cols = [c for c in WORK_CAPACITY_COLS if c in lu.columns]
+    else:
+        if 'school_enrol' in lu.columns:
+            cols = ['school_enrol']
+            if 'Education' in lu.columns:
+                cols.append('Education')
+        else:
+            cols = [c for c in SCHOOL_CAPACITY_COLS if c in lu.columns]
+
+    vals = np.zeros(len(zone_ids), dtype=np.float64)
+    for c in cols:
+        if c in lu.columns:
+            vals += lu.reindex(zone_ids)[c].fillna(0.0).clip(lower=0.0).to_numpy(dtype=np.float64)
+    if not cols:
+        logger.warning(
+            f"_zone_capacity(kind='{kind}'): no capacity columns found in landuse "
+            "— capacity equilibrium disabled for this assignment"
+        )
+    return np.maximum(np.nan_to_num(vals, nan=0.0), 0.0)
+
+
+def _capacity_equilibrium_probs(seed_probs: np.ndarray,
+                                origin_totals: np.ndarray,
+                                capacity: np.ndarray, *,
+                                n_iter: int = None, alpha: float = None,
+                                tol: float = None, clip_sp: float = None,
+                                abs_tol: float = None, eps: float = 1e-12) -> np.ndarray:
+    """
+    Doubly-constrained gravity with destination upper bounds (equilibrium).
+
+    Adjusts per-origin choice probabilities with destination shadow prices
+    (log balancing factors) so that expected assigned counts respect each
+    zone's land-use capacity while preserving every origin's total:
+
+        expected_j = Σ_o origin_totals[o] · p[o, j]  ≤  capacity[j]
+
+    seed_probs    : (n_orig, n_zone) MNL probabilities (rows sum to 1)
+    origin_totals : (n_orig,) chooser counts per origin (fixed, preserved)
+    capacity      : (n_zone,) per-zone upper bound (jobs / school places)
+
+    Returns adjusted probabilities with identical row sums. This is the
+    ARC-style shadow-price / IPF equilibrium from the stage-5 destination
+    model, applied here against land-use capacity rather than observed counts.
+    """
+    n_iter  = CAP_N_ITER if n_iter  is None else n_iter
+    alpha   = CAP_ALPHA  if alpha   is None else alpha
+    tol     = CAP_TOL    if tol     is None else tol
+    abs_tol = CAP_ABS_TOL if abs_tol is None else abs_tol
+    clip_sp = CAP_CLIP_SP if clip_sp is None else clip_sp
+
+    P = np.asarray(seed_probs, dtype=np.float64)
+    if P.ndim != 2 or P.shape[1] == 0:
+        return P
+    O = np.asarray(origin_totals, dtype=np.float64).reshape(-1)
+    C = np.asarray(capacity, dtype=np.float64).reshape(-1)
+    if O.shape[0] != P.shape[0] or C.shape[0] != P.shape[1]:
+        return P
+    if np.nanmax(np.abs(O)) == 0:
+        return P
+
+    # Zones with zero attractor cannot receive mass — leave them untouched.
+    active = (np.nan_to_num(P.sum(axis=0)) > 0) & np.isfinite(C)
+    lam    = np.zeros(P.shape[1], dtype=np.float64)
+    logP   = np.log(np.clip(P, eps, None))
+
+    def _renorm(u):
+        u = u - u.max(axis=1, keepdims=True)
+        e = np.exp(np.clip(u, -500, 500))
+        s = e.sum(axis=1, keepdims=True)
+        s = np.where(s > 0, s, 1.0)
+        return e / s
+
+    p    = _renorm(logP + lam)
+    pred = O @ p
+    # A zone "binds" when expected assignment exceeds its capacity — relative
+    # to capacity, with an absolute floor so (near-)zero-capacity zones only
+    # need expected mass near zero (realised hard-cap draw makes it exactly 0).
+    _over_test = lambda _pred: active & (_pred > np.maximum(C * (1.0 + tol), abs_tol))
+    for _it in range(max(int(n_iter), 1)):
+        p    = _renorm(logP + lam)
+        pred = O @ p
+        over = _over_test(pred)
+        if not over.any():
+            break
+        ratio = np.clip(C[over] / np.maximum(pred[over], eps), 1e-4, 1e4)
+        lam[over] += alpha * np.log(ratio)
+        lam = np.clip(lam, -clip_sp, 0.0)
+
+    if _it >= max(int(n_iter), 1) - 1 and _over_test(pred).any():
+        logger.warning(
+            f"_capacity_equilibrium_probs: did not fully converge in {int(n_iter)} "
+            "iterations — residual zone overcapacity will be handled by the "
+            "realised (hard-cap) draw/fallback"
+        )
+
+    return _renorm(logP + lam)
+
+
+def _capped_multinomial_draws(n: int,
+                              probs: np.ndarray,
+                              caps: np.ndarray,
+                              rng: np.random.Generator):
+    """
+    Allocate ``n`` choosers to zones proportionally to ``probs`` while leaving
+    no zone with more than its remaining cap. Returns (alloc, leftover):
+    alloc[j] choosers assigned to zone j; leftover = n - alloc.sum() if total
+    capacity was exhausted before all ``n`` choosers could be placed.
+    """
+    n = int(n)
+    n_zone = len(probs)
+    if n <= 0 or n_zone == 0:
+        return np.zeros(n_zone, dtype=np.int64), 0
+    q     = np.asarray(probs, dtype=np.float64).reshape(-1)
+    avail = np.rint(np.clip(np.asarray(caps, dtype=np.float64), 0, None)).astype(np.int64)
+    alloc = np.zeros(n_zone, dtype=np.int64)
+    n_left = n
+    while n_left > 0:
+        w = q * (avail > 0).astype(np.float64)
+        s = w.sum()
+        if s <= 0:
+            break
+        w    = w / s
+        take = min(n_left, int(avail.sum()))
+        if take <= 0:
+            break
+        draw = np.minimum(rng.multinomial(take, w), avail)
+        alloc += draw
+        avail -= draw
+        n_left -= int(draw.sum())
+    return alloc, n_left
+
+
+def _assign_choosers_capacity(probs_dict: dict,
+                              chooser_df: pd.DataFrame,
+                              otaz_col: str,
+                              combo_col: str,
+                              zone_ids: np.ndarray,
+                              capacity: np.ndarray,
+                              rng: np.random.Generator,
+                              logger,
+                              label: str = 'work'):
+    """
+    Assign one destination zone per chooser under a doubly-constrained
+    capacity equilibrium.
+
+    probs_dict : {(otaz, combo): np.ndarray} seed MNL probabilities per origin
+                 class; overwritten in place with the equilibrium version.
+    chooser_df : DataFrame with ``otaz_col`` + ``combo_col``, one row/chooser
+                 (order matches the caller's row mask).
+    capacity   : (n_zone,) land-use upper bound (jobs / school places).
+
+    Returns (assign, report):
+        assign   int array, len == len(chooser_df), per-chooser zone
+        report   {'overflow': # choosers that could not fit and fell back home,
+                  'zones_at_cap': # zones at their capacity limit}
+    """
+    zc   = np.asarray(zone_ids, dtype=np.int64)
+    n_zone = len(zc)
+    cap  = np.rint(np.clip(np.asarray(capacity, dtype=np.float64), 0, None)).astype(np.int64)
+    if len(chooser_df) == 0:
+        return np.zeros(0, dtype=np.int64), {'overflow': 0, 'zones_at_cap': 0}
+
+    grp     = chooser_df[[otaz_col, combo_col]].astype(int)
+    indices = grp.groupby([otaz_col, combo_col]).indices
+    keys    = [(int(k[0]), int(k[1])) for k in indices]
+    counts  = {k: int(len(indices[k])) for k in keys}
+
+    # ── destination shadow-price equilibrium across ALL origin classes ──
+    def _p1d(k):
+        v = np.asarray(probs_dict[k], dtype=np.float64).reshape(-1)
+        return v
+
+    valid = [k for k in keys
+             if probs_dict.get(k) is not None
+             and not np.isnan(_p1d(k)).any()
+             and _p1d(k).sum() > 0
+             and len(_p1d(k)) == n_zone]
+    if valid:
+        P     = np.stack([_p1d(k) for k in valid])
+        O     = np.array([counts[k] for k in valid], dtype=np.float64)
+        P_adj = _capacity_equilibrium_probs(P, O, cap.astype(np.float64))
+        for i, k in enumerate(valid):
+            probs_dict[k] = P_adj[i]
+
+    # ── realised sampling with hard per-zone caps ──
+    remaining = cap.copy()
+    assign    = np.zeros(len(chooser_df), dtype=np.int64)
+    overflow  = 0
+    for k in keys:
+        rows = indices[k]
+        cnt  = counts[k]
+        p    = _p1d(k)
+        if np.isfinite(p).all() and p.sum() > 0:
+            alloc, leftover = _capped_multinomial_draws(cnt, p, remaining, rng)
+            zone_vals = zc[np.repeat(np.arange(n_zone), alloc)]
+        else:
+            alloc     = np.zeros(n_zone, dtype=np.int64)
+            leftover  = cnt
+            zone_vals = np.empty(0, dtype=np.int64)
+        if leftover > 0:
+            home_idx = int(np.argmin(np.abs(zc - int(k[0]))))
+            zone_vals = np.append(zone_vals, np.full(leftover, zc[home_idx], dtype=np.int64))
+            overflow += leftover
+            logger.warning(
+                f"    [{label}] {leftover} choosers from home {int(k[0])} "
+                "exceeded remaining zone capacity — home-zone fallback")
+        assign[rows] = zone_vals
+        remaining -= alloc
+
+    report = {'overflow': int(overflow),
+              'zones_at_cap': int((remaining <= 0).sum())}
+    return assign, report
+
+
+# =============================================================================
 # MAIN MODEL
 # =============================================================================
 
@@ -270,6 +533,7 @@ def assign_usual_locations(
     plots_dir: str = None,
     assign_work: bool = True,
     assign_school: bool = True,
+    enforce_capacity: bool = None,
 ) -> pd.DataFrame:
     """
     Assign usual work zone (WORK_TAZ) and usual school zone (SCHOOL_TAZ)
@@ -288,6 +552,10 @@ def assign_usual_locations(
     save_path  : CSV output path
     hhts_tours : HHTS tours DataFrame for validation plots (optional)
     plots_dir  : directory to save validation plots (defaults to save_path dir)
+    enforce_capacity : if True, cap assigned workers per zone by TOTEMP and
+                 students by school_enrol + Education (doubly-constrained
+                 shadow-price equilibrium). Default None → falls back to the
+                 CAPACITY_CONSTRAINED env var; 0/1 disable/enable.
 
     Returns
     -------
@@ -296,6 +564,12 @@ def assign_usual_locations(
     print("=" * 55)
     print("USUAL LOCATIONS — Work & School Zone Assignment")
     print("=" * 55)
+
+    if enforce_capacity is None:
+        _env = os.environ.get('CAPACITY_CONSTRAINED', '1').strip().lower()
+        enforce_capacity = _env not in ('0', 'false', 'no', 'off')
+    print(f"  Capacity equilibrium: {'ON' if enforce_capacity else 'OFF'}"
+          "  (set CAPACITY_CONSTRAINED=0 to disable)")
 
     rng = np.random.default_rng(seed)
     df  = synth.copy()
@@ -378,17 +652,28 @@ def assign_usual_locations(
             att = _work_attractor(lu, zone_ids, indp=int(indp))
             work_probs[key] = _zone_probs(att, tt, WORK_DECAY_B)
 
-        # Sample per person from cached combo probabilities.
-        work_assign = np.zeros(len(worker_df), dtype=np.int32)
-        for i, (otaz, indp) in enumerate(worker_df[[otaz_col, 'indp']].itertuples(index=False, name=None)):
-            key = (int(otaz), int(indp))
-            p = work_probs.get(key)
-            if p is not None and len(p) == len(zone_ids) and np.isfinite(p).all() and p.sum() > 0:
-                work_assign[i] = int(rng.choice(zone_ids, p=p))
-            else:
-                tt = get_tt(int(otaz))
-                att = _work_attractor(lu, zone_ids, indp=int(indp))
-                work_assign[i] = _sample_zone(att, tt, zone_ids, WORK_DECAY_B, rng)
+        # Sample per person from cached combo probabilities, subject to
+        # per-zone job capacity (TOTEMP) when the equilibrium is enabled.
+        if enforce_capacity:
+            work_capacity = _zone_capacity(lu, zone_ids, kind='work')
+            work_assign, work_report = _assign_choosers_capacity(
+                work_probs, worker_df, otaz_col, 'indp', zone_ids,
+                work_capacity, rng, logger, label='work')
+            print(
+                f"    Capacity: {work_report['zones_at_cap']}/{len(zone_ids)} "
+                "zones at cap | "
+                f"{work_report['overflow']} workers fell back to home zone")
+        else:
+            work_assign = np.zeros(len(worker_df), dtype=np.int64)
+            for i, (otaz, indp) in enumerate(worker_df[[otaz_col, 'indp']].itertuples(index=False, name=None)):
+                key = (int(otaz), int(indp))
+                p = work_probs.get(key)
+                if p is not None and len(p) == len(zone_ids) and np.isfinite(p).all() and p.sum() > 0:
+                    work_assign[i] = int(rng.choice(zone_ids, p=p))
+                else:
+                    tt = get_tt(int(otaz))
+                    att = _work_attractor(lu, zone_ids, indp=int(indp))
+                    work_assign[i] = _sample_zone(att, tt, zone_ids, WORK_DECAY_B, rng)
 
         df.loc[is_worker, 'WORK_TAZ'] = work_assign
 
@@ -422,16 +707,28 @@ def assign_usual_locations(
             att = _edu_attractor(lu, zone_ids, studying=int(studying))
             school_probs[key] = _zone_probs(att, tt, SCHOOL_DECAY_B.get(int(studying), 0.06))
 
-        school_assign = np.zeros(len(student_df), dtype=np.int32)
-        for i, (otaz, studying) in enumerate(student_df[[otaz_col, 'STUDYING']].itertuples(index=False, name=None)):
-            key = (int(otaz), int(studying))
-            p = school_probs.get(key)
-            if p is not None and len(p) == len(zone_ids) and np.isfinite(p).all() and p.sum() > 0:
-                school_assign[i] = int(rng.choice(zone_ids, p=p))
-            else:
-                tt = get_tt(int(otaz))
-                att = _edu_attractor(lu, zone_ids, studying=int(studying))
-                school_assign[i] = _sample_zone(att, tt, zone_ids, SCHOOL_DECAY_B.get(int(studying), 0.06), rng)
+        # Sample per person from cached combo probabilities, subject to
+        # per-zone school capacity (school_enrol + Education) when enabled.
+        if enforce_capacity:
+            school_capacity = _zone_capacity(lu, zone_ids, kind='school')
+            school_assign, school_report = _assign_choosers_capacity(
+                school_probs, student_df, otaz_col, 'STUDYING', zone_ids,
+                school_capacity, rng, logger, label='school')
+            print(
+                f"    Capacity: {school_report['zones_at_cap']}/{len(zone_ids)} "
+                "zones at cap | "
+                f"{school_report['overflow']} students fell back to home zone")
+        else:
+            school_assign = np.zeros(len(student_df), dtype=np.int64)
+            for i, (otaz, studying) in enumerate(student_df[[otaz_col, 'STUDYING']].itertuples(index=False, name=None)):
+                key = (int(otaz), int(studying))
+                p = school_probs.get(key)
+                if p is not None and len(p) == len(zone_ids) and np.isfinite(p).all() and p.sum() > 0:
+                    school_assign[i] = int(rng.choice(zone_ids, p=p))
+                else:
+                    tt = get_tt(int(otaz))
+                    att = _edu_attractor(lu, zone_ids, studying=int(studying))
+                    school_assign[i] = _sample_zone(att, tt, zone_ids, SCHOOL_DECAY_B.get(int(studying), 0.06), rng)
 
         df.loc[is_student, 'SCHOOL_TAZ'] = school_assign
 
@@ -446,6 +743,38 @@ def assign_usual_locations(
               f"median={int(school_dist.median())}")
     else:
         print("\n  Skipping school location assignment (assign_school=False)")
+
+    # ── capacity equilibrium summary ──────────────────────────────────────
+    if enforce_capacity:
+        try:
+            _zmap = {int(z): i for i, z in enumerate(zone_ids)}
+            _cap_work = _zone_capacity(lu, zone_ids, kind='work')
+            _cap_school = _zone_capacity(lu, zone_ids, kind='school')
+            _cnt = np.zeros((2, len(zone_ids)), dtype=np.int64)
+            col_idx = {'WORK_TAZ': 0, 'SCHOOL_TAZ': 1}
+            for _col, _mask, _kind, _cap in (
+                ('WORK_TAZ', is_worker, 'work', _cap_work),
+                ('SCHOOL_TAZ', is_student, 'school', _cap_school)):
+                _vals = df.loc[_mask, _col].to_numpy(dtype=np.int64)
+                for _z in np.unique(_vals):
+                    _i = _zmap.get(int(_z))
+                    if _i is not None:
+                        _cnt[col_idx[_col], _i] += int((_vals == _z).sum())
+            print("\n  Capacity equilibrium summary:")
+            if assign_work:
+                _over = int((_cnt[0] > _cap_work).sum())
+                print(f"    Work:   {_cnt[0].sum()} workers, "
+                      f"{_over} zones assigned above TOTEMP "
+                      f"(of {len(zone_ids)}) | worst cap utilisation = "
+                      f"{(_cnt[0] / np.maximum(_cap_work, 1)).max():.0%}")
+            if assign_school:
+                _over = int((_cnt[1] > _cap_school).sum())
+                print(f"    School: {_cnt[1].sum()} students, "
+                      f"{_over} zones assigned above school_enrol+Education "
+                      f"(of {len(zone_ids)}) | worst cap utilisation = "
+                      f"{(_cnt[1] / np.maximum(_cap_school, 1)).max():.0%}")
+        except Exception as _ce:
+            logger.warning(f"  Capacity summary failed (non-fatal): {_ce}")
 
     # ── save ───────────────────────────────────────────────────────────
     if save_path:
@@ -799,6 +1128,7 @@ def run_usual_locations(
     plots_dir: str = None,
     assign_work: bool = True,
     assign_school: bool = True,
+    enforce_capacity: bool = None,
 ) -> pd.DataFrame:
     """
     Full pipeline entry point.  Called from pipeline_logger after CDAP,
@@ -810,6 +1140,9 @@ def run_usual_locations(
 
     hhts_tours : optional HHTS tours table for HHTS vs synth validation plots
     plots_dir  : where to save validation plots; defaults to save_path directory
+    enforce_capacity : passes through to assign_usual_locations (True → cap
+                 workers by TOTEMP, students by school_enrol + Education).
+                 Default None → CAPACITY_CONSTRAINED env var.
 
     Returns synth with WORK_TAZ and SCHOOL_TAZ added.
     """
@@ -834,6 +1167,7 @@ def run_usual_locations(
         plots_dir=plots_dir,
         assign_work=assign_work,
         assign_school=assign_school,
+        enforce_capacity=enforce_capacity,
     )
 
     if close_skims:
@@ -853,6 +1187,7 @@ def workplace_location_model(
     save_path: str = 'saved_data/workplace_location.csv',
     hhts_tours: pd.DataFrame = None,
     plots_dir: str = None,
+    enforce_capacity: bool = None,
 ) -> pd.DataFrame:
     """ActivitySim-style workplace_location wrapper over usual-location assignment."""
     return run_usual_locations(
@@ -865,6 +1200,7 @@ def workplace_location_model(
         plots_dir=plots_dir,
         assign_work=True,
         assign_school=False,
+        enforce_capacity=enforce_capacity,
     )
 
 
@@ -876,6 +1212,7 @@ def school_location_model(
     save_path: str = 'saved_data/school_location.csv',
     hhts_tours: pd.DataFrame = None,
     plots_dir: str = None,
+    enforce_capacity: bool = None,
 ) -> pd.DataFrame:
     """ActivitySim-style school_location wrapper over usual-location assignment."""
     return run_usual_locations(
@@ -888,6 +1225,7 @@ def school_location_model(
         plots_dir=plots_dir,
         assign_work=False,
         assign_school=True,
+        enforce_capacity=enforce_capacity,
     )
 
 

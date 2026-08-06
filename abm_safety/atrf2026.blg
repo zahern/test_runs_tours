@@ -1,0 +1,52 @@
+This is BibTeX, Version 0.99d
+Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
+The top-level auxiliary file: atrf2026.aux
+Reallocating 'name_of_file' (item size: 1) to 5 items.
+The style file: agsm.bst
+Reallocating 'name_of_file' (item size: 1) to 11 items.
+Reallocating 'name_of_file' (item size: 1) to 8 items.
+Database file #1: references.bib
+Database file #2: updated.bib
+Warning--empty publisher in AASHTO2010HighwayManual
+You've used 47 entries,
+            2909 wiz_defined-function locations,
+            988 strings with 17226 characters,
+and the built_in function-call counts, 240850 in all, are:
+= -- 39409
+> -- 3477
+< -- 2
++ -- 19194
+- -- 1064
+* -- 21387
+:= -- 47700
+add.period$ -- 47
+call.type$ -- 47
+change.case$ -- 654
+chr.to.int$ -- 47
+cite$ -- 48
+duplicate$ -- 725
+empty$ -- 1516
+format.name$ -- 1236
+if$ -- 43243
+int.to.chr$ -- 5
+int.to.str$ -- 0
+missing$ -- 47
+newline$ -- 170
+num.names$ -- 500
+pop$ -- 168
+preamble$ -- 1
+purify$ -- 705
+quote$ -- 0
+skip$ -- 596
+stack$ -- 0
+substring$ -- 56211
+swap$ -- 122
+text.length$ -- 660
+text.prefix$ -- 0
+top$ -- 0
+type$ -- 180
+warning$ -- 1
+while$ -- 1036
+width$ -- 0
+write$ -- 652
+(There was 1 warning)

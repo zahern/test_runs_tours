@@ -1,0 +1,178 @@
+#!/bin/bash -l
+#PBS -N full_stage3_suite
+#PBS -m abe
+#PBS -r y
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=8:mem=194GB
+
+# =============================================================================
+# job_full_stage3_suite.pbs
+# =============================================================================
+# ONE submission that estimates the whole staged pipeline with the current
+# Polaris / ActivitySim-inspired implementations, then predicts the synthetic
+# population through every stage.  Everything is ON by default — no fiddly
+# env vars needed.  Use the overrides below only if you want a subset.
+#
+# What it runs (in one process, order matters):
+#   1. FRESH Stage 1  — activity frequency (ordered logit), saved_data/stage1_output.csv
+#   2. FRESH Stage 2  — day-duration budget (lognormal), saved_data/stage2_output.csv
+#   3. Stage 3 suite  — ALL duration variants, each with its own dir:
+#        lognormal, copula_hazard, lognormal_mdcev, copula_hazard_mdcev
+#        (+ Polaris-style planning-order RRM fitted inside each variant)
+#   4. Stage 4        — SearchLibrium timing RRM (STAGE4_TIMING_MODEL=rrm),
+#                        applied to every variant -> stage4_output.csv
+#   5. Stage 5        — per variant: destination + mode + trip-chain
+#                        (Stage 5 Polaris sampled/space-time dest choice + 
+#                         ActivitySim-style mode/dest specs) -> stage5_output.csv
+#   5b. Stage 5b      — per variant: trip-level intermediate-stop destination
+#                        choice (first variant estimates the per-purpose MNLs on
+#                        the HHTS calibration sample; later variants reuse them
+#                        predict-only) -> stage5b_trips.csv
+#   6. Stage 6        — per variant: mode prediction -> stage6_output.csv
+#   = final prediction  = the stage6_output.csv per variant IS the prediction
+#     of the synthetic population's full day plan.
+#
+# Long-run population modules ON by default:
+#   - household vehicle/bike ownership prediction (ordered logit + ZIOP) is
+#     applied to the synthetic population before Stage 3/5 prediction
+#     (RUN_OWNERSHIP=1).
+#   - Stage 0 household coordination / joint travel (coordinated CDAP +
+#     joint-tour purposes folded into purpose counts) runs before Stage 3
+#     prediction when the synthetic persons carry a household id (RUN_STAGE0=1).
+#   - optional GA hypothesis-testing feedback: set GA_RESULTS_PKL to a merged
+#     AllStagesResult pickle and the suite uses the GA-optimised feature sets
+#     for Stage 3 (duration), Stage 4 (timing) and Stage 5 (mode/dest).
+#
+# Submit:
+#     qsub job_full_stage3_suite.pbs
+#
+# Useful overrides:
+#     qsub -v STAGE3_MODEL_SUITE=lognormal job_full_stage3_suite.pbs   # just 1 variant
+#     qsub -v FRESH=0 job_full_stage3_suite.pbs                        # reuse existing stage1/2 outputs
+#     qsub -v RUN_STAGE5_6=0 job_full_stage3_suite.pbs                 # stop after Stage 4
+#     qsub -v RUN_STAGE5B=0 job_full_stage3_suite.pbs                  # skip Stage 5b
+#     qsub -v STAGE3_SUITE_OUT=runs/full_run_<tag> job_full_stage3_suite.pbs
+#     qsub -l select=1:ncpus=8:mem=194GB -l walltime=48:00:00 job_full_stage3_suite.pbs
+#
+# Overridable env vars (defaults below):
+#     STAGE3_MODEL_SUITE=all
+#     FRESH=1
+#     RUN_STAGE4=1
+#     RUN_STAGE5_6=1
+#     RUN_STAGE5B=1
+#     RUN_OWNERSHIP=1
+#     GA_RESULTS_PKL=        (empty = default feature sets)
+#     SKIMS_PATH=downcasted_matrices_base.omx
+#     STAGE3_SUITE_OUT=runs/stage3_model_suite/${PBS_JOBID}
+#     STAGE3_MIN_SAMPLE=50  STAGE4_MIN_SAMPLE=30  STAGE3_SEED=42
+#     STAGE4_TIMING_MODEL=rrm
+#     CONDA_ENV=zigenv
+# =============================================================================
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+
+CONDA_ENV="${CONDA_ENV:-zigenv}"
+STAGE3_MODEL_SUITE="${STAGE3_MODEL_SUITE:-all}"
+STAGE3_INPUT="${STAGE3_INPUT:-saved_data/stage2_output.csv}"
+STAGE3_SUITE_OUT="${STAGE3_SUITE_OUT:-runs/stage3_model_suite/${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}"
+RUN_STAGE4="${RUN_STAGE4:-1}"
+RUN_STAGE5_6="${RUN_STAGE5_6:-1}"
+RUN_STAGE5B="${RUN_STAGE5B:-1}"
+RUN_OWNERSHIP="${RUN_OWNERSHIP:-1}"
+RUN_STAGE0="${RUN_STAGE0:-1}"
+GA_RESULTS_PKL="${GA_RESULTS_PKL:-}"
+SKIMS_PATH="${SKIMS_PATH:-downcasted_matrices_base.omx}"
+STAGE3_MIN_SAMPLE="${STAGE3_MIN_SAMPLE:-50}"
+STAGE4_MIN_SAMPLE="${STAGE4_MIN_SAMPLE:-30}"
+STAGE3_SEED="${STAGE3_SEED:-42}"
+FRESH="${FRESH:-1}"
+ZONE="${ZONE:-}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV}"
+module unload Anaconda3
+
+# Keep imports and scientific kernels stable on CPU PBS nodes. SearchLibrium
+# is still used by the planning-order and timing RRM paths.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORM_NAME="${JAX_PLATFORM_NAME:-cpu}"
+export JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
+export PIPELINE_ACCELERATOR="${PIPELINE_ACCELERATOR:-cpu}"
+export GA_METACOUNT_FORCE_CPU="${GA_METACOUNT_FORCE_CPU:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
+export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-3}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+export STAGE4_TIMING_MODEL="${STAGE4_TIMING_MODEL:-rrm}"
+export SEARCHLIBRIUM_SOURCE="${SEARCHLIBRIUM_SOURCE:-}"
+
+mkdir -p "${STAGE3_SUITE_OUT}"
+LOG_OUT="${STAGE3_SUITE_OUT}/job.out"
+LOG_ERR="${STAGE3_SUITE_OUT}/job.err"
+
+{
+    echo "=========================================================="
+    echo "Full staged pipeline — Stage 3 model suite end-to-end"
+    echo "PBS job       : ${PBS_JOBID:-local}"
+    echo "Node          : $(hostname)"
+    echo "Workdir       : ${PBS_O_WORKDIR}"
+    echo "Models        : ${STAGE3_MODEL_SUITE}"
+    echo "Fresh S1/S2   : ${FRESH}"
+    echo "Stage 2 input : ${STAGE3_INPUT}"
+    echo "Output        : ${STAGE3_SUITE_OUT}"
+    echo "Run Stage 4   : ${RUN_STAGE4}"
+    echo "Run Stage 5/6 : ${RUN_STAGE5_6}"
+    echo "Run Stage 5b  : ${RUN_STAGE5B}"
+    echo "Ownership     : ${RUN_OWNERSHIP}"
+    echo "Stage 0       : ${RUN_STAGE0}"
+    echo "GA_RESULTS_PKL: ${GA_RESULTS_PKL:-<default feature sets>}"
+    echo "Skims         : ${SKIMS_PATH}"
+    echo "Started       : $(date)"
+    echo "=========================================================="
+} | tee -a "${LOG_OUT}"
+
+ARGS=(
+    -u -X utf8 run_stage3_model_suite.py
+    --models "${STAGE3_MODEL_SUITE}"
+    --input "${STAGE3_INPUT}"
+    --out-dir "${STAGE3_SUITE_OUT}"
+    --min-sample "${STAGE3_MIN_SAMPLE}"
+    --timing-min-sample "${STAGE4_MIN_SAMPLE}"
+    --seed "${STAGE3_SEED}"
+    --skims "${SKIMS_PATH}"
+)
+if [[ "${FRESH}" == "1" ]]; then
+    ARGS+=(--fresh)
+    if [[ -n "${ZONE}" ]]; then
+        ARGS+=(--zone "${ZONE}")
+    fi
+fi
+if [[ "${RUN_STAGE4}" == "1" ]]; then
+    ARGS+=(--run-stage4)
+fi
+if [[ "${RUN_STAGE5_6}" == "1" ]]; then
+    ARGS+=(--run-stage5-6)
+fi
+if [[ "${RUN_STAGE5B}" == "1" ]]; then
+    ARGS+=(--run-stage5b)
+fi
+if [[ "${RUN_OWNERSHIP}" == "1" ]]; then
+    ARGS+=(--ownership)
+fi
+if [[ "${RUN_STAGE0}" == "1" ]]; then
+    ARGS+=(--stage0)
+fi
+if [[ -n "${GA_RESULTS_PKL}" ]]; then
+    ARGS+=(--ga-results "${GA_RESULTS_PKL}")
+fi
+
+python "${ARGS[@]}" >> "${LOG_OUT}" 2>> "${LOG_ERR}"
+
+printf 'Finished: %s\n' "$(date)" | tee -a "${LOG_OUT}"
+printf 'Manifest: %s/manifest.json\n' "${STAGE3_SUITE_OUT}" | tee -a "${LOG_OUT}"

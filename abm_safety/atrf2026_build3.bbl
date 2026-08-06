@@ -1,0 +1,334 @@
+\begin{thebibliography}{xx}
+
+\harvarditem{{AASHTO}}{2010}{AASHTO2010HighwayManual}
+{AASHTO}  \harvardyearleft 2010\harvardyearright , {\em {Highway Safety
+  Manual}}, Vol.~2, Washington, D.C.
+
+\harvarditem[Ahern et~al.]{Ahern, Corry \harvardand\
+  Paz}{2023}{Ahern2023MetacountregressorPyPI}
+Ahern, Z., Corry, P. \harvardand\ Paz, A.  \harvardyearleft
+  2023\harvardyearright , `{metacountregressor {\textperiodcentered} PyPI}'.
+\newline\harvardurl{https://pypi.org/project/metacountregressor/0.1.28/}
+
+\harvarditem[Ahern et~al.]{Ahern, Corry \harvardand\
+  Rabbani}{2024}{Ahern2024ExtensiveModels}
+Ahern, Z., Corry, P. \harvardand\ Rabbani, W.  \harvardyearleft
+  2024\harvardyearright , `{Extensive hypothesis testing for estimation of
+  crash frequency models}', {\em Heliyon} {\bf 10}.
+\newline\harvardurl{http://creativecommons.org/licenses/by/4.0/}
+
+\harvarditem{Alimo \harvardand\
+  Agyeman}{2026}{Alimo2026TransactionalSatisfaction}
+Alimo, P.~K. \harvardand\ Agyeman, S.  \harvardyearleft 2026\harvardyearright ,
+  `{Transactional stress model of annoyance provocation among women onboard
+  paratransit buses: Travel safety and satisfaction}', {\em African Transport
+  Studies} {\bf 4}.
+\newline\harvardurl{https://www.scopus.com/pages/publications/105021862473?origin=resultslist}
+
+\harvarditem[Bartin et~al.]{Bartin, Ozbay \harvardand\
+  Xu}{2023}{Bartin2023SafetySegments}
+Bartin, B., Ozbay, K. \harvardand\ Xu, C.  \harvardyearleft
+  2023\harvardyearright , `{Safety performance functions for Two-Lane urban
+  arterial segments}', {\em Safety Science} {\bf 167},~106284.
+
+\harvarditem{Beeramole}{2024}{Beeramole2024SearchlogitPyPI}
+Beeramole, P.  \harvardyearleft 2024\harvardyearright , `{searchlogit
+  {\textperiodcentered} PyPI}'.
+\newline\harvardurl{https://pypi.org/project/searchlogit/}
+
+\harvarditem[Behara et~al.]{Behara, Paz, Arndt \harvardand\
+  Baker}{2021}{Behara2021AQueensland}
+Behara, K.~N., Paz, A., Arndt, O. \harvardand\ Baker, D.  \harvardyearleft
+  2021\harvardyearright , `{A random parameters with heterogeneity in means and
+  Lindley approach to analyze crash data with excessive zeros: A case study of
+  head-on heavy vehicle crashes in Queensland}', {\em Accident Analysis {\&}
+  Prevention} {\bf 160},~106308.
+
+\harvarditem{Ben-Akiva \harvardand\ Lerman}{1985}{Ben-Akiva1985DiscreteDemand}
+Ben-Akiva, M.~E. \harvardand\ Lerman, S.~R.  \harvardyearleft
+  1985\harvardyearright , {\em {Discrete choice analysis: Theory and
+  application to travel demand}}, Vol.~9, MIT Press.
+
+\harvarditem[Bernardin et~al.]{Bernardin, Koppelman \harvardand\
+  Boyce}{2009}{Bernardin2009EnhancedCompetition}
+Bernardin, V.~L., Koppelman, F. \harvardand\ Boyce, D.  \harvardyearleft
+  2009\harvardyearright , `{Enhanced Destination Choice Models Incorporating
+  Agglomeration Related to Trip Chaining While Controlling for Spatial
+  Competition}', {\em Transportation Research Record} {\bf 2132}(1),~143--151.
+
+\harvarditem[Bian et~al.]{Bian, Tolford \harvardand\
+  Rana~Bhat}{2025}{Bian2025DevelopingData}
+Bian, R., Tolford, T. \harvardand\ Rana~Bhat, M.  \harvardyearleft
+  2025\harvardyearright , `{Developing a statewide active transportation
+  planning dashboard with mobility data}', {\em Transportation Planning and
+  Technology} {\bf 48}(1),~67--89.
+\newline\harvardurl{https://www.tandfonline.com/doi/abs/10.1080/03081060.2024.2343901}
+
+\harvarditem[Board et~al.]{Board, {of Sciences Engineering} \harvardand\
+  {Medicine}}{2014}{Board2014Activity-BasedPrimer}
+Board, T.~R., {of Sciences Engineering} \harvardand\ {Medicine}
+  \harvardyearleft 2014\harvardyearright , {\em {Activity-Based Travel Demand
+  Models: A Primer}}, The National Academies Press.
+
+\harvarditem{Bowman \harvardand\
+  Ben-Akiva}{2001}{Bowman2001Activity-BasedSchedules}
+Bowman, J.~L. \harvardand\ Ben-Akiva, M.~E.  \harvardyearleft
+  2001\harvardyearright , `{Activity-Based Disaggregate Travel Demand Model
+  System with Activity Schedules}'.
+
+\harvarditem[Calastri et~al.]{Calastri, Hess, Choudhury, Daly \harvardand\
+  Gabrielli}{2019}{Calastri2019Mode}
+Calastri, C., Hess, S., Choudhury, C., Daly, A. \harvardand\ Gabrielli, L.
+  \harvardyearleft 2019\harvardyearright , `{Mode choice with latent
+  availability and consideration: Theory and a case study}', {\em
+  Transportation Research Part B: Methodological} {\bf 123},~374--385.
+
+\harvarditem{{Cycling and Walking Australia and New Zealand}}{2025}{CWANZ2025}
+{Cycling and Walking Australia and New Zealand}  \harvardyearleft
+  2025\harvardyearright , `National walking and cycling participation survey
+  2025', CWANZ, Australia.
+
+\harvarditem[Dick et~al.]{Dick, Aloys \harvardand\
+  Harry}{1995}{Dick1995CompetingDuration}
+Dick, E., Aloys, B. \harvardand\ Harry, T.  \harvardyearleft
+  1995\harvardyearright , `{Competing risk hazard model of activity choice,
+  timing, sequencing, and duration}', {\em Transportation Research Record} .
+\newline\harvardurl{https://www.scopus.com/pages/publications/0029333547?origin=resultslist}
+
+\harvarditem[Duren et~al.]{Duren, Corrigan, Kennedy, Pollack~Porter
+  \harvardand\ Ehsani}{2023}{Duren2023IdentifyingComponents}
+Duren, M., Corrigan, B., Kennedy, R.~D., Pollack~Porter, K.~M. \harvardand\
+  Ehsani, J.  \harvardyearleft 2023\harvardyearright , `{Identifying and
+  Assessing Perceived Cycling Safety Components}', {\em Safety} {\bf 9}(4).
+\newline\harvardurl{https://www.mdpi.com/2313-576X/9/4/75}
+
+\harvarditem{Ewing \harvardand\ Dumbaugh}{2009}{Ewing2009TheEvidence}
+Ewing, R. \harvardand\ Dumbaugh, E.  \harvardyearleft 2009\harvardyearright ,
+  `{The built environment and traffic safety: A review of empirical evidence}',
+  {\em Journal of Planning Literature} {\bf 23}(4),~347--367.
+\newline\harvardurl{http://jpl.sagepub.comhttp://online.sagepub.com}
+
+\harvarditem[Fang et~al.]{Fang, Fan \harvardand\ Yu}{2024}{Fang2024APrediction}
+Fang, K., Fan, J. \harvardand\ Yu, B.  \harvardyearleft 2024\harvardyearright ,
+  `{A trip-based network travel risk: definition and prediction}', {\em Annals
+  of Operations Research} {\bf 343},~1069--1094.
+\newline\harvardurl{https://doi.org/10.1007/s10479-022-04630-6}
+
+\harvarditem[Gemma et~al.]{Gemma, Mannini, Busillo, Cipriani \harvardand\
+  Crisalli}{2022}{Gemma2022CaseAssignment}
+Gemma, A., Mannini, L., Busillo, V., Cipriani, E. \harvardand\ Crisalli, U.
+  \harvardyearleft 2022\harvardyearright , `{Case studies of integration
+  between activity-based demand models and multimodal assignment}', {\em
+  Research in Transportation Economics} {\bf 92},~101119.
+\newline\harvardurl{https://www.sciencedirect.com/science/article/abs/pii/S0739885921000913?utm_source=openai}
+
+\harvarditem{Gibbons \harvardand\ Macfarlane}{2025}{Gibbons2025EvaluatingModel}
+Gibbons, N. \harvardand\ Macfarlane, G.~S.  \harvardyearleft
+  2025\harvardyearright , `{Evaluating the Impacts of Parameter Uncertainty in
+  a Practical Transportation Demand Model}', {\em Future Transportation 2025,
+  Vol. 5, Page 15} {\bf 5}(1),~15.
+\newline\harvardurl{https://www.mdpi.com/2673-7590/5/1/15/htm
+  https://www.mdpi.com/2673-7590/5/1/15}
+
+\harvarditem[G{\"{o}}ssling et~al.]{G{\"{o}}ssling, Kees, Hologa, Riach
+  \harvardand\ von St{\"{u}}lpnagel}{2024}{Gossling2024ChildrensSpace}
+G{\"{o}}ssling, S., Kees, J., Hologa, R., Riach, N. \harvardand\ von
+  St{\"{u}}lpnagel, R.  \harvardyearleft 2024\harvardyearright ,
+  `{Childrenâ€™s safe routes to school: Real and perceived risks, and
+  evidence of an incapacity-incapability space}', {\em Journal of Cycling and
+  Micromobility Research} {\bf 2},~100019.
+\newline\harvardurl{https://www.sciencedirect.com/science/article/pii/S295010592400010X}
+
+\harvarditem[Haque et~al.]{Haque, Choudhury \harvardand\
+  Hess}{2019}{Haque2019ICMNL}
+Haque, M.~B., Choudhury, C. \harvardand\ Hess, S.  \harvardyearleft
+  2019\harvardyearright , `{Modelling residential location choices with
+  implicit availability of alternatives}', {\em Journal of Transport and Land
+  Use} {\bf 12}(1),~597--618.
+
+\harvarditem{Hartley \harvardand\ Zisserman}{2003}{hartley2003multiple}
+Hartley, R. \harvardand\ Zisserman, A.  \harvardyearleft 2003\harvardyearright
+  , {\em Multiple view geometry in computer vision}, Cambridge university
+  press.
+
+\harvarditem[Hess et~al.]{Hess, Daly, Bliemer, Guevara, Daziano \harvardand\
+  Dekker}{2026}{Hess2026Significance}
+Hess, S., Daly, A., Bliemer, M., Guevara, A., Daziano, R. \harvardand\ Dekker,
+  T.  \harvardyearleft 2026\harvardyearright , `{Statistical significance in
+  choice modelling: computation, usage and reporting}', {\em Journal of Choice
+  Modelling} {\bf 60},~100611.
+
+\harvarditem[Huang et~al.]{Huang, Gan, Postorino, Wang \harvardand\
+  Wu}{2025}{Huang2025YoungApproach}
+Huang, Y., Gan, H., Postorino, M.~N., Wang, K. \harvardand\ Wu, X.
+  \harvardyearleft 2025\harvardyearright , `{Young people preferences about
+  enhanced transportation services for intercity trips: An integrated choice
+  and latent variable approach}', {\em Research in Transportation Economics}
+  {\bf 114}.
+\newline\harvardurl{https://www.scopus.com/pages/publications/105021128010?origin=resultslist}
+
+\harvarditem{Johnson}{1977}{dijkstra_algorithm}
+Johnson, D.~B.  \harvardyearleft 1977\harvardyearright , `Efficient algorithms
+  for shortest paths in sparse networks', {\em J. ACM} {\bf 24}(1),~1â€"13.
+
+\harvarditem[Kim et~al.]{Kim, Rasouli \harvardand\
+  Timmermans}{2016}{Kim2016ACars}
+Kim, J., Rasouli, S. \harvardand\ Timmermans, H.  \harvardyearleft
+  2016\harvardyearright , `{A hybrid choice model with a nonlinear utility
+  function and bounded distribution for latent variables: application to
+  purchase intention decisions of electric cars}', {\em Transportmetrica A:
+  Transport Science} {\bf 12}(10),~909--932.
+\newline\harvardurl{http://dx.doi.org/10.1080/23249935.2016.1193567}
+
+\harvarditem[Luan et~al.]{Luan, Yang, Shu, Jia, Zheng \harvardand\
+  Meng}{2025}{Luan2025AnalyzingModel}
+Luan, S., Yang, X., Shu, W., Jia, S., Zheng, X. \harvardand\ Meng, F.
+  \harvardyearleft 2025\harvardyearright , `{Analyzing the Influence of Risk
+  Perception on Commutersâ€™ Travel Mode Choice in Heavy Rainfall:
+  Evidence from Qingdao, China, Using the RGWRR Model}', {\em Sustainability}
+  {\bf 17}(9).
+\newline\harvardurl{https://www.mdpi.com/2071-1050/17/9/4188}
+
+\harvarditem[Mishra et~al.]{Mishra, Tang, Ghader, Mahapatra \harvardand\
+  Zhang}{2018}{Mishra2018EstimationApplications}
+Mishra, S., Tang, L., Ghader, S., Mahapatra, S. \harvardand\ Zhang, L.
+  \harvardyearleft 2018\harvardyearright , `{Estimation and valuation of travel
+  time reliability for transportation planning applications}', {\em Case
+  Studies on Transport Policy} {\bf 6}(1),~51--62.
+\newline\harvardurl{https://www.sciencedirect.com/science/article/pii/S2213624X17300263}
+
+\harvarditem{Mladenovic \harvardand\
+  Trifunovic}{2014}{Mladenovic2014TheProcess}
+Mladenovic, M. \harvardand\ Trifunovic, A.  \harvardyearleft
+  2014\harvardyearright , `{The shortcomings of the conventional four step
+  travel demand forecasting process}', {\em Journal of Road and Traffic
+  Engineering} {\bf 60}(1),~5--12.
+
+\harvarditem{Nayak \harvardand\ Pandit}{2023}{Nayak2023ANetworks}
+Nayak, S. \harvardand\ Pandit, D.  \harvardyearleft 2023\harvardyearright , `{A
+  joint and simultaneous prediction framework of weekday and weekend
+  daily-activity travel pattern using conditional dependency networks}', {\em
+  Travel Behaviour and Society} {\bf 32},~100595.
+\newline\harvardurl{https://www.sciencedirect.com/science/article/abs/pii/S2214367X23000467?utm_source=openai}
+
+\harvarditem[Nurul~Habib et~al.]{Nurul~Habib, Day \harvardand\
+  Miller}{2009}{NurulHabib2009AnModel}
+Nurul~Habib, K.~M., Day, N. \harvardand\ Miller, E.~J.  \harvardyearleft
+  2009\harvardyearright , `{An investigation of commuting trip timing and mode
+  choice in the Greater Toronto Area: Application of a joint
+  discrete-continuous model}', {\em Transportation Research Part A: Policy and
+  Practice} {\bf 43}(7),~639--653.
+\newline\harvardurl{https://www.scopus.com/pages/publications/67650708018?origin=resultslist}
+
+\harvarditem[Palma et~al.]{Palma, Enam, Hess, Calastri \harvardand\ Crastes~dit
+  Sourd}{2021}{Palma2021MDCEV}
+Palma, D., Enam, A., Hess, S., Calastri, C. \harvardand\ Crastes~dit Sourd, R.
+  \harvardyearleft 2021\harvardyearright , `{Modelling multiple occurrences of
+  activities during a day: an extension of the MDCEV model}', {\em
+  Transportmetrica B: Transport Dynamics} {\bf 9}(1),~456--478.
+
+\harvarditem[Paz et~al.]{Paz, Molano, Martinez, Gaviria \harvardand\
+  Arteaga}{2015}{Paz2015CalibrationAlgorithm}
+Paz, A., Molano, V., Martinez, E., Gaviria, C. \harvardand\ Arteaga, C.
+  \harvardyearleft 2015\harvardyearright , `{Calibration of traffic flow models
+  using a memetic algorithm}', {\em Transportation Research Part C: Emerging
+  Technologies} {\bf 55},~432--443.
+\newline\harvardurl{https://linkinghub.elsevier.com/retrieve/pii/S0968090X15000807}
+
+\harvarditem{Perera \harvardand\ Bell}{2026}{Perera2026Data}
+Perera, S. \harvardand\ Bell, M.  \harvardyearleft 2026\harvardyearright ,
+  Beyond the four-step model: Structural differences and a data integration
+  framework for activity-based transport modelling, {\em in} `Australasian
+  Transport Research Forum 2026 Proceedings', Sydney, Australia.
+
+\harvarditem[Qin et~al.]{Qin, Van~de Weghe \harvardand\
+  Huang}{2025}{Qin2025TheReview}
+Qin, T., Van~de Weghe, N. \harvardand\ Huang, H.  \harvardyearleft
+  2025\harvardyearright , `{The role of urban built environments in the
+  perception of safety: A systematic review}', {\em Environmental Impact
+  Assessment Review} {\bf 114},~107915.
+\newline\harvardurl{https://www.sciencedirect.com/science/article/pii/S019592552500112X}
+
+\harvarditem{Rahnasto \harvardand\
+  Hollestelle}{2024}{Rahnasto2024ComparingChoice}
+Rahnasto, I. \harvardand\ Hollestelle, M.  \harvardyearleft
+  2024\harvardyearright , `{Comparing discrete choice and machine learning
+  models in predicting destination choice}', {\em European Transport Research
+  Review 2024 16:1} {\bf 16}(1),~43--.
+\newline\harvardurl{https://link.springer.com/article/10.1186/s12544-024-00667-9}
+
+\harvarditem{Ren \harvardand\ Chow}{2022}{Ren2022ASet}
+Ren, X. \harvardand\ Chow, J.~Y.  \harvardyearleft 2022\harvardyearright , `{A
+  random-utility-consistent machine learning method to estimate agentsâ€™
+  joint activity scheduling choice from a ubiquitous data set}', {\em
+  Transportation Research Part B: Methodological} {\bf 166},~396--418.
+\newline\harvardurl{https://www.sciencedirect.com/science/article/pii/S0191261522001862?utm_source=openai}
+
+\harvarditem[Roorda et~al.]{Roorda, Miller \harvardand\
+  Habib}{2008}{Roorda2008ValidationModel}
+Roorda, M.~J., Miller, E.~J. \harvardand\ Habib, K. M.~N.  \harvardyearleft
+  2008\harvardyearright , `{Validation of TASHA: A 24-h activity scheduling
+  microsimulation model}', {\em Transportation Research Part A: Policy and
+  Practice} {\bf 42}(2),~360--375.
+\newline\harvardurl{https://www.sciencedirect.com/science/article/pii/S0965856407000924}
+
+\harvarditem{Srinivasan \harvardand\
+  Bhat}{2005}{Srinivasan2005ModelingParticipation}
+Srinivasan, S. \harvardand\ Bhat, C.~R.  \harvardyearleft 2005\harvardyearright
+  , `{Modeling household interactions in daily in-home and out-of-home
+  maintenance activity participation}', {\em Transportation} {\bf
+  32}(5),~523--544.
+\newline\harvardurl{https://www.scopus.com/pages/publications/23144439236?origin=resultslist}
+
+\harvarditem[Swain et~al.]{Swain, Oswin, Truelove \harvardand\
+  Larue}{2024}{Swain2024ChildrensTravel}
+Swain, R., Oswin, P., Truelove, V. \harvardand\ Larue, G.~S.  \harvardyearleft
+  2024\harvardyearright , `{Childrenâ€™s and parentsâ€™ perceptions
+  on safe routes to schools: a mixed-methods study investigating factors
+  influencing active school travel}', {\em Journal of Urban Design} {\bf
+  29}(2),~208--230.
+\newline\harvardurl{https://doi.org/10.1080/13574809.2023.2223517}
+
+\harvarditem[Tokat et~al.]{Tokat, Tommasi, Ceschi, Oviedo-Trespalacios
+  \harvardand\ Sartori}{2026}{Tokat2026FromSafety}
+Tokat, T., Tommasi, F., Ceschi, A., Oviedo-Trespalacios, O. \harvardand\
+  Sartori, R.  \harvardyearleft 2026\harvardyearright , `{From work environment
+  to roadway: A narrative review on organizational psychologyâ€™s role in
+  road safety}', {\em Transportation Research Interdisciplinary Perspectives}
+  {\bf 36},~101867.
+\newline\harvardurl{https://www.sciencedirect.com/science/article/pii/S2590198226000321}
+
+\harvarditem[Tzouras et~al.]{Tzouras, Pastia, Kaparias \harvardand\
+  Kepaptsoglou}{2025}{Tzouras2025ExploringChoices}
+Tzouras, P.~G., Pastia, V., Kaparias, I. \harvardand\ Kepaptsoglou, K.
+  \harvardyearleft 2025\harvardyearright , `{Exploring the effect of perceived
+  safety in first/last mile mode choices}', {\em Transportation} {\bf
+  52}(5),~2145--2183.
+
+\harvarditem[Waddell et~al.]{Waddell, Garcia-Dorado, Maurer, Boeing, Gardner,
+  Porter \harvardand\ Aliaga}{2018}{Waddell2018ArchitectureTransportation}
+Waddell, P., Garcia-Dorado, I., Maurer, S.~M., Boeing, G., Gardner, M., Porter,
+  E. \harvardand\ Aliaga, D.  \harvardyearleft 2018\harvardyearright ,
+  `{Architecture for Modular Microsimulation of Real Estate Markets and
+  Transportation}', {\em arXiv} .
+
+\harvarditem{Wahba}{1990}{Wahba1990SplineData}
+Wahba, G.  \harvardyearleft 1990\harvardyearright , `{Spline Models for
+  Observational Data}', {\em Spline Models for Observational Data} .
+
+\harvarditem{Walker \harvardand\ Ben-Akiva}{2002}{Walker2002GeneralizedModel}
+Walker, J. \harvardand\ Ben-Akiva, M.  \harvardyearleft 2002\harvardyearright ,
+  `{Generalized random utility model}', {\em Mathematical Social Sciences} {\bf
+  43}(3),~303--343.
+\newline\harvardurl{http://dx.doi.org/10.1016/s0165-4896(02)00023-9}
+
+\harvarditem[Zong et~al.]{Zong, Wang, Jia, Jiao \harvardand\
+  Wu}{2016}{Zong2016PredictionRegression}
+Zong, F., Wang, Z.~Z., Jia, H.~F., Jiao, Y.~L. \harvardand\ Wu, Y.
+  \harvardyearleft 2016\harvardyearright , `{Prediction of commuter's daily
+  activity-travel duration time with support vector regression}', {\em Jilin
+  Daxue Xuebao (Gongxueban)/Journal of Jilin University (Engineering and
+  Technology Edition)} {\bf 46}(2),~406--411.
+\newline\harvardurl{https://www.scopus.com/pages/publications/84964007924?origin=resultslist}
+
+\end{thebibliography}

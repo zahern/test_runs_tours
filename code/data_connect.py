@@ -1243,7 +1243,7 @@ class Synth_Connect:
                     f"process_survey (new_pop): {_n_external} trip endpoints outside "
                     f"the {len(_valid_zones or [])}-zone SEQ universe -> external "
                     f"sentinel {EXTERNAL_TAZ} (excluded from zone choice). "
-                    f"{len(_ext_codes)} distinct external SA2s, first 10: {_ext_codes[:10]}"
+                    f"{len(_ext_codes)} distinct external SA2s: {_ext_codes}"
                 )
         else:
             # FIX 1: TAZ zone lookup (was missing entirely from process_survey)

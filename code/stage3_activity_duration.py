@@ -48,8 +48,15 @@ import pandas as pd
 import logging
 import os
 import pickle
+import sys
 from typing import Optional
 from scipy.stats import norm
+
+_SEARCHLIBRIUM_SRC = os.environ.get(
+    'SEARCHLIBRIUM_SOURCE', r'C:\Users\ahernz\source\SearchLibrium\src'
+)
+if os.path.isdir(_SEARCHLIBRIUM_SRC) and _SEARCHLIBRIUM_SRC not in sys.path:
+    sys.path.insert(0, _SEARCHLIBRIUM_SRC)
 
 try:
     from SearchLibrium import MDCEVModel
@@ -57,6 +64,43 @@ try:
 except Exception:
     MDCEVModel = None
     _MDCEV_AVAILABLE = False
+
+try:
+    from SearchLibrium import RandomRegret
+    _RRM_AVAILABLE = True
+except Exception:
+    RandomRegret = None
+    _RRM_AVAILABLE = False
+
+
+def _install_searchlibrium_pickle_support() -> None:
+    """Make installed SearchLibrium models portable across Python processes."""
+    if not _RRM_AVAILABLE:
+        return
+    try:
+        from SearchLibrium._choice_model import DiscreteChoiceModel
+    except Exception:
+        return
+    if '__getstate__' in DiscreteChoiceModel.__dict__:
+        return
+
+    def _getstate(model):
+        state = model.__dict__.copy()
+        state.pop('backend', None)
+        state['_backend_jax'] = bool(state.get('_jax', True))
+        return state
+
+    def _setstate(model, state):
+        backend_jax = bool(state.pop('_backend_jax', True))
+        model.__dict__.update(state)
+        from SearchLibrium._choice_model import get_backend
+        model.backend = get_backend(backend_jax)
+
+    DiscreteChoiceModel.__getstate__ = _getstate
+    DiscreteChoiceModel.__setstate__ = _setstate
+
+
+_install_searchlibrium_pickle_support()
 
 logger = logging.getLogger(__name__)
 
@@ -503,6 +547,257 @@ class BudgetLognormal:
         return np.exp(rng.normal(self._eta(X), self.sigma_))
 
 
+def _rank_to_unit(values: np.ndarray) -> np.ndarray:
+    """Map arbitrary order values to the open unit interval."""
+    values = np.asarray(values, dtype=float).reshape(-1)
+    if len(values) == 0:
+        return values
+    finite = np.isfinite(values)
+    if not finite.any():
+        return np.full(len(values), 0.5, dtype=float)
+    filled = values.copy()
+    filled[~finite] = np.nanmedian(filled[finite])
+    ranks = pd.Series(filled).rank(method='average').to_numpy(dtype=float)
+    n = float(len(values))
+    return np.clip((ranks - 0.5) / max(n, 1.0), 0.001, 0.999)
+
+
+def _activity_order_quantile(frame: pd.DataFrame) -> np.ndarray:
+    """Return each activity's observed within-person order quantile."""
+    if frame.empty:
+        return np.zeros(0, dtype=float)
+    time_col = next(
+        (c for c in (
+            'planning_order', 'activity_seq', 'STARTIME', 'start_time',
+            'depart', 'start_hr',
+        ) if c in frame.columns),
+        None,
+    )
+    work = frame.copy()
+    work['_order_time'] = (
+        pd.to_numeric(work[time_col], errors='coerce').fillna(0.0)
+        if time_col is not None else np.arange(len(work), dtype=float)
+    )
+    if 'person_id' not in work.columns:
+        return _rank_to_unit(work['_order_time'].to_numpy())
+
+    work['_order_row'] = np.arange(len(work))
+    ordered = work.sort_values(['person_id', '_order_time', '_order_row'], kind='stable')
+    ranks = ordered.groupby('person_id', sort=False).cumcount().astype(float)
+    counts = ordered.groupby('person_id', sort=False)['person_id'].transform('size').astype(float)
+    ordered['_order_u'] = (ranks + 0.5) / counts.clip(lower=1.0)
+    return ordered.set_index('_order_row')['_order_u'].reindex(
+        work['_order_row']
+    ).fillna(0.5).to_numpy(dtype=float)
+
+
+class CopulaLinkedHazardDurationModel:
+    """Joint activity-duration model with an order-linked Gaussian copula.
+
+    The duration margin is an AFT lognormal model.  A discrete-time completion
+    hazard is fitted on the same observations.  The standardized AFT residual
+    and the observed within-person activity-order quantile identify a Gaussian
+    copula correlation.  At prediction time, the copula supplies a shared
+    latent duration/completion propensity, so earlier or later planned
+    activities can receive systematically different duration draws.
+
+    This is intentionally separate from ``BudgetLognormal``.  It can be
+    enabled for experiments without changing saved legacy duration models.
+    """
+
+    estimator_ = 'copula_linked_discrete_hazard'
+
+    def __init__(self, l2: float = 1e-4, n_bins: int = 16,
+                 hazard_l2: float = 1e-3):
+        self.l2 = l2
+        self.n_bins = max(int(n_bins), 4)
+        self.hazard_l2 = hazard_l2
+        self.marginal_ = BudgetLognormal(l2=l2)
+        self.feature_names_ = None
+        self.rho_ = 0.0
+        self.bin_edges_ = None
+        self.hazard_intercept_ = None
+        self.hazard_coef_ = None
+        self.hazard_ll_ = None
+        self.hazard_converged_ = False
+        self.n_ = 0
+
+    @property
+    def sigma_(self):
+        return self.marginal_.sigma_
+
+    @property
+    def coef_(self):
+        return self.marginal_.coef_
+
+    @property
+    def intercept_(self):
+        return self.marginal_.intercept_
+
+    @property
+    def ll_(self):
+        return self.marginal_.ll_
+
+    @property
+    def rmse_(self):
+        return self.marginal_.rmse_
+
+    @property
+    def converged_(self):
+        return bool(self.marginal_.converged_ and self.hazard_converged_)
+
+    def _eta_standardized(self, X: np.ndarray) -> np.ndarray:
+        eta = self.marginal_._eta(np.asarray(X, dtype=float))
+        mu = float(getattr(self, 'eta_mu_', 0.0))
+        sd = max(float(getattr(self, 'eta_sd_', 1.0)), 1e-6)
+        return (eta - mu) / sd
+
+    def _latent_order(self, order_signal, size: int, rng=None) -> np.ndarray:
+        if order_signal is None:
+            if rng is None:
+                return np.zeros(size, dtype=float)
+            return rng.normal(size=size)
+        z_order = norm.ppf(_rank_to_unit(order_signal))
+        if rng is None:
+            return self.rho_ * z_order
+        residual_sd = np.sqrt(max(1.0 - self.rho_ ** 2, 1e-6))
+        return self.rho_ * z_order + residual_sd * rng.normal(size=size)
+
+    def fit(self, X: np.ndarray, y: np.ndarray, order_signal=None,
+            bounds=None):
+        from scipy.optimize import minimize
+
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float).reshape(-1)
+        if len(X) != len(y) or len(y) == 0:
+            raise ValueError('X and y must contain the same non-zero number of rows')
+
+        self.marginal_.fit(X, y)
+        self.feature_names_ = list(getattr(self, 'feature_names_', []) or [])
+        self.n_ = len(y)
+        eta = self.marginal_._eta(X)
+        sigma = max(float(self.marginal_.sigma_), 0.05)
+        z_duration = np.clip((np.log(np.clip(y, 1e-6, None)) - eta) / sigma, -6.0, 6.0)
+        z_order = norm.ppf(_rank_to_unit(order_signal)) if order_signal is not None \
+            else np.zeros(len(y), dtype=float)
+        if np.std(z_order) > 1e-8 and np.std(z_duration) > 1e-8:
+            self.rho_ = float(np.clip(np.corrcoef(z_duration, z_order)[0, 1], -0.95, 0.95))
+        else:
+            self.rho_ = 0.0
+
+        eta_sd = max(float(np.std(eta)), 1e-6)
+        self.eta_mu_ = float(np.mean(eta))
+        self.eta_sd_ = eta_sd
+        eta_std = (eta - self.eta_mu_) / eta_sd
+
+        lo = float(bounds[0]) if bounds is not None else max(float(np.min(y)), 1.0)
+        hi = float(bounds[1]) if bounds is not None else float(np.max(y))
+        hi = max(hi, float(np.max(y)) * 1.02, lo * 1.05)
+        self.bin_edges_ = np.geomspace(max(lo, 1.0), hi, self.n_bins + 1)
+        self.n_bins_ = len(self.bin_edges_) - 1
+
+        event_bins = np.searchsorted(self.bin_edges_[1:], y, side='right')
+        event_bins = np.clip(event_bins, 0, self.n_bins_ - 1)
+        row_idx = np.concatenate([
+            np.full(event_bin + 1, row, dtype=int)
+            for row, event_bin in enumerate(event_bins)
+        ])
+        bin_idx = np.concatenate([
+            np.arange(event_bin + 1, dtype=int)
+            for event_bin in event_bins
+        ])
+        events = (bin_idx == event_bins[row_idx]).astype(float)
+        n_at_risk = np.bincount(bin_idx, minlength=self.n_bins_).astype(float)
+        n_events = np.bincount(bin_idx, weights=events, minlength=self.n_bins_)
+        base_rate = np.clip(n_events / np.maximum(n_at_risk, 1.0), 1e-4, 1.0 - 1e-4)
+        initial = np.concatenate([
+            np.log(base_rate / (1.0 - base_rate)), np.zeros(2, dtype=float)
+        ])
+
+        def objective(params):
+            intercept = params[:self.n_bins_]
+            coef = params[self.n_bins_:]
+            linear = intercept[bin_idx] + coef[0] * eta_std[row_idx] \
+                + coef[1] * z_duration[row_idx]
+            return float(
+                np.sum(np.logaddexp(0.0, linear) - events * linear)
+                + 0.5 * self.hazard_l2 * np.dot(coef, coef)
+            )
+
+        def gradient(params):
+            intercept = params[:self.n_bins_]
+            coef = params[self.n_bins_:]
+            linear = intercept[bin_idx] + coef[0] * eta_std[row_idx] \
+                + coef[1] * z_duration[row_idx]
+            residual = 1.0 / (1.0 + np.exp(-np.clip(linear, -40.0, 40.0))) - events
+            grad_intercept = np.bincount(
+                bin_idx, weights=residual, minlength=self.n_bins_
+            )
+            grad_coef = np.array([
+                np.dot(residual, eta_std[row_idx]),
+                np.dot(residual, z_duration[row_idx]),
+            ]) + self.hazard_l2 * coef
+            return np.concatenate([grad_intercept, grad_coef])
+
+        result = minimize(
+            objective, initial, jac=gradient, method='L-BFGS-B',
+            options={'maxiter': 300, 'ftol': 1e-9},
+        )
+        self.hazard_intercept_ = result.x[:self.n_bins_]
+        self.hazard_coef_ = result.x[self.n_bins_:]
+        self.hazard_ll_ = float(-result.fun)
+        self.hazard_converged_ = bool(result.success)
+        return self
+
+    def _hazards(self, X: np.ndarray, z_duration: np.ndarray) -> np.ndarray:
+        eta_std = self._eta_standardized(X)
+        linear = (
+            self.hazard_intercept_[None, :]
+            + self.hazard_coef_[0] * eta_std[:, None]
+            + self.hazard_coef_[1] * z_duration[:, None]
+        )
+        return 1.0 / (1.0 + np.exp(-np.clip(linear, -40.0, 40.0)))
+
+    def completion_hazard(self, X: np.ndarray, order_signal=None) -> np.ndarray:
+        """Return completion hazard by duration bin for each activity."""
+        X = np.asarray(X, dtype=float)
+        z = self._latent_order(order_signal, len(X))
+        return self._hazards(X, z)
+
+    def predict_sampled(self, X: np.ndarray, rng: np.random.Generator,
+                        order_signal=None) -> np.ndarray:
+        X = np.asarray(X, dtype=float)
+        z_duration = self._latent_order(order_signal, len(X), rng=rng)
+        hazards = self._hazards(X, z_duration)
+        cdf = 1.0 - np.cumprod(1.0 - hazards, axis=1)
+        uniforms = rng.random(len(X))
+        bins = np.sum(uniforms[:, None] > cdf, axis=1)
+        bins = np.clip(bins, 0, self.n_bins_ - 1).astype(int)
+
+        aft_duration = np.exp(self.marginal_._eta(X) + self.sigma_ * z_duration)
+        low = self.bin_edges_[bins]
+        high = self.bin_edges_[bins + 1]
+        log_low = np.log(np.maximum(low, 1e-6))
+        log_high = np.log(np.maximum(high, low + 1e-6))
+        width = np.maximum(log_high - log_low, 0.05)
+        midpoint = 0.5 * (log_low + log_high)
+        frac = 1.0 / (1.0 + np.exp(-np.clip((np.log(aft_duration) - midpoint) / width, -30.0, 30.0)))
+        return np.exp(log_low + frac * (log_high - log_low))
+
+    def predict_mean(self, X: np.ndarray, order_signal=None) -> np.ndarray:
+        """Return the hazard-implied mean duration in minutes."""
+        X = np.asarray(X, dtype=float)
+        z_duration = self._latent_order(order_signal, len(X))
+        hazards = self._hazards(X, z_duration)
+        survival_before = np.column_stack([
+            np.ones(len(X)), np.cumprod(1.0 - hazards[:, :-1], axis=1)
+        ])
+        mass = survival_before * hazards
+        mid = np.sqrt(self.bin_edges_[:-1] * self.bin_edges_[1:])
+        tail = np.prod(1.0 - hazards, axis=1)
+        return mass @ mid + tail * self.bin_edges_[-1]
+
+
 def _augment_duration_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for col in ACTIVITY_COLS:
@@ -555,6 +850,7 @@ def estimate_duration_models(
     min_sample: int = 50,
     use_mdcev: bool = False,
     feature_override: list = None,
+    duration_model: str = None,
 ) -> dict:
     """
     Fit one BudgetLognormal per activity purpose.
@@ -564,8 +860,22 @@ def estimate_duration_models(
     tours, persons    : from process_survey()
     min_sample        : skip purposes with fewer observations
     feature_override  : GA-selected feature list (replaces PERSON_FEATURES)
+    duration_model    : ``'lognormal'`` (default) or ``'copula_hazard'``.
+                        The latter adds an order-linked discrete hazard
+                        layer around the lognormal marginal.
     """
     data    = _augment_duration_features(prepare_duration_data(tours, persons, trips=trips))
+    duration_model = (duration_model or os.environ.get(
+        'STAGE3_DURATION_MODEL', 'lognormal'
+    )).strip().lower()
+    if duration_model in {'copula', 'hazard', 'copula-linked-hazard'}:
+        duration_model = 'copula_hazard'
+    if duration_model not in {'lognormal', 'copula_hazard'}:
+        logger.warning(
+            f"Unknown STAGE3_DURATION_MODEL={duration_model!r}; using lognormal"
+        )
+        duration_model = 'lognormal'
+    data['_activity_order_u'] = _activity_order_quantile(data)
     ptypes  = data.attrs.get('ptypes', [])
     # ---- diagnose purpose column before fitting -------------------------
     purpose_col = None
@@ -669,7 +979,28 @@ def estimate_duration_models(
             m.fit(X, y)
             m.feature_names_ = X_cols
 
-        mean_pred = float(np.nanmean(m.predict_mean(X))) if len(X) else float('nan')
+        if duration_model == 'copula_hazard':
+            try:
+                copula_model = CopulaLinkedHazardDurationModel()
+                copula_model.feature_names_ = X_cols
+                copula_model.fit(
+                    X, y,
+                    order_signal=subset.get('_activity_order_u'),
+                    bounds=(lo, hi),
+                )
+                m = copula_model
+            except Exception as exc:
+                logger.warning(
+                    f"  {purpose}: copula-hazard fit failed; using lognormal: {exc}"
+                )
+
+        if isinstance(m, CopulaLinkedHazardDurationModel):
+            mean_values = m.predict_mean(
+                X, order_signal=subset.get('_activity_order_u')
+            )
+        else:
+            mean_values = m.predict_mean(X)
+        mean_pred = float(np.nanmean(mean_values)) if len(X) else float('nan')
         mean_obs = float(np.nanmean(y)) if len(y) else float('nan')
         calib = 1.0
         if np.isfinite(mean_pred) and mean_pred > 0 and np.isfinite(mean_obs):
@@ -692,6 +1023,7 @@ def estimate_duration_models(
             'mean_obs': mean_obs,
             'mean_pred_uncal': mean_pred,
             'observed_profile': _quantile_profile(pd.Series(y)),
+            'estimator': getattr(m, 'estimator_', 'budget_lognormal'),
         }
         bias_pct = (mean_pred - mean_obs) / mean_obs * 100 if mean_obs > 0 else float('nan')
         bias_str = f"{bias_pct:+.1f}%" if np.isfinite(bias_pct) else "n/a"
@@ -725,7 +1057,224 @@ def estimate_duration_models(
         except Exception as _mdcev_e:
             logger.warning(f"Stage 3 MDCEV fit failed, falling back to lognormal-only allocation: {_mdcev_e}")
 
+    planning = estimate_planning_order_model(data)
+    if planning is not None:
+        models['_planning_order'] = planning
+
     return models
+
+
+# ---------------------------------------------------------------------------
+# 2b.  POLARIS-STYLE ACTIVITY PLANNING ORDER
+# ---------------------------------------------------------------------------
+
+_PLANNING_FEATURES = [
+    'mandatory', 'flexibility', 'duration_ratio',
+    'remaining_ratio', 'horizon_pressure', 'empirical_rank',
+]
+
+
+class PlanningOrderModel:
+    """Sequential next-activity choice model with RRM and availability."""
+
+    def __init__(self, rrm=None, duration_by_purpose=None, rank_by_purpose=None):
+        self.rrm = rrm
+        self.duration_by_purpose = {
+            p: float((duration_by_purpose or {}).get(p, 30.0))
+            for p in PURPOSES
+        }
+        self.rank_by_purpose = {
+            p: float((rank_by_purpose or {}).get(p, i))
+            for i, p in enumerate(PURPOSES)
+        }
+        self.feature_names = list(_PLANNING_FEATURES)
+        self.n_obs = 0
+        self.estimator = 'searchlibrium_rrm' if rrm is not None else 'empirical'
+
+    @staticmethod
+    def _is_mandatory(purpose):
+        return float(purpose in {'work', 'edu'})
+
+    @staticmethod
+    def _is_flexible(purpose):
+        return float(purpose not in {'work', 'edu'})
+
+    def _candidate_features(self, remaining, durations, horizon_min):
+        total_remaining = max(sum(remaining.values()), 1)
+        horizon = max(float(horizon_min), 60.0)
+        features = np.zeros((len(PURPOSES), len(self.feature_names)), dtype=float)
+        for i, purpose in enumerate(PURPOSES):
+            duration = max(float(durations.get(purpose, self.duration_by_purpose[purpose])), 1.0)
+            features[i] = [
+                self._is_mandatory(purpose),
+                self._is_flexible(purpose),
+                duration / horizon,
+                float(remaining.get(purpose, 0)) / total_remaining,
+                duration / max(horizon * total_remaining, 1.0),
+                self.rank_by_purpose[purpose],
+            ]
+        return features
+
+    def _probabilities(self, features, available):
+        if self.rrm is None:
+            scores = -features[:, self.feature_names.index('empirical_rank')]
+            scores = np.where(available, scores, -np.inf)
+            scores -= np.max(scores)
+            probs = np.exp(scores)
+            return probs / max(float(probs.sum()), 1e-12)
+        try:
+            probs = self.rrm.predict_proba(
+                features[None, :, :], avail=available.astype(float)[None, :]
+            )[0]
+            return np.asarray(probs, dtype=float)
+        except Exception as exc:
+            logger.debug(f'Planning RRM prediction failed; using empirical order: {exc}')
+            scores = -features[:, self.feature_names.index('empirical_rank')]
+            scores = np.where(available, scores, -np.inf)
+            scores -= np.max(scores)
+            probs = np.exp(scores)
+            return probs / max(float(probs.sum()), 1e-12)
+
+    def order_group(self, group: pd.DataFrame) -> pd.DataFrame:
+        out = group.copy()
+        if out.empty:
+            return out
+        out['_planning_order'] = -1
+        remaining = out['purpose'].value_counts().to_dict()
+        durations = out.groupby('purpose')['predicted_duration_min'].mean().to_dict()
+        horizon = float(out['end_of_day'].iloc[0] - out['start_of_day'].iloc[0]) \
+            if {'start_of_day', 'end_of_day'}.issubset(out.columns) else 480.0
+        available_rows = {p: list(out.index[out['purpose'] == p]) for p in PURPOSES}
+
+        for step in range(len(out)):
+            available = np.array([remaining.get(p, 0) > 0 for p in PURPOSES], dtype=bool)
+            if not available.any():
+                break
+            features = self._candidate_features(remaining, durations, horizon)
+            probs = self._probabilities(features, available)
+            probs = np.where(available & np.isfinite(probs), probs, -np.inf)
+            chosen_idx = int(np.argmax(probs))
+            chosen_purpose = PURPOSES[chosen_idx]
+            row_idx = available_rows[chosen_purpose].pop(0)
+            out.loc[row_idx, '_planning_order'] = step
+            remaining[chosen_purpose] -= 1
+
+        out['planning_order'] = out['_planning_order'].clip(lower=0).astype(int)
+        out = out.sort_values('planning_order', kind='stable')
+        out['activity_seq'] = np.arange(len(out), dtype=int)
+        return out.drop(columns=['_planning_order'], errors='ignore')
+
+
+def _planning_purpose_column(data: pd.DataFrame) -> Optional[str]:
+    if '_purpose_coded' in data.columns:
+        return '_purpose_coded'
+    for col in ('main_purpose', 'purpose', 'primary_purpose'):
+        if col in data.columns:
+            return col
+    return None
+
+
+def _planning_order_rows(data: pd.DataFrame) -> pd.DataFrame:
+    purpose_col = _planning_purpose_column(data)
+    if purpose_col is None or 'person_id' not in data.columns:
+        return pd.DataFrame()
+    rows = data.copy()
+    rows['purpose'] = rows[purpose_col]
+    rows = rows[rows['purpose'].isin(PURPOSES)].copy()
+    if rows.empty:
+        return rows
+    time_col = next((c for c in ('STARTIME', 'start_time', 'depart') if c in rows.columns), None)
+    if time_col is not None:
+        rows['_planning_time'] = pd.to_numeric(rows[time_col], errors='coerce').fillna(0.0)
+    else:
+        rows['_planning_time'] = rows.groupby('person_id').cumcount()
+    return rows.sort_values(['person_id', '_planning_time'], kind='stable')
+
+
+def estimate_planning_order_model(data: pd.DataFrame, max_obs: int = 50000):
+    """Estimate next-activity order from observed person-day sequences."""
+    rows = _planning_order_rows(data)
+    if rows.empty:
+        return None
+
+    duration_by_purpose = rows.groupby('purpose')['duration'].median().to_dict() \
+        if 'duration' in rows.columns else {}
+    rank_sums = rows.groupby('person_id').cumcount()
+    rank_by_purpose = rows.assign(_rank=rank_sums).groupby('purpose')['_rank'].mean().to_dict()
+    model = PlanningOrderModel(
+        duration_by_purpose=duration_by_purpose,
+        rank_by_purpose=rank_by_purpose,
+    )
+
+    choices = []
+    attributes = []
+    availabilities = []
+    grouped = rows.groupby('person_id', sort=False)
+    for _, group in grouped:
+        sequence = group['purpose'].tolist()
+        remaining = group['purpose'].value_counts().to_dict()
+        horizon = float(group['B'].iloc[0] * 60.0) if 'B' in group.columns else 480.0
+        durations = group.groupby('purpose')['duration'].median().to_dict() \
+            if 'duration' in group.columns else {}
+        for purpose in sequence:
+            available = np.array([remaining.get(p, 0) > 0 for p in PURPOSES], dtype=bool)
+            if available.sum() < 2:
+                remaining[purpose] -= 1
+                continue
+            attributes.append(model._candidate_features(remaining, durations, horizon))
+            availabilities.append(available)
+            choices.append(PURPOSES.index(purpose))
+            remaining[purpose] -= 1
+            if len(choices) >= max_obs:
+                break
+        if len(choices) >= max_obs:
+            break
+
+    model.n_obs = len(choices)
+    if _RRM_AVAILABLE and choices:
+        try:
+            X = np.asarray(attributes, dtype=float)
+            y_idx = np.asarray(choices, dtype=int)
+            avail = np.asarray(availabilities, dtype=float)
+            n_obs, n_alt, n_attr = X.shape
+            long_X = X.reshape(n_obs * n_alt, n_attr)
+            long_y = np.zeros(n_obs * n_alt, dtype=int)
+            long_y[np.arange(n_obs) * n_alt + y_idx] = 1
+            long_alts = np.tile(np.arange(1, n_alt + 1), n_obs)
+            long_ids = np.repeat(np.arange(1, n_obs + 1), n_alt)
+            rrm = RandomRegret()
+            rrm.setup(
+                X=long_X,
+                y=long_y,
+                varnames=model.feature_names,
+                alts=long_alts,
+                ids=long_ids,
+                isvars=[],
+                avail=avail.ravel(),
+                maxiter=300,
+            )
+            rrm.fit(compute_inference=False)
+            if np.isfinite(getattr(rrm, 'loglik', np.nan)):
+                model.rrm = rrm
+                model.estimator = 'searchlibrium_rrm'
+                logger.info(f'  planning/order: fitted SearchLibrium RRM on {len(choices)} choices')
+        except Exception as exc:
+            logger.warning(f'  planning/order RRM fit failed; using empirical order: {exc}')
+
+    logger.info(
+        f"  planning/order: {model.estimator}, n={model.n_obs}, "
+        f"rank={{{', '.join(f'{p}:{model.rank_by_purpose[p]:.1f}' for p in PURPOSES)}}}"
+    )
+    return model
+
+
+def apply_planning_order(activities: pd.DataFrame, model: Optional[PlanningOrderModel]) -> pd.DataFrame:
+    if model is None or activities.empty or 'person_id' not in activities.columns:
+        return activities
+    ordered = [model.order_group(group) for _, group in activities.groupby('person_id', sort=False)]
+    if not ordered:
+        return activities
+    return pd.concat(ordered, axis=0).sort_index(kind='stable').reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +1393,7 @@ def predict_activity_durations(
         acts[col] = acts[col].fillna(val)
 
     acts = _augment_duration_features(acts)
+    acts['_copula_order_u'] = _activity_order_quantile(acts)
     acts['predicted_duration_min'] = np.nan
 
     # predict per purpose
@@ -873,7 +1423,19 @@ def predict_activity_durations(
             if col in subset.columns:
                 X[:, j] = subset[col].fillna(0).values.astype(float)
 
-        if sample:
+        _order_signal = subset['_copula_order_u'].to_numpy(dtype=float) \
+            if '_copula_order_u' in subset.columns else None
+
+        if isinstance(model, CopulaLinkedHazardDurationModel):
+            if sample:
+                preds = model.predict_sampled(
+                    X, rng, order_signal=_order_signal
+                )
+            else:
+                preds = model.predict_mean(
+                    X, order_signal=_order_signal
+                )
+        elif sample:
             # ActivitySim-style: use a minimum effective sigma so individual
             # durations vary even when the model fits tightly (small sigma_).
             # Purpose-specific floors:
@@ -1049,6 +1611,11 @@ def predict_activity_durations(
             acts.loc[pmask, 'predicted_duration_min'].clip(lower=lo, upper=soft_hi)
         )
 
+    planning_model = models.get('_planning_order') if isinstance(models, dict) else None
+    if isinstance(planning_model, PlanningOrderModel):
+        acts = apply_planning_order(acts, planning_model)
+
+    acts = acts.drop(columns=['_copula_order_u'], errors='ignore')
     acts['predicted_duration_hrs'] = acts['predicted_duration_min'] / 60
 
     # ── debug: show variation achieved ───────────────────────────────────────
@@ -1163,15 +1730,26 @@ def save_models(models: dict, path: str = 'saved_data/stage3_models.pkl'):
         html_path = path.replace('.pkl', '_report.html')
         flat = {}
         for purpose, entry in models.items():
-            flat[purpose] = {
-                'model': entry.get('model'),
-                'n_obs': entry.get('n_obs', '?'),
-                'features': entry.get('features', []),
-                'converged': getattr(entry.get('model'), 'converged_', True),
-                'll': entry.get('ll'),
-                'rmse': entry.get('rmse'),
-                'stat': f"sigma={entry.get('sigma','?')}"
-            }
+            if isinstance(entry, dict):
+                flat[purpose] = {
+                    'model': entry.get('model'),
+                    'n_obs': entry.get('n_obs', '?'),
+                    'features': entry.get('features', []),
+                    'converged': getattr(entry.get('model'), 'converged_', True),
+                    'll': entry.get('ll'),
+                    'rmse': entry.get('rmse'),
+                    'stat': f"sigma={entry.get('sigma','?')}"
+                }
+            else:
+                flat[purpose] = {
+                    'model': entry,
+                    'n_obs': getattr(entry, 'n_obs', '?'),
+                    'features': getattr(entry, 'feature_names', []),
+                    'converged': getattr(entry, 'estimator', None) == 'searchlibrium_rrm',
+                    'll': getattr(entry, 'll_', None),
+                    'rmse': None,
+                    'stat': getattr(entry, 'estimator', '')
+                }
         _write_model_html({'lognormal': flat}, html_path,
                           'Stage 3 — Activity Duration',
                           notes=f'Lognormal duration models. Saved: {path}')
@@ -1205,6 +1783,7 @@ def run_stage3(
     save_path: str = 'saved_data/stage3_models.pkl',
     use_mdcev: bool = False,
     feature_override: list = None,
+    duration_model: str = None,
 ) -> tuple:
     """Estimate duration models on HHTS, predict for Stage 2 output."""
     logging.basicConfig(level=logging.INFO, format='%(levelname)s  %(message)s')
@@ -1214,11 +1793,14 @@ def run_stage3(
     print("=" * 55)
     if feature_override:
         print(f"  Feature override: {feature_override}")
+    if duration_model:
+        print(f"  Duration model: {duration_model}")
 
     print("\n[1/2] Estimating duration models from HHTS...")
     models = estimate_duration_models(tours, persons, trips=trips,
                                       use_mdcev=use_mdcev,
-                                      feature_override=feature_override)
+                                      feature_override=feature_override,
+                                      duration_model=duration_model)
 
     if save_path:
         save_models(models, save_path)

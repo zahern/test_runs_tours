@@ -250,26 +250,32 @@ DEFAULT_FEATURES_BY_PURPOSE = {
     'nonmand': ['incp', 'vehrd', 'nprd', 'walk_acc', 'transit_acc', 'is_female',
                 'has_vehicle', 'auto_nonmand_acc', 'auto_shop_acc', 'age_older',
                 'mandatory_role', 'hh_child', 'ptype_Retired', 'age_senior',
-                'age_working', 'age_working'],
+                'age_working', 'age_working', 'logsum_nonmand_acc'],
     'work': ['incp', 'vehrd', 'CARLICENCE', 'mandatory_role',
              'ptype_FullTimeWorker', 'ptype_PartTimeWorker', 'ptype_WorkingStudent',
              'workstat_unemployed', 'workstat_carer', 'workstat_illness',
              'workstat_volunteer', 'workstat_other_reason',
-             'auto_work_acc', 'n_workers_hh', 'wfh'],
+             'auto_work_acc', 'n_workers_hh', 'wfh', 'logsum_work_acc'],
     'edu': ['studying_primary', 'studying_secondary', 'studying_tertiary_pt', 'studying_tertiary_ft',
             'ptype_SchoolChild', 'ptype_UniversityStudent',
             'ptype_WorkingStudent', 'age_child', 'age_teen', 'transit_acc',
-            'walk_acc', 'vehrd'],
+            'walk_acc', 'vehrd', 'logsum_edu_acc'],
     'escort': ['hh_child', 'nprd', 'vehrd', 'has_vehicle', 'is_female',
                'workstat_unemployed', 'workstat_carer', 'workstat_illness',
-               'workstat_volunteer', 'workstat_other_reason', 'auto_nonmand_acc'],
-    'shopping': ['incp', 'vehrd', 'has_vehicle', 'auto_shop_acc', 'nprd', 'age_older'],
-    'social': ['nprd', 'is_female', 'vehrd', 'walk_acc', 'transit_acc', 'age_teen'],
+               'workstat_volunteer', 'workstat_other_reason', 'auto_nonmand_acc',
+               'logsum_nonmand_acc'],
+    'shopping': ['incp', 'vehrd', 'has_vehicle', 'auto_shop_acc', 'nprd', 'age_older',
+                 'logsum_shopping_acc'],
+    'social': ['nprd', 'is_female', 'vehrd', 'walk_acc', 'transit_acc', 'age_teen',
+               'logsum_social_acc'],
     'othmaint': ['nprd', 'vehrd', 'has_vehicle', 'auto_nonmand_acc',
                   'workstat_unemployed', 'workstat_carer', 'workstat_illness',
-                  'workstat_volunteer', 'workstat_other_reason'],
-    'othdiscr': ['incp', 'vehrd', 'auto_nonmand_acc', 'age_older', 'walk_acc'],
-    'eat': ['incp', 'nprd', 'walk_acc', 'transit_acc', 'is_female'],
+                  'workstat_volunteer', 'workstat_other_reason',
+                  'logsum_nonmand_acc'],
+    'othdiscr': ['incp', 'vehrd', 'auto_nonmand_acc', 'age_older', 'walk_acc',
+                 'logsum_othdiscr_acc'],
+    'eat': ['incp', 'nprd', 'walk_acc', 'transit_acc', 'is_female',
+            'logsum_nonmand_acc'],
 }
 
 
@@ -715,6 +721,216 @@ class OrderedLogit:
         return out
 
 
+class ZeroInflatedOrderProbit:
+    """
+    Zero-inflated ordered probit (ZIOP) for activity-frequency counts.
+
+    Many persons make ZERO activities of a given purpose, and the remaining
+    non-zero counts follow an ordered response.  A standard ordered probit (or
+    logit) treats the zeros as just another ordered category and can under- or
+    over-weight them.  The zero-inflated specification splits the zero mass
+    into two sources:
+
+        P(y_i = 0)       = pi_i + (1 - pi_i) * P0(ordered probit zero)
+        P(y_i = k), k>0  =        (1 - pi_i) * Pk(ordered probit k)
+
+    where the inflation probability pi_i = Phi(gamma' z_i) is a probit on the
+    same feature vector X (the "always zero / never do this purpose" latent
+    class), and the count part is a cumulative-link ordered probit with
+    thresholds tau.
+
+    Parameters are stacked as  [beta (K), gamma (K), raw thresholds (J-1)]:
+        beta    — ordered-probit slopes on X
+        gamma   — zero-inflation probit slopes on X
+        raw tau — ordered-threshold offsets (exp-parameterised, strictly
+                  increasing via cumulative exp)
+    """
+
+    def __init__(self):
+        self.coef_        = None      # (K,) beta  (ordered-probit slopes)
+        self.infl_coef_   = None      # (K,) gamma (zero-inflation slopes)
+        self.thresholds_  = None      # (J-1,) ordered thresholds
+        self.classes_     = None      # sorted unique outcome values
+        self.feature_names_ = None
+        self.converged_   = False
+        self.std_err_     = None
+        self.t_stat_      = None
+        self.p_value_     = None
+
+    def _pack(self, beta, gamma, raw_cuts):
+        return np.concatenate([beta, gamma, raw_cuts])
+
+    def _unpack(self, params, K):
+        beta  = params[:K]
+        gamma = params[K:2 * K]
+        raw   = params[2 * K:]
+        cuts  = np.cumsum(np.concatenate([[raw[0]], np.exp(raw[1:])]))
+        return beta, gamma, cuts
+
+    def _log_likelihood(self, params, X, y, K, ridge=0.0):
+        from scipy.special import expit
+        beta, gamma, cuts = self._unpack(params, K)
+        eta   = X @ beta
+        pi    = expit(X @ gamma)            # probit inflation via logistic link
+        ll    = 0.0
+        J     = len(self.classes_)
+        # zero-inflation probit uses a logit link on the same X (standard ZIOP
+        # uses probit; logistic is numerically equivalent under re-scaling and
+        # far more stable in scipy).
+        for j, cls in enumerate(self.classes_):
+            mask = (y == cls)
+            if not mask.any():
+                continue
+            eta_j = eta[mask]
+            if j == 0:
+                p_ord = expit(cuts[0] - eta_j)
+            elif j == J - 1:
+                p_ord = 1 - expit(cuts[-1] - eta_j)
+            else:
+                p_ord = expit(cuts[j] - eta_j) - expit(cuts[j-1] - eta_j)
+            p_ord = np.clip(p_ord, 1e-12, 1.0)
+            p_infl = pi[mask]
+            if j == 0:
+                p = p_infl + (1 - p_infl) * p_ord
+            else:
+                p = (1 - p_infl) * p_ord
+            p = np.clip(p, 1e-12, 1.0)
+            ll += np.sum(np.log(p))
+
+        nll = -ll
+        if ridge:
+            nll += 0.5 * float(ridge) * (float(np.dot(beta, beta))
+                                         + float(np.dot(gamma, gamma)))
+        return nll
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        from scipy.optimize import minimize
+        self.classes_ = np.sort(np.unique(y))
+        J = len(self.classes_)
+        K = X.shape[1]
+
+        if J < 2:
+            self.coef_       = np.zeros(K)
+            self.infl_coef_  = np.zeros(K)
+            self.thresholds_ = np.array([0.0])
+            self.converged_  = False
+            return self
+
+        from scipy.special import logit as logit_fn
+        probs    = np.array([(y <= c).mean() for c in self.classes_[:-1]])
+        probs    = np.clip(probs, 0.01, 0.99)
+        init_cuts = logit_fn(probs)
+        raw_cuts = np.concatenate([[init_cuts[0]], np.log(np.diff(init_cuts) + 1e-4)])
+        init     = np.concatenate([np.zeros(K), np.zeros(K), raw_cuts])
+
+        _ridge = float(os.environ.get('GA_S1_RIDGE', '2.0'))
+        _cap   = float(os.environ.get('GA_S1_COEF_CAP', '10.0'))
+        _bounds = [(-_cap, _cap)] * (2 * K) + [(None, None)] * (len(init) - 2 * K)
+
+        res = minimize(
+            self._log_likelihood,
+            init,
+            args=(X, y, K, _ridge),
+            method='L-BFGS-B',
+            bounds=_bounds,
+            options={'maxiter': 700, 'ftol': 1e-9},
+        )
+
+        self.coef_, self.infl_coef_, self.thresholds_ = self._unpack(res.x, K)
+        self.converged_ = res.success
+        self.n_obs_ = int(len(y))
+        self.ll_    = float(-res.fun)
+        self.ll0_   = float(len(y) * np.log(1.0 / J))
+
+        # Standard errors on [beta | gamma | thresholds].
+        try:
+            hess = _numerical_hessian(
+                lambda p: self._log_likelihood(p, X, y, K, _ridge), res.x)
+            cov = np.linalg.pinv(hess)
+            params = np.concatenate([self.coef_, self.infl_coef_, self.thresholds_])
+            raw_se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+            self.std_err_ = raw_se
+            self.t_stat_ = np.divide(
+                params, self.std_err_,
+                out=np.full_like(params, np.nan, dtype=float),
+                where=self.std_err_ > 0,
+            )
+            self.p_value_ = 2.0 * norm.sf(np.abs(self.t_stat_))
+        except Exception:
+            size = 2 * K + max(J - 1, 0)
+            self.std_err_  = np.full(size, np.nan)
+            self.t_stat_   = np.full(size, np.nan)
+            self.p_value_  = np.full(size, np.nan)
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Return P(y == class_j), shape (N, J), mixing inflation + ordered."""
+        from scipy.special import expit
+        beta, gamma, cuts = self.coef_, self.infl_coef_, self.thresholds_
+        eta  = X @ beta
+        pi   = expit(X @ gamma)
+        J    = len(self.classes_)
+        probs = np.zeros((len(X), J))
+
+        for j in range(J):
+            if j == 0:
+                p_ord = expit(cuts[0] - eta)
+            elif j == J - 1:
+                p_ord = 1 - expit(cuts[-1] - eta)
+            else:
+                p_ord = expit(cuts[j] - eta) - expit(cuts[j-1] - eta)
+            p_ord = np.clip(p_ord, 0, 1)
+            if j == 0:
+                probs[:, j] = pi + (1 - pi) * p_ord
+            else:
+                probs[:, j] = (1 - pi) * p_ord
+
+        probs = np.clip(probs, 1e-12, 1.0)
+        probs = probs / probs.sum(axis=1, keepdims=True)
+        return probs
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        proba = self.predict_proba(X)
+        return self.classes_[proba.argmax(axis=1)]
+
+    def predict_sampled(self, X: np.ndarray, seed: int = None) -> np.ndarray:
+        rng   = np.random.default_rng(seed)
+        proba = self.predict_proba(X)
+        J     = len(self.classes_)
+        out   = np.array([
+            self.classes_[rng.choice(J, p=proba[i])]
+            for i in range(len(X))
+        ])
+        return out
+
+
+#: Stage-1 frequency model registry — the estimator used by
+#: estimate_frequency_models() is selected via STAGE1_FREQ_MODEL
+#: (default 'ordered_logit'; 'zero_inflated_probit' adds the excess-zero
+#: mass for never-participating persons).
+STAGE1_FREQ_MODEL = os.environ.get('STAGE1_FREQ_MODEL', 'ordered_logit').strip().lower()
+
+FREQUENCY_MODELS = {
+    'ordered_logit':        OrderedLogit,
+    'zero_inflated_probit': ZeroInflatedOrderProbit,
+    'zip_probit':           ZeroInflatedOrderProbit,
+    'ziop':                 ZeroInflatedOrderProbit,
+}
+
+
+def _make_frequency_model(model_type: str = None):
+    """Instantiate the requested Stage-1 frequency model class."""
+    mt = (model_type or STAGE1_FREQ_MODEL).strip().lower()
+    mt = mt.replace('-', '_')
+    cls = FREQUENCY_MODELS.get(mt, OrderedLogit)
+    if mt not in FREQUENCY_MODELS and mt != 'ordered_logit':
+        logger.warning(
+            f"Unknown STAGE1_FREQ_MODEL={mt!r}; using OrderedLogit "
+            f"(choose from {sorted(FREQUENCY_MODELS)})"
+        )
+    return cls()
+
+
 # ---------------------------------------------------------------------------
 # 4.  ESTIMATE MODELS
 # ---------------------------------------------------------------------------
@@ -736,9 +952,10 @@ def estimate_frequency_models(
     feature_override: list = None,
     landuse: pd.DataFrame = None,
     fit_nonmand_combined: bool = True,
+    model_type: str = None,
 ) -> dict:
     """
-    Estimate one ordered logit per (purpose, ptype) combination.
+    Estimate one frequency model per (purpose, ptype) combination.
 
     Parameters
     ----------
@@ -750,12 +967,16 @@ def estimate_frequency_models(
     landuse              : enriched landuse with *_acc columns, passed through
                            to prepare_frequency_data() for home-zone
                            accessibility features.
-    fit_nonmand_combined : if True (default), also estimate a single ordered
-                           logit for n_nonmand_out = sum(all six nonmand purposes)
+    fit_nonmand_combined : if True (default), also estimate a single frequency
+                           model for n_nonmand_out = sum(all six nonmand purposes)
                            and store Dirichlet split proportions in models['_nonmand']
                            and models['_nonmand_split'].  predict_activity_frequency()
                            uses these to replace the six individual predictions
                            with a combined-count + multinomial-split prediction.
+    model_type           : 'ordered_logit' (default) or 'zero_inflated_probit'.
+                           Overrides STAGE1_FREQ_MODEL env var.  The
+                           zero-inflated ordered probit adds an excess-zero
+                           probit stage on top of the ordered count link.
     """
     data = prepare_frequency_data(tours, persons, landuse=landuse)
     models = {}
@@ -817,7 +1038,7 @@ def estimate_frequency_models(
             sd[sd == 0] = 1.0
             X = (X_raw - mu) / sd
 
-            model = OrderedLogit()
+            model = _make_frequency_model(model_type)
             model.fit(X, y)
             # ── Prune insignificant parameters (magnitude AND p-value) ────────
             # Drop features that are near-zero OR statistically insignificant,
@@ -846,7 +1067,7 @@ def estimate_frequency_models(
                 pruned_cols = [feature_cols[_i] for _i in keep_idx]
                 Xp = X[:, keep_idx]
                 try:
-                    mp = OrderedLogit()
+                    mp = _make_frequency_model(model_type)
                     mp.fit(Xp, y)
                     if hasattr(mp, 'thresholds_') and len(mp.thresholds_) >= 2:
                         gaps = np.diff(np.sort(mp.thresholds_))
@@ -876,7 +1097,8 @@ def estimate_frequency_models(
             )
 
     n_fitted = sum(len(v) for v in models.values())
-    print(f"Stage 1: fitted {n_fitted} ordered logit models "
+    _freq_model_name = _make_frequency_model(model_type).__class__.__name__
+    print(f"Stage 1: fitted {n_fitted} {_freq_model_name} models "
           f"({len(PURPOSES)} purposes × ptypes)")
 
     # ── Combined non-mandatory count model (work/edu/nonmand GA segment) ────────
@@ -905,7 +1127,7 @@ def estimate_frequency_models(
             X_raw = subset[feature_cols].fillna(0).values.astype(float)
             mu = X_raw.mean(axis=0); sd = X_raw.std(axis=0); sd[sd == 0] = 1.0
             X = (X_raw - mu) / sd
-            m = OrderedLogit()
+            m = _make_frequency_model(model_type)
             m.fit(X, y)
             # p-value + magnitude pruning (same as per-purpose loop above)
             _zthresh = float(os.environ.get('GA_SIG_COEF_ZERO',  '0.01'))
@@ -926,7 +1148,7 @@ def estimate_frequency_models(
                 if len(_ki) in (0, len(feature_cols)):
                     break
                 try:
-                    _mp = OrderedLogit()
+                    _mp = _make_frequency_model(model_type)
                     _mp.fit(X[:, _ki], y)
                     m = _mp; feature_cols = [feature_cols[i] for i in _ki]
                     X = X[:, _ki]; mu = mu[_ki]; sd = sd[_ki]
@@ -1592,6 +1814,7 @@ def run_stage1(
     save_path: str = 'saved_data/stage1_models.pkl',
     feature_override: list = None,
     landuse: pd.DataFrame = None,
+    model_type: str = None,
 ) -> tuple:
     """
     Estimate on HHTS, predict on synthetic population.
@@ -1608,6 +1831,8 @@ def run_stage1(
     landuse           : enriched landuse with *_acc columns — passed through to
                         estimation and prediction so home-zone accessibility is
                         used as a feature.
+    model_type        : 'ordered_logit' (default) or 'zero_inflated_probit'.
+                        Overrides STAGE1_FREQ_MODEL env var.
     """
     logging.basicConfig(level=logging.INFO, format='%(levelname)s  %(message)s')
     print("=" * 55)
@@ -1615,11 +1840,14 @@ def run_stage1(
     print("=" * 55)
     if feature_override:
         print(f"  Feature override: {feature_override}")
+    _freq_model_name = _make_frequency_model(model_type).__class__.__name__
+    print(f"  Frequency model: {_freq_model_name}")
 
     print("\n[1/2] Estimating models from HHTS...")
     models = estimate_frequency_models(tours, persons,
                                        feature_override=feature_override,
-                                       landuse=landuse)
+                                       landuse=landuse,
+                                       model_type=model_type)
 
     if save_path:
         save_models(models, save_path)

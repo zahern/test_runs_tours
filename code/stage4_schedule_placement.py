@@ -58,22 +58,32 @@ import pandas as pd
 import logging
 import os
 import pickle
+import sys
 from typing import Optional
 from scipy.stats import norm as _norm
 
 logger = logging.getLogger(__name__)
 
+_SEARCHLIBRIUM_SRC = os.environ.get(
+    'SEARCHLIBRIUM_SOURCE', r'C:\Users\ahernz\source\SearchLibrium\src'
+)
+if os.path.isdir(_SEARCHLIBRIUM_SRC) and _SEARCHLIBRIUM_SRC not in sys.path:
+    sys.path.insert(0, _SEARCHLIBRIUM_SRC)
+
 _SEARCHLIB_OK = False
+_RRM_OK = False
 try:
     import io as _io, sys as _sys
     _sl_old = _sys.stdout; _sys.stdout = _io.StringIO()
     try:
         from SearchLibrium import MultinomialLogit as _SLMNL
+        from SearchLibrium import RandomRegret as _SLRRM
     finally:
         _sys.stdout = _sl_old
     _SEARCHLIB_OK = True
+    _RRM_OK = True
 except Exception:
-    pass
+    _SLRRM = None
 
 STAGE4_ESTIMATOR = os.environ.get('STAGE4_ESTIMATOR', 'scipy').strip().lower()
 if STAGE4_ESTIMATOR == 'searchlibrium' and not _SEARCHLIB_OK:
@@ -808,6 +818,137 @@ def _sample_within_period_fraction(model: Optional[MNLTimingModel],
     return float(rng.triangular(0.05, 0.5, 0.95))
 
 
+class RRMTimeModel:
+    """SearchLibrium Random Regret model for start-period choice."""
+
+    FEATURE_NAMES = [
+        'period_center_hr', 'period_center_sq', 'period_peak',
+        'period_start_rel', 'fit_slack_rel', 'duration_pressure',
+    ]
+
+    def __init__(self, purpose: str):
+        self.purpose_ = purpose
+        self.n_periods_ = len(TIME_PERIODS)
+        self.feature_names_ = list(self.FEATURE_NAMES)
+        self.rrm_ = None
+        self.within_period_draws_ = {}
+        self.observed_period_shares_ = None
+        self.period_blend_alpha_ = 0.0
+        self.fit_status_ = 'not_fit'
+        self.converged_ = False
+        self.n_obs_ = 0
+        self.ll_ = float('nan')
+        self.rho2_ = float('nan')
+
+    def _build_X(self, df: pd.DataFrame) -> np.ndarray:
+        duration = pd.to_numeric(
+            df.get('duration_min', pd.Series(30.0, index=df.index)), errors='coerce'
+        ).fillna(30.0).to_numpy(dtype=float)
+        day_start = pd.to_numeric(
+            df.get('day_start', df.get('start_of_day', pd.Series(420.0, index=df.index))),
+            errors='coerce'
+        ).fillna(420.0).to_numpy(dtype=float)
+        day_end = pd.to_numeric(
+            df.get('day_end', df.get('end_of_day', pd.Series(1200.0, index=df.index))),
+            errors='coerce'
+        ).fillna(1200.0).to_numpy(dtype=float)
+        day_span = np.maximum(day_end - day_start, 60.0)
+
+        X = np.zeros((len(df), self.n_periods_, len(self.FEATURE_NAMES)), dtype=float)
+        for pidx, (_, p_start, p_end) in enumerate(TIME_PERIODS):
+            center_hr = (p_start + p_end) / 120.0
+            width = max(float(p_end - p_start), 1.0)
+            X[:, pidx, :] = np.column_stack([
+                np.full(len(df), center_hr),
+                np.full(len(df), center_hr ** 2),
+                np.full(len(df), float(pidx in (1, 3))),
+                (p_start - day_start) / day_span,
+                (p_end - duration - day_start) / day_span,
+                duration / width,
+            ])
+        return X
+
+    def fit(self, df: pd.DataFrame) -> None:
+        if _SLRRM is None or len(df) < 30:
+            return
+        y = pd.to_numeric(df['period'], errors='coerce').dropna().astype(int).to_numpy()
+        if len(np.unique(y)) < 2:
+            return
+        fit_df = df.loc[df['period'].notna()].copy()
+        X = self._build_X(fit_df)
+        if len(X) > 20000:
+            keep = np.linspace(0, len(X) - 1, 20000).astype(int)
+            X = X[keep]
+            y = y[keep]
+
+        rrm = _SLRRM()
+        rrm.X = X
+        rrm.y = y
+        rrm.nb_samples = len(X)
+        rrm.nb_alt = self.n_periods_
+        rrm.nb_attr = X.shape[2]
+        rrm.attrs = list(self.FEATURE_NAMES)
+        rrm.avail = np.ones((len(X), self.n_periods_), dtype=float)
+        rrm.initialise()
+        rrm.normalize = False
+        rrm.fit(compute_inference=False)
+
+        if not np.isfinite(getattr(rrm, 'loglik', np.nan)):
+            return
+        self.rrm_ = rrm
+        self.n_obs_ = len(X)
+        self.ll_ = float(rrm.loglik)
+        counts = np.bincount(y, minlength=self.n_periods_).astype(float)
+        self.observed_period_shares_ = counts / max(float(counts.sum()), 1.0)
+        self.converged_ = bool(getattr(rrm, 'converged', True))
+        self.fit_status_ = 'ok' if self.converged_ else 'optimizer_stopped'
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if self.rrm_ is None:
+            return np.full((len(X), self.n_periods_), 1.0 / self.n_periods_)
+        probs = np.asarray(self.rrm_.predict_proba(X), dtype=float)
+        probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        row_sums = probs.sum(axis=1, keepdims=True)
+        return np.divide(
+            probs,
+            row_sums,
+            out=np.full_like(probs, 1.0 / self.n_periods_),
+            where=row_sums > 0,
+        )
+
+    def predict_sampled(self, X: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        proba = self.predict_proba(X)
+        return np.array([rng.choice(self.n_periods_, p=p / p.sum()) for p in proba])
+
+    def fit_within_period_offsets(self, df: pd.DataFrame) -> None:
+        draws = {}
+        if 'STARTIME' not in df.columns or 'period' not in df.columns:
+            self.within_period_draws_ = draws
+            return
+        for pidx, (_, p_start, p_end) in enumerate(TIME_PERIODS):
+            sub = df[df['period'] == pidx]
+            if sub.empty:
+                continue
+            frac = ((pd.to_numeric(sub['STARTIME'], errors='coerce') - p_start)
+                    / max(float(p_end - p_start), 1.0))
+            frac = frac.replace([np.inf, -np.inf], np.nan).dropna().clip(0.0, 0.999)
+            if len(frac) >= 5:
+                draws[pidx] = frac.to_numpy(dtype=float)
+        self.within_period_draws_ = draws
+
+
+def _fit_rrm_timing_model(subset: pd.DataFrame, purpose: str):
+    if not _RRM_OK:
+        return None
+    model = RRMTimeModel(purpose)
+    try:
+        model.fit(subset)
+    except Exception as exc:
+        logger.warning(f'  timing/{purpose}: SearchLibrium RRM failed: {exc}')
+        return None
+    return model if model.rrm_ is not None else None
+
+
 # ---------------------------------------------------------------------------
 # 3.  ESTIMATE — ONE MODEL PER PURPOSE
 # ---------------------------------------------------------------------------
@@ -826,6 +967,7 @@ def estimate_timing_models(
     models = {}
     _alpha_scale = float(os.environ.get('STAGE4_PERIOD_BLEND', '1.0') or 1.0)
     _alpha_scale = float(np.clip(_alpha_scale, 0.0, 2.0))
+    _timing_estimator = os.environ.get('STAGE4_TIMING_MODEL', 'rrm').strip().lower()
     _purpose_alpha = {
         'work': 0.08,
         'edu': 0.08,
@@ -851,6 +993,21 @@ def estimate_timing_models(
         if len(present_periods) < 2:
             logger.warning(f"  timing/{purpose}: only 1 period observed — skipping")
             continue
+
+        if _timing_estimator in ('rrm', 'searchlibrium'):
+            rrm_model = _fit_rrm_timing_model(subset, purpose)
+            if rrm_model is not None:
+                rrm_model.fit_within_period_offsets(subset)
+                rrm_model.period_blend_alpha_ = float(
+                    np.clip(_purpose_alpha.get(purpose, 0.20) * _alpha_scale, 0.0, 0.60)
+                )
+                models[purpose] = rrm_model
+                logger.info(
+                    f"  timing/{purpose}: SearchLibrium RRM, n={rrm_model.n_obs_}, "
+                    f"status={rrm_model.fit_status_}, "
+                    f"blend_alpha={rrm_model.period_blend_alpha_:.2f}"
+                )
+                continue
 
         m = MNLTimingModel()
         m.purpose_ = purpose
@@ -1158,9 +1315,15 @@ def predict_schedule(
     if 'end_of_day' not in df.columns:
         df['end_of_day']   = 1200   # default 20:00
 
-    # sort each person's activities by purpose priority
+    # Prefer the Stage 3 learned planning order; retain the priority fallback
+    # for older Stage 3 files that do not carry planning_order.
     df['_priority'] = df['purpose'].map(PURPOSE_PRIORITY).fillna(9)
-    df = df.sort_values(['person_id', '_priority']).reset_index(drop=True)
+    if 'planning_order' in df.columns:
+        df = df.sort_values(['person_id', 'planning_order', '_priority']).reset_index(drop=True)
+    elif 'activity_seq' in df.columns:
+        df = df.sort_values(['person_id', 'activity_seq', '_priority']).reset_index(drop=True)
+    else:
+        df = df.sort_values(['person_id', '_priority']).reset_index(drop=True)
 
     # ── Vectorised scheduling ─────────────────────────────────────────────
     # PHASE A — Predict time_period for ALL activities in one batch per purpose.
@@ -1229,8 +1392,14 @@ def predict_schedule(
     logger.info(f"  Phase A complete: periods assigned for {n_acts:,} activities")
 
     # ── Phase B: time arithmetic per person ──────────────────────────────
-    # Sort by person then priority (already sorted but ensure it)
-    df = df.sort_values([pid_col, '_priority']).reset_index(drop=True)
+    # Sort by person and the planning sequence already chosen above.
+    _order_cols = [pid_col]
+    if 'planning_order' in df.columns:
+        _order_cols.append('planning_order')
+    elif 'activity_seq' in df.columns:
+        _order_cols.append('activity_seq')
+    _order_cols.append('_priority')
+    df = df.sort_values(_order_cols).reset_index(drop=True)
 
     # Extract numpy arrays for arithmetic — avoids any DataFrame overhead
     pids_arr    = df[pid_col].to_numpy()

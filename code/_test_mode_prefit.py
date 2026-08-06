@@ -149,7 +149,7 @@ def _run_prefit_for_segment(segment, tours, persons, landuse, skims):
 
     # Show parameter changes
     key_params = ['ASC_SR', 'ASC_Walk', 'ASC_Bike', 'ASC_Transit',
-                  'Mu_Car', 'Mu_Motor', 'Mu_NonMotor']
+                  'Mu_Motor', 'Mu_NonMotor']
     print(f"\n  {'Parameter':<20} {'Before':>8} {'After':>8} {'Delta':>8}")
     print(f"  {'-'*20} {'-'*8} {'-'*8} {'-'*8}")
     changed = {}
@@ -165,7 +165,7 @@ def _run_prefit_for_segment(segment, tours, persons, landuse, skims):
     print(f"{'─'*60}")
 
     # Check for Mu at boundary (warning)
-    for mu_p in ('Mu_Car', 'Mu_Motor', 'Mu_NonMotor'):
+    for mu_p in ('Mu_Motor', 'Mu_NonMotor'):
         if mu_p not in mode_mdl.pf.index:
             continue
         v = float(mode_mdl.pf.loc[mu_p, 'value'])

@@ -18,6 +18,18 @@ Three models
 2. Joint-tour frequency : n_joint_tours per household ~ hh features → Poisson.
 3. Joint participation  : member joins a joint tour (0/1) ~ role + tour features
                           → binary logit (→ per-role join probabilities).
+4. Joint-tour purpose   : joint tour purpose ~ composition (adults/children/mixed)
+                          → categorical (→ composition-conditional purpose utilities
+                          folded into HouseholdCdapConfig.joint_purpose_utility).
+                          This is the structural link between the household CDAP
+                          and the Stage-1 activity-purpose dimension.
+
+All logit choices (1 and 3) are fitted with **SearchLibrium** (github.com/zahern/
+HypothesisX) discrete-choice MLE (MultinomialLogit; JAX/scipy) — ptype and
+household-composition utilities are estimated as a proper alternative-specific
+choice model rather than a generic ML classifier. If the package is unavailable
+the estimators fall back to a plain sklearn multinomial/binary logit with a
+warning.
 
 Run (on real HHTS):  python cdap_households_estimation.py
 """
@@ -28,7 +40,61 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from cdap_households import HouseholdCdapConfig, DAP_CLASSES
+from cdap_households import HouseholdCdapConfig
+
+
+_SEARCHLIBRIUM_AVAILABLE = None   # lazily resolved; True/False
+
+
+def _searchlibrium_mnl():
+    """
+    Lazily import SearchLibrium's MultinomialLogit.
+
+    SearchLibrium (github.com/zahern/HypothesisX) is the discrete-choice
+    estimation framework used for all logit models in this file.  Returns the
+    class, or None if the package is not installed (caller then falls back to
+    a plain sklearn MNL so the pipeline still runs, but logs the shortfall).
+    """
+    global _SEARCHLIBRIUM_AVAILABLE
+    if _SEARCHLIBRIUM_AVAILABLE is not None:
+        return _SEARCHLIBRIUM_AVAILABLE or None
+    try:
+        from SearchLibrium.multinomial_logit import MultinomialLogit
+        _SEARCHLIBRIUM_AVAILABLE = MultinomialLogit
+    except Exception as exc:                       # noqa: BLE001
+        _SEARCHLIBRIUM_AVAILABLE = False
+        print(f"[cdap-hh estimate] SearchLibrium unavailable ({exc}); "
+              f"falling back to sklearn MNL")
+    return _SEARCHLIBRIUM_AVAILABLE or None
+
+
+def _searchlibrium_logistic():
+    """
+    Lazily import SearchLibrium's JAX-based LogisticRegression class.
+
+    Returns the class, or None if the package is not installed (caller then
+    falls back to a plain sklearn binary logit so the pipeline still runs).
+    """
+    global _SEARCHLIBRIUM_AVAILABLE
+    if _SEARCHLIBRIUM_AVAILABLE is not None:
+        cls = _SEARCHLIBRIUM_AVAILABLE
+    else:
+        try:
+            from SearchLibrium.multinomial_logit import MultinomialLogit
+            _SEARCHLIBRIUM_AVAILABLE = MultinomialLogit
+            cls = MultinomialLogit
+        except Exception as exc:                   # noqa: BLE001
+            _SEARCHLIBRIUM_AVAILABLE = False
+            print(f"[cdap-hh estimate] SearchLibrium unavailable ({exc}); "
+                  f"falling back to sklearn MNL")
+            return None
+    try:
+        from SearchLibrium.logistic_regression import LogisticRegression
+        return LogisticRegression
+    except Exception as exc:                       # noqa: BLE001
+        print(f"[cdap-hh estimate] SearchLibrium LogisticRegression "
+              f"unavailable ({exc}); using MultinomialLogit binary path")
+        return cls
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +126,19 @@ def derive_observed_dap(persons: pd.DataFrame, tours: pd.DataFrame,
     return dap
 
 
+def _tour_purpose(sub: pd.DataFrame) -> str:
+    """Modal activity purpose for a group of trips/tours ('' if unknown)."""
+    purp = next((c for c in ('main_purpose', 'primary_purpose', 'purpose', 'PURPOSE',
+                             'DESTPURP')
+                 if c in sub.columns), None)
+    if purp is None:
+        return ''
+    s = sub[purp].dropna()
+    if not len(s):
+        return ''
+    return str(s.value_counts().index[0])
+
+
 def derive_observed_joint_tours(tours: pd.DataFrame,
                                 cfg: Optional[HouseholdCdapConfig] = None) -> pd.DataFrame:
     """
@@ -67,7 +146,8 @@ def derive_observed_joint_tours(tours: pd.DataFrame,
     shared/joint travel (TODO(hhts): confirm the flag column — commonly
     'joint_travel' / 'JOINT' / a shared tour_id across members).
 
-    Returns one row per (HHID, joint tour) with the participant person_ids.
+    Returns one row per (HHID, joint tour) with the participant person_ids
+    and the tour's modal 'purpose' ('' when no purpose column is present).
     """
     cfg = cfg or HouseholdCdapConfig()
     flag = next((c for c in ('joint_travel', 'JOINT', 'is_joint', 'joint')
@@ -87,14 +167,28 @@ def derive_observed_joint_tours(tours: pd.DataFrame,
             for k, val in zip(keys, key if isinstance(key, tuple) else (key,)):
                 sub = sub[sub[k] == val]
             rows.append({cfg.hh_id_col: sub[cfg.hh_id_col].iloc[0],
-                         'participants': sub[cfg.person_id_col].unique().tolist()})
+                         'participants': sub[cfg.person_id_col].unique().tolist(),
+                         'purpose': _tour_purpose(sub)})
         return pd.DataFrame(rows)
     jt = tours[tours[flag].astype(bool)]
-    return (jt.groupby([cfg.hh_id_col, 'tour_id'])[cfg.person_id_col]
+    out = (jt.groupby([cfg.hh_id_col, 'tour_id'])[cfg.person_id_col]
               .apply(list).reset_index(name='participants')
             if 'tour_id' in jt.columns else
             jt.groupby(cfg.hh_id_col)[cfg.person_id_col].apply(list)
               .reset_index(name='participants'))
+    # modal purpose per joint tour group
+    purp = next((c for c in ('main_purpose', 'primary_purpose', 'purpose', 'PURPOSE',
+                             'DESTPURP')
+                 if c in jt.columns), None)
+    if purp is not None:
+        gkeys = ['tour_id'] if 'tour_id' in jt.columns else [cfg.hh_id_col]
+        modals = jt.groupby(gkeys)[purp].apply(
+            lambda s: str(s.dropna().value_counts().index[0])
+            if len(s.dropna()) else '')
+        out['purpose'] = out[gkeys[0]].map(modals)
+    else:
+        out['purpose'] = ''
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -116,36 +210,107 @@ def _hh_composition_features(persons: pd.DataFrame, cfg: HouseholdCdapConfig) ->
     return hh
 
 
+def _cdap_model_matrix(persons: pd.DataFrame, cfg: HouseholdCdapConfig):
+    """Build the wide CDAP choice matrix: ptype dummies + hh-composition features."""
+    comp = _hh_composition_features(persons, cfg)
+    pt_dummies = pd.get_dummies(persons[cfg.ptype_col], prefix='pt')
+    X_wide = pd.concat([pt_dummies, comp[['hh_n_workers', 'child_x_home_adult']]],
+                       axis=1).fillna(0.0)
+    return X_wide, list(X_wide.columns)
+
+
 def estimate_cdap_coefficients(persons: pd.DataFrame, tours: pd.DataFrame,
                                cfg: Optional[HouseholdCdapConfig] = None) -> dict:
     """
-    Fit person DAP (M/N/H) ~ ptype dummies + household-composition features via a
-    multinomial logit. Returns {'dap_utility': {...}, 'interaction': {...}}
-    reshaped into the HouseholdCdapConfig layout (H is the reference class).
+    Fit person DAP (M/N/H) as a *multinomial logit choice model* using
+    SearchLibrium: each person chooses one of {H, M, N}; the choice-set covers
+    a home-only pattern (H, the reference alternative) plus two non-mandatory
+    variants, committee style.  Alternative-specific ptype and household-
+    composition utilities are estimated by maximum likelihood (JAX/scipy).
+
+    Returns {'dap_utility': {...}, 'interaction': {...}} shaped for
+    HouseholdCdapConfig (H is the reference class ⇒ utility 0).
     """
-    from sklearn.linear_model import LogisticRegression
     cfg = cfg or HouseholdCdapConfig()
-    y = derive_observed_dap(persons, tours, cfg)
-    comp = _hh_composition_features(persons, cfg)
-    pt_dummies = pd.get_dummies(persons[cfg.ptype_col], prefix='pt')
-    X = pd.concat([pt_dummies, comp[['hh_n_workers', 'child_x_home_adult']]], axis=1).fillna(0.0)
+    y = derive_observed_dap(persons, tours, cfg)          # per-person 'H'/'M'/'N'
+    alt_of = {'H': 0, 'M': 1, 'N': 2}                     # H is the base alternative
+    y_chosen = y.map(alt_of).fillna(0).astype(int).to_numpy()
+    X_wide, varnames = _cdap_model_matrix(persons, cfg)
 
-    clf = LogisticRegression(multi_class='multinomial', max_iter=500, C=5.0)
-    clf.fit(X.values, y.values)
-    classes = list(clf.classes_)                     # e.g. ['H','M','N']
-    coef = {c: dict(zip(X.columns, row)) for c, row in zip(classes, clf.coef_)}
-
-    # reshape to per-ptype DAP utility (M/N/H), H as reference (utility 0)
+    mnl_cls = _searchlibrium_mnl()
+    if mnl_cls is not None:
+        mnl = mnl_cls(_jax=True)
+        mnl.wide_setup(X_wide=X_wide.to_numpy(), y_chosen=y_chosen,
+                       varnames=varnames, n_alts=3, ids=None,
+                       empirical_init=True, base_alt=0,
+                       maxiter=2000, method="slsqp")
+        mnl.fit()
+        coeff_names = list(getattr(mnl, 'coeff_names', []))
+        coeff_est = np.asarray(getattr(mnl, 'coeff_est', []), dtype=float)
+        fitted_loglik = float(getattr(mnl, 'loglik', float('nan')))
+        conjugated = bool(getattr(mnl, 'converged', False))
+        beta = dict(zip(coeff_names, coeff_est)) if len(coeff_names) else {}
+        # 'pt.{alt}' and '<feature>.{alt}' per non-base alternative 1=M, 2=N
+        def _b(name, alt):
+            return float(beta.get(f"{name}.{alt}", 0.0))
+        dap_utility = {
+            pt: {'M': _b(f"pt_{pt}", 1), 'N': _b(f"pt_{pt}", 2), 'H': 0.0}
+            for pt in pt_from_columns(varnames)
+        }
+        interaction = {
+            'more_workers_boost_M': _b('hh_n_workers', 1),
+            'adult_home_boosts_child_N': _b('child_x_home_adult', 2),
+        }
+        accuracy = _mnl_accuracy(X_wide, varnames, dap_utility, y_chosen)
+        print(f"[cdap-hh estimate] SearchLibrium MNL: loglik={fitted_loglik:.2f} "
+              f"converged={conjugated} acc={accuracy:.3f} "
+              f"({len(coeff_names)} params)")
+        return {'dap_utility': dap_utility, 'interaction': interaction,
+                'accuracy': accuracy, 'framework': 'SearchLibrium',
+                'loglik': fitted_loglik, 'coeff_names': coeff_names}
+    # ── Fallback: sklearn multinomial MNL (SearchLibrium not installed) ─────
+    from sklearn.linear_model import LogisticRegression
+    clf = LogisticRegression(max_iter=500, C=5.0)   # lbfgs ⇒ multinomial by default
+    clf.fit(X_wide.to_numpy(), y_chosen)
+    classes = list(map(int, clf.classes_))
+    # sklearn gives per-class coefficients vs. its OWN reference class (the last
+    # class, not necessarily H).  MNL utilities are only identified up to an
+    # additive constant per alternative, so recentre on H:  U_X = raw_X - raw_H.
+    coef = {c: dict(zip(varnames, row)) for c, row in zip(classes, clf.coef_)}
     dap_utility = {}
-    for pt_col in pt_dummies.columns:
-        pt = pt_col[3:]
-        dap_utility[pt] = {k: float(coef.get(k, {}).get(pt_col, 0.0)) for k in DAP_CLASSES}
+    for pt in pt_from_columns(varnames):
+        cm = coef.get(1, {}).get(f"pt_{pt}", 0.0)   # raw M coefficient
+        cn = coef.get(2, {}).get(f"pt_{pt}", 0.0)   # raw N coefficient
+        ch = coef.get(0, {}).get(f"pt_{pt}", 0.0)   # raw H coefficient
+        dap_utility[pt] = {'M': float(cm - ch), 'N': float(cn - ch), 'H': 0.0}
     interaction = {
-        'more_workers_boost_M': float(coef.get('M', {}).get('hh_n_workers', 0.0)),
-        'adult_home_boosts_child_N': float(coef.get('N', {}).get('child_x_home_adult', 0.0)),
+        'more_workers_boost_M': float(coef.get(1, {}).get('hh_n_workers', 0.0)
+                                      - coef.get(0, {}).get('hh_n_workers', 0.0)),
+        'adult_home_boosts_child_N': float(coef.get(2, {}).get('child_x_home_adult', 0.0)
+                                           - coef.get(0, {}).get('child_x_home_adult', 0.0)),
     }
+    accuracy = _mnl_accuracy(X_wide, varnames, dap_utility, y_chosen)
     return {'dap_utility': dap_utility, 'interaction': interaction,
-            'accuracy': float((clf.predict(X.values) == y.values).mean())}
+            'accuracy': accuracy, 'framework': 'sklearn'}
+
+
+def pt_from_columns(varnames):
+    """Recover ptype labels from the 'pt_<ptype>' design columns."""
+    return [c[3:] for c in varnames if c.startswith('pt_')]
+
+
+def _mnl_accuracy(X_wide, varnames, dap_utility, y_chosen):
+    """Argmax class from the fitted utilities vs. the observed choices."""
+    pt_cols = {i: v[3:] for i, v in enumerate(varnames) if v.startswith('pt_')}
+    B = np.zeros((len(varnames), 2))                    # columns: M, N
+    for i, v in enumerate(varnames):
+        key = pt_cols.get(i, v)
+        B[i, 0] = dap_utility.get(key, {}).get('M', 0.0)
+        B[i, 1] = dap_utility.get(key, {}).get('N', 0.0)
+    U = X_wide.to_numpy() @ B                            # (N, 2): [U_M, U_N]
+    UH = np.zeros((U.shape[0], 1))                       # H reference ⇒ 0
+    pred = np.argmax(np.concatenate([UH, U], axis=1), axis=1)
+    return float((pred == y_chosen).mean())
 
 
 # ---------------------------------------------------------------------------
@@ -192,10 +357,11 @@ def estimate_joint_participation(persons: pd.DataFrame, tours: pd.DataFrame,
                                  cfg: Optional[HouseholdCdapConfig] = None) -> dict:
     """
     For households with an observed joint tour, model whether each member
-    participated (1/0) ~ is_child. Returns {'p_join_adult','p_join_child'} used
-    by joint_tour_participation. (Extend X with tour purpose/age when available.)
+    participated (1/0) as a binary logit choice (SearchLibrium MNL, J=2, base
+    alternative = not joining).  Features: const (ASC) + is_child.
+    Returns {'p_join_adult','p_join_child'} used by joint_tour_participation.
+    (Extend X with tour purpose/age when available.)
     """
-    from sklearn.linear_model import LogisticRegression
     cfg = cfg or HouseholdCdapConfig()
     jt = derive_observed_joint_tours(tours, cfg)
     if not len(jt):
@@ -208,11 +374,98 @@ def estimate_joint_participation(persons: pd.DataFrame, tours: pd.DataFrame,
     cand = persons[persons[cfg.hh_id_col].isin(hh_with_jt)].copy()
     cand['joined'] = cand[cfg.person_id_col].isin(part_ids).astype(int)
     cand['is_child'] = cand[cfg.ptype_col].isin(['SchoolChild', 'Preschool']).astype(int)
+    y_chosen = cand['joined'].to_numpy()
+    X_wide = np.column_stack([np.ones(len(cand)), cand['is_child'].to_numpy()])
+    varnames = ['const', 'is_child']
+
+    lg_cls = _searchlibrium_logistic()
+    if lg_cls is not None:
+        lg = lg_cls(_jax=True)
+        lg.fit(X_wide, y_chosen, varnames=varnames,
+               empirical_init=False, maxiter=1000, method="slsqp")
+        coef = np.asarray(getattr(lg, 'coef_', []) or []).ravel()
+        if len(coef) >= 2:
+            b_const, b_child = float(coef[0]), float(coef[1])
+        else:
+            b_const = getattr(lg, 'intercept_', 0.0) or 0.0
+            b_child = float(coef[-1]) if len(coef) else 0.0
+        p_adult = 1.0 / (1.0 + np.exp(-b_const))
+        p_child = 1.0 / (1.0 + np.exp(-(b_const + b_child)))
+        print(f"[cdap-hh estimate] participation logit: b_const={b_const:.3f} "
+              f"b_is_child={b_child:.3f}")
+        return {'p_join_adult': float(p_adult), 'p_join_child': float(p_child),
+                'framework': 'SearchLibrium'}
+    # ── Fallback: sklearn binary logistic regression ────────────────────────
+    from sklearn.linear_model import LogisticRegression
     clf = LogisticRegression(max_iter=300)
-    clf.fit(cand[['is_child']].values, cand['joined'].values)
+    clf.fit(X_wide[:, 1:], y_chosen)                 # drop const; sklearn adds its own
     p_adult = float(clf.predict_proba([[0]])[0, 1])
     p_child = float(clf.predict_proba([[1]])[0, 1])
-    return {'p_join_adult': p_adult, 'p_join_child': p_child}
+    return {'p_join_adult': p_adult, 'p_join_child': p_child, 'framework': 'sklearn'}
+
+
+# ---------------------------------------------------------------------------
+# 3b. Joint-tour PURPOSE  (composition → purpose choice, structural)
+# ---------------------------------------------------------------------------
+def _composition_label(participants, is_child_map: dict) -> str:
+    """Classify a participant list as adults / children / mixed."""
+    n_child = sum(1 for p in participants if is_child_map.get(p))
+    n_tot = max(len(participants), 1)
+    if n_child == n_tot:
+        return 'children'
+    if n_child == 0:
+        return 'adults'
+    return 'mixed'
+
+
+def estimate_joint_purpose(persons: pd.DataFrame, tours: pd.DataFrame,
+                           cfg: Optional[HouseholdCdapConfig] = None) -> dict:
+    """
+    Estimate the household joint-tour purpose choice from HHTS.
+
+    Observed joint tours (derive_observed_joint_tours) are classified into
+    adults / children / mixed composition and the purpose distribution per
+    composition is used to populate HouseholdCdapConfig.joint_purpose_utility on
+    the logit scale (U = ln share).
+
+    Returns
+    -------
+    {'shares': {composition: {purpose: share}},
+     'utility': {(composition, purpose): utility},
+     'n_obs': int}
+    """
+    from cdap_households import JOINT_PURPOSES
+    cfg = cfg or HouseholdCdapConfig()
+    jt = derive_observed_joint_tours(tours, cfg)
+    if not len(jt):
+        return {'shares': {}, 'utility': dict(cfg.joint_purpose_utility), 'n_obs': 0}
+
+    is_child = persons[cfg.ptype_col].isin(['SchoolChild', 'Preschool']).astype(bool)
+    is_child.index = persons[cfg.person_id_col]
+    is_child_map = is_child.to_dict()
+    comps = []
+    purps = []
+    for _, row in jt.iterrows():
+        comps.append(_composition_label(row['participants'], is_child_map))
+        purps.append(str(row.get('purpose', '')).lower().strip())
+    jt2 = jt.assign(_comp=comps, _purpose=purps)
+
+    shares = {}
+    for comp, grp in jt2.groupby('_comp'):
+        vc = grp[grp['_purpose'].ne('')]['_purpose'].value_counts(normalize=True)
+        shares[comp] = {p: float(v) for p, v in vc.items()}
+
+    utility = {}
+    for comp, probs in shares.items():
+        for p in JOINT_PURPOSES:
+            utility[(comp, p)] = float(np.log(max(probs.get(p, 1e-4), 1e-4)))
+
+    print(f"[cdap-hh estimate] joint-purpose: n_joint={len(jt2)}, "
+          f"compositions={ {c: int(n) for c, n in jt2['_comp'].value_counts().items()} }")
+    for comp, probs in shares.items():
+        print(f"    {comp:9s}: "
+              + ", ".join(f"{p}={v:.3f}" for p, v in sorted(probs.items())))
+    return {'shares': shares, 'utility': utility, 'n_obs': len(jt2)}
 
 
 # ---------------------------------------------------------------------------
@@ -220,11 +473,12 @@ def estimate_joint_participation(persons: pd.DataFrame, tours: pd.DataFrame,
 # ---------------------------------------------------------------------------
 def estimate_household_cdap(persons: pd.DataFrame, tours: pd.DataFrame,
                             base: Optional[HouseholdCdapConfig] = None) -> HouseholdCdapConfig:
-    """Fit all three models and fold the coefficients into a HouseholdCdapConfig."""
+    """Fit all four models and fold the coefficients into a HouseholdCdapConfig."""
     cfg = base or HouseholdCdapConfig()
     dap = estimate_cdap_coefficients(persons, tours, cfg)
     freq = estimate_joint_frequency(persons, tours, cfg)
     part = estimate_joint_participation(persons, tours, cfg)
+    purp = estimate_joint_purpose(persons, tours, cfg)
 
     cfg.dap_utility.update(dap['dap_utility'])
     cfg.more_workers_boost_M = dap['interaction']['more_workers_boost_M']
@@ -235,9 +489,13 @@ def estimate_household_cdap(persons: pd.DataFrame, tours: pd.DataFrame,
     cfg.joint_rate_if_multi_vehicle = freq['joint_rate_if_multi_vehicle']
     # participation probs live in joint_tour_participation; stash for reference
     cfg._participation = part   # type: ignore[attr-defined]
+    if purp['utility']:
+        cfg.joint_purpose_utility.update(purp['utility'])
+    cfg._joint_purpose = purp  # type: ignore[attr-defined]
     print(f"[cdap-hh estimate] DAP acc={dap['accuracy']:.3f}  "
           f"joint mean obs={freq['mean_observed']:.3f}  "
-          f"p_join adult/child={part.get('p_join_adult'):.2f}/{part.get('p_join_child'):.2f}")
+          f"p_join adult/child={part.get('p_join_adult'):.2f}/{part.get('p_join_child'):.2f}  "
+          f"joint-purpose n={purp['n_obs']}")
     return cfg
 
 

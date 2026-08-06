@@ -5,7 +5,10 @@ Wire MetaCountRegressor's MULTIVARIATE count model into Stage 1 (activity
 frequency). Instead of estimating an independent univariate model per purpose,
 this fits the 8 per-purpose activity counts (n_work_out … n_eat_out) JOINTLY
 with a copula, so the correlation between activity types (e.g. people who do
-more shopping also do more eat-out) is captured.
+more shopping also do more eat-out) is captured.  When HHTS joint tours are
+derivable, a 9th count dimension — the per-person household JOINT-tour
+participation count (``n_joint_tours``, "number of joint travel") — is added
+and modelled jointly as well (gracefully dropped if the fit fails).
 
 Uses metacountregressor.multivariate_count_regressor.fit_multivariate_activity_model
 (the DataFrame convenience wrapper: per-activity NB/Poisson marginals + a
@@ -63,7 +66,7 @@ def _import_mv():
             return None
 
 
-def _activity_and_covariates(df):
+def _activity_and_covariates(df, extra_activity_cols=('n_joint_tours',)):
     """(activity_cols, covariate_cols dict) present in df, from the Stage-1
     per-purpose count columns and DEFAULT_FEATURES_BY_PURPOSE."""
     from stage1_activity_frequency import PURPOSES, DEFAULT_FEATURES_BY_PURPOSE
@@ -83,7 +86,72 @@ def _activity_and_covariates(df):
                 if v.notna().any() and v.nunique(dropna=True) > 1:
                     keep.append(c)
         covariate_cols[col] = keep
+    # Optional extra activity-count dimension(s) — e.g. per-person household
+    # JOINT-tour participation count (the "number of joint travel").  Only kept
+    # when present, numeric and genuinely varying.
+    for c in extra_activity_cols:
+        if c in df.columns:
+            v = pd.to_numeric(df[c], errors='coerce')
+            if v.notna().any() and v.nunique(dropna=True) > 1:
+                activity_cols.append(c)
+                covariate_cols.setdefault(c, [])
     return activity_cols, covariate_cols
+
+
+def _add_joint_tour_count(df, tours: pd.DataFrame) -> pd.DataFrame:
+    """Add a per-person household JOINT-tour participation count as an extra
+    Stage-1 activity dimension (``n_joint_tours``) so the multivariate copula
+    also models the "number of joint travel".
+
+    Joint tours are derived from the observed HHTS ``tours`` via
+    cdap_households_estimation.derive_observed_joint_tours (uses the joint
+    flag when present, else the shared-trip heuristic).  Every participant of a
+    joint tour gets +1; persons with no observed joint tour get 0.
+
+    Never raises and returns ``df`` unchanged on any failure so the standard
+    8-purpose MV fit is never lost to a joint-count problem.
+    """
+    try:
+        from cdap_households_estimation import derive_observed_joint_tours
+        from cdap_households import HouseholdCdapConfig
+        jt = derive_observed_joint_tours(tours, HouseholdCdapConfig())
+        if jt is None or not len(jt) or 'participants' not in jt.columns:
+            return df
+        cnt = {}
+        parts = jt['participants']
+        for p_list in parts:
+            if isinstance(p_list, list):
+                iter_parts = p_list
+            else:
+                iter_parts = [p.strip()
+                              for p in str(p_list).replace('|', ',').split(',')]
+            for p in iter_parts:
+                try:
+                    pid = int(str(p).strip())
+                except (ValueError, TypeError):
+                    continue
+                cnt[pid] = cnt.get(pid, 0) + 1
+        if not cnt:
+            return df
+        key = 'person_id' if 'person_id' in df.columns else df.columns[0]
+        js = pd.DataFrame({
+            'pid_s': [str(k) for k in cnt.keys()],
+            'n_joint_tours': list(cnt.values()),
+        })
+        out = df.copy()
+        out['pid_s'] = out[key].astype(str)
+        out = out.merge(js, on='pid_s', how='left')
+        out['n_joint_tours'] = out['n_joint_tours'].fillna(0).astype(int)
+        out = out.drop(columns=['pid_s'])
+        n_positive = int((out['n_joint_tours'] > 0).sum())
+        logger.info(
+            f"stage1_multivariate: n_joint_tours added "
+            f"({n_positive:,} persons in ≥1 joint tour, "
+            f"max={int(out['n_joint_tours'].max())})")
+        return out
+    except Exception as e:
+        logger.warning(f"stage1_multivariate: n_joint_tours skipped ({e!r})")
+        return df
 
 
 def _write_reports(fit, activity_cols, out_dir):
@@ -135,6 +203,7 @@ def fit_stage1_multivariate(tours, persons, landuse=None, out_dir='saved_data'):
             return None
         from stage1_activity_frequency import prepare_frequency_data
         df = prepare_frequency_data(tours, persons, landuse=landuse)
+        df = _add_joint_tour_count(df, tours)
         activity_cols, covariate_cols = _activity_and_covariates(df)
         if len(activity_cols) < 2:
             logger.warning("stage1_multivariate: <2 activity count columns present "
@@ -145,9 +214,29 @@ def fit_stage1_multivariate(tours, persons, landuse=None, out_dir='saved_data'):
         d = df[used].apply(pd.to_numeric, errors='coerce').dropna()
         logger.info(f"stage1_multivariate: fitting {len(activity_cols)} activities "
                     f"jointly on {len(d)} persons ({MV_MARGINAL}/{MV_COPULA}) ...")
-        fit = fit_fn(d, activity_cols, covariate_cols, copula=MV_COPULA,
-                     marginal=MV_MARGINAL, add_intercept=True,
-                     maxiter=MV_MAXITER, verbose=True)
+        try:
+            fit = fit_fn(d, activity_cols, covariate_cols, copula=MV_COPULA,
+                         marginal=MV_MARGINAL, add_intercept=True,
+                         maxiter=MV_MAXITER, verbose=True)
+        except Exception as _mv_fit_e:
+            # Graceful degradation: if the extra joint-tour dimension makes the
+            # copula fit fail, retry on the standard per-purpose counts only so
+            # the multivariate report is still produced.
+            if 'n_joint_tours' in activity_cols:
+                logger.warning(
+                    f"stage1_multivariate: fit with n_joint_tours failed "
+                    f"({_mv_fit_e!r}); retrying without the joint dimension")
+                activity_cols = [c for c in activity_cols if c != 'n_joint_tours']
+                covariate_cols = {k: v for k, v in covariate_cols.items()
+                                  if k != 'n_joint_tours'}
+                used = activity_cols + sorted(
+                    {c for cs in covariate_cols.values() for c in cs})
+                d = df[used].apply(pd.to_numeric, errors='coerce').dropna()
+                fit = fit_fn(d, activity_cols, covariate_cols, copula=MV_COPULA,
+                             marginal=MV_MARGINAL, add_intercept=True,
+                             maxiter=MV_MAXITER, verbose=True)
+            else:
+                raise
         _write_reports(fit, activity_cols, out_dir)
         try:
             print(fit.summary())

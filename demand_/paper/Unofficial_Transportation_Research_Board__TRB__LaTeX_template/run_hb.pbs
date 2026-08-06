@@ -1,0 +1,88 @@
+#!/bin/bash -l
+#PBS -N hb_crash_new
+#PBS -l walltime=048:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ── Cluster paths ───────────────────────────────────────────────────────────
+SCRIPT_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template
+DATA_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_
+RESULTS_DIR=$DATA_DIR/results
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+mkdir -p "$RESULTS_DIR"
+
+# ── Ensure metacountregressor is at the latest version ──────────────────────
+echo "Upgrading metacountregressor ..."
+pip install --upgrade metacountregressor 2>&1 | tail -3
+
+# ------------------------------------------------------------------
+# JAX / XLA settings — CPU-only analysis
+# ------------------------------------------------------------------
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
+export JAX_PLATFORMS=cpu
+export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
+cd "$SCRIPT_DIR"
+
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "Script dir:  $SCRIPT_DIR"
+echo "Data:        $SCRIPT_DIR/near_miss_hb_ecf.csv"
+echo "Results dir: $SCRIPT_DIR"
+
+# First, prepare the data if not already done (aggregate GPKG -> CSV)
+if [ ! -f "$SCRIPT_DIR/near_miss_hb_ecf.csv" ]; then
+    echo "Preparing data from GPKG ..."
+    python -u -c "
+import geopandas as gpd, pandas as pd, numpy as np, os
+gdf = gpd.read_file('$SCRIPT_DIR/../crash_info_zonal/SEQ_Expected_Crashes_with_HardBraking.gpkg')
+gdf['segment_length_m'] = gdf.geometry.length
+sum_cols = ['ObsCrashes','ExpCrashes','HB_Total','HB_Critical-Likely','HB_Extreme','HB_Hard-Braking Candidate','segment_length_m']
+for p in ['Obs_C_','Exp_C_','Pred_C_']:
+    sum_cols += [c for c in gdf.columns if c.startswith(p)]
+skip = set(sum_cols + ['geometry','segment_id'])
+agg = {c:'sum' for c in sum_cols if c in gdf.columns}
+agg.update({c:'first' for c in gdf.columns if c not in skip})
+dfg = gdf.groupby('segment_id',as_index=False).agg(agg)
+dfg['seg_len_km'] = dfg['segment_length_m']/1000.0
+dfg['seg_len_km'] = dfg['seg_len_km'].clip(lower=0.001)
+dfg['log_len'] = np.log(dfg['seg_len_km'])
+dfg['nm_total'] = dfg['HB_Total']
+dfg['nm_braking'] = dfg['HB_Hard-Braking Candidate']
+dfg['hb_critical'] = dfg['HB_Critical-Likely']
+dfg['hb_extreme'] = dfg['HB_Extreme']
+dfg['hb_candidate'] = dfg['HB_Hard-Braking Candidate']
+dfg = dfg.dropna(subset=['ObsCrashes'])
+dfg = dfg[dfg['ObsCrashes']>=0]
+dfg.to_csv('$SCRIPT_DIR/near_miss_hb_ecf.csv',index=False)
+print(f'Prepared {len(dfg)} segments')
+" 2>&1
+fi
+
+# Run the main analysis (with resume support via checkpoints)
+python -u nearmiss_hb_analysis.py \
+    --data    "$SCRIPT_DIR/near_miss_hb_ecf.csv" \
+    --out-dir "$SCRIPT_DIR"
+EXIT_CODE=$?
+
+# Archive results
+ARCHIVE_DIR="$RESULTS_DIR/$(date +%Y%m%d_%H%M%S)_${PBS_JOBID}"
+mkdir -p "$ARCHIVE_DIR"
+cp "$SCRIPT_DIR"/hb_*.tex "$SCRIPT_DIR"/hb_*.png "$SCRIPT_DIR"/hb_*.csv "$ARCHIVE_DIR/" 2>/dev/null
+cp "$SCRIPT_DIR"/nearmiss_hb_analysis.py "$ARCHIVE_DIR/" 2>/dev/null
+
+echo "Job finished at $(date) — exit_code=$EXIT_CODE"
+if [ $EXIT_CODE -ne 0 ]; then
+    echo "Analysis FAILED -- check the PBS .o file for the full traceback above"
+fi
+exit $EXIT_CODE

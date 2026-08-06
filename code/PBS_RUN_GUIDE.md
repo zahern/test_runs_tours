@@ -258,6 +258,79 @@ Inspect run outputs under:
 runs/<mode>__<jobid>/
 ```
 
+## Stage 3 Duration Model Suite
+
+`job_stage3_model_suite.pbs` estimates each requested duration variant, applies
+it to the synthetic Stage 2 population, and keeps the artifacts isolated by
+variant. The default `all` suite runs:
+
+- `lognormal`
+- `copula_hazard`
+- `lognormal_mdcev`
+- `copula_hazard_mdcev`
+
+Submit the full duration suite:
+
+```bash
+qsub job_stage3_model_suite.pbs
+```
+
+Run the duration suite and continue through Stage 4 timing/schedule placement:
+
+```bash
+qsub -v RUN_STAGE4=1 job_stage3_model_suite.pbs
+```
+
+Run one large end-to-end job from Stage 1 through Stage 6 for every duration
+variant. Stage 5 and Stage 6 are substantially heavier than the duration and
+timing stages, so request larger resources:
+
+```bash
+qsub -l select=1:ncpus=4:mem=194GB -l walltime=48:00:00 \
+  -v FRESH=1,RUN_STAGE5_6=1,SKIMS_PATH=downcasted_matrices_base.omx \
+  job_stage3_model_suite.pbs
+```
+
+`RUN_STAGE5_6=1` automatically enables Stage 4. The job then performs:
+
+1. Stage 1 activity-frequency estimation and synthetic prediction.
+2. Stage 2 day-budget estimation and synthetic prediction.
+3. Every requested Stage 3 duration variant.
+4. SearchLibrium timing estimation and Stage 4 schedule placement.
+5. Stage 5 destination, mode, and trip-chain estimation for each variant.
+6. Stage 6 mode prediction and final activity-plan output for each variant.
+
+The final per-variant artifacts are `stage5_output.csv` and
+`stage6_output.csv`, alongside their model pickles. The complete run status is
+recorded in `manifest.json`.
+
+Run only the two duration marginals:
+
+```bash
+qsub -v STAGE3_MODEL_SUITE=lognormal,copula_hazard job_stage3_model_suite.pbs
+```
+
+Run Stage 1 and Stage 2 first for a fresh zone-specific job:
+
+```bash
+qsub -v FRESH=1,ZONE=40,RUN_STAGE4=1 job_stage3_model_suite.pbs
+```
+
+Artifacts are written below `runs/stage3_model_suite/<PBS_JOBID>/` by default:
+
+- `<variant>/stage3_models.pkl` and `stage3_output.csv`
+- `<variant>/stage4_output.csv` when `RUN_STAGE4=1`
+- `stage4_timing_models.pkl` when `RUN_STAGE4=1`
+- `<variant>/stage5_models.pkl` and `stage5_output.csv` when `RUN_STAGE5_6=1`
+- `<variant>/stage6_models.pkl` and `stage6_output.csv` when `RUN_STAGE5_6=1`
+- `model_fit_summary.csv`
+- `manifest.json`
+
+The suite estimates the existing SearchLibrium planning-order RRM inside each
+Stage 3 run. When Stage 4 is enabled, it estimates the SearchLibrium timing RRM
+once and applies it to every duration variant. Use `STAGE3_MODEL_SUITE` to
+reduce the walltime or memory footprint when testing.
+
 Common logs to watch:
 
 ```bash

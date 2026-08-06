@@ -224,6 +224,235 @@ def _age_group(age5p: pd.Series) -> pd.Series:
     return np.select(conditions, choices, default='adult')
 
 
+# ---------------------------------------------------------------------------
+# HHTS-DERIVED VEHICLE / BIKE OWNERSHIP PREDICTION
+# ---------------------------------------------------------------------------
+# The synthetic population may not carry household vehicle counts (`vehrd`) or
+# bicycle counts (`bikes`) — some census blends drop them.  Both are strong
+# predictors in every later stage (mode choice captivity, destination
+# interactions, accessibility), so when they are missing we fit a small model
+# on the HHTS persons and predict them for the synth population.
+
+#: Shared predictors available on BOTH HHTS persons (process_survey) and the
+#: enriched synthetic population.  `HHSIZE`/`nprd` are aliases — include both
+#: and let the intersection keep whichever is present.
+_OWNERSHIP_FEATURES = [
+    'sexp', 'nprd', 'HHSIZE', 'incp', 'WORKSTAT', 'STUDYING',
+    'CARLICENCE', 'age5p', 'rlhp',
+]
+
+
+def _ownership_feature_cols(df: pd.DataFrame) -> list:
+    """Columns from _OWNERSHIP_FEATURES actually present in a frame."""
+    return [c for c in _OWNERSHIP_FEATURES if c in df.columns]
+
+
+def _is_all_zero(col: pd.Series) -> bool:
+    vals = pd.to_numeric(col, errors='coerce').dropna()
+    if len(vals) == 0:
+        return True
+    return bool((vals == 0).all())
+
+
+def _fit_ownership_ordered(
+    survey_persons: pd.DataFrame,
+    target: str,
+    features: list,
+    min_sample: int = 30,
+    zero_inflated: bool = False,
+):
+    """
+    Fit an ordered (optionally zero-inflated) model for `target` on HHTS
+    persons.  Returns the fitted stage-1 model plus the mu/sd used to
+    standardise the feature matrix, or None if not enough observations.
+    """
+    from stage1_activity_frequency import OrderedLogit, ZeroInflatedOrderProbit
+
+    sub = survey_persons[features + [target]].dropna(subset=[target])
+    if len(sub) < min_sample:
+        logger.warning(
+            f"Ownership imputation: only {len(sub)} HHTS persons with {target} — skipping"
+        )
+        return None
+
+    y = pd.to_numeric(sub[target], errors='coerce').astype(int).values
+    if _is_all_zero(sub[target]):
+        logger.warning(
+            f"Ownership imputation: HHTS {target} is all zeros — cannot fit a model"
+        )
+        return None
+
+    # Remove zero-variance feature columns within this sample.
+    X_raw = sub[features].fillna(0).values.astype(float)
+    _sd0 = X_raw.std(axis=0)
+    _keep = _sd0 > 1e-9
+    if not _keep.all():
+        features = [f for f, k in zip(features, _keep) if k]
+        X_raw = X_raw[:, _keep]
+    if X_raw.shape[1] == 0:
+        logger.warning(f"Ownership imputation: no usable features for {target} — skipping")
+        return None
+    mu = X_raw.mean(axis=0)
+    sd = X_raw.std(axis=0)
+    sd[sd == 0] = 1.0
+    X = (X_raw - mu) / sd
+
+    model = ZeroInflatedOrderProbit() if zero_inflated else OrderedLogit()
+    model.fit(X, y)
+    if not model.converged_:
+        logger.warning(
+            f"Ownership imputation: {target} model did not converge "
+            f"(classes={getattr(model, 'classes_', None)})"
+        )
+    logger.info(
+        f"Ownership imputation: fitted {type(model).__name__} for {target} "
+        f"(n={len(sub)}, classes={getattr(model, 'classes_', None)}, "
+        f"feats={len(features)})"
+    )
+    return {'model': model, 'mu': mu, 'sd': sd, 'features': features}
+
+
+def _predict_ownership_entry(
+    synth: pd.DataFrame,
+    entry: dict,
+    rng: np.random.Generator,
+) -> pd.Series:
+    """Sample an ownership count for the whole synth frame from a fitted model."""
+    if entry is None:
+        return None
+    model = entry['model']
+    features = entry['features']
+    X_raw = np.zeros((len(synth), len(features)))
+    for j, col in enumerate(features):
+        if col in synth.columns:
+            X_raw[:, j] = synth[col].fillna(0).values.astype(float)
+    X = (X_raw - entry['mu']) / entry['sd']
+    if hasattr(model, 'predict_sampled'):
+        return pd.Series(model.predict_sampled(X, seed=int(rng.integers(0, 2**31))),
+                         index=synth.index)
+    return pd.Series(model.predict(X), index=synth.index)
+
+
+def predict_vehicle_bike_ownership(
+    synth: pd.DataFrame,
+    survey_persons: pd.DataFrame,
+    seed: int = 42,
+    min_sample: int = 30,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Assign ``vehrd`` and ``bikes`` to the synthetic population when missing.
+
+    Strategy
+    --------
+    * ``vehrd`` (household vehicles, clipped 0-4) — ordered logit on shared
+      person features (sexp, nprd/HHSIZE, incp, WORKSTAT, STUDYING,
+      CARLICENCE, age5p, rlhp).
+    * ``bikes`` (household bicycles) — zero-inflated ordered probit, because
+      most households own no bicycle (excess structural zeros).
+
+    Only columns that are missing (or entirely zero — implausible) are
+    predicted; existing values are left untouched.  Also derives ``veh_bin``
+    and ``bike_bin`` so later stages see the standard mode-cell columns.
+
+    Parameters
+    ----------
+    synth           : synthetic population (census-blend persons)
+    survey_persons  : HHTS persons from process_survey()['persons']
+    seed            : random seed for sampled draws
+    min_sample      : skip model if fewer HHTS observations for a target
+    verbose         : print a summary of what was assigned
+
+    Returns
+    -------
+    synth with vehrd / bikes / veh_bin / bike_bin columns completed.
+    """
+    df = synth.copy()
+    rng = np.random.default_rng(seed)
+
+    targets = []
+    if 'vehrd' not in df.columns or _is_all_zero(df['vehrd']):
+        targets.append('vehrd')
+    if 'bikes' not in df.columns or _is_all_zero(df['bikes']):
+        targets.append('bikes')
+    if not targets:
+        return df
+
+    survey = survey_persons.copy()
+    if 'person_id' not in survey.columns and 'PERSID' in survey.columns:
+        survey = survey.rename(columns={'PERSID': 'person_id'})
+    feats = _ownership_feature_cols(survey)
+    if not feats:
+        logger.warning(
+            "Ownership imputation: no shared predictors between HHTS and synth — "
+            f"HHTS has none of {_OWNERSHIP_FEATURES}; skipping"
+        )
+        return df
+
+    for target in targets:
+        if target not in survey.columns:
+            logger.warning(
+                f"Ownership imputation: HHTS has no '{target}' column — skipping"
+            )
+            continue
+        entry = _fit_ownership_ordered(
+            survey, target, feats,
+            min_sample=min_sample,
+            zero_inflated=(target == 'bikes'),
+        )
+        preds = _predict_ownership_entry(df, entry, rng)
+        if preds is None:
+            continue
+        df[target] = preds.clip(lower=0)
+        if verbose:
+            dist = df[target].value_counts().sort_index().to_dict()
+            print(f"  Ownership imputation: assigned {target} to {len(df):,} "
+                  f"persons (distribution: {dist})")
+
+    # Refresh derived mode-cell columns from the (possibly imputed) values.
+    if 'vehrd' in df.columns:
+        df['veh_bin'] = _veh_bin(df['vehrd'])
+    if 'bikes' in df.columns:
+        nb = pd.to_numeric(df['bikes'], errors='coerce').fillna(0).astype(int)
+        df['bike_bin'] = np.where(nb > 0, 'hasbike', 'nobike')
+    return df
+
+
+def _impute_ownership_if_missing(
+    synth: pd.DataFrame,
+    survey_persons: pd.DataFrame = None,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Entry point used by build_synth_population*: predict ``vehrd`` / ``bikes``
+    from HHTS only when the synthetic population actually lacks them, avoiding
+    the cost of a process_survey() call in the common (already-complete) case.
+
+    ``survey_persons`` may be passed in when the caller already holds the HHTS
+    persons table; otherwise it is loaded lazily via Synth_Connect.
+    """
+    needs = (
+        'vehrd' not in synth.columns or _is_all_zero(synth['vehrd'])
+        or 'bikes' not in synth.columns or _is_all_zero(synth['bikes'])
+    )
+    if not needs:
+        return synth
+
+    if survey_persons is None:
+        try:
+            from data_connect import Synth_Connect
+            survey_persons = Synth_Connect().process_survey(save=False)['persons']
+            logger.info("  Ownership imputation: loaded HHTS persons for prediction")
+        except Exception as exc:
+            logger.warning(
+                f"  Ownership imputation: could not load HHTS persons ({exc}) — "
+                f"leaving vehrd/bikes as-is"
+            )
+            return synth
+
+    return predict_vehicle_bike_ownership(synth, survey_persons, seed=seed)
+
+
 def build_synth_population(
     synth_dir:          str = SYNTH_DIR,
     zones:              list = None,
@@ -319,7 +548,10 @@ def build_synth_population(
     )
 
     # ── 6. Add mode-choice cell columns ───────────────────────────────────
-    # These match the frozen-probability cell keys in stage 5 and stage 6
+    # These match the frozen-probability cell keys in stage 5 and stage 6.
+    # If the census blend dropped vehrd/bikes, predict them from HHTS first.
+    synth = _impute_ownership_if_missing(synth, seed=42)
+
     if 'vehrd' in synth.columns:
         synth['veh_bin']     = _veh_bin(synth['vehrd'])
     if 'incp' in synth.columns:
@@ -586,6 +818,9 @@ def build_synth_population_mapped(
             logger.warning(f"Could not load landuse for accessibility: {exc}")
 
     synth = enrich_synth_population(synth, landuse=landuse)
+
+    # if the census blend dropped vehrd/bikes, predict them from HHTS first
+    synth = _impute_ownership_if_missing(synth, seed=42)
 
     if 'vehrd' in synth.columns:
         synth['veh_bin']     = _veh_bin(synth['vehrd'])

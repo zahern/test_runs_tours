@@ -995,10 +995,25 @@ def cdap(out, synth, landuse=None, feature_override=None):
     # by consuming its per-person log-utilities (cdap_util_M/N/H) as the
     # individual utilities; interaction coefficients are priors until estimated
     # from HHTS (cdap_households_estimation).
-    if os.environ.get('CDAP_HOUSEHOLD_COORD', '0') == '1':
+    #
+    # CDAP_HOUSEHOLD_COORD=joint (or JOINT_TOURS=1) additionally runs the FULL
+    # structural joint-tour path: joint_tour_frequency + joint_tour_participation
+    # + joint_tour_purpose, so each joint tour is co-assigned an ACTIVITY PURPOSE
+    # conditioned on composition and the participants' coordinated DAPs — the
+    # household CDAP thus enters the activity-purpose dimension. The household
+    # joint tours are saved to {OUT_DIR}/household_joint_tours.csv and reconciled
+    # into the Stage-1 purpose counts in predict_stage1() (n_joint_<purpose>_out,
+    # joint_tour_ids) and tagged on Stage-3 activity rows in predict_stage3().
+    _hh_mode = os.environ.get('CDAP_HOUSEHOLD_COORD', '0').strip().lower()
+    _joint_tours = (os.environ.get('JOINT_TOURS', '0').strip() == '1') \
+        or _hh_mode in ('joint', '2', 'true')
+    if _hh_mode in ('1', 'joint', '2', 'true') or _joint_tours:
         try:
             from cdap_households import (coordinate_household_cdap,
-                                         HouseholdCdapConfig)
+                                         HouseholdCdapConfig,
+                                         joint_tour_frequency,
+                                         joint_tour_participation,
+                                         joint_tour_purpose)
             _hhcol = next((c for c in ('household_id', 'HHID', 'hhid', 'abshid')
                            if c in synth.columns), None)
             _pcol = next((c for c in ('person_id', 'PERSONID', 'pid')
@@ -1006,6 +1021,8 @@ def cdap(out, synth, landuse=None, feature_override=None):
             if _hhcol and _pcol and 'ptype' in synth.columns:
                 _cfg = HouseholdCdapConfig(hh_id_col=_hhcol, person_id_col=_pcol,
                                            ptype_col='ptype')
+                if os.environ.get('JOINT_TOURS_ADDITIVE', '0').strip() == '1':
+                    _cfg.joint_tour_additive = True
                 _before = synth['CDAP'].value_counts(normalize=True).to_dict() \
                     if 'CDAP' in synth.columns else {}
                 _coord = coordinate_household_cdap(synth, _cfg)
@@ -1017,10 +1034,35 @@ def cdap(out, synth, landuse=None, feature_override=None):
                     + ", ".join(f"{k}:{v:.3f}" for k, v in sorted(_before.items()))
                     + "}} after={{"
                     + ", ".join(f"{k}:{v:.3f}" for k, v in sorted(_after.items())) + "}}")
+                if _joint_tours:
+                    _jt_freq = joint_tour_frequency(synth, _cfg)
+                    _jt_part = joint_tour_participation(synth, _jt_freq, _cfg)
+                    if len(_jt_part):
+                        _jt_part = joint_tour_purpose(_jt_part, synth, _cfg)
+                    _jt_out = os.path.join(OUT_DIR, 'household_joint_tours.csv')
+                    try:
+                        _jt_save = _jt_part.copy()
+                        if len(_jt_save):
+                            _jt_save['participants'] = _jt_save['participants'].apply(
+                                lambda x: '|'.join(str(p) for p in x))
+                        _jt_save.to_csv(_jt_out, index=False)
+                        logger.info(
+                            f"JOINT_TOURS: {len(_jt_save):,} joint tours → {_jt_out}")
+                        if len(_jt_save) and 'purpose' in _jt_save.columns:
+                            _jp_dist = _jt_save['purpose'].value_counts().to_dict()
+                            _jc_dist = _jt_save['composition'].value_counts().to_dict()
+                            logger.info(
+                                "  joint purposes: "
+                                + ", ".join(f"{k}={v}" for k, v in sorted(_jp_dist.items()))
+                                + "  |  composition: "
+                                + ", ".join(f"{k}={v}" for k, v in sorted(_jc_dist.items())))
+                    except Exception as _jts_e:
+                        logger.warning(f"  joint-tour CSV save failed: {_jts_e}")
             else:
                 logger.warning(
-                    "CDAP_HOUSEHOLD_COORD=1 but missing household_id/person_id/ptype "
-                    f"in synth (have hh={_hhcol}, pid={_pcol}) — coordination skipped")
+                    "CDAP_HOUSEHOLD_COORD/JOINT_TOURS enabled but missing "
+                    f"household_id/person_id/ptype in synth (have hh={_hhcol}, "
+                    f"pid={_pcol}) — household coordination skipped")
         except Exception as _hhc_e:
             logger.warning(f"CDAP household coordination skipped ({_hhc_e})")
 
@@ -1053,6 +1095,28 @@ def usual_locations(synth, landuse, hhts_tours=None):
         hhts_tours=hhts_tours,
         plots_dir=os.path.join(OUT_DIR, 'plots'),
     )
+
+
+@timer("WFH / telecommute — pre-day assignment")
+def wfh_assign(synth, out):
+    """lr4 pre-day module: estimate P(WFH) on HHTS workers and assign `wfh`
+    (+ WFHWEEK) onto the synthetic population before CDAP. Gated by PIPELINE_WFH;
+    a no-op (synth unchanged) when off or if the HHTS lacks WFHDAY/WFHWEEK, so
+    cdap() falls back to its own WFHDAY derivation / wfh=0."""
+    if os.environ.get('PIPELINE_WFH', '0') != '1':
+        return synth
+    try:
+        from wfh_telecommute import run_wfh
+        hhts = out.get('persons') if isinstance(out, dict) else None
+        if hhts is None or not len(hhts):
+            logger.warning("WFH: no HHTS persons in `out` — skipping assignment")
+            return synth
+        return run_wfh(hhts, synth,
+                       save_path=os.path.join(OUT_DIR, 'wfh_summary.csv'),
+                       seed=int(os.environ.get('PIPELINE_SEED', '42')))
+    except Exception as e:
+        logger.warning(f"WFH assignment skipped ({e}); wfh defaults downstream")
+        return synth
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3462,6 +3526,30 @@ def predict_stage1(synth, models=None, hhts_persons=None, hhts_tours=None):
             logger.info("  Stage 1 calibrated to HHTS ptype-purpose rates")
         except Exception as _cal_e:
             logger.warning(f"  Stage 1 calibration skipped (non-fatal): {_cal_e}")
+    # ── Household joint tours → shared activity purposes (structural) ───────
+    # Joint tours with purposes were generated in cdap() (CDAP_HOUSEHOLD_COORD=
+    # joint / JOINT_TOURS=1) and saved to household_joint_tours.csv.  Here we
+    # fold each participant's shared purpose into the per-person Stage-1 counts,
+    # so the household CDAP structurally enters the activity-purpose dimension.
+    try:
+        from cdap_households import HouseholdCdapConfig as _hhcfg
+        from cdap_households import reconcile_joint_tours as _reconcile_jt
+        _jt_csv = os.path.join(OUT_DIR, 'household_joint_tours.csv')
+        if os.path.exists(_jt_csv):
+            _jt = pd.read_csv(_jt_csv)
+            _hhcol = next((c for c in ('household_id', 'HHID', 'hhid', 'abshid')
+                           if c in _jt.columns), None)
+            if _hhcol and len(_jt) and 'person_id' in result.columns:
+                _cfg = _hhcfg(hh_id_col=_hhcol, person_id_col='person_id')
+                result, _jmap = _reconcile_jt(result, _jt, _cfg)
+                _jmap.to_csv(os.path.join(OUT_DIR, 'stage1_joint_map.csv'), index=False)
+                logger.info(
+                    f"  Joint tours reconciled into Stage 1 purposes: "
+                    f"{len(_jmap):,} participant-links across "
+                    f"{int(result['joint_tour_ids'].astype(str).ne('').sum()):,} "
+                    f"persons")
+    except Exception as _jr_e:
+        logger.warning(f"  Joint-tour reconcile skipped ({_jr_e})")
     result.to_csv(os.path.join(OUT_DIR, 'stage1_output.csv'), index=False)
     logger.info(f"  ✓  Stage 1 output: {len(result):,} rows → {OUT_DIR}/stage1_output.csv")
     _write_stage_checkpoint_report(
@@ -3507,6 +3595,23 @@ def predict_stage3(synth_s2, models=None):
     _use_mdcev = os.environ.get('STAGE3_USE_MDCEV', '0') == '1'
     logger.info(f"  Predicting activity durations for {len(synth_s2):,} persons...")
     result = predict_activity_durations(synth_s2, models, use_mdcev=_use_mdcev)
+    # ── Tag joint-activity rows (structural household-CDP → purpose bridge) ──
+    # When the household joint-tour path produced a joint map (stage1_joint_map.csv),
+    # mark the shared activity rows so joint destination/mode/scheduling can be
+    # applied downstream. Non-destructive — only adds is_joint / joint_tour_id /
+    # joint_participants columns.
+    try:
+        from cdap_households import tag_joint_activities
+        _jmap_csv = os.path.join(OUT_DIR, 'stage1_joint_map.csv')
+        if os.path.exists(_jmap_csv):
+            _jmap = pd.read_csv(_jmap_csv)
+            if len(_jmap):
+                result = tag_joint_activities(result, _jmap)
+                _n_joint = int(result['is_joint'].sum()) \
+                    if 'is_joint' in result.columns else 0
+                logger.info(f"  Tagged {_n_joint:,} joint-activity rows (shared household tours)")
+    except Exception as _jtag_e:
+        logger.warning(f"  Joint-activity tagging skipped ({_jtag_e})")
     result.to_csv(os.path.join(OUT_DIR, 'stage3_output.csv'), index=False)
     logger.info(f"  ✓  Stage 3 output: {len(result):,} rows "
                 f"({result['person_id'].nunique():,} persons) → {OUT_DIR}/stage3_output.csv")
@@ -6193,6 +6298,60 @@ def main(filepath: str = None):
             except Exception:
                 return float('nan')
 
+    # ── Unified logsum accessibility gate ───────────────────────────────────
+    # When UNIFIED_LOGSUM_ACC=1 the pipeline estimates Stage 5 (mode+dest)
+    # first so the fitted mode logsum can be used as the unified accessibility
+    # measure for Stage 1 (activity generation), replacing the separate
+    # log1p(attractor*decay) proxy and threading a single inclusive value
+    # through the whole chain. Stage 1-4 estimation follows afterwards with
+    # the enriched landuse; the original Stage 5 + Stage 5t calls are skipped.
+    _unified = (os.environ.get('UNIFIED_LOGSUM_ACC', '0').strip().lower()
+                in ('1', 'true', 'on', 'yes'))
+    if _unified:
+        logger.info("=== UNIFIED_LOGSUM_ACC=1 — estimating Stage 5 first ===")
+        logger.info("▶  Estimating Stage 5 models (destination + mode choice)...")
+        s5_models_est, skims, sk = estimate_stage5(out, landuse)
+        logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 5]")
+
+        logger.info("▶  Computing logsum accessibility from Stage-5 mode models...")
+        _lu_from5 = landuse
+        try:
+            from logsum_accessibility import (
+                compute_logsum_accessibility, attach_logsum_to_landuse)
+            _acc_df = compute_logsum_accessibility(
+                s5_models_est, landuse, skims, persons=out.get('persons'))
+            _lu_from5 = attach_logsum_to_landuse(landuse, _acc_df)
+            _n_acc = sum(1 for c in _acc_df.columns
+                         if c.startswith('logsum_'))
+            logger.info(
+                f"  +  {_n_acc} logsum_acc columns attached to landuse"
+            )
+        except Exception as _lu_e:
+            import traceback as _lu_tb
+            logger.warning(
+                f"  Logsum accessibility computation failed (non-fatal): {_lu_e}\n"
+                + _lu_tb.format_exc(limit=6))
+        landuse = _lu_from5
+
+        logger.info("▶  Estimating Stage 5t models...")
+        _require_s5t = os.environ.get('STAGE5T_REQUIRED', '1') == '1'
+        try:
+            estimate_stage5_trips(out, landuse, skims)
+        except Exception as _s5t_e:
+            import traceback as _tb_s5t
+            logger.error(f"  Trip-level Stage 5 estimation failed: {_s5t_e}")
+            logger.debug(_tb_s5t.format_exc())
+            if _require_s5t:
+                raise RuntimeError(
+                    "Stage 5t (trip mode + trip destination) is required but failed. "
+                    "Set STAGE5T_REQUIRED=0 to continue."
+                ) from _s5t_e
+        logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 5t]")
+    else:
+        s5_models_est = None
+        skims = None
+        sk = None
+
     logger.info("▶  Estimating Stage 1 models (activity frequency)...")
     s1_models = estimate_stage1(out, landuse)
     logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 1]")
@@ -6218,24 +6377,27 @@ def main(filepath: str = None):
     s4_models = estimate_stage4(out)
     logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 4]")
 
-    logger.info("▶  Estimating Stage 5 models (destination + mode choice)...")
-    s5_models_est, skims, sk = estimate_stage5(out, landuse)
-    logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 5]")
+    if _unified:
+        logger.info("▶  Stage 5 + Stage 5t already estimated (unified path) — skipping")
+    else:
+        logger.info("▶  Estimating Stage 5 models (destination + mode choice)...")
+        s5_models_est, skims, sk = estimate_stage5(out, landuse)
+        logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 5]")
 
-    logger.info("▶  Estimating Stage 5t models (trip-level mode + destination choice)...")
-    _require_s5t = os.environ.get('STAGE5T_REQUIRED', '1') == '1'
-    try:
-        estimate_stage5_trips(out, landuse, skims)
-    except Exception as _s5t_e:
-        import traceback as _tb_s5t
-        logger.error(f"  Trip-level Stage 5 estimation failed: {_s5t_e}")
-        logger.debug(_tb_s5t.format_exc())
-        if _require_s5t:
-            raise RuntimeError(
-                "Stage 5t (trip mode + trip destination) is required but failed. "
-                "Set STAGE5T_REQUIRED=0 to continue without trip-level model artifacts."
-            ) from _s5t_e
-    logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 5t]")
+        logger.info("▶  Estimating Stage 5t models (trip-level mode + destination choice)...")
+        _require_s5t = os.environ.get('STAGE5T_REQUIRED', '1') == '1'
+        try:
+            estimate_stage5_trips(out, landuse, skims)
+        except Exception as _s5t_e:
+            import traceback as _tb_s5t
+            logger.error(f"  Trip-level Stage 5 estimation failed: {_s5t_e}")
+            logger.debug(_tb_s5t.format_exc())
+            if _require_s5t:
+                raise RuntimeError(
+                    "Stage 5t (trip mode + trip destination) is required but failed. "
+                    "Set STAGE5T_REQUIRED=0 to continue without trip-level model artifacts."
+                ) from _s5t_e
+        logger.info(f"   [mem: {_mem_mb():.0f} MB after Stage 5t]")
 
     logger.info("✓  All stage models estimated and saved.")
     logger.info(f"   PKL + HTML reports in {OUT_DIR}/")
@@ -6264,6 +6426,41 @@ def main(filepath: str = None):
     del s1_models, s2_models, s3_models, s4_models, s5_models_est
     gc.collect()
     logger.info("  Phase 1 model objects freed from memory (all saved to disk)")
+
+    # ── Phase 2 logsum accessibility (non-unified path) ─────────────────────
+    # In the non-unified (standard) path landuse only carries the legacy
+    # log1p(attractor*decay) proxy accessibility columns.  Compute the
+    # fitted mode-logsum accessibility here from the saved stage5 models
+    # and attach to landuse so the synth population receives unified
+    # logsum_acc columns alongside the proxy ones.  This is harmless when
+    # Stage-1 models were NOT fitted with them (extra cols on synth are
+    # ignored by predict_activity_frequency).
+    if not _unified and os.path.exists(
+        os.path.join(OUT_DIR, 'stage5_models.pkl')):
+        try:
+            from logsum_accessibility import (
+                compute_logsum_accessibility, attach_logsum_to_landuse)
+            _s5_pl = __import__('stage5_destination_choice',
+                                fromlist=['load_models']).load_models(
+                                    os.path.join(OUT_DIR, 'stage5_models.pkl'))
+            # skim_df for logsum computation — use the skims path directly
+            import openmatrix as omx
+            from stage5_destination_choice import _skim_flat
+            _sk_pl = omx.open_file(PIPELINE_SKIMS_PATH, 'r')
+            _skdf = _skim_flat(_sk_pl)
+            _acc_df2 = compute_logsum_accessibility(
+                _s5_pl, landuse, _skdf, persons=out.get('persons'))
+            landuse = attach_logsum_to_landuse(landuse, _acc_df2)
+            _sk_pl.close()
+            _n2 = sum(1 for c in _acc_df2.columns
+                      if c.startswith('logsum_'))
+            logger.info(
+                f"  Phase 2: {_n2} logsum_acc columns attached to landuse")
+            del _s5_pl, _acc_df2, _sk_pl, _skdf
+            gc.collect()
+        except Exception as _p2e:
+            logger.warning(
+                f"  Phase 2 logsum attachment failed (non-fatal): {_p2e}")
 
     # ══════════════════════════════════════════════════════════════════════
     # PHASE 2 — POPULATION PREDICTION (synth population, one zone at a time)
@@ -6342,6 +6539,7 @@ def main(filepath: str = None):
             logger.debug(f"  Could not load HHTS tours for validation ({_tle})")
     # usual_locations must run BEFORE cdap so work/school zones are known
     synth      = usual_locations(synth, landuse, hhts_tours=_hhts_tours_for_val)
+    synth      = wfh_assign(synth, _out_for_cdap)   # lr4: WFH before CDAP
     synth      = cdap(_out_for_cdap, synth)
     _audit_hhts_synth_consistency(_out_for_cdap.get('persons'), synth, landuse,
                                   label='post_usual_locations')
@@ -6442,6 +6640,28 @@ def main(filepath: str = None):
                    if 'person_id' in synth.columns else None)
     del synth
     gc.collect()
+
+    # ── Optional outer equilibrium loop over Phase 2 (stages 1-6) ─────────
+    # When EQUILIBRIUM_LOOP=1, bypass the flat chain below and hand the whole
+    # prediction phase to equilibrium_loop.run_equilibrium_loop(), which
+    # iterates stages 1-5 until activity counts converge, then runs stage 6,
+    # validation and plotting.  Early-return because main() has no return value.
+    _eq_enabled = os.environ.get('EQUILIBRIUM_LOOP', '0').strip().lower()
+    _eq_enabled = _eq_enabled in ('1', 'true', 'on', 'yes')
+    if _eq_enabled:
+        from equilibrium_loop import run_equilibrium_loop
+        logger.info("=== EQUILIBRIUM_LOOP=1 — running full Phase 2 iteratively ===")
+        return run_equilibrium_loop(
+            travellers=travellers,
+            landuse=landuse,
+            skims=skims,
+            sk=sk,
+            OUT_DIR=OUT_DIR,
+            _hhts_tours_path=_hhts_tours_path,
+            _out_persons_ref=_out_persons_ref,
+            _hhts_tours_stage5_val=_hhts_tours_stage5_val,
+            _synth_home=_synth_home,
+        )
 
     # ── Stage 1 predict — load model, predict, del model ──────────────────
     logger.info("▶  Phase 2 — Stage 1 prediction")
@@ -6657,6 +6877,7 @@ def GA_main(filepath: str = None):
              else load_synth_all_zones(SYNTH_DIR, landuse=landuse))
 
     synth = usual_locations(synth, landuse, hhts_tours=out.get('tours'))
+    synth = wfh_assign(synth, out)   # lr4: WFH before CDAP
     _s0_res = ga_results.results.get(0) if ga_results is not None else None
     synth = cdap(out, synth, feature_override=getattr(_s0_res, 'best_features', None))
     travellers = synth[synth['CDAP'].isin(['M', 'N'])].copy()
@@ -6840,6 +7061,7 @@ def GA_STAGED(filepath: str = None):
              else load_synth_all_zones(SYNTH_DIR, landuse=landuse))
 
     synth = usual_locations(synth, landuse, hhts_tours=out.get('tours'))
+    synth = wfh_assign(synth, out)   # lr4: WFH before CDAP
     _s0_res = all_ga.results.get(0) if all_ga is not None else None
     synth = cdap(out, synth, feature_override=getattr(_s0_res, 'best_features', None))
     travellers = synth[synth['CDAP'].isin(['M', 'N'])].copy()

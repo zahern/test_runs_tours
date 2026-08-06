@@ -362,8 +362,22 @@ def build_person_profiles(df: pd.DataFrame) -> pd.DataFrame:
     d['hh_spouse'] = rel.isin(['spouse', 'partner', 'defacto']).astype(np.int8)
     d['hh_parent'] = rel.isin(['parent']).astype(np.int8)
 
-    if 'WFHDAY' in d.columns:
-        d['wfh'] = d['WFHDAY'].map({True:1, False:0, 1:1, 0:0}).fillna(0).astype(np.int8)
+    if 'wfh' in d.columns:
+        # already assigned upstream (synth pop via wfh_telecommute.predict_wfh)
+        d['wfh'] = (pd.to_numeric(d['wfh'], errors='coerce').fillna(0) > 0).astype(np.int8)
+    elif 'WFHDAY' in d.columns:
+        # bool / 0-1 int / 'Y'/'N' — coerce robustly (don't use .map({True:1,1:1}):
+        # Python folds True and 1 into one dict key and pandas fails to match int64)
+        _w = d['WFHDAY']
+        if _w.dtype == bool:
+            d['wfh'] = _w.astype(np.int8)
+        else:
+            _wn = pd.to_numeric(_w, errors='coerce')
+            if _wn.notna().any():
+                d['wfh'] = (_wn.fillna(0) > 0).astype(np.int8)
+            else:
+                d['wfh'] = _w.astype(str).str.strip().str.lower().isin(
+                    ['1', 'y', 'yes', 'true', 't']).astype(np.int8)
     else:
         d['wfh'] = 0
 

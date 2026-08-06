@@ -5148,11 +5148,32 @@ def _apply_param_ordering(model, kind: str = 'mode') -> None:
         logger.debug(f"_apply_param_ordering skipped: {_oe}")
 
 
-def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=None):
+def _resolve_mode_structure(structure=None) -> str:
+    """Resolve the mode-choice structure decision to 'nested' or 'flat'.
+
+    STAGE5_MODE_STRUCTURE (or the `structure` arg): 'nested' (default two-level
+    Motor/NonMotor NL), 'flat'/'mnl'/'mxl'/'mixed' (no nesting — a plain MNL
+    graph; a mixed logit adds random coefficients on top of the flat graph), or
+    'auto'/'search' (fit BOTH and keep the better BIC in _run_segment — resolves
+    to nested for the primary build here). A flat graph is just the nested one
+    with every nest scale = 1, i.e. Larch's default when no nest nodes are added.
+    """
+    s = str(structure or os.environ.get('STAGE5_MODE_STRUCTURE', 'nested')).strip().lower()
+    if s in ('flat', 'mnl', 'mxl', 'mixed'):
+        return 'flat'
+    return 'nested'   # 'auto'/'search' build nested first; decided by BIC later
+
+
+def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=None,
+                      structure=None):
     """
     Build mode choice model for one segment.
     ActivitySim: one model per tour_purpose, shared nested logit structure,
     per-segment coefficient starting values via _apply_segment_coefficients.
+
+    `structure` (or STAGE5_MODE_STRUCTURE) makes the NEST a decision: 'nested'
+    (default NL) vs 'flat'/'mnl'/'mxl' (no nests → standard MNL/MXL). See
+    _resolve_mode_structure.
     """
     Mode = Dict(**{k: v for k, v in MODE_MAP.items()}).freeze()
     # Prefer JAX when available; _lx_model automatically falls back to numba
@@ -5171,53 +5192,63 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
     else:
         m = _build_mode_utility(m, Mode, segment)
 
-    # Nested logit: Motorised (DA / SR / Transit) and NonMotorised (Walk / Bike).
-    # Two-level tree only: the intermediate Car{DA,SR} nest (Mu_Car) was removed
-    # because it was not identified by the data (Mu_Car collapsed to its 0.10
-    # floor in edu with |t| < 0.7).  DA and SR now sit directly inside the
-    # Motorised nest.  Parameter names use _ not : to avoid sharrow
-    # expression-compiler issues.
-    NonMotor = m.graph.new_node(parameter="Mu_NonMotor", children=[Mode.Walk, Mode.Bike])
-    Motor    = m.graph.new_node(parameter="Mu_Motor",    children=[Mode.DA, Mode.SR, Mode.Transit])
-    m.graph.new_node(parameter="Mu_Root", children=[Motor, NonMotor])
+    # ── Mode-choice structure decision: nested logit vs flat MNL/MXL ─────────
+    _structure = _resolve_mode_structure(structure)
+    if _structure == 'flat':
+        # No nests: all five modes sit directly under the root → a standard
+        # multinomial logit (Larch's default when no nest nodes are added). A
+        # mixed logit is this same flat graph plus random coefficients
+        # (STAGE5_ENABLE_MXL / _estimate_mixed_logit). This is the "just do a
+        # standard MNL/MXL instead of the nested part" path.
+        logger.info(f"[{segment}] mode structure = FLAT MNL (no nesting)")
+    else:
+        # Nested logit: Motorised (DA / SR / Transit) and NonMotorised (Walk / Bike).
+        # Two-level tree only: the intermediate Car{DA,SR} nest (Mu_Car) was removed
+        # because it was not identified by the data (Mu_Car collapsed to its 0.10
+        # floor in edu with |t| < 0.7).  DA and SR now sit directly inside the
+        # Motorised nest.  Parameter names use _ not : to avoid sharrow
+        # expression-compiler issues.
+        NonMotor = m.graph.new_node(parameter="Mu_NonMotor", children=[Mode.Walk, Mode.Bike])
+        Motor    = m.graph.new_node(parameter="Mu_Motor",    children=[Mode.DA, Mode.SR, Mode.Transit])
+        m.graph.new_node(parameter="Mu_Root", children=[Motor, NonMotor])
 
-    # Mu_Root = 1 is the normalisation constraint for the nested logit.
-    # It must be locked (holdfast=True) - if it's free, the hessian is
-    # singular because the root scale is not separately identified.
-    # Mu_Motor and Mu_NonMotor are FIXED (holdfast) rather than estimated:
-    # freeing them produced censored at-bound estimates (Mu_NonMotor=1.0 cap,
-    # Mu_Car=0.10 floor) with |t| < 0.7, i.e. the nesting scales were not
-    # identified by the data.  Holding both at a fixed mid-range value keeps
-    # the intended motorised/non-motorised correlation structure without
-    # reporting a censored estimate as if it were structural.
-    # Override the fixed value via STAGE5_MU_FIXED_VALUE (default 0.8).
-    _mu_fixed = float(os.environ.get('STAGE5_MU_FIXED_VALUE', '0.8'))
-    m.set_value("Mu_Root",     1.0)
-    m.set_value("Mu_Motor",    _mu_fixed)
-    m.set_value("Mu_NonMotor", _mu_fixed)
-    try:
-        m.lock_value("Mu_Root",     1.0)      # holdfast
-        m.lock_value("Mu_Motor",    _mu_fixed)  # holdfast
-        m.lock_value("Mu_NonMotor", _mu_fixed)  # holdfast
-        # Keep bounds on the fixed Mu params for self-documentation and as a
-        # guard if anyone flips holdfast off later.  Floor raised 0.001 → 0.10:
-        # run06/23300124 models collapsed Mu_Car to the 0.001 bound, scaling
-        # in-nest utilities by 1/mu = 1000×.  That made the Hessian
-        # non-invertible (every model fell back to OPG SEs → unreliable
-        # p-values) and produced degenerate predicted shares (e.g. work DA 0.1%
-        # vs 75.5% observed).  mu < 0.1 has no plausible behavioural
-        # interpretation; at the 0.10 bound the model is still
-        # near-deterministic within the nest but numerically sane.
-        # Override via STAGE5_MU_LOWER_BOUND env var if estimation diagnostics
-        # show consistent boundary solutions (warnings about params "ended AT
-        # A BOUND").  Values below 0.05 are strongly discouraged.
-        _mu_floor = float(os.environ.get('STAGE5_MU_LOWER_BOUND', '0.10'))
-        _pf_set(m, "Mu_Motor",    "minimum", _mu_floor)
-        _pf_set(m, "Mu_Motor",    "maximum", 1.0)
-        _pf_set(m, "Mu_NonMotor", "minimum", _mu_floor)
-        _pf_set(m, "Mu_NonMotor", "maximum", 1.0)
-    except Exception as e:
-        logger.debug(f"Could not set nesting bounds: {e}")
+        # Mu_Root = 1 is the normalisation constraint for the nested logit.
+        # It must be locked (holdfast=True) - if it's free, the hessian is
+        # singular because the root scale is not separately identified.
+        # Mu_Motor and Mu_NonMotor are FIXED (holdfast) rather than estimated:
+        # freeing them produced censored at-bound estimates (Mu_NonMotor=1.0 cap,
+        # Mu_Car=0.10 floor) with |t| < 0.7, i.e. the nesting scales were not
+        # identified by the data.  Holding both at a fixed mid-range value keeps
+        # the intended motorised/non-motorised correlation structure without
+        # reporting a censored estimate as if it were structural.
+        # Override the fixed value via STAGE5_MU_FIXED_VALUE (default 0.8).
+        _mu_fixed = float(os.environ.get('STAGE5_MU_FIXED_VALUE', '0.8'))
+        m.set_value("Mu_Root",     1.0)
+        m.set_value("Mu_Motor",    _mu_fixed)
+        m.set_value("Mu_NonMotor", _mu_fixed)
+        try:
+            m.lock_value("Mu_Root",     1.0)      # holdfast
+            m.lock_value("Mu_Motor",    _mu_fixed)  # holdfast
+            m.lock_value("Mu_NonMotor", _mu_fixed)  # holdfast
+            # Keep bounds on the fixed Mu params for self-documentation and as a
+            # guard if anyone flips holdfast off later.  Floor raised 0.001 → 0.10:
+            # run06/23300124 models collapsed Mu_Car to the 0.001 bound, scaling
+            # in-nest utilities by 1/mu = 1000×.  That made the Hessian
+            # non-invertible (every model fell back to OPG SEs → unreliable
+            # p-values) and produced degenerate predicted shares (e.g. work DA 0.1%
+            # vs 75.5% observed).  mu < 0.1 has no plausible behavioural
+            # interpretation; at the 0.10 bound the model is still
+            # near-deterministic within the nest but numerically sane.
+            # Override via STAGE5_MU_LOWER_BOUND env var if estimation diagnostics
+            # show consistent boundary solutions (warnings about params "ended AT
+            # A BOUND").  Values below 0.05 are strongly discouraged.
+            _mu_floor = float(os.environ.get('STAGE5_MU_LOWER_BOUND', '0.10'))
+            _pf_set(m, "Mu_Motor",    "minimum", _mu_floor)
+            _pf_set(m, "Mu_Motor",    "maximum", 1.0)
+            _pf_set(m, "Mu_NonMotor", "minimum", _mu_floor)
+            _pf_set(m, "Mu_NonMotor", "maximum", 1.0)
+        except Exception as e:
+            logger.debug(f"Could not set nesting bounds: {e}")
 
     # Availability: ActivitySim builds availability explicitly and falls back
     # gracefully when fields are missing. Mirror that behavior here by checking
@@ -10356,13 +10387,56 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             logger.info(f"_run_segment [{segment}]: mode warm-start applied "
                         f"{_n_mode_warm}/{len(coef_warm_start)} params")
 
-    print("  Estimating mode model (nested logit)...")
+    print(f"  Estimating mode model ({_resolve_mode_structure()} structure)...")
     # Pre-fit: align ASC starting values with observed shares and reset any
     # Mu parameter that is at or near its boundary to a safe interior value.
     # This prevents the gradient from pulling Mu→1 during early iterations
     # before the behavioural parameters have a chance to converge.
     mode_mdl = _prefit_mode_model(mode_mdl, seg, persons, skims, segment)
     mode_mdl = _estimate(mode_mdl)
+
+    # ── Nest-structure decision: nested logit vs flat MNL ────────────────────
+    # STAGE5_MODE_STRUCTURE=auto/search fits the FLAT (MNL) version of the same
+    # spec and keeps whichever has the better BIC — the nest becomes a
+    # data-driven decision. An explicit 'flat'/'mnl'/'mxl' or the default
+    # 'nested' fixes the structure in _build_mode_model and skips this compare.
+    _mode_struct_env = str(os.environ.get('STAGE5_MODE_STRUCTURE', 'nested')).strip().lower()
+    _chosen_struct = 'flat' if _mode_struct_env in ('flat', 'mnl', 'mxl', 'mixed') else 'nested'
+    _struct_base_vars = (mode_feature_override if mode_feature_override is not None
+                         else (_mode_uec if _nosafety else None))
+    if _mode_struct_env in ('auto', 'search'):
+        try:
+            _flat_mdl = _build_mode_model(
+                dt_m, segment, custom_mode_vars=_struct_base_vars,
+                avail_vars_hint=(list(seg.columns) + list(persons.columns)),
+                structure='flat')
+            try:
+                _flat_mdl.doctor(repair_ch_av="+")
+            except Exception:
+                pass
+            if coef_warm_start:
+                _fidx = set(_flat_mdl.pf.index.tolist())
+                for _wn, _wv in coef_warm_start.items():
+                    if _wn in _fidx:
+                        try:
+                            _flat_mdl.set_value(_wn, float(_wv))
+                        except Exception:
+                            pass
+            _flat_mdl = _prefit_mode_model(_flat_mdl, seg, persons, skims, segment)
+            _flat_mdl = _estimate(_flat_mdl)
+            _bic_nest = _model_bic(mode_mdl)
+            _bic_flat = _model_bic(_flat_mdl)
+            if np.isfinite(_bic_flat) and _bic_flat < _bic_nest:
+                logger.info(f"[{segment}] nest decision: FLAT MNL wins "
+                            f"(BIC {_bic_flat:.1f} < nested {_bic_nest:.1f})")
+                mode_mdl = _flat_mdl
+                _chosen_struct = 'flat'
+            else:
+                logger.info(f"[{segment}] nest decision: NESTED wins "
+                            f"(BIC {_bic_nest:.1f} ≤ flat {_bic_flat:.1f})")
+        except Exception as _mse:
+            logger.warning(f"[{segment}] nest-structure decision failed ({_mse}); "
+                           "keeping nested logit")
 
     # ── Generic-vs-alternative-specific refit substitution ───────────────────
     # When a per-mode ASV block is collinear or jointly weak (e.g. the four
@@ -10374,11 +10448,12 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     _mode_base_vars = (mode_feature_override
                        if isinstance(mode_feature_override, list) else None)
     if _mode_base_vars is not None:
-        def _rebuild_mode_generic(_genes, _base=_mode_base_vars):
+        def _rebuild_mode_generic(_genes, _base=_mode_base_vars, _struct=_chosen_struct):
             _mvars = list(dict.fromkeys(list(_base) + list(_genes)))
             _mm = _build_mode_model(
                 dt_m, segment, custom_mode_vars=_mvars,
-                avail_vars_hint=(list(seg.columns) + list(persons.columns)))
+                avail_vars_hint=(list(seg.columns) + list(persons.columns)),
+                structure=_struct)   # keep the chosen nested/flat structure
             try:
                 _mm.doctor(repair_ch_av="+")
             except Exception:

@@ -598,15 +598,21 @@ def reset_feature_weakness() -> None:
 
 def _metacount_significance_penalty(rows: list) -> float:
     """
-    BIC penalty for parameters that are near-zero or statistically insignificant.
+    BIC penalty for parameters that are near-zero, statistically insignificant,
+    or UNIDENTIFIED (no usable standard error).
 
-    A parameter is penalised if EITHER:
+    A parameter counts as weak if ANY of:
+      - it is stuck / at a bound (optimizer found no usable gradient), OR
+      - it is UNIDENTIFIED — it has a coefficient value but its standard error is
+        NaN / inf / non-positive (singular Hessian, perfect collinearity), which
+        also makes its p-value NaN. This is the worst case: the term inflates the
+        model with a coefficient the data cannot actually pin down, so it must be
+        penalised, not ignored (previously such rows slipped through because
+        `p > thresh` is False when p is NaN), OR
       - |coef_value| < GA_SIG_COEF_ZERO  (default 0.01)  — effectively zero, OR
-      - p_value > GA_SIG_PVAL_THRESH     (default 0.10)  — not significant at 10%
+      - p_value > GA_SIG_PVAL_THRESH     (default 0.10)  — not significant at 10%.
 
-    Penalty = GA_SIG_PENALTY_WEIGHT * (n_weak / n_tested)
-
-    Both env vars are tunable without code changes.
+    Penalty = GA_SIG_PENALTY_WEIGHT * (n_weak / n_tested). Env-tunable.
     """
     if not rows:
         return 0.0
@@ -614,24 +620,35 @@ def _metacount_significance_penalty(rows: list) -> float:
     coef_zero = float(os.environ.get('GA_SIG_COEF_ZERO',      '0.01'))
     p_thresh  = float(os.environ.get('GA_SIG_PVAL_THRESH',    '0.10'))
 
+    def _f(r, *keys):
+        for k in keys:
+            if k in r:
+                try:
+                    return float(r.get(k))
+                except Exception:
+                    return np.nan
+        return np.nan
+
     tested = 0
     n_weak = 0
     for r in rows:
-        try:
-            v = float(r.get('value', np.nan))
-        except Exception:
-            v = np.nan
-        try:
-            p = float(r.get('p_value', np.nan))
-        except Exception:
-            p = np.nan
-        if not np.isfinite(v) and not np.isfinite(p):
+        v  = _f(r, 'value', 'coef', 'estimate')
+        p  = _f(r, 'p_value', 'pval', 'p')
+        se = _f(r, 'std_err', 'stderr', 'se')
+        # Holdfast / structural rows carry no value AND no inference — skip them.
+        if not np.isfinite(v) and not np.isfinite(p) and not np.isfinite(se):
             continue
         tested += 1
-        # Stuck/at-bound is stronger evidence of a bad specification than
-        # mere insignificance — a parameter pinned at its start value or at a
-        # bound means the optimizer found zero usable gradient for that term.
+        # Stuck/at-bound: pinned at start value or a bound → zero usable gradient.
         if r.get('stuck') or r.get('at_bound'):
+            n_weak += 1
+            continue
+        # Unidentified: has a value but no valid standard error → NaN/inf/<=0 SE,
+        # or a value with a NaN p-value (same root cause: SE couldn't be formed).
+        unidentified = np.isfinite(v) and (
+            (not np.isfinite(se)) or se <= 0.0 or (not np.isfinite(p))
+        )
+        if unidentified:
             n_weak += 1
             continue
         near_zero = np.isfinite(v) and abs(v) < coef_zero
@@ -1491,12 +1508,20 @@ def stage1_fitness_metacount(
 _GA_COMPLEXITY_PENALTY = max(0.0, float(os.environ.get('GA_COMPLEXITY_PENALTY', '1.0')))
 
 
-def _ols_bic(y: np.ndarray, X: np.ndarray) -> float:
+def _ols_bic(y: np.ndarray, X: np.ndarray, sig_penalty: bool = True) -> float:
     """Return –BIC/n for an OLS regression y ~ X (intercept already in X).
 
     The complexity penalty is scaled by GA_COMPLEXITY_PENALTY (default 1.0 =
     standard BIC); lower values keep more predictors in the Stage 2/3 search.
-    """
+
+    When sig_penalty and GA_SIG_PENALTY_WEIGHT>0, ALSO subtract a significance
+    penalty equal to GA_SIG_PENALTY_WEIGHT × (fraction of slope coefficients that
+    are insignificant or UNIDENTIFIED). OLS standard errors come nearly free from
+    (X'X)^-1; a slope is weak if |t| < GA_SIG_T_THRESH (default 1.96) OR its SE is
+    NaN / non-positive, and a perfectly collinear design (singular X'X) takes the
+    full penalty. This makes the fast GA search proxy avoid insignificant / rank-
+    deficient specs during selection, mirroring the metacount / final-fit penalty
+    (_metacount_significance_penalty)."""
     n, k = X.shape
     if n < k + 2:
         return -1e9
@@ -1510,7 +1535,27 @@ def _ols_bic(y: np.ndarray, X: np.ndarray) -> float:
         if rss <= 0 or not np.isfinite(rss):
             return -1e9
         bic = n * np.log(rss / n) + _GA_COMPLEXITY_PENALTY * k * np.log(n)
-        return -bic / n
+        score = -bic / n
+
+        if sig_penalty and k > 1:
+            w = float(os.environ.get('GA_SIG_PENALTY_WEIGHT', '0.10'))
+            if w > 0:
+                t_thresh = float(os.environ.get('GA_SIG_T_THRESH', '1.96'))
+                try:
+                    sigma2 = rss / max(n - k, 1)
+                    XtXinv = np.linalg.inv(X.T @ X)
+                    se = np.sqrt(np.clip(np.diag(XtXinv) * sigma2, 0.0, None))
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        tstat = np.where(se > 0, coef / se, np.nan)
+                    # slope coefficients only (index 0 is the intercept)
+                    ss, tt = se[1:], tstat[1:]
+                    if tt.size:
+                        weak = ((~np.isfinite(ss)) | (ss <= 0.0)
+                                | (~np.isfinite(tt)) | (np.abs(tt) < t_thresh))
+                        score -= w * (int(np.count_nonzero(weak)) / tt.size)
+                except np.linalg.LinAlgError:
+                    score -= w   # singular X'X (perfect collinearity) → full penalty
+        return score
     except Exception:
         return -1e9
 

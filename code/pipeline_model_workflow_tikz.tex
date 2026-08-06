@@ -105,20 +105,21 @@
   \draw[arrow] (\a) -- (\b);
 
 % ======================= DATA INPUTS (left column) =========================
-% Each input sits at the row it feeds, so every feed is a short horizontal arrow.
+% Each input sits on the SAME ROW as the box it feeds, so every feed is a short
+% horizontal arrow (no diagonals across the pre-day boxes).
 \node[data, left=of acc]  (land)  {\textbf{Land use}\\
    employment, OSM, size terms, ACDC};
-\node[data, above=of land] (synth){\textbf{Synthetic population}\\
+\node[data, left=of mob]  (synth) {\textbf{Synthetic population}\\
    persons, households, vehrd, bikes\\
    {\ttfamily build\_synth\_population.py}};
-\node[data, above=of synth] (hhts){\textbf{HHTS survey}\\
-   persons, tours, trips \textperiodcentered\ estimation data};
+\node[data, left=of cdap] (hhts)  {\textbf{HHTS survey}\\
+   persons, tours, trips\\ \textperiodcentered\ estimation data (all stages)};
 \node[data, left=of s5]   (skims) {\textbf{Skims (OMX)}\\
    time, cost, distance, safety};
 
 \draw[feed] (land.east)  -- (acc.west);
 \draw[feed] (synth.east) -- (mob.west);
-\draw[feed] (hhts.east)  -- ([yshift=3pt]cdap.west);
+\draw[feed] (hhts.east)  -- (cdap.west);
 \draw[feed] (skims.east) -- (s5.west);
 \draw[feed] (skims.east) |- (s6.west);
 
@@ -131,7 +132,7 @@
 \foreach \s in {loc,cdap,s1,s2,s3,s4,s5,s5b,s6}
   \draw[bus,<->] (\s.east) -- (\s.east -| busT);
 
-\node[ga, right=1.0cm of busT, yshift=-0.2cm, anchor=north west] (gac)
+\node[ga, right=2.2cm of s1.east] (gac)
   {\textbf{Search constraints}\\
    collinearity mutex, sign priors,\\
    require-one, random-coef policy\\
@@ -141,8 +142,8 @@
    parameter vector, ASC, decision rule\\
    {\ttfamily ga\_hypothesis\_testing.py}};
 \node[ga, below=of ga]  (gav) {\textbf{Validation / calibration}\\
-   BIC + significance penalty,\\
-   ASC rescale to observed shares};
+   BIC + significance penalty (incl.\\
+   NaN-SE / at-bound), ASC rescale};
 \draw[bus] (gac) -- (ga);
 \draw[bus] (ga)  -- (gav);
 \draw[bus,<->] (ga.west) -- (ga.west -| busT);

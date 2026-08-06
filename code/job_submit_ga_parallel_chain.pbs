@@ -23,6 +23,13 @@ RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
 RUN_TAG=${RUN_TAG:-ga_parallel_${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}
 CONDA_ENV=${CONDA_ENV:-zigenv}
 
+# On each submit, prune AUTO-named job-run dirs older than RUN_RETENTION_DAYS
+# days from RUN_ROOT (see the prune block below). Only auto-name patterns are
+# touched; hand-named experiment dirs (mv*, s5diag, …) are never removed.
+# RUN_PRUNE=0 disables; RUN_RETENTION_DAYS changes the age cutoff.
+RUN_PRUNE=${RUN_PRUNE:-1}
+RUN_RETENTION_DAYS=${RUN_RETENTION_DAYS:-2}
+
 # Estimation settings propagated to stage jobs.
 # Defaults are the aligned 371 + search-quality config (a bare
 #   qsub -v "RUN_TAG=xxx" job_submit_ga_parallel_chain.pbs
@@ -151,6 +158,31 @@ echo "Pred  select  : ${PRED_SELECT}   walltime=${PRED_WALLTIME}"
 echo "New-pop (507) : NEW_POP=${NEW_POP}  NEW_POP_DIR=${NEW_POP_DIR}"
 echo "Skims path    : ${PIPELINE_SKIMS_PATH}"
 echo "=========================================="
+
+# ── Prune old auto-named job runs + stale PBS log files ──────────────────────
+# On each submit, remove things older than RUN_RETENTION_DAYS days:
+#   (a) AUTO-generated run dirs in RUN_ROOT — ONLY the auto-name patterns
+#       (ga_parallel_* and sa_*_staged__*); deliberately-named experiment dirs
+#       (mv*, s5diag, …) are NEVER removed;
+#   (b) PBS stdout/stderr files (<name>.o<jobid> / <name>.e<jobid>, ≥5-digit id)
+#       in the submit dir (PBS_O_WORKDIR, else cwd).
+# The age gate means the run being submitted and any still-running job's files
+# (both brand-new) are never matched. Best-effort: `|| true` keeps a prune
+# hiccup from aborting the submit under `set -e`.
+if [ "${RUN_PRUNE}" = "1" ]; then
+  if [ -d "${RUN_ROOT}" ]; then
+    echo "Pruning auto-named runs older than ${RUN_RETENTION_DAYS} days in ${RUN_ROOT} ..."
+    for _pat in 'ga_parallel_*' 'sa_*_staged__*'; do
+      find "${RUN_ROOT}" -maxdepth 1 -mindepth 1 -type d -name "${_pat}" \
+           -mtime +${RUN_RETENTION_DAYS} -print -exec rm -rf {} + 2>/dev/null || true
+    done
+  fi
+  _logdir="${PBS_O_WORKDIR:-.}"
+  echo "Pruning PBS .o/.e log files older than ${RUN_RETENTION_DAYS} days in ${_logdir} ..."
+  find "${_logdir}" -maxdepth 1 -type f -name '*.[oe][0-9][0-9][0-9][0-9][0-9]*' \
+       -mtime +${RUN_RETENTION_DAYS} -print -delete 2>/dev/null || true
+  echo "=========================================="
+fi
 
 submit_stage() {
   local sid="$1"

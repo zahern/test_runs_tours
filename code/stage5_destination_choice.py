@@ -430,6 +430,34 @@ def _load_zone_centroids_cached() -> dict:
     return out
 
 
+def _impute_crash_matrix(mat, square_diag: bool = True):
+    """Crash-matrix imputation shared by the mode (`_build_od_dataset`) and
+    destination (`_dest_tree`) trees so both treat crash identically:
+      • off-diagonal 0 → MAX  (a 0 means "no crash record", not "risk-free");
+      • diagonal (intrazonal, origin→self) → MIN (shortest trip ⇒ least
+        accumulated exposure).
+    Gated by STAGE5_CRASH_ZERO_TO_MAX (default on). Operates on a float copy;
+    returns (imputed_matrix, info) where info = (n_offdiag_zeros, cmax, cmin) or
+    None when disabled / no positive crash values. `square_diag=False` skips the
+    diagonal handling (non-square or misaligned otaz/dtaz coords)."""
+    if os.environ.get('STAGE5_CRASH_ZERO_TO_MAX', '1') != '1':
+        return mat, None
+    m = np.asarray(mat, dtype=float).copy()
+    pos = m[m > 0]
+    if not pos.size:
+        return mat, None
+    cmax, cmin = float(pos.max()), float(pos.min())
+    _sq = bool(square_diag and m.ndim == 2 and m.shape[0] == m.shape[1])
+    off0 = (m == 0.0)
+    if _sq:
+        np.fill_diagonal(off0, False)          # exclude the diagonal from 0→max
+    n0 = int(off0.sum())
+    m[off0] = cmax                              # unmeasured off-diagonal → max
+    if _sq:
+        np.fill_diagonal(m, cmin)              # intrazonal → min
+    return m, (n0, cmax, cmin)
+
+
 def _dataset_var_names(ds_like) -> set:
     """Return variable/column names from xarray-like or pandas-like datasets."""
     # DataTree nodes often expose the underlying dataset as .ds/.dataset.
@@ -537,6 +565,23 @@ def _build_od_dataset(skims, skim_df: pd.DataFrame = None):
         od_xr = od_df.set_index(['otaz', 'dtaz']).to_xarray()
         # Fill any NaN (from missing OD pairs) with 0
         od_xr = od_xr.fillna(0.0)
+        # Crash imputation (mode-model / base od crash source, so the mode UEC
+        # c_crash_veh / c_crash_safety see the SAME densified crash as the dest
+        # model). Operate on the dense (otaz×dtaz) matrix so every pair is covered.
+        if 'CRASH' in od_xr:
+            _cm = np.asarray(od_xr['CRASH'].values, dtype=float)
+            _ot = np.asarray(od_xr['otaz'].values)
+            _dt = np.asarray(od_xr['dtaz'].values)
+            _square = (_cm.ndim == 2 and _cm.shape[0] == _cm.shape[1]
+                       and np.array_equal(_ot, _dt))
+            _cm2, _cinfo = _impute_crash_matrix(_cm, square_diag=_square)
+            if _cinfo is not None:
+                od_xr['CRASH'].values[...] = _cm2.astype(od_xr['CRASH'].dtype)
+                logger.info(
+                    f"_build_od_dataset: crash imputation (mode/base od) — "
+                    f"{_cinfo[0]} unmeasured pairs → max={_cinfo[1]:.4g}"
+                    + (f"; diagonal → min={_cinfo[2]:.4g}" if _square
+                       else "; diagonal skipped (otaz≠dtaz coords)"))
         logger.debug(
             f"_build_od_dataset: xr.Dataset {len(od_xr.data_vars)} matrices, "
             f"{len(od_xr.coords['otaz'])} zones"
@@ -2054,6 +2099,38 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
         ls_vals  = np.array(logsums)
         case_ids = list(tours['ptour_id'].astype(str))
 
+    # ── Optional GP-over-space smoothing of the mode logsum surface ───────────
+    # c_logsum goes dead (pval≈1.0) when the mode logsum is near-constant across
+    # destination zones. Smooth each case's zone-vector over the zone centroids
+    # with the same GP/kernel operator used for crash, so the accessibility
+    # surface varies smoothly across space and the coefficient can identify.
+    # OFF by default (STAGE5_LOGSUM_SMOOTH); precomputed operator ⇒ one matmul.
+    if os.environ.get('STAGE5_LOGSUM_SMOOTH', '0') == '1':
+        try:
+            from crash_smoothing import smoothing_operator
+            _cent = _load_zone_centroids_cached()
+            _lat = np.array([_cent.get(int(z), (np.nan, np.nan))[0] for z in zone_ids])
+            _lon = np.array([_cent.get(int(z), (np.nan, np.nan))[1] for z in zone_ids])
+            _ok = np.isfinite(_lat) & np.isfinite(_lon)
+            _lsv = np.asarray(ls_vals, dtype=float)
+            if int(_ok.sum()) > 5 and _lsv.ndim == 2 and _lsv.shape[1] == len(zone_ids):
+                _ls = float(os.environ.get('STAGE5_LOGSUM_SMOOTH_LS', '5.0'))
+                _noise = float(os.environ.get('STAGE5_LOGSUM_SMOOTH_NOISE', '1.0'))
+                _idx = np.where(_ok)[0]
+                _S = np.eye(len(zone_ids))                        # identity for zones w/o centroids
+                _S[np.ix_(_idx, _idx)] = smoothing_operator(
+                    _lat[_ok], _lon[_ok], length_scale_km=_ls, noise=_noise)
+                _var0 = float(_lsv.var())
+                _lsv = _lsv @ _S.T                                # smooth across the zone axis
+                ls_vals = _lsv.astype(np.asarray(ls_vals).dtype)
+                logger.info(f"_dest_tree: logsum GP-smoothed over {int(_ok.sum())} zones "
+                            f"(ℓ={_ls}km) — cross-zone var {_var0:.4g}→{float(_lsv.var()):.4g}")
+            else:
+                logger.warning("_dest_tree: logsum smoothing skipped (too few centroids "
+                               "or unexpected logsum shape)")
+        except Exception as _lse:
+            logger.warning(f"_dest_tree: logsum smoothing skipped ({_lse})")
+
     n_cases = len(case_ids)
     n_zones = len(zone_ids)
 
@@ -2101,33 +2178,18 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                     _mat[_oi, _di] = float(_c)
 
             # ── Impute the crash matrix: unmeasured→max, intrazonal→min ──────
-            # Crash exposure ACCUMULATES along a route (roughly with distance):
-            #   • A literal off-diagonal 0 means "no crash record for this OD
-            #     pair", NOT "risk-free" — every real OD trip carries exposure.
-            #     Treating unknowns as worst-case (max) is the conservative safety
-            #     stance and removes the sparse-zero mass that left c_crash a
-            #     near-constant, unidentified column (pval≈1.0).
-            #   • The diagonal (origin→self, intrazonal) is the SHORTEST trip, so
-            #     it accumulates the least exposure → set it to the MIN crash.
-            # The matrix is built over `od`'s zone set, so it is already the SAME
-            # shape as the time/skim matrix (N×N over the same zones). Toggle with
-            # STAGE5_CRASH_ZERO_TO_MAX=0.
-            if os.environ.get('STAGE5_CRASH_ZERO_TO_MAX', '1') == '1':
-                _pos = _mat[_mat > 0]
-                _cmax = float(_pos.max()) if _pos.size else 0.0
-                _cmin = float(_pos.min()) if _pos.size else 0.0
-                if _cmax > 0:
-                    _off0 = (_mat == 0.0)
-                    np.fill_diagonal(_off0, False)      # exclude the diagonal
-                    _n0 = int(_off0.sum())
-                    _mat[_off0] = _cmax                 # unmeasured off-diagonal → max
-                    np.fill_diagonal(_mat, _cmin)       # intrazonal → min
-                    logger.info(f"_dest_tree: crash imputation — {_n0} unmeasured OD "
-                                f"pairs → max={_cmax:.4g}; diagonal (intrazonal) → "
-                                f"min={_cmin:.4g}")
-                else:
-                    logger.warning("_dest_tree: crash matrix is all-zero — imputation "
-                                   "skipped (no crash source?)")
+            # Shared with _build_od_dataset (mode model) so both trees densify
+            # crash identically. The matrix is built over `od`'s zone set, so it
+            # is already the SAME shape as the time/skim matrix (N×N over the same
+            # zones). Toggle with STAGE5_CRASH_ZERO_TO_MAX=0.
+            _mat, _cinfo = _impute_crash_matrix(_mat, square_diag=True)
+            if _cinfo is not None:
+                logger.info(f"_dest_tree: crash imputation — {_cinfo[0]} unmeasured OD "
+                            f"pairs → max={_cinfo[1]:.4g}; diagonal (intrazonal) → "
+                            f"min={_cinfo[2]:.4g}")
+            elif os.environ.get('STAGE5_CRASH_ZERO_TO_MAX', '1') == '1':
+                logger.warning("_dest_tree: crash matrix is all-zero — imputation "
+                               "skipped (no crash source?)")
 
             _da = xr.DataArray(
                 _mat, dims=['otaz', 'dtaz'],

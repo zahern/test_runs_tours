@@ -87,6 +87,31 @@ def smooth_zone_field(values: np.ndarray, lat: np.ndarray, lon: np.ndarray,
     return gp_smooth_field(values, D, length_scale_km, noise)
 
 
+def smoothing_operator(lat: np.ndarray, lon: np.ndarray,
+                       length_scale_km: float = 5.0, noise: float = 1.0,
+                       method: str = 'gp') -> np.ndarray:
+    """Return the N×N spatial smoothing matrix S such that `S @ y` (or, for a
+    stack of fields, `Y @ S.T`) is the smoothed field over zone space. This lets
+    a whole (cases × zones) surface — e.g. the destination-choice mode logsum —
+    be smoothed across zones in one matmul with a precomputed operator.
+
+    GP posterior-mean operator: S = K (K + noise·I)⁻¹  (computed via a solve).
+    Nadaraya-Watson: S = row-normalised K. Falls back to NW if the solve fails."""
+    D = haversine_km(lat, lon)
+    K = gaussian_kernel(D, length_scale_km)
+    n = len(lat)
+    if method == 'nw':
+        denom = K.sum(axis=1, keepdims=True); denom[denom == 0] = 1.0
+        return K / denom
+    try:
+        A = K + float(noise) * np.eye(n)
+        # S = K A⁻¹; since K,A symmetric, S = solve(A, K).T
+        return np.linalg.solve(A, K).T
+    except np.linalg.LinAlgError:
+        denom = K.sum(axis=1, keepdims=True); denom[denom == 0] = 1.0
+        return K / denom
+
+
 def smooth_destination_crash(od_crash: pd.DataFrame, centroids: pd.DataFrame,
                              length_scale_km: float = 5.0, noise: float = 1.0,
                              agg: str = 'sum', method: str = 'gp',

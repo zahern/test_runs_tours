@@ -47,44 +47,30 @@ def _worker_mask(df: pd.DataFrame) -> np.ndarray:
 
 
 def _wfh_features(df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
-    """Feature matrix from columns present in BOTH HHTS and synth (0-filled if
-    absent) so the fitted coefficients transfer. Intercept added by the model."""
-    feats: list[str] = []
-    cols: list[np.ndarray] = []
-
+    """FIXED WFH feature set (absent columns fall back to a default → a constant
+    column the GA/BIC drops), so HHTS and synth always yield the same columns in
+    the same order — required for a GA-selected sel_idx_ to transfer from fit to
+    predict. Intercept added by the model. Includes home-zone accessibility
+    (transit/auto): better transit access & lower auto access nudge WFH."""
     def _num(name, default=0.0):
         return pd.to_numeric(df.get(name, pd.Series(default, index=df.index)),
                              errors='coerce').fillna(default).values.astype(float)
-
-    # income (higher → more WFH), standardised
-    _inc = _num('incp', 7.0)
-    cols.append((_inc - 7.0) / 4.0); feats.append('incp_z')
-    # part-time (less WFH than FT baseline)
-    if 'WORKSTAT' in df.columns:
-        cols.append((pd.to_numeric(df['WORKSTAT'], errors='coerce').fillna(0) == 2)
-                    .astype(float).values); feats.append('is_parttime')
-    # female (often higher WFH)
-    if 'sexp' in df.columns:
-        cols.append((pd.to_numeric(df['sexp'], errors='coerce').fillna(0) == 2)
-                    .astype(float).values); feats.append('is_female')
-    # occupation: managers/professionals (occp 1,2) WFH more; labourers/trades less
-    if 'occp' in df.columns:
-        _occ = pd.to_numeric(df['occp'], errors='coerce').fillna(0)
-        cols.append(_occ.isin([1, 2]).astype(float).values); feats.append('occ_prof')
-        cols.append(_occ.isin([7, 8]).astype(float).values); feats.append('occ_manual')
-    # industry: office/finance/IT/public WFH more; retail/health/agri less
-    if 'indp' in df.columns:
-        _ind = pd.to_numeric(df['indp'], errors='coerce').fillna(0)
-        cols.append(_ind.isin([10, 11, 12, 13, 14]).astype(float).values); feats.append('ind_office')
-        cols.append(_ind.isin([7, 8, 16, 17]).astype(float).values); feats.append('ind_frontline')
-    # age band (mid-career WFH more than young/old)
-    if 'age5p' in df.columns:
-        _age = pd.to_numeric(df['age5p'], errors='coerce').fillna(8)
-        cols.append(_age.between(6, 12).astype(float).values); feats.append('age_prime')
-
-    if not cols:
-        cols.append(np.zeros(len(df))); feats.append('_const0')
-    return np.column_stack(cols), feats
+    _occ = _num('occp', 0.0)
+    _ind = _num('indp', 0.0)
+    _age = _num('age5p', 8.0)
+    cols = [
+        ('incp_z',        (_num('incp', 7.0) - 7.0) / 4.0),
+        ('is_parttime',   (_num('WORKSTAT', 0.0) == 2).astype(float)),
+        ('is_female',     (_num('sexp', 1.0) == 2).astype(float)),
+        ('occ_prof',      np.isin(_occ, [1, 2]).astype(float)),
+        ('occ_manual',    np.isin(_occ, [7, 8]).astype(float)),
+        ('ind_office',    np.isin(_ind, [10, 11, 12, 13, 14]).astype(float)),
+        ('ind_frontline', np.isin(_ind, [7, 8, 16, 17]).astype(float)),
+        ('age_prime',     ((_age >= 6) & (_age <= 12)).astype(float)),
+        ('transit_acc',   _num('transit_acc', 0.0)),
+        ('auto_work_acc', _num('auto_work_acc', 0.0)),
+    ]
+    return np.column_stack([c for _, c in cols]), [n for n, _ in cols]
 
 
 def _sigmoid(z):
@@ -110,8 +96,13 @@ class WfhModel:
     def __init__(self):
         self.coef_: Optional[np.ndarray] = None      # includes intercept as [0]
         self.feature_names_: list[str] = []
+        self.sel_idx_: Optional[np.ndarray] = None   # GA-selected column indices
         self.wfhweek_mean_: float = 2.5              # mean WFH days/week among WFH-ers
         self.base_rate_: float = 0.0
+
+    def _sel(self, X):
+        X = np.asarray(X, float)
+        return X[:, self.sel_idx_] if self.sel_idx_ is not None else X
 
     def fit(self, X: np.ndarray, y: np.ndarray, l2: float = 1.0, n_iter: int = 50):
         n, k = X.shape
@@ -140,6 +131,7 @@ class WfhModel:
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         if self.coef_ is None:
             return np.full(len(X), self.base_rate_)
+        X = self._sel(X)
         Xb = np.column_stack([np.ones(len(X)), X])
         return _sigmoid(Xb @ self.coef_)
 
@@ -167,16 +159,48 @@ def estimate_wfh_model(hhts_persons: pd.DataFrame) -> WfhModel:
         return WfhModel()
 
     X, names = _wfh_features(work)
+    sel_idx = None
+    # GA hypothesis-test the feature subset by BIC (logistic IRLS is fast), like
+    # the stage models. Gate with GA_SEARCH_PREDAY=0.
+    if X.shape[1] > 2:
+        try:
+            from feature_search import ga_feature_select, preday_search_enabled
+            if preday_search_enabled():
+                _cap = int(os.environ.get('GA_SEARCH_PREDAY_SAMPLE', '2000'))
+                if len(y) > _cap:
+                    _ri = np.random.default_rng(0).choice(len(y), _cap, replace=False)
+                    _Xs, _ys = X[_ri], y[_ri]
+                else:
+                    _Xs, _ys = X, y
+
+                def _score(mask):
+                    cols = np.where(mask)[0]
+                    mm = WfhModel().fit(_Xs[:, cols], _ys)
+                    Xb = np.column_stack([np.ones(len(_ys)), _Xs[:, cols]])
+                    p = np.clip(_sigmoid(Xb @ mm.coef_), 1e-9, 1 - 1e-9)
+                    ll = float(np.sum(_ys * np.log(p) + (1 - _ys) * np.log(1 - p)))
+                    k = len(cols) + 1
+                    return (2.0 * ll - k * np.log(len(_ys))) / len(_ys)   # -BIC/n
+                mask, _ = ga_feature_select(
+                    _score, X.shape[1], names=names, seed=42, min_feats=1,
+                    pop_size=int(os.environ.get('GA_SEARCH_PREDAY_POP', '10')),
+                    n_gen=int(os.environ.get('GA_SEARCH_PREDAY_GEN', '8')))
+                sel_idx = np.where(mask)[0]
+        except Exception as _e:
+            logger.debug(f"WFH feature search skipped: {_e}")
+    Xf = X[:, sel_idx] if sel_idx is not None else X
+    sel_names = [names[i] for i in sel_idx] if sel_idx is not None else names
     m = WfhModel()
-    m.fit(X, y)
-    m.feature_names_ = names
+    m.fit(Xf, y)
+    m.sel_idx_ = sel_idx
+    m.feature_names_ = sel_names
     if 'WFHWEEK' in work.columns:
         wk = pd.to_numeric(work['WFHWEEK'], errors='coerce').fillna(0).clip(0, 7)
         _wfh_wk = wk[wk > 0]
         m.wfhweek_mean_ = float(_wfh_wk.mean()) if len(_wfh_wk) else 2.5
     logger.info(f"WFH model fit on {len(work)} HHTS workers: base WFH rate="
                 f"{m.base_rate_:.3f}, mean WFHWEEK|WFH={m.wfhweek_mean_:.1f}, "
-                f"{len(names)} features")
+                f"{len(sel_names)}/{len(names)} features kept: {sel_names}")
     return m
 
 

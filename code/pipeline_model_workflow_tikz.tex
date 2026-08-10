@@ -125,12 +125,14 @@
 \draw[feed] (skims.east) |- (s6.west);
 
 % ======================= GA WORKBENCH (right bus) ==========================
-% One vertical dashed bus spanning the GA-searched stages (loc .. s6); each of
-% those stubs to it, so there are no dangling connectors.
-\coordinate (busT) at ([xshift=1.1cm]loc.east);
+% One vertical dashed bus spanning EVERY estimated model (accessibility through
+% the demand stages); each stubs to it. Pre-day models (mobility, WFH) are
+% feature-searched by BIC via feature_search.py; usual-location & CDAP have their
+% own GA fitnesses; Stages 1-6 use the portfolio engine.
+\coordinate (busT) at ([xshift=1.1cm]acc.east);
 \coordinate (busB) at ([xshift=1.1cm]s6.east);
 \draw[bus,dash pattern=on 4pt off 3pt] (busT) -- (busB);
-\foreach \s in {loc,cdap,s1,s2,s3,s4,s5,s5b,s6}
+\foreach \s in {acc,mob,loc,wfh,cdap,seq,s1,s2,s3,s4,s5,s5b,s6}
   \draw[bus,<->] (\s.east) -- (\s.east -| busT);
 
 \node[ga, right=2.2cm of s1.east] (gac)
@@ -193,9 +195,12 @@
   \textcolor{green!50!black}{$\blacksquare$~duration / budget}\quad
   \textcolor{red!65}{$\blacksquare$~discrete choice}\quad
   \textcolor{gray!65}{$\blacksquare$~output / assignment}\\[2pt]
-  \textcolor{red!70}{red dashed} = GA hypothesis-testing bus (model family,
-  features, parameters, decision rule loaned to every GA-searched stage)\quad
+  \textcolor{red!70}{red dashed} = GA hypothesis-testing bus — every estimated
+  model is searched: pre-day (mobility, WFH) by BIC feature-search, usual-location
+  \& CDAP by their own GA fitnesses, Stages 1--6 by the portfolio engine.\quad
   \textcolor{blue!45}{blue dashed} = data feeds \& the skim-update loop.
+  The accessibility logsum feeds mobility, usual-locations, WFH, CDAP and
+  Stages 1--5 (see the SVG render for the logsum rail).
 };
 
 \end{tikzpicture}

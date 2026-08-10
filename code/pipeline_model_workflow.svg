@@ -1,0 +1,100 @@
+<svg viewBox="0 0 1160 1240" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
+<title id="ttl">SEQ ABM model workflow</title>
+<desc id="dsc">Pipeline with the GA hypothesis-testing bus covering every estimated model (pre-day through the demand stages) and the accessibility logsum threaded down through each part.</desc>
+<style>
+  .bx{fill:#ffffff; stroke:#c8cdd6; stroke-width:1.5;}
+  .t{fill:#1c2330; font-weight:650; font-size:15px;}
+  .s{fill:#5b6472; font-size:11.5px; font-family:ui-monospace,Menlo,Consolas,monospace;}
+  .blab{font-weight:700; font-size:13px;}
+  .a{stroke:#8a94a6; stroke-width:2; fill:none; marker-end:url(#ah);}
+  .f{stroke:#5b8def; stroke-width:1.6; stroke-dasharray:5 4; fill:none; marker-end:url(#af);}
+  .bus{stroke:#d1495b; stroke-width:1.8; stroke-dasharray:5 4; fill:none;}
+  .ls{stroke:#2a9d8f; stroke-width:1.8; fill:none; marker-end:url(#al);}
+  .lsrail{stroke:#2a9d8f; stroke-width:2.4; fill:none;}
+</style>
+<defs>
+  <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#8a94a6"/></marker>
+  <marker id="af" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#5b8def"/></marker>
+  <marker id="al" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2a9d8f"/></marker>
+</defs>
+
+<rect x="330" y="104" width="440" height="252" rx="10" fill="#8e7cc3" opacity="0.10"/>
+<rect x="330" y="372" width="440" height="120" rx="10" fill="#3aa6a0" opacity="0.10"/>
+<rect x="330" y="508" width="440" height="452" rx="10" fill="#d1495b" opacity="0.10"/>
+<rect x="330" y="976" width="440" height="120" rx="10" fill="#8a94a6" opacity="0.10"/>
+<text class="blab" fill="#8e7cc3" transform="translate(322,230) rotate(-90)" text-anchor="middle">1 - pre-day</text>
+<text class="blab" fill="#3aa6a0" transform="translate(322,432) rotate(-90)" text-anchor="middle">2 - day pattern</text>
+<text class="blab" fill="#d1495b" transform="translate(322,734) rotate(-90)" text-anchor="middle">3 - tour &amp; trip demand</text>
+<text class="blab" fill="#8a94a6" transform="translate(322,1036) rotate(-90)" text-anchor="middle">4 - outputs</text>
+
+<g>
+  <rect class="bx" x="30"  y="20" width="200" height="52" rx="8" stroke="#5b8def"/><text class="t" x="130" y="42" text-anchor="middle">HHTS survey</text><text class="s" x="130" y="60" text-anchor="middle">estimation data</text>
+  <rect class="bx" x="250" y="20" width="220" height="52" rx="8" stroke="#5b8def"/><text class="t" x="360" y="42" text-anchor="middle">Synthetic pop</text><text class="s" x="360" y="60" text-anchor="middle">build_synth_population</text>
+  <rect class="bx" x="640" y="20" width="200" height="52" rx="8" stroke="#5b8def"/><text class="t" x="740" y="42" text-anchor="middle">Land use</text><text class="s" x="740" y="60" text-anchor="middle">employment - ACDC</text>
+  <rect class="bx" x="860" y="20" width="230" height="52" rx="8" stroke="#5b8def"/><text class="t" x="975" y="42" text-anchor="middle">Skims (OMX)</text><text class="s" x="975" y="60" text-anchor="middle">time - cost - safety</text>
+</g>
+
+<g>
+  <rect class="bx" x="360" y="110" width="360" height="52" rx="8"/><text class="t" x="540" y="132" text-anchor="middle">Accessibility (lr2)</text><text class="s" x="540" y="150" text-anchor="middle">computes mode / dest logsums</text>
+  <rect class="bx" x="360" y="176" width="360" height="52" rx="8"/><text class="t" x="540" y="198" text-anchor="middle">Mobility attributes</text><text class="s" x="540" y="216" text-anchor="middle">mobility_models.py</text>
+  <rect class="bx" x="360" y="242" width="360" height="52" rx="8"/><text class="t" x="540" y="264" text-anchor="middle">Usual locations (lr3)</text><text class="s" x="540" y="282" text-anchor="middle">usual_location.py - work/school</text>
+  <rect class="bx" x="360" y="308" width="360" height="52" rx="8"/><text class="t" x="540" y="330" text-anchor="middle">WFH / telecommute (lr4)</text><text class="s" x="540" y="348" text-anchor="middle">wfh_telecommute.py</text>
+  <rect class="bx" x="360" y="384" width="360" height="52" rx="8"/><text class="t" x="540" y="406" text-anchor="middle">Stage 0 - CDAP + household</text><text class="s" x="540" y="424" text-anchor="middle">cdap.py - cdap_households.py</text>
+  <rect class="bx" x="360" y="450" width="360" height="52" rx="8"/><text class="t" x="540" y="472" text-anchor="middle">Tour-purpose sequencing</text><text class="s" x="540" y="490" text-anchor="middle">tour_sequence.py</text>
+  <rect class="bx" x="360" y="520" width="360" height="52" rx="8"/><text class="t" x="540" y="542" text-anchor="middle">Stage 1 - Activity frequency</text><text class="s" x="540" y="560" text-anchor="middle">stage1_activity_frequency.py</text>
+  <rect class="bx" x="360" y="582" width="360" height="52" rx="8"/><text class="t" x="540" y="604" text-anchor="middle">Stage 2 - Day budget B</text><text class="s" x="540" y="622" text-anchor="middle">stage2_day_duration.py</text>
+  <rect class="bx" x="360" y="644" width="360" height="52" rx="8"/><text class="t" x="540" y="666" text-anchor="middle">Stage 3 - Activity duration</text><text class="s" x="540" y="684" text-anchor="middle">MDCEV / AFT / RRM</text>
+  <rect class="bx" x="360" y="706" width="360" height="52" rx="8"/><text class="t" x="540" y="728" text-anchor="middle">Stage 4 - Timing</text><text class="s" x="540" y="746" text-anchor="middle">hybrid RUM-RRM</text>
+  <rect class="bx" x="360" y="768" width="360" height="52" rx="8"/><text class="t" x="540" y="790" text-anchor="middle">Stage 5 - Destination + mode</text><text class="s" x="540" y="808" text-anchor="middle">logsum - crash - GP smooth</text>
+  <rect class="bx" x="360" y="830" width="360" height="52" rx="8"/><text class="t" x="540" y="852" text-anchor="middle">Stage 5b - Trip stops</text><text class="s" x="540" y="870" text-anchor="middle">stage5b_trip_destination.py</text>
+  <rect class="bx" x="360" y="892" width="360" height="52" rx="8"/><text class="t" x="540" y="914" text-anchor="middle">Stage 6 - Trip mode</text><text class="s" x="540" y="932" text-anchor="middle">stage6_mode_choice.py</text>
+  <rect class="bx" x="360" y="982" width="360" height="52" rx="8"/><text class="t" x="540" y="1004" text-anchor="middle">Outputs + saved models</text><text class="s" x="540" y="1022" text-anchor="middle">*_models.pkl - *_coefficients.csv</text>
+  <rect class="bx" x="360" y="1044" width="360" height="52" rx="8"/><text class="t" x="540" y="1066" text-anchor="middle">DTA / assignment</text><text class="s" x="540" y="1084" text-anchor="middle">run_full_pipeline_dta_tested.py</text>
+</g>
+
+<g>
+  <path class="a" d="M540,162 V176"/><path class="a" d="M540,228 V242"/><path class="a" d="M540,294 V308"/>
+  <path class="a" d="M540,360 V384"/><path class="a" d="M540,436 V450"/><path class="a" d="M540,502 V520"/>
+  <path class="a" d="M540,572 V582"/><path class="a" d="M540,634 V644"/><path class="a" d="M540,696 V706"/>
+  <path class="a" d="M540,758 V768"/><path class="a" d="M540,820 V830"/><path class="a" d="M540,882 V892"/>
+  <path class="a" d="M540,944 V982"/><path class="a" d="M540,1034 V1044"/>
+</g>
+
+<g>
+  <path class="f" d="M740,72 V110 H720"/>
+  <path class="f" d="M360,60 H300 V176 H360"/>
+  <path class="f" d="M130,72 V384 H360"/>
+  <path class="f" d="M975,72 V794 H720"/>
+</g>
+
+<path class="lsrail" d="M540,162 C 300,180 300,300 300,360 V930"/>
+<g>
+  <path class="ls" d="M300,202 H360"/><path class="ls" d="M300,268 H360"/><path class="ls" d="M300,334 H360"/>
+  <path class="ls" d="M300,410 H360"/><path class="ls" d="M300,546 H360"/><path class="ls" d="M300,608 H360"/>
+  <path class="ls" d="M300,670 H360"/><path class="ls" d="M300,732 H360"/><path class="ls" d="M300,794 H360"/>
+</g>
+<text class="blab" fill="#2a9d8f" transform="translate(286,650) rotate(-90)" text-anchor="middle">accessibility logsum</text>
+
+<rect class="bx" x="820" y="470" width="280" height="120" rx="10" stroke="#d1495b" stroke-dasharray="6 4"/>
+<text class="t" x="960" y="508" text-anchor="middle" fill="#d1495b">GA hypothesis testing</text>
+<text class="s" x="960" y="530" text-anchor="middle">ga_hypothesis_testing.py</text>
+<text class="s" x="960" y="548" text-anchor="middle">ga_constraints.py</text>
+<text class="s" x="960" y="570" text-anchor="middle">portfolio: Bandit-SA / GA</text>
+<path class="bus" d="M770,136 V918"/>
+<g>
+  <path class="bus" d="M720,136 H770"/><path class="bus" d="M720,202 H770"/><path class="bus" d="M720,268 H770"/><path class="bus" d="M720,334 H770"/>
+  <path class="bus" d="M720,410 H770"/><path class="bus" d="M720,476 H770"/>
+  <path class="bus" d="M720,546 H770"/><path class="bus" d="M720,608 H770"/><path class="bus" d="M720,670 H770"/><path class="bus" d="M720,732 H770"/><path class="bus" d="M720,794 H770"/><path class="bus" d="M720,856 H770"/><path class="bus" d="M720,918 H770"/>
+  <path class="bus" d="M820,530 H770"/>
+</g>
+
+<path class="f" d="M360,1070 H150 V72"/>
+<text class="s" x="150" y="1000" text-anchor="middle" fill="#5b8def" transform="rotate(-90 150 1000)">updated skims loop</text>
+
+<g font-size="12.5px" fill="#5b6472">
+  <rect x="30" y="1150" width="14" height="14" rx="3" fill="#5b8def" opacity="0.5"/><text x="50" y="1162">data</text>
+  <line x1="110" y1="1157" x2="150" y2="1157" class="ls"/><text x="158" y="1162">accessibility logsum</text>
+  <line x1="310" y1="1157" x2="350" y2="1157" class="bus"/><text x="358" y="1162">GA hypothesis-testing bus (every model)</text>
+  <line x1="640" y1="1157" x2="680" y2="1157" class="f"/><text x="688" y="1162">data / skim loop</text>
+</g>
+</svg>

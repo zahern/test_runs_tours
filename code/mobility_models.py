@@ -73,6 +73,8 @@ class ZeroInflatedCount:
     log_alpha_: float = 0.0                  # NegBin log-dispersion
     gate_names_: list = field(default_factory=list)
     count_names_: list = field(default_factory=list)
+    sel_idx_: Optional[np.ndarray] = None    # GA-selected column indices into the
+                                             # FULL feature matrix (None = use all)
     n_: int = 0
     ll_: float = np.nan
 
@@ -113,7 +115,7 @@ class ZeroInflatedCount:
         pen = self.l2 * (np.sum(gamma[1:] ** 2) + np.sum(beta[1:] ** 2))
         return -(np.sum(ll) - pen)
 
-    def fit(self, Xg, Xc, y):
+    def fit(self, Xg, Xc, y, maxiter: int = 500):
         y = np.asarray(y, float)
         Xg = np.column_stack([np.ones(len(y)), np.asarray(Xg, float)])
         Xc = np.column_stack([np.ones(len(y)), np.asarray(Xc, float)])
@@ -131,15 +133,19 @@ class ZeroInflatedCount:
             return self
         res = _opt.minimize(self._neg_ll, theta0, args=(Xg, Xc, y, kg, kc),
                             method='L-BFGS-B',
-                            options={'maxiter': 500, 'ftol': 1e-9})
+                            options={'maxiter': int(maxiter), 'ftol': 1e-9})
         g, b, la = self._unpack(res.x, kg, kc)
         self.gamma_, self.beta_, self.log_alpha_ = g, b, float(la)
         self.n_, self.ll_ = len(y), float(-res.fun)
         return self
 
+    def _sel(self, X):
+        X = np.asarray(X, float)
+        return X[:, self.sel_idx_] if self.sel_idx_ is not None else X
+
     def _pi_mu(self, Xg, Xc):
-        Xg = np.column_stack([np.ones(len(Xg)), np.asarray(Xg, float)])
-        Xc = np.column_stack([np.ones(len(Xc)), np.asarray(Xc, float)])
+        Xg = np.column_stack([np.ones(len(Xg)), self._sel(Xg)])
+        Xc = np.column_stack([np.ones(len(Xc)), self._sel(Xc)])
         pi = np.clip(_PHI(Xg @ self.gamma_), 0, 1)
         mu = np.exp(np.clip(Xc @ self.beta_, -30, 30))
         return pi, mu
@@ -286,34 +292,45 @@ def _num(df, name, default=0.0):
 
 
 def _person_features(df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
-    """Shared person-level drivers (present in both HHTS and synth)."""
-    cols, names = [], []
-    cols.append((_num(df, 'incp', 7.0) - 7.0) / 4.0); names.append('incp_z')
-    cols.append((_num(df, 'vehrd', 1.0)));            names.append('hh_vehicles')
-    cols.append((_num(df, 'nprd', 2.0) - 2.0) / 2.0); names.append('hh_size_z')
-    cols.append((_num(df, 'age5p', 8.0) - 8.0) / 4.0); names.append('age_z')
-    if 'sexp' in df.columns:
-        cols.append((_num(df, 'sexp', 1.0) == 2).astype(float)); names.append('is_female')
-    if 'CARLICENCE' in df.columns:
-        cols.append((_num(df, 'CARLICENCE', 0.0) > 0).astype(float)); names.append('has_licence')
-    if 'WORKSTAT' in df.columns:
-        ws = _num(df, 'WORKSTAT', 0.0)
-        cols.append((ws == 1).astype(float)); names.append('is_ftworker')
-        cols.append((ws == 2).astype(float)); names.append('is_ptworker')
-    if 'STUDYING' in df.columns:
-        cols.append((_num(df, 'STUDYING', 0.0) > 0).astype(float)); names.append('is_student')
-    return np.column_stack(cols), names
+    """Shared person-level drivers. FIXED column set (absent columns fall back to
+    a default → a constant column the GA/BIC simply drops), so HHTS and synth
+    always yield the same columns in the same order. That alignment is required
+    for a GA-selected sel_idx_ to mean the same thing at fit and predict.
+
+    Includes home-zone accessibility logsums (transit/walk/bike/auto) from
+    compute_accessibility — a strong driver of habitual mode usage."""
+    ws = _num(df, 'WORKSTAT', 0.0)
+    cols = [
+        ('incp_z',            (_num(df, 'incp', 7.0) - 7.0) / 4.0),
+        ('hh_vehicles',       _num(df, 'vehrd', 1.0)),
+        ('hh_size_z',         (_num(df, 'nprd', 2.0) - 2.0) / 2.0),
+        ('age_z',             (_num(df, 'age5p', 8.0) - 8.0) / 4.0),
+        ('is_female',         (_num(df, 'sexp', 1.0) == 2).astype(float)),
+        ('has_licence',       (_num(df, 'CARLICENCE', 0.0) > 0).astype(float)),
+        ('is_ftworker',       (ws == 1).astype(float)),
+        ('is_ptworker',       (ws == 2).astype(float)),
+        ('is_student',        (_num(df, 'STUDYING', 0.0) > 0).astype(float)),
+        ('transit_acc',       _num(df, 'transit_acc', 0.0)),
+        ('walk_acc',          _num(df, 'walk_acc', 0.0)),
+        ('bike_acc',          _num(df, 'bike_acc', 0.0)),
+        ('auto_work_acc',     _num(df, 'auto_work_acc', 0.0)),
+        ('auto_nonmand_acc',  _num(df, 'auto_nonmand_acc', 0.0)),
+    ]
+    return np.column_stack([c for _, c in cols]), [n for n, _ in cols]
 
 
 def _household_features(df: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
-    cols, names = [], []
-    cols.append((_num(df, 'incp', 7.0) - 7.0) / 4.0);  names.append('hh_income_z')
-    cols.append((_num(df, 'nprd', 2.0) - 2.0) / 2.0);  names.append('hh_size_z')
-    cols.append(_num(df, 'n_workers', 1.0));           names.append('n_workers')
-    cols.append(_num(df, 'n_adults', 2.0));            names.append('n_adults')
-    if 'dwelling_density' in df.columns:
-        cols.append((_num(df, 'dwelling_density', 0.0)) / 1000.0); names.append('density_k')
-    return np.column_stack(cols), names
+    """FIXED household feature set (see _person_features for why)."""
+    cols = [
+        ('hh_income_z',  (_num(df, 'incp', 7.0) - 7.0) / 4.0),
+        ('hh_size_z',    (_num(df, 'nprd', 2.0) - 2.0) / 2.0),
+        ('n_workers',    _num(df, 'n_workers', 1.0)),
+        ('n_adults',     _num(df, 'n_adults', 2.0)),
+        ('density_k',    _num(df, 'dwelling_density', 0.0) / 1000.0),
+        ('transit_acc',  _num(df, 'transit_acc', 0.0)),
+        ('auto_work_acc', _num(df, 'auto_work_acc', 0.0)),
+    ]
+    return np.column_stack([c for _, c in cols]), [n for n, _ in cols]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,10 +387,45 @@ def attach_observed_counts(persons: pd.DataFrame, trips: pd.DataFrame) -> pd.Dat
 # ─────────────────────────────────────────────────────────────────────────────
 def _fit_zic(feats_fn, df, y, l2=1.0, negbin=True):
     X, names = feats_fn(df)
+    y = np.asarray(y, float)
+    sel_idx = None
+    # GA hypothesis-test the feature subset (by BIC) like the stage models, so the
+    # pre-day models are searched too. Gate with GA_SEARCH_PREDAY=0.
+    if _SCIPY_OK and X.shape[1] > 2:
+        try:
+            from feature_search import ga_feature_select, preday_search_enabled
+            if preday_search_enabled():
+                # Search with a FAST proxy fit (Poisson, few iterations) on a
+                # bounded SUBSAMPLE so hundreds of candidate evaluations stay cheap
+                # regardless of n; the winner is refit at full quality below.
+                _cap = int(os.environ.get('GA_SEARCH_PREDAY_SAMPLE', '2000'))
+                if len(y) > _cap:
+                    _ridx = np.random.default_rng(0).choice(len(y), _cap, replace=False)
+                    _Xs, _ys = X[_ridx], y[_ridx]
+                else:
+                    _Xs, _ys = X, y
+
+                def _score(mask):
+                    cols = np.where(mask)[0]
+                    mm = ZeroInflatedCount(negbin=False, l2=l2).fit(
+                        _Xs[:, cols], _Xs[:, cols], _ys, maxiter=30)
+                    n = max(mm.n_, 1)
+                    return (2.0 * mm.ll_ - mm.k_ * np.log(n)) / n   # -BIC/n, higher=better
+                _pop = int(os.environ.get('GA_SEARCH_PREDAY_POP', '10'))
+                _gen = int(os.environ.get('GA_SEARCH_PREDAY_GEN', '8'))
+                mask, _ = ga_feature_select(_score, X.shape[1], names=names,
+                                            seed=42, min_feats=1,
+                                            pop_size=_pop, n_gen=_gen)
+                sel_idx = np.where(mask)[0]
+        except Exception as e:
+            logger.debug(f"_fit_zic feature search skipped: {e}")
+    Xs = X[:, sel_idx] if sel_idx is not None else X
+    sel_names = [names[i] for i in sel_idx] if sel_idx is not None else names
     m = ZeroInflatedCount(negbin=negbin, l2=l2)
-    m.fit(X, X, np.asarray(y, float))
-    m.gate_names_ = names
-    m.count_names_ = names
+    m.fit(Xs, Xs, y)
+    m.sel_idx_ = sel_idx
+    m.gate_names_ = sel_names
+    m.count_names_ = sel_names
     return m
 
 

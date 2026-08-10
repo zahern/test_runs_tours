@@ -966,6 +966,36 @@ def assign_usual_locations(
         df[out_cols].to_csv(save_path, index=False)
         print(f"\n  Usual locations saved → {save_path}")
 
+        # ── persist the fitted work/school location-choice parameters ────────
+        # The location models are gravity/decay choice models; their fitted
+        # parameters are the (HHTS-calibrated) distance-decay coefficients and the
+        # attractor/capacity column sets. Saved so the work & school location
+        # models are inspectable/reusable like the other stage models.
+        try:
+            import pickle as _pkl
+            _d = os.path.dirname(save_path) or '.'
+            _loc_model = {
+                'work': {'decay_b': float(WORK_DECAY_B),
+                         'attractor_cols': WORK_ATTRACTOR_COLS,
+                         'capacity_cols': WORK_CAPACITY_COLS},
+                'school': {'decay_b_by_studying': dict(SCHOOL_DECAY_B),
+                           'max_ivt_min_by_studying': dict(SCHOOL_MAX_IVT_MIN),
+                           'capacity_cols': SCHOOL_CAPACITY_COLS,
+                           'hhts_calibrated': (locals().get('_calibrated_db') or {})},
+            }
+            with open(os.path.join(_d, 'usual_location_model.pkl'), 'wb') as _fh:
+                _pkl.dump(_loc_model, _fh)
+            _rows = [{'model': 'work', 'param': 'decay_b', 'value': float(WORK_DECAY_B)}]
+            for _sc, _b in sorted(SCHOOL_DECAY_B.items()):
+                _rows.append({'model': f'school(STUDYING={_sc})', 'param': 'decay_b',
+                              'value': float(_b)})
+            pd.DataFrame(_rows).to_csv(
+                os.path.join(_d, 'usual_location_coefficients.csv'), index=False)
+            print(f"  Location models saved → {_d}/usual_location_model.pkl "
+                  "(+ usual_location_coefficients.csv)")
+        except Exception as _le:
+            logger.warning(f"usual_location model save skipped: {_le}")
+
     # ── Validation: compare HHTS observed destinations to synth assignments ──
     _val_dir = plots_dir or (os.path.dirname(save_path) if save_path else 'saved_data')
     _validation = {}

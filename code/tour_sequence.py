@@ -231,6 +231,25 @@ def run_tour_sequences(hhts_tours: pd.DataFrame, synth: pd.DataFrame,
         for _ in range(max(len(obs.get(c, [])), 1)):
             gen[c].append(model.generate(c, rng))
     validate_sequences(model, obs, gen, out_dir)
+    # persist the fitted Markov model + its start/transition matrices
+    if out_dir:
+        try:
+            import pickle
+            _d = os.path.join(out_dir, 'mobility')
+            os.makedirs(_d, exist_ok=True)
+            with open(os.path.join(_d, 'tour_sequence_model.pkl'), 'wb') as fh:
+                pickle.dump(model, fh)
+            for _cdap, _st in model.start_.items():
+                pd.DataFrame({'purpose': model.states, 'p_start': _st}).to_csv(
+                    os.path.join(_d, f'tour_sequence_start_{_cdap}.csv'), index=False)
+            for _cdap, _tr in model.trans_.items():
+                pd.DataFrame(_tr, index=model.states,
+                             columns=model.states + ['<STOP>']).to_csv(
+                    os.path.join(_d, f'tour_sequence_trans_{_cdap}.csv'))
+            logger.info(f"tour_sequence model saved → {_d}/tour_sequence_model.pkl "
+                        "(+ start/transition CSVs)")
+        except Exception as _se:
+            logger.warning(f"tour_sequence model save skipped: {_se}")
     logger.info(f"tour_sequence: generated sequences for {int((synth['n_tours_seq']>0).sum())}"
                 f"/{len(synth)} persons (mean {synth['n_tours_seq'].mean():.2f} tours)")
     return synth

@@ -451,6 +451,7 @@ def run_mobility_models(hhts_persons: pd.DataFrame, synth: pd.DataFrame,
     return_models=True returns (synth, {ycol: ZeroInflatedCount}) so the caller
     can attach matching propensities to the HHTS estimation frame."""
     person_models: dict = {}
+    all_models: dict = {}          # {name: ZeroInflatedCount} for persistence
     if not _SCIPY_OK:
         logger.warning("mobility_models: scipy unavailable — skipping")
         return (synth, person_models) if return_models else synth
@@ -472,6 +473,7 @@ def run_mobility_models(hhts_persons: pd.DataFrame, synth: pd.DataFrame,
                 try:
                     m = est(hp, hp[ycol].values)
                     person_models[ycol] = m
+                    all_models[name] = m
                     yp = m.predict_expected(*[_person_features(hp)[0]] * 2)
                     ys = m.sample(_person_features(hp)[0], _person_features(hp)[0],
                                   np.random.default_rng(seed))
@@ -493,6 +495,7 @@ def run_mobility_models(hhts_persons: pd.DataFrame, synth: pd.DataFrame,
             continue
         try:
             m = est(hh_src, pd.to_numeric(hh_src[ycol], errors='coerce').fillna(0).values)
+            all_models[name] = m
             Xv = _household_features(hh_src)[0]
             yp = m.predict_expected(Xv, Xv)
             ys = m.sample(Xv, Xv, np.random.default_rng(seed))
@@ -509,7 +512,45 @@ def run_mobility_models(hhts_persons: pd.DataFrame, synth: pd.DataFrame,
                     synth = synth.merge(hh_out[[hhid, synth_col]], on=hhid, how='left')
         except Exception as e:
             logger.warning(f"mobility {name} failed: {e}")
+
+    # ── persist fitted models + a combined coefficients table ────────────────
+    if rep_dir and all_models:
+        save_mobility_models(all_models, rep_dir)
     return (synth, person_models) if return_models else synth
+
+
+def save_mobility_models(models: dict, out_dir: str) -> None:
+    """Pickle the fitted mobility models and write a combined coefficients CSV
+    (gate γ + count β + NegBin dispersion per model), so the mobility models are
+    inspectable/reusable like the stageN_models.pkl / cdap_model.pkl."""
+    import pickle
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, 'mobility_models.pkl'), 'wb') as fh:
+            pickle.dump(models, fh)
+        rows = []
+        for name, m in models.items():
+            if getattr(m, 'beta_', None) is None:
+                continue
+            gate = ['const'] + list(m.gate_names_)
+            cnt = ['const'] + list(m.count_names_)
+            for nm, v in zip(gate, m.gamma_):
+                rows.append({'model': name, 'part': 'gate(probit)', 'param': nm, 'value': float(v)})
+            for nm, v in zip(cnt, m.beta_):
+                rows.append({'model': name, 'part': 'count(log)', 'param': nm, 'value': float(v)})
+            if m.negbin:
+                rows.append({'model': name, 'part': 'dispersion', 'param': 'log_alpha',
+                             'value': float(m.log_alpha_)})
+            _bic = (m.k_ * np.log(max(m.n_, 1)) - 2 * m.ll_) if np.isfinite(m.ll_) else np.nan
+            rows.append({'model': name, 'part': 'fit', 'param': 'loglik', 'value': float(m.ll_)})
+            rows.append({'model': name, 'part': 'fit', 'param': 'bic', 'value': float(_bic)})
+        if rows:
+            pd.DataFrame(rows).to_csv(
+                os.path.join(out_dir, 'mobility_coefficients.csv'), index=False)
+        logger.info(f"mobility models saved → {out_dir}/mobility_models.pkl "
+                    f"(+ mobility_coefficients.csv, {len(models)} models)")
+    except Exception as e:
+        logger.warning(f"save_mobility_models failed: {e}")
 
 
 def _persons_to_households(persons: Optional[pd.DataFrame]):

@@ -211,8 +211,20 @@ def run_wfh(hhts_persons: pd.DataFrame, synth: pd.DataFrame,
         if save_path:
             try:
                 synth[['wfh', 'WFHWEEK']].describe().to_csv(save_path)
-            except Exception:
-                pass
+                # persist the fitted model + coefficients next to the summary
+                _d = os.path.dirname(save_path) or '.'
+                import pickle
+                with open(os.path.join(_d, 'wfh_model.pkl'), 'wb') as fh:
+                    pickle.dump(model, fh)
+                if model.coef_ is not None:
+                    names = ['const'] + list(model.feature_names_)
+                    pd.DataFrame({'param': names, 'value': model.coef_}).assign(
+                        base_rate=model.base_rate_,
+                        wfhweek_mean=model.wfhweek_mean_,
+                    ).to_csv(os.path.join(_d, 'wfh_coefficients.csv'), index=False)
+                logger.info(f"WFH model saved → {_d}/wfh_model.pkl (+ wfh_coefficients.csv)")
+            except Exception as _se:
+                logger.warning(f"WFH model save skipped: {_se}")
     except Exception as e:
         logger.warning(f"run_wfh failed ({e}); leaving wfh unset (defaults to 0)")
     return synth

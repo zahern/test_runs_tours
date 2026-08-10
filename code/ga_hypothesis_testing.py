@@ -2498,6 +2498,63 @@ class BanditFeatureSearcher:
         return best_ever, history, [best_ever]
 
 
+# Model-based (noisy, rugged fitness) stages → Bandit-SA, which combines SA's
+# noise-robust acceptance with Thompson-sampling feature learning. Smooth
+# fast-proxy stages → GA, whose crossover + reheat/mutation-floor exploit the
+# deterministic landscape. This is the "portfolio by landscape" default.
+_PORTFOLIO_BANDIT_STAGES = {
+    'stage0', 'cdap', 'stage1', 'stage5', 'stage5_mode', 'stage5_dest', 'stage51',
+    'usual_loc', 'usual_location',
+}
+_PORTFOLIO_GA_STAGES = {'stage2', 'stage3', 'stage4', 'stage23', 'stage6'}
+
+
+def _resolve_search_engine(stage_id, use_sim_anneal=False, use_bandit=False):
+    """Pick the search-engine class for a stage.
+
+    Precedence:
+      1. GA_ENGINE_<STAGE> env (ga|sa|bandit) — explicit per-stage override, where
+         <STAGE> is the upper-cased stage_id (e.g. GA_ENGINE_STAGE5_DEST=bandit).
+      2. GA_ENGINE (ga|sa|bandit|portfolio) — global. 'portfolio' routes each stage
+         by landscape type (Bandit-SA for noisy model-based stages, GA for the
+         smooth fast-proxy stages); it is the recommended default.
+      3. Legacy flags GA_USE_BANDIT / GA_USE_BANDIT_SA → bandit, GA_USE_SA → SA,
+         else the use_bandit / use_sim_anneal kwargs, else GA.
+
+    Plain SA is never chosen by 'portfolio' — it is strictly dominated by Bandit-SA
+    (same noise robustness plus feature learning); it stays reachable only via an
+    explicit GA_ENGINE=sa / GA_USE_SA=1 for backward compatibility.
+    """
+    _MAP = {'ga': GeneticAlgorithm, 'sa': SimulatedAnnealing,
+            'bandit': BanditFeatureSearcher, 'bandit_sa': BanditFeatureSearcher}
+    sid = str(stage_id or '').strip().lower()
+
+    # 1. explicit per-stage override
+    if sid:
+        per = os.environ.get(f'GA_ENGINE_{sid.upper()}', '').strip().lower()
+        if per in _MAP:
+            return _MAP[per]
+
+    # 2. global GA_ENGINE (incl. portfolio)
+    eng = os.environ.get('GA_ENGINE', '').strip().lower()
+    if eng == 'portfolio':
+        if sid in _PORTFOLIO_GA_STAGES:
+            return GeneticAlgorithm
+        if sid in _PORTFOLIO_BANDIT_STAGES:
+            return BanditFeatureSearcher
+        return GeneticAlgorithm            # unknown stage → GA (safe, diverse)
+    if eng in _MAP:
+        return _MAP[eng]
+
+    # 3. legacy flags / kwargs
+    if use_bandit or os.environ.get('GA_USE_BANDIT', '0').strip() == '1' \
+            or os.environ.get('GA_USE_BANDIT_SA', '0').strip() == '1':
+        return BanditFeatureSearcher
+    if use_sim_anneal or os.environ.get('GA_USE_SA', '0').strip() == '1':
+        return SimulatedAnnealing
+    return GeneticAlgorithm
+
+
 def _make_searcher(
     n_features:         int,
     fitness_fn:         Callable,
@@ -2531,15 +2588,7 @@ def _make_searcher(
     require_one_groups — and force_exclude vars are masked to 0 in a fitness
     wrapper (the searchers have no native banned-feature support).
     """
-    _force_sa     = os.environ.get('GA_USE_SA',     '0').strip() == '1'
-    _force_bandit = (os.environ.get('GA_USE_BANDIT',    '0').strip() == '1'
-                     or os.environ.get('GA_USE_BANDIT_SA', '0').strip() == '1')
-    if use_bandit or _force_bandit:
-        cls = BanditFeatureSearcher
-    elif use_sim_anneal or _force_sa:
-        cls = SimulatedAnnealing
-    else:
-        cls = GeneticAlgorithm
+    cls = _resolve_search_engine(stage_id, use_sim_anneal, use_bandit)
 
     feature_names = feature_names or []
     try:

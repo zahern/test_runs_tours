@@ -97,6 +97,7 @@
    {\ttfamily\textcolor{black!55}{stage6\_mode\_choice.py}}};
 \node[out,    below=of s6]   (outp){\textbf{Outputs} \textperiodcentered\
    {\ttfamily stage6\_output.csv} \textperiodcentered\ {\ttfamily trips\_for\_aimsun.csv}\\
+   fitted models saved per stage ({\ttfamily *\_models.pkl}, {\ttfamily *\_coefficients.csv})\\
    multilevel validation (trip / tour / work / edu)};
 
 % spine arrows (one clean chain)
@@ -158,14 +159,33 @@
 \draw[feed, red!45] (asg.west) -| ([xshift=-0.9cm]hhts.west |- skims)
       -- (skims.west) node[file, midway, above]{updated skims};
 
-% ============================ ENCLOSURE + LEGEND ============================
+% ==================== ENCLOSURE + PHASE BANDS (background) ===================
+% Draw the white frame FIRST, then the light phase bands ON TOP of it (both on
+% the background layer, so the spine nodes still sit in front of everything).
+% The bands group the spine into the four logical phases so the top-to-bottom
+% flow reads at a glance; each fits only its spine nodes (never the data / GA
+% columns) and carries a rotated phase title in the left gutter.
 \begin{scope}[on background layer]
   \node[fit=(hhts)(land)(skims)(acc)(outp)(asg)(gac)(ga)(gav),
-        inner sep=0.5cm, draw=black!25, fill=white, rounded corners=4pt] (frame) {};
+        inner sep=0.7cm, draw=black!25, fill=white, rounded corners=4pt] (frame) {};
+  \tikzset{band/.style={rounded corners=3pt, draw=#1!40, fill=#1!6},
+           bandlab/.style={rotate=90, font=\footnotesize\bfseries, text=#1!55!black}}
+  \node[band=purple, fit=(acc)(mob)(loc)(wfh)]          (bA) {};
+  \node[band=teal,   fit=(cdap)(seq)]                    (bB) {};
+  \node[band=red,    fit=(s1)(s2)(s3)(s4)(s5)(s5b)(s6)]  (bC) {};
+  \node[band=gray,   fit=(outp)(asg)]                    (bD) {};
+  \node[bandlab=purple] at ([xshift=-0.30cm]bA.west) {1 · long-run / pre-day};
+  \node[bandlab=teal]   at ([xshift=-0.30cm]bB.west) {2 · day pattern};
+  \node[bandlab=red]    at ([xshift=-0.30cm]bC.west) {3 · tour \& trip demand (GA)};
+  \node[bandlab=gray]   at ([xshift=-0.30cm]bD.west) {4 · outputs};
 \end{scope}
 
 \node[below=0.35cm of frame.south, anchor=north, text width=20cm, align=center,
       font=\small] {
+  \textbf{Flow:} data inputs $\rightarrow$ \textbf{1} long-run / pre-day
+  $\rightarrow$ \textbf{2} day pattern \& tour generation $\rightarrow$
+  \textbf{3} tour \& trip demand (Stages 1--6, GA-searched) $\rightarrow$
+  \textbf{4} outputs $\rightarrow$ DTA assignment $\rightarrow$ updated skims loop.\\[3pt]
   \textcolor{blue!70!black}{$\blacksquare$~data}\quad
   \textcolor{purple!60}{$\blacksquare$~pre-day / long-run}\quad
   \textcolor{teal!60!black}{$\blacksquare$~Stage 0 / tour generation}\quad

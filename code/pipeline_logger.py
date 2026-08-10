@@ -1109,12 +1109,13 @@ def cdap(out, synth, landuse=None, feature_override=None):
 
 
 @timer("Usual Locations — work & school zone")
-def usual_locations(synth, landuse, hhts_tours=None):
+def usual_locations(synth, landuse, hhts_tours=None, hhts_persons=None):
     return run_usual_locations(
         synth, landuse,
         skims=PIPELINE_SKIMS_PATH,
         save_path=os.path.join(OUT_DIR, 'usual_locations.csv'),
         hhts_tours=hhts_tours,
+        hhts_persons=hhts_persons,
         plots_dir=os.path.join(OUT_DIR, 'plots'),
     )
 
@@ -4549,6 +4550,64 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                 for feat in (_s0_summary['best_features'] or []):
                     _f.write(f"  {feat}\n")
             logger.info(f"GA stage0 (CDAP) text report → {_s0_txt}")
+
+            # Fit the final CDAP model with the GA-winning features and persist
+            # models + coefficients into the stage directory (mirrors stages 1-5).
+            if best_feats:
+                try:
+                    from cdap import estimate_cdap
+                    _s0_model_pkl = os.path.join(OUT_DIR, 'stage0_cdap_models.pkl')
+                    _s0_mdls = estimate_cdap(
+                        out['persons'],
+                        save_path=_s0_model_pkl,
+                        feature_override=list(best_feats),
+                    )
+                    # Also write a copy to ga_reports/ for completeness
+                    _s0_ga_pkl = os.path.join(save_dir, 'stage0_cdap_models.pkl')
+                    import shutil as _sh
+                    _sh.copy2(_s0_model_pkl, _s0_ga_pkl)
+                    # Coefficient CSV (Larch MNL .pf → standard coefficient table)
+                    _ga_save_stage_coef_csv(_s0_mdls, 'stage0_cdap', save_dir)
+                    _ga_save_stage_coef_csv(_s0_mdls, 'stage0_cdap', OUT_DIR)
+                    # HTML coefficient table
+                    _s0_html_path = os.path.join(OUT_DIR, 'stage0_cdap_coefficients.html')
+                    _s0_csv_path  = os.path.join(OUT_DIR, 'stage0_cdap_coefficients.csv')
+                    if os.path.exists(_s0_csv_path):
+                        import pandas as _pd_html
+                        _df_coef = _pd_html.read_csv(_s0_csv_path)
+                        def _p_style(p):
+                            try:
+                                pf = float(p)
+                                if pf < 0.001: return "color:#1a7a1a;font-weight:bold"
+                                if pf < 0.01:  return "color:#2e7d32;font-weight:bold"
+                                if pf < 0.05:  return "color:#558b2f"
+                                if pf < 0.10:  return "color:#f57c00"
+                                return "color:#b71c1c"
+                            except Exception:
+                                return ""
+                        rows_html = ""
+                        for _, row in _df_coef.iterrows():
+                            p = row.get('p_value', row.get('pval', float('nan')))
+                            style = _p_style(p)
+                            cells = "".join(
+                                f"<td style='{style if c in ('p_value','pval','t_stat','t_stat_opg') else ''}'>"
+                                f"{v}</td>" for c, v in row.items())
+                            rows_html += f"<tr>{cells}</tr>"
+                        headers = "".join(f"<th>{c}</th>" for c in _df_coef.columns)
+                        html_body = (
+                            f"<table border='1' style='border-collapse:collapse;font-size:0.9em'>"
+                            f"<thead><tr>{headers}</tr></thead><tbody>{rows_html}</tbody></table>")
+                        with open(_s0_html_path, 'w', encoding='utf-8') as _fh:
+                            _fh.write(
+                                f"<html><body><h2>GA stage0 CDAP coefficients</h2>"
+                                f"{html_body}</body></html>")
+                    logger.info(
+                        f"GA stage0 CDAP model → {_s0_model_pkl}  "
+                        f"coefs → {_s0_csv_path}")
+                except Exception as _s0_me:
+                    logger.warning(
+                        f"GA stage0 CDAP model fit/save failed (feature JSON + txt "
+                        f"already saved): {_s0_me}", exc_info=True)
         elif sid == 1:
             from stage1_activity_frequency import estimate_frequency_models
             models = estimate_frequency_models(
@@ -6619,7 +6678,8 @@ def main(filepath: str = None):
         except Exception as _tle:
             logger.debug(f"  Could not load HHTS tours for validation ({_tle})")
     # usual_locations must run BEFORE cdap so work/school zones are known
-    synth      = usual_locations(synth, landuse, hhts_tours=_hhts_tours_for_val)
+    synth      = usual_locations(synth, landuse, hhts_tours=_hhts_tours_for_val,
+                                  hhts_persons=_hhts_persons_for_val)
     synth      = wfh_assign(synth, _out_for_cdap)   # lr4: WFH before CDAP
     synth      = mobility_assign(synth, _out_for_cdap)   # zero-inflated mobility
     synth      = cdap(_out_for_cdap, synth)

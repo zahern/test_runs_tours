@@ -99,21 +99,39 @@ INDUSTRY_ATTRACTOR = {
 }
 
 EDU_ATTRACTOR_COLS = {
-    # STUDYING code → columns
-    1: {'Primary':  1.0, 'HSENROLL': 0.3, 'AGE0519': 0.15},     # primary school (local)
-    2: {'Secondary': 1.0, 'HSENROLL': 0.5, 'AGE0519': 0.2},     # secondary school
-    3: {'Education': 0.5, 'HSENROLL': 0.3, 'TOTEMP': 0.05},     # tertiary PT
-    4: {'Education': 1.0, 'HSENROLL': 0.5, 'TOTEMP': 0.1},      # tertiary FT
+    # STUDYING code → columns and weights
+    # Land-use columns: Primary/Secondary are facility-based enrollment counts,
+    # university/college are OSM POI counts for higher-ed campuses.
+    # AGE0519 = children aged 5-19 in zone (proxy for school-age population),
+    # HSENROLL = high-school enrollment count,
+    # TOTPOP = total population (baseline for zones with no recorded facilities).
+    # TOTEMP  = total employment (weak proxy for tertiary student attractor).
+    1: {'Primary': 1.0, 'HSENROLL': 0.25, 'AGE0519': 0.10, 'TOTPOP': 0.05},
+    2: {'Secondary': 1.0, 'HSENROLL': 0.40, 'AGE0519': 0.15, 'TOTPOP': 0.05},
+    3: {'university': 1.0, 'college': 0.8, 'Education': 0.3, 'TOTPOP': 0.05},
+    4: {'university': 1.0, 'college': 0.8, 'Education': 0.5, 'TOTPOP': 0.05},
 }
 
 # Decay coefficients (exp(-b * tt_minutes))
 # Primary → very local catchment, Secondary → wider, Tertiary → region-wide
+# Default values are fallbacks; preferred values are calibrated from HHTS
+# person-level SCHOOLZONE data via _calibrate_school_decay().
 WORK_DECAY_B   = 0.04   # ~30 min mean commute
 SCHOOL_DECAY_B = {
     1: 0.15,   # primary: ~7 min mean (strict local catchment)
     2: 0.10,   # secondary: ~10 min mean
     3: 0.04,   # tertiary PT: ~25 min mean (commuter students)
     4: 0.04,   # tertiary FT: ~25 min mean
+}
+
+# Per-study-level MAXIMUM travel time (minutes from AM skims) for school
+# assignments.  Zones beyond this threshold get zero probability — prevents
+# primary students being assigned 30+ km away.  0 = no hard constraint.
+SCHOOL_MAX_IVT_MIN = {
+    1: 20,    # primary:  ~6 km at 18 km/h (very local)
+    2: 35,    # secondary: ~11 km
+    3: 999,   # tertiary PT: no hard limit (region-wide)
+    4: 999,   # tertiary FT: no hard limit
 }
 
 # =============================================================================
@@ -272,9 +290,16 @@ def _sample_zone(attractor: np.ndarray,
 
 def _zone_probs(attractor: np.ndarray,
                 tt: np.ndarray,
-                decay_b: float) -> np.ndarray:
-    """Return normalized destination probabilities for one chooser segment."""
+                decay_b: float,
+                max_ivt_min: float = 999.0) -> np.ndarray:
+    """Return normalized destination probabilities for one chooser segment.
+
+    Zones with tt > max_ivt_min get zero probability (hard distance cap).
+    Set max_ivt_min=999 to disable the cap (all zones reachable).
+    """
     weights = attractor * np.exp(-decay_b * tt)
+    if max_ivt_min > 0 and max_ivt_min < 900:
+        weights = np.where(tt <= max_ivt_min, weights, 0.0)
     total = weights.sum()
     if total <= 0:
         return np.array([], dtype=np.float64)
@@ -519,6 +544,143 @@ def _assign_choosers_capacity(probs_dict: dict,
 
 
 # =============================================================================
+# DECAY CALIBRATION FROM HHTS
+# =============================================================================
+
+def _calibrate_school_decay_from_hhts(
+    hhts_persons: pd.DataFrame,
+    landuse: pd.DataFrame,
+    zone_ids: np.ndarray,
+    get_tt_fn,
+    logger,
+) -> dict:
+    """
+    Calibrate school decay parameters from HHTS person-level SCHOOLZONE data.
+
+    For each STUDYING code with enough observations, performs a 1-D
+    line search for the decay_b that maximises the log-likelihood of
+    assigned school zones under the gravity model:
+
+        P(z | o, s) ∝ edu_attractor(z, s) × exp(-b_s × tt(o, z))
+
+    Returns a dict {studying_code: decay_b} for codes with ≥10 observed
+    school zones.  Returns None if HHTS data is unavailable or missing
+    the SCHOOLZONE column.
+    """
+    if hhts_persons is None or hhts_persons.empty:
+        return None
+
+    # Find the school-zone column in HHTS persons
+    sz_col = next((c for c in ['SCHOOL_TAZ', 'SCHOOLZONE', 'SCHOOL_ZONE', 'staz']
+                   if c in hhts_persons.columns), None)
+    otaz_col = next((c for c in ['OTAZ', 'ORDER']
+                     if c in hhts_persons.columns), None)
+    studying_col = 'STUDYING'
+
+    if sz_col is None or otaz_col is None:
+        logger.info(
+            "_calibrate_school_decay: HHTS persons missing SCHOOLZONE/OTAZ — "
+            "using heuristic decay defaults"
+        )
+        return None
+
+    persons = hhts_persons.copy()
+    persons = persons[
+        persons[sz_col].notna() &
+        persons[otaz_col].notna() &
+        (persons[sz_col].astype(float) > 0) &
+        (persons[otaz_col].astype(float) > 0)
+    ]
+    persons['otaz_i'] = persons[otaz_col].astype(int)
+    persons['szone'] = persons[sz_col].astype(int)
+
+    # STUDYING column may not exist in all HHTS formats
+    if studying_col not in persons.columns:
+        # Try to infer from AGE / study status
+        logger.info(
+            "_calibrate_school_decay: no STUDYING column — "
+            "using heuristic decay defaults"
+        )
+        return None
+
+    persons['studying'] = persons[studying_col].fillna(4).astype(int)
+
+    zone_arr = np.asarray(zone_ids, dtype=int)
+    zone_to_idx = {z: i for i, z in enumerate(zone_arr)}
+
+    # For each studying code, build observed (otaz, szone) and calibrate
+    calibrated = {}
+    from scipy.optimize import minimize_scalar
+
+    for sc in sorted(persons['studying'].unique()):
+        sc_data = persons[persons['studying'] == sc]
+        if len(sc_data) < 10:
+            continue
+
+        # Build OTAZ → observed zone list
+        obs_otaz = sc_data['otaz_i'].values.astype(int)
+        obs_zone = sc_data['szone'].values.astype(int)
+
+        # Pre-compute attractor and TT for unique OTAZs
+        unique_otaz = np.unique(obs_otaz)
+        ott_map = {}
+        for oz in unique_otaz:
+            if oz not in zone_to_idx:
+                continue
+            try:
+                tt = get_tt_fn(int(oz))
+                att = _edu_attractor(landuse, zone_arr, studying=int(sc))
+                ott_map[oz] = (att, tt)
+            except Exception:
+                continue
+
+        # Only zones reachable per max constraint
+        max_ivt = SCHOOL_MAX_IVT_MIN.get(int(sc), 999)
+
+        def _neg_loglik(db):
+            db = float(db)
+            if db <= 0.001 or db >= 0.5:
+                return 1e9
+            ll = 0.0
+            for i in range(len(obs_otaz)):
+                oz, sz = int(obs_otaz[i]), int(obs_zone[i])
+                if oz not in ott_map or sz not in zone_to_idx:
+                    continue
+                att_i, tt_i = ott_map[oz]
+                weights = att_i * np.exp(-db * tt_i)
+                if max_ivt > 0 and max_ivt < 900:
+                    weights = np.where(tt_i <= max_ivt, weights, 0.0)
+                total = weights.sum()
+                if total <= 0:
+                    continue
+                probs = weights / total
+                p = probs[zone_to_idx[sz]]
+                if p <= 0:
+                    ll -= 10.0  # penalise zones with zero probability
+                else:
+                    ll += np.log(p)
+            return -ll
+
+        # Bracketed line search — heuristic range for decay_b
+        try:
+            res = minimize_scalar(
+                _neg_loglik,
+                bounds=(0.005, 0.30),
+                method='bounded',
+                options={'xatol': 0.001},
+            )
+            calibrated[int(sc)] = float(res.x)
+            logger.info(
+                f"_calibrate_school_decay: STUDYING={sc} n={len(sc_data)} "
+                f"decay_b={res.x:.4f} LL={-res.fun:,.1f}"
+            )
+        except Exception as e:
+            logger.debug(f"_calibrate_school_decay: STUDYING={sc} failed: {e}")
+
+    return calibrated if calibrated else None
+
+
+# =============================================================================
 # MAIN MODEL
 # =============================================================================
 
@@ -530,6 +692,7 @@ def assign_usual_locations(
     save_path: str = 'saved_data/usual_locations.csv',
     tt_col: str = 'SOVTOLL_TIME__AM',
     hhts_tours: pd.DataFrame = None,
+    hhts_persons: pd.DataFrame = None,
     plots_dir: str = None,
     assign_work: bool = True,
     assign_school: bool = True,
@@ -551,6 +714,8 @@ def assign_usual_locations(
     seed       : random seed for reproducibility
     save_path  : CSV output path
     hhts_tours : HHTS tours DataFrame for validation plots (optional)
+    hhts_persons : HHTS persons DataFrame with SCHOOLZONE / WORKZONE columns
+                   for decay calibration and validation (optional).
     plots_dir  : directory to save validation plots (defaults to save_path dir)
     enforce_capacity : if True, cap assigned workers per zone by TOTEMP and
                  students by school_enrol + Education (doubly-constrained
@@ -701,11 +866,27 @@ def assign_usual_locations(
         unique_stu_combos = student_df[[otaz_col, 'STUDYING']].drop_duplicates().values
         print(f"    {len(unique_stu_combos)} unique (home_zone, study_type) combinations")
 
+        # ── Calibrate school decay from HHTS person-level SCHOOLZONE ────
+        _calibrated_db = _calibrate_school_decay_from_hhts(
+            hhts_persons, landuse, zone_ids, get_tt, logger)
+        if _calibrated_db is not None:
+            _n_updated = 0
+            for _sc, _b in _calibrated_db.items():
+                _old = SCHOOL_DECAY_B.get(_sc, _b)
+                SCHOOL_DECAY_B[_sc] = _b
+                if abs(_old - _b) > 0.001:
+                    _n_updated += 1
+            print(f"    School decay calibrated from HHTS: {_n_updated} study-levels updated")
+            for _sc in sorted(_calibrated_db):
+                print(f"      STUDYING={_sc}: decay_b={_calibrated_db[_sc]:.4f} (was {SCHOOL_DECAY_B.get(_sc, 0.0):.4f})")
+
         for otaz, studying in unique_stu_combos:
             key = (int(otaz), int(studying))
             tt  = get_tt(int(otaz))
             att = _edu_attractor(lu, zone_ids, studying=int(studying))
-            school_probs[key] = _zone_probs(att, tt, SCHOOL_DECAY_B.get(int(studying), 0.06))
+            _db = SCHOOL_DECAY_B.get(int(studying), 0.06)
+            _mx = SCHOOL_MAX_IVT_MIN.get(int(studying), 999)
+            school_probs[key] = _zone_probs(att, tt, _db, max_ivt_min=_mx)
 
         # Sample per person from cached combo probabilities, subject to
         # per-zone school capacity (school_enrol + Education) when enabled.
@@ -791,7 +972,8 @@ def assign_usual_locations(
     if hhts_tours is not None and not hhts_tours.empty:
         try:
             _validation = _validate_usual_locations(
-                df, hhts_tours, is_worker, is_student, _val_dir)
+                df, hhts_tours, is_worker, is_student, _val_dir,
+                hhts_persons=hhts_persons)
         except Exception as _ve:
             logger.warning(f"  Usual location validation failed (non-fatal): {_ve}")
 
@@ -813,10 +995,14 @@ def _validate_usual_locations(
     is_worker,
     is_student,
     save_dir: str,
+    hhts_persons: pd.DataFrame = None,
 ) -> dict:
     """
     Compare synthetic WORK_TAZ / SCHOOL_TAZ assignments to observed HHTS
-    work and school trip destinations.
+    usual work and school locations.
+
+    Prefers person-level WORKZONE/SCHOOLZONE columns (more accurate) over
+    tour-level destinations (which may include multi-stop chains).
 
     Returns a dict with:
         work_plots   : list of saved plot paths
@@ -830,29 +1016,35 @@ def _validate_usual_locations(
     os.makedirs(save_dir, exist_ok=True)
     result = {'work_plots': [], 'school_plots': [], 'work_metrics': {}, 'school_metrics': {}}
 
-    if hhts_tours is None or hhts_tours.empty:
-        return result
+    # ── Try person-level SCHOOLZONE / WORKZONE first ────────────────────────
+    obs_work_person  = None
+    obs_school_person = None
+    if hhts_persons is not None and not hhts_persons.empty:
+        for wcol in ['WORK_TAZ', 'WORKZONE', 'WORK_ZONE', 'wtaz']:
+            if wcol in hhts_persons.columns:
+                obs_work_person = hhts_persons[wcol].dropna().astype(int)
+                obs_work_person = obs_work_person[obs_work_person > 0]
+                logger.info(f"_validate: using HHTS persons {wcol} for work (n={len(obs_work_person)})")
+                break
+        for scol in ['SCHOOL_TAZ', 'SCHOOLZONE', 'SCHOOL_ZONE', 'staz']:
+            if scol in hhts_persons.columns:
+                obs_school_person = hhts_persons[scol].dropna().astype(int)
+                obs_school_person = obs_school_person[obs_school_person > 0]
+                logger.info(f"_validate: using HHTS persons {scol} for school (n={len(obs_school_person)})")
+                break
 
-    # ── map HHTS tour purpose column ───────────────────────────────────────
-    # data_connect aggregates tours as 'tour_primary_purpose'; some paths
-    # use 'primary_purpose', 'main_purpose', 'TOURPURP', or 'purpose'.
-    purp_col = next((c for c in ['primary_purpose', 'tour_primary_purpose',
-                                  'main_purpose', 'TOURPURP', 'purpose']
-                     if c in hhts_tours.columns), None)
-    # destination zone column: 'tour_destination' is the data_connect name;
-    # 'DTAZ' / 'dtaz' / 'dest_zone' are used in other paths.
-    dtaz_col = next((c for c in ['DTAZ', 'dtaz', 'tour_destination', 'dest_zone']
-                     if c in hhts_tours.columns), None)
-
-    if purp_col is None or dtaz_col is None:
-        missing = []
-        if purp_col is None: missing.append('purpose')
-        if dtaz_col is None: missing.append('DTAZ/dest')
-        logger.warning(
-            f"_validate_usual_locations: HHTS tours missing {', '.join(missing)} col "
-            f"(available: {list(hhts_tours.columns[:10])}) — skipping"
-        )
-        return result
+    # ── Fall back to tour-level destinations ────────────────────────────────
+    if obs_work_person is None or obs_school_person is None:
+        if hhts_tours is None or hhts_tours.empty:
+            return result
+        purp_col = next((c for c in ['primary_purpose', 'tour_primary_purpose',
+                                      'main_purpose', 'TOURPURP', 'purpose']
+                         if c in hhts_tours.columns), None)
+        dtaz_col = next((c for c in ['DTAZ', 'dtaz', 'tour_destination', 'dest_zone']
+                         if c in hhts_tours.columns), None)
+        if purp_col is None or dtaz_col is None:
+            logger.warning("_validate: no person-level zones and HHTS tours missing purpose/DTAZ — skipping")
+            return result
 
     def _top_zones(series: pd.Series, n: int = 30):
         vc = series.dropna().astype(int).value_counts()
@@ -891,59 +1083,71 @@ def _validate_usual_locations(
         q = q / max(q.sum(), 1e-9)
         return float(np.sum(np.sqrt(p * q)))
 
-    # ── Work comparison ───────────────────────────────────────────────────
-    work_mask_hhts = hhts_tours[purp_col].astype(str).str.lower().isin(
-        ['work', 'full-time work', 'part-time work', 'workfulltime', 'workparttime'])
-    obs_work_dtaz = hhts_tours.loc[work_mask_hhts, dtaz_col]
+# ── Work comparison ───────────────────────────────────────────────────
+    if obs_work_person is not None:
+        obs_work = obs_work_person
+        _work_source = 'persons'
+    else:
+        work_mask_hhts = hhts_tours[purp_col].astype(str).str.lower().isin(
+            ['work', 'full-time work', 'part-time work', 'workfulltime', 'workparttime'])
+        obs_work = hhts_tours.loc[work_mask_hhts, dtaz_col]
+        _work_source = 'tours'
     syn_work_taz  = df.loc[is_worker, 'WORK_TAZ']
 
-    if obs_work_dtaz.notna().any() and syn_work_taz.gt(0).any():
-        obs_vc = _top_zones(obs_work_dtaz, 50)
+    if obs_work.notna().any() and syn_work_taz.gt(0).any():
+        obs_vc = _top_zones(obs_work, 50)
         syn_vc = _top_zones(syn_work_taz, 50)
         p = _plot_comparison(
             obs_vc, syn_vc,
-            title=f'Usual Work Location — HHTS Observed (n={obs_work_dtaz.notna().sum()}) vs Synth (n={syn_work_taz.gt(0).sum()})',
+            title=f'Usual Work Location — HHTS {_work_source} (n={obs_work.notna().sum()}) vs Synth (n={syn_work_taz.gt(0).sum()})',
             save_path=os.path.join(save_dir, 'val_usual_work_location.png'),
         )
         result['work_plots'].append(p)
         ov = _overlap_metric(obs_vc, syn_vc)
         result['work_metrics'] = {
             'bhattacharyya_overlap': round(ov, 4),
-            'n_obs': int(obs_work_dtaz.notna().sum()),
+            'source': _work_source,
+            'n_obs': int(obs_work.notna().sum()),
             'n_syn': int(syn_work_taz.gt(0).sum()),
             'n_obs_zones': int(obs_vc.shape[0]),
             'n_syn_zones': int(syn_vc.shape[0]),
         }
-        logger.info(f"  Work location validation: overlap={ov:.3f} "
-                    f"({int(obs_work_dtaz.notna().sum())} HHTS, "
+        logger.info(f"  Work location validation [{_work_source}]: overlap={ov:.3f} "
+                    f"({int(obs_work.notna().sum())} HHTS, "
                     f"{int(syn_work_taz.gt(0).sum())} synth)")
 
     # ── School comparison ─────────────────────────────────────────────────
-    school_mask_hhts = hhts_tours[purp_col].astype(str).str.lower().isin(
-        ['edu', 'education', 'primary school', 'secondary school',
-         'full-time tafe/uni', 'part-time tafe/uni', 'school', 'university'])
-    obs_school_dtaz = hhts_tours.loc[school_mask_hhts, dtaz_col]
+    if obs_school_person is not None:
+        obs_school = obs_school_person
+        _sch_source = 'persons'
+    else:
+        school_mask_hhts = hhts_tours[purp_col].astype(str).str.lower().isin(
+            ['edu', 'education', 'primary school', 'secondary school',
+             'full-time tafe/uni', 'part-time tafe/uni', 'school', 'university'])
+        obs_school = hhts_tours.loc[school_mask_hhts, dtaz_col]
+        _sch_source = 'tours'
     syn_school_taz  = df.loc[is_student, 'SCHOOL_TAZ']
 
-    if obs_school_dtaz.notna().any() and syn_school_taz.gt(0).any():
-        obs_vc = _top_zones(obs_school_dtaz, 50)
+    if obs_school.notna().any() and syn_school_taz.gt(0).any():
+        obs_vc = _top_zones(obs_school, 50)
         syn_vc = _top_zones(syn_school_taz, 50)
         p = _plot_comparison(
             obs_vc, syn_vc,
-            title=f'Usual School Location — HHTS Observed (n={obs_school_dtaz.notna().sum()}) vs Synth (n={syn_school_taz.gt(0).sum()})',
+            title=f'Usual School Location — HHTS {_sch_source} (n={obs_school.notna().sum()}) vs Synth (n={syn_school_taz.gt(0).sum()})',
             save_path=os.path.join(save_dir, 'val_usual_school_location.png'),
         )
         result['school_plots'].append(p)
         ov = _overlap_metric(obs_vc, syn_vc)
         result['school_metrics'] = {
             'bhattacharyya_overlap': round(ov, 4),
-            'n_obs': int(obs_school_dtaz.notna().sum()),
+            'source': _sch_source,
+            'n_obs': int(obs_school.notna().sum()),
             'n_syn': int(syn_school_taz.gt(0).sum()),
             'n_obs_zones': int(obs_vc.shape[0]),
             'n_syn_zones': int(syn_vc.shape[0]),
         }
-        logger.info(f"  School location validation: overlap={ov:.3f} "
-                    f"({int(obs_school_dtaz.notna().sum())} HHTS, "
+        logger.info(f"  School location validation [{_sch_source}]: overlap={ov:.3f} "
+                    f"({int(obs_school.notna().sum())} HHTS, "
                     f"{int(syn_school_taz.gt(0).sum())} synth)")
 
     return result
@@ -1125,6 +1329,7 @@ def run_usual_locations(
     seed: int = 42,
     save_path: str = 'saved_data/usual_locations.csv',
     hhts_tours: pd.DataFrame = None,
+    hhts_persons: pd.DataFrame = None,
     plots_dir: str = None,
     assign_work: bool = True,
     assign_school: bool = True,
@@ -1138,8 +1343,10 @@ def run_usual_locations(
     for travel-time-weighted zone sampling.  If None, falls back to
     proximity-only (zones sorted by ORDER distance from home zone).
 
-    hhts_tours : optional HHTS tours table for HHTS vs synth validation plots
-    plots_dir  : where to save validation plots; defaults to save_path directory
+    hhts_tours   : optional HHTS tours table for HHTS vs synth validation plots
+    hhts_persons : optional HHTS persons table for decay calibration
+                   (SCHOOLZONE/WORKZONE) and person-level validation.
+    plots_dir    : where to save validation plots; defaults to save_path directory
     enforce_capacity : passes through to assign_usual_locations (True → cap
                  workers by TOTEMP, students by school_enrol + Education).
                  Default None → CAPACITY_CONSTRAINED env var.
@@ -1164,6 +1371,7 @@ def run_usual_locations(
         synth, landuse, skim_flat=skim_flat,
         seed=seed, save_path=save_path,
         hhts_tours=hhts_tours,
+        hhts_persons=hhts_persons,
         plots_dir=plots_dir,
         assign_work=assign_work,
         assign_school=assign_school,

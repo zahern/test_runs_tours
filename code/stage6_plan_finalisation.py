@@ -767,30 +767,34 @@ def write_dynus_vehicle_dat(
     │  Record 1  (Basic data — one line)                               │
     │    Field 1  INT   Number of vehicles to load                     │
     │    Field 2  INT   Max destinations per vehicle (1 for O-D only)  │
-    │    Field 3  TEXT  Optional description                           │
     │                                                                  │
-    │  Record 2  (Header comment line — optional)                      │
+    │  Record 2  (Header comment line)                                 │
     │                                                                  │
     │  Record 3+ (Vehicle characteristics — one line per vehicle)      │
-    │    Field 1   I  w7   Vehicle ID (sequential from 1)              │
-    │    Field 2   I  w7   Upstream node of generation link (usec)     │
-    │    Field 3   I  w7   Downstream node of generation link (dsec)   │
-    │    Field 4   F  w8   Departure time in MINUTES (ascending order) │
-    │    Field 5   I  w6   User class: 1=unresponsive 2=SO 3=UE        │
-    │                      4=enroute-info 5=VMS                        │
-    │    Field 6   I  w6   Vehicle type: 1=car 2=truck 3=HOV           │
-    │    Field 7   I  w6   Occupancy: 1=LOV 2=HOV                      │
-    │    Field 8   I  w6   # nodes in path (1 if path.dat not used)    │
-    │    Field 9   I  w6   # destinations (incl. intermediate + final) │
-    │    Field 10  I  w6   En-route info: 0=none 1=available           │
-    │    Field 11  F  w8   Indifference band (min) for mode switch      │
-    │    Field 12  F  w8   Compliance rate 0.0–1.0 (class 4 only;     │
-    │                      set 0 for all other classes)                │
-    │    Field 13  I  w5   Origin zone number                          │
+    │    Field 1   veh_id     Vehicle ID (sequential from 1)           │
+    │    Field 2   usec       Upstream node of generation link         │
+    │    Field 3   dsec       Downstream node of generation link       │
+    │    Field 4   stime      Departure time in MINUTES (ascending)    │
+    │    Field 5   vehcls     5=passenger car 6=HOV 2=truck            │
+    │    Field 6   vehtype    1=car 2=truck                            │
+    │    Field 7   ioc        0=LOV 1=shared-ride                      │
+    │    Field 8   #ONode     Origin network node                      │
+    │    Field 9   #IntDe     Intermediate destinations (=max stops)   │
+    │    Field 10  info       En-route info: 0=none 1=available        │
+    │    Field 11  ribf       Indifference band (min) for mode switch   │
+    │    Field 12  comp       Compliance rate 0.0–1.0                  │
+    │    Field 13  izone      Origin zone number                       │
+    │    Field 14  Evac       0=non-evacuation vehicle                  │
+    │    Field 15  InitPos    Initial position (departure hour frac)    │
+    │    Field 16  VoT        Value of time ($/hour)                   │
+    │    Field 17  tFlag      0                                          │
+    │    Field 18  pArrTime   Planned arrival time (min)               │
+    │    Field 19  TP         Time period (1=AM peak)                  │
+    │    Field 20  IniGas     Initial gas (0)                           │
     │                                                                  │
     │  Record 4+ (Destinations — one line per destination per vehicle) │
-    │    Field 1   I  w12  Zone number of destination                  │
-    │    Field 2   F  w7   Activity duration at destination (min)      │
+    │    Field 1   dest_zone  Zone number of destination               │
+    │    Field 2   dwell      Activity duration at destination (min)   │
     │                      Always 0.00 for the FINAL destination        │
     └──────────────────────────────────────────────────────────────────┘
 
@@ -865,23 +869,26 @@ def write_dynus_vehicle_dat(
     # ucls:      user_class param for DA/SR, 1=unresponsive for Transit
     veh_type_arr  = mode_int.map({1: 1, 2: 1, 5: 2}).fillna(1).astype(int)
     occupancy_arr = mode_int.map({1: 1, 2: 2, 5: 1}).fillna(1).astype(int)
-    ucls_arr      = mode_int.map({1: user_class, 2: user_class, 5: 1}).fillna(1).astype(int)
 
-    # ── En-route info flag: only meaningful for user_class 4 ──────────────
-    # For class 1/2/3 set info=0, indiff=0.0, compliance=0.0
-    info_arr  = (ucls_arr == 4).astype(int)
-    ribf_arr  = np.where(ucls_arr == 4, indiff_band, 0.0)
-    comp_arr  = np.where(ucls_arr == 4, compliance_rate, 0.0)
+    # ribf/compliance: always 0.2000/1.0000 (standard DynusT defaults)
+    ribf_arr  = np.full(n_vehicles, 0.2000, dtype=float)
+    comp_arr  = np.full(n_vehicles, 1.0000, dtype=float)
 
     # ── Write file ────────────────────────────────────────────────────────
     with open(path, 'w') as f:
 
         # Record 1: vehicle count, max stops, description
-        f.write(f"{n_vehicles} {max_stops}   # {description}\n")
+        f.write(f"{n_vehicles:12d}{max_stops:12d}    # of vehicles in the file, Max # of STOPs\r\n")
 
         # Record 2: column header (comment)
-        f.write("# usec    dsec    stime usrcls vehtyp  ioc #path #dest  info"
-                "    ribf    comp   OZ\n")
+        f.write("        #   usec   dsec   stime vehcls vehtype ioc #ONode"
+                " #IntDe info ribf    comp   izone Evac InitPos"
+                "    VoT  tFlag pArrTime TP IniGas\r\n")
+
+        # Generate pseudo-random VOT (5-25) seeded for repeatability
+        _seed_vot = int(n_vehicles) % (2**31 - 1)
+        _rng = np.random.default_rng(_seed_vot)
+        _vot_arr = (5.0 + _rng.random(n_vehicles) * 20.0).round(4)
 
         for i in range(n_vehicles):
             otaz = int(otaz_arr.iloc[i])
@@ -891,37 +898,47 @@ def write_dynus_vehicle_dat(
             if origin_link_map and otaz in origin_link_map:
                 usec, dsec = origin_link_map[otaz]
             else:
-                usec = dsec = otaz   # fallback: centroid node proxy
+                usec = dsec = otaz   # fallback: zone number as node proxy
 
             stime   = float(dep_min.iloc[i])
-            ucls    = int(ucls_arr.iloc[i])
             vt      = int(veh_type_arr.iloc[i])
             occ     = int(occupancy_arr.iloc[i])
-            info    = int(info_arr.iloc[i])
             ribf    = float(ribf_arr[i])
             comp    = float(comp_arr[i])
+            vot     = float(_vot_arr[i])
 
-            # Vehicle characteristics line — exact field widths from Table 4-27
+            # vehcls: 5=passenger car (default), 6=HOV (occ>1), 2=truck (transit)
+            vehcls = 5 if vt == 1 else (6 if vt == 1 and occ > 1 else 2)
+            # ioc: 0=drive-alone, 1=shared-ride (not LOV occupancy)
+            ioc = 0 if occ == 1 else 1
+
             f.write(
-                f"{i+1:7d}"       # Field 1  veh_id         w7
-                f"{usec:7d}"      # Field 2  usec (upstream) w7
-                f"{dsec:7d}"      # Field 3  dsec (dnstream) w7
-                f"{stime:8.2f}"   # Field 4  stime (min)     w8(2)
-                f"{ucls:6d}"      # Field 5  user class      w6
-                f"{vt:6d}"        # Field 6  veh type        w6
-                f"{occ:6d}"       # Field 7  occupancy       w6
-                f"{n_path_nodes:6d}"  # Field 8  #path nodes  w6
-                f"{max_stops:6d}" # Field 9  #destinations   w6
-                f"{info:6d}"      # Field 10 info flag        w6
-                f"{ribf:8.4f}"    # Field 11 indiff band      w8(4)
-                f"{comp:8.4f}"    # Field 12 compliance rate  w8(4)
-                f"{otaz:5d}"      # Field 13 origin zone      w5
-                f"\n"
+                f"{i+1:9d}"          # veh_id
+                f"{usec:7d}"         # usec (upstream node of generation link)
+                f"{dsec:7d}"         # dsec (downstream node)
+                f"{stime:8.2f}"      # stime (departure minutes)
+                f"{vehcls:6d}"       # vehcls (5=passenger, 6=HOV, 2=truck)
+                f"{vt:6d}"           # vehtype (1=car, 2=truck)
+                f"{ioc:4d}"          # ioc (0=LOV, 1=shared)
+                f"{usec:5d}"         # #ONode (origin network node)
+                f"{max_stops:7d}"    # #IntDe (intermediate destinations)
+                f"{0:5d}"            # info (en-route info flag)
+                f"{ribf:8.4f}"       # ribf (indifference band, min)
+                f"{comp:8.4f}"       # comp (compliance rate)
+                f"{otaz:7d}"         # izone (origin zone number)
+                f"{0:5d}"            # Evac
+                f"{stime/60:.8f}"    # InitPos (departure hour fraction)
+                f"{vot:8.4f}"        # VoT (value of time, $)
+                f"{0:6d}"            # tFlag
+                f"{stime:9.2f}"      # pArrTime (planned arrival)
+                f"{1:3d}"            # TP (time period, 1=AM peek)
+                f"{0:7d}"            # IniGas (initial gas, 0)
+                f"\r\n"
             )
 
             # Destination record — one line per destination (max_stops=1 here)
             # Activity duration = 0.00 for the final destination (always)
-            f.write(f"{dtaz:12d}{0.0:7.2f}\n")
+            f.write(f"{dtaz:12d}{0.0:7.2f}\r\n")
 
     # ── Summary ───────────────────────────────────────────────────────────
     n_da      = int((mode_int == 1).sum())

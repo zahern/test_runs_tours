@@ -3380,6 +3380,38 @@ def _stage5_fitness_larch(
         dest_rows = _larch_coef_rows(dest_mdl)
         sig_pen   = (_metacount_significance_penalty(mode_rows)
                      + _metacount_significance_penalty(dest_rows)) / 2.0
+
+        # ── Mode model degeneracy sentinel ─────────────────────────────
+        # When >80% of FREE mode-model parameters are weak (p > 0.10, stuck,
+        # at-bound, or unidentified), the mode Hessian is likely singular
+        # and all SEs are from proxy fill.  A linear sig-penalty of ~0.10
+        # is invisible to the GA against BIC differences of 1-10, so the GA
+        # can't climb toward better-identified specs.  This sentinel adds a
+        # FLAT heavy penalty (tunable via GA_MODE_DEGEN_PENALTY, default 20)
+        # that is large enough to push degenerate genomes below viable
+        # candidates, forcing the search toward simpler / more-identifiable
+        # parameter subspaces.  Only triggers when at least 5 free-mode
+        # params exist (meaningful model, not a trivial holdfast-only spec).
+        try:
+            _mode_free = [r for r in mode_rows
+                          if not r.get('holdfast', False)
+                          and np.isfinite(r.get('value', float('nan')))
+                          and np.isfinite(r.get('p_value', float('nan')))]
+            _mode_n_free = len(_mode_free)
+            _mode_n_weak = sum(1 for r in _mode_free
+                               if (r.get('stuck')
+                                   or r.get('at_bound')
+                                   or r.get('p_value', 1.0) > 0.10))
+            if _mode_n_free >= 5 and _mode_n_weak > 0.8 * _mode_n_free:
+                _pen = float(os.environ.get('GA_MODE_DEGEN_PENALTY', '20.0'))
+                sig_pen += _pen
+                logger.debug(
+                    f"Stage5 fitness [{segment}]: mode degeneracy sentinel "
+                    f"({_mode_n_weak}/{_mode_n_free} weak) → +{_pen:.1f} penalty"
+                )
+        except Exception:
+            pass
+
         _update_feature_weakness(mode_rows, mode_vars)
         _update_feature_weakness(dest_rows, dest_vars)
 
@@ -3750,7 +3782,7 @@ def _cdap_fitness_sklearn(
     Xs = (X - mu) / sd
 
     try:
-        clf = LogisticRegression(multi_class='multinomial', solver='lbfgs',
+        clf = LogisticRegression(solver='lbfgs',
                                  max_iter=300, C=1e6)
         clf.fit(Xs, y)
         probs    = clf.predict_proba(Xs)

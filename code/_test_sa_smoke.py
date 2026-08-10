@@ -124,8 +124,7 @@ def _mnl_bic(df: pd.DataFrame, y_col: str, feats: list[str], n_alts: int = 6) ->
         if len(sub) < 20 or len(np.unique(y)) < 2:
             return -1e9
         X = sub[feats].astype(float).fillna(0).values
-        clf = LogisticRegression(max_iter=300, C=1e6,
-                                 multi_class='multinomial', solver='lbfgs')
+        clf = LogisticRegression(max_iter=300, C=1e6, solver='lbfgs')
         clf.fit(X, y)
         log_lik = clf.score(X, y) * len(y)   # approximate
         k = (n_alts - 1) * (len(feats) + 1)

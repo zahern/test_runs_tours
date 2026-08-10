@@ -2458,6 +2458,58 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     ca_df['walk_feasible'] = (ca_df['DISTWALK'] < WALK_MAX_KM).astype(np.float32)
     ca_df['bike_feasible'] = (ca_df['DISTBIKE'] < BIKE_MAX_KM).astype(np.float32)
 
+    # ── Polaris-style destination distance constraint ──────────────────────
+    # Hard-constrains the choice set to zones within DEST_MAX_IVT_MIN (env var,
+    # default 0 = no constraint).  Polaris limits destinations to those reachable
+    # within a time budget; this is the ESTIMATION analogue — only HHTS tours
+    # whose CHOSEN destination also lies within the constraint window are
+    # retained, ensuring the estimated model never learns from tours outside
+    # the reachable radius.  The DIST column is from the SOVTOLL_DIST__AM skim
+    # joined above; zero/invalid DIST is treated as sentinel (excluded).
+    #   DEST_MAX_IVT_MIN=0  → all zones in choice set (current behaviour)
+    #   DEST_MAX_IVT_MIN=30 → only zones within 30 auto-minutes
+    _max_ivt_min = float(os.environ.get('DEST_MAX_IVT_MIN', '0'))
+    if _max_ivt_min > 0 and 'DIST' in ca_df.columns:
+        _dist_valid = ca_df['DIST'].notna() & (ca_df['DIST'] > 0.001)
+        # Use 50 km/h average speed to convert minutes → km
+        _max_dist_km = _max_ivt_min * (50.0 / 60.0)
+        _in_range = _dist_valid & (ca_df['DIST'] <= _max_dist_km)
+        _n_before = len(ca_df)
+        # Keep rows within range OR intrazonal (always allowed)
+        _intra = (ca_df['intrazonal'] > 0) if 'intrazonal' in ca_df.columns else pd.Series(False, index=ca_df.index)
+        _keep = _in_range | _intra.values
+        # IMPORTANT: also keep rows where the ptour_id's chosen DTAZ matches
+        # this alt's zone, so the observed alternative is always in the set
+        # (required for consistent MLE under choice-set truncation).
+        _chosen_match = pd.Series(False, index=ca_df.index)
+        if 'DTAZ' in tour_df.columns:
+            _pids = ca_df['ptour_id'].values
+            _alts = ca_df['_altid_'].values.astype(int)
+            _dta_map = tour_df.copy()
+            _dta_map['ptour_id'] = _dta_map.index.map(str)
+            _dta_map_d = dict(zip(_dta_map.index, _dta_map['DTAZ'].astype(int)))
+            for _ii in range(len(_pids)):
+                _pid_i = _pids[_ii]
+                _alt_i = _alts[_ii]
+                try:
+                    _pid_int = int(_pid_i)
+                except (ValueError, TypeError):
+                    _pid_int = None
+                if _pid_int is not None and _pid_int in _dta_map_d:
+                    _chosen_match.iloc[_ii] = (_alt_i == _dta_map_d[_pid_int])
+        _keep = _keep | _chosen_match
+        ca_df = ca_df[_keep].reset_index(drop=True)
+        _n_after = len(ca_df)
+        if _n_before > _n_after:
+            logger.info(
+                f"_dest_tree: distance constraint DEST_MAX_IVT_MIN={_max_ivt_min:.0f} "
+                f"→ {_n_before} rows → {_n_after} rows "
+                f"({100*_n_after/max(_n_before,1):.1f}% retained, "
+                f"{_chosen_match.sum()} chosen-zones force-kept)"
+            )
+            print(f"  _dest_tree: DIST constraint {_max_ivt_min:.0f} min → "
+                  f"{_n_before}→{_n_after} rows ({100*_n_after/max(_n_before,1):.1f}% kept)")
+
     # ── Pre-join landuse (emp) columns into ca_df (keyed by DTAZ=zone) ───
     _lu_cols_to_join = [
         'size_term', 'acdc_aggl', 'acdc_comp',
@@ -2980,6 +3032,7 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                     or frozenset([c1, c2]) in {
                         frozenset(['acdc_comp', 'acdc_aggl']),
                         frozenset(['indp_finance_flag', 'occp_mgr']),
+                        frozenset(['transit_acc', 'transit_walk_acc']),
                     }
                 )
                 _pair_key = frozenset([c1, c2])
@@ -2992,7 +3045,13 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                     + ("" if _already_warned else " (further repeats of this pair logged at DEBUG)")
                 )
                 _WARNED_COLLINEAR_CA_PAIRS.add(_pair_key)
-                _collinear_ca_cols.add(to_holdfast)
+                if not _is_known:
+                    _collinear_ca_cols.add(to_holdfast)
+                else:
+                    logger.debug(
+                        f"_dest_tree: '{c1}' vs '{c2}' collinear — SKIPPING holdfast "
+                        f"(known duplicate skim, free to estimate)"
+                    )
                 # Detect the specific DISTWALK=DIST / DISTBIKE=DIST cases
                 if set([c1, c2]) & {'DISTWALK', 'DIST'} == {'DISTWALK', 'DIST'}:
                     _dist_walk_collinear = True
@@ -3008,8 +3067,11 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     "  DEST MODEL DATA ISSUE: DISTWALK (or DISTBIKE) == DIST in OMX.\n"
                     "  All three distance skims carry the same auto-network data.\n"
-                    "  Consequence: c_log_distwalk / c_log_distbike holdfasted at 0.\n"
-                    "  c_log_dist REMAINS FREE and active (primary distance term).\n"
+                    "  Consequence: c_log_distwalk / c_log_distbike are collinear with\n"
+                    "  c_log_dist but kept FREE — the estimator can capture the\n"
+                    "  different behavioural sensitivity to walk/bike vs auto distance\n"
+                    "  through the separate coefficients.  The nested-logit logsum\n"
+                    "  already provides an independent mode-accessibility path.\n"
                     "  Walk/bike feasibility flags are still in the model as binary\n"
                     "  indicators (c_walk_feasible, c_bike_feasible).\n"
                     "  Fix: supply a true pedestrian/cycling distance skim in the OMX.\n"
@@ -4895,6 +4957,16 @@ def _mode_spec_custom(m, Mode, custom_vars: list, segment: str = 'all'):
         'c_veh_da', 'c_veh_sr', 'c_noveh_transit', 'c_noveh_walk',
         'c_incp_da', 'c_incp_transit',
         'c_age_walk', 'c_age_bike',
+        # Zone-varying accessibility (breaks logsum-distance collinearity)
+        # Without these the mode utility for every alternative is purely f(DIST),
+        # so the inclusive-value logsum is also purely f(DIST) → c_logsum ≈ 0.
+        # ActivitySim's trip_destination always includes transit accessibility
+        # in the mode model logsum spec for this exact reason.
+        #   c_transit_access  – transit accessibility  (continuous, 371 zones)
+        #   c_cbd_*           – NOT always-included: CBD is binary (~5/371 zones
+        #                       true), making it near-constant in many segments.
+        #                       The GA can select these when useful.
+        'c_transit_access',
     }
 
     # ── 2. Person/tour term → candidate gate mapping ─────────────────────────
@@ -8068,18 +8140,63 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
     walk_logmin = xp.log(xp.clip(xp.asarray(walk_dist) * 12.0, 0.0, 1500.0) + 1.0)
     bike_logmin = xp.log(xp.clip(xp.asarray(bike_dist) * 4.0, 0.0, 1500.0) + 1.0)
 
-    # MNL utility per mode - shape (n_cases, n_zones)
+    # ── 6. Nested-logit inclusive value ──────────────────────────────────
+    # Compute mode utilities PER MODE, then aggregate them into nested-logit
+    # inclusive values (logsums) respecting the motor / non-motor nest
+    # structure (Mu_Motor, Mu_NonMotor, Mu_Root=1.0).  This matches the
+    # estimation graph in _build_mode_model and _nested_mode_probs.
+    #
+    # The old flat-MNL logsum (log(Σ exp(V))) overstates accessibility for
+    # modes inside a tight nest (e.g. DA/SR in Motor at Mu=0.8) and
+    # understates it for modes in a loose one, because it ignores the
+    # correlation captured by the nesting parameter.  ActivitySim computes
+    # nest-consistent logsums via its nest_spec and simple_simulate_logsums;
+    # this numpy fallback reconstructs that logic directly.
+    mu_motor    = float(max(_pv('Mu_Motor',    0.8), 0.01))
+    mu_nonmotor = float(max(_pv('Mu_NonMotor', 0.8), 0.01))
+    # NOTE: Mu_Root is always 1.0 (locked in _build_mode_model), so the root
+    # nest is the simple log-sum-exp of the two nest-level inclusive values
+    # without additional scaling.
+
+    # ── 6a. Linear utility per mode ─────────────────────────────────────────
+    # Mode utilities are linear in the travel-time variables ONLY (this is a
+    # zone-destination logsum, not a person-level mode choice, so person
+    # attributes are not available here). ASCs and time coefficients come from
+    # the fitted mode model; these match ModeVars above:
+    #   DA / SR : -β_t * auto_ivt_hours      (SVTOLL_TIME)
+    #   Transit : -β_t * transit_ivt_hours    (WLK_LOC_WLK_TOTIVT)
+    #   Walk    : -β_t * log(DISTWALK*12+1)  (5 km/h)
+    #   Bike    : -β_t * log(DISTBIKE*4+1)   (15 km/h)
     v_da      = c_ivt_auto  * auto_h
     v_sr      = c_ivt_auto  * auto_h     + asc_sr
+    v_transit = c_ivt_transit * trans_h  + asc_transit
     v_walk    = c_walk_time * walk_logmin + asc_walk
     v_bike    = c_bike_time * bike_logmin + asc_bike
-    v_transit = c_ivt_transit * trans_h  + asc_transit
 
-    # Stack to (n_cases, n_zones, n_modes) and compute log-sum-exp
-    utils = xp.stack([v_da, v_sr, v_walk, v_bike, v_transit], axis=2)
-    # subtract per-row max for numerical stability
-    utils -= utils.max(axis=2, keepdims=True)
-    ls_array = np.asarray(xp.log(xp.exp(utils).sum(axis=2)), dtype=np.float32)
+    def _nest_logsum(v_list, mu):
+        """Inclusive value for one nest: mu * log( Σ exp(V_i / mu) )."""
+        V = xp.stack(v_list, axis=2)                # (cases, zones, k)
+        Vm = V / float(mu)
+        row_max = xp.max(Vm, axis=2, keepdims=True)
+        row_max = xp.where(xp.isfinite(row_max), row_max, 0.0)
+        exp_v  = xp.exp(xp.clip(Vm - row_max, -500, 0))
+        totals = exp_v.sum(axis=2)
+        totals_safe = xp.where(totals > 0, totals, 1e-300)
+        return float(mu) * (xp.log(totals_safe) + row_max[..., 0])
+
+    # Motor nest: DA, SR, Transit
+    iv_motor    = _nest_logsum([v_da, v_sr, v_transit], mu_motor)
+    # NonMotor nest: Walk, Bike
+    iv_nonmotor = _nest_logsum([v_walk, v_bike],     mu_nonmotor)
+    # Root nest (Mu=1): simple log-sum-exp of the two nest inclusive values
+    iv_stack = xp.stack([iv_motor, iv_nonmotor], axis=2)
+    root_max = xp.max(iv_stack, axis=2, keepdims=True)
+    root_max = xp.where(xp.isfinite(root_max), root_max, 0.0)
+    root_exp = xp.exp(xp.clip(iv_stack - root_max, -500, 0))
+    root_sum = root_exp.sum(axis=2)
+    root_sum_safe = xp.where(root_sum > 0, root_sum, 1e-300)
+    ls_array = np.asarray(
+        root_max[..., 0] + xp.log(root_sum_safe), dtype=np.float32)
 
     pct_nonzero = float((ls_array != 0).mean()) * 100
     logger.info(f"_logsums_numpy_fallback: {n_cases}×{n_zones} logsums computed "
@@ -18397,24 +18514,19 @@ def write_vehicle_dat(
     persons: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
-    Write a vehicle.dat file for network simulation.
+    Write a diagnostic CSV export of motorised trips (NOT DynusT format).
 
-    One row per unique vehicle-trip (DA or SR).  Columns match the standard
-    DynusT / Cube Voyager vehicle record format:
+    One row per unique vehicle-trip (DA or SR).  This is a CSV for AUDITING
+    vehicle assignments — it is NOT the DynusT fixed-column vehicle.dat.
+    For DynusT loading use stage6_plan_finalisation.write_dynus_vehicle_dat().
 
+    Columns:
         vehicle_id, hhid, person_id, mode, OTAZ, DTAZ,
         STARTIME_min, ENDTIME_min, travtime_min, purpose
 
     SR trips that share a vehicle_id with a DA trip represent carpools -
     the vehicle is counted ONCE for network loading but both travellers
     are recorded.
-
-    For network-aware simulation:
-      • Each unique vehicle_id = one vehicle in the network
-      • DA + matched SR trips have the same vehicle_id → one vehicle,
-        multiple occupants (correct for capacity / congestion models)
-      • vehicle.dat total row count ≠ total car trips;
-        unique vehicle_id count = actual vehicles on network
     """
     car_modes = {1, 2}   # DA=1, SR=2
 
@@ -19361,15 +19473,20 @@ def run_stage5(
         logger.debug(f"print_stage5_dashboard failed: {_dash_e}")
         import traceback; logger.debug(traceback.format_exc())
 
-    # ── Write vehicle.dat ─────────────────────────────────────────────────
-    try:
-        _veh_path = os.path.join(
-            os.path.dirname(save_path) if save_path else 'saved_data',
-            'vehicle.dat'
-        )
-        write_vehicle_dat(plan, save_path=_veh_path, persons=persons)
-    except Exception as _vd_e:
-        logger.debug(f"write_vehicle_dat failed: {_vd_e}")
+    # ── Diagnostic CSV export (NOT the DynusT vehicle.dat) ───────────────
+    # The PROPER DynusT fixed-column vehicle.dat is written by
+    # stage6_plan_finalisation.write_dynus_vehicle_dat() — use that for DTA loading.
+    # This CSV is for debugging/auditing only.  Disabled by default to avoid
+    # accidental use as a DynusT input; enable via STAGE5_DEBUG_VEHICLE_CSV=1.
+    if os.environ.get('STAGE5_DEBUG_VEHICLE_CSV', '0') == '1':
+        try:
+            _veh_path = os.path.join(
+                os.path.dirname(save_path) if save_path else 'saved_data',
+                'vehicle_diag.csv'
+            )
+            write_vehicle_dat(plan, save_path=_veh_path, persons=persons)
+        except Exception as _vd_e:
+            logger.debug(f"write_vehicle_dat (debug CSV) failed: {_vd_e}")
 
     return plan, models
 

@@ -296,6 +296,8 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             'ASC_SR', 'ASC_Walk', 'ASC_Bike', 'ASC_Transit',
             'Mu_Motor', 'Mu_NonMotor', 'Mu_Root',
             'c_ivt_auto', 'c_ivt_transit', 'c_walk_time', 'c_bike_time',
+            # Zone-varying accessibility: breaks logsum-distance collinearity
+            'c_transit_access',
         ],
     },
     # Stage 5 — destination choice (Larch MNL, flat CA)

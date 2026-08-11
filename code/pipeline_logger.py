@@ -1045,6 +1045,25 @@ def cdap(out, synth, landuse=None, feature_override=None):
                                            ptype_col='ptype')
                 if os.environ.get('JOINT_TOURS_ADDITIVE', '0').strip() == '1':
                     _cfg.joint_tour_additive = True
+                # Estimate the household / joint-tour coefficients from HHTS
+                # (SearchLibrium) and SAVE them, instead of using the heuristic
+                # priors baked into HouseholdCdapConfig. Gate CDAP_HH_ESTIMATE=0
+                # to keep the priors. Falls back to priors on any failure.
+                if os.environ.get('CDAP_HH_ESTIMATE', '1').strip() != '0':
+                    try:
+                        from cdap_households_estimation import estimate_household_cdap as _est_hh
+                        from cdap import build_person_profiles as _bpp
+                        _hp = out.get('persons') if isinstance(out, dict) else None
+                        _ht = (out.get('tours') or out.get('trips')) if isinstance(out, dict) else None
+                        if _hp is not None and _ht is not None and len(_hp):
+                            _hp2 = _hp if 'ptype' in _hp.columns else _bpp(_hp)
+                            _cfg = _est_hh(_hp2, _ht, base=_cfg, out_dir=OUT_DIR)
+                            logger.info("CDAP household + joint-tour coefficients "
+                                        "estimated from HHTS and saved "
+                                        f"→ {OUT_DIR}/household_cdap_coefficients.csv")
+                    except Exception as _ehe:
+                        logger.warning(f"household CDAP estimation failed ({_ehe}); "
+                                       "using heuristic priors")
                 _before = synth['CDAP'].value_counts(normalize=True).to_dict() \
                     if 'CDAP' in synth.columns else {}
                 _coord = coordinate_household_cdap(synth, _cfg)

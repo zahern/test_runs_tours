@@ -35,6 +35,8 @@ Run (on real HHTS):  python cdap_households_estimation.py
 """
 from __future__ import annotations
 
+import os
+import pickle
 from typing import Optional
 
 import numpy as np
@@ -247,6 +249,11 @@ def estimate_cdap_coefficients(persons: pd.DataFrame, tours: pd.DataFrame,
         mnl.fit()
         coeff_names = list(getattr(mnl, 'coeff_names', []))
         coeff_est = np.asarray(getattr(mnl, 'coeff_est', []), dtype=float)
+        # standard errors, if SearchLibrium exposes them (attribute name varies)
+        _se = next((np.asarray(getattr(mnl, a), dtype=float)
+                    for a in ('coeff_se', 'stderr', 'std_err', 'se', 'coeff_stderr')
+                    if getattr(mnl, a, None) is not None), None)
+        coeff_se = dict(zip(coeff_names, _se)) if (_se is not None and len(_se) == len(coeff_names)) else {}
         fitted_loglik = float(getattr(mnl, 'loglik', float('nan')))
         conjugated = bool(getattr(mnl, 'converged', False))
         beta = dict(zip(coeff_names, coeff_est)) if len(coeff_names) else {}
@@ -267,7 +274,8 @@ def estimate_cdap_coefficients(persons: pd.DataFrame, tours: pd.DataFrame,
               f"({len(coeff_names)} params)")
         return {'dap_utility': dap_utility, 'interaction': interaction,
                 'accuracy': accuracy, 'framework': 'SearchLibrium',
-                'loglik': fitted_loglik, 'coeff_names': coeff_names}
+                'loglik': fitted_loglik, 'coeff_names': coeff_names,
+                'coeff_est': beta, 'coeff_se': coeff_se}
     # ── Fallback: sklearn multinomial MNL (SearchLibrium not installed) ─────
     from sklearn.linear_model import LogisticRegression
     clf = LogisticRegression(max_iter=500, C=5.0)   # lbfgs ⇒ multinomial by default
@@ -471,9 +479,58 @@ def estimate_joint_purpose(persons: pd.DataFrame, tours: pd.DataFrame,
 # ---------------------------------------------------------------------------
 # Orchestrator: HHTS → estimated HouseholdCdapConfig
 # ---------------------------------------------------------------------------
+def save_household_cdap_coefficients(dap: dict, freq: dict, part: dict, purp: dict,
+                                     out_dir: str) -> None:
+    """Write the estimated household-CDAP / joint-tour coefficients to
+    household_cdap_coefficients.csv (+ .pkl) so they are inspectable like the
+    other stage models: the M/N DAP utilities per person-type, the household
+    interaction coefficients (ActivitySim INTERACTION_COEFFICIENTS analogue), and
+    the joint-tour frequency / participation / purpose coefficients. Includes a
+    std_err / p_value column where the estimator exposed standard errors."""
+    from scipy.stats import norm as _norm
+    rows = []
+
+    def _row(model, param, value, se=np.nan):
+        se = float(se) if se is not None and np.isfinite(se) else np.nan
+        t = value / se if (np.isfinite(se) and se > 0) else np.nan
+        p = float(2.0 * _norm.sf(abs(t))) if np.isfinite(t) else np.nan
+        rows.append({'model': model, 'param': param, 'value': float(value),
+                     'std_err': se, 't_stat': t, 'p_value': p})
+
+    se_map = dap.get('coeff_se', {}) or {}
+    for pt, u in dap.get('dap_utility', {}).items():
+        _row('cdap_dap_utility', f'{pt}.M', u.get('M', 0.0), se_map.get(f'pt_{pt}.1'))
+        _row('cdap_dap_utility', f'{pt}.N', u.get('N', 0.0), se_map.get(f'pt_{pt}.2'))
+    for k, v in (dap.get('interaction', {}) or {}).items():
+        _row('cdap_interaction', k, v)
+    for k in ('joint_base_rate', 'joint_rate_per_child', 'joint_rate_per_adult',
+              'joint_rate_if_multi_vehicle'):
+        if k in freq:
+            _row('joint_frequency', k, freq[k])
+    for k in ('p_join_adult', 'p_join_child'):
+        if part.get(k) is not None:
+            _row('joint_participation', k, part[k])
+    for pur, u in (purp.get('utility', {}) or {}).items():
+        _row('joint_purpose_utility', pur, u)
+
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        df = pd.DataFrame(rows)
+        df.to_csv(os.path.join(out_dir, 'household_cdap_coefficients.csv'), index=False)
+        with open(os.path.join(out_dir, 'household_cdap_coefficients.pkl'), 'wb') as fh:
+            pickle.dump({'dap': dap, 'freq': freq, 'participation': part, 'purpose': purp}, fh)
+        print(f"[cdap-hh estimate] saved {len(df)} coefficients → "
+              f"{out_dir}/household_cdap_coefficients.csv")
+    except Exception as _e:
+        print(f"[cdap-hh estimate] save skipped: {_e}")
+
+
 def estimate_household_cdap(persons: pd.DataFrame, tours: pd.DataFrame,
-                            base: Optional[HouseholdCdapConfig] = None) -> HouseholdCdapConfig:
-    """Fit all four models and fold the coefficients into a HouseholdCdapConfig."""
+                            base: Optional[HouseholdCdapConfig] = None,
+                            out_dir: Optional[str] = None) -> HouseholdCdapConfig:
+    """Fit all four models and fold the coefficients into a HouseholdCdapConfig.
+    When out_dir is given, also save the estimated coefficients (incl. joint-tour)
+    to household_cdap_coefficients.csv/.pkl."""
     cfg = base or HouseholdCdapConfig()
     dap = estimate_cdap_coefficients(persons, tours, cfg)
     freq = estimate_joint_frequency(persons, tours, cfg)
@@ -496,6 +553,8 @@ def estimate_household_cdap(persons: pd.DataFrame, tours: pd.DataFrame,
           f"joint mean obs={freq['mean_observed']:.3f}  "
           f"p_join adult/child={part.get('p_join_adult'):.2f}/{part.get('p_join_child'):.2f}  "
           f"joint-purpose n={purp['n_obs']}")
+    if out_dir:
+        save_household_cdap_coefficients(dap, freq, part, purp, out_dir)
     return cfg
 
 

@@ -51,6 +51,16 @@ logger = logging.getLogger(__name__)
 CDAP_LABELS = {0: 'H', 1: 'N', 2: 'M'}
 CDAP_CODES  = {'H': 0, 'N': 1, 'M': 2}
 
+# Coefficient magnitude cap. The old tight ±10 pin created at-bound coefficients
+# under quasi-separation (a ptype/studying dummy perfectly predicting M/N/H),
+# which made the unpenalized Hessian singular → covariance failed → all
+# std-errs/p-values came back NaN. Elastic-net regularization
+# (elasticnet_objective) is already embedded, so the pin isn't needed for
+# identification; loosen it to a wide numerical guard (won't bind for real
+# coefficients) and let regularization + the SE fallback (_fill_larch_inference)
+# do the work. Set CDAP_COEF_CAP very large to effectively disable it.
+_CDAP_COEF_CAP = float(os.environ.get('CDAP_COEF_CAP', '25'))
+
 MANDATORY_ACTS = {
     'Full-time Work', 'Part-time Work', 'Work',
     'Primary School', 'Secondary School',
@@ -208,6 +218,10 @@ def _fill_larch_inference(model) -> None:
     except Exception:
         needs_fallback = True
 
+    if 'std_err_source' not in pf.columns:
+        pf['std_err_source'] = 'hessian'
+
+    # ── Fallback 1: OPG (outer product of casewise gradients) ────────────────
     if needs_fallback:
         try:
             scores = np.asarray(model.d_loglike_casewise(), dtype=float)
@@ -222,17 +236,55 @@ def _fill_larch_inference(model) -> None:
     if 'std_err_opg' in pf.columns:
         bad = pf['std_err'].isna() | (pf['std_err'] <= 0)
         pf.loc[bad, 'std_err'] = pf.loc[bad, 'std_err_opg']
+        pf.loc[bad & pf['std_err'].notna(), 'std_err_source'] = 'opg'
 
+    # ── Fallback 2: finite-difference DIAGONAL Hessian (real curvature) ──────
+    # A meaningful SE per free param from the loglike curvature — unlike the
+    # |value|×0.35 proxy, this actually discriminates identified from
+    # unidentified terms (a separated / at-bound param has ~0 curvature → a huge
+    # SE → correctly insignificant), which is what the significance penalty needs.
+    bad = pf['std_err'].isna() | (pf['std_err'] <= 0)
+    if bad.any():
+        try:
+            names = list(pf.index[bad])
+            ll0 = float(getattr(model, '_cached_ll', model.loglike()))
+            for nm in names:
+                try:
+                    v0 = float(pf.loc[nm, 'value'])
+                    if bool(pf.loc[nm].get('holdfast', False)):
+                        continue
+                    h = max(1e-3, abs(v0) * 1e-3)
+                    model.set_value(nm, v0 + h); lp = float(model.loglike())
+                    model.set_value(nm, v0 - h); lm = float(model.loglike())
+                    model.set_value(nm, v0)
+                    curv = -(lp - 2.0 * ll0 + lm) / (h * h)   # −d²LL/dθ² = info
+                    if np.isfinite(curv) and curv > 1e-8:
+                        pf.loc[nm, 'std_err'] = float(1.0 / np.sqrt(curv))
+                        pf.loc[nm, 'std_err_source'] = 'fd_hessian'
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug(f"CDAP finite-difference Hessian failed: {e}")
+
+    # ── Fallback 3: last-resort proxy (flagged so it can be down-weighted) ───
     bad = pf['std_err'].isna() | (pf['std_err'] <= 0)
     if bad.any():
         proxy = np.maximum(np.abs(pd.to_numeric(pf.loc[bad, 'value'], errors='coerce').fillna(0.0)) * 0.35, 0.15)
         pf.loc[bad, 'std_err'] = proxy.values
-        pf['std_err_source'] = pf.get('std_err_source', 'hessian')
         pf.loc[bad, 'std_err_source'] = 'proxy'
 
     with np.errstate(divide='ignore', invalid='ignore'):
         pf['t_stat'] = pd.to_numeric(pf['value'], errors='coerce') / pd.to_numeric(pf['std_err'], errors='coerce').replace(0, np.nan)
     pf['p_value'] = 2.0 * norm.sf(np.abs(pd.to_numeric(pf['t_stat'], errors='coerce')))
+
+    # PERSIST: model.pf returns a COPY in this Larch version, so writes above do
+    # NOT stick to the model. Stash the enriched frame so _print_larch_table /
+    # _save_cdap_html / the summary read the computed SEs instead of raw NaNs.
+    try:
+        model._inference_pf = pf
+    except Exception:
+        pass
+    return pf
 
 
 def build_person_profiles(df: pd.DataFrame) -> pd.DataFrame:
@@ -448,8 +500,16 @@ def prepare_cdap_data(persons: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _inf_pf(model):
+    """Enriched parameter frame with computed std_err/t_stat/p_value if
+    _fill_larch_inference stashed one (model.pf itself returns a fresh copy that
+    lacks those columns), else the raw model.pf."""
+    pf = getattr(model, '_inference_pf', None)
+    return pf if pf is not None else model.pf
+
+
 def _print_larch_table(model, label: str):
-    pf  = model.pf
+    pf  = _inf_pf(model)
     ll  = getattr(model, '_cached_ll', float('nan'))
     try:    rho2 = float(model.rho_sq_null())
     except: rho2 = float('nan')
@@ -470,7 +530,7 @@ def _save_cdap_html(mnl, mxl, path):
     if path is None: return
     def pf_html(model, title):
         if model is None: return f'<p><em>{title} — not available</em></p>'
-        pf = model.pf
+        pf = _inf_pf(model)
         ll = getattr(model, '_cached_ll', float('nan'))
         try:    rho2 = float(model.rho_sq_null())
         except: rho2 = float('nan')
@@ -571,7 +631,7 @@ def estimate_cdap(persons: pd.DataFrame,
         mnl.weight_co_var = 'weight'
     except (TypeError, AttributeError):
         pass
-    mnl.set_cap(10)
+    mnl.set_cap(_CDAP_COEF_CAP)
     # Elastic-net (L1+L2) penalty on the objective, mirroring
     # metacountregressor's penalized-likelihood estimation - see
     # larch_regularization.py. Restored before LL/covariance are read back
@@ -617,7 +677,7 @@ def estimate_cdap(persons: pd.DataFrame,
                 for feat in feat_cols:
                     mxl.utility_co[1] += lx.P(f'b_N_{feat}') * lx.X(f'person.{feat}')
                     mxl.utility_co[2] += lx.P(f'b_M_{feat}') * lx.X(f'person.{feat}')
-                mxl.set_cap(10)
+                mxl.set_cap(_CDAP_COEF_CAP)
                 # warm-start at the full-sample MNL estimates
                 for _p in mnl.pf.index:
                     try:
@@ -715,7 +775,7 @@ def _estimate_mxl_subsample(sub: pd.DataFrame,
     for feat in feat_cols:
         mnl.utility_co[1] += lx.P(f'b_N_{feat}') * lx.X(f'person.{feat}')
         mnl.utility_co[2] += lx.P(f'b_M_{feat}') * lx.X(f'person.{feat}')
-    mnl.set_cap(10)
+    mnl.set_cap(_CDAP_COEF_CAP)
     with elasticnet_objective(mnl):
         mnl.maximize_loglike(options={'ftol': 1e-7})
     _fill_larch_inference(mnl)
@@ -746,7 +806,7 @@ def _estimate_mxl_subsample(sub: pd.DataFrame,
 
     _print_larch_table(mxl, f"CDAP MXL (subsample n={len(sub)})")
 
-    pf = mxl.pf
+    pf = _inf_pf(mxl)
     return {
         'coef':    {name: float(pf.loc[name, 'value'])   for name in pf.index},
         'std_err': {name: float(pf.loc[name, 'std_err'])  for name in pf.index},

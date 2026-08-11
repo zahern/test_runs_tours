@@ -3740,21 +3740,21 @@ def _cdap_fitness(
     Returns McFadden rho┬▓ (higher = better).
     Fitness is penalised by number of active features (parsimony).
     """
-    # SEARCH fitness uses the sklearn multinomial logit by default: same
-    # unpenalized MLE surface and same -BIC/n metric as the Larch path, but
-    # milliseconds per fit with no compilation. The Larch path rebuilds a
-    # DataTree and triggers fresh sharrow/jax flow compiles for EVERY
-    # candidate spec — run guided03 spent 16h 57m on Stage 0 alone, with
-    # 356,129 "writing fresh flow code" lines (~100 compiles per evaluation,
-    # ~9 s each). Larch remains the engine for the FINAL CDAP model after
-    # selection; set GA_CDAP_FITNESS=larch to restore the old behaviour.
-    if os.environ.get('GA_CDAP_FITNESS', 'sklearn').strip().lower() != 'larch':
-        return _cdap_fitness_sklearn(genes, data, feature_names)
+    # SEARCH fitness uses a self-contained RIDGE multinomial logit (scipy) by
+    # default: no sklearn dependency, regularization embedded, milliseconds per
+    # fit, and finite SEs for the significance penalty. The Larch path rebuilds a
+    # DataTree and triggers fresh sharrow/jax flow compiles for EVERY candidate
+    # spec — run guided03 spent 16h 57m on Stage 0 alone (~100 compiles/eval,
+    # ~9 s each) — so it is impractical for a GA. Larch remains the engine for
+    # the FINAL CDAP model after selection (estimate_cdap, with elastic-net);
+    # set GA_CDAP_FITNESS=larch to use Larch during the search too.
+    if os.environ.get('GA_CDAP_FITNESS', 'numpy').strip().lower() != 'larch':
+        return _cdap_fitness_numpy(genes, data, feature_names)
 
     try:
         import larch as lx
     except ImportError:
-        return _cdap_fitness_sklearn(genes, data, feature_names)
+        return _cdap_fitness_numpy(genes, data, feature_names)
 
     feats = [f for f, g in zip(feature_names, genes) if g == 1]
     if not feats:
@@ -3806,44 +3806,97 @@ def _cdap_fitness(
 
     except Exception as e:
         logger.debug(f"CDAP Larch fitness failed: {e}")
-        return _cdap_fitness_sklearn(genes, data, feature_names)
+        return _cdap_fitness_numpy(genes, data, feature_names)
 
 
-def _cdap_fitness_sklearn(
+def _multinomial_ridge_fit(X: np.ndarray, y: np.ndarray, l2: float = 1.0,
+                           maxiter: int = 150):
+    """Baseline-category (class 0 reference) multinomial logit with RIDGE, via
+    scipy — no sklearn. The ridge penalty keeps the (penalized) Hessian
+    non-singular even under perfect separation, so standard errors are finite and
+    coefficients don't blow up (no pinned bounds needed). Returns
+    (B[K-1, p+1], unpenalized_ll, SE[K-1, p+1])."""
+    from scipy import optimize as _sopt
+    n, p = X.shape
+    K = int(y.max()) + 1
+    pk = p + 1
+    Xb = np.column_stack([np.ones(n), X])
+
+    def negll(th, pen=True):
+        B = th.reshape(K - 1, pk)
+        eta = Xb @ B.T                                  # (n, K-1)
+        M = np.maximum(0.0, eta.max(1))
+        logZ = M + np.log(np.exp(-M) + np.exp(eta - M[:, None]).sum(1))
+        chosen = np.where(y > 0,
+                          np.take_along_axis(eta, np.clip(y[:, None] - 1, 0, K - 2), 1).ravel(),
+                          0.0)
+        ll = np.sum(chosen - logZ)
+        r = l2 * np.sum(B[:, 1:] ** 2) if pen else 0.0  # ridge, exclude intercepts
+        return -(ll - r)
+
+    res = _sopt.minimize(negll, np.zeros((K - 1) * pk), method='L-BFGS-B',
+                         options={'maxiter': maxiter})
+    B = res.x.reshape(K - 1, pk)
+    ll = -negll(res.x, pen=False)
+    # SEs from the penalized-Hessian diagonal (finite differences); ridge makes
+    # this positive even under separation → finite, meaningful SEs.
+    diagH = np.empty_like(res.x)
+    h = 1e-4
+    f0 = negll(res.x)
+    for i in range(len(res.x)):
+        e = np.zeros_like(res.x); e[i] = h
+        diagH[i] = (negll(res.x + e) - 2.0 * f0 + negll(res.x - e)) / (h * h)
+    se = np.where(diagH > 1e-8, 1.0 / np.sqrt(np.abs(diagH)), np.nan).reshape(K - 1, pk)
+    return B, float(ll), se
+
+
+def _cdap_fitness_numpy(
     genes:         np.ndarray,
     data:          pd.DataFrame,
     feature_names: List[str],
 ) -> float:
-    """Sklearn MNL fallback if Larch is unavailable."""
-    from sklearn.linear_model import LogisticRegression
-
+    """Fast, dependency-free CDAP search fitness: a RIDGE multinomial logit
+    (scipy, no sklearn, no Larch compilation) scored by -BIC/n minus a Wald
+    significance penalty. Regularization is embedded (GA_CDAP_L2, ridge), so
+    coefficients stay finite and identified without pinned bounds; separated /
+    insignificant terms get large SEs → penalised → evicted by the search."""
     feats     = [f for f, g in zip(feature_names, genes) if g == 1]
     available = [f for f in feats if f in data.columns]
     if not available:
         return -1e9
-
     X = data[available].fillna(0).values.astype(float)
     y = data['cdap_obs'].values.astype(int)
     if len(np.unique(y)) < 2:
         return -1e9
-
     mu = X.mean(0); sd = X.std(0); sd[sd == 0] = 1.0
     Xs = (X - mu) / sd
-
     try:
-        clf = LogisticRegression(solver='lbfgs',
-                                 max_iter=300, C=1e6)
-        clf.fit(Xs, y)
-        probs    = clf.predict_proba(Xs)
-        probs    = np.clip(probs, 1e-10, 1.0)
-        ll_fit   = float(np.sum(np.log(probs[np.arange(len(y)), y])))
-        n        = len(y)
-        k        = 2 * len(available) + 2
-        bic      = -2.0 * ll_fit + k * np.log(max(n, 2))
-        return -bic / max(n, 1)
+        l2 = float(os.environ.get('GA_CDAP_L2', '1.0'))
+        B, ll_fit, se = _multinomial_ridge_fit(Xs, y, l2=l2)
+        n = len(y)
+        k = B.size                                      # (K-1)*(p+1)
+        bic = -2.0 * ll_fit + k * np.log(max(n, 2))
+        score = -bic / max(n, 1)
+
+        # Wald significance penalty over the slope coefficients (drop intercepts).
+        w = float(os.environ.get('GA_SIG_PENALTY_WEIGHT', '1.50'))
+        t_thresh = float(os.environ.get('GA_SIG_T_THRESH', '1.96'))
+        if w > 0:
+            slope_B, slope_se = B[:, 1:], se[:, 1:]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                t = slope_B / np.where(slope_se > 0, slope_se, np.nan)
+            n_tot = slope_B.size
+            if n_tot:
+                n_weak = int(np.sum((~np.isfinite(t)) | (np.abs(t) < t_thresh)))
+                score -= w * (n_weak / n_tot)
+        return score
     except Exception as e:
-        logger.debug(f"CDAP sklearn fitness failed: {e}")
+        logger.debug(f"CDAP numpy fitness failed: {e}")
         return -1e9
+
+
+# Backwards-compatible alias (old name referenced elsewhere / in checkpoints).
+_cdap_fitness_sklearn = _cdap_fitness_numpy
 
 
 # ÔöÇÔöÇ Usual Location: decay_b and attractor column selection ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ

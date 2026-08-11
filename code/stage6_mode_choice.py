@@ -2018,6 +2018,80 @@ def predict_modes(
 
 
 # ---------------------------------------------------------------------------
+# 4b. TOUR-MODE CONSISTENCY
+# ---------------------------------------------------------------------------
+# Priority for deriving a single tour mode when the primary-leg heuristic can't
+# be used: a private vehicle taken on ANY leg must serve the whole tour (you
+# cannot strand a car or bicycle mid-tour), so DA and Bike dominate; SR/Transit/
+# Walk have no vehicle-continuity constraint.
+_TOUR_MODE_PRIORITY = ['DA', 'Bike', 'SR', 'Transit', 'Walk']
+
+
+def enforce_tour_mode_consistency(df: pd.DataFrame, mode_col: str = 'mode') -> pd.DataFrame:
+    """Constrain every leg of a tour to a single, consistent tour mode.
+
+    Stage 6 picks each leg's mode independently, which can yield physically
+    impossible tours (a drive-alone leg stranded inside a transit tour, or a car
+    abandoned mid-tour). ActivitySim instead chooses ONE tour mode and constrains
+    the trip legs to it. Here the tour mode is the mode of the PRIMARY
+    (max-distance) leg — the main-destination leg — falling back to the
+    vehicle-continuity priority (DA/Bike dominate) when distances are unavailable.
+    All legs are set to it; the raw per-leg prediction is preserved in
+    ``<mode_col>_leg`` and the chosen tour mode in ``tour_mode``.
+
+    Gate with STAGE6_TOUR_MODE_CONSISTENCY=0. Grouping key preference:
+    ptour_id → person_id+tour_id → person_id+tour_num → person_id (whole day)."""
+    if os.environ.get('STAGE6_TOUR_MODE_CONSISTENCY', '1') == '0':
+        return df
+    if mode_col not in df.columns or df.empty:
+        return df
+    cols = set(df.columns)
+    if 'ptour_id' in cols:
+        tk = df['ptour_id'].astype(str)
+    elif {'person_id', 'tour_id'} <= cols:
+        tk = df['person_id'].astype(str) + '_' + df['tour_id'].astype(str)
+    elif {'person_id', 'tour_num'} <= cols:
+        tk = df['person_id'].astype(str) + '_' + df['tour_num'].astype(str)
+    elif 'person_id' in cols:
+        tk = df['person_id'].astype(str)
+        logger.info("tour-mode consistency: no tour id — grouping by person (whole day)")
+    else:
+        logger.warning("tour-mode consistency: no person/tour key — skipping")
+        return df
+
+    df = df.copy()
+    df['_tk'] = tk.values
+    _dist = pd.to_numeric(df.get('dist', pd.Series(np.nan, index=df.index)),
+                          errors='coerce')
+
+    _prio = {m: i for i, m in enumerate(_TOUR_MODE_PRIORITY)}
+
+    def _tour_mode(sub: pd.DataFrame):
+        modes = sub[mode_col].tolist()
+        d = _dist.loc[sub.index]
+        if d.notna().any() and d.max() > 0:
+            return sub.loc[d.idxmax(), mode_col]          # primary (max-dist) leg
+        valid = [m for m in modes if m in _prio]
+        return min(valid, key=lambda m: _prio[m]) if valid else (modes[0] if modes else None)
+
+    tmode = pd.Series(index=df.index, dtype=object)
+    for _k, sub in df.groupby('_tk'):
+        tmode.loc[sub.index] = _tour_mode(sub)
+
+    changed = int((df[mode_col].astype(object) != tmode).sum())
+    df[mode_col + '_leg'] = df[mode_col]                   # keep raw per-leg mode
+    df['tour_mode'] = tmode.values
+    _ok = tmode.notna()
+    df.loc[_ok, mode_col] = tmode[_ok].values
+    df = df.drop(columns=['_tk'])
+    n_tours = int(pd.Series(tk.values).nunique())
+    logger.info(f"tour-mode consistency: {changed}/{len(df)} legs reconciled to their "
+                f"tour mode across {n_tours} tours (primary max-dist leg; DA/Bike "
+                f"continuity). Raw per-leg mode preserved in '{mode_col}_leg'.")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # 5.  BUILD FINAL ACTIVITY PLAN
 # ---------------------------------------------------------------------------
 
@@ -2402,6 +2476,9 @@ def run_stage6(
     print("\n[2/3] Predicting modes for synthetic population...")
     scheduled = predict_modes(synth_s5, models, landuse,
                               sample=sample, seed=seed)
+    # Constrain each tour's legs to a single consistent tour mode (ActivitySim-
+    # style: no stranded car / walk leg inside a transit tour, etc.).
+    scheduled = enforce_tour_mode_consistency(scheduled)
 
     print("\n[3/3] Building final activity plan...")
     activity_plan = build_activity_plan(scheduled)

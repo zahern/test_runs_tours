@@ -480,7 +480,7 @@ def estimate_joint_purpose(persons: pd.DataFrame, tours: pd.DataFrame,
 # Orchestrator: HHTS → estimated HouseholdCdapConfig
 # ---------------------------------------------------------------------------
 def save_household_cdap_coefficients(dap: dict, freq: dict, part: dict, purp: dict,
-                                     out_dir: str) -> None:
+                                     out_dir: str, cfg=None) -> None:
     """Write the estimated household-CDAP / joint-tour coefficients to
     household_cdap_coefficients.csv (+ .pkl) so they are inspectable like the
     other stage models: the M/N DAP utilities per person-type, the household
@@ -512,6 +512,14 @@ def save_household_cdap_coefficients(dap: dict, freq: dict, part: dict, purp: di
             _row('joint_participation', k, part[k])
     for pur, u in (purp.get('utility', {}) or {}).items():
         _row('joint_purpose_utility', pur, u)
+    # Household interaction coefficients (ActivitySim INTERACTION_COEFFICIENTS):
+    # the 2-way table plus the higher-order 3/4/5-way tables from the config.
+    if cfg is not None:
+        for _order, _attr in ((2, 'interaction'), (3, 'interaction3'),
+                              (4, 'interaction4'), (5, 'interaction5')):
+            _tbl = getattr(cfg, _attr, None) or {}
+            for _key, _v in _tbl.items():
+                _row(f'interaction_{_order}way', '|'.join(map(str, _key)), _v)
 
     try:
         os.makedirs(out_dir, exist_ok=True)
@@ -519,7 +527,7 @@ def save_household_cdap_coefficients(dap: dict, freq: dict, part: dict, purp: di
         df.to_csv(os.path.join(out_dir, 'household_cdap_coefficients.csv'), index=False)
         with open(os.path.join(out_dir, 'household_cdap_coefficients.pkl'), 'wb') as fh:
             pickle.dump({'dap': dap, 'freq': freq, 'participation': part, 'purpose': purp}, fh)
-        print(f"[cdap-hh estimate] saved {len(df)} coefficients → "
+        print(f"[cdap-hh estimate] saved {len(df)} coefficients -> "
               f"{out_dir}/household_cdap_coefficients.csv")
     except Exception as _e:
         print(f"[cdap-hh estimate] save skipped: {_e}")
@@ -554,7 +562,7 @@ def estimate_household_cdap(persons: pd.DataFrame, tours: pd.DataFrame,
           f"p_join adult/child={part.get('p_join_adult'):.2f}/{part.get('p_join_child'):.2f}  "
           f"joint-purpose n={purp['n_obs']}")
     if out_dir:
-        save_household_cdap_coefficients(dap, freq, part, purp, out_dir)
+        save_household_cdap_coefficients(dap, freq, part, purp, out_dir, cfg=cfg)
     return cfg
 
 

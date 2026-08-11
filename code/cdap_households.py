@@ -122,6 +122,26 @@ class HouseholdCdapConfig:
         # and two children home alone together even more so
         ('AC', 'M', 'H'): -0.30, ('CC', 'H', 'H'): -0.25,
     })
+    # ── ActivitySim higher-order (3/4/5-way) interaction coefficients ─────────
+    # Applied to any subset of k members that ALL take the same pattern, keyed by
+    # (group_class, pattern) where group_class counts children (e.g. 'AAC' = two
+    # adults + one child). These capture household-level schedule alignment /
+    # joint travel / shared-home effects beyond the sum of pairwise terms, exactly
+    # like ActivitySim's 3-way (and 4/5-person) interaction rows. Higher orders
+    # shrink (diminishing marginal coordination). Behaviourally-signed priors;
+    # TODO(estimate). Absent keys default to 0. Set any table to {} to disable.
+    interaction3: dict = field(default_factory=lambda: {
+        ('AAA', 'M'): 0.10, ('AAC', 'M'): 0.08, ('ACC', 'M'): 0.06, ('CCC', 'M'): 0.12,
+        ('AAA', 'N'): 0.12, ('AAC', 'N'): 0.10, ('ACC', 'N'): 0.08, ('CCC', 'N'): 0.06,
+        ('AAA', 'H'): 0.08, ('ACC', 'H'): -0.15,   # 2+ kids home with 1 adult: strained
+    })
+    interaction4: dict = field(default_factory=lambda: {
+        ('AAAA', 'M'): 0.05, ('AAAC', 'M'): 0.04,
+        ('AAAA', 'N'): 0.06, ('AAAC', 'N'): 0.05, ('AACC', 'N'): 0.04,
+    })
+    interaction5: dict = field(default_factory=lambda: {
+        ('AAAAA', 'N'): 0.03, ('AAAAC', 'N'): 0.03,
+    })
     # Joint-tour frequency: base Poisson rate + per-feature increments.
     joint_base_rate: float = 0.25
     joint_rate_per_child: float = 0.20
@@ -205,6 +225,21 @@ def _interaction_util(cfg: 'HouseholdCdapConfig', cls: str,
                  cfg.interaction.get((cls, b, a), 0.0)))
 
 
+def _group_class(is_child_subset) -> str:
+    """Composition label for a member subset: adults first, then children —
+    e.g. two adults + one child → 'AAC' (order-independent, mirrors _pair_class)."""
+    c = sum(int(x) for x in is_child_subset)
+    k = len(is_child_subset)
+    return 'A' * (k - c) + 'C' * c
+
+
+def _higher_order_util(cfg: 'HouseholdCdapConfig', k: int, gcls: str, d: str) -> float:
+    """k-way (k=3,4,5) interaction coefficient for a subset of k members that all
+    take pattern `d`, keyed by (group_class, pattern). 0 if the table/key absent."""
+    tbl = getattr(cfg, f'interaction{k}', None)
+    return float(tbl.get((gcls, d), 0.0)) if tbl else 0.0
+
+
 def _person_dap_utilities(row, cfg: 'HouseholdCdapConfig', n_workers: int) -> dict:
     """Individual M/N/H utility for one person.
 
@@ -239,6 +274,14 @@ def _joint_cdap_draw(members: list, cfg: 'HouseholdCdapConfig',
     utils     = [m[1] for m in members]
     children  = [m[2] for m in members]
     combos    = list(itertools.product(DAP_CLASSES, repeat=n))
+    # Precompute the k-member subsets (k=3..5) that carry a non-empty
+    # higher-order table, with each subset's composition class, so the per-combo
+    # loop only does same-pattern lookups.
+    ho_subsets = []   # (subset_tuple, group_class, k)
+    for k in (3, 4, 5):
+        if k <= n and getattr(cfg, f'interaction{k}', None):
+            for sub in itertools.combinations(range(n), k):
+                ho_subsets.append((sub, _group_class([children[i] for i in sub]), k))
     logits    = np.empty(len(combos), dtype=float)
     for c, combo in enumerate(combos):
         s = 0.0
@@ -248,6 +291,11 @@ def _joint_cdap_draw(members: list, cfg: 'HouseholdCdapConfig',
             for j in range(i + 1, n):
                 s += _interaction_util(cfg, _pair_class(children[i], children[j]),
                                        combo[i], combo[j])
+        # higher-order: any subset whose members ALL share one pattern
+        for sub, gcls, k in ho_subsets:
+            d0 = combo[sub[0]]
+            if all(combo[i] == d0 for i in sub[1:]):
+                s += _higher_order_util(cfg, k, gcls, d0)
         logits[c] = s
     logits -= logits.max()
     p = np.exp(logits)

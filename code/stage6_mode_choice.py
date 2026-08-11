@@ -2036,13 +2036,24 @@ def enforce_tour_mode_consistency(df: pd.DataFrame, mode_col: str = 'mode') -> p
     the trip legs to it. Here the tour mode is the mode of the PRIMARY
     (max-distance) leg — the main-destination leg — falling back to the
     vehicle-continuity priority (DA/Bike dominate) when distances are unavailable.
-    All legs are set to it; the raw per-leg prediction is preserved in
-    ``<mode_col>_leg`` and the chosen tour mode in ``tour_mode``.
 
-    Gate with STAGE6_TOUR_MODE_CONSISTENCY=0. Grouping key preference:
+    Two modes via STAGE6_TOUR_MODE_CONSISTENCY:
+      • 'relaxed' / '1' (default) — the ActivitySim-style nuance: a genuine WALK
+        leg (walk access/egress) is allowed to remain inside a tour whose mode is
+        NOT a private vehicle (Transit / SR / Walk), because walking a sub-leg
+        never strands anything. Every other non-conforming leg is set to the tour
+        mode. Private-vehicle tours (DA, Bike) stay strict — a walk leg there
+        would abandon the car/bicycle — so ALL their legs take the tour mode.
+      • 'strict' — every leg is set to the tour mode, no exceptions.
+      • '0' / 'off' — disabled.
+
+    The raw per-leg prediction is preserved in ``<mode_col>_leg`` and the chosen
+    tour mode in ``tour_mode``. Grouping key preference:
     ptour_id → person_id+tour_id → person_id+tour_num → person_id (whole day)."""
-    if os.environ.get('STAGE6_TOUR_MODE_CONSISTENCY', '1') == '0':
+    _cfg = os.environ.get('STAGE6_TOUR_MODE_CONSISTENCY', '1').strip().lower()
+    if _cfg in ('0', 'off', 'false', 'no'):
         return df
+    _strict = _cfg in ('strict', '2')
     if mode_col not in df.columns or df.empty:
         return df
     cols = set(df.columns)
@@ -2078,16 +2089,28 @@ def enforce_tour_mode_consistency(df: pd.DataFrame, mode_col: str = 'mode') -> p
     for _k, sub in df.groupby('_tk'):
         tmode.loc[sub.index] = _tour_mode(sub)
 
-    changed = int((df[mode_col].astype(object) != tmode).sum())
+    raw = df[mode_col].astype(object)
     df[mode_col + '_leg'] = df[mode_col]                   # keep raw per-leg mode
     df['tour_mode'] = tmode.values
-    _ok = tmode.notna()
-    df.loc[_ok, mode_col] = tmode[_ok].values
+
+    new = tmode.copy()
+    n_walk_kept = 0
+    if not _strict:
+        # relaxed: keep a genuine walk access/egress leg when the tour mode is not
+        # a private vehicle (walking never strands a car/bike).
+        keep_walk = (raw == 'Walk') & tmode.notna() & (~tmode.isin(['DA', 'Bike']))
+        new[keep_walk] = 'Walk'
+        n_walk_kept = int(keep_walk.sum())
+    _ok = new.notna()
+    df.loc[_ok, mode_col] = new[_ok].values
+    changed = int((raw != df[mode_col].astype(object)).sum())
     df = df.drop(columns=['_tk'])
     n_tours = int(pd.Series(tk.values).nunique())
-    logger.info(f"tour-mode consistency: {changed}/{len(df)} legs reconciled to their "
-                f"tour mode across {n_tours} tours (primary max-dist leg; DA/Bike "
-                f"continuity). Raw per-leg mode preserved in '{mode_col}_leg'.")
+    logger.info(f"tour-mode consistency [{'strict' if _strict else 'relaxed'}]: "
+                f"{changed}/{len(df)} legs reconciled across {n_tours} tours "
+                f"(primary max-dist leg; DA/Bike continuity)"
+                + ('' if _strict else f"; {n_walk_kept} walk access/egress legs kept")
+                + f". Raw per-leg mode preserved in '{mode_col}_leg'.")
     return df
 
 

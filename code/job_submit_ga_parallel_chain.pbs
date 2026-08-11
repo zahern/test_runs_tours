@@ -97,8 +97,9 @@ STAGE5_LOGSUM_SMOOTH=${STAGE5_LOGSUM_SMOOTH:-1}
 # GA feature-search for the pre-day numpy models (mobility_models, wfh_telecommute)
 # — searches their covariate subset by BIC like the stages. Off with =0.
 GA_SEARCH_PREDAY=${GA_SEARCH_PREDAY:-1}
-# Constrain each tour's trip legs to one consistent tour mode (ActivitySim-style;
-# vehicle continuity). Off with =0.
+# Constrain each tour's trip legs to one consistent tour mode (ActivitySim-style
+# vehicle continuity). 'relaxed'/1 (default) keeps genuine walk access/egress legs
+# inside Transit/SR/Walk tours; 'strict' forces every leg to the tour mode; 0=off.
 STAGE6_TOUR_MODE_CONSISTENCY=${STAGE6_TOUR_MODE_CONSISTENCY:-1}
 # ActivitySim-style household CDAP coordination (joint 2-way logit).
 # Off by default; CDAP_HOUSEHOLD_COORD=1 coordinates M/N/H at household level.

@@ -1,0 +1,135 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyram"
+version = "0.1.0"
+description = "PYRAM travel demand modeling pipeline for activity-based transport simulation"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "PYRAM Team", email = "pyram@example.com"}
+]
+keywords = [
+    "travel-demand", "activity-based-model", "discrete-choice",
+    "transport-simulation", "MATSim", "SUMO", "DynusT"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26.4,<2.0.0",
+    "pandas>=2.1,<3.0",
+    "scipy>=1.11,<1.14",
+    "openmatrix>=0.3.5,<1.0",
+    "larch>=6.0,<7.0",
+    "xarray>=2023.6,<2025.0",
+    "pyarrow>=14.0,<18.0",
+    "geopandas>=0.14,<1.0",
+    "shapely>=2.0,<3.0",
+    "rasterio>=1.3,<2.0",
+    "rasterio[gdal]>=1.3,<2.0",
+    "pyproj>=3.5,<4.0",
+    "overturemaps>=1.0,<2.0",
+    "pyyaml>=6.0,<7.0",
+    "tables>=3.7,<4.0",
+    "numexpr>=2.8,<3.0",
+    "networkx>=3.0,<4.0",
+    "ortools>=9.8,<10.0",
+    "rich>=13.0,<14.0",
+    "typer>=0.9,<1.0",
+    "tqdm>=4.65,<5.0",
+    "jax==0.4.30",
+    "jaxlib==0.4.30",
+    "jaxopt>=0.8.0",
+    "ortools>=9.8,<10.0",
+    "pyyaml>=6.0,<7.0",
+    "tables>=3.7,<4.0",
+    "pyarrow>=14.0,<18.0",
+    "xarray>=2023.6,<2025.0",
+    "geopandas>=0.14,<1.0",
+    "shapely>=2.0,<3.0",
+    "rasterio>=1.3,<2.0",
+    "rasterio[gdal]>=1.3,<2.0",
+    "pyproj>=3.5,<4.0",
+    "openmatrix>=0.3.5,<1.0",
+    "larch>=6.0,<7.0",
+    "rich>=13.0,<14.0",
+    "typer>=0.9,<1.0",
+    "tqdm>=4.65,<5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0,<9.0",
+    "pytest-cov>=4.0,<5.0",
+    "black>=23.0,<25.0",
+    "ruff>=0.4,<1.0",
+    "mypy>=1.5,<2.0",
+    "pre-commit>=3.0,<4.0",
+]
+docs = [
+    "sphinx>=7.0,<8.0",
+    "sphinx-rtd-theme>=1.3,<2.0",
+    "myst-parser>=2.0,<3.0",
+]
+gpu = [
+    "jax[cuda12]==0.4.30",
+    "jaxlib[cuda12]==0.4.30",
+]
+visualizer = [
+    "flask>=2.3,<3.0",
+    "geopandas>=0.14,<1.0",
+]
+full = [
+    "jax==0.4.30",
+    "jaxlib==0.4.30",
+    "matsim-python>=0.1,<1.0",
+    "flask>=2.3,<3.0",
+    "geopandas>=0.14,<1.0",
+]
+
+[project.entry-points]
+console_scripts = { "pyram" = "pyram.cli:app", "pyram-build-pop" = "pyram.cli:build_population", "pyram-run-pipeline" = "pyram.cli:run_pipeline", "pyram-dta-feedback" = "pyram.cli:run_dta_feedback", "pyram-visualize" = "pyram.cli:visualize" }
+
+[project.urls]
+Homepage = "https://github.com/pyram/pyram"
+Repository = "https://github.com/pyram/pyram"
+Issues = "https://github.com/pyram/pyram/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["pyram*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.yml", "*.json", "*.csv", "*.txt"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "PL", "T20"]
+ignore = ["E501", "B008"]
+per-file-ignores = { "tests/*" = ["S101", "SLF001"] }
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"

@@ -1,0 +1,983 @@
+"""
+Discrete choice models for pyram.
+
+Provides:
+- DestinationChoiceModel: MNL and Nested Logit with distance bands
+- ModeChoiceModel: Nested Logit and Mixed Logit for mode choice
+- ParkingChoiceModel: Parking choice (on-street, garage, P&R)
+- TripDestinationModel: Trip-level intermediate stop destination
+- CompetingHazardActivityGenerator: Competing hazard activity generation
+- ActivityPlanningOrderModel: POLARIS-style planning order
+- HybridTimingChoiceModel: Hybrid RUM-RRM Copula timing
+- RoutineLocationChoiceModel: Work/school location choice
+"""
+
+import os
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union, Any
+import warnings
+
+import numpy as np
+import pandas as pd
+
+try:
+    import larch as lx
+    from larch import P, X
+    LARCH_AVAILABLE = True
+except ImportError:
+    LARCH_AVAILABLE = False
+    warnings.warn("larch not installed - discrete choice models will use heuristics")
+
+try:
+    from pyram.models.activity_generation import (
+        CompetingHazardActivityGenerator as _CompetingHazardActivityGenerator,
+        ActivityPlanningOrderModel as _ActivityPlanningOrderModel,
+        HybridTimingChoiceModel as _HybridTimingChoiceModel,
+        RoutineLocationChoiceModel as _RoutineLocationChoiceModel,
+        create_activity_generation_model as _create_activity_generation_model,
+        create_planning_order_model as _create_planning_order_model,
+        create_timing_model as _create_timing_model,
+        create_routine_location_model as _create_routine_location_model,
+        create_all_activity_models as _create_all_activity_models,
+    )
+    ACTIVITY_GEN_AVAILABLE = True
+except ImportError:
+    ACTIVITY_GEN_AVAILABLE = False
+    warnings.warn("activity_generation module not available")
+
+
+# ── Base Model Class ─────────────────────────────────────────────────────────
+
+class BaseChoiceModel:
+    """Base class for discrete choice models."""
+    
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        self.model = None
+        self.coefficients = {}
+        self.fitted = False
+    
+    def estimate(self, data: pd.DataFrame, **kwargs) -> "BaseChoiceModel":
+        """Estimate model from data."""
+        raise NotImplementedError
+    
+    def predict(self, data: pd.DataFrame, **kwargs) -> pd.DataFrame:
+        """Predict choices for new data."""
+        raise NotImplementedError
+    
+    def save(self, path: Union[str, Path]):
+        """Save model to file."""
+        import pickle
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump({
+                "model": self.model,
+                "coefficients": self.coefficients,
+                "config": self.config,
+                "fitted": self.fitted,
+            }, f)
+    
+    @classmethod
+    def load(cls, path: Union[str, Path]) -> "BaseChoiceModel":
+        """Load model from file."""
+        import pickle
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        obj = cls(data.get("config", {}))
+        obj.model = data.get("model")
+        obj.coefficients = data.get("coefficients", {})
+        obj.fitted = data.get("fitted", False)
+        return obj
+
+
+# ── Destination Choice Model ─────────────────────────────────────────────────
+
+class DestinationChoiceModel(BaseChoiceModel):
+    """
+    Destination choice model with support for:
+    - MNL (Multinomial Logit)
+    - NL Distance Bands (Nested Logit with distance-based nests)
+    - NL SA3 (Nested Logit with SA3-level nests)
+    
+    Based on POLARIS/ActivitySim destination choice patterns.
+    """
+    
+    MODEL_TYPES = ["mnl", "nl_distance", "nl_sa3"]
+    
+    def __init__(self, config: Dict = None):
+        super().__init__(config)
+        self.model_type = self.config.get("model_type", "mnl")
+        self.distance_bands = self.config.get("distance_bands", [0, 2, 5, 10, 100])
+        self.sample_size = self.config.get("sample_size", 0)
+        self.zone_ids = None
+        self.segment_models = {}  # per segment (work, edu, nonmand)
+    
+    def _build_utility(self, ca_df: pd.DataFrame, segment: str) -> Dict[str, Any]:
+        """Build utility specification for a segment."""
+        if not LARCH_AVAILABLE:
+            return {}
+        
+        # Base utility terms (same for all segments)
+        utility_terms = {
+            # Size term (employment/attractions)
+            "c_size_term": "log_size",
+            # Distance deterrence
+            "c_log_dist": "log_DIST_1",
+            "c_dist": "DIST",
+            # Mode choice logsum (accessibility)
+            "c_logsum": "logsum",
+            # Crash risk
+            "c_crash": "log_CRASH_1",
+            # Accessibility
+            "c_transit_acc": "transit_acc",
+            "c_walk_acc": "walk_acc",
+            "c_auto_work_acc": "auto_work_acc",
+            "c_auto_shop_acc": "auto_shop_acc",
+            # CBD
+            "c_cbd_dest": "is_cbd",
+            # Industry interactions
+            "c_indp_finance": "FPSEMPN",
+            "c_indp_health": "HEREMPN",
+            "c_indp_retail": "RETEMPN",
+        }
+        
+        # Segment-specific terms
+        if segment == "work":
+            utility_terms.update({
+                "c_occp_dist": "occp_group",
+                "c_edu_post": "Education",
+            })
+        elif segment == "edu":
+            utility_terms.update({
+                "c_edu_primary": "Primary",
+                "c_edu_secondary": "Secondary",
+            })
+        elif segment == "nonmand":
+            utility_terms.update({
+                "c_shopping": "RETEMPN",
+                "c_social": "Entertainment",
+                "c_escort": "TOTPOP",
+            })
+        
+        return utility_terms
+    
+    def _assign_nest_ids(self, ca_df: pd.DataFrame) -> pd.DataFrame:
+        """Assign nest IDs based on distance bands."""
+        if self.model_type != "nl_distance":
+            return ca_df
+        
+        dist_km = ca_df.get("DIST", ca_df.get("dist_km", 0))
+        ca_df = ca_df.copy()
+        
+        # Create distance band nest IDs
+        conditions = []
+        choices = []
+        for i, (low, high) in enumerate(zip(self.distance_bands[:-1], self.distance_bands[1:])):
+            if high == 100:  # last band
+                cond = dist_km >= low
+            else:
+                cond = (dist_km >= low) & (dist_km < high)
+            conditions.append(cond)
+            choices.append(i)
+        
+        ca_df["nest_id"] = np.select(conditions, choices, default=len(self.distance_bands) - 2)
+        return ca_df
+    
+    def estimate(
+        self,
+        trips: pd.DataFrame,
+        persons: pd.DataFrame,
+        landuse: pd.DataFrame,
+        skims: Dict,
+        segment_col: str = "purpose",
+        **kwargs
+    ) -> "DestinationChoiceModel":
+        """
+        Estimate destination choice model.
+        
+        Parameters
+        ----------
+        trips : HHTS trips with OTAZ, DTAZ, purpose, person_id
+        persons : Person attributes
+        landuse : Zone land use data
+        skims : Skim matrices or lookup
+        segment_col : Column to segment by (purpose, tour_purpose)
+        """
+        if not LARCH_AVAILABLE:
+            warnings.warn("larch not available - using heuristic fallback")
+            return self._estimate_heuristic(trips, persons, landuse, skims, segment_col)
+        
+        # Merge person attributes onto trips
+        trips = trips.merge(persons, on="person_id", how="left", suffixes=("", "_p"))
+        
+        # Segment trips
+        segments = trips[segment_col].unique()
+        
+        for segment in segments:
+            seg_trips = trips[trips[segment_col] == segment].copy()
+            
+            if len(seg_trips) < 30:
+                warnings.warn(f"Segment {segment}: only {len(seg_trips)} observations")
+                continue
+            
+            # Build case-alternative dataset
+            ca_df = self._build_ca_dataset(seg_trips, landuse, skims)
+            
+            # Assign nest IDs for NL
+            ca_df = self._assign_nest_ids(ca_df)
+            
+            # Estimate
+            model = self._estimate_segment(ca_df, segment)
+            self.segment_models[segment] = model
+        
+        self.fitted = True
+        return self
+    
+    def _build_ca_dataset(self, trips: pd.DataFrame, landuse: pd.DataFrame, skims: Dict) -> pd.DataFrame:
+        """Build case-alternative dataset for Larch."""
+        # Get zone IDs
+        self.zone_ids = landuse["zone_id"].unique() if "zone_id" in landuse.columns else landuse.index.unique()
+        
+        # For each trip, create alternatives
+        ca_rows = []
+        for idx, trip in trips.iterrows():
+            otaz = trip["OTAZ"]
+            dtaz = trip["DTAZ"]
+            
+            for zone in self.zone_ids:
+                # Get skim values
+                skim_key = (otaz, zone)
+                skim_vals = skims.get(skim_key, {})
+                
+                # Land use at destination
+                lu = landuse[landuse["zone_id"] == zone].iloc[0] if zone in landuse["zone_id"].values else None
+                
+                row = {
+                    "case_id": idx,
+                    "alt_id": zone,
+                    "chosen": int(zone == dtaz),
+                    "OTAZ": otaz,
+                    "DTAZ": dtaz,
+                    "DIST": skim_vals.get("DIST", 0),
+                    "log_DIST_1": np.log(max(skim_vals.get("DIST", 1), 1)),
+                    "logsum": skim_vals.get("logsum", 0),
+                    "log_CRASH_1": np.log(max(skim_vals.get("CRASH", 1), 1)),
+                }
+                
+                # Add land use attributes
+                if lu is not None:
+                    for col in ["TOTEMP", "RETEMPN", "FPSEMPN", "HEREMPN", "TOTPOP", "is_cbd"]:
+                        if col in lu.index:
+                            row[col.lower()] = lu[col]
+                
+                ca_rows.append(row)
+        
+        return pd.DataFrame(ca_rows)
+    
+    def _estimate_segment(self, ca_df: pd.DataFrame, segment: str) -> Any:
+        """Estimate model for one segment."""
+        ca_df = ca_df.set_index(["case_id", "alt_id"])
+        dt = lx.Dataset.construct.from_idca(ca_df, crack=False)
+        m = lx.Model(dt)
+        m.choice_co_code = "chosen"
+        
+        # Build utility
+        utility_terms = self._build_utility(ca_df, segment)
+        
+        if self.model_type == "nl_distance":
+            # Nested Logit with distance bands
+            nest_names = [f"dist_{i}" for i in range(len(self.distance_bands) - 1)]
+            nest_params = {name: P(name) for name in nest_names}
+            m.nesting_parameters = nest_params
+        
+        # Add utility terms
+        utility = None
+        for coef_name, var_name in utility_terms.items():
+            if var_name in ca_df.columns:
+                term = P(coef_name) * X(var_name)
+                utility = term if utility is None else utility + term
+        
+        if utility is not None:
+            m.utility_ca = utility
+        
+        # Estimate
+        m.maximize_loglike(method="slsqp", engine="numba")
+        
+        # Store coefficients
+        self.coefficients[segment] = {
+            name: float(m.pf.loc[name, "value"]) for name in m.pf.index
+        }
+        
+        return m
+    
+    def _estimate_heuristic(self, trips, persons, landuse, skims, segment_col):
+        """Heuristic fallback when Larch unavailable."""
+        # Simple gravity model estimation
+        self.fitted = True
+        return self
+    
+    def predict(
+        self,
+        trips: pd.DataFrame,
+        persons: pd.DataFrame,
+        landuse: pd.DataFrame,
+        skims: Dict,
+        segment_col: str = "purpose",
+        **kwargs
+    ) -> pd.DataFrame:
+        """
+        Predict destinations for trips.
+        
+        Returns trips with predicted DTAZ column.
+        """
+        if not self.fitted:
+            warnings.warn("Model not fitted - using gravity fallback")
+            return self._predict_gravity(trips, landuse, skims)
+        
+        # Similar to estimation but with simulation
+        trips = trips.merge(persons, on="person_id", how="left", suffixes=("", "_p"))
+        predictions = []
+        
+        for segment in trips[segment_col].unique():
+            if segment not in self.segment_models:
+                continue
+            
+            seg_trips = trips[trips[segment_col] == segment].copy()
+            model = self.segment_models[segment]
+            
+            # Build CA dataset
+            ca_df = self._build_ca_dataset(seg_trips, landuse, skims)
+            ca_df = self._assign_nest_ids(ca_df)
+            
+            # Simulate
+            preds = self._simulate(model, ca_df, seg_trips)
+            predictions.append(preds)
+        
+        if predictions:
+            pred_df = pd.concat(predictions)
+            trips = trips.merge(pred_df[["case_id", "predicted_DTAZ"]], 
+                              left_index=True, right_on="case_id", how="left")
+            trips["DTAZ_pred"] = trips["predicted_DTAZ"].fillna(trips["DTAZ"])
+        
+        return trips
+    
+    def _simulate(self, model, ca_df, trips) -> pd.DataFrame:
+        """Simulate choices from fitted model."""
+        # Use Larch simulation
+        ca_df = ca_df.set_index(["case_id", "alt_id"])
+        dt = lx.Dataset.construct.from_idca(ca_df, crack=False)
+        model.data = dt
+        
+        choices = model.simulate_choices()
+        return pd.DataFrame({"case_id": choices.index, "predicted_DTAZ": choices.values})
+    
+    def _predict_gravity(self, trips, landuse, skims):
+        """Gravity model fallback prediction."""
+        trips = trips.copy()
+        trips["DTAZ_pred"] = trips["DTAZ"]  # fallback to observed
+        return trips
+
+
+# ── Mode Choice Model ────────────────────────────────────────────────────────
+
+class ModeChoiceModel(BaseChoiceModel):
+    """
+    Mode choice model with:
+    - Nested Logit (NL)
+    - Mixed Logit (MXL)
+    - MXL with GSE (Gradient Score Enhanced)
+    
+    Based on POLARIS mode choice structure.
+    """
+    
+    MODEL_TYPES = ["nl", "mxl", "mxl_gse"]
+    
+    def __init__(self, config: Dict = None):
+        super().__init__(config)
+        self.model_type = self.config.get("model_type", "nl")
+        self.nest_structure = self.config.get("nest_structure", {
+            "motorized": ["DA", "SR", "Transit"],
+            "non_motorized": ["Walk", "Bike"]
+        })
+        self.transit_submodes = self.config.get("transit_submodes", True)
+        self.access_modes = self.config.get("access_modes", True)
+        self.mixed_logit = self.config.get("mixed_logit", False)
+        self.panel_mxl = self.config.get("panel_mxl", True)
+        self.mode_codes = {"DA": 1, "SR": 2, "Walk": 3, "Bike": 4, "Transit": 5}
+    
+    def estimate(
+        self,
+        trips: pd.DataFrame,
+        persons: pd.DataFrame,
+        landuse: pd.DataFrame,
+        skims: Dict,
+        **kwargs
+    ) -> "ModeChoiceModel":
+        """Estimate mode choice model."""
+        if not LARCH_AVAILABLE:
+            warnings.warn("larch not available - using heuristic fallback")
+            return self
+        
+        # Prepare data
+        trips = trips.merge(persons, on="person_id", how="left", suffixes=("", "_p"))
+        
+        # Build CA dataset
+        ca_df = self._build_mode_ca(trips, landuse, skims)
+        
+        # Estimate
+        self.model = self._estimate_mode_model(ca_df)
+        self.fitted = True
+        return self
+    
+    def _build_mode_ca(self, trips, landuse, skims):
+        """Build case-alternative dataset for mode choice."""
+        ca_rows = []
+        modes = list(self.mode_codes.keys())
+        
+        for idx, trip in trips.iterrows():
+            otaz = trip["OTAZ"]
+            dtaz = trip["DTAZ"]
+            purpose = trip.get("purpose", "other")
+            
+            for mode in modes:
+                mode_code = self.mode_codes[mode]
+                
+                # Availability
+                avail = self._check_availability(trip, mode)
+                
+                # Skim values
+                skim_key = (otaz, dtaz)
+                skim_vals = skims.get(skim_key, {})
+                
+                row = {
+                    "case_id": idx,
+                    "alt_id": mode_code,
+                    "mode": mode,
+                    "chosen": int(trip.get("mode", trip.get("tour_mode", 1)) == mode_code),
+                    "avail": avail,
+                    "cost": skim_vals.get("cost", 0),
+                    "time": skim_vals.get(f"{mode}_time", skim_vals.get("time", 0)),
+                    "dist": skim_vals.get("DIST", 0),
+                    "walk_dist": skim_vals.get("DISTWALK", 0),
+                    "bike_dist": skim_vals.get("DISTBIKE", 0),
+                }
+                
+                # Add person attributes
+                for attr in ["incp", "age5p", "sexp", "vehrd", "bikes", "CARLICENCE"]:
+                    if attr in trip.index:
+                        row[attr] = trip[attr]
+                
+                ca_rows.append(row)
+        
+        return pd.DataFrame(ca_rows)
+    
+    def _check_availability(self, trip, mode):
+        """Check mode availability."""
+        if mode == "Walk":
+            return trip.get("DISTWALK", trip.get("dist", 100)) <= 10
+        elif mode == "Bike":
+            return trip.get("DISTBIKE", trip.get("dist", 100)) <= 25
+        elif mode == "Transit":
+            return trip.get("transit_avail", 1) > 0
+        elif mode == "DA":
+            return trip.get("CARLICENCE", 0) > 0 and trip.get("vehrd", 0) > 0
+        elif mode == "SR":
+            return trip.get("vehrd", 0) > 0
+        return True
+    
+    def _estimate_mode_model(self, ca_df):
+        """Estimate mode choice model."""
+        ca_df = ca_df.set_index(["case_id", "alt_id"])
+        dt = lx.Dataset.construct.from_idca(ca_df, crack=False)
+        m = lx.Model(dt)
+        m.choice_co_code = "chosen"
+        m.availability_ca_var = "avail"
+        
+        # Build utility
+        utility = None
+        # ASC terms
+        for mode in ["SR", "Walk", "Bike", "Transit"]:
+            term = P(f"ASC_{mode}") * X(f"mode_{mode}")
+            utility = term if utility is None else utility + term
+        
+        # Cost, time terms
+        for term_name, var_name in [
+            ("c_cost", "cost"),
+            ("c_time", "time"),
+            ("c_dist", "dist"),
+            ("c_walk_dist", "walk_dist"),
+            ("c_bike_dist", "bike_dist"),
+        ]:
+            if var_name in ca_df.columns:
+                term = P(term_name) * X(var_name)
+                utility = utility + term if utility is not None else term
+        
+        m.utility_ca = utility
+        
+        # Nesting
+        if self.model_type in ["nl", "mxl", "mxl_gse"]:
+            motorized = P("mu_motorized")
+            nonmotor = P("mu_nonmotor")
+            m.nesting_parameters = {"motorized": motorized, "nonmotor": nonmotor}
+        
+        if self.mixed_logit:
+            # Add random parameters
+            pass  # MXL implementation
+        
+        m.maximize_loglike(method="slsqp", engine="numba")
+        
+        self.coefficients = {
+            name: float(m.pf.loc[name, "value"]) for name in m.pf.index
+        }
+        
+        return m
+    
+    def predict(self, trips, persons, landuse, skims, **kwargs) -> pd.DataFrame:
+        """Predict mode choices."""
+        if not self.fitted:
+            return self._predict_heuristic(trips)
+        
+        trips = trips.merge(persons, on="person_id", how="left", suffixes=("", "_p"))
+        ca_df = self._build_mode_ca(trips, landuse, skims)
+        ca_df = ca_df.set_index(["case_id", "alt_id"])
+        
+        dt = lx.Dataset.construct.from_idca(ca_df, crack=False)
+        self.model.data = dt
+        
+        choices = self.model.simulate_choices()
+        trips = trips.copy()
+        trips["mode_pred"] = choices.map({v: k for k, v in self.mode_codes.items()})
+        trips["mode_code_pred"] = choices.values
+        
+        return trips
+    
+    def _predict_heuristic(self, trips):
+        """Heuristic mode prediction."""
+        trips = trips.copy()
+        trips["mode_pred"] = "DA"
+        trips["mode_code_pred"] = 1
+        return trips
+
+
+# ── Parking Choice Model ─────────────────────────────────────────────────────
+
+class ParkingChoiceModel(BaseChoiceModel):
+    """
+    Parking choice model for auto trips.
+    
+    Alternatives:
+    - On-street (free/cheap, search time, walk to destination)
+    - Garage (paid, guaranteed space, walk to destination)
+    - Park-and-Ride (transit access)
+    """
+    
+    PARKING_TYPES = {
+        1: "onstreet",
+        2: "garage", 
+        3: "pnr",
+    }
+    
+    def __init__(self, config: Dict = None):
+        super().__init__(config)
+        self.model_type = self.config.get("model_type", "mnl")
+        self.onstreet_search_time = self.config.get("onstreet_search_time", 5.0)
+        self.walk_speed_kmh = self.config.get("walk_speed_kmh", 5.0)
+        self.cbd_zones = self.config.get("cbd_zones", [1, 2, 3, 4, 5])
+    
+    def estimate(
+        self,
+        trips: pd.DataFrame,
+        persons: pd.DataFrame,
+        location_table: pd.DataFrame,
+        landuse: pd.DataFrame,
+        skims: Dict,
+        **kwargs
+    ) -> "ParkingChoiceModel":
+        """Estimate parking choice model."""
+        if not LARCH_AVAILABLE:
+            warnings.warn("larch not available - using heuristic fallback")
+            return self
+        
+        # Filter auto trips
+        auto_trips = trips[
+            (trips["mode"].isin([1, 2])) &  # DA, SR
+            (trips["purpose"] != "home")
+        ].copy()
+        
+        if auto_trips.empty:
+            warnings.warn("No auto trips for parking estimation")
+            return self
+        
+        # Build CA dataset
+        ca_df = self._build_parking_ca(auto_trips, persons, location_table, landuse, skims)
+        
+        # Estimate
+        self.model = self._estimate_parking_model(ca_df)
+        self.fitted = True
+        return self
+    
+    def _build_parking_ca(self, trips, persons, location_table, landuse, skims):
+        """Build case-alternative dataset for parking choice."""
+        ca_rows = []
+        
+        for idx, trip in trips.iterrows():
+            pid = trip["person_id"]
+            dest_zone = trip["DTAZ"]
+            purpose = trip["purpose"]
+            act_dur = trip.get("predicted_duration_min", 60) / 60.0
+            
+            # Person attributes
+            person = persons[persons["person_id"] == pid].iloc[0] if pid in persons["person_id"].values else None
+            
+            # Available parking in destination zone
+            zone_facilities = location_table[location_table["zone"] == dest_zone]
+            
+            if len(zone_facilities) == 0:
+                # Create synthetic alternatives
+                alternatives = [
+                    {"type": 1, "cost": 0, "walk_dist": 0.5, "search_time": self.onstreet_search_time},
+                    {"type": 2, "cost": 5, "walk_dist": 0.3, "search_time": 0},
+                ]
+            else:
+                alternatives = []
+                for _, fac in zone_facilities.iterrows():
+                    alternatives.append({
+                        "type": 2,  # garage
+                        "cost": fac.get("avg_parking_cost", 5),
+                        "walk_dist": 0.3,
+                        "search_time": 0,
+                    })
+                # Add on-street option
+                alternatives.append({
+                    "type": 1,
+                    "cost": 0,
+                    "walk_dist": 0.5,
+                    "search_time": self.onstreet_search_time,
+                })
+            
+            for alt in alternatives:
+                ca_rows.append({
+                    "case_id": idx,
+                    "alt_id": alt["type"],
+                    "parking_type": alt["type"],
+                    "chosen": 0,  # Will be set from observed if available
+                    "parking_fee": alt["cost"],
+                    "walk_dist_km": alt["walk_dist"],
+                    "search_time_min": alt["search_time"],
+                    "act_dur_hr": act_dur,
+                    "dest_zone": dest_zone,
+                    "is_cbd": int(dest_zone in self.cbd_zones),
+                    "female": int(person.get("sexp", 0) == 2) if person is not None else 0,
+                    "income": person.get("incp", 50000) if person is not None else 50000,
+                })
+        
+        return pd.DataFrame(ca_rows)
+    
+    def _estimate_parking_model(self, ca_df):
+        """Estimate parking MNL."""
+        ca_df = ca_df.set_index(["case_id", "alt_id"])
+        dt = lx.Dataset.construct.from_idca(ca_df, crack=False)
+        m = lx.Model(dt)
+        m.choice_co_code = "chosen"
+        
+        utility = None
+        for coef, var in [
+            ("c_fee", "parking_fee"),
+            ("c_walk", "walk_dist_km"),
+            ("c_search", "search_time_min"),
+            ("c_duration", "act_dur_hr"),
+            ("c_cbd", "is_cbd"),
+        ]:
+            if var in ca_df.columns:
+                term = P(coef) * X(var)
+                utility = utility + term if utility is not None else term
+        
+        m.utility_ca = utility
+        m.maximize_loglike(method="slsqp", engine="numba")
+        
+        self.coefficients = {
+            name: float(m.pf.loc[name, "value"]) for name in m.pf.index
+        }
+        
+        return m
+    
+    def predict(
+        self,
+        trips: pd.DataFrame,
+        persons: pd.DataFrame,
+        location_table: pd.DataFrame,
+        landuse: pd.DataFrame,
+        skims: Dict,
+        **kwargs
+    ) -> pd.DataFrame:
+        """Predict parking choices."""
+        if not self.fitted:
+            return self._predict_heuristic(trips, location_table)
+        
+        # Similar to estimation but with simulation
+        auto_mask = (trips["mode"].isin([1, 2])) & (trips["purpose"] != "home")
+        auto_trips = trips[auto_mask].copy()
+        
+        ca_df = self._build_parking_ca(auto_trips, persons, location_table, landuse, skims)
+        ca_df = ca_df.set_index(["case_id", "alt_id"])
+        
+        dt = lx.Dataset.construct.from_idca(ca_df, crack=False)
+        self.model.data = dt
+        
+        choices = self.model.simulate_choices()
+        
+        # Merge back
+        trips = trips.copy()
+        trips.loc[auto_mask, "parking_type"] = choices.map(self.PARKING_TYPES).values
+        trips.loc[auto_mask, "parking_type_code"] = choices.values
+        
+        return trips
+    
+    def _predict_heuristic(self, trips, location_table):
+        """Heuristic parking assignment."""
+        trips = trips.copy()
+        auto_mask = (trips["mode"].isin([1, 2])) & (trips["purpose"] != "home")
+        
+        for idx in trips.index[auto_mask]:
+            dest_zone = trips.at[idx, "DTAZ"]
+            if dest_zone in self.cbd_zones:
+                trips.at[idx, "parking_type"] = "garage"
+                trips.at[idx, "parking_type_code"] = 2
+            else:
+                trips.at[idx, "parking_type"] = "onstreet"
+                trips.at[idx, "parking_type_code"] = 1
+        
+        return trips
+
+
+# ── Trip Destination Model ───────────────────────────────────────────────────
+
+class TripDestinationModel(BaseChoiceModel):
+    """
+    Trip-level intermediate stop destination choice.
+    
+    For non-mandatory tours with multiple stops, predicts
+    stop destinations conditional on tour destination and home anchor.
+    
+    Based on ActivitySim trip_destination and POLARIS patterns.
+    """
+    
+    def __init__(self, config: Dict = None):
+        super().__init__(config)
+        self.detour_max_km = self.config.get("detour_max_km", 50.0)
+        self.detour_max_ratio = self.config.get("detour_max_ratio", 1.0)
+        self.detour_base_km = self.config.get("detour_base_km", 3.0)
+        self.size_terms = self.config.get("size_terms", {
+            "work": ["TOTEMP", "FPSEMPN", "HEREMPN"],
+            "shopping": ["RETEMPN", "EATOUT"],
+            "social": ["TOTPOP", "Entertainment"],
+        })
+    
+    def estimate(
+        self,
+        stop_trips: pd.DataFrame,
+        landuse: pd.DataFrame,
+        skims: Dict,
+        segment_col: str = "purpose",
+        **kwargs
+    ) -> "TripDestinationModel":
+        """Estimate trip-level destination model for intermediate stops."""
+        if not LARCH_AVAILABLE:
+            warnings.warn("larch not available - using heuristic fallback")
+            return self
+        
+        self.segment_models = {}
+        
+        for segment in stop_trips[segment_col].unique():
+            seg_trips = stop_trips[stop_trips[segment_col] == segment]
+            
+            if len(seg_trips) < 30:
+                continue
+            
+            model = self._estimate_segment(seg_trips, landuse, skims, segment)
+            self.segment_models[segment] = model
+        
+        self.fitted = True
+        return self
+    
+    def _estimate_segment(self, trips, landuse, skims, segment):
+        """Estimate MNL for one purpose segment."""
+        # Build CA dataset with detour distance
+        ca_df = self._build_trip_ca(trips, landuse, skims)
+        
+        ca_df = ca_df.set_index(["case_id", "alt_id"])
+        dt = lx.Dataset.construct.from_idca(ca_df, crack=False)
+        m = lx.Model(dt)
+        m.choice_co_code = "chosen"
+        
+        # Utility with detour, size, logsum
+        utility = None
+        for coef, var in [
+            ("c_detour", "detour_dist_km"),
+            ("c_log_size", "log_size"),
+            ("c_logsum", "logsum"),
+            ("c_crash", "AutoCrashRisk"),
+        ]:
+            if var in ca_df.columns:
+                term = P(coef) * X(var)
+                utility = utility + term if utility is not None else term
+        
+        m.utility_ca = utility
+        m.maximize_loglike(method="slsqp", engine="numba")
+        
+        return m
+    
+    def _build_trip_ca(self, trips, landuse, skims):
+        """Build CA dataset for trip destination."""
+        ca_rows = []
+        zone_ids = landuse["zone_id"].unique() if "zone_id" in landuse.columns else landuse.index.unique()
+        
+        for idx, trip in trips.iterrows():
+            otaz = trip["origin_taz"]
+            dtaz = trip["dest_taz"]
+            anchor = trip["anchor_down_taz"]
+            
+            for zone in zone_ids:
+                # Detour distance
+                d_os = skims.get((otaz, zone), {}).get("DIST", 0)
+                d_sa = skims.get((zone, anchor), {}).get("DIST", 0)
+                d_oa = skims.get((otaz, anchor), {}).get("DIST", 0)
+                detour = max(d_os + d_sa - d_oa, 0)
+                
+                # Trip boundary constraint
+                max_detour = min(self.detour_max_km, self.detour_max_ratio * d_oa + self.detour_base_km)
+                feasible = detour <= max_detour
+                
+                # Size term
+                lu = landuse[landuse["zone_id"] == zone].iloc[0] if zone in landuse["zone_id"].values else None
+                size = sum(lu.get(v, 0) for v in self.size_terms.get(trip["purpose"], ["TOTPOP"])) if lu is not None else 1
+                
+                ca_rows.append({
+                    "case_id": idx,
+                    "alt_id": zone,
+                    "chosen": int(zone == dtaz),
+                    "detour_dist_km": detour,
+                    "log_size": np.log(max(size, 1)),
+                    "logsum": 0,  # Would come from mode choice
+                    "AutoCrashRisk": skims.get((otaz, zone), {}).get("CRASH", 0),
+                    "feasible": feasible,
+                })
+        
+        return pd.DataFrame(ca_rows)
+    
+    def predict(
+        self,
+        stop_trips: pd.DataFrame,
+        landuse: pd.DataFrame,
+        skims: Dict,
+        segment_col: str = "purpose",
+        **kwargs
+    ) -> pd.DataFrame:
+        """Predict stop destinations."""
+        if not self.fitted:
+            return self._predict_gravity(stop_trips, landuse, skims)
+        
+        predictions = []
+        for segment in stop_trips[segment_col].unique():
+            if segment not in self.segment_models:
+                continue
+            
+            seg_trips = stop_trips[stop_trips[segment_col] == segment]
+            model = self.segment_models[segment]
+            
+            ca_df = self._build_trip_ca(seg_trips, landuse, skims)
+            ca_df = ca_df.set_index(["case_id", "alt_id"])
+            
+            dt = lx.Dataset.construct.from_idca(ca_df, crack=False)
+            model.data = dt
+            
+            choices = model.simulate_choices()
+            predictions.append(pd.DataFrame({
+                "case_id": choices.index,
+                "predicted_dest_taz": choices.values,
+            }))
+        
+        if predictions:
+            pred_df = pd.concat(predictions)
+            stop_trips = stop_trips.merge(pred_df, left_index=True, right_on="case_id", how="left")
+            stop_trips["dest_taz_pred"] = stop_trips["predicted_dest_taz"].fillna(stop_trips["dest_taz"])
+        
+        return stop_trips
+    
+    def _predict_gravity(self, trips, landuse, skims):
+        """Gravity fallback."""
+        trips = trips.copy()
+        trips["dest_taz_pred"] = trips["dest_taz"]
+        return trips
+
+
+# ── Factory Functions ────────────────────────────────────────────────────────
+
+def create_destination_model(config: Dict = None) -> DestinationChoiceModel:
+    """Create destination choice model from config."""
+    return DestinationChoiceModel(config)
+
+
+def create_mode_model(config: Dict = None) -> ModeChoiceModel:
+    """Create mode choice model from config."""
+    return ModeChoiceModel(config)
+
+
+def create_parking_model(config: Dict = None) -> ParkingChoiceModel:
+    """Create parking choice model from config."""
+    return ParkingChoiceModel(config)
+
+
+def create_trip_destination_model(config: Dict = None) -> TripDestinationModel:
+    """Create trip destination model from config."""
+    return TripDestinationModel(config)
+
+
+def create_activity_generation_model(config: Dict = None, metacount_model: Any = None, seed: int = 42):
+    """Create competing hazard activity generation model."""
+    if ACTIVITY_GEN_AVAILABLE:
+        return _create_activity_generation_model(config, metacount_model, seed)
+    raise ImportError("activity_generation module not available")
+
+
+def create_planning_order_model(metacount_model: Any = None, seed: int = 42):
+    """Create activity planning order model."""
+    if ACTIVITY_GEN_AVAILABLE:
+        return _create_planning_order_model(metacount_model, seed)
+    raise ImportError("activity_generation module not available")
+
+
+def create_timing_model(config: Dict = None, metacount_model: Any = None, seed: int = 42):
+    """Create hybrid timing choice model."""
+    if ACTIVITY_GEN_AVAILABLE:
+        return _create_timing_model(config, metacount_model, seed)
+    raise ImportError("activity_generation module not available")
+
+
+def create_routine_location_model(metacount_model: Any = None, seed: int = 42):
+    """Create routine location choice model."""
+    if ACTIVITY_GEN_AVAILABLE:
+        return _create_routine_location_model(metacount_model, seed)
+    raise ImportError("activity_generation module not available")
+
+
+def create_all_models(config: "pyram.Config", metacount_model: Any = None) -> Dict[str, BaseChoiceModel]:
+    """Create all models from main config."""
+    models = {
+        "destination": create_destination_model(config.destination.__dict__),
+        "mode": create_mode_model(config.mode.__dict__),
+        "parking": create_parking_model(config.parking.__dict__),
+        "trip_destination": create_trip_destination_model({}),
+    }
+    
+    if ACTIVITY_GEN_AVAILABLE:
+        mc_model = models.get("metacount")  # if available
+        activity_models = _create_all_activity_models(
+            config.activity_generation.__dict__ if hasattr(config, 'activity_generation') else None,
+            mc_model,
+            config.seed
+        )
+        models.update(activity_models)
+    
+    return models

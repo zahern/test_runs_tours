@@ -4,6 +4,15 @@
 #PBS -m n
 #PBS -r y
 #PBS -l walltime=24:00:00
+# Safe default resources for BARE submits (qsub job_ga_stage_single.pbs
+# without -l): the scheduler default is 1 cpu / 1 GB, which OOM-kills any real
+# stage in minutes (observed: stage-1 job 25374014 cgroup-OOMed at 1 GB after
+# 58 min). The chain always passes -l select=... explicitly (command-line -l
+# overrides these directives), so this only affects manual submits.
+# NOTE: a full Stage 5 still needs 1:ncpus=4:mem=256GB:place=excl passed
+# explicitly — 64 GB is not enough for the skim-heavy stage-5 build.
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -l place=excl
 
 set -euo pipefail
 
@@ -12,10 +21,28 @@ RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
 RUN_TAG=${RUN_TAG:-${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}
 CONDA_ENV=${CONDA_ENV:-zigenv}
 
+# Zone system: NEW_POP=1 → 371 SA2-native zones (OTAZ/DTAZ = 9-digit SA2 codes)
+# NEW_POP_MAPPED=1 → legacy 329 ORDER system with SA2→ORDER crosswalk
+# NEW_POP=0 → legacy 329 ORDER system (explicit opt-in only)
+NEW_POP=${NEW_POP:-1}
+NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+
+# Skims path for NEW_POP=1 (SA2-native 371 zones)
+if [ "${NEW_POP}" = "1" ] && [ "${NEW_POP_MAPPED}" != "1" ]; then
+    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+else
+    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-}
+fi
+
 GA_BUDGET=${GA_BUDGET:-fast}
 GA_ESTIMATOR=${GA_ESTIMATOR:-sa_bandit}
-GA_USE_SA=${GA_USE_SA:-1}
-GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-1}
+GA_USE_SA=${GA_USE_SA:-0}
+GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-0}
+# Search engine: default to SparseEA-AGDS (GA_ENGINE has precedence over the
+# legacy GA_USE_SA / GA_USE_BANDIT_SA flags in _resolve_search_engine). Override
+# with -v GA_ENGINE=ga|sa|bandit|portfolio to fall back to another searcher.
+GA_ENGINE=${GA_ENGINE:-agds}
 GA_N_RESTARTS=${GA_N_RESTARTS:-0}
 GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-4}
 STAGE23_JOINT=${STAGE23_JOINT:-0}
@@ -31,15 +58,22 @@ module unload Anaconda3
 
 # ── Keep estimators current from PyPI ──────────────────────────────────────
 # The per-stage jobs previously did NO install, so they ran on whatever was
-# already in the conda env (stale metacountregressor 0.0.138). Upgrade both to
-# the latest PyPI release (metacountregressor>=1.0.107, SearchLibrium>=0.0.154)
-# on every stage job. Skip with ESTIMATORS_SKIP_UPGRADE=1; use local dev trees
-# with ESTIMATOR_SOURCE=editable.
-if [ "${ESTIMATOR_SOURCE:-pypi}" != "editable" ] && [ "${ESTIMATORS_SKIP_UPGRADE:-0}" != "1" ]; then
-    echo "[pkg] Upgrading MetaCount + SearchLibrium to latest PyPI release..."
-    pip install --upgrade -q metacountregressor SearchLibrium \
-        && echo "[pkg] MetaCount + SearchLibrium upgraded (PyPI latest)" \
-        || echo "[pkg] WARNING: PyPI estimator upgrade failed (offline?) — using installed"
+# already in the conda env (stale metacountregressor 0.0.138). Every stage job
+# therefore pulls metacountregressor's newest PyPI release here (unpinned, so
+# it always tracks latest; pip never downgrades on --upgrade, so a newer
+# local/dev install is kept until PyPI publishes something newer). Offline
+# the attempt fails fast and the installed build is used. SearchLibrium keeps
+# its version floor. Parallel stage jobs serialize here with flock (shared
+# lock in the code dir) instead of racing concurrent pip installs into the
+# shared env; use local dev trees with ESTIMATOR_SOURCE=editable.
+if [ "${ESTIMATOR_SOURCE:-pypi}" != "editable" ]; then
+    echo "[pkg] Upgrading metacountregressor to latest PyPI release (SearchLibrium>=${SEARCHLIBRIUM_MIN:-0.0.154})..."
+    (
+        flock -w 900 9 2>/dev/null || echo "[pkg] (flock unavailable, proceeding without lock)"
+        pip install --upgrade -q --retries 1 --timeout 20 metacountregressor "SearchLibrium>=${SEARCHLIBRIUM_MIN:-0.0.154}" \
+            && echo "[pkg] MetaCount (PyPI latest) + SearchLibrium upgraded" \
+            || echo "[pkg] WARNING: PyPI estimator upgrade failed (offline?) — using installed"
+    ) 9>"${PBS_O_WORKDIR:-.}/.pkg_upgrade.lock"
     pip show metacountregressor 2>/dev/null | awk '/^Version:/{print "[pkg] metacountregressor " $0}'
     pip show SearchLibrium      2>/dev/null | awk '/^Version:/{print "[pkg] SearchLibrium " $0}'
 fi
@@ -57,6 +91,13 @@ export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
 export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
 export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-1}
+# JAX memory: by default JAX preallocates ~75% of host RAM on first use, which
+# alone can OOM a 128GB stage-5 job. Disable preallocation so JAX allocates on
+# demand, and keep the in-code cache guard (ga_external_estimators.
+# _maybe_clear_jax_caches) on a tight leash via the two GA_JAX_CACHE_* knobs.
+export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-false}
+export GA_JAX_CACHE_MEM_LIMIT_GB=${GA_JAX_CACHE_MEM_LIMIT_GB:-40}
+export GA_JAX_CACHE_CHECK_EVERY=${GA_JAX_CACHE_CHECK_EVERY:-25}
 # Suppress JAX cuda-plugin version-mismatch warnings (cosmetic; plugin just unused)
 export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
 
@@ -64,11 +105,16 @@ export GA_BUDGET
 export GA_ESTIMATOR
 export GA_USE_SA
 export GA_USE_BANDIT_SA
+export GA_ENGINE
 export GA_N_RESTARTS
 export GA_PARALLEL_SEGMENTS
 export STAGE23_JOINT
 export GA_SIG_PENALTY_WEIGHT
 export GA_SIG_PVAL_THRESH
+export NEW_POP
+export NEW_POP_MAPPED
+export NEW_POP_DIR
+export PIPELINE_SKIMS_PATH
 
 echo "=========================================="
 echo "Single-stage GA job"
@@ -76,13 +122,22 @@ echo "PBS job     : ${PBS_JOBID:-unknown}"
 echo "Stage       : ${STAGE_ID}"
 echo "Run root    : ${RUN_ROOT}"
 echo "Run tag     : ${RUN_TAG}"
+echo "Zone system : NEW_POP=${NEW_POP} NEW_POP_MAPPED=${NEW_POP_MAPPED}"
+echo "Skims path  : ${PIPELINE_SKIMS_PATH}"
 echo "Budget      : ${GA_BUDGET}"
 echo "Estimator   : ${GA_ESTIMATOR}"
+echo "Search eng. : ${GA_ENGINE}"
 echo "Restarts    : ${GA_N_RESTARTS}"
 echo "Started     : $(date)"
 echo "=========================================="
 
 GA_PROFILE=${GA_PROFILE:-0}
+if [ "${STAGE_ID}" = "5" ] && [ -z "${GA_MEM_PER_WORKER_GB:-}" ]; then
+  export GA_MEM_PER_WORKER_GB=200
+  export GA_PARALLEL_SEGMENTS=1
+  echo "Stage 5 memory cap: GA_MEM_PER_WORKER_GB=${GA_MEM_PER_WORKER_GB}"
+  echo "Stage 5 workers: GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS}"
+fi
 if [ "${GA_PROFILE}" = "1" ]; then
   # cProfile only sees work in THIS process, and the SA search farms segments
   # out to spawn-mode workers — so force serial here or the model fits stay

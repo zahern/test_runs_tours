@@ -32,7 +32,12 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # Copula / marginal are tunable via env so the qsub can sweep them.
-MV_COPULA = os.environ.get('GA_MV_COPULA', 'gaussian')      # 'gaussian' | 'vine-frank'
+MV_COPULA = os.environ.get('GA_MV_COPULA', 'gaussian')
+#   'gaussian' | 'vine-frank' | 'vine-joe' | 'vine-gumbel' | 'vine-clayton'
+#   joe/gumbel capture UPPER-tail dependence (people who do a lot of one
+#   activity also do a lot of another); clayton captures LOWER-tail; gaussian
+#   is symmetric/tail-free. Estimation uses the family; prediction reproduces
+#   the fitted implied rank-correlation (see predict_joint_counts).
 MV_MARGINAL = os.environ.get('GA_MV_MARGINAL', 'nb')        # 'nb' | 'poisson'
 MV_MAXITER = int(os.environ.get('GA_MV_MAXITER', '1000'))
 
@@ -242,11 +247,159 @@ def fit_stage1_multivariate(tours, persons, landuse=None, out_dir='saved_data'):
             print(fit.summary())
         except Exception:
             pass
+        # Persist the fit + its covariate recipe so prediction can draw
+        # JOINT (copula-correlated) counts per person. Never fatal.
+        try:
+            import pickle
+            bundle = {'fit': fit, 'activity_cols': activity_cols,
+                      'covariate_cols': covariate_cols,
+                      'marginal': MV_MARGINAL, 'copula': MV_COPULA}
+            with open(os.path.join(out_dir, 'stage1_multivariate_fit.pkl'),
+                      'wb') as _fh:
+                pickle.dump(bundle, _fh)
+            logger.info("stage1_multivariate: saved fit bundle "
+                        "stage1_multivariate_fit.pkl")
+        except Exception as _pk_e:
+            logger.warning(f"stage1_multivariate: bundle save skipped "
+                           f"({_pk_e!r}) — prediction falls back to "
+                           f"separate per-purpose models")
         return fit
     except Exception as e:
         logger.error(f"stage1_multivariate: fit failed ({e!r}); Stage 1 continues "
                      "with the standard estimator.")
         return None
+
+
+def predict_joint_counts(synth, bundle=None, bundle_path=None, seed=42,
+                         landuse=None):
+    """Draw JOINT activity counts per person from a fitted MV copula model.
+
+    Replaces the independent per-purpose draws with copula-correlated draws:
+    marginal NB/Poisson means come from the person's covariates, dependence
+    between activity types from the fitted copula correlation, so simulated
+    persons who shop a lot also tend to eat out (etc.) exactly as estimated.
+
+    Parameters
+    ----------
+    synth       : synthetic-person DataFrame (same attributes as estimation)
+    bundle      : dict from stage1_multivariate_fit.pkl (fit, activity_cols,
+                  covariate_cols, marginal, copula); or pass bundle_path
+    bundle_path : path to the pickle (used when bundle is None)
+    seed        : RNG seed for the copula draws
+    landuse     : enriched landuse for *_acc features (optional; missing
+                  features are filled with 0 + logged, as in estimation)
+
+    Returns
+    -------
+    DataFrame with n_{purpose}_out int columns (MAX_COUNT-capped), indexed
+    like synth. Raises on any problem (caller falls back to separate models).
+    """
+    import pickle
+    from scipy.stats import norm, nbinom, poisson
+    from stage1_activity_frequency import (
+        PURPOSES, MAX_COUNT, assign_ptype_column,
+        _add_categorical_person_features,
+    )
+    if bundle is None:
+        with open(bundle_path, 'rb') as _fh:
+            bundle = pickle.load(_fh)
+    fit = bundle['fit']
+    activity_cols = list(bundle['activity_cols'])
+    covariate_cols = dict(bundle['covariate_cols'])
+    marginal = bundle.get('marginal', 'nb')
+    copula = bundle.get('copula', 'gaussian')
+    rng = np.random.default_rng(seed)
+
+    df = synth.copy()
+    if 'person_id' not in df.columns and 'PERSID' in df.columns:
+        df = df.rename(columns={'PERSID': 'person_id'})
+    if 'ptype' not in df.columns:
+        df = assign_ptype_column(df)
+    df = _add_categorical_person_features(df)
+    if landuse is not None:
+        try:
+            from synth_attributes import attach_person_accessibility
+            df = attach_person_accessibility(df, landuse)
+        except Exception as _acc_e:
+            logger.warning(f"predict_joint_counts: accessibility attach "
+                           f"skipped ({_acc_e!r})")
+
+    # feature matrices in the saved per-activity order (const -> ones)
+    X_list, missing = [], set()
+    feat_names = list(getattr(fit, 'feature_names', []))
+    for m, act in enumerate(activity_cols):
+        names = list(feat_names[m]) if m < len(feat_names) else []
+        cols = [c for c in names if c not in ('const', 'Intercept')]
+        Xm = np.zeros((len(df), len(names)))
+        for j, nm in enumerate(names):
+            if nm in ('const', 'Intercept'):
+                Xm[:, j] = 1.0
+            elif nm in df.columns:
+                Xm[:, j] = pd.to_numeric(df[nm],
+                                         errors='coerce').fillna(0).values
+            else:
+                missing.add(nm)
+        X_list.append(Xm)
+    if missing:
+        logger.warning(f"predict_joint_counts: {len(missing)} fit features "
+                       f"absent in synth, filled 0: {sorted(missing)[:8]}")
+    means = np.asarray(fit.predict(X_list), dtype=float)
+    means = np.where(np.isfinite(means), np.maximum(means, 0.0), 0.0)
+
+    # Joint uniforms. Gaussian and the vine families (frank/joe/gumbel/clayton)
+    # all expose a fitted implied rank-correlation matrix (fit.correlation);
+    # sample correlated uniforms from it via a Gaussian sampler. For the vine
+    # copulas this reproduces the estimated PAIRWISE rank dependence (the family
+    # governs the fit / model selection and the copula-parameter -> Kendall tau
+    # mapping); it does not reproduce Archimedean tail-dependence asymmetry in
+    # the draws. Only fall back to independent draws if no usable matrix exists.
+    M = len(activity_cols)
+    R = np.asarray(getattr(fit, 'correlation', np.eye(M)), dtype=float)
+    if R.shape == (M, M) and np.all(np.isfinite(R)):
+        R = (R + R.T) / 2.0 + 1e-8 * np.eye(M)
+        try:
+            L = np.linalg.cholesky(R)
+        except np.linalg.LinAlgError:
+            # project to the nearest positive-definite correlation matrix
+            w, V = np.linalg.eigh(R)
+            R = V @ np.diag(np.clip(w, 1e-6, None)) @ V.T
+            d = np.sqrt(np.clip(np.diag(R), 1e-12, None))
+            R = R / np.outer(d, d)
+            L = np.linalg.cholesky(R + 1e-8 * np.eye(M))
+        u = norm.cdf(rng.standard_normal((len(df), M)) @ L.T)
+        if str(copula).lower() != 'gaussian':
+            logger.info(f"predict_joint_counts: {copula} sampled via fitted "
+                        f"implied rank-correlation (Gaussian sampler)")
+    else:
+        logger.warning(f"predict_joint_counts: copula={copula!r} has no usable "
+                       f"correlation matrix — independent draws around MV means")
+        u = rng.uniform(size=(len(df), M))
+    u = np.clip(u, 1e-12, 1 - 1e-12)
+
+    out = pd.DataFrame(index=df.index)
+    alphas = list(getattr(fit, 'alphas', [np.nan] * M))
+    for m, act in enumerate(activity_cols):
+        mu = means[:, m]
+        if str(marginal).lower() == 'poisson':
+            y = poisson.ppf(u[:, m], mu)
+        else:
+            a = float(alphas[m]) if m < len(alphas) else np.nan
+            if not np.isfinite(a) or a <= 0:
+                a = 1.0
+            y = nbinom.ppf(u[:, m], n=1.0 / a, p=1.0 / (1.0 + a * mu))
+        y = np.nan_to_num(y, nan=0.0, posinf=10.0).astype(int)
+        out[act] = np.maximum(y, 0)
+    # cap like the estimation counts + keep only purpose columns
+    for p in PURPOSES:
+        col = f'n_{p}_out'
+        if col in out.columns:
+            out[col] = out[col].clip(
+                upper=int(MAX_COUNT.get(p, 9))).astype(int)
+        else:
+            out[col] = 0
+    logger.info(f"predict_joint_counts: joint draws for {len(df):,} persons "
+                f"({M} dims, copula={copula}, marginal={marginal})")
+    return out[[f'n_{p}_out' for p in PURPOSES]]
 
 
 if __name__ == '__main__':

@@ -80,15 +80,105 @@ import pandas as pd
 import logging
 import pickle
 import os
+import sys
 import glob
 import copy
 import html
 import re
 import time
+from itertools import combinations
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Callable, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def _shard_filter(items: list, stage: int, key_fn=None) -> list:
+    """Micro-job shard filter: keep only segments in GA_SHARD_SEGMENT.
+
+    No-op unless GA_SHARD_SEGMENT is set (see ga_shard.py). Lets one PBS job
+    run a single (stage, segment) search while sharing the run tag with its
+    sibling shards; `merge_ga_shards.py` unions the per-shard artifacts.
+    """
+    try:
+        from ga_shard import shard_keep
+    except Exception:
+        return items
+    if os.environ.get("GA_SHARD_SEGMENT", "all").strip().lower() in ("all", ""):
+        return items
+    key_fn = key_fn or (lambda x: str(x))
+    kept = [it for it in items if shard_keep(stage, key_fn(it))]
+    print(f"  [shard] stage {stage}: {len(kept)}/{len(items)} segment(s) in this job: "
+          f"{[key_fn(it) for it in kept]}")
+    return kept
+
+
+def _crash_force_include(skim_df=None) -> bool:
+    """Whether the CRASH term may be force-included/fixed in mode search.
+
+    CRASH is force-included on SEQ because the run exists to evaluate the
+    safety treatment. On transfer fixtures without a crash skim (Exampville,
+    MTC) the term is identically zero, so forcing it spends a fixed gene on
+    an unidentified coefficient, zeroes the gradient, and trips the
+    warm-start fail-fast abort (exampville E2, MTC M2). Mode:
+    STAGE5_CRASH_FORCE_INCLUDE=1 always force (legacy); =0 never force;
+    =auto (default) force only when the skim CRASH column actually varies.
+    Fail-open: any detection error preserves legacy force-include, loudly.
+    """
+    try:
+        _mode = os.environ.get('STAGE5_CRASH_FORCE_INCLUDE', 'auto').strip().lower()
+    except Exception:
+        return True
+    if _mode in ('1', 'true', 'yes', 'force'):
+        return True
+    if _mode in ('0', 'false', 'no', 'never'):
+        logger.warning("STAGE5_CRASH_FORCE_INCLUDE=0: CRASH force-include disabled")
+        return False
+    # nosafety experiment mode drops crash params from the UECs; the worker
+    # must not re-add CRASH behind its back (exampville E2 aborted on the
+    # CRASH-only minimal spec despite nosafety being set).
+    try:
+        if os.environ.get('SAFETY_EXPERIMENT_MODE', '').strip() == 'nosafety':
+            return False
+    except Exception:
+        pass
+    try:
+        cols = getattr(skim_df, 'columns', [])
+        if skim_df is None or 'CRASH' not in cols:
+            logger.warning("_crash_force_include[auto]: no CRASH skim column — "
+                           "skipping CRASH force-include (transfer fixture?)")
+            return False
+        v = pd.to_numeric(skim_df['CRASH'], errors='coerce').fillna(0.0)
+        if int(v.nunique()) <= 3 or not np.isfinite(float(v.std())) \
+                or float(v.std()) <= 1e-9:
+            logger.warning("_crash_force_include[auto]: CRASH skim near-constant "
+                           f"(nunique={int(v.nunique())}) — skipping force-include")
+            return False
+        return True
+    except Exception as _e:
+        logger.warning(f"_crash_force_include[auto]: detection failed ({_e}) — "
+                       "keeping legacy force-include")
+        return True
+
+
+def _ensure_utf8_console() -> None:
+    """Reconfigure stdout/stderr to UTF-8 with replace-fallback (no-op on failure).
+
+    Mirrors stage5_destination_choice._ensure_utf8_console: ~350 print sites
+    use box-drawing/unicode art, and an encoding crash inside an except handler
+    masks the real error. Called once at import.
+    """
+    try:
+        for _s in (sys.stdout, sys.stderr):
+            try:
+                _s.reconfigure(encoding='utf-8', errors='replace')
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+_ensure_utf8_console()
 
 
 def _plog(msg: str) -> None:
@@ -101,7 +191,13 @@ def _ga_save_stage_coef_csv(models: dict, stage_name: str, save_dir: str) -> Non
     rows = []
 
     def _add_rows(segment: str, obj: Any):
-        pf = getattr(obj, 'pf', None)
+        # Prefer the enriched inference frame (_fill_larch_inference stashes a
+        # copy with std_err/t_stat/p_value here), because model.pf returns a
+        # fresh frame lacking those columns in this Larch version. Without this
+        # the coefficient CSV/HTML exports show NaN for every SE/p-value.
+        pf = getattr(obj, '_inference_pf', None)
+        if pf is None:
+            pf = getattr(obj, 'pf', None)
         if pf is not None and hasattr(pf, 'iterrows'):
             for param, row in pf.iterrows():
                 rows.append({
@@ -122,15 +218,29 @@ def _ga_save_stage_coef_csv(models: dict, stage_name: str, save_dir: str) -> Non
                 if hasattr(obj.get('model', None), 'thresholds_'):
                     thr = getattr(obj['model'], 'thresholds_', None)
                     if thr is not None:
+                        _m = obj['model']
+                        _thr_se_raw = getattr(_m, 'threshold_std_err_', None)
+                        _thr_t_raw = getattr(_m, 't_stat_', None)
+                        _thr_p_raw = getattr(_m, 'p_value_', None)
+                        _thr_se = (np.asarray(_thr_se_raw, dtype=float).ravel().tolist()
+                                   if _thr_se_raw is not None else [])
+                        _thr_t = (np.asarray(_thr_t_raw, dtype=float).ravel().tolist()
+                                  if _thr_t_raw is not None else [])
+                        _thr_p = (np.asarray(_thr_p_raw, dtype=float).ravel().tolist()
+                                  if _thr_p_raw is not None else [])
+                        _n_beta = max(len(_thr_t) - len(list(thr)), 0) if _thr_t else 0
                         for i, v in enumerate(thr):
+                            _se = float(_thr_se[i]) if i < len(_thr_se) else float('nan')
+                            _tt = float(_thr_t[_n_beta + i]) if _n_beta + i < len(_thr_t) else float('nan')
+                            _pv = float(_thr_p[_n_beta + i]) if _n_beta + i < len(_thr_p) else float('nan')
                             rows.append({
                                 'stage': stage_name,
                                 'segment': segment,
                                 'param': f'threshold_{i}',
                                 'value': float(v),
-                                'std_err': float('nan'),
-                                't_stat': float('nan'),
-                                'p_value': float('nan'),
+                                'std_err': _se,
+                                't_stat': _tt,
+                                'p_value': _pv,
                                 'source': 'ordered_logit_threshold',
                             })
                 return
@@ -525,6 +635,67 @@ def _enforce_feature_bounds(
     return genes
 
 
+def _merge_segment_histories(segment_results: Dict[str, GAResult]) -> List[dict]:
+    """Joint per-generation history across segments (fixes single-row artifact).
+
+    The bundler used to emit one row (generation 0), so print_summary() always
+    reported Improvement 0.0000 / Generations 1 for multi-target stages (1, 2,
+    3, 23) even when every inner search improved and early-stopped. Here each
+    segment's fitness rows are outer-joined on generation and forward-filled
+    (an early-stopped segment holds its final value — the same semantics as its
+    own search), then averaged; feature counts sum and stagnation takes the
+    max. Returns [] on any failure so the caller keeps the legacy single-row
+    fallback and the pipeline never breaks.
+    """
+    try:
+        import pandas as _pd
+        import numpy as _np
+        frames = []
+        for _i, (_key, _res) in enumerate(segment_results.items()):
+            _h = _res.history_summary()
+            if _h is None or len(_h) == 0:
+                continue
+            _h = _h.copy()
+            _h['generation'] = _pd.to_numeric(
+                _h['generation'], errors='coerce').fillna(0).astype(int)
+            _h = _h.sort_values('generation').drop_duplicates('generation', keep='last')
+            _keep = [c for c in ('best_fitness', 'best_so_far', 'mean_fitness',
+                                 'worst_fitness', 'diversity', 'mutation_rate',
+                                 'n_features', 'stagnation') if c in _h.columns]
+            _sub = _h[_keep].copy()
+            _sub.columns = [f'{c}__{_i}' for c in _keep]
+            _sub.index = _h['generation'].values
+            frames.append(_sub)
+        if not frames:
+            return []
+        _wide = _pd.concat(frames, axis=1).sort_index().ffill()
+
+        def _row_mean(g, prefix):
+            _cs = [c for c in _wide.columns if c.startswith(prefix + '__')]
+            if not _cs:
+                return 0.0
+            _v = _pd.to_numeric(_wide.loc[g, _cs], errors='coerce')
+            _m = _np.nanmean(_np.atleast_1d(_v.values.astype(float)))
+            return float(_m) if _np.isfinite(_m) else 0.0
+
+        _hist = []
+        for _g in _wide.index:
+            _row = {'generation': int(_g)}
+            for _c in ('best_fitness', 'best_so_far', 'mean_fitness',
+                       'worst_fitness', 'diversity', 'mutation_rate'):
+                _row[_c] = _row_mean(_g, _c)
+            _fcs = [c for c in _wide.columns if c.startswith('n_features__')]
+            _scs = [c for c in _wide.columns if c.startswith('stagnation__')]
+            _row['n_features'] = int(_pd.to_numeric(
+                _wide.loc[_g, _fcs], errors='coerce').fillna(0).sum()) if _fcs else 0
+            _row['stagnation'] = int(_pd.to_numeric(
+                _wide.loc[_g, _scs], errors='coerce').fillna(0).max()) if _scs else 0
+            _hist.append(_row)
+        return _hist
+    except Exception:
+        return []
+
+
 def _combine_segment_feature_results(
     stage: int,
     segment_results: Dict[str, GAResult],
@@ -540,17 +711,21 @@ def _combine_segment_feature_results(
     })
     best_fitness = (float(np.mean([r.best_fitness for r in segment_results.values()]))
                     if segment_results else -1e9)
-    history = [{
-        'generation': 0,
-        'best_fitness': best_fitness,
-        'best_so_far': best_fitness,
-        'mean_fitness': best_fitness,
-        'worst_fitness': best_fitness,
-        'diversity': 0.0,
-        'mutation_rate': 0.0,
-        'n_features': int(sum(len(v) for v in feature_map.values())),
-        'stagnation': 0,
-    }]
+    # Joint history across segments so Improvement/Generations reflect the real
+    # inner searches; legacy single-row fallback keeps old behaviour on failure.
+    history = _merge_segment_histories(segment_results)
+    if not history:
+        history = [{
+            'generation': 0,
+            'best_fitness': best_fitness,
+            'best_so_far': best_fitness,
+            'mean_fitness': best_fitness,
+            'worst_fitness': best_fitness,
+            'diversity': 0.0,
+            'mutation_rate': 0.0,
+            'n_features': int(sum(len(v) for v in feature_map.values())),
+            'stagnation': 0,
+        }]
     dummy = Individual(genes=np.zeros(len(all_feature_names), dtype=int), fitness=best_fitness)
     combined = GAResult(
         stage=stage,
@@ -1033,6 +1208,191 @@ class AllStagesResult:
 # 1.  CORE GA ENGINE  (with caching, adaptive mutation, multi-restart)
 # ---------------------------------------------------------------------------
 
+def _save_best_ckpt(searcher, individual) -> None:
+    """
+    Atomic, throttled best-so-far checkpoint whenever a search finds a new
+    global best. Written to $GA_CHECKPOINT_DIR/best_<label>.npz so an OOM or
+    walltime kill mid-run still leaves the winning genes behind — the salvage
+    path in _run_ga_single_stage can then hand a usable feature set to the
+    prediction chain instead of dropping the stage entirely.
+    """
+    try:
+        import time as _time
+        # Never checkpoint a poisoned fitness: a -1e9 "best" means every eval
+        # so far failed, and persisting it lets a broken run masquerade as
+        # having a valid starting point (then burns walltime on -1e9 evals).
+        _fit = float(getattr(individual, 'fitness', -np.inf))
+        if not np.isfinite(_fit) or _fit <= -1e8:
+            return
+        now = _time.time()
+        if now - float(getattr(searcher, '_last_best_ckpt_t', 0.0)) < 30.0:
+            return                                   # ≥30 s between writes
+        searcher._last_best_ckpt_t = now
+        label = str(getattr(searcher, 'progress_label', '')
+                    or f'searcher_{id(searcher):x}')
+        slug = ''.join(c if c.isalnum() else '_' for c in label)[:60]
+        ckpt_dir = os.environ.get('GA_CHECKPOINT_DIR') or '.'
+        os.makedirs(ckpt_dir, exist_ok=True)
+        path = os.path.join(ckpt_dir, f'best_{slug}.npz')
+        tmp = path + '.tmp.npz'
+        feat_names = list(getattr(searcher, 'feature_names', None) or [])
+        np.savez_compressed(
+            tmp,
+            genes=np.asarray(individual.genes, dtype=np.int8),
+            fitness=float(getattr(individual, 'fitness', -np.inf)),
+            feat_names=np.array(feat_names, dtype=object),
+            label=np.array(label),
+            fitness_metric=np.array(str(getattr(searcher, 'fitness_metric', ''))),
+            saved_at=np.array(_time.strftime('%Y-%m-%d %H:%M:%S')),
+        )
+        os.replace(tmp, path)
+    except Exception:                                # noqa: BLE001
+        pass                                         # never break a search
+
+
+def _ga_memory_leash() -> None:
+    """Bound per-search memory growth (Larch/sharrow/JAX compiled artifacts).
+
+    Each stage-5 fitness eval compiles a fresh utility flow while the
+    sharrow/numba/JAX caches are only ever cleared OUTSIDE the search loop,
+    so RSS ratchets monotonically (~70 GB over 10 h on work-s5) until the
+    cgroup OOM-kills the job (exit 137, e.g. nonmand). The existing
+    _maybe_clear_jax_caches leash only runs in the SearchLibrium/MetaCount
+    fitness path — never in the stage-5 Larch path.
+
+    Every GA_LEASH_EVERY evals (default 5): gc.collect() always (cheap);
+    jax.clear_caches() + SearchLibrium JIT-cache clears only when RSS tops
+    80% of GA_JAX_CACHE_MEM_LIMIT_GB (default 48). psutil missing ⇒
+    gc-only. Throttled, logged at most once per call-site minute, never
+    raises into the search.
+    """
+    try:
+        _every = int(os.environ.get('GA_LEASH_EVERY', '5'))
+    except ValueError:
+        _every = 5
+    if _every <= 0:
+        return
+    _ga_memory_leash.calls = int(getattr(_ga_memory_leash, 'calls', 0)) + 1
+    if _ga_memory_leash.calls % _every:
+        return
+    try:
+        import gc as _gc
+        _gc.collect()
+    except Exception:
+        pass
+    try:
+        import psutil as _ps
+        _rss = int(_ps.Process().memory_info().rss)
+    except Exception:
+        return
+    try:
+        _lim_gb = float(os.environ.get('GA_JAX_CACHE_MEM_LIMIT_GB', '48'))
+    except ValueError:
+        _lim_gb = 48.0
+    if _rss < int(_lim_gb * 1e9 * 0.80):
+        return
+    try:
+        import time as _t
+        _now = _t.monotonic()
+        _last = float(getattr(_ga_memory_leash, 'last_log', 0.0) or 0.0)
+        if _now - _last > 60.0:
+            _ga_memory_leash.last_log = _now
+            try:
+                from pipeline_logger import logger as _lg
+                _lg.warning(f"GA memory leash: RSS {_rss / 1e9:.1f} GB "
+                            f"(>80% of {_lim_gb:.0f} GB) — clearing JIT caches")
+            except Exception:
+                pass
+        import jax as _jax
+        _jax.clear_caches()
+    except Exception:
+        pass
+    for _mod, _cls in (('SearchLibrium.multinomial_logit', 'MultinomialLogit'),
+                       ('SearchLibrium.MixedLogit', 'MixedLogit')):
+        try:
+            _m = __import__(_mod, fromlist=[_cls])
+            getattr(_m, _cls)._clear_jit_cache()
+        except Exception:
+            continue
+
+
+# ── PBS walltime awareness ────────────────────────────────────────────────────
+# The chain sets GA_WALLTIME_SECONDS (the job's -l walltime, in seconds). We
+# capture the process start once and derive an absolute deadline so any long GA
+# search can stop *gracefully* — finishing the current generation and writing its
+# checkpoint — instead of being SIGKILLed by PBS mid-generation (which loses the
+# whole segment). A margin leaves time to pickle the per-segment checkpoint.
+import time as _time_mod
+import signal as _signal_mod
+
+_GA_START_MONO = _time_mod.monotonic()
+_GA_WALLTIME_LIMIT = None             # absolute monotonic() PBS limit (no margin), or None
+_GA_WALLTIME_MARGIN = 300.0           # base reserve for checkpoint/finalise (seconds)
+_GA_WALLTIME_HIT = False              # set by the SIGTERM backstop / deadline check
+_GA_LAST_CHECK_MONO = None            # monotonic() of the previous guard check
+_GA_GEN_SECONDS_EMA = 0.0             # EMA of observed per-generation duration
+
+def _init_walltime_guard(margin_seconds: float = 300.0) -> None:
+    """Compute the walltime limit from GA_WALLTIME_SECONDS (if set).
+
+    The deadline is now generation-duration-aware (see _walltime_exceeded):
+    we store the absolute PBS limit and the base margin separately, and the
+    per-check reserve grows with the observed generation time so a SLOW search
+    (e.g. stage-4 tdd timing at ~28 min/gen) stops *before* starting a
+    generation it cannot finish — rather than being SIGKILLed mid-generation
+    (Exit -29), which loses the finalise step (model save + HTML)."""
+    global _GA_WALLTIME_LIMIT, _GA_WALLTIME_MARGIN, _GA_LAST_CHECK_MONO, _GA_GEN_SECONDS_EMA
+    try:
+        _env_margin = float(
+            os.environ.get('GA_WALLTIME_MARGIN_SECONDS', '').strip() or 0) or None
+    except (ValueError, TypeError, AttributeError):
+        _env_margin = None
+    _GA_WALLTIME_MARGIN = float(
+        _env_margin if _env_margin else margin_seconds)
+    _GA_LAST_CHECK_MONO = None
+    _GA_GEN_SECONDS_EMA = 0.0
+    wt = os.environ.get('GA_WALLTIME_SECONDS')
+    if wt:
+        try:
+            _GA_WALLTIME_LIMIT = _GA_START_MONO + float(wt)
+        except (ValueError, TypeError):
+            _GA_WALLTIME_LIMIT = None
+
+def _walltime_exceeded() -> bool:
+    """True once we cannot safely start another generation before the PBS wall.
+
+    This is called once per generation at the loop top, so the gap between
+    successive calls estimates one generation's wall-time. We reserve the base
+    margin PLUS 1.5x that observed generation time: if the projected end of the
+    next generation would blow the PBS limit, stop now so the loop breaks, the
+    best-so-far checkpoint is written, and the segment is finalised cleanly."""
+    global _GA_WALLTIME_HIT, _GA_LAST_CHECK_MONO, _GA_GEN_SECONDS_EMA
+    if _GA_WALLTIME_HIT:
+        return True
+    now = _time_mod.monotonic()
+    if _GA_LAST_CHECK_MONO is not None:
+        _gap = now - _GA_LAST_CHECK_MONO
+        if _gap > 0:
+            _GA_GEN_SECONDS_EMA = (_gap if _GA_GEN_SECONDS_EMA == 0.0
+                                   else 0.5 * _GA_GEN_SECONDS_EMA + 0.5 * _gap)
+    _GA_LAST_CHECK_MONO = now
+    if _GA_WALLTIME_LIMIT is not None:
+        _reserve = _GA_WALLTIME_MARGIN + 1.5 * _GA_GEN_SECONDS_EMA
+        if now >= _GA_WALLTIME_LIMIT - _reserve:
+            _GA_WALLTIME_HIT = True
+            return True
+    return False
+
+def _walltime_sigterm_handler(signum, frame):           # pragma: no cover
+    """Backstop: PBS SIGTERM (sent just before SIGKILL) flips the flag so the
+    next generation-loop check breaks and the in-progress segment is checkpointed
+    cleanly rather than killed with no save."""
+    global _GA_WALLTIME_HIT
+    _GA_WALLTIME_HIT = True
+
+_signal_mod.signal(_signal_mod.SIGTERM, _walltime_sigterm_handler)
+
+
 class GeneticAlgorithm:
     """
     Binary-encoded GA with:
@@ -1105,6 +1465,10 @@ class GeneticAlgorithm:
         else:
             shown = active
         return str(shown)
+
+    def _feature_count(self, genes: np.ndarray) -> int:
+        """Count the primary feature block, excluding optional gene metadata."""
+        return int(np.asarray(genes)[:self.n_features].sum())
 
     # ÔöÇÔöÇ initialisation ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
@@ -1307,7 +1671,25 @@ class GeneticAlgorithm:
         # Disable with GA_EARLY_STOP=0; tune with GA_EARLY_STOP_PATIENCE /
         # GA_EARLY_STOP_MIN_GENS.
         import os as _os
-        _early_stop = _os.environ.get('GA_EARLY_STOP', '1').strip() != '0'
+        _label_lower = str(getattr(self, 'progress_label', '')).lower()
+        if 'stage4' in _label_lower or 'stage 4' in _label_lower:
+            _stage_prefix = 'GA_STAGE4_'
+            _default_patience = max(10 * self.stagnation_limit, 120)
+            _default_min_gens = max(8 * self.stagnation_limit, 120)
+        elif 'stage2' in _label_lower or 'stage 2' in _label_lower:
+            _stage_prefix = 'GA_STAGE2_'
+            _default_patience = max(3 * self.stagnation_limit, 24)
+            _default_min_gens = max(2 * self.stagnation_limit, 20)
+        else:
+            _stage_prefix = ''
+            _default_patience = max(3 * self.stagnation_limit, 24)
+            _default_min_gens = max(2 * self.stagnation_limit, 20)
+
+        _early_raw = _os.environ.get(
+            f'{_stage_prefix}EARLY_STOP' if _stage_prefix else 'GA_EARLY_STOP',
+            _os.environ.get('GA_EARLY_STOP', '1'),
+        )
+        _early_stop = str(_early_raw).strip() != '0'
 
         def _env_int(_name: str, _default: int) -> int:
             try:
@@ -1316,8 +1698,12 @@ class GeneticAlgorithm:
             except ValueError:
                 return _default
 
-        _es_patience = _env_int('GA_EARLY_STOP_PATIENCE', max(3 * self.stagnation_limit, 24))
-        _es_min_gens = _env_int('GA_EARLY_STOP_MIN_GENS', max(2 * self.stagnation_limit, 20))
+        _es_patience = _env_int(
+            f'{_stage_prefix}EARLY_STOP_PATIENCE' if _stage_prefix
+            else 'GA_EARLY_STOP_PATIENCE', _default_patience)
+        _es_min_gens = _env_int(
+            f'{_stage_prefix}EARLY_STOP_MIN_GENS' if _stage_prefix
+            else 'GA_EARLY_STOP_MIN_GENS', _default_min_gens)
         # Fraction of the population replaced by fresh random individuals on each
         # stagnation-limit-multiple plateau generation (partial reheat). 0 = off.
         try:
@@ -1335,6 +1721,12 @@ class GeneticAlgorithm:
         _mut_min = min(max(_mut_min, 0.0), 0.9)
 
         for gen in range(self.n_generations):
+            if _walltime_exceeded():
+                self._walltime_hit = True
+                print(f"\n  !! Walltime guard tripped at gen {gen} "
+                      f"(PBS limit approaching) — stopping search gracefully; "
+                      "segment checkpoint will be written on exit.", flush=True)
+                break
             print(f"Gen {gen:3d} | evaluating population... ", end='', flush=True)
             fitnesses = [ind.fitness for ind in pop]
             gen_best  = max(pop, key=lambda x: x.fitness)
@@ -1343,6 +1735,7 @@ class GeneticAlgorithm:
             if gen_best.fitness > best_ever.fitness:
                 best_ever        = gen_best.copy()
                 stagnation_count = 0
+                _save_best_ckpt(self, best_ever)   # incremental best-so-far save
                 if self.verbose:
                     label = f" [{self.progress_label}]" if self.progress_label else ""
                     metric = f"BIC/n={-best_ever.fitness:.4f}" if best_ever.fitness > -1e8 else f"fitness={best_ever.fitness:.4f}"
@@ -1416,11 +1809,73 @@ class GeneticAlgorithm:
                 'best_so_far':   best_ever.fitness,
                 'mean_fitness':  float(np.mean(fitnesses)),
                 'worst_fitness': float(np.min(fitnesses)),
-                'n_features':    int(gen_best.genes.sum()),
+                'n_features':    self._feature_count(gen_best.genes),
                 'diversity':     div,
                 'mutation_rate': cur_rate,
                 'stagnation':    stagnation_count,
             })
+
+            # ── OOM-proof periodic checkpoint ─────────────────────────────
+            # A SIGKILL (HPC OOM, e.g. nonmand qld_shard3 exit 137 at gen
+            # 22/30) cannot be caught: history lives only in RAM, so the
+            # kill loses the whole trajectory and no GA plots can ever be
+            # rendered. Every K-th generation persist the trajectory CSV,
+            # best genes, and a partial convergence PNG. Tiny files,
+            # throttled by K, and never raises into the search.
+            try:
+                _ckpt_every = int(os.environ.get('GA_CHECKPOINT_EVERY', '5'))
+            except ValueError:
+                _ckpt_every = 5
+            if _ckpt_every > 0 and gen % _ckpt_every == 0:
+                try:
+                    _ckpt_dir = os.environ.get('GA_CHECKPOINT_DIR') or '.'
+                    os.makedirs(_ckpt_dir, exist_ok=True)
+                    _ckpt_plots = os.path.join(_ckpt_dir, 'plots')
+                    os.makedirs(_ckpt_plots, exist_ok=True)
+                    _slug = ''.join(c if c.isalnum() else '_'
+                                    for c in str(getattr(self, 'progress_label', '') or 'ga'))[:60]
+                    import csv as _csv_mod
+                    _hist_path = os.path.join(_ckpt_dir, f'ga_history_partial_{_slug}.csv')
+                    with open(_hist_path, 'w', newline='') as _fh:
+                        _w = _csv_mod.DictWriter(_fh, fieldnames=list(history[-1].keys()))
+                        _w.writeheader()
+                        _w.writerows(history)
+                    np.savez_compressed(
+                        os.path.join(_ckpt_dir, f'ga_best_partial_{_slug}.npz'),
+                        genes=np.asarray(best_ever.genes, dtype=np.int8),
+                        fitness=float(best_ever.fitness),
+                        feat_names=np.array(list(getattr(self, 'feature_names', []) or []), dtype=object),
+                        generation=np.array(int(gen)))
+                    try:
+                        import matplotlib
+                        matplotlib.use('Agg')
+                        import matplotlib.pyplot as plt
+                        _is_bic = 'BIC' in str(getattr(self, 'fitness_metric', ''))
+                        _gs = [h['generation'] for h in history]
+                        _bf = [(-h['best_so_far'] if _is_bic else h['best_so_far']) for h in history]
+                        _mf = [(-h['mean_fitness'] if _is_bic else h['mean_fitness']) for h in history]
+                        _fig, _ax = plt.subplots(figsize=(8, 4))
+                        _ax.plot(_gs, _bf, label='best so far')
+                        _ax.plot(_gs, _mf, label='mean', alpha=0.7)
+                        _ax.set_xlabel('generation')
+                        _ax.set_ylabel('BIC/n' if _is_bic else 'fitness')
+                        _ax.set_title(f'GA convergence (partial, gen {gen})'
+                                      + (f' [{self.progress_label}]' if self.progress_label else ''))
+                        _ax.legend()
+                        _fig.tight_layout()
+                        _fig.savefig(os.path.join(_ckpt_plots, f'ga_partial_{_slug}.png'), dpi=120)
+                        plt.close(_fig)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            # Memory leash: bound compiled-artifact growth every few gens so
+            # long stage-5 searches ratchet to the cgroup limit (exit 137).
+            try:
+                _ga_memory_leash()
+            except Exception:
+                pass
 
             if self.verbose and gen % 5 == 0:
                 if 'BIC' in self.fitness_metric:
@@ -1501,6 +1956,7 @@ class GeneticAlgorithm:
         print(f"  Main run: {self.n_generations} generations, pop={self.pop_size}")
         best_ever, history, pop = self.run(seed_individuals=seed_individuals)
         print(f"  Main run best: {best_ever.fitness:.4f}")
+        _save_best_ckpt(self, best_ever)
 
         orig_gens          = self.n_generations
         self.n_generations = restart_gens
@@ -1520,10 +1976,365 @@ class GeneticAlgorithm:
             if best_r.fitness > best_ever.fitness:
                 best_ever = best_r.copy()
                 print(f"    ^ New global best: {best_ever.fitness:.4f}")
+                _save_best_ckpt(self, best_ever)
             history.extend(hist_r)
 
         self.n_generations = orig_gens
         return best_ever, history, pop
+
+
+# ---------------------------------------------------------------------------
+# 1a-AGDS.  SPARSE-EA AGDS ENGINE
+# ---------------------------------------------------------------------------
+# Reference-point helpers for the (optional) many-objective survival step.
+
+def _agds_reference_points(n_obj, divisions):
+    """Das-Dennis structured reference points on the (n_obj-1)-simplex."""
+    def _recurse(left, depth):
+        if depth == n_obj - 1:
+            return [[left]]
+        pts = []
+        for i in range(left + 1):
+            for tail in _recurse(left - i, depth + 1):
+                pts.append([i] + tail)
+        return pts
+    if n_obj == 1:
+        return np.array([[1.0]])
+    return np.array(_recurse(divisions, 0), dtype=float) / float(divisions)
+
+
+def _agds_associate(points, ref):
+    """Associate each point with the nearest reference line (index into ref)."""
+    if len(points) == 0:
+        return np.array([], dtype=int)
+    ref_norm = ref / (np.linalg.norm(ref, axis=1, keepdims=True) + 1e-12)
+    out = np.empty(len(points), dtype=int)
+    for i, p in enumerate(points):
+        proj = points[i] @ ref_norm.T
+        perp = np.linalg.norm(p[None, :] - proj[:, None] * ref_norm, axis=1)
+        out[i] = int(np.argmin(perp))
+    return out
+
+
+class SparseEAAGDS(GeneticAlgorithm):
+    """
+    SparseEA-AGDS feature-selection engine (Wang et al., Scientific Reports 2025:
+    "Evolution algorithm with adaptive genetic operator and dynamic scoring
+    mechanism for large-scale sparse many-objective optimization").
+
+    The binary feature mask (``Individual.genes``) *is* the SparseEA ``mask``;
+    ``dec`` is degenerate here because each feature is a plain include/exclude
+    gene.  Three stackable strategies are layered on top of the base
+    ``GeneticAlgorithm`` while keeping all of its machinery (fitness caching,
+    adaptive-mutation floor, diversity injection, stagnation reheat, early stop,
+    collinearity / require-one / bounds repair, and the run / run_with_restarts
+    interface the staged pipeline relies on):
+
+      (A) Adaptive genetic operator - per-individual crossover / mutation
+          probabilities scale with the non-dominated (here: fitness-tier) rank
+          ``P_s,i = (maxr - r_i + 1)/maxr`` (Eq. 5), ``P_c,i = pc0 * P_s,i``
+          (Eq. 6), ``P_m,i = pm0 * P_s,i`` (Eq. 7).  Superior individuals get
+          more genetic opportunity.  The parent's ``P_s`` is threaded to its
+          offspring through ``Individual.metadata['agds_ps']``.
+      (B) Dynamic scoring mechanism - each generation the per-gene score is
+          recomputed from the current layers: ``S_i_r = maxr - r_i + 1``
+          (Eq. 8), ``sumS_d = sum_i S_i_r * genes_{i,d}`` (Eq. 9),
+          ``S_d = maxS - sumS_d + 1`` (Eq. 10).  Mutation flips are chosen by a
+          binary tournament on ``S_d`` (Figs. 3-4) rather than i.i.d. per gene,
+          so genes frequently active among superior models are perturbed
+          preferentially.
+      (C) Reference-point-based environmental selection (NSGA-III niching) is
+          implemented in :meth:`reference_point_survival` for the many-objective
+          case.  The staged pipeline supplies a *single* scalar fitness, so
+          (C) degenerates to the inherited elitist + tournament survival of the
+          base GA; the helper is retained for parity with the metacountregressor
+          and SearchLibrium AGDS implementations and is exercised directly by
+          the verification harness.
+
+    Selectable from the staged pipeline via ``GA_ENGINE=agds`` (or
+    ``GA_ENGINE_<STAGE>=agds``).
+    """
+
+    def __init__(self, *args, pc0=None, pm0=None, ref_divisions=12,
+                 distribution_features=None, distribution_options=None,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.distribution_features = list(dict.fromkeys(distribution_features or []))
+        _default_dist_options = ('fixed', 'normal', 'neglognormal')
+        self.distribution_options = {}
+        for _name in self.distribution_features:
+            _opts = (distribution_options or {}).get(_name, _default_dist_options)
+            _opts = tuple(dict.fromkeys(str(_opt).lower() for _opt in _opts))
+            _opts = tuple(_opt for _opt in _opts if _opt in _default_dist_options)
+            if 'fixed' not in _opts:
+                _opts = ('fixed',) + _opts
+            self.distribution_options[_name] = _opts or ('fixed',)
+        self._distribution_positions = {
+            _name: self.n_features + 2 * _idx
+            for _idx, _name in enumerate(self.distribution_features)
+        }
+        self.n_genes = self.n_features + 2 * len(self.distribution_features)
+        # env overrides so the engine can be tuned without touching call sites
+        if pc0 is None:
+            try:
+                pc0 = float(os.environ.get('GA_AGDS_PC0', '0.9'))
+            except ValueError:
+                pc0 = 0.9
+        if pm0 is None:
+            _env_pm0 = os.environ.get('GA_AGDS_PM0', '').strip()
+            pm0 = float(_env_pm0) if _env_pm0 else 1.0 / max(self.n_features, 1)
+        self.pc0 = float(pc0)
+        self.pm0 = float(pm0)
+        self.ref_divisions = int(ref_divisions)
+        self._maxr = 1
+        self._ps_by_key = {}
+        self._dyn_scores = np.ones(self.n_features, dtype=float)
+
+    def _dist_code(self, name: str, choice: str) -> int:
+        """Encode fixed, Normal, or negative-LogNormal as a two-bit code."""
+        choice = str(choice or 'fixed').lower()
+        if choice not in self.distribution_options.get(name, ('fixed',)):
+            return 0
+        return {'fixed': 0, 'normal': 1, 'neglognormal': 2}.get(choice, 0)
+
+    @staticmethod
+    def _dist_name(code: int) -> str:
+        return {0: 'fixed', 1: 'normal', 2: 'neglognormal'}.get(int(code), 'fixed')
+
+    def encode_distribution_genes(self, base_genes: np.ndarray,
+                                  policy: dict = None) -> np.ndarray:
+        """Build a full chromosome from feature genes and a distribution policy."""
+        base = np.asarray(base_genes, dtype=int)[:self.n_features]
+        out = np.zeros(self.n_genes, dtype=int)
+        out[:self.n_features] = base
+        policy = policy or {}
+        name_to_idx = {name: idx for idx, name in enumerate(self.feature_names)}
+        for name, pos in self._distribution_positions.items():
+            if name in name_to_idx and base[name_to_idx[name]] != 1:
+                continue
+            code = self._dist_code(name, policy.get(name, 'fixed'))
+            out[pos] = code & 1
+            out[pos + 1] = (code >> 1) & 1
+        return out
+
+    def decode_distribution_genes(self, genes: np.ndarray) -> dict:
+        """Return non-fixed distribution choices represented by a chromosome."""
+        genes = np.asarray(genes, dtype=int)
+        name_to_idx = {name: idx for idx, name in enumerate(self.feature_names)}
+        out = {}
+        for name, pos in self._distribution_positions.items():
+            if name in name_to_idx and genes[name_to_idx[name]] != 1:
+                continue
+            if pos + 1 >= len(genes):
+                continue
+            choice = self._dist_name(int(genes[pos]) + 2 * int(genes[pos + 1]))
+            if choice != 'fixed':
+                out[name] = choice
+        return out
+
+    def _repair_distribution_tail(self, genes: np.ndarray) -> np.ndarray:
+        """Clear invalid two-bit choices and choices for inactive features."""
+        genes = np.asarray(genes, dtype=int).copy()
+        name_to_idx = {name: idx for idx, name in enumerate(self.feature_names)}
+        for name, pos in self._distribution_positions.items():
+            if pos + 1 >= len(genes):
+                continue
+            if name in name_to_idx and genes[name_to_idx[name]] != 1:
+                genes[pos:pos + 2] = 0
+                continue
+            code = int(genes[pos]) + 2 * int(genes[pos + 1])
+            if code == 3 or self._dist_name(code) not in self.distribution_options.get(name, ('fixed',)):
+                genes[pos:pos + 2] = 0
+        return genes
+
+    # -- refresh AGDS state whenever a population is (re)evaluated ---------
+    def _evaluate(self, pop):
+        pop = super()._evaluate(pop)
+        self._refresh_agds_state(pop)
+        return pop
+
+    def _refresh_agds_state(self, pop):
+        n = len(pop)
+        if n == 0:
+            return
+        # non-dominated layers -> single-objective fitness tiers
+        # (higher fitness == better == smaller rank r_i).
+        order = sorted(range(n), key=lambda i: pop[i].fitness, reverse=True)
+        ranks = [1] * n
+        layer, prev = 1, None
+        for i in order:
+            f = pop[i].fitness
+            if prev is not None and f < prev:
+                layer += 1
+            ranks[i] = layer
+            prev = f
+        maxr = max(ranks)
+        self._maxr = maxr
+        si_r = np.array([maxr - ranks[i] + 1 for i in range(n)], dtype=float)  # Eq. 8
+        self._ps_by_key = {pop[i].key(): (maxr - ranks[i] + 1) / maxr          # Eq. 5
+                           for i in range(n)}
+        genes = np.array([ind.genes[:self.n_features] for ind in pop], dtype=float)
+        sumS = (si_r[:, None] * genes).sum(axis=0)                             # Eq. 9
+        maxS = float(sumS.max()) if sumS.size else 0.0
+        self._dyn_scores = maxS - sumS + 1.0                                   # Eq. 10
+
+    def _ps_for(self, ind):
+        ps = ind.metadata.get('agds_ps') if isinstance(ind.metadata, dict) else None
+        if ps is not None:
+            return ps
+        return self._ps_by_key.get(ind.key(), 1.0)
+
+    def _random_individual(self, n_active: int = None) -> Individual:
+        base = super()._random_individual(n_active)
+        if not self.distribution_features:
+            return base
+        policy = {}
+        name_to_idx = {name: idx for idx, name in enumerate(self.feature_names)}
+        for name in self.distribution_features:
+            if name in name_to_idx and base.genes[name_to_idx[name]] != 1:
+                continue
+            choices = self.distribution_options.get(name, ('fixed',))
+            policy[name] = choices[int(self.rng.integers(0, len(choices)))]
+        return Individual(genes=self.encode_distribution_genes(base.genes, policy),
+                          metadata=copy.deepcopy(base.metadata))
+
+    # -- (A) adaptive crossover -------------------------------------------
+    def _crossover(self, p1, p2):
+        ps = max(self._ps_for(p1), self._ps_for(p2))
+        pc = self.pc0 * ps                                        # Eq. 6
+        if self.rng.random() > pc:
+            a, b = p1.copy(), p2.copy()
+        else:
+            mask = self.rng.integers(0, 2, size=self.n_features).astype(bool)
+            a_base = np.where(mask, p1.genes[:self.n_features], p2.genes[:self.n_features])
+            b_base = np.where(mask, p2.genes[:self.n_features], p1.genes[:self.n_features])
+            a_tail = p1.genes[self.n_features:self.n_genes].copy()
+            b_tail = p2.genes[self.n_features:self.n_genes].copy()
+            if len(a_tail):
+                tail_mask = self.rng.integers(0, 2, size=len(a_tail)).astype(bool)
+                a_tail = np.where(tail_mask, a_tail, p2.genes[self.n_features:self.n_genes])
+                b_tail = np.where(tail_mask, p2.genes[self.n_features:self.n_genes],
+                                  p1.genes[self.n_features:self.n_genes])
+            a = Individual(genes=self._repair_distribution_tail(
+                np.concatenate([a_base, a_tail])))
+            b = Individual(genes=self._repair_distribution_tail(
+                np.concatenate([b_base, b_tail])))
+        a.metadata['agds_ps'] = ps
+        b.metadata['agds_ps'] = ps
+        return a, b
+
+    # -- (A)+(B) adaptive + dynamic-scoring mutation ----------------------
+    def _mutate(self, ind, rate):
+        ps = self._ps_for(ind)
+        pm = self.pm0 * ps                                        # Eq. 7
+        # keep the base loop's diversity / stagnation-driven boost as a floor
+        eff = max(rate, pm)
+        genes = ind.genes[:self.n_features].copy()
+        distribution_tail = (ind.genes[self.n_features:self.n_genes].copy()
+                     if self.distribution_features else None)
+        mutable = [i for i in range(self.n_features) if i not in self._fixed_idx]
+        if mutable:
+            n_flips = max(1, int(round(eff * len(mutable))))
+            scores = self._dyn_scores
+            for _ in range(n_flips):
+                a = int(self.rng.choice(mutable))
+                b = int(self.rng.choice(mutable))
+                d = a if scores[a] <= scores[b] else b   # binary tournament: smaller S_d wins
+                genes[d] = 1 - genes[d]
+        if self._fixed_idx:
+            genes[list(self._fixed_idx)] = 1
+
+        # reuse the base repair chain (collinearity / bounds / require-one)
+        if self.collinear_groups and self.feature_names:
+            genes = _repair_collinearity(genes, self.feature_names,
+                                         self.collinear_groups, self.rng,
+                                         protected_idx=self._fixed_idx)
+        genes = _enforce_feature_bounds(
+            genes,
+            max(self.min_features, len(self._fixed_idx)),
+            self.max_features,
+            self.rng,
+            feature_names=self.feature_names,
+            collinear_groups=self.collinear_groups,
+            protected_idx=self._fixed_idx,
+        )
+        if self.require_one_groups and self.feature_names:
+            genes = _repair_require_one(genes, self.feature_names,
+                                        self.require_one_groups, self.rng,
+                                        protected_idx=self._fixed_idx,
+                                        collinear_groups=self.collinear_groups)
+        if self.distribution_features:
+            tail = distribution_tail
+            name_to_idx = {name: idx for idx, name in enumerate(self.feature_names)}
+            for name, pos in self._distribution_positions.items():
+                tail_pos = pos - self.n_features
+                if tail_pos + 1 >= len(tail):
+                    continue
+                base_idx = name_to_idx.get(name)
+                if base_idx is not None and genes[base_idx] != 1:
+                    tail[tail_pos:tail_pos + 2] = 0
+                    continue
+                if self.rng.random() < eff:
+                    choices = self.distribution_options.get(name, ('fixed',))
+                    current = self._dist_name(int(tail[tail_pos]) + 2 * int(tail[tail_pos + 1]))
+                    alternatives = [choice for choice in choices if choice != current]
+                    choice = (alternatives[int(self.rng.integers(0, len(alternatives)))]
+                              if alternatives else 'fixed')
+                    code = self._dist_code(name, choice)
+                    tail[tail_pos] = code & 1
+                    tail[tail_pos + 1] = (code >> 1) & 1
+            genes = self._repair_distribution_tail(np.concatenate([genes, tail]))
+        out = Individual(genes=genes)
+        out.metadata['agds_ps'] = ps
+        return out
+
+    # -- (C) reference-point-based environmental selection (NSGA-III) -----
+    def reference_point_survival(self, objectives, n_select):
+        """Select ``n_select`` row indices from an ``(N, M)`` objective matrix
+        (minimisation) using NSGA-III normalization + reference-point niching.
+
+        In the staged single-objective pipeline this is not on the hot path -
+        survival degenerates to the base GA's elitist tournament - but the
+        method is provided (and unit-tested) for parity with the AGDS
+        implementations in the other two packages.
+        """
+        F = np.asarray(objectives, dtype=float)
+        if F.ndim == 1:
+            F = F[:, None]
+        N, M = F.shape
+        if N <= n_select:
+            return list(range(N))
+        if M == 1:
+            return list(np.argsort(F[:, 0])[:n_select])
+
+        ideal = F.min(axis=0)
+        Fn = F - ideal
+        nadir = Fn.max(axis=0)
+        nadir[nadir == 0] = 1.0
+        Fn = Fn / nadir
+
+        ref = _agds_reference_points(M, self.ref_divisions)
+        assoc = _agds_associate(Fn, ref)
+        niche = np.zeros(len(ref), dtype=int)
+        chosen, available = [], list(range(N))
+        # distance to associated line, for tie-breaking within a niche
+        ref_norm = ref / (np.linalg.norm(ref, axis=1, keepdims=True) + 1e-12)
+        dist = np.array([
+            np.linalg.norm(Fn[i] - (Fn[i] @ ref_norm[assoc[i]]) * ref_norm[assoc[i]])
+            for i in range(N)
+        ])
+        while len(chosen) < n_select and available:
+            rmin = None
+            for k in set(assoc[c] for c in available):
+                if rmin is None or niche[k] < niche[rmin]:
+                    rmin = k
+            members = [c for c in available if assoc[c] == rmin]
+            pick = min(members, key=lambda c: dist[c]) if niche[rmin] == 0 \
+                else int(self.rng.choice(members))
+            chosen.append(pick)
+            niche[rmin] += 1
+            available.remove(pick)
+        return chosen
 
 
 # ---------------------------------------------------------------------------
@@ -1752,6 +2563,12 @@ class SimulatedAnnealing:
         history: List[dict] = []
 
         for gen in range(self.n_generations):
+            if _walltime_exceeded():
+                self._walltime_hit = True
+                print(f"\n  !! Walltime guard tripped at SA gen {gen} "
+                      f"(PBS limit approaching) — stopping search gracefully; "
+                      "segment checkpoint will be written on exit.", flush=True)
+                break
             print(f"SA gen {gen:3d} | T={T:.5f} | evaluating neighbors... ", end='', flush=True)
             bucket_fits: List[float] = []      # accepted-state fitness after each step
             proposed_fits: List[float] = []    # ALL proposed (before accept/reject)
@@ -1827,6 +2644,7 @@ class SimulatedAnnealing:
         print(f"  SA main run: {self.n_generations} gens (steps/gen={self.pop_size})")
         best_ever, history, _ = self.run(seed_individuals=seed_individuals)
         print(f"  SA main run best: {best_ever.fitness:.4f}")
+        _save_best_ckpt(self, best_ever)
 
         orig_gens          = self.n_generations
         self.n_generations = restart_gens
@@ -1844,6 +2662,7 @@ class SimulatedAnnealing:
             if best_r.fitness > best_ever.fitness:
                 best_ever = best_r
                 print(f"New SA global best: {best_ever.fitness:.4f}")
+                _save_best_ckpt(self, best_ever)
             history.extend(hist_r)
 
         self.n_generations = orig_gens
@@ -1851,32 +2670,25 @@ class SimulatedAnnealing:
 
 
 # ---------------------------------------------------------------------------
-# 1c.  BANDIT FEATURE SEARCHER  (Thompson-sampling multi-armed bandit)
+# 1c.  BANDIT FEATURE SEARCHER  (MH-guided Thompson search)
 # ---------------------------------------------------------------------------
 
 class BanditFeatureSearcher:
     """
-    SA-based Thompson-sampling bandit for binary feature selection.
+    Metropolis-Hastings feature search with Thompson-informed proposals.
 
-    Combines Simulated Annealing acceptance with Thompson-sampling proposals:
+    The search state is a legal binary chromosome.  Local one-bit moves and
+    two-bit substitutions are enumerated explicitly, then weighted by the
+    current Beta arms.  Because both the forward and reverse proposal masses
+    are available, acceptance uses the Hastings correction rather than the
+    old implicit simulated-annealing rule:
 
-      1. At each step a *candidate* chromosome is drawn by sampling
-             theta_i ~ Beta(alpha_i, beta_i)
-             gene_i  ~ Bernoulli(theta_i)
-         for every optional feature i.  Fixed features are always ON.
+        log(alpha) = (fitness_candidate - fitness_current) / T
+                     + log q(current | candidate) - log q(candidate | current)
 
-      2. The candidate is accepted as the new current state with SA
-         probability  min(1, exp(Δfitness / T)).
-
-      3. Beta posteriors are updated on *every evaluated candidate*
-         (not just accepted ones), using the running mean as threshold:
-             fitness > mean → alpha[i] += 1 for ON, beta[i] += 0.1 for OFF
-             fitness ≤ mean → beta[i]  += 1 for ON
-
-    The two mechanisms are complementary:
-      - High T (early):  SA accepts worse proposals freely  → landscape exploration
-      - Sharpening Beta: proposals concentrate on good features → feature selection
-      - Low T (late):    SA only accepts improvements         → exploitation
+    Beta posteriors are still updated on every evaluated candidate, so the
+    bandit learns which legal local moves deserve more proposal mass without
+    hiding that asymmetry from the acceptance rule.
 
     Total evaluation budget equals pop_size × n_generations steps, organised
     into n_generations reporting buckets — same budget structure as SA.
@@ -1925,7 +2737,7 @@ class BanditFeatureSearcher:
         elitism_k:           int   = 4,
         tournament_k:        int   = 4,
         stagnation_limit:    int   = 12,
-        n_neighbors:         int   = 1,     # accepted, ignored (SA-bandit uses Thompson proposals)
+        n_neighbors:         int   = 1,     # accepted for interface compatibility
     ):
         self.n_features     = n_features
         self.fitness_fn     = fitness_fn
@@ -2139,6 +2951,103 @@ class BanditFeatureSearcher:
             )
         return self._attach_rand_genes(cand_genes, cand_tail)
 
+    def _mh_state_valid(self, genes: np.ndarray) -> bool:
+        """Return whether a chromosome satisfies all hard search constraints."""
+        genes = np.asarray(genes, dtype=int)
+        if len(genes) != self.n_genes or np.any((genes != 0) & (genes != 1)):
+            return False
+        base = genes[:self.n_features]
+        if any(base[i] != 1 for i in self._fixed_idx):
+            return False
+        blocked = getattr(self, '_blocked', set())
+        if self.feature_names and any(
+            base[i] == 1 and self.feature_names[i] in blocked
+            for i in self._opt_idx
+        ):
+            return False
+        n_active = int(base.sum())
+        if n_active < self.min_features or n_active > self.max_features:
+            return False
+        if self.feature_names:
+            for group in self.collinear_groups:
+                idx = [self.feature_names.index(name)
+                       for name in group if name in self.feature_names]
+                if sum(base[i] for i in idx) > 1:
+                    return False
+            for group in self.require_one_groups:
+                idx = [self.feature_names.index(name)
+                       for name in group if name in self.feature_names]
+                if idx and not any(base[i] for i in idx):
+                    return False
+        if self.n_rand:
+            tail = genes[self.n_features:]
+            for j, fi in enumerate(self._rand_feat_idx):
+                if base[fi] == 0 and tail[j] != 0:
+                    return False
+                if j in self._force_rand_pos and base[fi] == 1 and tail[j] != 1:
+                    return False
+        return True
+
+    def _mh_neighbors(self, genes: np.ndarray) -> list[tuple[np.ndarray, tuple[int, ...]]]:
+        """Enumerate legal one-bit and feature-substitution MH neighbors."""
+        genes = np.asarray(genes, dtype=int)
+        positions = list(self._opt_idx)
+        positions.extend(
+            self.n_features + j for j in range(self.n_rand)
+            if j not in self._force_rand_pos
+        )
+        moves = [(pos,) for pos in positions]
+        # Two-bit moves provide direct feature substitutions and also let a
+        # gated random-parameter bit change with its include bit. Both forms
+        # remain reversible because legality is checked on the final state.
+        moves.extend(combinations(positions, 2))
+        neighbors: dict[tuple[int, ...], tuple[np.ndarray, tuple[int, ...]]] = {}
+        for move in moves:
+            candidate = genes.copy()
+            candidate[list(move)] = 1 - candidate[list(move)]
+            if self._mh_state_valid(candidate):
+                neighbors[tuple(candidate.tolist())] = (candidate, tuple(move))
+        return list(neighbors.values())
+
+    def _mh_move_weight(self, genes: np.ndarray, move: tuple[int, ...]) -> float:
+        """Weight a legal move using Beta preference and weakness history."""
+        weight = 1.0
+        for pos in move:
+            theta = self._alpha[pos] / max(self._alpha[pos] + self._beta[pos], 1e-12)
+            weight *= theta if genes[pos] else max(1.0 - theta, 1e-12)
+            if pos < self.n_features and genes[pos] and self.feature_names:
+                weight /= 1.0 + max(
+                    self._weakness.get(self.feature_names[pos], 0.0), 0.0)
+        return max(float(weight), 1e-15)
+
+    def _mh_propose(self, genes: np.ndarray):
+        """Draw a legal candidate and return its forward/reverse log masses."""
+        neighbors = self._mh_neighbors(genes)
+        if not neighbors:
+            return None, 0.0, 0.0
+
+        weights = np.asarray([
+            self._mh_move_weight(candidate, move)
+            for candidate, move in neighbors
+        ], dtype=float)
+        probs = weights / weights.sum()
+        pick = int(self.rng.choice(len(neighbors), p=probs))
+        candidate, move = neighbors[pick]
+        reverse_neighbors = self._mh_neighbors(candidate)
+        reverse_weights = np.asarray([
+            self._mh_move_weight(reverse_candidate, reverse_move)
+            for reverse_candidate, reverse_move in reverse_neighbors
+        ], dtype=float)
+        reverse_probs = reverse_weights / reverse_weights.sum()
+        reverse_lookup = {
+            tuple(reverse_candidate.tolist()): float(prob)
+            for (reverse_candidate, _), prob in zip(reverse_neighbors, reverse_probs)
+        }
+        q_reverse = reverse_lookup.get(tuple(np.asarray(genes).tolist()), 0.0)
+        if q_reverse <= 0.0:
+            return candidate, float(np.log(probs[pick])), -np.inf
+        return candidate, float(np.log(probs[pick])), float(np.log(q_reverse))
+
     def _evaluate_one(self, ind: Individual) -> Individual:
         key = tuple(ind.genes.tolist())
         if key in self._cache:
@@ -2245,7 +3154,7 @@ class BanditFeatureSearcher:
         seed_individuals: list = None,
     ) -> Tuple[Individual, List[dict], List[Individual]]:
         """
-        Run one pass of SA-bandit feature search.
+        Run one pass of MH-guided bandit feature search.
 
         Total evaluation budget: pop_size × n_generations steps, grouped into
         n_generations reporting buckets.  Temperature is auto-calibrated from
@@ -2260,7 +3169,11 @@ class BanditFeatureSearcher:
         if seed_individuals:
             best_seed = max(seed_individuals, key=lambda x: x.fitness
                             if np.isfinite(x.fitness) else -np.inf)
-            cur_genes = best_seed.genes.copy()
+            _seed_base, _seed_tail = self._split_genes(best_seed.genes.copy())
+            cur_genes = self._attach_rand_genes(
+                _seed_base,
+                _seed_tail if len(_seed_tail) == self.n_rand else None,
+            )
             cur_fit   = best_seed.fitness
             if not np.isfinite(cur_fit) or cur_fit <= -1e8:
                 cur_fit = self._evaluate_one(Individual(genes=cur_genes)).fitness
@@ -2281,29 +3194,69 @@ class BanditFeatureSearcher:
         #   exp(-|Δ|/T₀) = 0.60  →  T₀ = |Δ| / ln(1/0.6) ≈ |Δ| / 0.51
         if self.t_initial is None:
             deltas: List[float] = []
+            _fits: List[float] = []
             for _ in range(min(self.pop_size, 20)):
                 g = self._sample_chromosome()
                 f = self._evaluate_one(Individual(genes=g)).fitness
                 self._update_arms(g, f)
                 if np.isfinite(f) and f > -1e8:
                     deltas.append(abs(f - cur_fit))
+                    _fits.append(f)
                     if f > best_fit:
                         best_fit   = f
                         best_genes = g.copy()
                         cur_genes  = g.copy()
                         cur_fit    = f
             mean_delta = float(np.mean(deltas)) if deltas else 0.1
-            t0 = max(mean_delta / 0.51, 0.02)
+            # T₀ must match the fitness SCALE. The moving-reference mean|Δ| above
+            # COLLAPSES when the initial samples happen to be similar (it then
+            # floors to 0.02 and the SA is greedy from gen 0 → frozen best_so_far,
+            # the exact failure seen in destfix/gatefix). Also key T₀ off the
+            # fitness RANGE across the sampled candidates so a genuinely varied
+            # landscape gets a hot-enough start (≈30% of range ⇒ meaningful early
+            # acceptance). Floor raised to 0.05. Tunable via GA_SA_T0_FLOOR.
+            _frange = (max(_fits) - min(_fits)) if len(_fits) > 1 else 0.0
+            _t0_floor = float(os.environ.get('GA_SA_T0_FLOOR', '0.10'))
+            # HOT start: key T₀ off the full fitness RANGE (default 0.8× the
+            # observed spread) so early exploration accepts most moves — a cold
+            # start froze the search at gen 0 (destfix/gatefix). Crank higher with
+            # GA_SA_T0_RANGE_FRAC (e.g. 1.5) if it still converges too fast.
+            _range_frac = float(os.environ.get('GA_SA_T0_RANGE_FRAC', '0.8'))
+            t0 = max(mean_delta / 0.51, _frange * _range_frac, _t0_floor)
         else:
             t0 = float(self.t_initial)
 
-        t_final = t0 * 1e-3
+        # Gentler cooling (T_final = T₀ × GA_SA_COOLING, default 1e-2 not 1e-3)
+        # keeps the search warm for longer so it keeps exploring, not just the
+        # first few generations.
+        t_final = t0 * float(os.environ.get('GA_SA_COOLING', '1e-2'))
         alpha_T = (t_final / max(t0, 1e-15)) ** (1.0 / max(n_steps_total, 1))
         T       = t0
+        print(
+            f"  Bandit-MH: T0={t0:.4f} (range={_frange:.3f}) cooling->{t_final:.5f}"
+            if self.t_initial is None else f"  Bandit-MH: T0={t0:.4f} (fixed)"
+        )
+
+        # ── Reheat-on-stagnation ──────────────────────────────────────────────
+        # A pure cooling SA with no reheat becomes a greedy hill-climb once cold
+        # and freezes at the first local optimum (destfix/gatefix: best_so_far flat
+        # for 263 gens, stagnation hardcoded 0). Track generations since the best
+        # improved; after GA_SA_REHEAT_EVERY stale gens, REHEAT T back toward T₀ so
+        # the search can escape and keep finding better solutions. =0 disables.
+        _reheat_every = int(os.environ.get('GA_SA_REHEAT_EVERY', '10'))
+        _reheat_frac  = float(os.environ.get('GA_SA_REHEAT_FRAC', '0.7'))
+        _since_improve = 0
+        _best_prev = best_fit
 
         history: List[dict] = []
 
         for gen in range(self.n_generations):
+            if _walltime_exceeded():
+                self._walltime_hit = True
+                print(f"\n  !! Walltime guard tripped at Bandit gen {gen} "
+                      f"(PBS limit approaching) — stopping search gracefully; "
+                      "segment checkpoint will be written on exit.", flush=True)
+                break
             print(f"Bandit gen {gen:3d} | T={T:.5f} | evaluating candidates... ", end='', flush=True)
             # Refresh weakness snapshot every 10 gens so recent coefficient
             # quality feeds back into arm posteriors without per-step overhead.
@@ -2313,72 +3266,27 @@ class BanditFeatureSearcher:
             n_accepted = 0
 
             for _ in range(self.pop_size):
-                # Propose candidate: mix three move types so the search stays
-                # mostly stochastic (avoids getting stuck at a local optimum)
-                # while still spending some steps on analyst-like moves:
-                #   20% directed  - drop the weakest active feature, try a
-                #                   collinear/require-one group-mate instead
-                #                   ("this term isn't pulling its weight, try
-                #                   a different form of the same idea")
-                #   30% local     - plain random 1-2 bit flip from cur_genes
-                #   50% global    - Thompson sample from the full posterior
-                _move_r = self.rng.random()
-                if (self._opt_idx and len(self._opt_idx) >= 2 and _move_r < 0.20):
-                    cand_genes = self._directed_candidate(cur_genes)
-                elif (self._opt_idx and len(self._opt_idx) >= 2 and _move_r < 0.50):
-                    # Local perturbation: flip 1–2 optional bits from cur_genes
-                    # (include block only; rand block re-gated after repair,
-                    # occasionally flipping one rand bit as its own local move)
-                    _lp_base, _lp_tail = self._split_genes(cur_genes.copy())
-                    cand_genes = _lp_base
-                    n_flips = int(self.rng.integers(
-                        1, max(2, min(3, len(self._opt_idx) // 3 + 1))
-                    ))
-                    flip_idx = self.rng.choice(
-                        self._opt_idx, size=n_flips, replace=False
-                    )
-                    _blocked = getattr(self, '_blocked', set())
-                    for fi in flip_idx:
-                        if self.feature_names[fi] in _blocked:
-                            continue
-                        cand_genes[fi] = 1 - cand_genes[fi]
-                    cand_genes = _enforce_feature_bounds(
-                        cand_genes, self.min_features, self.max_features,
-                        self.rng, protected_idx=self._fixed_idx,
-                        feature_names=self.feature_names,
-                        blocked_features=_blocked,
-                    )
-                    if self.collinear_groups and self.feature_names:
-                        cand_genes = _repair_collinearity(
-                            cand_genes, self.feature_names,
-                            self.collinear_groups, self.rng,
-                            protected_idx=self._fixed_idx,
-                        )
-                    if self.require_one_groups and self.feature_names:
-                        cand_genes = _repair_require_one(
-                            cand_genes, self.feature_names,
-                            self.require_one_groups, self.rng,
-                            protected_idx=self._fixed_idx,
-                            collinear_groups=self.collinear_groups,
-                        )
-                    if self.n_rand and len(_lp_tail) == self.n_rand \
-                            and self.rng.random() < 0.5:
-                        _lp_tail = _lp_tail.copy()
-                        _j = int(self.rng.integers(0, self.n_rand))
-                        _lp_tail[_j] = 1 - _lp_tail[_j]
-                    cand_genes = self._attach_rand_genes(cand_genes, _lp_tail)
-                else:
-                    # Global Thompson sample (standard path)
-                    cand_genes = self._sample_chromosome()
+                # Every transition uses the explicit reversible MH kernel.
+                # Global Thompson draws remain useful for initialization and
+                # temperature calibration, but never bypass the Hastings test.
+                cand_genes, log_q_forward, log_q_reverse = self._mh_propose(cur_genes)
+                if cand_genes is None:
+                    bucket_fits.append(cur_fit)
+                    continue
                 cand       = self._evaluate_one(Individual(genes=cand_genes))
                 cand_fit   = cand.fitness
 
                 # Update Beta posteriors regardless of acceptance
                 self._update_arms(cand_genes, cand_fit)
 
-                # SA acceptance criterion
+                # Tempered Metropolis-Hastings acceptance with the exact
+                # forward/reverse proposal correction.
                 delta = cand_fit - cur_fit
-                if delta >= 0 or (T > 1e-15 and self.rng.random() < np.exp(delta / T)):
+                log_alpha = (delta / max(T, 1e-15)
+                             + log_q_reverse - log_q_forward)
+                if (np.isfinite(log_alpha)
+                        and (log_alpha >= 0.0
+                             or np.log(max(self.rng.random(), 1e-300)) < log_alpha)):
                     cur_genes  = cand_genes
                     cur_fit    = cand_fit
                     n_accepted += 1
@@ -2408,6 +3316,19 @@ class BanditFeatureSearcher:
                 arm_probs = np.array([])
                 diversity = 0.0
 
+            # Track improvement; reheat T when the best has been stale too long.
+            if best_fit > _best_prev + 1e-9:
+                _best_prev = best_fit
+                _since_improve = 0
+            else:
+                _since_improve += 1
+                if _reheat_every > 0 and _since_improve >= _reheat_every:
+                    T = max(T, t0 * _reheat_frac)   # reheat to escape local optimum
+                    _since_improve = 0
+                    if self.verbose:
+                        print(f"  Bandit gen {gen:3d}: reheat T -> {T:.5f} "
+                              "(stagnation)")
+
             history.append({
                 'generation':    gen,
                 'best_fitness':  float(max(bucket_fits)) if bucket_fits else best_fit,
@@ -2417,7 +3338,7 @@ class BanditFeatureSearcher:
                 'n_features':    int(best_genes.sum()),
                 'diversity':     diversity,
                 'mutation_rate': T,      # current temperature (analogous to mut rate)
-                'stagnation':    0,
+                'stagnation':    _since_improve,
             })
 
             if self.verbose and gen % 5 == 0:
@@ -2469,19 +3390,19 @@ class BanditFeatureSearcher:
         """Same interface as GeneticAlgorithm.run_with_restarts()."""
         restart_gens = restart_gens or max(10, self.n_generations // 3)
         label = f" [{self.progress_label}]" if self.progress_label else ""
-        print(f"  Bandit(SA) main run{label}: {self.n_generations} gens "
+        print(f"  Bandit(MH) main run{label}: {self.n_generations} gens "
               f"(steps/gen={self.pop_size}, n_opt_arms={len(self._opt_idx)})")
-        _plog(f"[Bandit{label}] starting: {self.n_generations} gens × {self.pop_size} steps/gen")
+        _plog(f"[Bandit-MH{label}] starting: {self.n_generations} gens × {self.pop_size} steps/gen")
         best_ever, history, _ = self.run(seed_individuals=seed_individuals)
-        print(f"  Bandit(SA) main best: {best_ever.fitness:.4f}")
-        _plog(f"[Bandit{label}] done: best_fit={best_ever.fitness:.4f}")
-
+        print(f"  Bandit(MH) main best: {best_ever.fitness:.4f}")
+        _plog(f"[Bandit-MH{label}] done: best_fit={best_ever.fitness:.4f}")
+        _save_best_ckpt(self, best_ever)
         orig_gens          = self.n_generations
         self.n_generations = restart_gens
         gen_offset         = len(history)
 
         for r in range(n_restarts):
-            print(f"  Bandit(SA) restart {r+1}/{n_restarts}: {restart_gens} gens "
+            print(f"  Bandit(MH) restart {r+1}/{n_restarts}: {restart_gens} gens "
                   f"(cache={len(self._cache)})")
             best_r, hist_r, _ = self.run(seed_individuals=[best_ever])
             for i, h in enumerate(hist_r):
@@ -2491,15 +3412,16 @@ class BanditFeatureSearcher:
             gen_offset += len(hist_r)
             if best_r.fitness > best_ever.fitness:
                 best_ever = best_r
-                print(f"    ^ New Bandit(SA) global best: {best_ever.fitness:.4f}")
+                print(f"    ^ New Bandit(MH) global best: {best_ever.fitness:.4f}")
+                _save_best_ckpt(self, best_ever)
             history.extend(hist_r)
 
         self.n_generations = orig_gens
         return best_ever, history, [best_ever]
 
 
-# Model-based (noisy, rugged fitness) stages → Bandit-SA, which combines SA's
-# noise-robust acceptance with Thompson-sampling feature learning. Smooth
+# Model-based (noisy, rugged fitness) stages → Bandit-MH, which combines
+# Hastings-corrected acceptance with Thompson-sampling feature learning. Smooth
 # fast-proxy stages → GA, whose crossover + reheat/mutation-floor exploit the
 # deterministic landscape. This is the "portfolio by landscape" default.
 _PORTFOLIO_BANDIT_STAGES = {
@@ -2513,20 +3435,23 @@ def _resolve_search_engine(stage_id, use_sim_anneal=False, use_bandit=False):
     """Pick the search-engine class for a stage.
 
     Precedence:
-      1. GA_ENGINE_<STAGE> env (ga|sa|bandit) — explicit per-stage override, where
-         <STAGE> is the upper-cased stage_id (e.g. GA_ENGINE_STAGE5_DEST=bandit).
-      2. GA_ENGINE (ga|sa|bandit|portfolio) — global. 'portfolio' routes each stage
-         by landscape type (Bandit-SA for noisy model-based stages, GA for the
-         smooth fast-proxy stages); it is the recommended default.
+      1. GA_ENGINE_<STAGE> env (ga|sa|bandit|agds) — explicit per-stage override,
+         where <STAGE> is the upper-cased stage_id (e.g. GA_ENGINE_STAGE5_DEST=bandit).
+      2. GA_ENGINE (ga|sa|bandit|agds|portfolio) — global. 'portfolio' routes each
+         stage by landscape type (Bandit-MH for noisy model-based stages, GA for the
+         smooth fast-proxy stages); it is the recommended default. 'agds' selects the
+         SparseEA-AGDS engine (adaptive genetic operator + dynamic scoring), also
+         reachable as the alias 'sparseea'.
       3. Legacy flags GA_USE_BANDIT / GA_USE_BANDIT_SA → bandit, GA_USE_SA → SA,
          else the use_bandit / use_sim_anneal kwargs, else GA.
 
-    Plain SA is never chosen by 'portfolio' — it is strictly dominated by Bandit-SA
+    Plain SA is never chosen by 'portfolio' — it is strictly dominated by Bandit-MH
     (same noise robustness plus feature learning); it stays reachable only via an
     explicit GA_ENGINE=sa / GA_USE_SA=1 for backward compatibility.
     """
     _MAP = {'ga': GeneticAlgorithm, 'sa': SimulatedAnnealing,
-            'bandit': BanditFeatureSearcher, 'bandit_sa': BanditFeatureSearcher}
+            'bandit': BanditFeatureSearcher, 'bandit_sa': BanditFeatureSearcher,
+            'agds': SparseEAAGDS, 'sparseea': SparseEAAGDS}
     sid = str(stage_id or '').strip().lower()
 
     # 1. explicit per-stage override
@@ -2567,6 +3492,7 @@ def _make_searcher(
     fixed_features:     Optional[List[str]] = None,
     fitness_metric:     str = 'mean(-BIC/n)',
     stage_id:           Optional[str] = None,
+    progress_label:     str = '',
 ) -> 'GeneticAlgorithm | SimulatedAnnealing | BanditFeatureSearcher':
     """
     Factory: return the appropriate searcher class.
@@ -2621,7 +3547,7 @@ def _make_searcher(
 
     # ── Mixed-model (random-parameter) gene search ────────────────────────
     # GA_MXL_GENE_SEARCH=1 appends a "fixed vs random (normal)" gene per
-    # eligible feature to the bandit-SA chromosome (BanditFeatureSearcher
+    # eligible feature to the bandit-MH chromosome (BanditFeatureSearcher
     # rand_param_features), making random-parameter choice a first-class
     # searched decision instead of the post-hoc greedy toggle
     # (GA_RAND_PARAM_SEARCH). Only effective when (a) the searcher is the
@@ -2640,6 +3566,18 @@ def _make_searcher(
         ga_kwargs.setdefault('never_random', list(_never_r))
         ga_kwargs.setdefault('force_random', list(_force_r))
 
+    if (os.environ.get('GA_AGDS_MXL_SEARCH', '0').strip() == '1'
+            and cls is SparseEAAGDS and str(stage_id).lower() == 'stage5_mode'):
+        try:
+            from ga_constraints import (stage5_mxl_distribution_features,
+                                        stage5_mxl_distribution_options)
+            ga_kwargs.setdefault('distribution_features',
+                                 stage5_mxl_distribution_features())
+            ga_kwargs.setdefault('distribution_options',
+                                 stage5_mxl_distribution_options())
+        except Exception as _de:
+            logger.warning(f"AGDS MXL distribution policy unavailable: {_de}")
+
     return cls(
         n_features,
         fitness_fn,
@@ -2648,6 +3586,7 @@ def _make_searcher(
         require_one_groups = require_one_groups or [],
         fixed_features     = fixed_features or [],
         fitness_metric     = fitness_metric,
+        progress_label     = progress_label,
         **ga_kwargs,
     )
 
@@ -2803,6 +3742,7 @@ def _ga_segment_worker(payload: dict) -> dict:
         collinear_groups    = collinear_groups,
         require_one_groups  = require_one_groups,
         fixed_features      = fixed_feats,
+        progress_label     = label,
         fitness_metric      = fitness_metric,
         stage_id            = f'stage{stage_id}',
     )
@@ -3118,7 +4058,10 @@ def _stage4_fitness(
     from stage4_schedule_placement import MNLTimingModel, TIME_PERIODS
 
     feats  = [f for f, g in zip(feature_names, genes) if g == 1]
-    subset = data[data['purpose'] == purpose].copy()
+    _nonmand = {'escort', 'shopping', 'social', 'othmaint', 'othdiscr', 'eat'}
+    subset = (data[data['purpose'].isin(_nonmand)].copy()
+              if purpose == 'nonmand'
+              else data[data['purpose'] == purpose].copy())
     if len(subset) < 30:
         return -1e9
 
@@ -3156,8 +4099,11 @@ def _stage4_fitness_aggregate(
     purposes: List[str],
 ) -> float:
     scores = []
+    _nonmand = {'escort', 'shopping', 'social', 'othmaint', 'othdiscr', 'eat'}
     for p in purposes:
-        if len(data[data['purpose'] == p]) >= 30:
+        _mask = data['purpose'].isin(_nonmand) if p == 'nonmand' \
+            else data['purpose'] == p
+        if int(_mask.sum()) >= 30:
             s = _stage4_fitness(genes, data, feature_names, p)
             if s > -1e8:
                 scores.append(s)
@@ -3170,6 +4116,34 @@ def _stage4_fitness_aggregate(
 # entanglement issue where the mode and destination feature pools compete
 # for the same mutation budget.
 
+def _scored_ll(mdl, label: str = '') -> float:
+    """Estimator's RECORDED LL first; fresh loglike() only as last resort.
+
+    After _estimate returns (elastic-net unpatched, JAX JIT state changed), a
+    fresh model.loglike() can return garbage (~-1.6e34) or raise NaN errors
+    even for converged models (job 25302769: dest starter CONVERGED ll=-9541
+    but the baseline fitness scored -1e9 off a fresh call). Prefer _cached_ll,
+    then most_recent_estimation_result, then fresh — callers gate finiteness.
+    Returns float (possibly non-finite; callers must check).
+    """
+    try:
+        _c = getattr(mdl, '_cached_ll', None)
+        if _c is not None and np.isfinite(float(_c)) and float(_c) > -1e12:
+            return float(_c)
+    except Exception:
+        pass
+    try:
+        _r = float(mdl.most_recent_estimation_result.loglike)
+        if np.isfinite(_r):
+            return _r
+    except Exception:
+        pass
+    try:
+        return float(mdl.loglike())
+    except Exception as _e:
+        logger.debug(f"_scored_ll [{label}]: all LL sources failed ({_e})")
+        return float('nan')
+
 def _stage5_mode_only_fitness(
     mode_genes:      np.ndarray,
     mode_candidates: List[str],
@@ -3178,25 +4152,58 @@ def _stage5_mode_only_fitness(
     persons:         pd.DataFrame,
     landuse:         pd.DataFrame,
     skims,
+    distribution_policy: Optional[Dict[str, str]] = None,
+    structure: Optional[str] = None,
 ) -> float:
     """
     Tour-level mode model fitness ONLY (no destination).
     Returns -BIC_mode / n  (higher = better).
+    structure: forwarded to _build_mode_model ('nested' default / 'flat').
+        Lets shard variant arms score the same spec under each mode family.
     """
     from stage5_destination_choice import (
         _filter_seg, _mode_tree, _build_mode_model, _estimate,
+        _estimate_mixed_logit,
     )
     mode_vars = [v for v, g in zip(mode_candidates, mode_genes) if g == 1]
     if not mode_vars:
         return -1e9
     seg_tours = _filter_seg(tours, segment)
-    if len(seg_tours) < 50:
+    # Floor follows STAGE5_MIN_TOURS (default 50 = QLD behavior); small
+    # transfer fixtures (e.g. 33-tour MTC) lower it via env instead of being
+    # unsearchable (every genome scores the -1e9 sentinel otherwise).
+    if len(seg_tours) < int(os.environ.get('STAGE5_MIN_TOURS', '50')):
+        return -1e9
+    # Large-model policy: JAX-first always (CPU-only, float64). Legacy numba
+    # forcing worked around the e25042407 zero-gradient bug, now fixed via
+    # float64 + elasticnet JAX path (see smoke_jax_models.py A1/B1). Numba
+    # finite-differences stall/OOM on 371-zone expansions.
+    _prev_ga_engine = os.environ.get('GA_LARCH_ENGINE', '')
+    os.environ['GA_LARCH_ENGINE'] = 'jax'
+    # Guard each stage separately and log the exception repr at WARNING.  A
+    # single swallowed try/except here is why a missing SOVTOLL_TIME__AM skim
+    # surfaced only as "-1e9" / "BIC/n=1000000000.0000" with no cause for
+    # 18h (job 25929034): the KeyError vanished into the sentinel.
+    try:
+        dt_m = _mode_tree(seg_tours, persons, landuse, skims)
+    except Exception as _e:
+        logger.warning(
+            f"Stage5 mode-only [{segment}]: mode tree build failed ({_e!r}). "
+            "Check the skim/od columns the mode utility needs (DIST, "
+            "SOVTOLL_TIME__AM) are present in the skim source.")
         return -1e9
     try:
-        dt_m     = _mode_tree(seg_tours, persons, landuse, skims)
         mode_mdl = _build_mode_model(dt_m, segment, custom_mode_vars=mode_vars,
-                                     avail_vars_hint=list(seg_tours.columns))
-        mode_mdl = _estimate(mode_mdl)
+                                     avail_vars_hint=list(seg_tours.columns),
+                                     structure=structure)
+    except Exception as _e:
+        logger.warning(
+            f"Stage5 mode-only [{segment}]: mode model build failed ({_e!r}). "
+            "Usually a utility expression referencing a column absent from the "
+            "skim (e.g. od.SOVTOLL_TIME__AM).")
+        return -1e9
+    try:
+        mode_mdl = _estimate(mode_mdl, search_mode=True)
         # Force the CHOSEN alternative available before scoring. With DA now gated
         # on (CARLICENCE>0)*(vehrd>0), a chosen-DA record in a zero-vehicle
         # household otherwise gets ~0 probability and drives loglike() to ~-1e35,
@@ -3208,6 +4215,24 @@ def _stage5_mode_only_fitness(
             mode_mdl.doctor(repair_ch_av="+")
         except Exception:
             pass
+        _mxl_result = None
+        if distribution_policy:
+            _mxl_result, _mxl_model = _estimate_mixed_logit(
+                seg_tours, segment, n_draws=int(os.environ.get('GA_AGDS_MXL_DRAWS', '80')),
+                seed=42, mode_model=mode_mdl,
+                distribution_policy=distribution_policy)
+            if (_mxl_result is not None and _mxl_model is not None
+                    and np.isfinite(_mxl_result.get('ll', np.nan))):
+                mode_mdl = _mxl_model
+        # The MXL fitter's reported LL is the likelihood evaluated with its
+        # simulation draws and repaired availability state. Re-evaluating the
+        # returned model can lose that state and score chosen alternatives at
+        # near-zero probability, especially for expression-based availability.
+        if (_mxl_result is not None
+                and np.isfinite(_mxl_result.get('ll', np.nan))):
+            mode_ll = float(_mxl_result['ll'])
+        else:
+            mode_ll = None
         # Score from the estimation's OWN reported LL (result.loglike, cached on
         # the model as _cached_ll), which is finite and well-fitted (e.g. work
         # phase-1 LL≈-5230). A fresh mode_mdl.loglike() can blow up to ~-1e35 even
@@ -3216,16 +4241,19 @@ def _stage5_mode_only_fitness(
         # so a chosen-DA/zero-vehicle record floors to ~0 probability on rescoring.
         # That mis-scoring is why work/nonmand mode never produced a valid model
         # while edu (non-DA) did. Fall back to loglike() only if no cached LL.
-        _cached = getattr(mode_mdl, '_cached_ll', None)
-        if _cached is not None and np.isfinite(_cached) and _cached > -1e12:
-            mode_ll = float(_cached)
-        else:
-            mode_ll = float(mode_mdl.loglike())
+        if mode_ll is None:
+            _cached = getattr(mode_mdl, '_cached_ll', None)
+            if _cached is not None and np.isfinite(_cached) and _cached > -1e12:
+                mode_ll = float(_cached)
+            else:
+                mode_ll = float(mode_mdl.loglike())
         if not np.isfinite(mode_ll) or mode_ll < -1e12:
             logger.debug(f"Stage5 mode-only [{segment}]: non-finite/blown LL={mode_ll}")
             return -1e9
         n   = len(seg_tours)
-        k   = int(mode_genes.sum())
+        k   = int(mode_genes[:len(mode_candidates)].sum())
+        if _mxl_result is not None:
+            k = int(_mxl_result.get('n_params', k))
         _seen = getattr(_stage5_mode_only_fitness, '_valid_logged', set())
         if segment not in _seen:
             print(f"    First valid Stage 5 mode model [{segment}]: LL={mode_ll:.2f}  n={n}  k={k}")
@@ -3243,8 +4271,131 @@ def _stage5_mode_only_fitness(
         # behavioural coefficients); sig_pen still evicts insignificant terms.
         return _bic_per_obs(float(mode_ll), k, n) - sig_pen
     except Exception as e:
-        logger.debug(f"Stage5 mode-only [{segment}]: {e}")
+        # WARNING, not debug: this is the catch-all that turns a real failure
+        # into the -1e9 sentinel.  At debug level the cause was invisible and
+        # the segment burned its whole walltime on -1e9 evaluations (job
+        # 25328790).  Log once per segment so a failing GA can't spam.
+        _seen_e = getattr(_stage5_mode_only_fitness, '_err_logged', set())
+        if segment not in _seen_e:
+            _seen_e.add(segment)
+            _stage5_mode_only_fitness._err_logged = _seen_e
+            logger.warning(
+                f"Stage5 mode-only [{segment}]: fitness raised ({e!r}) — "
+                "returning the -1e9 failure sentinel for this genome.")
         return -1e9
+    finally:
+        # Restore GA_LARCH_ENGINE for any downstream estimation
+        if '_prev_ga_engine' in locals():
+            if _prev_ga_engine:
+                os.environ['GA_LARCH_ENGINE'] = _prev_ga_engine
+            else:
+                os.environ.pop('GA_LARCH_ENGINE', None)
+
+
+def _ga_sample_dest_alts(seg_acdc, lu_st, logsums, seed: int = 42):
+    """Importance-sample destination alternatives for the GA SEARCH fitness.
+
+    The GA search previously estimated every candidate over ALL zones (371),
+    which inflates the effective sample size by ~371×.  That collapses every
+    Hessian standard error toward a tiny near-constant (~0.002), so every Wald
+    t-stat is in the hundreds, the significance penalty never fires, and the
+    -BIC/n landscape is flat — the search freezes at generation 0.
+
+    Estimating on the SAME Manski-Lerman importance sample the final fit uses
+    (DEST_EST_SAMPLE_SIZE alternatives, chosen always included) restores honest
+    SEs and a discriminating fitness landscape.  Returns a DataFrame with
+    ['ptour_id','alt_zone','log_correction'] or None (→ full zone set) on any
+    failure, matching _dest_tree's contract.
+    """
+    try:
+        from stage5_destination_choice import (_importance_sample_dest_alts,
+                                                DEST_EST_SAMPLE_SIZE,
+                                                _default_zone_universe)
+        if DEST_EST_SAMPLE_SIZE <= 0:
+            return None
+        if 'ptour_id' not in seg_acdc.columns or 'DTAZ' not in seg_acdc.columns:
+            return None
+        if hasattr(logsums, 'coords') and 'zones' in logsums.coords:
+            zone_ids = [int(z) for z in logsums.coords['zones'].values]
+        else:
+            zone_ids = _default_zone_universe()
+        return _importance_sample_dest_alts(
+            tours_df    = seg_acdc[['ptour_id', 'DTAZ']].copy(),
+            landuse     = lu_st,
+            zone_ids    = zone_ids,
+            sample_size = DEST_EST_SAMPLE_SIZE,
+            seed        = seed,
+        )
+    except Exception as _e:
+        logger.debug(f"_ga_sample_dest_alts failed ({_e}) — using full zone set")
+        return None
+
+
+# ── Tour-level destination tree cache + GA case cap ────────────────────────
+# `_dest_tree()` takes NO genes: the case-alternative table, OD joins,
+# landuse/person attributes and availability are identical for every genome of
+# a segment. The GA previously rebuilt it on EVERY evaluation (hundreds of
+# times per segment). Cache it in-process instead. The tree depends on the
+# inputs (and logsums), so the key is content-based: segment label, case count,
+# first/last case id, chosen-zone checksum, plus any caller-provided extra.
+_DEST_TREE_CACHE: dict = {}
+
+
+def _cap_dest_cases(seg_acdc: pd.DataFrame, label: str = "") -> pd.DataFrame:
+    """Optional GA-only case cap (STAGE5_DEST_EST_CASES).
+
+    Larch's dense from_idca unstacks the (sampled) CA design to
+    cases x all zones, so the case count directly scales the estimation
+    matrix. 0 (default) = keep all cases; the final/apply estimation is never
+    capped. Capping is deterministic (stable sort by ptour_id) so the tree
+    cache key stays stable across evaluations.
+    """
+    _cap = int(os.environ.get('STAGE5_DEST_EST_CASES', '0') or 0)
+    if _cap <= 0 or _cap >= len(seg_acdc):
+        return seg_acdc
+    _col = 'ptour_id' if 'ptour_id' in seg_acdc.columns else (
+        'case_id' if 'case_id' in seg_acdc.columns else None)
+    if _col is None:
+        return seg_acdc.iloc[:_cap].reset_index(drop=True)
+    logger.info(f"Stage5 dest [{label}]: GA case cap STAGE5_DEST_EST_CASES="
+                f"{_cap} of {len(seg_acdc)} tours")
+    return (seg_acdc.sort_values(_col, kind='stable')
+            .iloc[:_cap].reset_index(drop=True))
+
+
+def _dest_tree_cached(seg_acdc, persons, lu_st, skims, ls_cached,
+                      sampled_alts, key_extra: str = ""):
+    """Build (or reuse) the genome-independent destination DataTree."""
+    from stage5_destination_choice import _dest_tree
+    if os.environ.get('STAGE5_DEST_TREE_CACHE', '1').strip() == '0':
+        return _dest_tree(seg_acdc, persons, lu_st, skims, ls_cached,
+                          sampled_alts=sampled_alts)
+    try:
+        _pid = (pd.to_numeric(seg_acdc['ptour_id'], errors='coerce')
+                if 'ptour_id' in seg_acdc.columns
+                else pd.Series(dtype=float))
+        _key = (str(key_extra), len(seg_acdc),
+                str(_pid.iloc[0]) if len(_pid) else '',
+                str(_pid.iloc[-1]) if len(_pid) else '',
+                float(pd.to_numeric(seg_acdc.get('DTAZ', pd.Series(dtype=float)),
+                                    errors='coerce').sum()))
+    except Exception:
+        _key = None
+    if _key is not None and _key in _DEST_TREE_CACHE:
+        return _DEST_TREE_CACHE[_key]
+    _dt = _dest_tree(seg_acdc, persons, lu_st, skims, ls_cached,
+                     sampled_alts=sampled_alts)
+    if _key is not None:
+        try:
+            _max = max(int(os.environ.get('STAGE5_DEST_TREE_CACHE_MAX', '2')), 1)
+            while len(_DEST_TREE_CACHE) >= _max:
+                _DEST_TREE_CACHE.pop(next(iter(_DEST_TREE_CACHE)))
+            _DEST_TREE_CACHE[_key] = _dt
+            logger.info(f"Stage5 dest: cached estimation tree "
+                        f"(keys={len(_DEST_TREE_CACHE)}/{_max})")
+        except Exception:
+            pass
+    return _dt
 
 
 def _stage5_dest_only_fitness(
@@ -3257,24 +4408,89 @@ def _stage5_dest_only_fitness(
     skims,
     ls_cached,       # pre-computed mode logsums (from best mode GA run)
     seg_acdc:        pd.DataFrame,
+    warm_start:      dict = None,
+    custom_uec:      dict = None,
 ) -> float:
     """
     Tour-level destination model fitness using CACHED mode logsums.
     Returns -BIC_dest / n  (higher = better).
     The mode model is NOT re-estimated here   logsums are pre-computed once
     with the best mode features before the dest GA starts.
+    warm_start: {coef: value} from the converged starter (or best-so-far) —
+        applied to overlapping params so perturbations test DELTAS from a
+        converged point instead of cold-starting every spec from priors.
+    custom_uec: optional UEC sub-dict {coef: (expr, segs)} forcing the exact
+        utility spec to estimate (bypasses the gene-list → UEC gating, whose
+        always-include backbone can pull in extra terms the caller never
+        selected). Used for the starter-spec baseline so it estimates the
+        same spec the converged starter ran — a converged starter must then
+        yield a finite baseline by construction. Search genomes keep the
+        default list-gated path (custom_uec=None).
+    Each pipeline stage (sample / tree / build / estimate / score) is guarded
+    separately and logged at WARNING with the exception repr — a silent
+    debug-only -1e9 here once cost a 7.5h segment (job 25328790: starter
+    CONVERGED ll=-9541 yet the baseline scored -1e9 with no cause in the
+    logs because the raise site was swallowed).
     """
-    from stage5_destination_choice import _dest_tree, _build_dest_model, _estimate
+    from stage5_destination_choice import (_dest_tree, _build_dest_model, _estimate,
+                                           apply_dest_warm_start,
+                                           quarantine_dest_cases)
     dest_vars = [v for v, g in zip(dest_candidates, dest_genes) if g == 1]
-    if not dest_vars:
+    if not dest_vars and custom_uec is None:
+        return -1e9
+    # Quarantine unrepresentable tours (out-of-universe/NaN chosen zones yield
+    # NaN case-likelihoods that abort the whole fit — observed: ~5 such tours
+    # kept ~6500 evals at priors). Deterministic per segment (data-only), so
+    # BIC/n stays comparable across genomes.
+    try:
+        _n_acdc_pre = len(seg_acdc)
+        seg_acdc = quarantine_dest_cases(seg_acdc, label=f"{segment}/search")
+        if len(seg_acdc) < _n_acdc_pre:
+            logger.info(f"Stage5 dest-only [{segment}]: quarantined "
+                        f"{_n_acdc_pre - len(seg_acdc)} tour(s) before sampling")
+    except Exception as _qe:
+        logger.debug(f"Stage5 dest-only [{segment}]: quarantine skipped ({_qe})")
+    seg_acdc = _cap_dest_cases(seg_acdc, label=f"{segment}/search")
+    try:
+        _samp = _ga_sample_dest_alts(seg_acdc, lu_st, ls_cached)
+    except Exception as _e:
+        logger.warning(f"Stage5 dest-only [{segment}]: alt sampling failed ({_e!r})")
         return -1e9
     try:
-        dt_d     = _dest_tree(seg_acdc, persons, lu_st, skims, ls_cached)
-        dest_mdl = _build_dest_model(dt_d, segment, custom_dest_vars=dest_vars)
-        dest_mdl = _estimate(dest_mdl)
-        dest_ll  = float(dest_mdl.loglike())
-        n   = len(seg_tours)
+        dt_d = _dest_tree_cached(seg_acdc, persons, lu_st, skims, ls_cached,
+                                 _samp, key_extra=f"{segment}/dest-only")
+    except Exception as _e:
+        logger.warning(f"Stage5 dest-only [{segment}]: dest tree build failed ({_e!r})")
+        return -1e9
+    try:
+        _bvars = custom_uec if custom_uec is not None else dest_vars
+        dest_mdl = _build_dest_model(dt_d, segment, custom_dest_vars=_bvars)
+    except Exception as _e:
+        logger.warning(f"Stage5 dest-only [{segment}]: model build failed ({_e!r})")
+        return -1e9
+    if warm_start:
+        _n_w = apply_dest_warm_start(dest_mdl, warm_start)
+        if _n_w:
+            logger.debug(f"Stage5 dest-only [{segment}]: warm-started {_n_w} params")
+    try:
+        dest_mdl = _estimate(dest_mdl, search_mode=True)
+    except Exception as _e:
+        logger.warning(f"Stage5 dest-only [{segment}]: estimation raised ({_e!r})")
+        return -1e9
+    try:
+        dest_ll = _scored_ll(dest_mdl, f"{segment}/dest")
+    except Exception as _e:
+        logger.warning(f"Stage5 dest-only [{segment}]: LL scoring raised ({_e!r})")
+        return -1e9
+    if not np.isfinite(dest_ll) or dest_ll < -1e12:
+        logger.warning(f"Stage5 dest-only [{segment}]: non-finite/blown LL={dest_ll} "
+                       f"(vars={dest_vars})")
+        return -1e9
+    try:
+        n   = len(seg_acdc)  # fitted cases (post-quarantine, deterministic per segment)
         k   = int(dest_genes.sum())
+        if k == 0 and custom_uec:
+            k = len(custom_uec)
         _seen = getattr(_stage5_dest_only_fitness, '_valid_logged', set())
         if segment not in _seen:
             print(f"    First valid Stage 5 dest model [{segment}]: LL={dest_ll:.2f}  n={n}  k={k}")
@@ -3289,7 +4505,7 @@ def _stage5_dest_only_fitness(
         _update_feature_weakness(coef_rows, dest_vars)
         return _bic_per_obs(float(dest_ll), k, n) - sig_pen
     except Exception as e:
-        logger.debug(f"Stage5 dest-only [{segment}]: {e}")
+        logger.warning(f"Stage5 dest-only [{segment}]: fitness tail failed ({e!r})")
         return -1e9
 
 
@@ -3368,7 +4584,8 @@ def _stage5_fitness_larch(
         return -1e9
 
     seg_tours = _filter_seg(tours, segment)
-    if len(seg_tours) < 50:
+    # Same STAGE5_MIN_TOURS floor as the mode-only fitness above.
+    if len(seg_tours) < int(os.environ.get('STAGE5_MIN_TOURS', '50')):
         return -1e9
 
     # Deterministic train/held-out split - fixed seed so every genome in every
@@ -3385,19 +4602,22 @@ def _stage5_fitness_larch(
         train_tours = seg_tours
         test_tours  = None
 
-    # Use JAX engine for bandit fitness eval on GPU — removes numba override.
-    # _lx_model() auto-detects: JAX first on Linux, falls back to numba if
-    # covariance computation fails (cusolver_gesvdj_ffi on CUDA 13).
-    # Set XLA_PYTHON_CLIENT_PREALLOCATE=false in PBS env to avoid GPU OOM.
+    # Large-model policy: JAX-first always (fixed e25042407 via float64+elasticnet).
     _prev_ga_engine = os.environ.get('GA_LARCH_ENGINE', '')
-    os.environ.pop('GA_LARCH_ENGINE', None)  # let _lx_model auto-detect
+    os.environ['GA_LARCH_ENGINE'] = 'jax'
     try:
         # Mode model on TRAIN
         dt_m     = _mode_tree(train_tours, persons, landuse, skims)
         mode_mdl = _build_mode_model(dt_m, segment, custom_mode_vars=mode_vars,
                                      avail_vars_hint=list(train_tours.columns))
-        mode_mdl = _estimate(mode_mdl)
-        mode_ll  = float(mode_mdl.loglike())
+        mode_mdl = _estimate(mode_mdl, search_mode=True)
+        mode_ll  = _scored_ll(mode_mdl, f"{segment}/mode")
+
+        # Restore GA_LARCH_ENGINE for destination model (which has its own JAX fallback)
+        if _prev_ga_engine:
+            os.environ['GA_LARCH_ENGINE'] = _prev_ga_engine
+        else:
+            os.environ.pop('GA_LARCH_ENGINE', None)
 
         # Logsums for destination tree
         ls = _logsums(mode_mdl, dt_m, skims=skims, verbose=False)
@@ -3409,10 +4629,12 @@ def _stage5_fitness_larch(
             skim_df if skim_df is not None else pd.DataFrame(),
             segment
         )
-        dt_d     = _dest_tree(seg_acdc, persons, lu_st, skims, ls)
+        _samp    = _ga_sample_dest_alts(seg_acdc, lu_st, ls)
+        dt_d     = _dest_tree(seg_acdc, persons, lu_st, skims, ls,
+                              sampled_alts=_samp)
         dest_mdl = _build_dest_model(dt_d, segment, custom_dest_vars=dest_vars)
-        dest_mdl = _estimate(dest_mdl)
-        dest_ll  = float(dest_mdl.loglike())
+        dest_mdl = _estimate(dest_mdl, search_mode=True)
+        dest_ll  = _scored_ll(dest_mdl, f"{segment}/dest")
 
         # Proper BIC: -2*LL + GA_COMPLEXITY_PENALTY*k*ln(n), normalised per obs.
         # The penalty scale lets stage 5 relax full-BIC parsimony (which shed
@@ -3538,6 +4760,252 @@ def _stage5_fitness_aggregate(
 # to be a subset of the tour mode) and trip-level destination choice.
 # Here we estimate independently on HHTS trips for GA variable selection.
 
+# ── HHTS trips -> conditional stop-trip table (stage-51 destination search) ──
+# The stage-51 destination GA must estimate the SAME model that prediction
+# applies (stage5b_trip_destination._estimate_mnl_segment), which needs tour
+# structure (is_outbound / trip_num_in_tour / tour_id), an anchor_down_taz and
+# a tour_mode. The survey trips table carries tour_id + trip_direction (see
+# data_connect._assign_tours); fall back to sequence-derived structure when not.
+_HHTS_TRIP_PURPOSE_MAP = {
+    'Work (my workplace)': 'work', 'Work (other work reason)': 'work',
+    'Direct Work Commute': 'work', 'Work Related': 'work',
+    'Education': 'edu', 'Childcare or Kindergarten': 'edu',
+    'Childcare or kindergarten': 'edu',
+    'Social Visit': 'social', 'Recreation/leisure activity': 'social',
+    'Recreation': 'social', 'Social': 'social',
+    'Pick up or drop off a passenger': 'escort',
+    'Pickup/Dropoff Someone': 'escort',
+    'Just accompanying someone': 'escort',
+    'Shopping': 'shopping',
+    'Personal Business': 'othmaint', 'Personal business': 'othmaint',
+    'Pickup/deliver something (not work-related)': 'othmaint',
+    'Other place (please specify)': 'othdiscr',
+    'Other Place': 'othdiscr', 'Refuel my vehicle': 'othdiscr',
+    'Eat/drink': 'eat',
+}
+
+_TRIPDEST_CTX_CACHE: dict = {}
+_TRIP_MODE_LL_CACHE: dict = {}   # (purpose, mode_vars) -> (ll, n_obs)
+
+
+def _build_hhts_stop_trips(trips: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame:
+    """Convert HHTS survey trips to the conditional stop-trip schema expected by
+    ``stage5b_trip_destination`` (origin_taz/dest_taz/anchor_down_taz,
+    is_outbound, trip_num_in_tour, tour_id, tour_mode, purpose, times, mode)."""
+    t = trips.copy()
+    # Deduplicate columns: a duplicated label (e.g. two 'purpose'/'mode'
+    # columns after an upstream rename/merge) makes t[col] a DataFrame and
+    # every downstream `.str` call fails with "'DataFrame' object has no
+    # attribute 'str'". Keep the first occurrence.
+    try:
+        if getattr(t.columns, 'duplicated', None) is not None:
+            _dup = t.columns.duplicated(keep='first')
+            if bool(_dup.any()):
+                t = t.loc[:, ~_dup]
+    except Exception:
+        pass
+
+    pid_t = next((c for c in ('person_id', 'PERSID', 'persid') if c in t.columns), None)
+    if pid_t is None:
+        return pd.DataFrame()
+    if pid_t != 'person_id':
+        t = t.rename(columns={pid_t: 'person_id'})
+
+    _ren = {}
+    _rename_candidates = {
+        'origin_taz': ('OTAZ', 'ORIGZONE', 'orig_taz'),
+        'dest_taz': ('DTAZ', 'DESTZONE', 'dest_taz'),
+        'depart_time_min': ('STARTIME',),
+        'arrive_time_min': ('ENDTIME',),
+        'travel_time_min': ('TRAVTIME', 'tt_avg'),
+        'mode': ('MAINMODE', 'mode'),
+        'purpose_raw': ('DESTPURP', 'purpose'),
+    }
+    # Choose one source per destination name.  Renaming DESTPURP and purpose
+    # to the same target in one pandas call creates duplicate columns; then
+    # t['purpose_raw'] is a DataFrame and .str operations fail.
+    for _dst, _sources in _rename_candidates.items():
+        if _dst in t.columns:
+            continue
+        _src = next((c for c in _sources if c in t.columns), None)
+        if _src is not None:
+            _ren[_src] = _dst
+    if _ren:
+        t = t.rename(columns=_ren)
+
+    # purpose -> canonical trip purpose
+    if 'purpose_raw' in t.columns:
+        t['purpose'] = (t['purpose_raw'].astype(str).str.strip()
+                        .map(_HHTS_TRIP_PURPOSE_MAP)
+                        .fillna(t['purpose_raw'].astype(str).str.lower()
+                                .str.strip()))
+    if 'purpose' not in t.columns:
+        t['purpose'] = 'nonmand'
+
+    # times / mode / travel time defaults
+    for _c, _d in (('depart_time_min', 480.0), ('arrive_time_min', 0.0),
+                   ('travel_time_min', 0.0)):
+        if _c not in t.columns:
+            t[_c] = _d
+        t[_c] = pd.to_numeric(t[_c], errors='coerce').fillna(_d)
+    if 'mode' not in t.columns:
+        t['mode'] = 'DA'
+
+    # tour structure
+    _dir_map = {'outbound': 1, 'main': 1, 'inbound': 0}
+    if 'tour_id' not in t.columns:
+        # Derive simple tours: a new tour starts at every home-origin trip.
+        _home = (_home_zone_series(t, persons))
+        t['_is_home_origin'] = (pd.to_numeric(t['origin_taz'], errors='coerce')
+                                .fillna(0).astype(int).values
+                                == _home.reindex(t.index).values)
+        t['tour_id'] = (t.groupby('person_id')['_is_home_origin']
+                        .cumsum().clip(lower=1).astype(str))
+        t.drop(columns=['_is_home_origin'], inplace=True)
+    t['tour_id'] = t['tour_id'].astype(str)
+    t = t.sort_values(['person_id', 'depart_time_min']).reset_index(drop=True)
+    t['trip_num_in_tour'] = t.groupby(['person_id', 'tour_id']).cumcount() + 1
+    if 'trip_direction' in t.columns:
+        t['is_outbound'] = (t['trip_direction'].astype(str).str.lower()
+                            .map(_dir_map).fillna(0).astype(int))
+    else:
+        _maxleg = t.groupby(['person_id', 'tour_id'])['trip_num_in_tour'].transform('max')
+        t['is_outbound'] = (t['trip_num_in_tour'] <= _maxleg / 2.0).astype(int)
+
+    # tour mode = mode of the tour's primary (main/highest outbound) leg
+    _CANON_TO_CODE = {'DA': 1, 'SR': 2, 'Walk': 3, 'Bike': 4, 'Transit': 5}
+    _mode_num = None
+    try:
+        from stage6_mode_choice import RAW_MODE_MAP as _RAW_MODE_MAP
+        _mode_num = t['mode'].map(_RAW_MODE_MAP).map(_CANON_TO_CODE)
+    except Exception:  # noqa: BLE001
+        pass
+    if _mode_num is None or float(_mode_num.notna().mean()) < 0.5:
+        _mode_num = t['mode'].map(_CANON_TO_CODE)
+    _mode_num = pd.to_numeric(_mode_num, errors='coerce')
+    t['_mode_num'] = _mode_num.fillna(1).astype(int)
+    _prim = (t[t['is_outbound'] == 1]
+             .sort_values('trip_num_in_tour')
+             .groupby(['person_id', 'tour_id'])['_mode_num'].last())
+    t = t.merge(_prim.rename('tour_mode'),
+                left_on=['person_id', 'tour_id'], right_index=True, how='left')
+    t['tour_mode'] = t['tour_mode'].fillna(t['_mode_num']).astype(int)
+    t.drop(columns=['_mode_num'], inplace=True)
+
+    # home taz from persons
+    home_col = next((c for c in ('OTAZ', 'HOME_TAZ', 'home_taz', 'home_zone')
+                     if persons is not None and c in persons.columns), None)
+    pp = persons.copy()
+    _ppid = next((c for c in ('person_id', 'PERSID', 'persid') if c in pp.columns), None)
+    if home_col and _ppid:
+        if _ppid != 'person_id':
+            pp = pp.rename(columns={_ppid: 'person_id'})
+        _hm = (pp[['person_id', home_col]].rename(columns={home_col: 'home_taz'})
+               .drop_duplicates('person_id'))
+        t = t.merge(_hm, on='person_id', how='left')
+    if 'home_taz' not in t.columns:
+        t['home_taz'] = t['origin_taz']
+
+    # person covariates used by the destination MNL candidates
+    if persons is not None and not persons.empty:
+        _pc = ['is_female', 'income_hi', 'income_lo', 'hh_child', 'occp_group',
+               'ptype_FullTimeWorker', 'ptype_UniversityStudent', 'mtwp',
+               'WFHWEEK', 'incp']
+        _avail = [c for c in _pc if c in persons.columns]
+        if _avail:
+            _pers = persons.copy()
+            if 'person_id' not in _pers.columns and 'PERSID' in _pers.columns:
+                _pers = _pers.rename(columns={'PERSID': 'person_id'})
+            t = t.merge(_pers[['person_id'] + _avail], on='person_id', how='left')
+
+    from stage5b_trip_destination import build_trip_records
+    t = build_trip_records(t, home_taz_col='home_taz')
+    try:
+        if getattr(t.columns, 'duplicated', None) is not None:
+            _dup2 = t.columns.duplicated(keep='first')
+            if bool(_dup2.any()):
+                t = t.loc[:, ~_dup2]
+    except Exception:
+        pass
+    _purp = t['purpose']
+    try:
+        import pandas as _pd
+        if isinstance(_purp, _pd.DataFrame):
+            _purp = _purp.iloc[:, 0]
+    except Exception:
+        pass
+    stop = t[(t['is_tour_dest_leg'] == 0)
+             & (_purp.astype(str).str.lower() != 'home')].copy()
+    return stop
+
+
+def _home_zone_series(trips: pd.DataFrame, persons: pd.DataFrame) -> pd.Series:
+    """Home zone per person for tour-boundary derivation."""
+    pp = persons.copy() if persons is not None else pd.DataFrame()
+    _ppid = next((c for c in ('person_id', 'PERSID', 'persid') if c in pp.columns), None)
+    home_col = next((c for c in ('OTAZ', 'HOME_TAZ', 'home_taz', 'home_zone')
+                     if c in pp.columns), None)
+    if _ppid and home_col:
+        if _ppid != 'person_id':
+            pp = pp.rename(columns={_ppid: 'person_id'})
+        return (pp.drop_duplicates('person_id').set_index('person_id')[home_col]
+                .reindex(trips['person_id']))
+    # Fallback: first observed origin of the day
+    return (trips.sort_values('depart_time_min')
+            .groupby('person_id')['origin_taz'].first()
+            .reindex(trips['person_id']))
+
+
+def _tripdest_ctx(trips: pd.DataFrame, persons: pd.DataFrame, landuse: pd.DataFrame):
+    """Prepare (and cache per process) stop trips + skims + zone table for the
+    stage-51 destination GA. Returns None when skims are unavailable."""
+    key = (id(trips), len(trips), id(landuse))
+    if key in _TRIPDEST_CTX_CACHE:
+        return _TRIPDEST_CTX_CACHE[key]
+    try:
+        from stage5b_trip_destination import _load_skims
+        skims_path = (os.environ.get('PIPELINE_SKIMS_PATH') or '').strip()
+        if not skims_path or not os.path.isfile(skims_path):
+            logger.warning("Stage 51: PIPELINE_SKIMS_PATH unavailable — "
+                           "destination search disabled")
+            _TRIPDEST_CTX_CACHE[key] = None
+            return None
+        skims = _load_skims(skims_path)
+        zone_col = 'ORDER' if 'ORDER' in landuse.columns else 'zone_id'
+        all_zones = (landuse[[zone_col]].drop_duplicates()
+                     .reset_index(drop=True))
+        taz_index = {int(z): i for i, z in enumerate(all_zones[zone_col])}
+        stop_trips = _build_hhts_stop_trips(trips, persons)
+        if stop_trips.empty or 'purpose' not in stop_trips.columns:
+            logger.warning("Stage 51: no HHTS stop trips could be built")
+            _TRIPDEST_CTX_CACHE[key] = None
+            return None
+        ctx = {"stop_trips": stop_trips, "all_zones": all_zones,
+               "skims": skims, "taz_index": taz_index, "zone_col": zone_col}
+        # DuckDB CA cache dir: the GA refits the same purpose repeatedly, so the
+        # wide (case, alt) feature table is materialised once per purpose.
+        _ca_root = (os.environ.get('GA_CHECKPOINT_DIR')
+                    or os.environ.get('PIPELINE_OUT_DIR')
+                    or os.environ.get('TMPDIR') or '.')
+        ctx["ca_dir"] = os.path.join(_ca_root, 'stage51_ca')
+        print(f"  [Stage 51] stop-trip table: {len(stop_trips):,} rows | "
+              f"purposes={sorted(stop_trips['purpose'].dropna().unique().tolist())[:8]}")
+        _TRIPDEST_CTX_CACHE[key] = ctx
+        return ctx
+    except Exception as exc:  # noqa: BLE001
+        import traceback as _tb
+        _dup_info = ""
+        try:
+            _d = trips.columns[trips.columns.duplicated(keep=False)]
+            if len(_d):
+                _dup_info = f" dup_cols={sorted(set(map(str, _d.tolist)))[:8]}"
+        except Exception:
+            pass
+        logger.warning(f"Stage 51: trip-dest context build failed: {exc}{_dup_info} | {_tb.format_exc(limit=5)}")
+        _TRIPDEST_CTX_CACHE[key] = None
+        return None
+
+
 def _stage5_trip_fitness(
     mode_genes:      np.ndarray,
     dest_genes:      np.ndarray,
@@ -3553,12 +5021,10 @@ def _stage5_trip_fitness(
     Trip-level mode + destination BIC fitness.
 
     Fits a nested logit mode model on individual HHTS trip legs (not tours),
-    then fits a destination choice MNL on HHTS observed DTAZ, and returns
-    the combined -BIC/n.
-
-    This mirrors the ActivitySim trip_mode_choice approach where trip mode
-    is estimated conditional on in-vehicle time, cost, safety, and person
-    attributes, with a separate trip-destination model for each purpose.
+    then fits the SAME conditional stop-destination MNL that prediction
+    applies (``stage5b_trip_destination._estimate_mnl_segment``: detour +
+    size term + backbone skims + anchor/tour-mode/previous-stop conditioning
+    candidates selected by ``dest_genes``), and returns the combined -BIC/n.
     """
     from stage6_mode_choice import NestedLogitModeModel, prepare_mode_data
 
@@ -3567,82 +5033,78 @@ def _stage5_trip_fitness(
     if not mode_vars and not dest_vars:
         return -1e9
 
-    # ÔöÇÔöÇ Trip-level mode model on HHTS ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
-    try:
-        mode_data = prepare_mode_data(trips, persons, landuse)
-        mode_data_purp = mode_data[mode_data['purpose'] == purpose].copy()
-        if len(mode_data_purp) < 30 or mode_data_purp['chosen_mode'].nunique() < 2:
+    # ── Trip-level mode model on HHTS ─────────────────────────────────────
+    # Cached per (purpose, mode_vars): the destination GA holds the mode genes
+    # fixed, so re-fitting the mode NL on every destination evaluation would
+    # dominate runtime for no benefit.
+    _mode_key = (purpose, tuple(mode_vars))
+    if _mode_key in _TRIP_MODE_LL_CACHE:
+        mode_ll, n_mode = _TRIP_MODE_LL_CACHE[_mode_key]
+    else:
+        try:
+            mode_data = prepare_mode_data(trips, persons, landuse)
+            mode_data_purp = mode_data[mode_data['purpose'] == purpose].copy()
+            if len(mode_data_purp) < 30 or mode_data_purp['chosen_mode'].nunique() < 2:
+                return -1e9
+
+            for col in mode_vars:
+                if col not in mode_data_purp.columns:
+                    mode_data_purp[col] = 0.0
+
+            m = NestedLogitModeModel()
+            m.fit(mode_data_purp, purpose)
+            if m.ll_final_ is None or m.n_obs_ == 0:
+                return -1e9
+            mode_ll = m.ll_final_
+            n_mode  = m.n_obs_
+            _TRIP_MODE_LL_CACHE[_mode_key] = (mode_ll, n_mode)
+        except Exception as e:
+            logger.debug(f"Stage51 mode fitness [{purpose}]: {e}")
             return -1e9
 
-        for col in mode_vars:
-            if col not in mode_data_purp.columns:
-                mode_data_purp[col] = 0.0
-
-        m = NestedLogitModeModel()
-        m.fit(mode_data_purp, purpose)
-        if m.ll_final_ is None or m.n_obs_ == 0:
-            return -1e9
-        mode_ll = m.ll_final_
-        n_mode  = m.n_obs_
-    except Exception as e:
-        logger.debug(f"Stage51 mode fitness [{purpose}]: {e}")
-        return -1e9
-
-    # ÔöÇÔöÇ Trip-level destination model (simple logit on observed DTAZ) ÔöÇÔöÇÔöÇÔöÇÔöÇ
-    dest_ll = 0.0
-    n_dest  = 0
+    # ── Trip-level destination model (real conditional MNL) ───────────────
+    dest_ll, n_dest, n_dest_params = 0.0, 0, 0
     try:
-        if not skim_df.empty and dest_vars:
-            trip_dest = trips.copy()
-            # Merge person attributes
-            if persons is not None and not persons.empty:
-                p_cols = ['person_id'] + [c for c in dest_vars if c in persons.columns]
-                if len(p_cols) > 1:
-                    pid_col = next((c for c in ['person_id', 'PERSONID', 'PERSNUM']
-                                    if c in persons.columns), None)
-                    if pid_col:
-                        trip_dest = trip_dest.merge(
-                            persons[[pid_col] + [c for c in dest_vars
-                                                 if c in persons.columns and c != pid_col]],
-                            left_on='person_id', right_on=pid_col, how='left'
-                        )
-            # Filter to this purpose
-            purp_col = next((c for c in ['purpose', 'main_purpose', 'TRIPTYPE']
-                             if c in trip_dest.columns), None)
-            if purp_col:
-                trip_dest = trip_dest[trip_dest[purp_col] == purpose]
-
-            dtaz_col = next((c for c in ['DTAZ', 'DESTZONE', 'dest_taz']
-                             if c in trip_dest.columns), None)
-            otaz_col = next((c for c in ['OTAZ', 'ORIGZONE', 'orig_taz', 'ORDER']
-                             if c in trip_dest.columns), None)
-            if dtaz_col and otaz_col and len(trip_dest) >= 30:
-                # Build simple log-distance destination logit
-                dist_col = 'DIST' if 'DIST' in skim_df.columns else 'SOVTOLL_DIST__AM'
-                if dist_col not in skim_df.columns:
-                    dist_col = [c for c in skim_df.columns if 'DIST' in c]
-                    dist_col = dist_col[0] if dist_col else None
-
-                if dist_col:
-                    dist_lookup = skim_df.set_index(['OTAZ', 'DTAZ'])[dist_col].to_dict() \
-                                  if 'OTAZ' in skim_df.columns else {}
-                    log_dists = np.array([
-                        np.log(max(dist_lookup.get((int(row[otaz_col]),
-                                                    int(row[dtaz_col])), 0.1), 0.01))
-                        for _, row in trip_dest.iterrows()
-                    ])
-                    # Null LL: uniform over observed zones
-                    n_zones = skim_df['DTAZ'].nunique() if 'DTAZ' in skim_df.columns else 100
-                    dest_ll = float(np.mean(log_dists)) * len(trip_dest) - \
-                              len(trip_dest) * np.log(max(n_zones, 2))
-                    n_dest = len(trip_dest)
+        ctx = _tripdest_ctx(trips, persons, landuse)
+        if ctx is not None and dest_vars:
+            seg = ctx["stop_trips"][ctx["stop_trips"]["purpose"] == purpose].copy()
+            if len(seg) >= 30:
+                from stage5b_trip_destination import (
+                    _estimate_mnl_segment, MAX_ESTIMATION_OBS)
+                # GA fitness sample: every generation refits this MNL, so keep
+                # the idca expansion tractable (n_obs x n_zones). Larch's dense
+                # from_idca unstacks to cases x all zones, so this cap directly
+                # bounds the design matrix. Full-population prediction is
+                # unaffected — it reuses these coefficients.
+                _cap = min(MAX_ESTIMATION_OBS,
+                           int(float(os.environ.get('STAGE51_DEST_EST_OBS', '8000'))))
+                if len(seg) > _cap:
+                    seg = seg.sample(n=_cap, random_state=42)
+                res = _estimate_mnl_segment(
+                    stop_trips   = seg,
+                    all_zones    = ctx["all_zones"],
+                    skims        = ctx["skims"],
+                    landuse      = landuse,
+                    purpose      = purpose,
+                    taz_index    = ctx["taz_index"],
+                    g_tripdest   = list(np.asarray(dest_genes, dtype=int)),
+                    zone_id_col  = ctx["zone_col"],
+                    persons      = persons,
+                    ca_dir       = (None if os.environ.get(
+                                        'STAGE5B_CA_BACKEND', '').strip().lower()
+                                    in ('off', '0', 'pandas') else ctx.get("ca_dir")),
+                )
+                if res is not None:
+                    dest_ll = float(res["log_likelihood"])
+                    n_dest = int(res["n_obs"])
+                    n_dest_params = int(res.get("n_params", int(dest_genes.sum())))
     except Exception as e:
         logger.debug(f"Stage51 dest fitness [{purpose}]: {e}")
 
-    # ÔöÇÔöÇ Combined BIC ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+    # ── Combined BIC ──────────────────────────────────────────────────────
     total_ll = mode_ll + dest_ll
     n        = n_mode + max(n_dest, 0)
-    k        = int(mode_genes.sum() + dest_genes.sum())
+    k        = int(mode_genes.sum()) + n_dest_params
     bic      = -2.0 * total_ll + k * np.log(max(n, 2))
     return -bic / max(n, 1)    # -BIC/n, higher is better
 
@@ -3795,7 +5257,7 @@ def _cdap_fitness(
             mnl.utility_co[1] += lx.P(f'b_N_{feat}') * lx.X(f'person.{feat}')
             mnl.utility_co[2] += lx.P(f'b_M_{feat}') * lx.X(f'person.{feat}')
         mnl.set_cap(10)
-        r = mnl.maximize_loglike(options={'ftol': 1e-7, 'maxiter': 200})
+        r = mnl.maximize_loglike(options={'ftol': 1e-7, 'maxiter': 200}, quiet=True)
         ll_fit = float(r.loglike)
 
         # BIC: k = 2 params per feature (one for N, one for M) + 2 ASCs
@@ -3941,7 +5403,8 @@ def _usual_loc_fitness(
 
     zone_col  = 'ORDER' if 'ORDER' in landuse.columns else landuse.columns[0]
     zone_ids  = landuse[zone_col].astype(int).values
-    zone_ids  = zone_ids[(zone_ids > 0) & (zone_ids != 330)]
+    # 371-only: no `!= 330` drop — ORDER 330 is a real zone in the 371 system.
+    zone_ids  = zone_ids[zone_ids > 0]
     zone_idx  = {z: i for i, z in enumerate(zone_ids)}
     N         = len(zone_ids)
     lu_vals   = landuse.set_index(zone_col)
@@ -4029,10 +5492,11 @@ def _cdap_candidates(data: pd.DataFrame) -> List[str]:
     access    = ['has_vehicle', 'has_licence']
     work_vars = ['is_female', 'wfh', 'income_midplus', 'mandatory_role',
                  'income_hi', 'income_lo']   # census_bridge income flags
-    acc_cols  = ['auto_work_acc', 'walk_acc', 'transit_acc', 'auto_nonmand_acc',
-                 'crash_acc']   # home-zone crash exposure - lets the search test
-                                # safety in CDAP/generation, not only mode/dest
-                                # utilities (ATRF reviewer request)
+    acc_cols  = (['auto_work_acc', 'walk_acc', 'transit_acc', 'auto_nonmand_acc',
+                  'crash_acc']   # home-zone crash exposure - lets the search test
+                                 # safety in CDAP/generation, not only mode/dest
+                                 # utilities (ATRF reviewer request)
+                 + _LOGSUM_ACC_CANDIDATES)  # upstream logsum cascade (ActivitySim)
     raw_synth = ['vehrd', 'nprd', 'incp', 'sexp',
                  'workstat_fulltime', 'workstat_parttime', 'workstat_notworking',
                  'studying_none', 'studying_primary', 'studying_secondary',
@@ -4101,37 +5565,150 @@ def _taste_interaction_candidates(
     continuous: List[str],
     segments: List[str],
     prefix: str = 'ix',
-    max_pairs: int = 30,
+    max_pairs: int = 60,
 ) -> List[str]:
     """
     Build taste-variation interaction columns in `data` and return their names.
 
-    For each (cont, seg) pair where both columns exist and have variance, compute
-    cont * seg and store as '<prefix>_<seg>_x_<cont>'.  These proxies capture
-    heterogeneous preferences without requiring a full mixed-logit random-coefficient
-    sampler, which is not supported by the current scikit/statsmodels estimators.
+    For each (cont, seg) pair where both columns exist and the product carries
+    variance, the column `'<prefix>_<seg>_x_<cont>'` is a fixed-interaction
+    proxy for a random coefficient: a significant coefficient means the
+    continuous variable's effect SCALES with the segment — the heterogeneity a
+    mixed logit would capture with a random slope, expressed as a toggleable
+    gene for the search.
 
-    Only pairs where the interaction column has non-trivial variance are kept.
-    `max_pairs` caps the number added to avoid blowing up the chromosome size.
+    Two-pass design (production-safe on multi-million-row frames):
+      pass 1  score every pair by variance WITHOUT materialising columns;
+              drop near-constant segments (product ≡ scaled parent) and pairs
+              whose product correlates ≥0.97 with the continuous parent;
+      pass 2  keep up to `max_pairs` in ROUND-ROBIN across segments so the cap
+              doesn't bias toward whichever segment comes first, then
+              materialise only the kept columns.
     """
-    added: List[str] = []
+    import numpy as _np
+
+    # ── pass 1: score pairs ────────────────────────────────────────────────
+    by_segment: dict = {}
     for seg in segments:
         if seg not in data.columns:
             continue
+        s_seg = pd.to_numeric(data[seg], errors='coerce').fillna(0.0)
+        if float(s_seg.std()) < 1e-9:
+            continue                                   # constant segment
         for cont in continuous:
-            if cont not in data.columns or len(added) >= max_pairs:
-                break
-            col_name = f'{prefix}_{seg}_x_{cont}'
-            if col_name not in data.columns:
-                try:
-                    vals = data[seg] * data[cont]
-                    if vals.std() > 1e-9:
-                        data[col_name] = vals
-                except Exception:
+            if cont not in data.columns:
+                continue
+            name = f'{prefix}_{seg}_x_{cont}'
+            if name in data.columns:
+                by_segment.setdefault(seg, []).append((cont, name, None))
+                continue
+            try:
+                s_cont = pd.to_numeric(data[cont], errors='coerce').fillna(0.0)
+                vals = s_seg * s_cont
+                if float(vals.std()) <= 1e-9:
                     continue
-            if col_name in data.columns:
-                added.append(col_name)
+                # collinearity guard: drop only near-duplicates of the
+                # continuous parent (|r| ≥ 0.98). Activity-count interactions
+                # legitimately correlate 0.85-0.95 with their parent — that
+                # residual differential IS the taste signal, and the embedded
+                # ridge keeps the joint estimation well-conditioned.
+                if float(s_cont.std()) > 1e-9:
+                    corr = float(_np.corrcoef(vals, s_cont)[0, 1]) \
+                        if len(vals) > 2 else 0.0
+                    if np.isfinite(corr) and abs(corr) >= 0.98:
+                        continue
+                by_segment.setdefault(seg, []).append((cont, name, vals))
+            except Exception:                          # noqa: BLE001
+                continue
+
+    # ── pass 2: round-robin selection + materialisation ────────────────────
+    # Round-robin across the CONTINUOUS (behavioural/activity) dimension so
+    # the cap spreads coverage over as many behavioural aspects as possible,
+    # with segments rotating within each continuous variable. Columns are
+    # materialised in ONE block assignment to avoid frame fragmentation.
+    by_cont: dict = {}
+    for seg, pairs in by_segment.items():
+        for cont, name, vals in pairs:
+            by_cont.setdefault(cont, []).append((seg, name, vals))
+    cont_names = [c for c in continuous if by_cont.get(c)]
+    added: List[str] = []
+    new_cols: dict = {}
+    idx = 0
+    while len(added) < max_pairs and any(by_cont.get(c) for c in cont_names):
+        cont = cont_names[idx % len(cont_names)]
+        idx += 1
+        bucket = by_cont.get(cont)
+        if not bucket:
+            continue
+        seg, name, vals = bucket.pop(0)
+        added.append(name)
+        if vals is not None:                           # pre-existing → skip
+            new_cols[name] = vals
+    if new_cols:
+        data[list(new_cols.keys())] = pd.DataFrame(new_cols, index=data.index)
     return added
+
+
+# Taste-variation (mixed-logit proxy) specs per stage. Continuous × segment
+# pairs span BEHAVIORAL dimensions (accessibility, income, work-from-home,
+# habitual mode use, activity counts, budget/timing) crossed with the socio-
+# demographic segments — a significant ix* coefficient reads as a
+# heterogeneous preference: e.g. ix3_ptype_FullTimeWorker_x_log_dist > 0
+# means work duration scales with distance more steeply for full-time
+# workers — exactly the random-slope signal a full MXL would estimate,
+# expressed as a toggleable gene. Continuous variables missing from a stage's
+# frame (e.g. logsums without landuse) are skipped by the existence guard.
+_TASTE_STAGE_CONTINUOUS = {
+    1: [   # activity frequency: accessibility + logsums + behaviour
+        'incp', 'age_norm', 'n_workers_hh', 'nprd', 'vehrd', 'WFHWEEK',
+        'walk_acc', 'transit_acc', 'auto_work_acc', 'auto_shop_acc',
+        'auto_nonmand_acc', 'bike_acc', 'crash_acc',
+        'logsum_work_acc', 'logsum_edu_acc', 'logsum_nonmand_acc',
+        'logsum_shopping_acc', 'logsum_social_acc', 'logsum_othdiscr_acc',
+        'n_transit', 'n_car', 'n_bike', 'wfh',
+    ],
+    2: [   # day budget/timing: activity counts + socio-demographics
+        'n_total', 'n_tours', 'n_work_out', 'n_edu_out', 'n_social_out',
+        'n_escort_out', 'n_shopping_out', 'n_othmaint_out', 'n_othdiscr_out',
+        'n_eat_out', 'incp', 'vehrd', 'n_workers_hh', 'WFHWEEK', 'wfh',
+    ],
+    3: [   # activity duration: budget/timing + ACTIVITY-BASED counts
+        'log_dist', 'B', 'budget_per_activity_hr', 'start_hr', 'day_span_hr',
+        'n_mandatory', 'n_discretionary',
+        'n_work_out', 'n_edu_out', 'n_social_out', 'n_escort_out',
+        'n_shopping_out', 'n_othmaint_out', 'n_othdiscr_out', 'n_eat_out',
+        'incp', 'vehrd',
+    ],
+}
+_TASTE_STAGE4_CONTINUOUS = [   # schedule placement: timing context
+    'duration_min', 'time_consumed', 'time_remaining', 'day_position',
+    'start_hr', 'n_total', 'log_dist', 'incp',
+]
+_TASTE_SEGMENTS = [
+    'mandatory_role', 'is_female', 'has_vehicle', 'no_vehicle',
+    'hh_child', 'hh_alone', 'hh_size_large', 'hh_couple',
+    'CARLICENCE', 'wfh',
+    'income_hi', 'income_lo', 'income_midplus',
+    'age_child', 'age_teen', 'age_working', 'age_older', 'age_senior',
+    'ptype_FullTimeWorker', 'ptype_PartTimeWorker', 'ptype_SchoolChild',
+    'ptype_UniversityStudent', 'ptype_WorkingStudent', 'ptype_Retired',
+    'ptype_NonWorker', 'ptype_Preschool',
+]
+
+
+def _add_taste_interactions(data: pd.DataFrame, stage_id: int) -> List[str]:
+    """Materialise the stage's taste-variation columns (idempotent) and return
+    the names available as GA perturbations. Called from the stage candidate
+    builders (search side) and from ensure_ga_search_columns (refit side) so
+    a selected ix* column resolves in BOTH frames."""
+    if int(stage_id) == 4:
+        cont = _TASTE_STAGE4_CONTINUOUS
+    else:
+        cont = _TASTE_STAGE_CONTINUOUS.get(int(stage_id), [])
+    if not cont:
+        return []
+    return _taste_interaction_candidates(
+        data, cont, _TASTE_SEGMENTS, prefix=f'ix{int(stage_id)}', max_pairs=120)
 
 
 def _meaningful_interaction_candidates(
@@ -4300,6 +5877,10 @@ _S1_OPTIONAL_BY_PURPOSE = {
 # The collinear groups ensure at most one income band and at most one vehicle band is
 # active per chromosome; the BIC + significance penalties handle the rest.
 _S1_OPTIONAL_EXTRA = [
+    # ActivitySim-style mode-choice logsum accessibility measures
+    "asim_work_acc", "asim_edu_acc", "asim_shop_acc",
+    "asim_nonmand_acc", "asim_eat_acc", "asim_social_acc",
+
     'income_verylo', 'income_mid', 'income_midhi', 'income_veryhi',  # finer income splits
     'one_vehicle', 'multi_vehicle',                                   # 1-car vs 2+ car HH
     'hh_couple', 'hh_medium',                                         # 2-person couple; 3-person family
@@ -4315,6 +5896,15 @@ _S1_OPTIONAL_EXTRA = [
     'mstp',                                   # marital status (ABS)
     'preferred_mode',                         # mode preference derived from mtwp
     'INDUSTRY',                               # industry category (ABS-derived)
+    # ── household composition (from persons grouped by HHID) ────────────────
+    'hh_n_children', 'hh_n_adults', 'hh_n_seniors', 'autos_per_adult',
+    # ── ActivitySim hierarchy conditioning ──────────────────────────────────
+    # stage-1 counts are CONDITIONAL on the person's daily activity pattern:
+    # observed on HHTS (derived in _run_ga_stage1), predicted CDAP on synth
+    # (derived in predict_activity_frequency). dap_H is the reference. These
+    # sharpen the stage0/stage1 division of labour: stage 0 chooses the day
+    # pattern; stage 1 the per-purpose counts GIVEN that pattern.
+    'dap_M', 'dap_N',
 ]
 for _p1k in list(_S1_OPTIONAL_BY_PURPOSE):
     for _v1 in _S1_OPTIONAL_EXTRA:
@@ -4380,17 +5970,47 @@ _S2_OPTIONAL_BY_TARGET = {
                      'CARLICENCE'],                         # car licence expands accessible range -> longer trips
 }
 
+# Upstream logsum cascade (ActivitySim design): downstream expected utility
+# feeds CDAP / frequency / timing / duration choices so early stages respond
+# to transport conditions. Two sources, both picked up automatically by
+# _join_zone_accessibility (every *_acc column) once built:
+#   asim_*    skim-based mode-choice logsums from compute_accessibility
+#             (no fitted models needed — always available);
+#   logsum_*  fitted stage-5 mode-model logsums via build_fitted_logsum_371.py
+#             (saved_data/logsum_acc_371.csv) or UNIFIED_LOGSUM_ACC=1.
+# Names absent from a stage's data are dropped by the `c in data.columns`
+# filters — never errors. (logsum_shop_acc + logsum_shopping_acc both listed:
+# stage-1 specs use the former, the fitted builder writes the latter.)
+_LOGSUM_ACC_CANDIDATES = [
+    "asim_work_acc", "asim_edu_acc", "asim_shop_acc",
+    "asim_nonmand_acc", "asim_eat_acc", "asim_social_acc",
+    "logsum_work_acc", "logsum_edu_acc", "logsum_shop_acc",
+    "logsum_shopping_acc", "logsum_nonmand_acc", "logsum_social_acc",
+    "logsum_escort_acc", "logsum_othmaint_acc", "logsum_othdiscr_acc",
+    "logsum_eat_acc",
+]
+
 # Augment stage 2 optional pools with granular income / vehicle / household-size bands.
 _S2_OPTIONAL_EXTRA = [
+    # ActivitySim-style mode-choice logsum accessibility measures
+    "asim_work_acc", "asim_edu_acc", "asim_shop_acc",
+    "asim_nonmand_acc", "asim_eat_acc", "asim_social_acc",
+
     'income_verylo', 'income_mid', 'income_midhi', 'income_veryhi',
     'one_vehicle', 'multi_vehicle',
     'hh_couple', 'hh_medium',
     'hh_spouse', 'hh_parent', 'age_retired', 'age_young',
     'rlhp', 'WFHDAY', 'bikes', 'empp', 'occp_group',
     'rntrd', 'mstp', 'preferred_mode', 'INDUSTRY',
+    # household composition (from persons grouped by HHID)
+    'hh_n_children', 'hh_n_adults', 'hh_n_seniors', 'autos_per_adult',
 ]
 for _p2k in list(_S2_OPTIONAL_BY_TARGET):
     for _v2 in _S2_OPTIONAL_EXTRA:
+        if _v2 not in _S2_OPTIONAL_BY_TARGET[_p2k]:
+            _S2_OPTIONAL_BY_TARGET[_p2k].append(_v2)
+for _p2k in list(_S2_OPTIONAL_BY_TARGET):
+    for _v2 in _LOGSUM_ACC_CANDIDATES:
         if _v2 not in _S2_OPTIONAL_BY_TARGET[_p2k]:
             _S2_OPTIONAL_BY_TARGET[_p2k].append(_v2)
 
@@ -4508,17 +6128,30 @@ _S3_PURPOSE_OPTIONAL = {
                  'hh_spouse', 'hh_parent', 'mstp', 'rntrd'],
 }
 
-# Augment stage 3 optional pools with granular income / vehicle / household-size bands.
+# Augment stage 3 optional pools with granular income / vehicle / household-size bands
+# and ActivitySim-style household-composition aggregates (built by
+# _enrich_ga_data from the full person table: children/adults/seniors counts and
+# the vehicle-per-adult ratio).
 _S3_OPTIONAL_EXTRA = [
+    # ActivitySim-style mode-choice logsum accessibility measures
+    "asim_work_acc", "asim_edu_acc", "asim_shop_acc",
+    "asim_nonmand_acc", "asim_eat_acc", "asim_social_acc",
+
     'income_verylo', 'income_mid', 'income_midhi', 'income_veryhi',
     'one_vehicle', 'multi_vehicle',
     'hh_couple', 'hh_medium',
     'hh_spouse', 'hh_parent', 'age_retired', 'age_young',
     'rlhp', 'WFHDAY', 'bikes', 'empp', 'occp_group',
     'rntrd', 'mstp', 'preferred_mode', 'INDUSTRY',
+    # household composition (from persons grouped by HHID)
+    'hh_n_children', 'hh_n_adults', 'hh_n_seniors', 'autos_per_adult',
 ]
 for _p3k in list(_S3_PURPOSE_OPTIONAL):
     for _v3 in _S3_OPTIONAL_EXTRA:
+        if _v3 not in _S3_PURPOSE_OPTIONAL[_p3k]:
+            _S3_PURPOSE_OPTIONAL[_p3k].append(_v3)
+for _p3k in list(_S3_PURPOSE_OPTIONAL):
+    for _v3 in _LOGSUM_ACC_CANDIDATES:
         if _v3 not in _S3_PURPOSE_OPTIONAL[_p3k]:
             _S3_PURPOSE_OPTIONAL[_p3k].append(_v3)
 
@@ -4546,6 +6179,10 @@ _S4_PURPOSE_OPTIONAL = {
                  'CARLICENCE', 'wfh', 'WFHWEEK', 'n_workers_hh', 'incp',
                  'age_working', 'hh_child', 'transit_acc', 'walk_acc',
                  'auto_work_acc', 'workstat_fulltime', 'workstat_parttime',
+                 # ActivitySim mandatory-scheduling keystone: period-varying
+                 # home→workplace commute LOS (schedule responds to peak congestion).
+                 # Zero unless STAGE4_MANDATORY_LOS=1; GA decides if they matter.
+                 'commute_am', 'commute_md', 'commute_pm', 'commute_ev', 'commute_peak_ratio',
                  'ptype_Retired',                           # rare non-standard work tours by retired
                  'hh_alone'],                               # solo worker has flexible scheduling
     # ── Education tour schedule placement (time-of-day logit) ────────────────
@@ -4556,6 +6193,8 @@ _S4_PURPOSE_OPTIONAL = {
                  'studying_secondary', 'studying_tertiary_pt', 'studying_tertiary_ft',
                  'has_vehicle', 'transit_acc', 'walk_acc',
                  'age_working', 'hh_child', 'no_vehicle', 'bike_acc', 'incp',
+                 # Period-varying home→school commute LOS (see 'work' above).
+                 'commute_am', 'commute_md', 'commute_pm', 'commute_ev', 'commute_peak_ratio',
                  'ptype_Retired',                           # retired adult learners attend at non-standard times
                  'hh_alone'],                               # solo household learners have flexible timing
     # ── Escort tour schedule placement (time-of-day logit) ───────────────────
@@ -4615,6 +6254,16 @@ _S4_PURPOSE_OPTIONAL = {
                  'hh_alone', 'hh_size_large', 'CARLICENCE'],  # solo HH dines anytime; CARLICENCE for evening
 }
 
+_S4_NONMAND_PURPOSES = ('escort', 'shopping', 'social', 'othmaint', 'othdiscr', 'eat')
+_S4_PURPOSE_PERSON_CORE['nonmand'] = list(dict.fromkeys(
+    feature for purpose in _S4_NONMAND_PURPOSES
+    for feature in _S4_PURPOSE_PERSON_CORE.get(purpose, [])
+))
+_S4_PURPOSE_OPTIONAL['nonmand'] = list(dict.fromkeys(
+    feature for purpose in _S4_NONMAND_PURPOSES
+    for feature in _S4_PURPOSE_OPTIONAL.get(purpose, [])
+))
+
 # Augment stage 4 optional pools with granular income / vehicle / household-size bands.
 _S4_OPTIONAL_EXTRA = [
     'income_verylo', 'income_mid', 'income_midhi', 'income_veryhi',
@@ -4626,6 +6275,10 @@ _S4_OPTIONAL_EXTRA = [
 ]
 for _p4k in list(_S4_PURPOSE_OPTIONAL):
     for _v4 in _S4_OPTIONAL_EXTRA:
+        if _v4 not in _S4_PURPOSE_OPTIONAL[_p4k]:
+            _S4_PURPOSE_OPTIONAL[_p4k].append(_v4)
+for _p4k in list(_S4_PURPOSE_OPTIONAL):
+    for _v4 in _LOGSUM_ACC_CANDIDATES:
         if _v4 not in _S4_PURPOSE_OPTIONAL[_p4k]:
             _S4_PURPOSE_OPTIONAL[_p4k].append(_v4)
 
@@ -4708,6 +6361,82 @@ def _filter_candidates_by_signal(
         if nunq < min_unique:
             continue
         # Binary columns with extreme prevalence have little identification power.
+        if nunq == 2:
+            p = float((s > 0).mean())
+            if p < min_binary_share or p > max_binary_share:
+                continue
+        keep.append(c)
+    return list(dict.fromkeys(keep))
+
+
+# ── Stage-5 universe-aware candidate filter ─────────────────────────────────
+# Stage 5 mode AND destination candidates span FOUR universes, not just the
+# tour/person frame:
+#   • person/tour columns (incp, is_female, ...)          → live on seg_tours
+#   • person-frame attributes (age_older, hh_child, ...)  → live on persons
+#   • zone/landuse columns (FPSEMPN, TOTPOP, retail, ...) → live on landuse
+#   • OD skim columns (SOVTOLL_TIME__AM, ...)             → live on skim_df
+#   • coeff-name genes (c_dist_0_2, c_cbd_dest, ...)      → gate by DEST_UEC_FLAT
+#     key / token, and zone-level computed columns (acdc_aggl_*, home_pull,
+#     is_cbd, transit_walk_acc, size_term) materialized by the worker.
+# Filtering candidates against seg_tours alone (as the generic helper would)
+# drops every zone-level and coeff-name gene, collapsing the pool to only the
+# person columns physically present on the tours frame — the dest pool shrank to
+# 2-3 genes (edu=['incp','is_female']) and the GA had nothing real to search
+# over, so the dest landscape looked flat. This helper checks each candidate
+# against the frame that actually holds it.
+def _filter_dest_candidates_by_signal(
+    seg_tours: pd.DataFrame,
+    landuse: pd.DataFrame,
+    skim_df: pd.DataFrame,
+    candidates: List[str],
+    persons: pd.DataFrame = None,
+    min_unique: int = 2,
+    min_binary_share: float = 0.01,
+    max_binary_share: float = 0.99,
+) -> List[str]:
+    # Zone-level columns the worker materializes on landuse at build time
+    # (_attach_size_term / _attach_acdc_terms / _ensure_cbd_and_transit_cols).
+    computed_zone = {
+        'size_term', 'acdc_aggl', 'acdc_comp',
+        'acdc_aggl_retail', 'acdc_aggl_office', 'acdc_aggl_edu',
+        'acdc_aggl_leisure', 'acdc_aggl_parks', 'acdc_aggl_health',
+        'acdc_aggl_food', 'acdc_aggl_civic',
+        'home_pull', 'home_pull_late', 'is_cbd', 'transit_walk_acc',
+        'emp_density', 'log_emp_density',   # MTC wkempden (mode) — worker-materialized
+    }
+    try:
+        from stage5_destination_choice import DEST_UEC_FLAT
+        coeff_names = set(DEST_UEC_FLAT.keys())
+    except Exception:
+        coeff_names = set()
+    _skim_cols = set(skim_df.columns) if skim_df is not None and len(skim_df.columns) else set()
+    _person_cols = set(persons.columns) if persons is not None else set()
+
+    keep: List[str] = []
+    for c in candidates:
+        # Coeff-name genes and worker-materialized zone columns gate by name /
+        # token — they need no data column at filter time.
+        if c in coeff_names or c in computed_zone:
+            keep.append(c)
+            continue
+        if c in seg_tours.columns:
+            src = seg_tours
+        elif c in _person_cols:
+            src = persons
+        elif c in landuse.columns:
+            src = landuse
+        elif c in _skim_cols:
+            src = skim_df
+        else:
+            continue
+        s = pd.to_numeric(src[c], errors='coerce') if src[c].dtype == object else src[c]
+        s = pd.Series(s).dropna()
+        if s.empty:
+            continue
+        nunq = int(s.nunique(dropna=True))
+        if nunq < min_unique:
+            continue
         if nunq == 2:
             p = float((s > 0).mean())
             if p < min_binary_share or p > max_binary_share:
@@ -4799,7 +6528,15 @@ def _stage4_feature_spec(data: pd.DataFrame, purpose: str) -> Tuple[List[str], L
     )
     core = structural + _available_feature_list(data, _S4_PURPOSE_PERSON_CORE.get(purpose, []))
     optional = _available_feature_list(data, _S4_PURPOSE_OPTIONAL.get(purpose, []))
-    return list(dict.fromkeys(core + optional)), list(dict.fromkeys(core))
+    # Widened pool (2026-09-18): ActivitySim-style interaction genes, pre-day
+    # mobility attributes, and stage-4 taste interactions (ix4_*). Each helper
+    # keeps only columns actually present, so unavailable groups drop out
+    # silently. Refit side already resolves ix4_* via
+    # ensure_ga_search_columns(stage_id=4).
+    widened = (_available_feature_list(data, _STAGE_INTERACTION_CANDIDATES)
+               + _available_feature_list(data, _MOBILITY_ATTR_CANDIDATES)
+               + _add_taste_interactions(data, 4))
+    return list(dict.fromkeys(core + optional + widened)), list(dict.fromkeys(core))
 
 
 # ActivitySim-style interaction ("perturbation character") candidate genes,
@@ -4864,6 +6601,7 @@ def _stage1_candidates(data: pd.DataFrame) -> List[str]:
     return list(dict.fromkeys(
         c for c in base + age_grp + extra + profile + abs_ + acc + ptype
         + _STAGE_INTERACTION_CANDIDATES + _MOBILITY_ATTR_CANDIDATES
+        + _add_taste_interactions(data, 1)
         if c in data.columns
     ))
 
@@ -4888,6 +6626,7 @@ def _stage2_candidates(data: pd.DataFrame) -> List[str]:
     return list(dict.fromkeys(
         c for c in counts + base + profile + abs_ + acc + ptype
         + _STAGE_INTERACTION_CANDIDATES + _MOBILITY_ATTR_CANDIDATES
+        + _add_taste_interactions(data, 2)
         if c in data.columns
     ))
 
@@ -4910,6 +6649,7 @@ def _stage3_candidates(data: pd.DataFrame) -> List[str]:
     return list(dict.fromkeys(
         c for c in act_vars + counts + base + profile + abs_ + ptype
         + _STAGE_INTERACTION_CANDIDATES + _MOBILITY_ATTR_CANDIDATES
+        + _add_taste_interactions(data, 3)
         if c in data.columns
     ))
 
@@ -4924,7 +6664,19 @@ def _stage4_candidates(data: pd.DataFrame) -> List[str]:
                'income_hi', 'income_lo', 'income_midplus',
                'income_verylo', 'income_mid', 'income_midhi', 'income_veryhi',
                'has_vehicle', 'no_vehicle', 'one_vehicle', 'multi_vehicle',
-               'hh_couple', 'hh_medium']
+               'hh_couple', 'hh_medium',
+               # origin/job timing conditionals (stage4 _attach_origin_job_features)
+               'has_work_anchor', 'same_zone_work', 'has_school_anchor',
+               'same_zone_school', 'job_fulltime', 'job_parttime',
+               'is_worker', 'occp_prof', 'occp_blue', 'wfh',
+               # joint-travel timing conditionals (stage4 _attach_joint_features)
+               'is_joint_act', 'joint_party_n', 'escort_duty',
+               'pickup_anchor', 'joint_worker',
+               # observed-CDAP timing conditionals (attach_cdap_to_hhts)
+               'cdap_M', 'cdap_N', 'cdap_H', 'cdap_hh_n_workers',
+               'cdap_hh_n_children', 'cdap_hh_has_home_adult',
+               'cdap_child_x_home_adult', 'cdap_is_child',
+               'n_joint_tours_hh', 'is_joint_traveller']
     profile = _profile_vars(data)
     abs_    = _abs_person_vars(data)
     purp    = [c for c in data.columns if c.startswith('purp_')]
@@ -5017,7 +6769,7 @@ def _stage5_mode_candidates(data: pd.DataFrame = None) -> List[str]:
     studying_vars = ['studying_tertiary_pt', 'studying_tertiary_ft',
                      'studying_secondary', 'studying_primary']
     misc = ['mandatory_role']
-    dest_lu_vars = ['is_cbd', 'transit_walk_acc']
+    dest_lu_vars = ['is_cbd', 'transit_walk_acc', 'emp_density']  # emp_density = MTC wkempden
 
     # ── ActivitySim-inspired GA genes (gated in MODE_UEC / _COEFF_GATE) ──────
     # Generic-vs-alternative-specific toggles (ga_constraints.generic_groups):
@@ -5049,6 +6801,23 @@ def _stage5_mode_candidates(data: pd.DataFrame = None) -> List[str]:
             workstat_vars + studying_vars + misc + dest_lu_vars +
             generic_genes + cost_tod + captivity_dist + occ_genes +
             mobility_use)
+
+
+def _stage5_dest_candidate_maps_to_live_uec(candidate: str,
+                                            segment: str = None) -> bool:
+    """Return whether a destination gene gates a live flat UEC term.
+
+    Delegates to stage5's dest_live_tokens so this filter uses the EXACT build-
+    time mapping logic (coeff-name, substring AND the person-isvar alias that
+    routes 'is_female'/'income_*'/'age_*'/'has_vehicle' to their interaction
+    terms). Previously this did a substring-only check that missed the aliases
+    and would wrongly prune those isvar candidates, so the search never tested
+    them — the asvars/isvars phantom-candidate bug."""
+    try:
+        from stage5_destination_choice import dest_live_tokens
+        return bool(dest_live_tokens([candidate]))
+    except Exception:
+        return True
 
 
 def _stage5_dest_candidates() -> List[str]:
@@ -5136,14 +6905,22 @@ def _stage5_dest_candidates() -> List[str]:
     home_pull_vars = ['home_pull', 'home_pull_late']
     # -- Mode-relevant landuse columns (CBD flag, transit walk access) --
     mode_lu_vars = ['is_cbd', 'transit_walk_acc']
+    # -- Overture occupancy residuals (orthogonalised beyond census) --
+    # Raw est_workers/est_students track establishment counts (r≈0 vs census)
+    # and would double-count size_term; the residuals carry only the Overture
+    # news ~uncorrelated with the census base (see build_zone_landuse_overture).
+    occu_resid = ['est_workers_resid', 'est_students_resid']
     # -- ActivitySim-inspired dest genes (coeff-name gated in DEST_UEC_FLAT) --
     #    piecewise distance spline (replaces c_dist) + CBD/urban-core attractor.
-    dist_spline = ['c_dist_0_2', 'c_dist_2_5', 'c_dist_5_10', 'c_cbd_dest']
-    return list(dict.fromkeys(
+    dist_spline = ['c_dist_0_2', 'c_dist_2_5', 'c_dist_5_10', 'c_cbd_dest',
+                   'c_dist_sq']   # ActivitySim util_dist_squared (quadratic decay)
+    candidates = list(dict.fromkeys(
         skim_extra + emp_work + emp_edu + emp_nonmand + pop_area +
         acc_dest + person_dest_int + acdc_themed + home_pull_vars +
-        mode_lu_vars + dist_spline + _overlay_dest_interaction_genes()
+        mode_lu_vars + dist_spline + occu_resid + _overlay_dest_interaction_genes()
     ))
+    return [candidate for candidate in candidates
+            if _stage5_dest_candidate_maps_to_live_uec(candidate)]
 
 
 def _overlay_dest_interaction_genes(segment: str = None) -> List[str]:
@@ -5175,7 +6952,7 @@ def _stage5_mode_candidates_for_segment(segment: str) -> List[str]:
         'age_working', 'age_older', 'nprd', 'hh_child', 'n_workers_hh',
         'hh_couple', 'hh_medium',
         'mandatory_role',
-        'is_cbd', 'transit_walk_acc',
+        'is_cbd', 'transit_walk_acc', 'emp_density',   # emp_density = MTC wkempden
         # ActivitySim-inspired genes (all gated in MODE_UEC / _COEFF_GATE)
         'incp_generic', 'veh_generic', 'crash_generic', 'age_active_generic',
         'auto_cost', 'SOVTOLL_TOLL__AM', 'SOVTOLL_TIME__MD', 'SOVTOLL_TIME__EV',
@@ -5220,6 +6997,9 @@ def _stage5_dest_candidates_for_segment(segment: str) -> List[str]:
     common = {
         'SOVTOLL_TIME__AM',
         'c_crash',
+        # Extended accessibility (accessibility_371_extended.csv): substrings
+        # of the flat UEC expressions, so live-token mapping picks them up.
+        'crime_violent', 'crash_smooth', 'transit_int',
         'TOTPOP', 'TOTHH', 'sa2_area',
         'auto_work_acc', 'auto_shop_acc', 'walk_acc', 'transit_acc',
         'incp', 'has_vehicle', 'n_workers_hh', 'is_female',
@@ -5231,6 +7011,7 @@ def _stage5_dest_candidates_for_segment(segment: str) -> List[str]:
         #   piecewise distance spline (replaces c_dist) + CBD/urban-core pull.
         'c_dist_0_2', 'c_dist_2_5', 'c_dist_5_10', 'c_cbd_dest', 'is_cbd',
         'c_dist_decay', 'c_dist_decay_slow',   # non-linear gravity distance-decay
+        'c_dist_sq',   # ActivitySim util_dist_squared (quadratic distance decay)
         'c_crash_safety_dest',   # per-agent safety utility x destination crash
     }
     by_seg = {
@@ -5241,11 +7022,19 @@ def _stage5_dest_candidates_for_segment(segment: str) -> List[str]:
             # additional industry-sector attractor coefficients (coeff-name gated)
             'c_indp_agri', 'c_indp_mfg', 'c_indp_construction', 'c_indp_govt',
             'c_indp_industrial', 'c_indp_education',
+            # Overture job news beyond TOTEMP (orthogonalised residual)
+            'est_workers_resid',
+            # composite work visitability (extended accessibility)
+            'visit_work',
         },
         'edu': {
             'Education', 'Primary', 'Secondary', 'HSENROLL', 'AGE0519',
             'Primary_total_priv', 'Secondary_total_priv',
             'ptype_UniversityStudent', 'hh_child', 'age_working',
+            # Overture enrolment news beyond school counts (orthogonalised residual)
+            'est_students_resid',
+            # education density + composite edu visitability (extended)
+            'attract_edu', 'visit_edu',
         },
         'nonmand': {
             'Shopping', 'Entertainment', 'OTHERMAINTENANCE', 'OTHERDISCRFacilities',
@@ -5254,10 +7043,15 @@ def _stage5_dest_candidates_for_segment(segment: str) -> List[str]:
             'residential', 'retail', 'construction',
             'age_older',
             'home_pull', 'home_pull_late',
+            # purpose densities + composite visitability (extended)
+            'attract_shop', 'attract_food', 'attract_health', 'attract_rec',
+            'visit_shop', 'visit_social',
         },
     }
-    return list(dict.fromkeys(sorted(common | by_seg.get(segment, set()))
-                              + _overlay_dest_interaction_genes(segment)))
+    candidates = list(dict.fromkeys(sorted(common | by_seg.get(segment, set()))
+                                   + _overlay_dest_interaction_genes(segment)))
+    return [candidate for candidate in candidates
+            if _stage5_dest_candidate_maps_to_live_uec(candidate, segment)]
 
 
 def _stage6_candidates(data: pd.DataFrame) -> List[str]:
@@ -5294,6 +7088,13 @@ def _run_ga_cdap(persons, ga_kwargs, n_restarts=2) -> GAResult:
 
     print("\n[CDAP] Preparing estimation data from HHTS persons...")
     data       = prepare_cdap_data(persons)
+    # Persons grain -> home-zone accessibility + shared derivations, so the
+    # acc/logsum candidates (gravity, asim_*, fitted logsum_*) can be selected.
+    # Non-fatal by construction: missing keys/columns skip silently inside.
+    try:
+        data = _enrich_ga_data(data, persons, zone_col='HOME_SA2_2021')
+    except Exception as _cdap_enrich_e:
+        print(f"  [CDAP] enrichment skipped ({_cdap_enrich_e})")
     feat_names = _cdap_candidates(data)
     print(f"  {len(data)} HHTS persons | {len(feat_names)} candidate features")
     print(f"  CDAP dist: {data['cdap_obs'].value_counts().sort_index().to_dict()}")
@@ -5539,7 +7340,327 @@ def _resolve_min_features(ga_kwargs: dict, feat_names: list, fixed_feats: list) 
     return kw
 
 
-def _enrich_ga_data(data: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame:
+def ensure_ga_search_columns(
+    data: pd.DataFrame,
+    persons: Optional[pd.DataFrame] = None,
+    ptype_subset=None,
+    stage_id: int = None,
+    zone_col: str = None,
+) -> pd.DataFrame:
+    """
+    Recreate, on a plain estimation frame, the engineered columns that the
+    stage 1-4 GA search frames reference, so a final re-fit driven by a
+    GA `best_features` dict resolves the same columns the search saw.
+
+    Applies exactly the feature engineering `_run_ga_stage1/2/3` perform
+    before searching:
+      * ptype one-hot dummies            (see ptype_subset below)
+      * is_female                        (from sexp)
+      * income_hi / income_lo / income_midplus  (from incp)
+      * mandatory_role                   (WORKSTAT >= 1)
+      * everything _enrich_ga_data adds when `persons` is supplied
+        (vehicle flags, CARLICENCE / n_workers_hh / AGEGROUP / wfh /
+        WFHWEEK merges, granular income bands, age-group dummies,
+        household-size flags, stage interaction columns)
+      * when `stage_id` is given: the stage's taste-variation columns
+        (ix<stage>_<seg>_x_<cont> mixed-logit proxies) so a GA-selected
+        taste interaction resolves in the refit frame too
+      * when `zone_col` is given: home/destination-zone accessibility
+        (_join_zone_accessibility) so GA-selected *_acc features resolve.
+        WITHOUT this, a GA-selected acc/logsum feature is silently dropped
+        by the refit ("unresolvable features") and the final model degrades
+        to a spec without it — the prediction then applies coefficients for
+        a different specification than the search chose.
+
+    Applies exactly the feature engineering `_run_ga_stage1/2/3` perform
+    before searching:
+      * ptype one-hot dummies            (see ptype_subset below)
+      * is_female                        (from sexp)
+      * income_hi / income_lo / income_midplus  (from incp)
+      * mandatory_role                   (WORKSTAT >= 1)
+      * everything _enrich_ga_data adds when `persons` is supplied
+        (vehicle flags, CARLICENCE / n_workers_hh / AGEGROUP / wfh /
+         WFHWEEK merges, granular income bands, age-group dummies,
+         household-size flags, stage interaction columns)
+      * when `stage_id` is given: the stage's taste-variation columns
+        (ix<stage>_<seg>_x_<cont> mixed-logit proxies) so a GA-selected
+        taste interaction resolves in the refit frame too
+
+    ptype_subset : when given (e.g. only the 'ptype_*' names referenced by
+        the GA override), create just those dummies. This matters for
+        estimators like stage 3 whose feature builder auto-appends every
+        ptype dummy column present in the frame — creating them all would
+        leak unselected dummies into the final specification.
+        None (default) creates all dummies, matching the search frames.
+
+    Safe to call repeatedly: every step is guarded by "not in data.columns".
+    """
+    data = data.copy()
+    if 'ptype' in data.columns:
+        _dummies = pd.get_dummies(data['ptype'], prefix='ptype')
+        for _c in _dummies.columns:
+            if ptype_subset is not None and _c not in set(ptype_subset):
+                continue
+            if _c not in data.columns:
+                data[_c] = _dummies[_c].astype(int)
+    if 'sexp' in data.columns and 'is_female' not in data.columns:
+        data['is_female'] = (data['sexp'] == 2).astype(int)
+    if 'incp' in data.columns:
+        if 'income_hi'      not in data.columns: data['income_hi']      = (data['incp'] >= 12).astype(int)
+        if 'income_lo'      not in data.columns: data['income_lo']      = (data['incp'] <= 4).astype(int)
+        if 'income_midplus' not in data.columns: data['income_midplus'] = (data['incp'] >= 8).astype(int)
+    if 'WORKSTAT' in data.columns and 'mandatory_role' not in data.columns:
+        data['mandatory_role'] = (data['WORKSTAT'] >= 1).astype(int)
+    if persons is not None:
+        data = _enrich_ga_data(data, persons, zone_col=zone_col)
+    if stage_id is not None:
+        # taste-variation (mixed-logit proxy) columns for this stage, so a
+        # GA-selected ix<stage>_* interaction resolves in the refit frame
+        try:
+            _add_taste_interactions(data, stage_id)
+        except Exception:                              # noqa: BLE001
+            pass
+    return data
+
+
+_ACC_FILES = ('saved_data/accessibility.csv', 'saved_data/accessibility_371.csv',
+              'saved_data/logsum_acc_371.csv', 'accessibility.csv')
+
+
+def ensure_prediction_features(df: pd.DataFrame,
+                                stage_id: int = None,
+                                zone_col: str = None) -> pd.DataFrame:
+    """Prediction-side twin of ensure_ga_search_columns (no HHTS persons merge).
+
+    Rebuilds, from the prediction frame's OWN columns, every derived feature
+    the GA search/refit frames carry, so a GA-selected feature resolves at
+    prediction instead of being silently zero-filled (zero-fill biases
+    predictions toward the reference alternative):
+
+      * ptype dummies, is_female, has/no/one/multi_vehicle
+      * income_hi/lo/midplus (+ verylo/mid/midhi/veryhi) from incp
+      * mandatory_role, workstat_fulltime/parttime (WORKSTAT 1/2),
+        studying_primary/secondary/tertiary_pt/tertiary_ft (STUDYING 1-4)
+      * age bins (AGEGROUP, else age5p — same cutoffs as _enrich_ga_data;
+        NOTE cdap.build_person_profiles uses different cutoffs; the
+        not-in-columns guards keep whichever builder ran first)
+      * INDUSTRY (indp alias), occp_group (occp carry)
+      * hh_alone/couple/medium/size_large (nprd), n_workers_hh + hh_child
+        (own-HHID grouping; hh_spouse/parent need relationship codes — skipped)
+      * day aggregates (frames with person_id + B + n_*_out):
+        budget_per_activity_hr, day_span_hr, n_mandatory, n_discretionary
+      * home-zone accessibility via _join_zone_accessibility. For stage-3
+        activities destinations don't exist yet (pre-stage-5), so HOME-zone
+        values stand in under the same names — a documented asymmetry with
+        the destination-zone estimation join; real values either way, never
+        silent zeros when a home key exists.
+      * stage taste interactions when stage_id is given.
+
+    zone_col defaults to the first present HOME-like key (HOME_SA2_2021,
+    HOME_SA2, OTAZ, HOMETAZ, HOMEZONE) — never a destination key, so predict
+    and search join the same grain. Never raises; safe to call repeatedly.
+    """
+    try:
+        d = df.copy()
+        if 'ptype' in d.columns:
+            for _pt in pd.Series(d['ptype'].dropna().unique()):
+                _c = f'ptype_{_pt}'
+                if _c not in d.columns:
+                    d[_c] = (d['ptype'] == _pt).astype(int)
+        if 'sexp' in d.columns and 'is_female' not in d.columns:
+            d['is_female'] = (pd.to_numeric(d['sexp'], errors='coerce') == 2).astype(int)
+        if 'vehrd' in d.columns:
+            _v = pd.to_numeric(d['vehrd'], errors='coerce').fillna(0)
+            if 'has_vehicle' not in d.columns:
+                d['has_vehicle'] = (_v > 0).astype(int)
+            if 'no_vehicle' not in d.columns:
+                d['no_vehicle'] = (_v == 0).astype(int)
+            if 'one_vehicle' not in d.columns:
+                d['one_vehicle'] = (_v == 1).astype(int)
+            if 'multi_vehicle' not in d.columns:
+                d['multi_vehicle'] = (_v >= 2).astype(int)
+        if 'incp' in d.columns:
+            _ii = pd.to_numeric(d['incp'], errors='coerce')
+            for _c, _m in (('income_hi', _ii >= 12), ('income_lo', _ii <= 4),
+                           ('income_midplus', _ii >= 8),
+                           ('income_verylo', _ii <= 2),
+                           ('income_mid', _ii.between(5, 7)),
+                           ('income_midhi', _ii.between(8, 11)),
+                           ('income_veryhi', _ii >= 13)):
+                if _c not in d.columns:
+                    d[_c] = _m.astype(int)
+        if 'WORKSTAT' in d.columns:
+            _ws = pd.to_numeric(d['WORKSTAT'], errors='coerce').fillna(0).astype(int)
+            if 'mandatory_role' not in d.columns:
+                d['mandatory_role'] = (_ws >= 1).astype(int)
+            if 'workstat_fulltime' not in d.columns:
+                d['workstat_fulltime'] = (_ws == 1).astype(int)
+            if 'workstat_parttime' not in d.columns:
+                d['workstat_parttime'] = (_ws == 2).astype(int)
+        if 'STUDYING' in d.columns:
+            _st = pd.to_numeric(d['STUDYING'], errors='coerce').fillna(0).astype(int)
+            for _code, _name in ((1, 'primary'), (2, 'secondary'),
+                                 (3, 'tertiary_pt'), (4, 'tertiary_ft')):
+                _col = f'studying_{_name}'
+                if _col not in d.columns:
+                    d[_col] = (_st == _code).astype(int)
+        _agesrc, _is5p = None, False
+        if 'AGEGROUP' in d.columns:
+            _agesrc, _is5p = pd.to_numeric(d['AGEGROUP'], errors='coerce'), False
+        elif 'age5p' in d.columns:
+            _agesrc, _is5p = pd.to_numeric(d['age5p'], errors='coerce'), True
+        if _agesrc is not None:
+            if 'age_child' not in d.columns:
+                d['age_child'] = (_agesrc <= 2).astype(int)
+            if 'age_teen' not in d.columns:
+                d['age_teen'] = (_agesrc == 3).astype(int)
+            if 'age_working' not in d.columns:
+                d['age_working'] = _agesrc.between(4, 7).astype(int)
+            if 'age_older' not in d.columns:
+                d['age_older'] = (_agesrc >= 8).astype(int)
+            if 'age_senior' not in d.columns:
+                d['age_senior'] = (_agesrc >= (9 if _is5p else 10)).astype(int)
+            if 'age_retired' not in d.columns:
+                _ws5 = (pd.to_numeric(d['WORKSTAT'], errors='coerce').fillna(0) == 5) \
+                    if 'WORKSTAT' in d.columns else False
+                d['age_retired'] = ((_agesrc >= (9 if _is5p else 10)) | _ws5).astype(int)
+            if 'age_young' not in d.columns:
+                d['age_young'] = (_agesrc <= 5).astype(int)
+        if 'indp' in d.columns and 'INDUSTRY' not in d.columns:
+            d['INDUSTRY'] = pd.to_numeric(d['indp'], errors='coerce').fillna(0)
+        if 'occp' in d.columns and 'occp_group' not in d.columns:
+            d['occp_group'] = pd.to_numeric(d['occp'], errors='coerce').fillna(0)
+        if 'nprd' in d.columns:
+            if 'hh_alone' not in d.columns:
+                d['hh_alone'] = (d['nprd'] == 1).astype(int)
+            if 'hh_size_large' not in d.columns:
+                d['hh_size_large'] = (d['nprd'] >= 4).astype(int)
+            if 'hh_couple' not in d.columns:
+                d['hh_couple'] = (d['nprd'] == 2).astype(int)
+            if 'hh_medium' not in d.columns:
+                d['hh_medium'] = (d['nprd'] == 3).astype(int)
+        _hhid = next((c for c in ('HHID', 'household_id', 'abshid')
+                      if c in d.columns), None)
+        if _hhid is not None:
+            try:
+                _wraw = pd.to_numeric(d['WORKSTAT'], errors='coerce').fillna(0).astype(int) \
+                    if 'WORKSTAT' in d.columns else pd.Series(0, index=d.index)
+                _isw = _wraw.isin([1, 2]).astype(int)
+                if 'RELATIONSHIP' in d.columns:
+                    _isc = d['RELATIONSHIP'].astype(str).str.lower().isin(
+                        ['child', 'son', 'daughter']).astype(int)
+                elif _agesrc is not None:
+                    _isc = (_agesrc <= 2).astype(int)
+                else:
+                    _isc = pd.Series(0, index=d.index)
+                _g = d.assign(_w=_isw.values, _c=np.asarray(_isc).astype(int)
+                              ).groupby(_hhid)
+                if 'n_workers_hh' not in d.columns:
+                    d['n_workers_hh'] = d[_hhid].map(
+                        _g['_w'].sum()).fillna(0)
+                if 'hh_child' not in d.columns:
+                    d['hh_child'] = (d[_hhid].map(_g['_c'].max()).fillna(0) > 0).astype(int)
+            except Exception:
+                pass
+        # day aggregates (activity/person grains carrying B + counts)
+        if 'person_id' in d.columns and 'B' in d.columns:
+            try:
+                _nact = d.groupby('person_id').size()
+                _b = pd.to_numeric(d['B'], errors='coerce')
+                if 'budget_per_activity_hr' not in d.columns:
+                    d['budget_per_activity_hr'] = (
+                        _b / d['person_id'].map(_nact).clip(lower=1)).fillna(_b)
+                if 'day_span_hr' not in d.columns and \
+                        'start_of_day' in d.columns and 'end_of_day' in d.columns:
+                    _s = pd.to_numeric(d['start_of_day'], errors='coerce')
+                    _e = pd.to_numeric(d['end_of_day'], errors='coerce')
+                    _span = ((_e.groupby(d['person_id']).max()
+                              - _s.groupby(d['person_id']).min()) / 60.0)
+                    d['day_span_hr'] = d['person_id'].map(_span).fillna(_b).clip(lower=0.5)
+                _ncols = [c for c in d.columns if c.startswith('n_') and c.endswith('_out')]
+                if 'n_mandatory' not in d.columns:
+                    _m = [c for c in ('n_work_out', 'n_edu_out') if c in _ncols]
+                    d['n_mandatory'] = d[_m].sum(axis=1).fillna(0) if _m else 0.0
+                if 'n_discretionary' not in d.columns:
+                    _dd = [c for c in _ncols if c not in ('n_work_out', 'n_edu_out')]
+                    d['n_discretionary'] = d[_dd].sum(axis=1).fillna(0) if _dd else 0.0
+            except Exception:
+                pass
+        if zone_col is None:
+            zone_col = next((c for c in ('HOME_SA2_2021', 'HOME_SA2', 'OTAZ',
+                                         'HOMETAZ', 'HOMEZONE') if c in d.columns), None)
+        if zone_col is not None:
+            _before = set(d.columns)
+            d = _join_zone_accessibility(d, zone_col)
+            _added = sorted(set(d.columns) - _before)
+            if _added and stage_id == 3:
+                print("    [predict] stage-3 acc uses HOME-zone proxy "
+                      f"({len(_added)} cols) — destinations don't exist "
+                      f"pre-stage-5 while estimation joined destination zones "
+                      f"(documented asymmetry, real values over zeros)")
+        if stage_id is not None:
+            try:
+                _add_taste_interactions(d, stage_id)
+            except Exception:
+                pass
+        return d
+    except Exception:
+        return df
+
+
+def _join_zone_accessibility(data: pd.DataFrame, zone_col: str) -> pd.DataFrame:
+    """Left-join zone accessibility measures onto GA estimation rows (non-fatal).
+
+    The GA specs for stages 2/3 list acc candidates (walk/transit/bike/auto_*
+    gravity, asim_* logsums) that the stage builders never join — the search
+    can only see tour-count/demographic features and plateaus. This closes the
+    gap using the accessibility file load_data() writes earlier in the same job
+    (zone_id key; every *_acc column is picked up, including power_*_acc when
+    the power-accessibility step has run).
+
+    Coverage is logged; a zero-match join returns data unchanged. Never raises.
+    """
+    try:
+        if not zone_col or zone_col not in data.columns:
+            return data
+        _acc, _src = None, None
+        for _p in _ACC_FILES:
+            if os.path.exists(_p):
+                try:
+                    _acc = pd.read_csv(_p, low_memory=False)
+                    _src = _p
+                    break
+                except Exception:
+                    continue
+        if _acc is None:
+            print("    [acc-join] no accessibility file found — zone features skipped")
+            return data
+        _key = 'zone_id' if 'zone_id' in _acc.columns else _acc.columns[0]
+        _mcols = [c for c in _acc.columns if c != _key and str(c).endswith('_acc')]
+        if not _mcols:
+            return data
+        _a = _acc[[_key] + _mcols].copy()
+        _a['_z'] = pd.to_numeric(_a[_key], errors='coerce')
+        _a = _a.dropna(subset=['_z']).drop_duplicates('_z').set_index('_z')
+        _z = pd.to_numeric(data[zone_col], errors='coerce')
+        _cov = float(_z.isin(_a.index).mean()) if len(_z) else 0.0
+        print(f"    [acc-join] {zone_col} -> {_src}: {len(_mcols)} measures, "
+              f"coverage={_cov:.1%}")
+        if _cov <= 0 or len(_a) == 0:
+            return data
+        _add = _a[_mcols].reindex(_z.values)
+        _add.index = data.index
+        for _c in _mcols:
+            if _c not in data.columns:
+                data[_c] = pd.to_numeric(_add[_c], errors='coerce')
+        return data
+    except Exception as _e:
+        print(f"    [acc-join] skipped ({_e})")
+        return data
+
+
+def _enrich_ga_data(data: pd.DataFrame, persons: pd.DataFrame,
+                    zone_col: str = None) -> pd.DataFrame:
     """Merge additional person-level columns into GA estimation data.
 
     Stages 1-4 use a narrow PERSON_FEATURES list.  This helper adds columns
@@ -5552,11 +7673,27 @@ def _enrich_ga_data(data: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame:
 
     Merged from `persons` if not already in data (one pass, drop_duplicates):
       * CARLICENCE, hh_child, n_workers_hh, AGEGROUP, wfh, WFHWEEK, incp
+      * HOME_SA2_2021, WFHDAY, WORKSTAT, STUDYING, HHSIZE, empp, indp, occp,
+        bikes, mstp, rntrd, rlhp, RELATIONSHIP, age5p, HHID (raw carry-through;
+        the narrow stage keep-lists drop these even though the survey has them)
 
     Derived from newly-merged columns:
       * income_hi / income_lo / income_midplus / income_verylo / income_mid
         / income_midhi / income_veryhi  (from incp, if newly added)
-      * age_child / age_teen / age_working / age_older / age_senior  (from AGEGROUP)
+      * age_child / age_teen / age_working / age_older / age_senior (from AGEGROUP)
+      * workstat_fulltime / workstat_parttime (WORKSTAT 1/2 — codebase convention)
+      * studying_primary / secondary / tertiary_pt / tertiary_ft (STUDYING 1-4)
+      * INDUSTRY (alias of indp codes), occp_group (carries occp 1:1; grouping
+        deferred — values stay truthful), n_workers_hh + hh_child (HHID
+        grouping; hh_spouse/hh_parent need relationship codes — no codebook,
+        skipped openly, see below)
+
+    Zone accessibility (zone_col):
+      * when zone_col is given (HOME_SA2_2021 for person-day grain, DESTSA2_2021
+        for activity grain), _join_zone_accessibility left-joins every *_acc
+        measure (gravity + asim logsums + power acc when present) from the
+        accessibility file this job wrote. Without this call the GA spec lists
+        acc candidates that can never be selected (the stage-2/3 plateau).
     """
     # ── derived from vehrd (already in data) ──────────────────────────────
     if 'vehrd' in data.columns:
@@ -5576,8 +7713,17 @@ def _enrich_ga_data(data: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame:
             data['multi_vehicle'] = (data['vehrd'] >= 2).astype(int)
 
     # ── merge extra columns from persons ──────────────────────────────────
-    _extra_cols = [c for c in ['CARLICENCE', 'hh_child', 'n_workers_hh',
-                                'AGEGROUP', 'wfh', 'WFHWEEK', 'incp']
+    # HHID is merged too so the per-household composition aggregates below can
+    # be built (ActivitySim-style household structure variables).
+    # Extended carry-through: the narrow stage keep-lists drop raw HHTS columns
+    # the GA specs reference (WORKSTAT/STUDYING/empp/indp/occp/bikes/mstp/rntrd/
+    # rlhp/HHSIZE/age5p/RELATIONSHIP/HOME_SA2_2021/WFHDAY), so they are merged
+    # here instead of editing every stage builder's keep-list.
+    _extra_cols = [c for c in ['HHID', 'CARLICENCE', 'hh_child', 'n_workers_hh',
+                                'AGEGROUP', 'wfh', 'WFHWEEK', 'incp',
+                                'HOME_SA2_2021', 'WFHDAY', 'WORKSTAT', 'STUDYING',
+                                'HHSIZE', 'empp', 'indp', 'occp', 'bikes', 'mstp',
+                                'rntrd', 'rlhp', 'RELATIONSHIP', 'age5p']
                    if c in persons.columns and c not in data.columns]
     if _extra_cols and 'person_id' in data.columns and 'person_id' in persons.columns:
         _pers_extra = (
@@ -5617,7 +7763,7 @@ def _enrich_ga_data(data: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame:
         if 'age_senior'  not in data.columns:
             data['age_senior']  = (data['AGEGROUP'] >= 10).astype(int)
 
-    # ── derive household size flags from nprd ─────────────────────────────
+    # ── derive household-size flags from nprd ─────────────────────────────
     # hh_alone    : single-person household (sole adult, fewer time constraints)
     # hh_couple   : two-person household (couple without young children)
     # hh_medium   : three-person household (small family)
@@ -5631,6 +7777,146 @@ def _enrich_ga_data(data: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame:
             data['hh_couple']     = (data['nprd'] == 2).astype(int)
         if 'hh_medium' not in data.columns:
             data['hh_medium']     = (data['nprd'] == 3).astype(int)
+
+    # ── per-household composition aggregates (ActivitySim-style) ──────────
+    # Counts of adults / children / seniors and vehicle-per-adult ratio,
+    # aggregated from the FULL person table so every member sees the same
+    # household structure. These give stages 1-4 the household-composition
+    # covariates ActivitySim's generation/CDAP/duration models rely on.
+    _need_hh_comp = any(c not in data.columns for c in (
+        'hh_n_children', 'hh_n_adults', 'hh_n_seniors', 'autos_per_adult'))
+    if (_need_hh_comp and 'HHID' in persons.columns
+            and 'HHID' in data.columns):
+        _p_hh = persons.copy()
+        if cfg_age_col := next((c for c in ('AGEGROUP', 'age5p', 'agep')
+                                if c in _p_hh.columns), None):
+            _p_age = pd.to_numeric(_p_hh[cfg_age_col], errors='coerce')
+        else:
+            _p_age = pd.Series(np.nan, index=_p_hh.index)
+        _pt_col = next((c for c in ('ptype', 'PTYPE') if c in _p_hh.columns), None)
+        if _pt_col is not None:
+            _is_child = _p_hh[_pt_col].astype(str).isin(
+                ['Preschool', 'SchoolChild'])
+            _is_senior = _p_hh[_pt_col].astype(str).isin(['Retired'])
+        else:
+            _is_child = _p_age <= 3          # 0-14
+            _is_senior = _p_age >= 11        # 50+
+        _comp = pd.DataFrame({
+            'HHID': _p_hh['HHID'],
+            '_child': _is_child.astype(int),
+            '_senior': _is_senior.fillna(False).astype(int),
+        })
+        _g = _comp.groupby('HHID')
+        _hh_tbl = pd.DataFrame({
+            'hh_n_children': _g['_child'].sum(),
+            'hh_n_seniors': _g['_senior'].sum(),
+            'hh_size': _g.size(),
+        })
+        _hh_tbl['hh_n_adults'] = (
+            _hh_tbl['hh_size'] - _hh_tbl['hh_n_children']).clip(lower=0)
+        data = data.merge(_hh_tbl.reset_index(), on='HHID', how='left')
+        for c in ('hh_n_children', 'hh_n_adults', 'hh_n_seniors'):
+            if c in data.columns:
+                data[c] = data[c].fillna(0.0).astype(float)
+        if 'autos_per_adult' not in data.columns and 'vehrd' in data.columns:
+            data['autos_per_adult'] = (
+                pd.to_numeric(data['vehrd'], errors='coerce').fillna(0.0)
+                / data.get('hh_n_adults', pd.Series(1, index=data.index))
+                  .clip(lower=1.0)
+            ).astype(float)
+
+    # ── WORKSTAT / STUDYING flags (codebook used across the codebase:
+    # WORKSTAT 1=full-time 2=part-time; STUDYING 1=primary 2=secondary
+    # 3=tertiary-PT 4=tertiary-FT). _add_categorical_person_features builds the
+    # studying_* set for stage 1 only — stages 2/3 get them here. ──────────
+    if 'WORKSTAT' in data.columns:
+        _ws = pd.to_numeric(data['WORKSTAT'], errors='coerce').fillna(0).astype(int)
+        if 'workstat_fulltime' not in data.columns:
+            data['workstat_fulltime'] = (_ws == 1).astype(int)
+        if 'workstat_parttime' not in data.columns:
+            data['workstat_parttime'] = (_ws == 2).astype(int)
+    if 'STUDYING' in data.columns:
+        _st = pd.to_numeric(data['STUDYING'], errors='coerce').fillna(0).astype(int)
+        for _code, _name in ((1, 'primary'), (2, 'secondary'),
+                             (3, 'tertiary_pt'), (4, 'tertiary_ft')):
+            _col = f'studying_{_name}'
+            if _col not in data.columns:
+                data[_col] = (_st == _code).astype(int)
+
+    # ── age bins (AGEGROUP cutoffs match stage1; age5p fallback bands) ──────
+    _need_age = any(c not in data.columns for c in (
+        'age_child', 'age_teen', 'age_working', 'age_older', 'age_senior',
+        'age_retired', 'age_young'))
+    if _need_age:
+        if 'AGEGROUP' in data.columns:
+            _ag = pd.to_numeric(data['AGEGROUP'], errors='coerce')
+            _agesrc, _is5p = _ag, False
+        elif 'age5p' in data.columns:
+            _agesrc, _is5p = pd.to_numeric(data['age5p'], errors='coerce'), True
+        else:
+            _agesrc, _is5p = None, False
+        if _agesrc is not None:
+            if 'age_child' not in data.columns:
+                data['age_child'] = (_agesrc <= 2).astype(int)
+            if 'age_teen' not in data.columns:
+                data['age_teen'] = (_agesrc == 3).astype(int)
+            if 'age_working' not in data.columns:
+                data['age_working'] = _agesrc.between(4, 7).astype(int)
+            if 'age_older' not in data.columns:
+                data['age_older'] = (_agesrc >= 8).astype(int)
+            if 'age_senior' not in data.columns:
+                data['age_senior'] = (_agesrc >= (9 if _is5p else 10)).astype(int)
+            if 'age_retired' not in data.columns:
+                _ws5 = (pd.to_numeric(data['WORKSTAT'], errors='coerce').fillna(0) == 5) \
+                    if 'WORKSTAT' in data.columns else False
+                data['age_retired'] = ((_agesrc >= (9 if _is5p else 10)) | _ws5).astype(int)
+            if 'age_young' not in data.columns:
+                data['age_young'] = (_agesrc <= 5).astype(int)
+
+    # ── occupation / industry aliases (documented, code-preserving) ─────────
+    # INDUSTRY is the canonical alias for indp; occp_group carries occp 1:1
+    # (true grouping deferred — values stay truthful so GA selection is valid).
+    if 'indp' in data.columns and 'INDUSTRY' not in data.columns:
+        data['INDUSTRY'] = pd.to_numeric(data['indp'], errors='coerce').fillna(0)
+    if 'occp' in data.columns and 'occp_group' not in data.columns:
+        data['occp_group'] = pd.to_numeric(data['occp'], errors='coerce').fillna(0)
+
+    # ── household composition from HHID (n_workers_hh, hh_child) ────────────
+    # hh_spouse / hh_parent need relationship codes — no codebook in repo, so
+    # they stay unsearchable until one is documented (see module notes).
+    if ('HHID' in data.columns and 'n_workers_hh' not in data.columns
+            and 'HHID' in persons.columns):
+        try:
+            _ph = persons.copy()
+            _wraw = pd.to_numeric(_ph['WORKSTAT'], errors='coerce').fillna(0).astype(int) \
+                if 'WORKSTAT' in _ph.columns else pd.Series(0, index=_ph.index)
+            _isw = _wraw.isin([1, 2]).astype(int)
+            if 'RELATIONSHIP' in _ph.columns:
+                _rel = _ph['RELATIONSHIP'].astype(str).str.lower()
+                _isc = _rel.isin(['child', 'son', 'daughter']).astype(int)
+            elif 'AGEGROUP' in _ph.columns:
+                _isc = (pd.to_numeric(_ph['AGEGROUP'], errors='coerce') <= 2).astype(int)
+            elif 'age5p' in _ph.columns:
+                _isc = (pd.to_numeric(_ph['age5p'], errors='coerce') <= 2).astype(int)
+            else:
+                _isc = pd.Series(0, index=_ph.index)
+            _hh = pd.DataFrame({'HHID': _ph['HHID'].values, '_w': _isw.values,
+                                '_c': np.asarray(_isc).astype(int)})
+            _g = _hh.groupby('HHID')
+            _tbl = pd.DataFrame({'n_workers_hh': _g['_w'].sum(),
+                                 '_nch': _g['_c'].max()})
+            _tbl['hh_child'] = (_tbl['_nch'] > 0).astype(int)
+            for _c in ('n_workers_hh', 'hh_child'):
+                if _c not in data.columns:
+                    data = data.merge(_tbl[[_c]], left_on='HHID',
+                                      right_index=True, how='left')
+                    data[_c] = pd.to_numeric(data[_c], errors='coerce').fillna(0)
+        except Exception as _e:
+            print(f"    [hh-join] household composition skipped ({_e})")
+
+    # ── zone accessibility join (stage 2: home zone; stage 3: destination) ──
+    if zone_col is not None:
+        data = _join_zone_accessibility(data, zone_col)
 
     data = _ensure_stage_interactions(data)
     return data
@@ -5757,6 +8043,25 @@ def _run_ga_stage1(tours, persons, ga_kwargs, n_restarts=2, landuse=None) -> GAR
         #breakdown workstat by _binary
     data = _enrich_ga_data(data, persons)
 
+    # ── Observed day-pattern conditioning (ActivitySim hierarchy) ──────────
+    # Stage-1 frequency models are conditional on the person's daily activity
+    # pattern: dap_M / dap_N dummies (dap_H reference) derived from observed
+    # tours. predict_activity_frequency() derives the same dummies from the
+    # predicted CDAP letter on the synthetic side, so GA-selected dap_*
+    # candidates transfer symmetrically.
+    try:
+        from cdap_households_estimation import derive_observed_dap as _derive_dap
+        if 'person_id' in data.columns:
+            # returns a Series index-aligned to the frame passed as `persons`
+            _dap = _derive_dap(data, tours)
+            data['dap_M'] = (_dap == 'M').astype(int).to_numpy()
+            data['dap_N'] = (_dap == 'N').astype(int).to_numpy()
+            print(f"  Stage 1 DAP conditioning attached "
+                  f"(M={int(data['dap_M'].sum())}, N={int(data['dap_N'].sum())})")
+    except Exception as _dap_e:
+        print(f"  Stage 1 DAP conditioning unavailable ({_dap_e}); "
+              "dap_* candidates stay inert")
+
     # Build combined non-mandatory count for the consolidated model.
     # Uses work/edu/nonmand structure matching Stage 5 — all six nonmand purposes
     # (escort, shopping, social, othmaint, othdiscr, eat) pooled into one count.
@@ -5772,6 +8077,7 @@ def _run_ga_stage1(tours, persons, ga_kwargs, n_restarts=2, landuse=None) -> GAR
     # Replace all six nonmand purposes with one combined 'nonmand' purpose → work/edu/nonmand
     purposes   = ([p for p in _all_purps if p not in _nonmand_set]
                   + (['nonmand'] if 'n_nonmand_out' in data.columns else list(_nonmand_set & set(_all_purps))))
+    purposes = _shard_filter(purposes, 1)
     est        = ga_estimator()
     use_sim_anneal = est in ('metacount', 'both', 'hybrid', 'sa_bandit')
 
@@ -5939,8 +8245,11 @@ def _run_ga_stage2(tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
         if 'income_midplus' not in data.columns: data['income_midplus'] = (data['incp'] >= 8).astype(int)
     if 'WORKSTAT' in data.columns and 'mandatory_role' not in data.columns:
         data['mandatory_role'] = (data['WORKSTAT'] >= 1).astype(int)
-    data = _enrich_ga_data(data, persons)
+    # Person-day grain -> home-zone accessibility (HOME_SA2_2021).
+    data = _enrich_ga_data(data, persons, zone_col='HOME_SA2_2021')
     targets    = [t for t in ['start_of_day', 'end_of_day', 'B'] if t in data.columns]
+    targets = _shard_filter(targets, 2, key_fn=lambda t: {
+        'start_of_day': 'start', 'end_of_day': 'end', 'B': 'budget'}.get(t, t))
     est        = ga_estimator()
     use_sim_anneal = est in ('metacount', 'both', 'hybrid', 'sa_bandit')
 
@@ -6086,7 +8395,8 @@ def _run_ga_stage3(tours, persons, ga_kwargs, trips=None, n_restarts=2) -> GARes
         if 'income_midplus' not in data.columns: data['income_midplus'] = (data['incp'] >= 8).astype(int)
     if 'WORKSTAT' in data.columns and 'mandatory_role' not in data.columns:
         data['mandatory_role'] = (data['WORKSTAT'] >= 1).astype(int)
-    data = _enrich_ga_data(data, persons)
+    # Activity grain -> destination-zone accessibility (DESTSA2_2021).
+    data = _enrich_ga_data(data, persons, zone_col='DESTSA2_2021')
     purp_col = next(
         (c for c in ['main_purpose', '_purpose_coded', 'purpose'] if c in data.columns),
         None
@@ -6112,6 +8422,7 @@ def _run_ga_stage3(tours, persons, ga_kwargs, trips=None, n_restarts=2) -> GARes
         _data_by_seg['nonmand'] = _nm_rows
 
     purposes = list(_data_by_seg.keys())
+    purposes = _shard_filter(purposes, 3)
     est      = ga_estimator()
     use_sim_anneal = est in ('metacount', 'both', 'hybrid', 'sa_bandit')
     dur_col  = next((c for c in ['duration_min', 'duration', 'B'] if c in data.columns), None)
@@ -6232,15 +8543,15 @@ def _run_ga_stage3(tours, persons, ga_kwargs, trips=None, n_restarts=2) -> GARes
 
 def _run_ga_stage23_joint(tours, persons, ga_kwargs, trips=None, n_restarts=2) -> GAResult:
     """
-    Joint Stage 2+3 SA-Bandit search with a shared feature pool.
+    Joint Stage 2+3 MH-Bandit search with a shared feature pool.
 
-    Instead of running separate SA-Bandit searches for Stage 2 (3 targets) and
-    Stage 3 (3 purpose segments), this runs a **single** SA-Bandit search over
+    Instead of running separate MH-Bandit searches for Stage 2 (3 targets) and
+    Stage 3 (3 purpose segments), this runs a **single** MH-Bandit search over
     a unified candidate feature pool.  The fitness oracle
     `stage23_fitness_joint` evaluates each chromosome against both sub-models
     simultaneously using fast OLS-BIC proxies (~1 ms per eval).
 
-    After the SA-Bandit converges, `fit_joint_stage23` is called **once** with
+    After the MH-Bandit converges, `fit_joint_stage23` is called **once** with
     the winning feature set to produce the final JAX-optimised joint model
     (budget-constrained lognormal/Weibull).  This replaces the combined ~754 min
     (634+120) that separate MetaCount runs would require.
@@ -6274,7 +8585,7 @@ def _run_ga_stage23_joint(tours, persons, ga_kwargs, trips=None, n_restarts=2) -
             person_day['income_lo'] = (person_day['incp'] <= 4).astype(int)
         if 'income_midplus' not in person_day.columns:
             person_day['income_midplus'] = (person_day['incp'] >= 8).astype(int)
-    person_day = _enrich_ga_data(person_day, persons)
+    person_day = _enrich_ga_data(person_day, persons, zone_col='HOME_SA2_2021')
 
     # ── Stage 3 data ─────────────────────────────────────────────────────────
     tours3 = prepare_duration_data(tours, persons, trips=trips)
@@ -6292,7 +8603,7 @@ def _run_ga_stage23_joint(tours, persons, ga_kwargs, trips=None, n_restarts=2) -
             tours3['income_lo'] = (tours3['incp'] <= 4).astype(int)
         if 'income_midplus' not in tours3.columns:
             tours3['income_midplus'] = (tours3['incp'] >= 8).astype(int)
-    tours3 = _enrich_ga_data(tours3, persons)
+    tours3 = _enrich_ga_data(tours3, persons, zone_col='DESTSA2_2021')
 
     purp_col = next(
         (c for c in ['main_purpose', '_purpose_coded', 'purpose'] if c in tours3.columns),
@@ -6343,7 +8654,7 @@ def _run_ga_stage23_joint(tours, persons, ga_kwargs, trips=None, n_restarts=2) -
     use_sim_anneal = est in ('metacount', 'both', 'hybrid', 'sa_bandit')
     fitness_metric = 'mean(-BIC/n) [joint OLS-BIC Stage2+3]'
 
-    # ── Single-segment SA-Bandit search ──────────────────────────────────────
+    # ── Single-segment MH-Bandit search ──────────────────────────────────────
     label = 'Stage2+3   Joint (budget-constrained)'
     payload = {
         'label':               label,
@@ -6359,7 +8670,7 @@ def _run_ga_stage23_joint(tours, persons, ga_kwargs, trips=None, n_restarts=2) -
         'require_one_groups':  STAGE_REQUIRE_ONE_GROUPS.get(2, []),
         'fallback_to_default': False,
         'feature_map_key':     'joint',
-        # Fast OLS-BIC proxy: <2 ms per eval, so SA-Bandit can run 3000+ evals.
+        # Fast OLS-BIC proxy: <2 ms per eval, so MH-Bandit can run 3000+ evals.
         # fit_joint_stage23 (JAX) is called ONCE on the winning feature set below.
         'default_fit': ('ga_external_estimators', 'stage23_fitness_joint',
                         (active_purposes, 5.0)),
@@ -6373,7 +8684,7 @@ def _run_ga_stage23_joint(tours, persons, ga_kwargs, trips=None, n_restarts=2) -
     seg_result = result[0]['seg_result']
     best_feats = result[0]['feats']
 
-    print(f"\n  [Stage 2+3 Joint] SA-Bandit converged → {len(best_feats)} features: {best_feats}")
+    print(f"\n  [Stage 2+3 Joint] MH-Bandit converged → {len(best_feats)} features: {best_feats}")
 
     # ── Final joint estimation with winning feature set ───────────────────────
     print("  [Stage 2+3 Joint] Running final JAX joint estimation...")
@@ -6424,8 +8735,16 @@ def _run_ga_stage4(trips, tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
         data['is_female'] = (data['sexp'] == 2).astype(int)
     if 'WORKSTAT' in data.columns and 'mandatory_role' not in data.columns:
         data['mandatory_role'] = (data['WORKSTAT'] >= 1).astype(int)
-    data = _enrich_ga_data(data, persons)
-    purposes   = [p for p in PURPOSES if len(data[data['purpose'] == p]) >= 30]
+    # Trip grain -> home-zone accessibility (ActivitySim timing convention:
+    # schedule placement conditions on home accessibility; HOME_SA2_2021
+    # arrives via the persons merge inside _enrich_ga_data).
+    data = _enrich_ga_data(data, persons, zone_col='HOME_SA2_2021')
+    purposes = [p for p in ('work', 'edu')
+                if len(data[data['purpose'] == p]) >= 30]
+    _nonmand_n = int(data['purpose'].isin(_S4_NONMAND_PURPOSES).sum())
+    if _nonmand_n >= 30:
+        purposes.append('nonmand')
+    purposes = _shard_filter(purposes, 4)
     est            = ga_estimator()
     use_sim_anneal = (os.environ.get('GA_STAGE4_USE_SA', '1').strip() == '1'
                       or est in ('searchlibrium', 'both', 'hybrid', 'sa_bandit'))
@@ -6491,7 +8810,11 @@ def _run_ga_stage4(trips, tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
             'feature_map_key':    purpose,
             'default_fit':        ('ga_hypothesis_testing', '_stage4_fitness_aggregate', ([purpose],)),
             'mc_fit': (
-                ('ga_external_estimators', 'stage4_fitness_searchlibrium', ([purpose],), {'n_alts': n_alts})
+                ('ga_external_estimators',
+                 'stage4_fitness_searchlibrium_mixed'
+                 if os.environ.get('GA_STAGE4_MXL_SEARCH', '0').strip() == '1'
+                 else 'stage4_fitness_searchlibrium',
+                 ([purpose],), {'n_alts': n_alts})
                 if sl_state['enabled'] else None
             ),
             'mc_fail_msg':     "    ! Stage4 SearchLibrium repeatedly failing; disabling SearchLibrium for remaining evaluations",
@@ -6533,6 +8856,46 @@ def _run_ga_stage4(trips, tours, persons, ga_kwargs, n_restarts=2) -> GAResult:
     )
 
 
+def _s5_sidecar_path():
+    """Path of the Stage-5 mode/dest split-progress sidecar (per shard dir)."""
+    _d = os.environ.get('GA_CHECKPOINT_DIR', None)
+    return os.path.join(_d, 'ga_stage5_sidesearch.pkl') if _d else None
+
+
+def _s5_sidecar_load() -> dict:
+    """Load split-progress {seg: {'mode': {...}, 'dest': {...}}} ({} if none)."""
+    _p = _s5_sidecar_path()
+    if _p and os.path.exists(_p):
+        try:
+            import pickle
+            with open(_p, 'rb') as _f:
+                _c = pickle.load(_f)
+            return dict(_c) if isinstance(_c, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _s5_sidecar_save(seg: str, side: str, entry: dict) -> None:
+    """Persist one side's best for the complementary split job to reuse."""
+    _p = _s5_sidecar_path()
+    if not _p:
+        return
+    try:
+        import pickle
+        _c = _s5_sidecar_load()
+        _s = dict(_c.get(seg, {}))
+        _s[side] = entry
+        _c[seg] = _s
+        os.makedirs(os.path.dirname(_p) or '.', exist_ok=True)
+        _tmp = _p + '.tmp'
+        with open(_tmp, 'wb') as _f:
+            pickle.dump(_c, _f)
+        os.replace(_tmp, _p)
+    except Exception as _e:
+        logger.warning(f"Stage 5 [{seg}] sidecar save failed ({_e})")
+
+
 def _ga_stage5_segment_worker(payload: dict) -> dict:
     """
     Run mode GA then dest GA for one Stage 5 segment (work/edu/nonmand) in an
@@ -6546,7 +8909,9 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
     import openmatrix as omx
     from stage5_destination_choice import (
         _mode_tree, _build_mode_model, _estimate, _logsums,
-        _attach_size_term, _attach_acdc_terms,
+        _estimate_mixed_logit, _attach_size_term, _attach_acdc_terms,
+        _dest_tree, _build_dest_model, estimate_dest_starter,
+        apply_dest_warm_start, dest_starter_terms,
     )
 
     seg            = payload['seg']
@@ -6560,6 +8925,34 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
     seg_dest_cands = payload['seg_dest_cands']
     ga_kwargs      = payload['ga_kwargs']
     n_restarts     = payload['n_restarts']
+
+    # ── Mode/dest split across PBS jobs ──────────────────────────────────
+    # GA_STAGE5_RUN_MODE=0  → skip the mode GA (dest-only job); mode best is
+    #   taken from the sidecar (written by a mode job) or the evaluated
+    #   all-features baseline as last resort.
+    # GA_STAGE5_RUN_DEST=0  → skip the dest GA (mode-only job).
+    # A segment counts as complete only when BOTH sides ran clean in jobs;
+    # otherwise progress persists via sidecar + best_*.npz salvage and the
+    # complementary job finishes it. Defaults keep the all-in-one behaviour.
+    _run_mode = os.environ.get('GA_STAGE5_RUN_MODE', '1').strip() != '0'
+    _run_dest = os.environ.get('GA_STAGE5_RUN_DEST', '1').strip() != '0'
+    if not _run_mode and not _run_dest:
+        raise RuntimeError("Stage 5: GA_STAGE5_RUN_MODE=0 and "
+                           "GA_STAGE5_RUN_DEST=0 — nothing to run")
+    try:
+        _s5_stag = int(os.environ.get('GA_STAGE5_STAG', '').strip() or 0) or None
+    except (ValueError, TypeError, AttributeError):
+        _s5_stag = None
+    _side_prog = _s5_sidecar_load().get(seg, {})
+    mode_searcher = None
+    dest_searcher = None
+    print(f"  [Stage 5   {seg_label}] split plan: "
+          f"mode={'RUN' if _run_mode else 'reuse'} "
+          f"dest={'RUN' if _run_dest else 'reuse'}")
+
+    # Make this worker walltime-aware so a near-limit PBS kill stops the current
+    # generation gracefully instead of losing the segment with no checkpoint.
+    _init_walltime_guard()
 
     skims_path = payload.get('skims_path')
     if skims_path:
@@ -6577,15 +8970,92 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
         # ── Mode search (chromosome = mode candidates only)
         # Warm-start: evaluate full-feature baseline first, then SA/GA perturbs
         # downward from that optimum.  SA is active when GA_USE_SA=1 (--sa-cases).
+        _mode_dist_features = []
+        _mode_dist_options = {}
+        try:
+            if (os.environ.get('GA_AGDS_MXL_SEARCH', '0').strip() == '1'
+                    and _resolve_search_engine('stage5_mode', False, True) is SparseEAAGDS):
+                from ga_constraints import (stage5_mxl_distribution_features,
+                                            stage5_mxl_distribution_options)
+                _mode_dist_features = stage5_mxl_distribution_features()
+                _mode_dist_options = stage5_mxl_distribution_options()
+        except Exception:
+            pass
+
+        def _decode_mode_genes(genes):
+            genes = np.asarray(genes, dtype=int)
+            base = genes[:len(seg_mode_cands)]
+            policy = {}
+            for index, name in enumerate(_mode_dist_features):
+                pos = len(seg_mode_cands) + 2 * index
+                if pos + 1 >= len(genes):
+                    continue
+                choice = {0: 'fixed', 1: 'normal', 2: 'neglognormal'}.get(
+                    int(genes[pos]) + 2 * int(genes[pos + 1]), 'fixed')
+                if choice in _mode_dist_options.get(name, ()) and choice != 'fixed':
+                    policy[name] = choice
+            return base, policy
+
         def _mode_fit(genes):
+            base_genes, distribution_policy = _decode_mode_genes(genes)
             return _stage5_mode_only_fitness(
-                genes, seg_mode_cands, seg, tours, persons, landuse, skims)
+                base_genes, seg_mode_cands, seg, tours, persons, landuse, skims,
+                distribution_policy=distribution_policy)
 
         _bl_mode_genes   = np.ones(len(seg_mode_cands), dtype=int)
         _bl_mode_fitness = _mode_fit(_bl_mode_genes)
-        print(f"    Mode baseline (all features): BIC/n={-_bl_mode_fitness:.4f}")
+        if np.isfinite(_bl_mode_fitness) and _bl_mode_fitness <= -1e8:
+            # -1e9 is the FAILURE sentinel (see _stage5_mode_only_fitness), not
+            # a BIC.  Printing it through `-fitness` produced the misleading
+            # "BIC/n=1000000000.0000" (jobs 25929034/25929038).  Say so plainly.
+            print(f"    Mode baseline (all features): FAILED "
+                  f"(sentinel={_bl_mode_fitness:.3g})", flush=True)
+        else:
+            print(f"    Mode baseline (all features): BIC/n={-_bl_mode_fitness:.4f}")
 
-        _mode_fixed = [f for f in ['CRASH'] if f in seg_mode_cands]
+        # ── Validated warm start: the all-ON baseline can fail outright
+        # (collinear full spec → singular Hessian → every eval returns the
+        # -1e9 failure sentinel, and the search then burns its whole walltime
+        # budget on poisoned seeds). If it failed, fall back to a minimal
+        # fixed-features-only spec; if THAT fails too, fail fast here with
+        # the real cause instead of launching a doomed multi-hour search.
+        # CRASH is fixed only when the skim carries real crash variation
+        # (transfer fixtures without a crash skim get a constant-zero term
+        # that unidentifies the baseline and trips this abort).
+        _mode_fixed = [f for f in ['CRASH']
+                       if f in seg_mode_cands and _crash_force_include(skim_df)]
+        if _bl_mode_fitness <= -1e8:
+            logger.warning(
+                f"[{seg}] mode all-features baseline FAILED "
+                f"(fitness={_bl_mode_fitness:.3g}) — trying minimal "
+                f"fixed-features-only spec {sorted(_mode_fixed)} ...")
+            print(f"    Mode baseline FAILED — retrying with minimal spec "
+                  f"{sorted(_mode_fixed)} ...")
+            _min_genes = np.array(
+                [1 if v in set(_mode_fixed) else 0 for v in seg_mode_cands],
+                dtype=int)
+            _min_fitness = _mode_fit(_min_genes)
+            if np.isfinite(_min_fitness) and _min_fitness > -1e8:
+                print(f"    Mode minimal-spec baseline: "
+                      f"BIC/n={-_min_fitness:.4f}")
+            else:
+                print(f"    Mode minimal-spec baseline: FAILED "
+                      f"(sentinel={_min_fitness:.3g})", flush=True)
+            if _min_fitness > -1e8:
+                logger.warning(
+                    f"[{seg}] using minimal-spec baseline as warm start "
+                    f"(BIC/n={-_min_fitness:.4f}); full-spec baseline unusable.")
+                _bl_mode_genes, _bl_mode_fitness = _min_genes, _min_fitness
+            else:
+                raise RuntimeError(
+                    f"Stage 5 [{seg}] mode warm-start FAILED: both the "
+                    f"all-features baseline and the minimal "
+                    f"{sorted(_mode_fixed)}-only spec returned failure "
+                    f"fitness ({_bl_mode_fitness:.3g} / {_min_fitness:.3g}). "
+                    f"Aborting this segment now instead of burning walltime "
+                    f"on -1e9 evaluations — check the mode data/skims for "
+                    f"this segment (constant/missing utility columns).")
+
         _ga_kwargs_mode = dict(ga_kwargs)
         if len(seg_mode_cands) > len(_mode_fixed):
             _user_min_mode = int(_ga_kwargs_mode.get('min_features', 3))
@@ -6595,45 +9065,176 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
             )
         else:
             _ga_kwargs_mode['min_features'] = len(seg_mode_cands)
-        mode_searcher = _make_searcher(
-            len(seg_mode_cands), _mode_fit, _ga_kwargs_mode,
-            use_sim_anneal   = False,
-            use_bandit       = True,
-            feature_names       = seg_mode_cands,
-            collinear_groups    = STAGE_COLLINEAR_GROUPS.get('5_mode', []),
-            require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get('5_mode', []),
-            fixed_features   = _mode_fixed,
-            fitness_metric   = 'mean(-BIC/n) [Larch NL]',
-            stage_id         = 'stage5_mode',
-        )
-        _bl_mode_key = tuple(int(x) for x in _bl_mode_genes.tolist())
-        mode_searcher._cache[_bl_mode_key] = _bl_mode_fitness
-        _bl_mode_seed = Individual(genes=_bl_mode_genes, fitness=_bl_mode_fitness)
-        mode_best, mode_hist, mode_pop = mode_searcher.run_with_restarts(
-            n_restarts=n_restarts, seed_individuals=[_bl_mode_seed])
-        best_mode_vars = [v for v, g in zip(seg_mode_cands, mode_best.genes) if g == 1]
-        print(f"    Mode best vars: {best_mode_vars}  BIC/n={-mode_best.fitness:.4f}")
+        if _s5_stag:
+            _ga_kwargs_mode['stagnation_limit'] = _s5_stag
+        if _run_mode:
+            mode_searcher = _make_searcher(
+                len(seg_mode_cands), _mode_fit, _ga_kwargs_mode,
+                use_sim_anneal   = False,
+                use_bandit       = True,
+                feature_names       = seg_mode_cands,
+                collinear_groups    = STAGE_COLLINEAR_GROUPS.get('5_mode', []),
+                require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get('5_mode', []),
+                fixed_features   = _mode_fixed,
+                fitness_metric   = 'mean(-BIC/n) [Larch NL]',
+                stage_id         = 'stage5_mode',
+                progress_label   = f"Stage5 {seg_label} Mode",
+            )
+            _bl_mode_full = (mode_searcher.encode_distribution_genes(_bl_mode_genes, {})
+                     if hasattr(mode_searcher, 'encode_distribution_genes')
+                     else _bl_mode_genes)
+            mode_searcher._cache[Individual(genes=_bl_mode_full).key()] = _bl_mode_fitness
+            _bl_mode_seed = Individual(genes=_bl_mode_full, fitness=_bl_mode_fitness)
+            _mode_seeds = [_bl_mode_seed]
+            _sc_m = (_side_prog.get('mode') or {})
+            try:
+                _sc_mg = np.asarray(_sc_m.get('genes'), dtype=int).ravel()
+                if _sc_mg.size == len(seg_mode_cands):
+                    _sc_mf = float(_sc_m.get('fitness', -np.inf))
+                    if np.isfinite(_sc_mf) and _sc_mf > -1e8:
+                        _mode_seeds.append(Individual(genes=_sc_mg, fitness=_sc_mf))
+                        print(f"    Mode search seeded with sidecar best "
+                              f"(BIC/n={-_sc_mf:.4f})")
+            except Exception:
+                pass
+            mode_best, mode_hist, mode_pop = mode_searcher.run_with_restarts(
+                n_restarts=n_restarts, seed_individuals=_mode_seeds)
+            best_mode_vars = [v for v, g in zip(seg_mode_cands, mode_best.genes) if g == 1]
+            best_mode_distribution = _decode_mode_genes(mode_best.genes)[1]
+            print(f"    Mode best vars: {best_mode_vars}  BIC/n={-mode_best.fitness:.4f}")
+            try:
+                _s5_sidecar_save(seg, 'mode', {
+                    'vars': list(best_mode_vars),
+                    'genes': np.asarray(mode_best.genes, dtype=int).tolist(),
+                    'fitness': float(mode_best.fitness),
+                    'policy': dict(best_mode_distribution or {}),
+                })
+            except Exception:
+                pass
+        else:
+            # Dest-only job: reuse the mode best from a mode job's sidecar;
+            # fall back to the evaluated all-features baseline (already proven
+            # finite above) so the dest search anchors to a real mode spec.
+            _sc_m = (_side_prog.get('mode') or {})
+            _adopted = False
+            try:
+                _sc_mg = np.asarray(_sc_m.get('genes'), dtype=int).ravel()
+                _sc_mf = float(_sc_m.get('fitness', -np.inf))
+                if (_sc_mg.size == len(seg_mode_cands) and np.isfinite(_sc_mf)
+                        and _sc_mf > -1e8):
+                    _sc_mv = [v for v, g in zip(seg_mode_cands, _sc_mg) if g == 1]
+                    print(f"    Mode search SKIPPED — reusing sidecar best "
+                          f"{_sc_mv}  BIC/n={-_sc_mf:.4f}")
+                    best_mode_vars = _sc_mv
+                    best_mode_distribution = dict(_sc_m.get('policy') or {})
+                    mode_best = Individual(genes=_sc_mg, fitness=_sc_mf)
+                    _adopted = True
+            except Exception:
+                _adopted = False
+            if not _adopted:
+                print(f"    Mode search SKIPPED — no sidecar best, using "
+                      f"evaluated baseline (BIC/n={-_bl_mode_fitness:.4f})")
+                best_mode_vars = [v for v, g in zip(seg_mode_cands, _bl_mode_genes) if g == 1]
+                best_mode_distribution = {}
+                mode_best = Individual(genes=np.asarray(_bl_mode_genes, dtype=int),
+                                       fitness=_bl_mode_fitness)
+            mode_hist, mode_pop = [], [mode_best]
 
         mode_seg_result = GAResult(
             stage=5, best_features={'mode': best_mode_vars, 'dest': []},
             best_fitness=mode_best.fitness, best_individual=mode_best,
             history=mode_hist, all_candidates=mode_pop,
             feature_names=seg_mode_cands, fitness_metric='mean(-BIC/n)',
-            n_restarts=n_restarts, cache_hits=mode_searcher.cache_hits,
+            n_restarts=n_restarts,
+            cache_hits=(mode_searcher.cache_hits if mode_searcher is not None else 0),
         )
         mode_seg_result.metadata['sub_model'] = 'mode'
+        mode_seg_result.metadata['distribution_policy'] = (
+            _decode_mode_genes(mode_best.genes)[1] if _run_mode
+            else dict(best_mode_distribution or {}))
+        if not _run_mode:
+            mode_seg_result.metadata['skipped_search'] = True
+
+        if not _run_dest:
+            # Mode-only job: skip logsum precompute, GSE arm and dest search
+            # entirely. The dest placeholder carries a prior dest job's sidecar
+            # best when present (so re-runs keep improving); otherwise a
+            # poisoned -1e9 genome that salvage/merge auto-exclude. The segment
+            # stays incomplete so a dest-only job finishes it.
+            print(f"\n  [Stage 5   {seg_label}] Dest search SKIPPED (mode-only job)")
+            _sc_d = (_side_prog.get('dest') or {})
+            _dvars = []
+            _dgenes = np.zeros(len(seg_dest_cands), dtype=int)
+            _dfit = -1e9
+            try:
+                _sc_dg = np.asarray(_sc_d.get('genes'), dtype=int).ravel()
+                _sc_df = float(_sc_d.get('fitness', -np.inf))
+                if (_sc_dg.size == len(seg_dest_cands) and np.isfinite(_sc_df)
+                        and _sc_df > -1e8):
+                    _dvars = [v for v, g in zip(seg_dest_cands, _sc_dg) if g == 1]
+                    _dgenes, _dfit = _sc_dg, _sc_df
+                    print(f"    Dest placeholder carries sidecar best "
+                          f"BIC/n={-_dfit:.4f}")
+            except Exception:
+                pass
+            dest_best = Individual(genes=_dgenes, fitness=_dfit)
+            dest_seg_result = GAResult(
+                stage=5, best_features={'mode': best_mode_vars, 'dest': _dvars},
+                best_fitness=_dfit, best_individual=dest_best,
+                history=[], all_candidates=[dest_best],
+                feature_names=seg_dest_cands, fitness_metric='mean(-BIC/n)',
+                n_restarts=0, cache_hits=0,
+            )
+            dest_seg_result.metadata['sub_model'] = 'dest'
+            dest_seg_result.metadata['skipped_search'] = True
+            return {
+                'seg': seg,
+                'seg_label': seg_label,
+                'mode_seg_result': mode_seg_result,
+                'dest_seg_result': dest_seg_result,
+                'best_mode_vars': best_mode_vars,
+                'mode_distribution_policy': best_mode_distribution,
+                'best_dest_vars': _dvars,
+                'mode_genes': mode_best.genes.copy(),
+                'elapsed': time.time() - _seg_t0,
+                'walltime_hit': bool(
+                    getattr(mode_searcher, '_walltime_hit', False)
+                    or _GA_WALLTIME_HIT),
+                'completed': False,
+            }
 
         # ── Pre-compute mode logsums with best mode vars
         ls_cached    = None
         lu_st_cached = None
         seg_acdc     = None
         logsums_ok   = False
+        logsum_method = 'nested_logit'
         try:
             dt_m          = _mode_tree(seg_tours, persons, landuse, skims)
             mode_mdl_best = _build_mode_model(dt_m, seg, custom_mode_vars=best_mode_vars,
                                               avail_vars_hint=list(seg_tours.columns))
             mode_mdl_best = _estimate(mode_mdl_best)
-            ls_cached     = _logsums(mode_mdl_best, dt_m, skims=skims, verbose=False)
+            logsum_model = mode_mdl_best
+            logsum_coef_override = None
+            logsum_force_numpy = False
+            if best_mode_distribution:
+                _logsum_mxl_result, _logsum_mxl_model = _estimate_mixed_logit(
+                    seg_tours, seg, n_draws=int(os.environ.get('GA_AGDS_MXL_DRAWS', '80')),
+                    seed=42, mode_model=mode_mdl_best,
+                    distribution_policy=best_mode_distribution)
+                if (_logsum_mxl_result is not None and _logsum_mxl_model is not None
+                        and np.isfinite(_logsum_mxl_result.get('ll', np.nan))):
+                    logsum_model = _logsum_mxl_model
+                    logsum_coef_override = _logsum_mxl_result.get('logsum_coef')
+                    logsum_force_numpy = bool(logsum_coef_override)
+                    logsum_method = _logsum_mxl_result.get(
+                        'logsum_method', 'effective_mean_random_coefficient')
+                    print(f"    Destination logsums use selected MXL distributions "
+                          f"via {logsum_method}.")
+            ls_cached     = _logsums(
+                logsum_model, dt_m, skims=skims, verbose=False,
+                coef_override=logsum_coef_override,
+                force_numpy=logsum_force_numpy)
             lu_st_cached  = _attach_size_term(landuse, seg)
             lu_st_cached, seg_acdc = _attach_acdc_terms(
                 lu_st_cached, seg_tours, skim_df, seg)
@@ -6641,21 +9242,242 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
             print(f"    Mode logsums cached for Dest GA.")
         except Exception as e:
             logger.warning(f"Stage 5 [{seg}] could not pre-compute mode logsums: {e}")
+        mode_seg_result.metadata['logsum_method'] = logsum_method
+
+        # ── GSE structural arm (GA_SEARCH_GSE=1): let the SEARCH decide ──
+        # GSE (β=μ+γ·g+σ·η) was previously env-forced on/off globally and never
+        # tested. Refit the winning spec twice (GSE off vs on, env toggled with
+        # save/restore around each fit — worker processes are separate and the
+        # GA_LARCH_ENGINE precedent in _stage5_mode_only_fitness uses the same
+        # pattern), compare BIC/n with identically-counted k, adopt on strict
+        # improvement. A win swaps the logsum source below and is recorded in
+        # metadata. Cost: ≤2 extra fits per segment. Any failure (or an empty
+        # distribution policy — GSE needs mixture params to attach to) keeps
+        # the searched spec silently.
+        if (os.environ.get('GA_SEARCH_GSE', '1').strip() == '1'
+                and best_mode_distribution and logsums_ok):
+            try:
+                from ga_external_estimators import (
+                    _bic_per_obs as _gse_bpo,
+                    _larch_coef_rows as _gse_lcr,
+                    _metacount_significance_penalty as _gse_sp)
+
+                def _gse_refit(_flag):
+                    _prev = os.environ.get('STAGE5_ENABLE_GSE', '')
+                    os.environ['STAGE5_ENABLE_GSE'] = _flag
+                    try:
+                        _dt = _mode_tree(seg_tours, persons, landuse, skims)
+                        _mm = _build_mode_model(
+                            _dt, seg, custom_mode_vars=best_mode_vars,
+                            avail_vars_hint=list(seg_tours.columns))
+                        _mm = _estimate(_mm)
+                        _mx, _mm2 = _estimate_mixed_logit(
+                            seg_tours, seg,
+                            n_draws=int(os.environ.get('GA_AGDS_MXL_DRAWS', '80')),
+                            seed=42, mode_model=_mm,
+                            distribution_policy=best_mode_distribution)
+                        if (_mx is not None
+                                and np.isfinite(_mx.get('ll', np.nan))):
+                            _mm, _ll = _mm2, float(_mx['ll'])
+                            _mxd = _mx
+                        else:
+                            _ll = getattr(_mm, '_cached_ll', None)
+                            _mxd = None
+                        _k = 0
+                        try:
+                            _pf = _mm.pf
+                            for _p in list(_pf.index):
+                                try:
+                                    if np.isfinite(float(_pf.loc[_p, 'value'])):
+                                        _k += 1
+                                except Exception:
+                                    continue
+                        except Exception:
+                            _k = len(best_mode_vars)
+                        _pen = _gse_sp(_gse_lcr(_mm))
+                        return _mm, _mxd, _gse_bpo(float(_ll), _k,
+                                                   len(seg_tours)) - _pen
+                    finally:
+                        if _prev == '':
+                            os.environ.pop('STAGE5_ENABLE_GSE', None)
+                        else:
+                            os.environ['STAGE5_ENABLE_GSE'] = _prev
+
+                _off_mdl, _off_mx, _off_fit = _gse_refit('0')
+                _on_mdl, _on_mx, _on_fit = _gse_refit('1')
+                print(f"    GSE arm: no-GSE BIC/n={-_off_fit:.4f} | "
+                      f"GSE BIC/n={-_on_fit:.4f}")
+                if np.isfinite(_on_fit) and _on_fit > _off_fit:
+                    _g_co = (_on_mx.get('logsum_coef')
+                             if isinstance(_on_mx, dict) else None)
+                    ls_cached = _logsums(
+                        _on_mdl, dt_m, skims=skims, verbose=False,
+                        coef_override=_g_co, force_numpy=bool(_g_co))
+                    logsum_model = _on_mdl
+                    mode_seg_result.metadata['gse_selected'] = True
+                    mode_seg_result.metadata['gse_bic'] = float(-_on_fit)
+                    print(f"    GSE SELECTED for [{seg}] "
+                          f"(BIC/n gain={-(_on_fit - _off_fit):.4f})")
+                else:
+                    mode_seg_result.metadata['gse_selected'] = False
+                    print(f"    GSE not selected for [{seg}] — keeping searched spec")
+            except Exception as _gse_e:
+                logger.warning(f"Stage 5 [{seg}] GSE arm failed ({_gse_e}) — "
+                               f"keeping searched spec")
+                try:
+                    mode_seg_result.metadata['gse_selected'] = False
+                except Exception:
+                    pass
 
         # ── Dest search (chromosome = dest candidates only)
         print(f"\n  [Stage 5   {seg_label}] Dest SA/GA ...")
+        dest_searcher = None
         if logsums_ok:
-            def _dest_fit(genes):
-                return _stage5_dest_only_fitness(
-                    genes, seg_dest_cands, seg, seg_tours, persons, lu_st_cached, skims, ls_cached, seg_acdc)
+            # ── Convergent starter (replaces the old all-features-ON baseline,
+            # which is exactly the spec that never converges: ~73 collinear
+            # terms → singular Hessian → SLSQP stalls at iteration 0).
+            # Fit the minimal backbone ONCE (two_phase), gate on convergence,
+            # then perturb from there with coefficient warm starts.
+            _starter_coefs: dict = {}
+            _starter_genes = np.zeros(len(seg_dest_cands), dtype=int)
+            _starter_ok = False
+            if os.environ.get('STAGE5_DEST_STARTER', '1').strip() == '1':
+                try:
+                    _st_terms = sorted(dest_starter_terms().keys())
+                    _st_samp = _ga_sample_dest_alts(seg_acdc, lu_st_cached, ls_cached)
+                    _st_dt = _dest_tree(seg_acdc, persons, lu_st_cached, skims,
+                                        ls_cached, sampled_alts=_st_samp)
+                    _st_res = estimate_dest_starter(_st_dt, seg)
+                    if _st_res.get('converged'):
+                        _starter_ok = True
+                        _starter_coefs = dict(_st_res.get('coefs', {}))
+                        for _t in _st_terms:
+                            if _t in seg_dest_cands:
+                                _starter_genes[seg_dest_cands.index(_t)] = 1
+                        print(f"    Dest starter: CONVERGED ll={_st_res['ll']:.1f} "
+                              f"terms={_st_terms} (perturbations start here)")
+                    else:
+                        print(f"    Dest starter: FAILED "
+                              f"({'; '.join(_st_res.get('reasons', ['unknown']))}) — "
+                              f"dest GA for [{seg}] will use cold starts")
+                except Exception as _ste:
+                    print(f"    Dest starter: ERROR ({_ste!r}) — cold starts")
+            else:
+                print("    Dest starter: disabled (STAGE5_DEST_STARTER=0) — cold starts")
 
-            # Warm-start: fit full dest model first, SA/GA perturbs from there.
-            _bl_dest_genes   = np.ones(len(seg_dest_cands), dtype=int)
-            _bl_dest_fitness = _dest_fit(_bl_dest_genes)
-            print(f"    Dest baseline (all features): BIC/n={-_bl_dest_fitness:.4f}")
+            def _dest_fit(genes, uec=None):
+                return _stage5_dest_only_fitness(
+                    genes, seg_dest_cands, seg, seg_tours, persons, lu_st_cached, skims, ls_cached, seg_acdc,
+                    warm_start=_starter_coefs or None, custom_uec=uec)
+
+            # Baseline = starter spec (converged point), NOT all-features-ON.
+            # Pass the FULL starter UEC dict — do NOT filter it by the ON genes.
+            # The starter terms (c_crash/c_dist/c_log_dist/c_size_term) are the
+            # always-include backbone and are NOT in seg_dest_cands (and c_crash
+            # is dropped from the per-segment pool by the intersection with the
+            # global pool), so _starter_genes is necessarily EMPTY and filtering
+            # dest_starter_terms() by gene names silently produced an empty spec
+            # whose fitness is the -1e9 empty-genome sentinel. Reproduced on the
+            # 371 work segment (2026-09-15 local probe): starter converged
+            # ll=-9541.126 yet the gene-filtered baseline scored -1e9; passing
+            # dict(dest_starter_terms()) gives BIC/n=2.764, exactly
+            # _bic_per_obs(starter_ll, k=4, n=6909). Job 25328790 aborted here.
+            _bl_dest_genes   = _starter_genes.copy()
+            _bl_starter_uec  = None
+            try:
+                _bl_starter_uec = dict(dest_starter_terms())
+            except Exception as _ue:
+                logger.debug(f"Stage 5 [{seg}] starter-UEC override "
+                             f"unavailable ({_ue!r}) — list-gated baseline")
+                _bl_starter_uec = None
+            _bl_dest_fitness = _dest_fit(_bl_dest_genes, _bl_starter_uec)
+            print(f"    Dest baseline (starter): BIC/n={-_bl_dest_fitness:.4f}")
+            # Same fail-fast rule as mode: a failed starter baseline means every
+            # downstream eval will also fail — abort now with the cause instead
+            # of burning walltime on -1e9 evaluations. EXCEPTION: when the
+            # starter itself converged, its recorded LL is a valid finite
+            # baseline for the same spec/data — use it (starter-LL fallback)
+            # rather than aborting a hours-long segment over a re-eval hiccup.
+            if _bl_dest_fitness <= -1e8:
+                try:
+                    _fb_ll = (float(_st_res.get('ll', float('nan')))
+                              if _starter_ok else float('nan'))
+                except Exception:
+                    _fb_ll = float('nan')
+                _fb_done = False
+                if np.isfinite(_fb_ll) and _fb_ll > -1e12:
+                    try:
+                        from ga_external_estimators import _bic_per_obs
+                        try:
+                            from stage5_destination_choice import (
+                                quarantine_dest_cases as _qdc)
+                            _fb_n = len(_qdc(seg_acdc,
+                                             label=f"{seg}/baseline-fallback-n"))
+                        except Exception:
+                            _fb_n = len(seg_acdc)
+                        _fb_k = int(_bl_dest_genes.sum()) or len(_bl_starter_uec or {})
+                        _bl_dest_fitness = _bic_per_obs(_fb_ll, _fb_k, _fb_n)
+                        _fb_done = True
+                        logger.warning(
+                            f"Stage 5 [{seg}] dest baseline re-eval failed but the "
+                            f"starter converged (ll={_fb_ll:.1f}) — using "
+                            f"starter-LL fallback fitness BIC/n={-_bl_dest_fitness:.4f} "
+                            f"(k={_fb_k}, n={_fb_n}) instead of aborting the segment.")
+                        print(f"    Dest baseline (starter-LL fallback): "
+                              f"BIC/n={-_bl_dest_fitness:.4f}")
+                    except Exception as _fbe:
+                        logger.debug(f"Stage 5 [{seg}] baseline fallback "
+                                     f"failed ({_fbe!r})")
+            if _bl_dest_fitness <= -1e8:
+                raise RuntimeError(
+                    f"Stage 5 [{seg}] dest warm-start FAILED: the starter-spec "
+                    f"baseline returned failure fitness "
+                    f"({_bl_dest_fitness:.3g}). Aborting this segment now "
+                    f"instead of burning walltime on -1e9 evaluations — check "
+                    f"the dest data/skims/logsums for this segment.")
+
+            # ── Starter-check short-circuit (debug loop in minutes, not hours)
+            # STAGE5_STARTER_CHECK=1 validates mode baseline + dest starter and
+            # returns immediately with the starter genes (no GA search). Both
+            # baselines finite ⇒ the segment is estimable and a full search is
+            # worthwhile; either at -1e9 ⇒ fail fast here with the cause above.
+            if os.environ.get('STAGE5_STARTER_CHECK', '0').strip() == '1':
+                print(f"    [STARTER-CHECK {seg}] mode BIC/n={-_bl_mode_fitness:.4f} | "
+                      f"dest BIC/n={-_bl_dest_fitness:.4f} — baselines finite, "
+                      f"skipping GA search (diagnostic mode)")
+                _sc_dest_best = Individual(genes=_bl_dest_genes.copy(),
+                                           fitness=_bl_dest_fitness)
+                _sc_best_dest_vars = [v for v, g in zip(seg_dest_cands, _sc_dest_best.genes)
+                                      if g == 1]
+                print(f"    Dest best vars: {_sc_best_dest_vars}  "
+                      f"BIC/n={-_sc_dest_best.fitness:.4f}")
+                _sc_dest_seg_result = GAResult(
+                    stage=5, best_features={'mode': best_mode_vars, 'dest': _sc_best_dest_vars},
+                    best_fitness=_sc_dest_best.fitness, best_individual=_sc_dest_best,
+                    history=[], all_candidates=[_sc_dest_best],
+                    feature_names=seg_dest_cands, fitness_metric='mean(-BIC/n)',
+                    n_restarts=n_restarts, cache_hits=0,
+                )
+                _sc_dest_seg_result.metadata['sub_model'] = 'dest'
+                _sc_dest_seg_result.metadata['starter_check'] = True
+                return {
+                    'seg':             seg,
+                    'seg_label':       seg_label,
+                    'mode_seg_result': mode_seg_result,
+                    'dest_seg_result': _sc_dest_seg_result,
+                    'best_mode_vars':  best_mode_vars,
+                    'mode_distribution_policy': best_mode_distribution,
+                    'best_dest_vars':  _sc_best_dest_vars,
+                    'mode_genes':      mode_best.genes.copy(),
+                    'elapsed':         time.time() - _seg_t0,
+                    'walltime_hit':    False,
+                    'completed':       True,
+                }
 
             _dest_fixed = [f for f in ['c_crash'] if f in seg_dest_cands]
             _ga_kwargs_dest = dict(ga_kwargs)
+            _ga_kwargs_dest.pop('distribution_features', None)
+            _ga_kwargs_dest.pop('distribution_options', None)
             if len(seg_dest_cands) > len(_dest_fixed):
                 _user_min_dest = int(_ga_kwargs_dest.get('min_features', 3))
                 _ga_kwargs_dest['min_features'] = min(
@@ -6664,6 +9486,8 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
                 )
             else:
                 _ga_kwargs_dest['min_features'] = len(seg_dest_cands)
+            if _s5_stag:
+                _ga_kwargs_dest['stagnation_limit'] = _s5_stag
             dest_searcher = _make_searcher(
                 len(seg_dest_cands), _dest_fit, _ga_kwargs_dest,
                 use_sim_anneal   = False,
@@ -6674,12 +9498,25 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
                 fixed_features   = _dest_fixed,
                 fitness_metric   = 'mean(-BIC/n) [Larch NL]',
                 stage_id         = 'stage5_dest',
+                progress_label   = f"Stage5 {seg_label} Dest",
             )
-            _bl_dest_key = tuple(int(x) for x in _bl_dest_genes.tolist())
-            dest_searcher._cache[_bl_dest_key] = _bl_dest_fitness
+            dest_searcher._cache[Individual(genes=_bl_dest_genes).key()] = _bl_dest_fitness
             _bl_dest_seed = Individual(genes=_bl_dest_genes, fitness=_bl_dest_fitness)
+            _dest_seeds = [_bl_dest_seed]
+            _sc_d = (_side_prog.get('dest') or {})
+            try:
+                _sc_dg = np.asarray(_sc_d.get('genes'), dtype=int).ravel()
+                _sc_df = float(_sc_d.get('fitness', -np.inf))
+                if (_sc_dg.size == len(seg_dest_cands) and np.isfinite(_sc_df)
+                        and _sc_df > -1e8
+                        and _sc_df > _bl_dest_fitness):
+                    _dest_seeds.append(Individual(genes=_sc_dg, fitness=_sc_df))
+                    print(f"    Dest search seeded with sidecar best "
+                          f"(BIC/n={-_sc_df:.4f})")
+            except Exception:
+                pass
             dest_best, dest_hist, dest_pop = dest_searcher.run_with_restarts(
-                n_restarts=n_restarts, seed_individuals=[_bl_dest_seed])
+                n_restarts=n_restarts, seed_individuals=_dest_seeds)
             dest_cache = dest_searcher.cache_hits
         else:
             # Fallback: joint GA if logsums could not be computed
@@ -6695,6 +9532,19 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
 
         best_dest_vars = [v for v, g in zip(seg_dest_cands, dest_best.genes) if g == 1]
         print(f"    Dest best vars: {best_dest_vars}  BIC/n={-dest_best.fitness:.4f}")
+        try:
+            _s5_sidecar_save(seg, 'dest', {
+                'vars': list(best_dest_vars),
+                'genes': np.asarray(dest_best.genes, dtype=int).tolist(),
+                'fitness': float(dest_best.fitness),
+            })
+        except Exception:
+            pass
+
+        _dest_walltime_hit = bool(
+            dest_searcher is not None
+            and getattr(dest_searcher, '_walltime_hit', False)
+        )
 
         dest_seg_result = GAResult(
             stage=5, best_features={'mode': best_mode_vars, 'dest': best_dest_vars},
@@ -6711,13 +9561,35 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
             'mode_seg_result': mode_seg_result,
             'dest_seg_result': dest_seg_result,
             'best_mode_vars':  best_mode_vars,
+            'mode_distribution_policy': best_mode_distribution,
             'best_dest_vars':  best_dest_vars,
             'mode_genes':      mode_best.genes.copy(),
             'elapsed':         time.time() - _seg_t0,
+            # Walltime guard: if either search stopped early at the limit, the
+            # segment is NOT complete and must be re-run (resumed) rather than
+            # treated as a finished, salvageable gene set. A split job (mode-
+            # or dest-only) is likewise incomplete by construction — the
+            # complementary job finishes it, with progress via sidecar.
+            'walltime_hit':    bool(getattr(mode_searcher, '_walltime_hit', False)
+                                    or _dest_walltime_hit
+                                    or _GA_WALLTIME_HIT),
+            'completed':       bool(_run_mode and _run_dest
+                                    and not (getattr(mode_searcher, '_walltime_hit', False)
+                                             or _dest_walltime_hit
+                                             or _GA_WALLTIME_HIT)),
         }
     finally:
         if _close_skims:
             skims.close()
+
+
+class _Stage5Incomplete(Exception):
+    """Raised when the walltime guard stops Stage 5 with segments unfinished.
+
+    Deliberately caught by the stage wrapper's generic except so it salvages a
+    PARTIAL result and exits 0 (chain proceeds) instead of dying on walltime.
+    """
+    pass
 
 
 def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
@@ -6737,7 +9609,14 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
                  with dominant-mode derivation if None.
     """
     import openmatrix as omx
-    from stage5_destination_choice import _prep_hhts_tours, _skim_flat, _filter_seg
+    from stage5_destination_choice import (
+        _prep_hhts_tours, _skim_flat, _filter_seg, _ensure_person_behavioural_cols)
+    # Enrich persons to the same column set the mode/dest models build on
+    # (_mode_tree/_dest_tree apply _ensure_person_behavioural_cols internally),
+    # so candidate gating + the _filter_dest_candidates_by_signal pool filter
+    # both see the columns genes can actually reference (travel_propensity,
+    # safety_sensitivity, workstat_*, studying_*, occp_*).
+    persons = _ensure_person_behavioural_cols(persons)
 
     print("\n[Stage 5] Preparing HHTS estimation data...")
     # Use the HHTS tours table (has tour_mode) rather than trips (has no tour_mode).
@@ -6804,7 +9683,12 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
     }
 
     segments   = ['work', 'edu', 'nonmand']
-    valid_segs = [s for s in segments if len(_filter_seg(tours, s)) >= 50]
+    # Floor follows STAGE5_MIN_TOURS (default 50 = QLD behavior); small
+    # transfer fixtures (e.g. 33-tour MTC) lower it via env — otherwise no
+    # segment validates and the GA returns the sentinel untouched.
+    _seg_min = int(os.environ.get('STAGE5_MIN_TOURS', '50'))
+    valid_segs = [s for s in segments if len(_filter_seg(tours, s)) >= _seg_min]
+    valid_segs = _shard_filter(valid_segs, 5)
     print(f"  {len(tours)} HHTS tours | mode_cands={len(mode_cands)}  dest_cands={len(dest_cands)} | "
           f"valid segments: {valid_segs}")
 
@@ -6815,11 +9699,21 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
     segment_results = {}
     seg_best_mode_vars = {}
     seg_best_mode_genes = {}
+    seg_best_mode_distribution = {}
     seg_best_dest_vars = {}
 
     # -- Per-segment checkpoint --------------------------------------------
     _ckpt_dir5  = os.environ.get('GA_CHECKPOINT_DIR', None)
     _ckpt_file5 = os.path.join(_ckpt_dir5, 'ga_stage5_segments.pkl') if _ckpt_dir5 else None
+    # Clear any stale PARTIAL marker from a previous (incomplete) run so a
+    # now-complete run isn't mistaken for partial by the resume driver.
+    if _ckpt_dir5:
+        try:
+            _stale = os.path.join(_ckpt_dir5, 'PARTIAL')
+            if os.path.exists(_stale):
+                os.remove(_stale)
+        except Exception:
+            pass
     _completed_segs: dict = {}
     if _ckpt_file5 and os.path.exists(_ckpt_file5):
         try:
@@ -6842,11 +9736,17 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
             seg_best_mode_vars[seg]  = _ck['best_mode_vars']
             seg_best_dest_vars[seg]  = _ck['best_dest_vars']
             seg_best_mode_genes[seg] = _ck['mode_genes']
+            seg_best_mode_distribution[seg] = _ck.get(
+                'mode_distribution_policy', {})
             continue
 
         seg_tours = _filter_seg(tours, seg)
-        seg_mode_cands = _filter_candidates_by_signal(seg_tours, _stage5_mode_candidates_for_segment(seg))
-        seg_dest_cands = _filter_candidates_by_signal(seg_tours, _stage5_dest_candidates_for_segment(seg))
+        seg_mode_cands = _filter_dest_candidates_by_signal(seg_tours, landuse, skim_df,
+                                                           _stage5_mode_candidates_for_segment(seg),
+                                                           persons=persons)
+        seg_dest_cands = _filter_dest_candidates_by_signal(seg_tours, landuse, skim_df,
+                                                           _stage5_dest_candidates_for_segment(seg),
+                                                           persons=persons)
         seg_mode_cands = [c for c in seg_mode_cands if c in mode_cands]
         seg_dest_cands = [c for c in seg_dest_cands if c in dest_cands]
 
@@ -6854,12 +9754,13 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
         # (see safety_baseline/safety_nosafety experiment modes). Force it
         # back in even if _filter_candidates_by_signal dropped it for looking
         # near-constant in this segment's data, so it's never silently
-        # missing from the mode model. It's marked fixed_features below
-        # (see _mode_fixed), which makes it structurally impossible for the
-        # GA/SA/Bandit search - including the directed move - to remove it:
-        # _opt_idx (the only index set any perturbation touches) excludes
-        # every fixed index by construction.
-        if 'CRASH' in mode_cands and 'CRASH' not in seg_mode_cands:
+        # missing from the mode model — UNLESS the skim has no crash signal
+        # at all (transfer fixtures), where forcing spends a fixed gene on a
+        # constant term and aborts the warm start (see _crash_force_include).
+        # When forced it is marked fixed_features below (see _mode_fixed),
+        # which excludes it from every perturbation by construction.
+        if 'CRASH' in mode_cands and 'CRASH' not in seg_mode_cands \
+                and _crash_force_include(skim_df):
             logger.warning(
                 f"[{seg}] CRASH failed the candidate-signal filter (looks "
                 "near-constant in this segment's data) - force-included "
@@ -6907,28 +9808,47 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
             seg_best_mode_vars[seg]  = result['best_mode_vars']
             seg_best_dest_vars[seg]  = result['best_dest_vars']
             seg_best_mode_genes[seg] = result['mode_genes']
+            seg_best_mode_distribution[seg] = result.get(
+                'mode_distribution_policy', {})
             _plog(f"[Stage 5] Done: {seg_label}  "
                   f"mode_BIC/n={-mode_seg_result.best_fitness:.4f} feats={len(result['best_mode_vars'])}  "
                   f"dest_BIC/n={-dest_seg_result.best_fitness:.4f} feats={len(result['best_dest_vars'])}  "
                   f"elapsed={result['elapsed']/60:.1f}min")
 
-            # Save per-segment checkpoint
-            if _ckpt_file5:
+            # Save per-segment checkpoint — but ONLY for segments that actually
+            # finished. If the walltime guard tripped mid-search, the segment is
+            # incomplete: we deliberately do NOT record it as done, so a resume
+            # run (GA_CHECKPOINT_DIR set) will re-run it from the best-so-far
+            # checkpoint instead of treating a truncated search as final.
+            if result.get('completed', True):
+                # Record in memory unconditionally — the completed-count below
+                # must reflect finished searches even when no checkpoint file
+                # is configured (GA_CHECKPOINT_DIR unset); only the FILE
+                # write itself is gated on _ckpt_file5.
                 _completed_segs[seg] = {
                     'mode_seg_result': mode_seg_result,
                     'dest_seg_result': dest_seg_result,
                     'best_mode_vars':  result['best_mode_vars'],
+                    'mode_distribution_policy': result.get(
+                        'mode_distribution_policy', {}),
                     'best_dest_vars':  result['best_dest_vars'],
                     'mode_genes':      result['mode_genes'],
                 }
-                try:
-                    with open(_ckpt_file5, 'wb') as _f:
-                        pickle.dump(_completed_segs, _f)
-                    print(f"    Stage 5 segment checkpoint saved "
-                          f"({len(_completed_segs)}/{len(valid_segs)} segments)")
-                    _plog(f"[Stage 5] checkpoint: {len(_completed_segs)}/{len(valid_segs)} segments done")
-                except Exception as _e:
-                    print(f"    Warning: could not save Stage 5 segment checkpoint: {_e}")
+                if _ckpt_file5:
+                    try:
+                        with open(_ckpt_file5, 'wb') as _f:
+                            pickle.dump(_completed_segs, _f)
+                        print(f"    Stage 5 segment checkpoint saved "
+                              f"({len(_completed_segs)}/{len(valid_segs)} segments)")
+                        _plog(f"[Stage 5] checkpoint: {len(_completed_segs)}/{len(valid_segs)} segments done")
+                    except Exception as _e:
+                        print(f"    Warning: could not save Stage 5 segment checkpoint: {_e}")
+            else:
+                print(f"    ! Stage 5 segment '{seg_label}' did NOT complete "
+                      f"(walltime guard tripped) — left out of checkpoint; a "
+                      "resume run will re-search it. Best-so-far saved to "
+                      f"{_ckpt_dir5 or '.'}/best_*.npz for salvage.")
+                _plog(f"[Stage 5] {seg_label} incomplete (walltime) — not checkpointed")
 
     # ÔöÇÔöÇ Aggregate: majority vote across segments per sub-model 
     def _mode_agg(g):
@@ -6998,8 +9918,53 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
     except Exception:
         agg_fit = -1e9
 
+    # Aggregate-sentinel fallback (job 25328790 aftermath): when the dest search
+    # legitimately returns NO extra terms (the converged starter/backbone spec
+    # cannot be improved on — dest genes stay empty), _stage5_fitness_aggregate
+    # returns the -1e9 empty-dest guard sentinel even though every segment
+    # finished with finite sub-model fitness. A -1e9 stage best_fitness is NOT
+    # just cosmetic: pipeline_logger's prediction path treats <=-1e8 as "invalid
+    # GA result" and DISCARDS the (valid) mode feature overrides too. Report the
+    # honest per-segment dest fitness mean instead.
+    if (not np.isfinite(agg_fit) or agg_fit <= -1e8) and int(consensus_dest.sum()) == 0:
+        _seg_fits = [float(r.best_fitness) for _k, r in segment_results.items()
+                     if str(_k).strip().endswith('Dest')
+                     and np.isfinite(float(r.best_fitness))
+                     and float(r.best_fitness) > -1e8]
+        if _seg_fits:
+            agg_fit = float(np.mean(_seg_fits))
+            print(f"  Note: no dest genes selected (starter spec retained); "
+                  f"aggregate fitness from per-segment dest fits: "
+                  f"BIC/n={-agg_fit:.4f}")
+
     if close_skims:
         skims.close()
+
+    # Walltime-incomplete: if the guard tripped and < all segments finished, the
+    # per-segment checkpoint only has the completed ones. Raise a deliberate
+    # signal so the stage wrapper's salvage path fires: it writes the PARTIAL
+    # marker + a salvageable ga_results.pkl and exits 0, so the chain still
+    # moves on to merge/prediction instead of dying with no checkpoint.
+    if len(_completed_segs) < len(valid_segs):
+        _n_done = len(_completed_segs)
+        _msg = (f"Stage 5 incomplete: {_n_done}/{len(valid_segs)} segments "
+                f"completed (walltime guard tripped). Best-so-far genes for the "
+                f"completed segment(s) are in "
+                f"{_ckpt_dir5 or '.'}/ga_stage5_segments.pkl and best_*.npz — a "
+                "resume run (GA_CHECKPOINT_DIR set) will finish the rest.")
+        print("\n  !! " + _msg)
+        _plog("[Stage 5] " + _msg)
+        if _ckpt_dir5:
+            try:
+                with open(os.path.join(_ckpt_dir5, 'PARTIAL'), 'w') as _fh:
+                    _fh.write(
+                        f"stage=5\nsegments_completed={_n_done}\n"
+                        f"note=walltime-guard-incomplete\n"
+                        f"fitness_metric=salvaged-partial (completed segments only)\n")
+            except Exception:
+                pass
+        # Signal the wrapper to salvage (PARTIAL + exit 0) rather than fail hard.
+        raise _Stage5Incomplete(_msg)
 
     consensus_ind         = Individual(genes=consensus_genes)
     consensus_ind.fitness = agg_fit
@@ -7023,6 +9988,7 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
         cache_hits     = agg_cache,
     )
     combined.metadata['segment_results'] = segment_results
+    combined.metadata['mode_distribution_by_segment'] = seg_best_mode_distribution
     print(f"\n  Stage 5 aggregate: mode={best_mode_feats}  dest={best_dest_feats}")
     return combined
 
@@ -7064,10 +10030,11 @@ def _run_ga_stage5_trip(trips, persons, skims, landuse, ga_kwargs,
         skim_df = pd.DataFrame()
 
     mode_cands = _stage5_mode_candidates(persons)   # gate mobility genes on data
-    dest_cands = _stage5_dest_candidates()
+    from stage5b_trip_destination import GA_CANDIDATE_VARS as _TRIPDEST_CANDS
+    dest_cands = list(_TRIPDEST_CANDS)              # conditional trip-dest pool
     n_mode     = len(mode_cands)
 
-    # valid purposes = those with ÔëÑ50 trip-mode observations in HHTS
+    # valid purposes = those with ≥50 trip-mode observations in HHTS
     try:
         trip_mode_data = prepare_mode_data(trips, persons, landuse)
     except Exception as e:
@@ -7083,6 +10050,12 @@ def _run_ga_stage5_trip(trips, persons, skims, landuse, ga_kwargs,
         valid_purposes = [p for p in TRIP_PURPOSES
                           if len(trips.get('purpose', pd.Series(dtype=str))
                                  [trips.get('purpose', pd.Series(dtype=str)) == p]) >= 30]
+
+    # Micro-job shard: Stage 51 selects one exact trip purpose per shard.
+    _seg_filter = (os.environ.get('GA_SHARD_SEGMENT') or '').strip().lower()
+    if _seg_filter and _seg_filter != 'all':
+        valid_purposes = [p for p in valid_purposes
+                          if str(p).lower() == _seg_filter]
     print(f"  Trip-level GA valid purposes: {valid_purposes}")
 
     _TRIP_PURP_LABELS = {
@@ -7176,7 +10149,7 @@ def _run_ga_stage5_trip(trips, persons, skims, landuse, ga_kwargs,
             feature_names       = dest_cands,
             collinear_groups    = STAGE_COLLINEAR_GROUPS.get('5_dest', []),
             require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get('5_dest', []),
-            fixed_features   = [f for f in ['c_crash'] if f in dest_cands],
+            fixed_features   = [f for f in ['detour_dist_km', 'log_size'] if f in dest_cands],
             **ga_kwargs,
         )
         dest_best, dest_hist, dest_pop = dest_ga.run_with_restarts(n_restarts=n_restarts)
@@ -7433,6 +10406,40 @@ def apply_ga_results_to_pipeline(
     plan         : validated trip chain with mode + destination assigned
     models       : fitted Stage 5 model dict
     """
+    def _stage5_free_vars(model: Any) -> int:
+        """Count free (non-holdfasted) NON-CONSTANT parameters in a Larch model.
+
+        Constants (ASC_, log_correction, c_size_term, Mu_*) are expected to be
+        free in every valid stage-5 model, so a model whose only free terms are
+        intercepts actually has ZERO behaviour variables (a degenerate fit that
+        would produce an empty coefficient table downstream). Returns 0 when the
+        model cannot be introspected or holds no free variables at all.
+        """
+        if model is None:
+            return 0
+        pf = getattr(model, '_final_pf', None)
+        if pf is None:
+            pf = getattr(model, 'pf', None)
+        if pf is None or not hasattr(pf, 'index'):
+            return 0
+        try:
+            holdfast = (pf['holdfast'].fillna(False).astype(bool)
+                        if 'holdfast' in pf.columns
+                        else pd.Series(False, index=pf.index))
+        except Exception:
+            return 0
+        n = 0
+        for pname, is_held in holdfast.items():
+            if bool(is_held):
+                continue
+            nm = str(pname)
+            if nm.startswith('ASC_') or nm.startswith('c_ASC'):
+                continue                      # intercept constants
+            if nm in ('log_correction', 'c_size_term') or nm.startswith('Mu_'):
+                continue                      # structural offsets
+            n += 1
+        return n
+
     def _invalid_stage5_segments(models: Any) -> List[str]:
         expected = ('work', 'edu', 'nonmand')
         bad: List[str] = []
@@ -7443,8 +10450,23 @@ def apply_ga_results_to_pipeline(
             if not isinstance(seg_res, dict):
                 bad.append(seg)
                 continue
-            if seg_res.get('mode_model') is None or seg_res.get('dest_model') is None:
-                bad.append(seg)
+            for mtype in ('mode_model', 'dest_model'):
+                mdl = seg_res.get(mtype)
+                if mdl is None:
+                    bad.append(seg)
+                    break
+                # Flag fits with no free behavioural variable: a mode/dest model
+                # that is only intercepts + structural offsets (all GA-selected
+                # terms holdfasted at 0) is degenerate and would write an empty
+                # coefficient table / broken validation.
+                if _stage5_free_vars(mdl) < 1:
+                    logger.warning(
+                        f"GA Stage 5 segment '{seg}' {mtype} has no free "
+                        f"non-constant variables (degenerate fit) — "
+                        "will retry with baseline spec."
+                    )
+                    bad.append(seg)
+                    break
         return bad
 
     os.makedirs(save_dir, exist_ok=True)
@@ -7645,8 +10667,8 @@ def apply_ga_results_to_pipeline(
     _bad_s5 = _invalid_stage5_segments(s5_models)
     if _bad_s5:
         _msg = (
-            "GA Stage 5 produced incomplete models "
-            f"(missing mode/dest submodels for segments: {_bad_s5})."
+            "GA Stage 5 produced incomplete/degenerate models "
+            f"(missing or zero-free-variable mode/dest submodels for segments: {_bad_s5})."
         )
         logger.warning(_msg)
         _allow_fallback = os.environ.get('GA_STAGE5_FALLBACK_TO_MAIN', '0').strip() != '0'
@@ -7911,7 +10933,8 @@ def _build_trip_like_table(trips: pd.DataFrame,
                      if c in t.columns), None)
     _mode_map = {'DA': 1, 'SR': 2, 'Walk': 3, 'Bike': 4, 'Transit': 5}
     if mode_col and 'tour_mode' not in t.columns:
-        t['tour_mode'] = t[mode_col].map(_mode_map).fillna(2).astype(int)
+        # Unknown labels → DA (1), consistent with the missing-column default.
+        t['tour_mode'] = t[mode_col].map(_mode_map).fillna(1).astype(int)
     elif 'tour_mode' not in t.columns:
         t['tour_mode'] = 1
 
@@ -8488,12 +11511,58 @@ def run_ga_stage(
         verbose           = verbose,
     )
 
+    def _positive_env_int(*names):
+        for name in names:
+            raw = os.environ.get(name, '').strip()
+            if not raw:
+                continue
+            try:
+                value = int(raw)
+            except ValueError:
+                continue
+            if value > 0:
+                return value
+        return None
+
     # Apply stage-specific overrides if provided
     if stage_overrides and stage in stage_overrides:
-        override = stage_overrides[stage]
+        override = dict(stage_overrides[stage])
+        if 'n_restarts' in override:
+            n_restarts = int(override.pop('n_restarts'))
         ga_kwargs.update(override)
         if verbose:
-            print(f"  Stage {stage} overrides applied: {override}")
+            applied = dict(override)
+            applied['n_restarts'] = n_restarts
+            print(f"  Stage {stage} overrides applied: {applied}")
+
+    # Environment controls are the final run-level override. This keeps PBS
+    # knobs such as GA_STAGE4_GENS effective after the default stage merge.
+    # GA_SEED re-seeds the search (fresh restarts escape gen-0 local optima
+    # such as s4work's frozen 1.8906) without touching any other setting.
+    try:
+        _env_seed = int(os.environ.get('GA_SEED', '').strip() or 0) or None
+    except (ValueError, TypeError, AttributeError):
+        _env_seed = None
+    if _env_seed is not None:
+        seed = _env_seed
+    if stage == 2:
+        _stage_gens = _positive_env_int('GA_SA2_GENS', 'GA_STAGE2_GENS')
+        _stage_restarts = _positive_env_int('GA_SA2_RESTARTS', 'GA_STAGE2_RESTARTS')
+    elif stage == 4:
+        _stage_gens = _positive_env_int('GA_STAGE4_GENS')
+        _stage_restarts = _positive_env_int('GA_STAGE4_RESTARTS')
+    elif stage == 5:
+        _stage_gens = _positive_env_int('GA_STAGE5_GENS')
+        _stage_restarts = _positive_env_int('GA_STAGE5_RESTARTS')
+    elif stage == 51:
+        _stage_gens = _positive_env_int('GA_STAGE51_GENS')
+        _stage_restarts = _positive_env_int('GA_STAGE51_RESTARTS')
+    else:
+        _stage_gens = _stage_restarts = None
+    if _stage_gens is not None:
+        ga_kwargs['n_generations'] = _stage_gens
+    if _stage_restarts is not None:
+        n_restarts = _stage_restarts
 
     stage_labels = {
          0: 'CDAP   daily activity pattern',
@@ -8515,7 +11584,7 @@ def run_ga_stage(
     _is_sa        = (os.environ.get('GA_USE_SA', '0') == '1'
                      or _est_env in ('metacount', 'both', 'hybrid'))
     if _is_bandit_sa:
-        _algo_tag = 'SA-Bandit (Thompson sampling + SA acceptance)'
+        _algo_tag = 'MH-Bandit (Thompson sampling + Hastings acceptance)'
     elif _is_bandit:
         _algo_tag = 'Bandit (Thompson sampling)'
     elif _is_sa:
@@ -8623,7 +11692,7 @@ def run_ga_all_stages(
             1: {'pop_size': 20, 'n_generations': 40, 'n_restarts': 2,
                 'mutation_rate': 0.12, 'stagnation_limit': 8,
                 'tournament_k': 3, 'crossover_rate': 0.70},
-            2: {'pop_size': 20, 'n_generations': 40, 'n_restarts': 2,
+            2: {'pop_size': 20, 'n_generations': 120, 'n_restarts': 3,
                 'mutation_rate': 0.12, 'stagnation_limit': 8,
                 'tournament_k': 3, 'crossover_rate': 0.70},
             3: {'pop_size': 20, 'n_generations': 40, 'n_restarts': 2,

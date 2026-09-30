@@ -293,6 +293,70 @@ except ImportError:
     logger.warning("larch not installed - Stage 5 will use distance-only fallback")
 
 
+def _larch_data_array_guard(m, dt, engine=None):
+    """
+    Diagnose Larch's silently-swallowed `_data_arrays = None` state.
+
+    larch/model/jaxmodel.py:218-219 wraps the `dataset.dc.to_arrays(...)`
+    call in a bare `except KeyError` and sets `_data_arrays = None`, with the
+    comment "no defined caseid dimension, JAX only".  Because the `dataset`
+    property only calls `reflow_data_arrays()` when `_dataset is None`, a
+    dataset that is already populated but whose arrays failed to build leaves
+    `_data_arrays` permanently None.  The next likelihood evaluation then dies
+    far away at jaxmodel.py:965 with the misleading
+
+        AttributeError: 'NoneType' object has no attribute 'wt'
+
+    This guard detects that sticky state and re-runs `to_arrays` directly so
+    the *real* KeyError (the actual missing CASEID/ALTID key) is logged with
+    dataset context instead of surfacing as a bogus `.wt` error.
+
+    Returns True when the model can evaluate its own likelihood, False when it
+    is in the broken state.  Never raises: this is diagnostics only, so a
+    failure here must not mask the original problem.
+    """
+    # `_dataset` not yet populated is the normal lazy state, not a failure.
+    if getattr(m, '_dataset', None) is None:
+        return True
+    if getattr(m, '_data_arrays', None) is not None:
+        return True
+    ctx = {}
+    try:
+        dc = m.dataset.dc
+        ctx['n_cases'] = getattr(dc, 'n_cases', None)
+        ctx['n_alts'] = getattr(dc, 'n_alts', None)
+        ctx['CASEID'] = str(getattr(dc, 'CASEID', None))
+        ctx['ALTID'] = str(getattr(dc, 'ALTID', None))
+        ctx['GROUPID'] = str(getattr(dc, 'GROUPID', None))
+        ctx['names'] = list(dc.names)[:20] if hasattr(dc, 'names') else None
+    except Exception as _ce:
+        ctx['inspect_error'] = f'{type(_ce).__name__}: {_ce}'
+    try:
+        import larch as _lx
+        root = getattr(dt, 'root', None)
+        ctx['root_dims'] = {str(k): int(v) for k, v in dict(root.sizes).items()} if root is not None else None
+        ctx['root_vars'] = sorted(str(v) for v in root.data_vars)[:25] if root is not None else None
+    except Exception:
+        pass
+    logger.error(
+        "LARCH DATA-ARRAY STATE BROKEN: _data_arrays is None while _dataset is set "
+        "(engine=%s). larch swallowed a KeyError from dataset.dc.to_arrays().",
+        engine,
+    )
+    for key in sorted(ctx):
+        logger.error("    %s = %s", key, ctx[key])
+    # Reproduce the swallowed exception directly so the true cause is visible.
+    try:
+        m.dataset.dc.to_arrays(m.graph, float_dtype=getattr(m, 'float_dtype', None) or 'float64')
+        logger.error("    to_arrays() succeeded on retry -> transient/ordering state")
+    except KeyError as _ke:
+        logger.error("    ROOT CAUSE KeyError from to_arrays: %r (missing key %r)",
+                     _ke, _ke.args[0] if _ke.args else None)
+    except Exception as _re:
+        logger.error("    to_arrays() raised %s: %s", type(_re).__name__, _re)
+    return False
+
+
 def _lx_model(dt, **kwargs) -> 'lx.Model':
     """
     Create a Larch model — JAX-first, always (large-model policy).
@@ -350,7 +414,9 @@ def _lx_model(dt, **kwargs) -> 'lx.Model':
             logger.info("_lx_model: large model requested numba → forcing jax (LARCH_FORCE_JAX=1)")
             _engine = 'jax'
         try:
-            return lx.Model(dt, compute_engine=_engine, **kwargs)
+            m = lx.Model(dt, compute_engine=_engine, **kwargs)
+            _larch_data_array_guard(m, dt, _engine)
+            return m
         except Exception as _e:
             logger.debug(f"_lx_model: requested engine='{_engine}' failed ({_e}), trying alternatives")
             # Fall through to auto-detect
@@ -366,6 +432,7 @@ def _lx_model(dt, **kwargs) -> 'lx.Model':
             _forced = 'jax'
         try:
             m = lx.Model(dt, compute_engine=_forced, **kwargs)
+            _larch_data_array_guard(m, dt, _forced)
             logger.debug(f"_lx_model: using forced compute_engine='{_forced}' (GA_LARCH_ENGINE)")
             return m
         except Exception as _e:
@@ -377,6 +444,7 @@ def _lx_model(dt, **kwargs) -> 'lx.Model':
     for engine in _engines:
         try:
             m = lx.Model(dt, compute_engine=engine, **kwargs)
+            _larch_data_array_guard(m, dt, engine)
             logger.debug(f"_lx_model: using compute_engine='{engine}'")
             return m
         except Exception as _e:
@@ -5211,6 +5279,41 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     if _drop_from_ca:
         ca_df = ca_df.drop(columns=_drop_from_ca)
         logger.info(f"_dest_tree: dropped {_drop_from_ca} from CA (kept in CO only)")
+    # ── Canonicalise the caseid to str BEFORE building the idca index ─────────
+    # tour_df['ptour_id'] is .astype(str) (see _dest_tree tour_df setup), but
+    # ca_df comes from the importance-sampled AC/DC frame where ptour_id may be
+    # int64/other. Left alone, xarray .merge() unions the two coord sets and
+    # silently doubles the case axis with NaN weights (LL=nan). Canonicalising
+    # both sides to str here makes them agree by construction; the post-merge
+    # alignment check below remains as a second line of defence.
+    try:
+        if 'ptour_id' in ca_df.columns:
+            _pt_dtype_before = str(ca_df['ptour_id'].dtype)
+            _pt_key_before = ca_df['ptour_id'].astype(str)
+            _n_na = int(_pt_key_before.isna().sum())
+            if _n_na:
+                raise ValueError(
+                    f"_dest_tree: ca_df['ptour_id'] has {_n_na} missing value(s) "
+                    f"after str() -- refusing to build the idca index")
+            # Guard against the reverse failure: distinct ids collapsing together
+            # under str() (e.g. 1 -> '1' and '1 ' -> '1') would silently merge cases.
+            _uniq_before = ca_df['ptour_id'].nunique(dropna=False)
+            ca_df['ptour_id'] = _pt_key_before
+            _uniq_after = ca_df['ptour_id'].nunique(dropna=False)
+            if int(_uniq_after) != int(_uniq_before):
+                raise ValueError(
+                    f"_dest_tree: ptour_id str() cast is not injective "
+                    f"({_uniq_before} distinct -> {_uniq_after} distinct); "
+                    f"refusing to proceed (would merge distinct tours)")
+            if _pt_dtype_before != 'object':
+                logger.info(
+                    f"_dest_tree: canonicalised ca_df['ptour_id'] "
+                    f"{_pt_dtype_before} -> str "
+                    f"({_uniq_after:,} unique cases) to match tour_df")
+    except ValueError:
+        raise
+    except Exception as _cn_e:
+        logger.warning(f"_dest_tree: ptour_id canonicalisation failed ({_cn_e!r})")
     ca_df_indexed = ca_df.set_index(['ptour_id', '_altid_']).sort_index()
     # ── dtype coercion: force every numeric CA column to float64 ──────────────
     # The sharrow/numba flow fills a float64 3-D result buffer; float32 columns
@@ -5312,11 +5415,97 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     _co_keep = ['OTAZ', 'DTAZ', 'person_id', 'PERSID', 'weight',
                 'tour_mode', 'tour_purpose', 'segment']
     _co_keep = [c for c in _co_keep if c in tour_co.columns]
+    # CO-side mirror of the CA canonicalisation: tour_df is already indexed by
+    # ptour_id (astype(str) upstream), but from_idco() names the caseid from
+    # df.index.name -- an unnamed index silently becomes the caseid 'index',
+    # which cannot align with d_ca's 'ptour_id'. Pin the name explicitly.
+    try:
+        if 'ptour_id' not in tour_co.columns and tour_co.index.name != 'ptour_id':
+            if tour_co.index.name is None:
+                logger.warning(
+                    "_dest_tree: tour_co index is unnamed; setting it to 'ptour_id' "
+                    "(from_idco would otherwise name the caseid 'index' and the "
+                    "merge with d_ca would silently union the case axes)")
+            tour_co = tour_co.rename_axis('ptour_id')
+        if 'ptour_id' in tour_co.columns:
+            tour_co['ptour_id'] = tour_co['ptour_id'].astype(str)
+            tour_co = tour_co.set_index('ptour_id')
+    except ValueError:
+        raise
+    except Exception as _cn2_e:
+        logger.warning(f"_dest_tree: tour_co caseid canonicalisation failed ({_cn2_e!r})")
     if _co_keep:
         tour_co = tour_co[_co_keep]
     d_co = lx.Dataset.construct.from_idco(tour_co)
     logger.info(f"_dest_tree: d_co built - {len(d_co.data_vars)} vars: "
                 f"{list(d_co.data_vars)}")
+
+    # ── Caseid alignment before merge (dest) ──────────────────────────────────
+    # d_ca is built from the importance-sampled AC/DC frame (ca_df) while d_co
+    # comes from tour_df, whose ptour_id was cast with .astype(str). The two
+    # frames have DIFFERENT provenances, so their ptour_id dtypes can differ
+    # (e.g. ca_df int64 vs tour_df object/str). xarray .merge() unions the
+    # coordinates, which silently DOUBLES the case dimension and leaves the
+    # unmatched half with NaN 'weight' -- the model then evaluates with NaN
+    # weights (LL=nan) and to_arrays() raises inside larch, where a bare
+    # `except KeyError` swallows it into _data_arrays=None and the real error
+    # surfaces as the misleading "'NoneType' object has no attribute 'wt'".
+    #
+    # _mode_tree cannot hit this: it derives case_ids from the SAME tours frame
+    # it builds the CO from (case_ids = list(tours['ptour_id'].values)), so the
+    # dtypes agree by construction. That is why only the dest model failed.
+    #
+    # Align d_co onto exactly d_ca's caseid coordinate before merging so the
+    # merge is a no-op on the case axis. Any case missing tour data is a real
+    # data bug -- raise loudly rather than silently estimating NaN weights.
+    # Set STAGE5_DEST_CASEID_ALIGN=loose to restore the old unchecked merge.
+    try:
+        _cc = str(d_ca.dc.CASEID) if getattr(d_ca, 'dc', None) is not None else 'ptour_id'
+        if _cc in d_ca.coords and _cc in d_co.coords:
+            _ca_ids = d_ca[_cc].values
+            _co_ids = d_co[_cc].values
+            _same_dtype = (_ca_ids.dtype == _co_ids.dtype)
+            if not _same_dtype:
+                # Normalise both to string keys for a value-based comparison.
+                _ca_key = np.asarray([str(v) for v in _ca_ids])
+                _co_key = np.asarray([str(v) for v in _co_ids])
+                if len(np.unique(_ca_key)) != len(_ca_key):
+                    _ca_key = pd.Index(_ca_key)
+                _missing = sorted(set(_ca_key) - set(_co_key))
+                _extra = sorted(set(_co_key) - set(_ca_key))
+                logger.warning(
+                    f"_dest_tree: CASEID DTYPE MISMATCH ca={_ca_ids.dtype} vs "
+                    f"co={_co_ids.dtype} on '{_cc}' "
+                    f"(ca={len(_ca_key)} co={len(_co_key)} "
+                    f"missing_in_co={len(_missing)} extra_in_co={len(_extra)}); "
+                    f"examples missing={_missing[:5]} extra={_extra[:5]}")
+                if _missing and os.environ.get('STAGE5_DEST_CASEID_ALIGN', 'strict') != 'loose':
+                    raise ValueError(
+                        f"_dest_tree: {len(_missing)} case(s) in CA have no tour "
+                        f"(CO) record -- refusing to merge (would silently produce "
+                        f"NaN weights and LL=nan). Examples: {_missing[:10]}. "
+                        f"Set STAGE5_DEST_CASEID_ALIGN=loose to override.")
+                # Align in string space, then restore d_ca's native dtype/values so
+                # the merge is an exact no-op on the case axis. Order matters:
+                # assign_coords relabels positions (safe, same length/order),
+                # reindex aligns by value, and the final assign_coords puts the
+                # coord back to d_ca's own dtype so merge cannot union the axes.
+                _tmp = d_co.assign_coords({_cc: (d_co[_cc].dims, _co_key)})
+                for _junk in ('_index',):
+                    if _junk in _tmp.coords:
+                        _tmp = _tmp.drop_vars(_junk)
+                _tmp = _tmp.reindex({_cc: _ca_key})
+                d_co = _tmp.assign_coords({_cc: _ca_ids})
+            elif len(_ca_ids) != len(_co_ids) or not np.array_equal(
+                    np.sort(_ca_ids.astype(str)), np.sort(_co_ids.astype(str))):
+                logger.warning(
+                    f"_dest_tree: CASEID VALUE MISMATCH on '{_cc}': "
+                    f"ca={len(_ca_ids)} co={len(_co_ids)} (dtypes agree)")
+    except ValueError:
+        raise
+    except Exception as _al_e:
+        logger.warning(f"_dest_tree: caseid alignment check skipped ({_al_e!r})")
+
 
     # Check for overlapping variables before merge
     _ca_vars = set(d_ca.data_vars)
@@ -10368,6 +10557,48 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
             "_estimate phase-1 entry probe failed (%r) - continuing without "
             "gradient diagnostics", _probe_e,
         )
+    # ── Pre-flight: prove the model can actually evaluate its likelihood ────
+    # A Larch model whose data arrays were never built (flat idca without a
+    # usable 'ch', a failed sharrow flow, a dropped choice column) does NOT
+    # raise a useful error from maximize_loglike -- it raises
+    # "'NoneType' object has no attribute 'wt'" from deep inside
+    # jax_loglike, or returns NaN.  The caller then kept the initial values
+    # and reported the model as fitted (6x 'LL=nan' across the stage-51 and
+    # stage5_compare runs).  Verify the likelihood is finite BEFORE optimizing
+    # so the real cause is reported here, with the offending variables named.
+    try:
+        _pre_ll = float(model.loglike())
+    except Exception as _pre_e:
+        _pf_names = []
+        try:
+            _pf_names = [str(p) for p in model.pf.index]
+        except Exception:
+            pass
+        logger.error(
+            "_estimate PRE-FLIGHT: the model cannot evaluate its own "
+            f"likelihood before optimization: {_pre_e!r}\n"
+            f"  engine={getattr(model, 'compute_engine', '?')!r} "
+            f"n_params={len(_pf_names)} datatree={type(getattr(model,'datatree',None)).__name__} "
+            f"dataset={type(getattr(model,'dataset',None)).__name__} "
+            f"_data_arrays={type(getattr(model,'_data_arrays',None)).__name__}\n"
+            f"  params: {_pf_names[:12]}{'...' if len(_pf_names) > 12 else ''}\n"
+            "  Usual causes: (1) the flat idca dataset has no choice/chosen "
+            "variable so Larch cannot build 'ch' (check choice_co_code points "
+            "at a CO column that survived the CA/CO merge in _dest_tree), "
+            "(2) the sharrow flow failed to compile for this shape, "
+            "(3) a utility expression references a column absent from the "
+            "dataset.  Aborting rather than reporting an unestimated model."
+        )
+        raise
+    if not np.isfinite(_pre_ll):
+        logger.error(
+            f"_estimate PRE-FLIGHT: initial log-likelihood is {_pre_ll} "
+            f"(engine={getattr(model, 'compute_engine', '?')!r}). "
+            "Aborting before optimization instead of returning a NaN fit."
+        )
+        raise RuntimeError(
+            f"_estimate: non-finite initial log-likelihood ({_pre_ll})")
+    logger.debug(f"_estimate pre-flight LL={_pre_ll:.4f}")
     try:
         result = model.maximize_loglike(options=est_options, quiet=True)
         #todo : why candidate pool mode=5 and dest = 2
@@ -10420,11 +10651,23 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
             logger.error(
                 f"_estimate phase-1 fallback also failed: {_mll_e2!r}\n"
                 f"  Diagnosis: {'; '.join(_fail_reason)}\n"
-                "  Model will have initial values only - predictions will be weak.\n"
+                "  ABORTING: the model cannot be estimated. Returning it with "
+                "initial values would let an unestimated model be written to "
+                "stage5_models_coefficients.csv and reported as a fit with "
+                "LL=nan. Set STAGE5_ALLOW_UNESTIMATED=1 to restore the old "
+                "degrade-to-priors behaviour deliberately.\n"
                 "  To fix: check that HHTS estimation data has ≥2 modes, no zero-variance\n"
                 "  columns, and that skim values are non-zero for a reasonable fraction of OD pairs."
             )
-            # Don't raise - return model with initial values so pipeline continues
+            if not os.environ.get('STAGE5_ALLOW_UNESTIMATED', '0').strip() == '1':
+                raise
+            # Explicitly opted out of failing loudly: keep the priors, but mark
+            # the model so downstream code can refuse to treat it as a fit.
+            try:
+                model._estimation_failed = True
+                model._estimation_error = repr(_mll_e2)
+            except Exception:
+                pass
             result = type('_FakeResult', (), {'loglike': float('nan')})()
 
     # ── Zero-gradient engine fallback ─────────────────────────────────────

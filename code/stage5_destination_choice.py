@@ -175,6 +175,10 @@ STAGE5_SCHED_DAY_END = float(os.environ.get(
 STAGE5_SCHED_DIST_BOUND_KM = 150.0
 # Module-level flag: print the DISTWALK==DIST banner only once (it fires per segment)
 _DIST_WALK_BANNER_SHOWN = False
+# Per-observation log-likelihood is O(1) for any sane logit/MNL fit. Anything
+# past this many orders of magnitude per obs is a solver blow-up that happened
+# to stay finite, and must not be published as a model-fit result.
+_MAX_PLAUSIBLE_LL_PER_OBS = 1e4
 # Track which segments have already been warned about DIST/DISTWALK correlation
 _DIST_WALK_CORR_WARNED: set = set()
 # Track (c1, c2) collinear-column pairs already warned about at WARNING level.
@@ -25440,6 +25444,34 @@ def _compute_model_fit_stats(models: dict) -> pd.DataFrame:
             bic = float(-2 * ll_final + n_free * np.log(max(n_obs, 1))) if (
                 np.isfinite(ll_final) and np.isfinite(float(n_obs))
             ) else float('nan')
+
+            # Degeneracy gate. A collapsed/blow-up fit can still hand back a
+            # FINITE but nonsensical likelihood, and downstream consumers (the
+            # PLC A/B comparison, the dashboard) treat finite as "valid". Real
+            # per-observation log-likelihoods are O(1), so anything beyond a very
+            # generous multiple of n_obs is a solver blow-up, not a measurement.
+            # Observed: ll_final=-2.99e+35 for n_obs=6909 with n_free_params=-108
+            # and rho2=-0.25, published in runs/plc_work_test_371 as a successful
+            # PLC win. Blank the row instead so it cannot be read as a result.
+            _no = float(n_obs) if np.isfinite(float(n_obs)) else float('nan')
+            _bad = []
+            if np.isfinite(float(ll_final)) and np.isfinite(_no) and _no > 0:
+                if abs(float(ll_final)) > _MAX_PLAUSIBLE_LL_PER_OBS * _no:
+                    _bad.append(f'll_final={ll_final:.3g} vs n_obs={_no:.0f}')
+            if np.isfinite(float(n_free)) and int(n_free) < 0:
+                _bad.append(f'n_free_params={int(n_free)}')
+            if np.isfinite(rho2) and rho2 < 0.0:
+                _bad.append(f'rho2={rho2:.4f}')
+            if _bad:
+                logger.warning(
+                    "DEGENERATE MODEL FIT [%s/%s]: %s -- reporting these fields as "
+                    "NaN so the run cannot be read as a valid result.",
+                    seg, mtype, '; '.join(_bad))
+                ll_final = float('nan')
+                ll_null = float('nan')
+                rho2 = float('nan')
+                aic = float('nan')
+                bic = float('nan')
 
             rows.append({
                 'segment':    seg,

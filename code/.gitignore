@@ -14,6 +14,18 @@
 
 # ── Run outputs (huge, regenerated every job; pruned by the submit script) ───
 runs/
+
+# ── Generated pipeline data and local model-search artifacts ────────────────
+# Keep the synthetic zone input files under version control, but leave all
+# regenerated pipeline outputs and caches on the local filesystem.
+saved_data/*
+!saved_data/zone_ids_sa2/
+!saved_data/zone_ids_sa2/**
+saved_data/osm_cache/
+*.pstats
+best_searcher_*.npz
+*.bak
+
 # *.omx skim matrices are KEPT (tracked via Git LFS — see .gitattributes). The
 # repo-root .gitignore ignores *.omx, so re-include them here.
 !*.omx

@@ -46,6 +46,25 @@ from scipy.stats import norm
 
 from larch_regularization import elasticnet_objective
 
+# Larch 6.0 runtime patches: ridge-aware covariance (p_values from the same
+# penalised objective that was fitted) + logsums(datatree=) shim. Idempotent.
+import larch_patches as _larch_patches
+_larch_patches.apply()
+
+# UTF-8 console guard: CDAP prints box-drawing progress art; on a C-locale
+# (or cp1252) stdout one fancy print raises UnicodeEncodeError and aborts an
+# otherwise-healthy estimation (observed locally on Windows). Same pattern
+# as ga_hypothesis_testing._ensure_utf8_console. No-op on failure.
+try:
+    import sys as _sys
+    for _s in (_sys.stdout, _sys.stderr):
+        try:
+            _s.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+except Exception:
+    pass
+
 logger = logging.getLogger(__name__)
 
 CDAP_LABELS = {0: 'H', 1: 'N', 2: 'M'}
@@ -221,12 +240,22 @@ def _fill_larch_inference(model) -> None:
     if 'std_err_source' not in pf.columns:
         pf['std_err_source'] = 'hessian'
 
+    # Ridge lift used by every fallback below — SAME penalty strength the model
+    # was fitted with (GA_L1_L2_ALPHA), so a flat direction gets a large but
+    # FINITE standard error instead of NaN/inf.
+    try:
+        from larch_regularization import DEFAULT_L1_L2_ALPHA as _ridge_alpha
+    except Exception:
+        _ridge_alpha = 1e-3
+    _ridge_alpha = float(os.environ.get('GA_L1_L2_ALPHA', _ridge_alpha))
+
     # ── Fallback 1: OPG (outer product of casewise gradients) ────────────────
     if needs_fallback:
         try:
             scores = np.asarray(model.d_loglike_casewise(), dtype=float)
             if scores.ndim == 2 and scores.shape[1] > 0:
                 bread = scores.T @ scores
+                bread = bread + _ridge_alpha * np.eye(bread.shape[0])
                 vcov = np.linalg.pinv(bread)
                 se = np.sqrt(np.clip(np.diag(vcov), 0.0, None))
                 pf['std_err_opg'] = pd.Series(se, index=pf.index[:len(se)]).reindex(pf.index).values
@@ -258,7 +287,10 @@ def _fill_larch_inference(model) -> None:
                     model.set_value(nm, v0 - h); lm = float(model.loglike())
                     model.set_value(nm, v0)
                     curv = -(lp - 2.0 * ll0 + lm) / (h * h)   # −d²LL/dθ² = info
-                    if np.isfinite(curv) and curv > 1e-8:
+                    # ridge lift: flat direction → curv≈0 → SE≈1/√α
+                    # (large but FINITE → correctly insignificant, never NaN)
+                    curv = curv + _ridge_alpha
+                    if np.isfinite(curv) and curv > 0:
                         pf.loc[nm, 'std_err'] = float(1.0 / np.sqrt(curv))
                         pf.loc[nm, 'std_err_source'] = 'fd_hessian'
                 except Exception:
@@ -475,22 +507,26 @@ def prepare_cdap_data(persons: pd.DataFrame) -> pd.DataFrame:
 
     df = build_person_profiles(df)
 
-    # Attach home-zone accessibility (incl. crash_acc) so safety enters the
-    # CDAP utility. Non-fatal: _nonconstant_features silently drops the
+    # Attach home-zone accessibility so safety (and every other GA-selected
+    # *_acc measure: asim logsums, power acc, fitted logsums) enters the CDAP
+    # utility. Previously a hardcoded 3-column list, which silently dropped any
+    # other GA-selected accessibility feature at refit even though the search
+    # frame carried it. Non-fatal: _nonconstant_features silently drops the
     # columns when the accessibility CSV hasn't been built yet.
     try:
         _acc_csv = os.path.join('saved_data', 'accessibility.csv')
-        _acc_wanted = ['crash_acc', 'walk_acc', 'transit_acc']
-        if os.path.exists(_acc_csv) and not all(c in df.columns for c in _acc_wanted):
+        if os.path.exists(_acc_csv):
             _acc = pd.read_csv(_acc_csv).set_index('zone_id')
-            _home = pd.to_numeric(
-                df.get('OTAZ', df.get('HOMETAZ')), errors='coerce'
-            ).fillna(-1).astype(int)
-            for c in _acc_wanted:
-                if c in _acc.columns and c not in df.columns:
+            _acc_wanted = [c for c in _acc.columns
+                           if str(c).endswith('_acc') and c not in df.columns]
+            if _acc_wanted:
+                _home = pd.to_numeric(
+                    df.get('OTAZ', df.get('HOMETAZ')), errors='coerce'
+                ).fillna(-1).astype(int)
+                for c in _acc_wanted:
                     df[c] = _home.map(_acc[c]).fillna(float(_acc[c].median()))
-            print(f"  CDAP: attached home-zone accessibility "
-                  f"({[c for c in _acc_wanted if c in df.columns]})")
+                print(f"  CDAP: attached home-zone accessibility "
+                      f"({[c for c in _acc_wanted if c in df.columns]})")
     except Exception as _acc_e:
         logger.warning(f"CDAP accessibility attach skipped: {_acc_e}")
 
@@ -567,7 +603,7 @@ MXL random coefficients (s_*) show taste heterogeneity — significant std dev m
 <div>{pf_html(mxl, "Mixed Logit — Random Coefficients")}</div></div>
 </body></html>"""
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
-    open(path, 'w').write(html)
+    open(path, 'w', encoding='utf-8').write(html)
     print(f"  CDAP HTML → {path}")
 
 
@@ -634,28 +670,61 @@ def estimate_cdap(persons: pd.DataFrame,
     mnl.set_cap(_CDAP_COEF_CAP)
     # Elastic-net (L1+L2) penalty on the objective, mirroring
     # metacountregressor's penalized-likelihood estimation - see
-    # larch_regularization.py. Restored before LL/covariance are read back
-    # so cached results reflect the true unpenalized likelihood.
+    # larch_regularization.py. The covariance is computed INSIDE the context so
+    # the Hessian includes the SAME penalty that was fitted: the ≈α eigenvalue
+    # lift keeps collinear/flat directions invertible → std_err/p_value are
+    # always finite (a genuinely flat direction gets a large-but-finite SE and
+    # correctly shows as insignificant). _cached_ll still stores the pure LL
+    # for reporting.
     with elasticnet_objective(mnl):
-        r = mnl.maximize_loglike(options={'ftol': 1e-8})
+        r = mnl.maximize_loglike(options={'ftol': 1e-8}, quiet=True)
+        try:
+            mnl.calculate_parameter_covariance()
+        except Exception as e:
+            logger.warning(f"MNL covariance failed: {e}")
     mnl._cached_ll = float(r.loglike)
-    try:
-        mnl.calculate_parameter_covariance()
-    except Exception as e:
-        logger.warning(f"MNL covariance failed: {e}")
     _fill_larch_inference(mnl)
     _print_larch_table(mnl, "CDAP MNL")
 
-    # ── MXL (JAX engine, bounded sample) ───────────────────────────────────
+    # ── MXL / heterogeneity reporting (bounded sample) ─────────────────────
     # The full-sample 200-draw JAX MXL OOM-killed the 250GB prediction node
     # (job 23970303: cgroup SIGKILL at ~259GB — uncatchable, so the except
-    # below never fires). The MXL is report-only (predict_cdap uses the MNL),
-    # so estimate it on a bounded sample with fewer draws. CDAP_MXL=0 skips
-    # it entirely; CDAP_MXL_MAX_N / CDAP_MXL_DRAWS tune the bounds.
+    # below never fires). The MXL is report-only (predict_cdap uses the MNL).
+    # CDAP_MXL=0  skips it entirely (MNL only — cheapest, shard default).
+    # CDAP_MXL=mh estimates taste heterogeneity via the JAX-free RWMH driver
+    #   (mh_choice_estimator.estimate_mnl_mh) on a weight-aware subsample:
+    #   minutes + single-digit MBs instead of 10s of GBs. Posterior SDs are
+    #   parameter uncertainty (not Larch s_* random-coefficient SDs) — the
+    #   report is labelled accordingly.
+    # otherwise   JAX MSL mixed logit; CDAP_MXL_MAX_N / CDAP_MXL_DRAWS bound it.
     mxl = None
     mxl_ok = False
-    if os.environ.get('CDAP_MXL', '1') == '0':
+    _mxl_mode = os.environ.get('CDAP_MXL', '1').strip().lower()
+    if _mxl_mode == '0':
         print("\n  CDAP_MXL=0 — skipping Mixed Logit (MNL only)")
+    elif _mxl_mode == 'mh':
+        _mxl_max_n = int(os.environ.get('CDAP_MXL_MAX_N', '5000'))
+        try:
+            if len(data) > _mxl_max_n:
+                _w = pd.to_numeric(data.get('weight', 1.0),
+                                   errors='coerce').fillna(0.0).clip(lower=0.0)
+                if float(_w.sum()) > 0:
+                    mxl_sub = data.sample(n=_mxl_max_n, weights=_w,
+                                          random_state=42)
+                else:
+                    mxl_sub = data.sample(n=_mxl_max_n, random_state=42)
+                print(f"\n  CDAP heterogeneity via MH posterior (RWMH, "
+                      f"weight-aware subsample n={len(mxl_sub)}/{len(data)})...")
+            else:
+                mxl_sub = data
+            _mh_res = _estimate_cdap_mh(mxl_sub, feat_cols, mnl)
+            if _mh_res is None:
+                raise RuntimeError("MH heterogeneity returned no result")
+            mxl = _mh_res['model']
+            mxl_ok = True
+        except Exception as e:
+            logger.warning(f"MH heterogeneity failed: {e} — MNL only")
+            mxl = None
     else:
         _mxl_draws = int(os.environ.get('CDAP_MXL_DRAWS', '100'))
         _mxl_max_n = int(os.environ.get('CDAP_MXL_MAX_N', '5000'))
@@ -700,12 +769,12 @@ def estimate_cdap(persons: pd.DataFrame,
             except (TypeError, AttributeError):
                 pass
             with elasticnet_objective(mxl):
-                r2 = mxl.maximize_loglike(stderr=True, options={'ftol': 1e-8})
+                r2 = mxl.maximize_loglike(stderr=True, options={'ftol': 1e-8}, quiet=True)
+                try:
+                    mxl.calculate_parameter_covariance()
+                except Exception:
+                    pass
             mxl._cached_ll = float(r2.loglike)
-            try:
-                mxl.calculate_parameter_covariance()
-            except Exception:
-                pass
             _fill_larch_inference(mxl)
             _print_larch_table(mxl, "CDAP Mixed Logit")
             mxl_ok = True
@@ -777,7 +846,11 @@ def _estimate_mxl_subsample(sub: pd.DataFrame,
         mnl.utility_co[2] += lx.P(f'b_M_{feat}') * lx.X(f'person.{feat}')
     mnl.set_cap(_CDAP_COEF_CAP)
     with elasticnet_objective(mnl):
-        mnl.maximize_loglike(options={'ftol': 1e-7})
+        mnl.maximize_loglike(options={'ftol': 1e-7}, quiet=True)
+        try:
+            mnl.calculate_parameter_covariance()
+        except Exception:
+            pass
     _fill_larch_inference(mnl)
 
     # add Normal mixtures on the 3 key random variables
@@ -796,12 +869,12 @@ def _estimate_mxl_subsample(sub: pd.DataFrame,
         pass
 
     with elasticnet_objective(mxl):
-        r = mxl.maximize_loglike(stderr=True, options={'ftol': 1e-7})
+        r = mxl.maximize_loglike(stderr=True, options={'ftol': 1e-7}, quiet=True)
+        try:
+            mxl.calculate_parameter_covariance()
+        except Exception:
+            pass
     mxl._cached_ll = float(r.loglike)
-    try:
-        mxl.calculate_parameter_covariance()
-    except Exception:
-        pass
     _fill_larch_inference(mxl)
 
     _print_larch_table(mxl, f"CDAP MXL (subsample n={len(sub)})")
@@ -813,6 +886,111 @@ def _estimate_mxl_subsample(sub: pd.DataFrame,
         'tstat':   {name: float(pf.loc[name, 't_stat'])   for name in pf.index},
         'll':      mxl._cached_ll,
         'n_sub':   len(sub),
+    }
+
+
+def _estimate_cdap_mh(mxl_sub: pd.DataFrame,
+                      feat_cols: list,
+                      mnl=None) -> Optional[dict]:
+    """Heterogeneity reporting via MH posterior (JAX-free, low-memory).
+
+    Runs the fixed-coefficient CDAP MNL through the adaptive RWMH driver
+    (mh_choice_estimator.estimate_mnl_mh) warm-started at the full-sample MNL.
+    Design is built directly in numpy — no Larch DataTree, no JAX/XLA, no
+    Hessian: ~N*3*d floats (single-digit MBs) plus O(N*K*d) per iteration.
+
+    Posterior SDs quantify parameter uncertainty, NOT Larch s_* random-
+    coefficient taste SDs — callers must label the report accordingly
+    (done here via the table title and result metadata).
+
+    Returns a dict with coef/std_err/tstat/ll/n_sub/accept_rate/ess plus a
+    'model' adapter exposing .pf/.rho_sq_null()/._cached_ll so the existing
+    HTML/pickle plumbing works unchanged, or None on failure.
+    """
+    from types import SimpleNamespace
+    from mh_choice_estimator import (
+        estimate_mnl_mh, loglik_mat, pad_choice_data)
+
+    feats = [f for f in (feat_cols or []) if f in mxl_sub.columns]
+    if not feats:
+        return None
+    names = (['ASC_N', 'ASC_M']
+             + [f'b_N_{f}' for f in feats]
+             + [f'b_M_{f}' for f in feats])
+    idx = {n: i for i, n in enumerate(names)}
+    Xf = mxl_sub[feats].apply(
+        pd.to_numeric, errors='coerce').fillna(0.0).to_numpy(dtype=float)
+    N, d = Xf.shape[0], len(names)
+    if N < 30:
+        return None
+
+    # Per-case design: alt 0 = reference (all zeros); alt 1/2 carry their
+    # intercept plus case attributes under alt-specific coefficients.
+    Xarr = np.zeros((N, 3, d))
+    Xarr[:, 1, idx['ASC_N']] = 1.0
+    Xarr[:, 2, idx['ASC_M']] = 1.0
+    _bN = [idx[f'b_N_{f}'] for f in feats]
+    _bM = [idx[f'b_M_{f}'] for f in feats]
+    Xarr[:, 1, _bN] = Xf
+    Xarr[:, 2, _bM] = Xf
+    Xlist = [Xarr[n] for n in range(N)]
+    yidx = np.clip(pd.to_numeric(
+        mxl_sub['cdap_obs'], errors='coerce').fillna(0).astype(int).to_numpy(),
+        0, 2)
+
+    # Warm-start at the full-sample MNL (cap respected by construction).
+    init = np.zeros(d)
+    if mnl is not None:
+        try:
+            _pf = _inf_pf(mnl)
+            for n, i in idx.items():
+                if n in _pf.index:
+                    init[i] = float(_pf.loc[n, 'value'])
+        except Exception:
+            pass
+
+    _burn = int(os.environ.get('CDAP_MH_BURN', '1000'))
+    _draw = int(os.environ.get('CDAP_MH_DRAWS', '2000'))
+    _thin = int(os.environ.get('CDAP_MH_THIN', '5'))
+    _seed = int(os.environ.get('CDAP_MH_SEED', '42'))
+    _psd = float(os.environ.get('CDAP_MH_PRIOR_SD', '5.0'))
+    print(f"  Estimating CDAP MH posterior (RWMH burn={_burn} draws={_draw} "
+          f"thin={_thin}, n={N}, d={d}, prior_sd={_psd})...")
+    fit = estimate_mnl_mh(Xlist, yidx, offsets=None, prior_sd=_psd, init=init,
+                          n_burn=_burn, n_draw=_draw, thin=_thin, seed=_seed,
+                          verbose=True)
+    draws = np.asarray(fit['draws'])
+    mu = np.asarray(fit['posterior_mean'], dtype=float)
+    sd = draws.std(axis=0, ddof=1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t = mu / np.where(sd > 0, sd, np.nan)
+    Xp, yp, opp, maskp = pad_choice_data(Xlist, yidx, None)
+    ll_mean = loglik_mat(mu, Xp, yp, opp, maskp)
+    ess = np.asarray(fit['ess'], dtype=float)
+
+    pf = pd.DataFrame({'value': mu, 'std_err': sd, 't_stat': t}, index=names)
+    model = SimpleNamespace(
+        pf=pf, _inference_pf=pf, _cached_ll=float(ll_mean),
+        rho_sq_null=lambda: float('nan'),
+        mh_accept_rate=float(fit['accept_rate']),
+        mh_ess_min=float(np.nanmin(ess)) if ess.size else float('nan'),
+        mh_ess_mean=float(np.nanmean(ess)) if ess.size else float('nan'),
+        mh_label='CDAP MH posterior (RWMH fixed-coefficient; s_* not estimated)',
+        n_sub=int(N),
+    )
+    _print_larch_table(model, "CDAP MH posterior (RWMH, report-only)")
+    print(f"  MH accept={fit['accept_rate']:.3f} "
+          f"ESS min={model.mh_ess_min:.0f} mean={model.mh_ess_mean:.0f}")
+    return {
+        'coef':      {n: float(mu[i]) for i, n in enumerate(names)},
+        'std_err':   {n: float(sd[i]) for i, n in enumerate(names)},
+        'tstat':     {n: float(t[i]) for i, n in enumerate(names)},
+        'll':        float(ll_mean),
+        'n_sub':     int(N),
+        'accept_rate': float(fit['accept_rate']),
+        'ess_min':   float(model.mh_ess_min),
+        'ess_mean':  float(model.mh_ess_mean),
+        'model':     model,
     }
 
 
@@ -901,7 +1079,7 @@ td{{padding:5px 12px;border-bottom:1px solid #eee;font-size:.9em}}
 
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.',
                     exist_ok=True)
-        open(path, 'w').write(html)
+        open(path, 'w', encoding='utf-8').write(html)
         print(f"  CDAP HTML → {path}")
     except Exception as e:
         logger.debug(f"CDAP HTML failed: {e}")

@@ -21,6 +21,8 @@ runs/
 saved_data/*
 !saved_data/zone_ids_sa2/
 !saved_data/zone_ids_sa2/**
+!saved_data/zone_ids_sa2_copy/
+!saved_data/zone_ids_sa2_copy/**
 saved_data/osm_cache/
 *.pstats
 best_searcher_*.npz

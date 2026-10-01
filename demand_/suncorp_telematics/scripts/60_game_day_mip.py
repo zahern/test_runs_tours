@@ -169,6 +169,93 @@ def build_plans(site_lat, site_lon, speed_mps=12.0, setup_min=5.0,
     return plans, cover_by_cell, tau
 
 
+def fixture_variation(surfaces, top_n=(5, 10, 20)):
+    """How much of the predicted surface actually differs between games?
+
+    WHY THIS IS REPORTED. Job 26107921 returned distinct_site_sets = 1: the
+    same four streets for all six fixtures, which makes a "game-day" plan a
+    static street list. Measured on that run's surfaces, the cause is the
+    model, not the optimiser:
+
+      * variance of log1p(pred) per segment x fixture splits 92.0% between
+        segments, 5.4% between fixtures, 2.6% residual
+      * the top-10 and top-20 site sets are 100% IDENTICAL across all six
+        fixtures, and the argmax site is the same segment every time
+
+    So the optimiser cannot choose different sites -- it is given the same
+    ranking every time. Meanwhile the TIMING does differ: the mean
+    off-diagonal correlation of the per-fixture relative-bin profiles is 0.095,
+    and the peak bin splits 7-8 (pre-kickoff arrival) for the 19:00 NRL games
+    against 27 (end of window) for the others. Officers at the same streets on
+    a different clock is still a usable plan, but "where" is not a game-day
+    decision and the summary should say so rather than leave it implied by
+    distinct_site_sets.
+
+    Returns a dict for game_day_mip_summary.json. Purely diagnostic: nothing
+    here changes the optimisation.
+    """
+    out = {"note": "diagnostic only; does not affect the optimisation"}
+    keys = list(surfaces.keys())
+    if len(keys) < 2:
+        out["reason"] = "need at least 2 fixtures to compare"
+        return out
+    mats = {k: np.asarray(surfaces[k], dtype=float) for k in keys}
+    # Per (fixture, site) totals on the original scale for ranking...
+    tot = {k: m.sum(axis=1) for k, m in mats.items()}
+    # ...and on a log scale for the variance split, because the raw spread is
+    # dominated by the few biggest arterials.
+    lg = {k: np.log1p(m).mean(axis=1) for k, m in mats.items()}
+    common = sorted(set.intersection(*[set(np.nonzero(t)[0].tolist())
+                                       for t in tot.values()]))
+    if len(common) < 2:
+        out["reason"] = "fixtures do not share enough segments to compare"
+        return out
+    L = np.column_stack([lg[k][common] for k in keys])
+    grand = L.mean()
+    seg_means = L.mean(axis=1)
+    fx_means = L.mean(axis=0)
+    total_ss = float(((L - grand) ** 2).sum())
+    if total_ss > 0:
+        out["variance_between_segments_pct"] = round(
+            100 * float(((seg_means - grand) ** 2).sum()) * L.shape[1]
+            / total_ss, 1)
+        out["variance_between_fixtures_pct"] = round(
+            100 * float(((fx_means - grand) ** 2).sum()) * L.shape[0]
+            / total_ss, 1)
+
+    # Ranking stability: do the same sites come out on top every time?
+    jac = {}
+    for n in top_n:
+        tops = [set(np.argsort(-tot[k])[:n].tolist()) for k in keys]
+        vals = []
+        for i in range(len(tops)):
+            for j in range(i + 1, len(tops)):
+                vals.append(len(tops[i] & tops[j])
+                            / max(len(tops[i] | tops[j]), 1))
+        jac["top%d" % n] = round(float(np.mean(vals)), 3) if vals else None
+    out["site_overlap_jaccard"] = jac
+    out["same_argmax_for_all_fixtures"] = bool(
+        len({int(np.argmax(tot[k])) for k in keys}) == 1)
+
+    # Timing: is the relative-bin profile game-specific?
+    prof = {k: np.asarray(mats[k], dtype=float).sum(axis=0) for k in keys}
+    C = np.column_stack([prof[k] / max(prof[k].sum(), 1e-12) for k in keys])
+    cc = np.corrcoef(C)
+    off = [cc[i, j] for i in range(len(keys)) for j in range(len(keys)) if i < j]
+    out["timing_profile_corr_mean"] = round(float(np.mean(off)), 3) if off \
+        else None
+    out["peak_rel_bin_per_fixture"] = {
+        str(k): int(np.argmax(prof[k])) for k in keys}
+    distinct_peaks = len(set(out["peak_rel_bin_per_fixture"].values()))
+    out["timing_is_game_specific"] = bool(distinct_peaks > 1)
+    if out.get("same_argmax_for_all_fixtures"):
+        out["interpretation"] = (
+            "the same streets win every fixture, so WHERE to post is not a "
+            "game-day decision; check timing_is_game_specific for whether WHEN "
+            "still is")
+    return out
+
+
 def solve_mclp(r, plans, cover_by_cell, squad):
     cells = [(j, t) for j in range(r.shape[0]) for t in range(r.shape[1])
              if r[j, t] > 0]
@@ -862,6 +949,7 @@ def main():
         "mean_coverage": round(float(site_df["coverage"].mean()), 4),
         "mean_relocations": round(float(site_df["relocations"].mean()), 2),
         "distinct_site_sets": int(site_df["sites"].nunique()),
+        "fixture_variation": fixture_variation(surfaces),
         "penetration": args.penetration,
         "min_marg": args.min_marg,
         "min_marg_scale": "network",
@@ -954,7 +1042,12 @@ def main():
                      zip(_roads["road_osmid"], _roads.geometry)}
             _have_geom = True
             print(f"   map background: {len(_bg):,} road features from "
-                  f"{GEOJSON.rsplit('/', 1)[-1]}")
+                  # GEOJSON is a pathlib.Path, which has no .rsplit -- calling it
+            # raised AttributeError and the whole map silently degraded to
+            # bubbles on every run, including job 26107921:
+            #   WARN: segment map geometries unavailable ('PosixPath' object
+            #          has no attribute 'rsplit'); using bubbles
+            f"{GEOJSON.name}")
         except Exception as exc:  # noqa: BLE001
             print(f"   WARN: segment map geometries unavailable ({exc}); "
                   "using bubbles")

@@ -36,11 +36,12 @@ DEPLOY_PY = [
     'preflight.py',
 ]
 DEPLOY_PBS = [
-    't1_unit_tests.pbs',
-    't2_smoke_test.pbs',
-    't4_mip_uclass.pbs',
-    't5_shape_arms.pbs',
-]
+      't1_unit_tests.pbs',
+      't2_smoke_test.pbs',
+      'p58_rebuild_panel.pbs',
+      't4_mip_uclass.pbs',
+      't5_shape_arms.pbs',
+  ]
 
 problems = []
 notes = []

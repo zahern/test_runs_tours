@@ -1,0 +1,54 @@
+#!/bin/bash -l
+# =============================================================================
+# Validate zone population against WorldPop (independent gridded population map).
+# Zonal-sums the WorldPop raster within each SA2 polygon and compares to the
+# model's zone population (zone_landuse TOTPOP / synth pop), reporting per-zone
+# ratios, correlation, flagged zones, and a WorldPop-based rescale column.
+# Output: saved_data/worldpop_validation.csv
+#
+# Prereq: download the WorldPop Australia raster once (needs internet), e.g.
+#   mkdir -p saved_data/worldpop && cd saved_data/worldpop && wget \
+#   https://data.worldpop.org/GIS/Population/Global_2000_2020_Constrained/2020/BSGM/AUS/aus_ppp_2020_constrained.tif
+# then submit:  qsub job_validate_worldpop.pbs
+#   (override raster/year via -v "WORLDPOP_TIF=...")
+# =============================================================================
+#PBS -N validate_worldpop
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=2:mem=32GB
+#PBS -l walltime=02:00:00
+
+set -euo pipefail
+CONDA_ENV=${CONDA_ENV:-geotfenv}
+cd "$PBS_O_WORKDIR"
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+
+echo "=== Verify geo/raster imports ==="
+python - <<'PY'
+import geopandas, rasterio
+print("geopandas", geopandas.__version__, "rasterio", rasterio.__version__)
+try:
+    import rasterstats; print("rasterstats", rasterstats.__version__, "(fast zonal path)")
+except Exception as e:
+    print("rasterstats NOT available -> rasterio.mask fallback:", e)
+PY
+
+echo "=== Validate against WorldPop ==="
+python -u validate_worldpop.py
+
+echo "=== Summary ==="
+python - <<'PY'
+import pandas as pd, os, numpy as np
+p = os.environ.get('WORLDPOP_OUT', 'saved_data/worldpop_validation.csv')
+d = pd.read_csv(p)
+print(f"{len(d)} zones validated")
+if 'model_pop' in d.columns:
+    v = d[d['worldpop'] > 10]
+    print("model/WorldPop total ratio: %.3f" % (d['model_pop'].sum()/max(d['worldpop'].sum(),1)))
+    print("zones flagged (ratio outside 0.67-1.5):", int((d.get('flag','')=='CHECK').sum()))
+PY
+echo "Done. Output: saved_data/worldpop_validation.csv"

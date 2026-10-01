@@ -345,7 +345,7 @@ tr:nth-child(even){{background:#f9f9f9}}
 <strong>Why the synthetic population matters:</strong>
 The Queensland Household Travel Survey (HHTS) provides high-quality trip diaries for
 approximately {len(hhts_persons):,} persons.  However, survey data alone covers only
-{hhts_zones} of the 329 SA2 zones in SEQ and represents a sample — not the full population.
+{hhts_zones} of the 371 SA2 zones in SEQ and represents a sample — not the full population.
 The synthetic population expands this to {n_synth:,.0f} persons across all {synth_zones} zones,
 generating {len(synth_trips):,} daily trips versus the {len(hhts_trips):,} trip records in
 the HHTS sample.  This ~{scale_factor}&times; scale-up enables:

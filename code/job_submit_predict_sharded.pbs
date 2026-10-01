@@ -1,0 +1,125 @@
+#!/bin/bash -l
+# Orchestrator: submit the PHASE-SHARDED prediction chain (replaces the single
+# 190GB/20h job_predict_from_merged.pbs monolith).
+#
+#   prep -> s1 -> s23 -> s4 -> s5 -> finalize -> publish (validation + paper)
+#
+# Submit (from ~/test_runs_tours/code on an aqua login node):
+#   qsub -v "RUN_TAG=<tag>,MERGE_JID=<jid>" job_submit_predict_sharded.pbs
+#   DRY_RUN=1 bash job_submit_predict_sharded.pbs   # preview
+#
+# MERGE_JID is the ga_shardmerge_<tag> job id; the first phase waits for it
+# with afterok. Omit MERGE_JID if the merge already finished.
+
+#PBS -m n
+#PBS -r y
+#PBS -P FPAXJW8067
+#PBS -l select=1:ncpus=1:mem=2GB
+#PBS -l walltime=00:30:00
+
+set -euo pipefail
+
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:?RUN_TAG is required}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+GA_ESTIMATOR=${GA_ESTIMATOR:-metacount_mv}
+GA_ENGINE=${GA_ENGINE:-agds}
+MERGE_JID=${MERGE_JID:-}
+PUBLISH_PAPER=${PUBLISH_PAPER:-1}
+DRY_RUN=${DRY_RUN:-0}
+PROJECT_RPID=${PROJECT_RPID:-FPAXJW8067}
+_P_FLAG=()
+if [ -n "${PROJECT_RPID}" ]; then
+  _P_FLAG=(-P "${PROJECT_RPID}")
+fi
+
+NEW_POP=${NEW_POP:-1}
+NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+if [ "${NEW_POP}" = "1" ] && [ "${NEW_POP_MAPPED}" != "1" ]; then
+    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+else
+    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-}
+fi
+
+PREDICT_DIR="${RUN_ROOT}/${RUN_TAG}/predict"
+MERGED_DIR="${RUN_ROOT}/${RUN_TAG}/merged"
+
+# -- phase table: "phase:ncpus:mem:walltime" --------------------------------
+# Sized from the qld_shard1 measurements + the streaming design of the
+# pipeline: predict phases only APPLY models (peak <2GB for s1-s4), prep loads
+# the all-zones synth, s5 holds the plan while zone plans stream to CSV
+# (STAGE5_WORKERS=1 default), finalize reloads the plan + synth for stage 6
+# (chunked 20k persons) and plots.
+PHASES="
+prep:4:64GB:06:00:00
+s1:4:24GB:04:00:00
+s23:4:24GB:04:00:00
+s4:4:24GB:04:00:00
+s5:4:96GB:12:00:00
+finalize:4:96GB:06:00:00
+plots:4:32GB:02:00:00
+"
+
+cd "$PBS_O_WORKDIR"
+
+echo "=========================================="
+echo "Phase-sharded predict submitter"
+echo "Run tag      : ${RUN_TAG}"
+echo "Predict dir  : ${PREDICT_DIR}"
+echo "Merge dep    : ${MERGE_JID:-none}"
+echo "Started      : $(date)"
+echo "=========================================="
+
+if [ ! -f "${MERGED_DIR}/ga_results.pkl" ] && [ -z "${MERGE_JID}" ]; then
+  echo "FATAL: ${MERGED_DIR}/ga_results.pkl not found and no MERGE_JID given."
+  exit 2
+fi
+
+COMMON_VARS="RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},GA_ESTIMATOR=${GA_ESTIMATOR},GA_ENGINE=${GA_ENGINE},PIPELINE_RUN_DIR=${PREDICT_DIR},GA_STAGED_GA_DIR=${MERGED_DIR},NEW_POP=${NEW_POP},NEW_POP_MAPPED=${NEW_POP_MAPPED},NEW_POP_DIR=${NEW_POP_DIR},PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH}"
+
+PREV_JID="${MERGE_JID}"
+FIRST=1
+while read -r line; do
+  [ -z "${line}" ] && continue
+  phase=$(echo "$line" | cut -d: -f1)
+  ncpus=$(echo "$line" | cut -d: -f2)
+  mem=$(echo "$line" | cut -d: -f3)
+  wt=$(echo "$line" | cut -d: -f4-)
+  dep_flag=()
+  if [ -n "${PREV_JID}" ]; then
+    dep_flag=(-W "depend=afterok:${PREV_JID}")
+  fi
+  cmd=(qsub "${_P_FLAG[@]}" -N "ga_pred_${phase}_${RUN_TAG}" \
+    "${dep_flag[@]}" \
+    -l "select=1:ncpus=${ncpus}:mem=${mem}" -l place=excl -l "walltime=${wt}" \
+    -v "${COMMON_VARS},PREDICT_PHASE=${phase}" \
+    job_predict_phase.pbs)
+  if [ "${DRY_RUN}" = "1" ]; then
+    echo "DRY: ${cmd[*]}"
+    PREV_JID="DRY_${phase}"
+  else
+    jid=$("${cmd[@]}" | awk '{print $1}')
+    echo "phase ${phase}: ${jid}"
+    PREV_JID="${jid}"
+  fi
+done <<< "${PHASES}"
+
+# publish (validation + paper artifacts) after finalize
+dep_flag=()
+if [ -n "${PREV_JID}" ]; then
+  dep_flag=(-W "depend=afterok:${PREV_JID}")
+fi
+pub_cmd=(qsub "${_P_FLAG[@]}" -N "ga_predict_publish_${RUN_TAG}" \
+  "${dep_flag[@]}" \
+  -l "select=1:ncpus=4:mem=32GB" -l "walltime=02:00:00" \
+  -v "RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},PUBLISH_PAPER=${PUBLISH_PAPER}" \
+  job_predict_publish.pbs)
+if [ "${DRY_RUN}" = "1" ]; then
+  echo "DRY: ${pub_cmd[*]}"
+else
+  jid_pub=$("${pub_cmd[@]}" | awk '{print $1}')
+  echo "publish: ${jid_pub}"
+fi
+
+echo "Predict chain submitted (dir: ${PREDICT_DIR})"

@@ -79,6 +79,8 @@ matplotlib.use("Agg")
 # ── Standard library ─────────────────────────────────────────────────────────
 import sys
 import json
+import traceback
+import inspect
 import time
 import pickle
 import logging
@@ -362,7 +364,7 @@ def _mcr_nb2_fit(df: pd.DataFrame, y_col: str, feat_cols: List[str],
         fit["backend"] = "MCR-NB2"
         return fit
     except Exception as exc:
-        log.debug(f"  MCR NB2 fit failed for {y_col}: {exc}")
+        log.warning(f"  MCR NB2 fit failed for {y_col}: {exc}\n{traceback.format_exc()}")
         return None
 
 
@@ -401,7 +403,7 @@ def _mcr_zip_fit(df: pd.DataFrame, y_col: str, feat_cols: List[str],
         fit["backend"] = "MCR-ZIP"
         return fit
     except Exception as exc:
-        log.debug(f"  MCR ZIP fit failed for {y_col}: {exc}")
+        log.warning(f"  MCR ZIP fit failed for {y_col}: {exc}\n{traceback.format_exc()}")
         return None
 
 
@@ -453,7 +455,7 @@ def _sl_ordered_logit_fit(X: np.ndarray, y: np.ndarray,
         }
         return result
     except Exception as exc:
-        log.debug(f"  SL OrderedLogit fit failed: {exc}")
+        log.warning(f"  SL OrderedLogit fit failed: {exc}\n{traceback.format_exc()}")
         return None
 
 
@@ -483,17 +485,40 @@ def stage1_activity_frequency(out: dict, out_dir: pathlib.Path) -> dict:
         freq_df  = prepare_frequency_data(tours, persons)
         count_df = build_activity_counts(tours)
 
-        # Merge counts onto person features
+        # Merge counts onto person features.
+        #
+        # BUG (fixed): prepare_frequency_data() already calls build_activity_counts()
+        # internally, so freq_df ALREADY carries every n_*_out column. Merging
+        # count_df on top made all ten n_* columns collide, and pandas renamed
+        # each to _x/_y -- so `n_work_out not in merged.columns` was true for
+        # every purpose and stage 1 skipped all 8 while still logging "ok".
+        # Only bring across columns freq_df does not already have, and coalesce
+        # any that still collide, so the unsuffixed names survive.
         if "person_id" not in freq_df.columns:
             freq_df = freq_df.reset_index().rename(columns={"index": "person_id"})
         if "person_id" not in count_df.columns:
             count_df = count_df.reset_index().rename(columns={"index": "person_id"})
 
-        merged = freq_df.merge(
-            count_df[[c for c in count_df.columns
-                       if c.startswith("n_") or c == "person_id"]],
-            on="person_id", how="left",
-        )
+        _extra = [c for c in count_df.columns
+                  if c != "person_id" and c not in freq_df.columns]
+        if _extra:
+            merged = freq_df.merge(count_df[["person_id"] + _extra],
+                                   on="person_id", how="left")
+        else:
+            merged = freq_df
+        # Safety net: if any count column still got suffixed, coalesce it back.
+        for _c in [c for c in merged.columns
+                   if c.endswith(("_x", "_y")) and c[:-2] not in merged.columns]:
+            _base = _c[:-2]
+            merged[_base] = merged[_c].combine_first(
+                merged.get(f"{_base}_x" if _c.endswith("_y") else f"{_base}_y"))
+        _missing_counts = [f"n_{p}_out" for p in PURPOSES
+                           if f"n_{p}_out" not in merged.columns]
+        if _missing_counts:
+            raise KeyError(
+                f"stage1: count columns missing after the person/count merge: "
+                f"{_missing_counts}. Refusing to report 'ok' with zero fitted "
+                f"purposes -- this silently produced 0-cell stage-1 runs.")
 
         feat_cols = [c for c in PERSON_FEATURES if c in merged.columns]
 
@@ -617,7 +642,7 @@ def _mcr_tobit_fit(df: pd.DataFrame, y_col: str, feat_cols: List[str],
         fit["backend"] = f"MCR-Tobit-{censoring}"
         return fit
     except Exception as exc:
-        log.debug(f"  MCR Tobit fit failed for {y_col}: {exc}")
+        log.warning(f"  MCR Tobit fit failed for {y_col}: {exc}\n{traceback.format_exc()}")
         return None
 
 
@@ -644,9 +669,26 @@ def _mcr_lognormal_fit(df: pd.DataFrame, y_col: str, feat_cols: List[str],
         return None
     rdm_terms = rdm_terms or []
     rdm_str   = [f"{v}:normal" for v in rdm_terms if v in feat_cols]
+    # Lognormal needs an explicit right-censoring indicator.
+    #
+    # MCR's ALL_SURVIVAL_FAMILIES includes "lognormal", so fit_manual_model()
+    # routes model="lognormal" down the survival branch and hard-requires
+    # event_col:
+    #     ValueError: survival/hazard refit needs an event_col on the builder
+    # that branch never ran here, so every lognormal fit (Stage 2 budget B and
+    # Stage 3 durations) returned None -- 10 silent failures per run.
+    #
+    # Activity durations and budget hours are FULLY OBSERVED: there is no
+    # right-censoring, so every row is an event. MCR's own docstring says a
+    # None event_col means data["event"] is all ones, which is the semantics we
+    # want -- it just refuses to infer that for a survival-family name. Supply
+    # the all-ones column explicitly.
+    df_fit = df_fit.copy()
+    df_fit["_event"] = np.ones(len(df_fit), dtype=np.int8)
     try:
         builder = ExperimentBuilder(
             df_fit, id_col=person_id_col, y_col=y_col,
+            event_col="_event",
             default_engine="jax",
         )
         spec = builder.make_manual_spec(
@@ -664,7 +706,7 @@ def _mcr_lognormal_fit(df: pd.DataFrame, y_col: str, feat_cols: List[str],
         fit["backend"] = "MCR-Lognormal" + ("-Mixed" if rdm_terms else "")
         return fit
     except Exception as exc:
-        log.debug(f"  MCR Lognormal fit failed for {y_col}: {exc}")
+        log.warning(f"  MCR Lognormal fit failed for {y_col}: {exc}\n{traceback.format_exc()}")
         return None
 
 
@@ -721,7 +763,7 @@ def _sm_heckman_fit(df: pd.DataFrame,
             "r2":        float(ols.rsquared),
         }
     except Exception as exc:
-        log.debug(f"  Heckman fit failed: {exc}")
+        log.warning(f"  Heckman fit failed: {exc}\n{traceback.format_exc()}")
         return None
 
 
@@ -873,7 +915,7 @@ def _lifelines_aft_fit(df: pd.DataFrame, duration_col: str,
             "bic":    float(m.BIC_),
         }
     except Exception as exc:
-        log.debug(f"  lifelines AFT {family} failed for {duration_col}: {exc}")
+        log.warning(f"  lifelines AFT {family} failed for {duration_col}: {exc}\n{traceback.format_exc()}")
         return None
 
 
@@ -907,12 +949,27 @@ def stage3_activity_duration(out: dict, out_dir: pathlib.Path) -> dict:
         models: dict = {}
         val_rows: list = []
 
+        # prepare_duration_data() emits the duration column as `duration`
+        # (minutes at the activity destination). Older revisions of this stage
+        # expected `duration_min`, and the mismatch was a hard KeyError at the
+        # dropna below -- stage 3 could not run at all. Resolve the name once
+        # and accept either contract so the two modules stop drifting.
+        _y_src = "duration_min" if "duration_min" in dur_df.columns else (
+            "duration" if "duration" in dur_df.columns else None)
+        if _y_src is None:
+            raise KeyError(
+                "stage3: no duration column in the estimation frame -- expected "
+                f"'duration' or 'duration_min'; got {list(dur_df.columns)[:20]}"
+            )
+        if _y_src != "duration_min":
+            dur_df = dur_df.rename(columns={_y_src: "duration_min"})
+        y_col = "duration_min"
+
         for purpose in PURPOSES:
             mask    = dur_df.get("purpose", pd.Series(dtype=str)) == purpose
             cell_df = dur_df[mask].copy() if mask.any() else dur_df.copy()
             cell_df = cell_df.dropna(subset=feat_cols + ["duration_min"])
 
-            y_col = "duration_min"
             rdm   = ["B"] if "B" in feat_cols else []
 
             mlogn_fit = _mcr_lognormal_fit(cell_df, y_col, feat_cols, rdm_terms=rdm)
@@ -972,7 +1029,21 @@ def _build_mnl_long_format(timing_df: pd.DataFrame,
     Individual-specific variables (isvars) are identical across alternatives;
     alternative-specific constants (ASCs) are identified via fit_intercept=True.
     """
-    periods  = list(TIME_PERIODS.keys()) if hasattr(TIME_PERIODS, "keys") else TIME_PERIODS
+    # TIME_PERIODS is a list of (label, start_min, end_min) TUPLES, so taking it
+    # wholesale yielded tuples as the alternative codes:
+    #   * rows_alt became a (N*J, 3) array -> SearchLibrium's
+    #     `[j for j in self.alts if j != self.base_alt]` raised
+    #     "truth value of an array is ambiguous" (base_alt = alts[0] = a 3-tuple)
+    #   * `1 if chosen == period` compared a label ('am_peak') to a tuple, so y
+    #     was ALL ZEROS -- no alternative was ever marked chosen.
+    # Use the label (p[0]); stage4_schedule_placement does exactly this with
+    # PERIOD_LABELS = [p[0] for p in TIME_PERIODS], and the data's time_period
+    # column holds labels ('am_peak', 'midday', ...).
+    if hasattr(TIME_PERIODS, "keys"):
+        periods = list(TIME_PERIODS.keys())
+    else:
+        periods = [p[0] if isinstance(p, (tuple, list)) else p
+                   for p in TIME_PERIODS]
     if not isinstance(periods, list):
         periods = ["early", "am_peak", "midday", "pm_peak", "evening", "late"]
 
@@ -1140,7 +1211,7 @@ def _larch_mnl_fit(timing_df: pd.DataFrame,
             "model_obj": m,
         }
     except Exception as exc:
-        log.debug(f"  Larch MNL fit failed: {exc}")
+        log.warning(f"  Larch MNL fit failed: {exc}\n{traceback.format_exc()}")
         return None
 
 
@@ -1226,7 +1297,7 @@ def _larch_nested_logit_fit(timing_df: pd.DataFrame,
             "model_obj": m,
         }
     except Exception as exc:
-        log.debug(f"  Larch NestedLogit fit failed: {exc}")
+        log.warning(f"  Larch NestedLogit fit failed: {exc}\n{traceback.format_exc()}")
         return None
 
 
@@ -1314,7 +1385,7 @@ def _larch_mxl_fit(timing_df: pd.DataFrame,
             "model_obj": m,
         }
     except Exception as exc:
-        log.debug(f"  Larch MXL fit failed (engine={engine}): {exc}")
+        log.warning(f"  Larch MXL fit failed (engine={engine}): {exc}\n{traceback.format_exc()}")
         return None
 
 
@@ -1565,7 +1636,7 @@ def _sl_mnl_fit(timing_df: pd.DataFrame, feat_cols: List[str],
             "model_obj": model,
         }
     except Exception as exc:
-        log.debug(f"  SL MNL fit failed: {exc}")
+        log.warning(f"  SL MNL fit failed: {exc}\n{traceback.format_exc()}")
         return None
 
 
@@ -1594,8 +1665,20 @@ def _sl_nested_logit_fit(timing_df: pd.DataFrame, feat_cols: List[str],
     try:
         X, y, alts, ids = _build_mnl_long_format(timing_df, feat_cols, period_col)
         model = SL_NL(_jax=_SL_USE_JAX)
+        # SearchLibrium's NestedLogit.setup signature is
+        #     setup(self, X, X_nest, y, varnames=None, ...)
+        # -- it gained a nest-level design matrix as positional #2. Calling
+        # setup(X, y, ...) bound y to X_nest and left the required y missing:
+        #     TypeError: NestedLogit.setup() missing 1 required positional
+        #                argument: 'y'
+        # We pass no nest-specific covariates, and setup handles X_nest=None
+        # explicitly (F=0; utilities_Upper=0), so insert the placeholder only
+        # when the installed version declares that parameter -- keeps this
+        # working against older SearchLibrium builds too.
+        _nl_params = inspect.signature(model.setup).parameters
+        _setup_args = (X, None, y) if "X_nest" in _nl_params else (X, y)
         model.setup(
-            X, y,
+            *_setup_args,
             varnames=feat_cols,
             alts=alts,
             isvars=feat_cols,
@@ -1614,7 +1697,7 @@ def _sl_nested_logit_fit(timing_df: pd.DataFrame, feat_cols: List[str],
             "model_obj": model,
         }
     except Exception as exc:
-        log.debug(f"  SL NestedLogit fit failed: {exc}")
+        log.warning(f"  SL NestedLogit fit failed: {exc}\n{traceback.format_exc()}")
         return None
 
 
@@ -1666,7 +1749,7 @@ def _pylogit_mnl_fit(timing_df: pd.DataFrame, feat_cols: List[str],
             "model_obj": model,
         }
     except Exception as exc:
-        log.debug(f"  pylogit MNL failed: {exc}")
+        log.warning(f"  pylogit MNL failed: {exc}\n{traceback.format_exc()}")
         return None
 
 

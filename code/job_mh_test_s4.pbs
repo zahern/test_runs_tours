@@ -1,0 +1,32 @@
+#!/bin/bash -l
+# MH live test on real Stage-4 timing data (escort). Tiny job.
+#   qsub -P FPAXJW8067 -N mh_test_s4escort job_mh_test_s4.pbs
+#PBS -m n
+#PBS -r y
+#PBS -P FPAXJW8067
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=2:mem=16GB
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+CONDA_BASE=${CONDA_BASE:-/mnt/hpccs01/home/ahernz/miniconda3}
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_BASE}/envs/${CONDA_ENV:-zigenv}"
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+echo "python: $(which python) ($(python --version 2>&1))"
+export PYTHONPATH="${PBS_O_WORKDIR}/compat:${PYTHONPATH:-}"
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+
+echo "=========================================="
+echo "MH stage-4 live test : ${PBS_JOBID:-unknown}"
+echo "Started              : $(date)"
+echo "=========================================="
+python -u -X utf8 test_mh_stage4.py
+EXIT_CODE=$?
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+exit "${EXIT_CODE}"

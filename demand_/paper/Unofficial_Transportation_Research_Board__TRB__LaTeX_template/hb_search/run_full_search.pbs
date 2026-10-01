@@ -1,0 +1,71 @@
+#!/bin/bash
+#PBS -N hb_full_search
+#PBS -j oe
+#PBS -o run_full_search.log
+#PBS -l select=1:ncpus=8:mem=64gb
+#PBS -l walltime=24:00:00
+#PBS -r n
+# No-restarts policy: single-run GA only.
+
+# ======================================================================
+# Full HB / Crash / Joint search + held-out validation on the FULL-YEAR data.
+#
+# Fixes the launcher bug in hb_search_runner.pbs: that script used
+# dirname "$0", which under PBS resolves to the spooled job copy in
+# /var/spool/PBS/mom_priv/jobs and cannot find the python entry point.
+# We use $PBS_O_WORKDIR (the directory you ran `qsub` from) instead, and
+# run FROM hb_search/ so `import finalize` / `import validation` resolve.
+#
+# Submit from inside hb_search/:
+#     cd .../hb_search && qsub run_full_search.pbs
+# ======================================================================
+
+module purge
+module load python/3.11      2>/dev/null || true
+module load anaconda3/2023.09 2>/dev/null || true
+module load miniconda3        2>/dev/null || true
+module load gcc/11.2.0        2>/dev/null || true
+
+export JAX_PLATFORM_NAME=cpu
+export JAX_ENABLE_X64=1
+export JAX_LOG_COMPILES=0
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export PYTHONIOENCODING=utf-8      # driver prints Unicode arrows in transfer step
+
+cd "$PBS_O_WORKDIR"                 # = hb_search/  (import-safe)
+PAPER_DIR="$(dirname "$PBS_O_WORKDIR")"
+PYTHON="python3"
+
+DATA="${HB_DATA:-$PAPER_DIR/near_miss_hb_ecf_year.csv}"
+PANEL="${HB_PANEL:-$PAPER_DIR/near_miss_hb_panel_year.csv}"
+
+echo "============================================"
+echo "  HB full search  |  node $(hostname)  |  $(date)"
+echo "  data  = $DATA"
+echo "  panel = $PANEL"
+echo "============================================"
+$PYTHON -c "import metacountregressor as m; print('mcr', m.__version__)"
+$PYTHON -c "import jax; print('jax', jax.__version__, jax.default_backend())"
+
+$PYTHON hb_vs_crash_prediction_search.py \
+    --out-dir "$PAPER_DIR" \
+    --data  "$DATA" \
+    --panel "$PANEL" \
+    --maxiter       ${MCR_MAXITER:-80} \
+    --popsize       ${MCR_POPSIZE:-20} \
+    --mcr-n-starts  ${MCR_N_STARTS:-1} \
+    --mcr-max-iter  ${MCR_MAX_ITER:-600} \
+    --mcr-nmax      ${MCR_NMAX:-12000} \
+    --kfolds        ${KFOLDS:-5} \
+    --solver        ${MCR_SOLVER:-de}
+
+# Best-model gate: fail loudly if the reported best models were not written.
+for f in "$PAPER_DIR/best_models_master.tex" "$PAPER_DIR/hb_de_best_nm.tex" "$PAPER_DIR/hb_de_best_crash.tex"; do
+  if [ ! -f "$f" ]; then echo "MISSING best-model output: $f"; exit 1; fi
+done
+
+echo "============================================"
+echo "  End: $(date)"
+echo "============================================"

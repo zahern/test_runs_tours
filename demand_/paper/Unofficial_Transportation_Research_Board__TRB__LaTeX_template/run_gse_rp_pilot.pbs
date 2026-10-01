@@ -1,0 +1,36 @@
+#!/bin/bash -l
+#PBS -N gse_rp_pilot
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -j oe
+#PBS -r n
+# GSE structured random-parameter pilot (metacountregressor==1.0.151):
+# unstructured vs hetro_in_means vs +hetro_in_variances vs GSE scores,
+# same verdict gate as the refit jobs (SD p<0.10, |mean|<5, disp p<0.10).
+# Arms report ACCEPT/REJECT/SKIP -- the pilot never fails on API mismatch.
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+mkdir -p /mnt/hpccs01/home/ahernz/test_runs_tours/code
+(
+    flock -w 900 9 2>/dev/null || echo "(flock unavailable, proceeding without lock)"
+    pip install --quiet --upgrade --retries 5 --timeout 60 "metacountregressor==1.0.165" 2>&1 | tail -5
+) 9>/mnt/hpccs01/home/ahernz/test_runs_tours/code/.pkg_upgrade.lock
+python -c "from importlib.metadata import version as _v; v=tuple(map(int, _v('metacountregressor').split('.')[:3])); assert v>=(1,0,165), f\"stale mcr {_v('metacountregressor')} — aborting\"; print('mcr', _v('metacountregressor'), 'OK')" || exit 1
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
+export JAX_PLATFORMS=cpu
+cd "$PROJ_DIR"
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+python -u gse_rp_pilot.py --data "$PROJ_DIR/near_miss_hb_ecf.csv" --out-dir "$PROJ_DIR" 2>&1
+EXIT_CODE=$?
+for f in "$PROJ_DIR/gse_rp_pilot.csv" "$PROJ_DIR/gse_rp_pilot_verdict.csv" "$PROJ_DIR/gse_rp_pilot.tex"; do
+  if [ ! -f "$f" ]; then echo "MISSING pilot output: $f"; EXIT_CODE=1; fi
+done
+echo "Job finished at $(date) exit=$EXIT_CODE"
+exit $EXIT_CODE

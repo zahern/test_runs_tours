@@ -26,6 +26,14 @@ module load Anaconda3/2024.02-1
 conda activate "$CONDA_ENV"
 module unload Anaconda3
 
+# Defensive PATH: activation can lose the PATH-order fight against the
+# Anaconda3 module (bare `python` then resolves to the module interpreter
+# instead of the env's, so imports fail despite being installed). Pin the
+# env first and clear bash's cached command paths.
+export PATH="$CONDA_PREFIX/bin:$PATH"
+hash -r
+echo "[env] python=$(which python) prefix=$CONDA_PREFIX"
+
 # Force UTF-8 I/O
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
@@ -54,7 +62,7 @@ python build_transit_gtfs_skims.py 2>&1
 echo "=== Verify OMX ==="
 python -c "
 import openmatrix as omx
-f = omx.open_file('../demand_/sa2_skims_507_omxspec.omx', 'r')
+f = omx.open_file('../demand_/skims_371.omx', 'r')
 for name in ['WLK_LOC_WLK_TOTIVT__AM', 'WLK_LOC_WLK_WAIT__AM', 'WLK_LOC_WLK_BOARDS__AM']:
     if name in f:
         mat = f[name]

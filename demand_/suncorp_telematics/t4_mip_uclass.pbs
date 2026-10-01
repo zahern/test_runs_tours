@@ -1,0 +1,209 @@
+#!/bin/bash -l
+#PBS -N t4mip
+# Walltime raised from 03:00 to 06:00. This run does 6 future games per arm
+# (was 2), and the deployment sweep went from a ceiling of 10 to 12 officers
+# per game plus a fractional A/B solve per game, so the MIP alone is roughly
+# 1.5x the previous cost on top of 3x the prediction work. The stage-59 arms
+# stay bounded by their own --wall-budget of 2400s each, so the extra time is
+# headroom for the MIP rather than an invitation to spend more on search.
+#PBS -l walltime=06:00:00
+# Dropped from 8 cores / 64gb to 4 cores / 32gb. Job 26095208 sat in the queue
+# for 1h33m with the scheduler reporting
+#   Not Running: Insufficient amount of resource
+#   Resource_List.select = 1:ncpus=8:mem=64gb
+# i.e. no single node had 8 free cores AND 64GB free, while 1684 jobs sat in
+# cpu_batch_exec. Nothing was wrong with the job. Halving the footprint lets
+# it fit the gaps between my other 8-core allocations; the cost is roughly 2x
+# runtime, which is a good trade against an unbounded queue wait.
+#PBS -l select=1:ncpus=4:mem=32gb
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# T4 — stage 59 exposure A/B over ALL SIX games, then stage 60 (MIP) on the
+# surfaces that A/B produced, with a movement A/B.
+#
+# The question T4 answers, in two parts.
+#
+# (1) EXPOSURE. The exposure LRT rejected the pinned offset at chi2(1)=364 on
+# real data. The response is a count of speeding TRIPS, so its true
+# denominator is trips_with_judged_speed -- which stage 58 already measures
+# and stage 59 never used. The offset in use is instead seg_flow *
+# bin_factor * uplift, a TMR flow projection. Both arms run the same fixtures,
+# same search budget, same LRT, so the chi2 difference is attributable to the
+# exposure channel alone.
+#
+#     arm A (baseline)  : --exposure-calibration off   (today's channel)
+#     arm B (calibrated): --exposure-calibration on    (two-step shrunk
+#                         calibration onto the observed denominator)
+#
+# (2) DEPLOYMENT. Does a smaller squad help, and should those officers move?
+# The shipped objective covers a cell once no matter how many officers are
+# there, so a second officer at an already-staffed site is worth exactly
+# nothing and relocation can never win -- relocations came out 0 on all six
+# games of job 26075201. That is a property of the objective, not evidence
+# that officers should sit still, so --mobility-ab re-solves each game with
+# coverage that scales with the number of officers present and reports both
+# answers side by side instead of asserting one.
+#
+# ORDER MATTERS: the arms write the shared results/game_day_pred_15min.parquet,
+# so the MIP must run after them or the deployment artefacts describe a model
+# that is no longer on disk.
+set -u
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+MIP_OUT=$PROJ_DIR/results_tests/t4_mip
+MIP_FIG=$PROJ_DIR/figures_tests/t4_mip
+A_OUT=$PROJ_DIR/results_tests/t4_armA_base
+B_OUT=$PROJ_DIR/results_tests/t4_armB_calib
+A_FIG=$PROJ_DIR/figures_tests/t4_armA_base
+B_FIG=$PROJ_DIR/figures_tests/t4_armB_calib
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+# The grouped-draws fix (main_hpc.py, commit ca34749) must be in the
+# interpreter that runs these models.
+#
+# Gate on BEHAVIOUR, not on a version number. The previous gate asserted
+# version >= 1.0.170, which nothing in the job could verify: the cluster has
+# no DNS, so pip cannot reach PyPI at all, and the install's own metadata
+# contradicts itself (its _version.py says 1.0.143 while importlib.metadata
+# reports 1.0.153 for the same directory). A version floor is a statement
+# about a package index; the property we need is a statement about the
+# loaded code, and it is directly observable: with N=24 panels and G=3
+# groups, a correct build_jax_data allocates draws_g with 3 rows, not 24.
+#
+# patch_grouped_draws.py applies the fix in place, idempotently, with a
+# backup, because the cluster cannot install from PyPI. It is best effort
+# here: if the fix is already present it does nothing and exits 0.
+timeout 120 python -u "$PROJ_DIR/patch_grouped_draws.py" 2>&1 | tail -6 || true
+python -u "$PROJ_DIR/check_grouped_draws.py" 2>&1 | tail -8 || {
+  echo "FAIL: installed metacountregressor still allocates group draws per panel"
+  exit 1
+}
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+# Must match the cores requested above: BLAS oversubscribing a 4-core
+# allocation onto 8 threads makes the job slower, not faster.
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export JAX_PLATFORMS=cpu
+export PYTHONIOENCODING=utf-8
+
+cd "$SCRIPT_DIR"
+mkdir -p "$MIP_OUT" "$MIP_FIG" "$A_OUT" "$B_OUT" "$A_FIG" "$B_FIG"
+
+echo "=================================================================="
+echo "T4 stage-60 MIP + exposure A/B, on $(hostname) at $(date)"
+echo "=================================================================="
+
+# ---------------------------------------------------------------- arm A
+echo
+echo "### PART 1a: baseline exposure channel (calibration OFF) ###"
+python -u 59_game_day_search_predict.py \
+  --out-dir "$A_OUT" --fig-dir "$A_FIG" \
+  --search-iters 3 --search-chunk 3 --wall-budget 2400 \
+  --n-starts 1 --search-R 10 --refit-R 30 \
+  --search-vars slim --target speeding_trips \
+  --group-by segment --n-future 6 --surface-scale linear \
+  --exposure free --exposure-lrt on \
+  --exposure-calibration off \
+  --temporal-refit none \
+  2>&1
+RC_A=$?
+echo "arm A exit: $RC_A"
+echo
+
+# ---------------------------------------------------------------- arm B
+echo "### PART 1b: calibrated exposure channel (calibration ON) ###"
+python -u 59_game_day_search_predict.py \
+  --out-dir "$B_OUT" --fig-dir "$B_FIG" \
+  --search-iters 3 --search-chunk 3 --wall-budget 2400 \
+  --n-starts 1 --search-R 10 --refit-R 30 \
+  --search-vars slim --target speeding_trips \
+  --group-by segment --n-future 6 --surface-scale linear \
+  --exposure free --exposure-lrt on \
+  --exposure-calibration on \
+  --binomial-refit on \
+  --temporal-refit none \
+  2>&1
+RC_B=$?
+echo "arm B exit: $RC_B"
+echo
+
+# ---------------------------------------------------------------- stage 60
+# Run AFTER the arms on purpose. Both arms write the shared
+# results/game_day_pred_15min.parquet, so running the MIP first (as T4
+# 26075201 did) would solve the deployment problem against the PREVIOUS
+# run's surfaces and then silently overwrite them, making the map, the
+# selected-site heatmap and the squad sizes describe a model that is no
+# longer the one on disk.
+echo
+echo "### PART 2: stage 60 MIP on the surfaces just written ###"
+# Point at ARM B's per-run parquet, NOT results/game_day_pred_15min.parquet.
+# Stage 59 writes only into its own --out-dir; the shared results/ copy was
+# last written on 29 Aug and its fixture labels differ
+# ("NRL Broncos-Eels" vs "NRL Broncos-Eels @ 2026-03-12 19:00") and its row
+# count differs (1,904,616 vs 1,269,744). Pointing at the shared file meant
+# the deployment solve described a model that was no longer the one on disk,
+# which is the exact failure the arms-then-MIP reorder was meant to prevent.
+PRED="$B_OUT/game_day_pred_15min.parquet"
+if [ ! -s "$PRED" ]; then
+  echo "FAIL: no $PRED to run the MIP on"
+  exit 1
+fi
+echo "predictions: $PRED ($(du -h "$PRED" | cut -f1))"
+python - <<PY
+import pandas as pd
+df = pd.read_parquet("$PRED", columns=["fixture", "pred_speeding"])
+print("   MIP input: %d rows, %d fixtures, %.0f total predicted speeding"
+      % (len(df), df["fixture"].nunique(), df["pred_speeding"].sum()))
+PY
+python -u 60_game_day_mip.py \
+  --pred "$PRED" --out-dir "$MIP_OUT" --fig-dir "$MIP_FIG" \
+  --min-marg 0 --min-marg-frac 0.10 --max-squad 12 \
+  --max-segments 250 --squads all \
+  --travel-speed-kmh 43.2 --detour-factor 1.3 \
+  --setup-min 5 --max-travel-m 4000 --obs-m 100 \
+  --mobility-ab on --max-officers-per-site 3 \
+  2>&1
+RC_MIP=$?
+echo "MIP exit: $RC_MIP"
+echo
+
+# ---------------------------------------------------------------- compare
+# ---------------------------------------------------------------- verify
+# Assert against the OUTPUT ARTEFACTS, not the PBS log.
+#
+# T4 (26075201) and T5 (26077240) both completed their work and then died at
+#   LOG=$(ls -t "$PROJ_DIR"/t4mip.o* 2>/dev/null | head -1)
+#   log: none
+#   FAIL: no output file
+# so the glob found nothing, ZERO assertions ran, and both jobs exited 1 with
+# no verdict on hundreds of lines of results. Grepping a file the job is still
+# writing depends on filesystem visibility timing the job does not control.
+# The metrics JSON and the MIP CSVs are written by the scripts themselves and
+# are the actual deliverable, so those are what get checked.
+echo "=================================================================="
+echo "T4 assertions (from artefacts)"
+echo "=================================================================="
+python -u "$PROJ_DIR/t4_assert.py" "$MIP_OUT" "$A_OUT" "$B_OUT" 2>&1
+RC_ASSERT=$?
+FAIL=$RC_ASSERT
+if [ "$RC_ASSERT" -ne 0 ]; then
+  echo "  -> artefact assertions FAILED (rc=$RC_ASSERT)"
+fi
+
+echo
+echo "=================================================================="
+echo "T4 exits: mip=$RC_MIP armA=$RC_A armB=$RC_B assert=$RC_ASSERT"
+echo "=================================================================="
+if [ "$RC_MIP" -ne 0 ] || [ "$RC_A" -ne 0 ] || [ "$RC_B" -ne 0 ] || [ "$RC_ASSERT" -ne 0 ]; then
+  exit 1
+fi
+exit 0

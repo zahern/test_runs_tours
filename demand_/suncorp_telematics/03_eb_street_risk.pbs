@@ -1,0 +1,108 @@
+#!/bin/bash -l
+#PBS -N suncorp_street_risk
+#PBS -l walltime=03:00:00
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Job 3: EB-Adjusted Street Risk Analysis for Police Paper
+# Computes EB-adjusted risk scores by event/control type
+# ══════════════════════════════════════════════════════════════════════════════
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results
+FIG_DIR=$PROJ_DIR/figures
+
+# ── Load environment ──────────────────────────────────────────────────────────
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+# Ensure required packages are present in the conda env (force-repair broken installs)
+echo "Checking/installing required Python packages..."
+for pkg in statsmodels seaborn matplotlib pandas numpy; do
+    python -c "import ${pkg%%-*}" 2>/dev/null || pip install --force-reinstall --no-deps $pkg
+done
+
+# ── Environment variables ─────────────────────────────────────────────────────
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export JAX_PLATFORMS=cpu
+
+cd "$SCRIPT_DIR"
+
+echo "════════════════════════════════════════════════════════════════════════════"
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "Project dir:  $PROJ_DIR"
+echo "Input data:   $DATA_DIR/segment_roads_part0_5000.csv.gz"
+echo "Results dir:  $RESULTS_DIR"
+echo "Figures dir:  $FIG_DIR"
+echo "════════════════════════════════════════════════════════════════════════════"
+
+# ── Check input file exists ───────────────────────────────────────────────────
+if [ ! -f "$DATA_DIR/segment_roads_part0_5000.csv.gz" ]; then
+    echo "✗ ERROR: segment_roads_part0_5000.csv.gz not found!"
+    exit 1
+fi
+
+# ── Update paths in Python script ─────────────────────────────────────────────
+echo "Updating paths for HPC environment..."
+sed -i "s|PROJ = r\"C:\\\\Users\\\\ahernz.*\"|PROJ = \"$PROJ_DIR\"|g" 20_eb_adjusted_street_risk.py
+
+# ── Run EB street risk analysis ──────────────────────────────────────────────
+echo ""
+echo "Running 20_eb_adjusted_street_risk.py..."
+echo ""
+
+python -u 20_eb_adjusted_street_risk.py 2>&1
+EXIT_CODE=$?
+
+# ── Check outputs ─────────────────────────────────────────────────────────────
+echo ""
+echo "Checking outputs..."
+OUTPUTS_OK=0
+
+if [ -f "$RESULTS_DIR/eb_street_risk.csv" ]; then
+    echo "✓ eb_street_risk.csv created"
+    wc -l "$RESULTS_DIR/eb_street_risk.csv"
+    OUTPUTS_OK=$((OUTPUTS_OK + 1))
+fi
+
+if [ -f "$RESULTS_DIR/eb_street_risk.md" ]; then
+    echo "✓ eb_street_risk.md created"
+    OUTPUTS_OK=$((OUTPUTS_OK + 1))
+fi
+
+if [ -f "$FIG_DIR/eb_street_risk_comparison.png" ]; then
+    echo "✓ Figures generated"
+    OUTPUTS_OK=$((OUTPUTS_OK + 1))
+fi
+
+echo ""
+if [ $OUTPUTS_OK -eq 3 ]; then
+    echo "✓ All outputs created successfully!"
+else
+    echo "✗ Some outputs missing (created $OUTPUTS_OK/3)"
+    EXIT_CODE=1
+fi
+
+# ── Display top 10 segments by EB event risk ─────────────────────────────────
+if [ -f "$RESULTS_DIR/eb_street_risk.md" ]; then
+    echo ""
+    echo "Top 10 segments by EB-adjusted event risk:"
+    head -n 35 "$RESULTS_DIR/eb_street_risk.md" | tail -n 11
+fi
+
+echo ""
+echo "════════════════════════════════════════════════════════════════════════════"
+echo "Job finished at $(date) — exit_code=$EXIT_CODE"
+echo "════════════════════════════════════════════════════════════════════════════"
+
+exit $EXIT_CODE

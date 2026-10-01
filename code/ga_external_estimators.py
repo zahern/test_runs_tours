@@ -1899,6 +1899,16 @@ def _to_long_format(
     return long.sort_values([id_col, 'alt_id']).reset_index(drop=True)
 
 
+_STAGE4_NONMAND_PURPOSES = frozenset(
+    {'escort', 'shopping', 'social', 'othmaint', 'othdiscr', 'eat'})
+
+
+def _stage4_subset(data: pd.DataFrame, purpose: str) -> pd.DataFrame:
+    if 'purpose' not in data.columns or purpose != 'nonmand':
+        return data[data['purpose'] == purpose] if 'purpose' in data.columns else data
+    return data[data['purpose'].isin(_STAGE4_NONMAND_PURPOSES)]
+
+
 def stage4_fitness_searchlibrium(
     genes: np.ndarray,
     data: pd.DataFrame,
@@ -1930,8 +1940,7 @@ def stage4_fitness_searchlibrium(
 
     scores = []
     for purpose in purposes:
-        sub = data[data.get('purpose', data.iloc[:, 0]) == purpose] \
-              if 'purpose' in data.columns else data
+        sub = _stage4_subset(data, purpose)
         if len(sub) < 20:
             continue
         avail_feats = [f for f in selected if f in sub.columns]
@@ -2030,7 +2039,7 @@ def stage4_fitness_searchlibrium_mixed(
 
     scores = []
     for purpose in purposes:
-        sub = data[data['purpose'] == purpose] if 'purpose' in data.columns else data
+        sub = _stage4_subset(data, purpose)
         if len(sub) < 30:
             continue
         avail_feats = [f for f in selected if f in sub.columns]
@@ -2228,7 +2237,7 @@ def stage4_final_mixed_logit(
         _rand_search, _never_random = False, ()
 
     for purpose in purposes:
-        sub = data[data['purpose'] == purpose] if 'purpose' in data.columns else data
+        sub = _stage4_subset(data, purpose)
         if len(sub) < 30:
             continue
         avail_feats = [f for f in selected_vars if f in sub.columns]

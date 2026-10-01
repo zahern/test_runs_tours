@@ -35,6 +35,7 @@ NEW_POP_DIR = os.environ.get("NEW_POP_DIR", r"Z:\test_runs_tours\new_pop")
 ZONE_DIR    = os.path.join(NEW_POP_DIR, "saved_data", "zone_ids_sa2")
 SA1_CSV     = r"Z:\test_runs_tours\SA1_SHP\sa1_2021.csv"
 SA1_EMME_XW = r"Z:\test_runs_tours\demand_\sa1_to_emme_crosswalk_seqtweed.csv"
+SA2_CONCORDANCE = r"Z:\test_runs_tours\demand_\sa2_2016_to_2021_concordance.csv"
 
 
 def main():
@@ -42,16 +43,27 @@ def main():
     sa1_lu["SA2_CODE21"] = sa1_lu["SA2_CODE21"].str.strip()
     sa1_lu["SA1_CODE21"] = sa1_lu["SA1_CODE21"].str.strip()
 
-    # Check if SA1 EMME crosswalk exists to restrict to study-area SA1s only
-    if os.path.exists(SA1_EMME_XW):
-        xwalk = pd.read_csv(SA1_EMME_XW, dtype={"SA1_CODE21": str})
-        study_sa1s = set(xwalk["SA1_CODE21"].str.strip())
-        sa1_lu = sa1_lu[sa1_lu["SA1_CODE21"].isin(study_sa1s)]
-        print(f"Restricted to {len(sa1_lu)} study-area SA1 codes")
-    else:
-        print(f"WARNING: {SA1_EMME_XW} not found — including all SA1 codes for each SA2")
+    # # Do NOT restrict to study-area SA1s - assign HOME_SA1 to ALL persons.
+    # stage5 will fall back to SA2-averaged skims for SA1s outside STM boundary.
+    # if os.path.exists(SA1_EMME_XW):
+    #     xwalk = pd.read_csv(SA1_EMME_XW, dtype={"SA1_CODE21": str})
+    #     study_sa1s = set(xwalk["SA1_CODE21"].str.strip())
+    #     sa1_lu = sa1_lu[sa1_lu["SA1_CODE21"].isin(study_sa1s)]
+    #     print(f"Restricted to {len(sa1_lu)} study-area SA1 codes")
+    # else:
+    #     print(f"WARNING: {SA1_EMME_XW} not found -- including all SA1 codes for each SA2")
+    print(f"Using all {len(sa1_lu)} SA1 codes from lookup table (no study-area restriction)")
 
-    # Build SA2 → list of SA1 codes mapping
+    # Load 2016->2021 SA2 concordance (zone files use SA2_MAIN16, SA1 uses SA2_CODE21)
+    sa2_16_to_21 = {}
+    if os.path.exists(SA2_CONCORDANCE):
+        conc = pd.read_csv(SA2_CONCORDANCE, dtype={"sa2_main16": str, "sa2_code21": str})
+        sa2_16_to_21 = dict(zip(conc["sa2_main16"].astype(str), conc["sa2_code21"].astype(str)))
+        print(f"Loaded SA2 2016->2021 concordance: {len(sa2_16_to_21)} mappings")
+    else:
+        print(f"WARNING: {SA2_CONCORDANCE} not found -- zone files using SA2_MAIN16 may not map to SA1")
+
+    # Build SA2_CODE21 → list of SA1 codes mapping
     sa2_to_sa1s = sa1_lu.groupby("SA2_CODE21")["SA1_CODE21"].apply(list).to_dict()
 
     zone_files = sorted(glob.glob(os.path.join(ZONE_DIR, "zone_*.csv")))
@@ -60,8 +72,10 @@ def main():
     updated = 0
     skipped = 0
     for fp in zone_files:
-        sa2_code = str(int(re.search(r"zone_(\d+)", os.path.basename(fp)).group(1)))
-        sa1_options = sa2_to_sa1s.get(sa2_code)
+        # Zone filename uses SA2_MAIN16 (2016 code); map to SA2_CODE21 (2021) for SA1 lookup
+        sa2_main16 = str(int(re.search(r"zone_(\d+)", os.path.basename(fp)).group(1)))
+        sa2_code21 = sa2_16_to_21.get(sa2_main16, sa2_main16)  # fallback: assume same if direct match
+        sa1_options = sa2_to_sa1s.get(sa2_code21)
         if not sa1_options:
             skipped += 1
             continue
@@ -76,7 +90,7 @@ def main():
         # (without per-SA1 population counts, equal weighting is the correct
         # null assumption; population-weighted sampling would require a separate
         # SA1-level ABS census table not currently loaded here)
-        rng = np.random.default_rng(seed=int(sa2_code) % (2**32))
+        rng = np.random.default_rng(seed=int(sa2_code21) % (2**32))
         df["HOME_SA1"] = rng.choice(
             [int(s) for s in sa1_options],
             size=len(df),

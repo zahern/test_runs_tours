@@ -1,0 +1,101 @@
+#!/bin/bash -l
+#PBS -N suncorp_postselp
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Job 9: Candidate-post selection as an EXACT binary MIP (Programme P4)
+# Maximum-weight independent set over road-graph junctions under a 0.8 km
+# mutual-separation constraint (clique-strengthened), cardinality K=14.
+# Solved to proven optimality with HiGHS branch-and-bound (scipy.optimize.milp);
+# greedy construction seeds an objective cut (never the final answer).
+# Runs AFTER 01b_geometry.pbs / 02_eb_analysis.pbs (needs near_miss_hb_ecf.csv
+# with geometry columns merged).
+# Outputs: results/post_selection_mip.csv, post_selection_summary.json,
+#          results/post_selection.tex, figures/fig31_post_selection.png
+# ══════════════════════════════════════════════════════════════════════════════
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+
+# ── Load environment ──────────────────────────────────────────────────────────
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+echo "Checking/installing required Python packages..."
+# Modern HiGHS is required: old scipy (<=1.11) times out on the 263k-row MIP.
+python -c "import scipy; assert int(scipy.__version__.split('.')[1]) >= 15" 2>/dev/null \
+    || pip install -U --no-deps scipy
+python -c "import networkx" 2>/dev/null || pip install --force-reinstall --no-deps networkx
+python -c "import geopandas" 2>/dev/null || pip install --force-reinstall --no-deps geopandas pyogrio
+
+# ── Environment variables ─────────────────────────────────────────────────────
+export PROJ="$PROJ_DIR"
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
+cd "$SCRIPT_DIR"
+
+echo "════════════════════════════════════════════════════════════════"
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "Project dir:  $PROJ_DIR"
+echo "Data dir:     $DATA_DIR"
+echo "════════════════════════════════════════════════════════════════"
+
+# ── Check inputs ──────────────────────────────────────────────────────────────
+if [ ! -f "$DATA_DIR/osm_roads_suncorp.geojson" ] || [ ! -f "$DATA_DIR/near_miss_hb_ecf.csv" ]; then
+    echo "✗ ERROR: inputs missing — run 01_prepare_data.pbs / 01b_geometry.pbs first."
+    exit 1
+fi
+
+# ── Run exact-MIP post selection ──────────────────────────────────────────────
+echo ""
+echo "Running 28_post_selection_mip.py ..."
+echo ""
+
+python -u 28_post_selection_mip.py \
+    --data-dir "$DATA_DIR" \
+    --out-results "$PROJ_DIR/results" \
+    --out-figures "$PROJ_DIR/figures" \
+    --k 14 --delta-m 800 --decay-m 5000 \
+    --min-len-m 100 --time-limit 600 2>&1
+EXIT_CODE=$?
+
+# ── Check outputs ─────────────────────────────────────────────────────────────
+echo ""
+if [ -f "$PROJ_DIR/results/post_selection_summary.json" ] && \
+   python - "$PROJ_DIR/results/post_selection_summary.json" <<'EOF'
+import json, sys
+s = json.load(open(sys.argv[1]))
+sys.exit(0 if s.get("optimality_certified") else 1)
+EOF
+then
+    echo "✓ Success! Exact-MIP post selection certified optimal:"
+    wc -l "$PROJ_DIR/results/post_selection_mip.csv"
+    python - <<'EOF'
+import json
+with open("/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics/results/post_selection_summary.json") as f:
+    s = json.load(f)
+print(f"   solver status={s['solver_status']} optimal={s['optimality_certified']} "
+      f"MIP obj={s['mip_objective']} greedy={s['greedy_objective']} "
+      f"runtime={s['runtime_s']}s")
+EOF
+else
+    echo "✗ FAILED: post selection not certified optimal (see log above)"
+    EXIT_CODE=1
+fi
+
+echo ""
+echo "════════════════════════════════════════════════════════════════"
+echo "Job finished at $(date) — exit_code=$EXIT_CODE"
+echo "════════════════════════════════════════════════════════════════"
+
+exit $EXIT_CODE

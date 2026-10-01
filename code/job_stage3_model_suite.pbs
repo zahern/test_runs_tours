@@ -70,6 +70,9 @@ export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 export STAGE4_TIMING_MODEL="${STAGE4_TIMING_MODEL:-rrm}"
+# Search engine for every GA stage in this end-to-end job: default to
+# SparseEA-AGDS (override with -v GA_ENGINE=ga|sa|bandit|portfolio).
+export GA_ENGINE="${GA_ENGINE:-agds}"
 
 # Optional local source trees. On the cluster these are normally empty and the
 # conda/PyPI installations are used; set them only when the paths exist there.
@@ -119,6 +122,19 @@ if [[ "${RUN_STAGE5_6}" == "1" ]]; then
 fi
 
 python "${ARGS[@]}" >> "${LOG_OUT}" 2>> "${LOG_ERR}"
+
+# ── MATSim export per variant (PIPELINE_MATSIM=1, default on) ────────────────
+# When Stage 5/6 ran, each variant directory holds a stage6_output.csv. Convert
+# each into a MATSim scenario under <variant>/matsim. Non-blocking.
+if [[ "${RUN_STAGE5_6}" == "1" && "${PIPELINE_MATSIM:-1}" != "0" ]]; then
+    while IFS= read -r _s6; do
+        _vdir="$(dirname "${_s6}")"
+        echo "MATSim export: ${_vdir}" | tee -a "${LOG_OUT}"
+        python -u -X utf8 matsim_export.py --run-dir "${_vdir}" \
+            --crs "${MATSIM_CRS:-EPSG:28356}" >> "${LOG_OUT}" 2>> "${LOG_ERR}" \
+            || echo "  MATSim export failed for ${_vdir} (non-fatal)" | tee -a "${LOG_OUT}"
+    done < <(find "${STAGE3_SUITE_OUT}" -maxdepth 3 -name stage6_output.csv 2>/dev/null)
+fi
 
 printf 'Finished: %s\n' "$(date)" | tee -a "${LOG_OUT}"
 printf 'Manifest: %s/manifest.json\n' "${STAGE3_SUITE_OUT}" | tee -a "${LOG_OUT}"

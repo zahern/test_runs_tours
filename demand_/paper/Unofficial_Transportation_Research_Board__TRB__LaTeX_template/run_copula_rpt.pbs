@@ -1,0 +1,41 @@
+#!/bin/bash -l
+#PBS -N copula_rpt
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -j oe
+#PBS -r n
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+# ALWAYS ensure the pinned estimator: flock-serialized so concurrent paper jobs
+# don't race pip into the shared env. Jobs 25258209/25271015 died at the
+# >=1.0.151 gate with stale 1.0.143 because this install used --retries 1
+# --timeout 20 without --upgrade and failed silently on dead mirrors.
+# Hardened: --upgrade, longer retries/timeout, lock-dir ensured (non-fatal;
+# the script's version gate below remains the hard check).
+mkdir -p /mnt/hpccs01/home/ahernz/test_runs_tours/code
+(
+    flock -w 900 9 2>/dev/null || echo "(flock unavailable, proceeding without lock)"
+    pip install --quiet --upgrade --retries 5 --timeout 60 "metacountregressor==1.0.151" 2>&1 | tail -5
+) 9>/mnt/hpccs01/home/ahernz/test_runs_tours/code/.pkg_upgrade.lock
+# Log dist metadata, not m.__version__ (stale "1.0.143" in the 1.0.151 wheel).
+python -c "from importlib.metadata import version as _v; print('mcr', _v('metacountregressor'))"
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
+export JAX_PLATFORMS=cpu
+cd "$PROJ_DIR"
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+python -u copula_rp_tiers.py --data "$PROJ_DIR/near_miss_hb_ecf.csv" --out-dir "$PROJ_DIR" 2>&1
+EXIT_CODE=$?
+# Gate: tier outputs are mandatory; RP outputs may legitimately be absent
+# only if --skip-rp was used or all RP draws failed (script warns).
+for f in "$PROJ_DIR/copula_tiers.tex" "$PROJ_DIR/copula_tiers.csv"; do
+  if [ ! -f "$f" ]; then echo "MISSING tier output: $f"; EXIT_CODE=1; fi
+done
+echo "Job finished at $(date) exit=$EXIT_CODE"
+exit $EXIT_CODE

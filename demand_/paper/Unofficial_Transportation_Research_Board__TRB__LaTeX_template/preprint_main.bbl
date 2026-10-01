@@ -1,0 +1,266 @@
+\begin{thebibliography}{37}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[{Bureau of Infrastructure, Transport and Regional Economics (BITRE)}(2019)]{BITRE2019}
+{Bureau of Infrastructure, Transport and Regional Economics (BITRE)}.
+\newblock {Road trauma Australia: annual summaries}.
+\newblock Technical report, Australian Government Department of Infrastructure, Transport, Regional Development and Communications, Canberra, Australia, 2019.
+\newblock URL \url{https://bitre.gov.au/publications/ongoing/road-trauma-australia-annual-summaries}.
+
+\bibitem[Miaou and Lum(1993)]{Miaou1993ModelingRelationships}
+Shaw-Pin Miaou and Harry Lum.
+\newblock {Modeling vehicle accidents and highway geometric design relationships}.
+\newblock \emph{Accident Analysis {\&} Prevention}, 25\penalty0 (6):\penalty0 689--709, 1993.
+\newblock \doi{10.1016/0001-4575(93)90034-T}.
+
+\bibitem[Lord and Mannering(2010{\natexlab{a}})]{Lord2010TheAlternatives}
+Dominique Lord and Fred Mannering.
+\newblock {The statistical analysis of crash-frequency data: A review and assessment of methodological alternatives}.
+\newblock \emph{Transportation Research Part A: Policy and Practice}, 44\penalty0 (5):\penalty0 291--305, 2010{\natexlab{a}}.
+\newblock \doi{10.1016/j.tra.2010.02.001}.
+
+\bibitem[Ayuso et~al.(2019)Ayuso, Guillen, and P{\'e}rez-Mar{\'i}n]{Ayuso2019TelematicsWomens}
+Mercedes Ayuso, Montserrat Guillen, and Ana~Mar{\'i}a P{\'e}rez-Mar{\'i}n.
+\newblock {Telematics and gender discrimination: Some usage-based evidence on whether men's risk of accidents differs from women's}.
+\newblock \emph{Risks}, 7\penalty0 (2):\penalty0 38, 2019.
+\newblock \doi{10.3390/risks7020038}.
+
+\bibitem[Arum{\textbackslash}'{\textbackslash}i et~al.(2024)Arum{\textbackslash}'{\textbackslash}i, Guillen, and P{\'e}rez-Mar{\'i}n]{Arumi2024CanEvents}
+Pau Arum{\textbackslash}'{\textbackslash}i, Montserrat Guillen, and Ana~Mar{\'i}a P{\'e}rez-Mar{\'i}n.
+\newblock {Can automobile insurance telematics predict the risk of near-miss events?}
+\newblock \emph{Applied Sciences}, 14\penalty0 (14):\penalty0 6378, 2024.
+\newblock \doi{10.3390/app14146378}.
+
+\bibitem[Mihăiţă et~al.(2026)Mihăiţă, Cheung, Grigorev, Mao, and Lillo-Trynes]{Mihaita2026Proactive}
+Adriana-Simona Mihăiţă, Clarence Cheung, Artur Grigorev, Tuo Mao, and David Lillo-Trynes.
+\newblock {Proactive Road Safety Intervention in Australia: Predicting Risky Driving Hotspots from Connected Vehicle Data}.
+\newblock In \emph{47th Australasian Transport Research Forum}, Sydney, Australia, 11 2026.
+\newblock URL \url{https://arxiv.org/abs/2608.16913}.
+\newblock Submitted.
+
+\bibitem[Grigorev et~al.(2025)Grigorev, Mihăiţă, Saleh, and Piccardi]{Grigorev2025Spatial}
+Artur Grigorev, Adriana-Simona Mihăiţă, Wafaa Saleh, and Massimo Piccardi.
+\newblock {Spatial association between connected-vehicle near-miss clusters and official crash blackspots in Greater Sydney}.
+\newblock \emph{Accident Analysis \& Prevention}, 2025.
+\newblock URL \url{https://arxiv.org/abs/2608.16913}.
+\newblock In review.
+
+\bibitem[Hyd{\'{e}}n(1987)]{Hyden1987TheTechnique}
+Christer Hyd{\'{e}}n.
+\newblock \emph{{The development of a method for traffic safety evaluation: The Swedish Traffic Conflicts Technique}}.
+\newblock PhD thesis, Lund University, 1987.
+
+\bibitem[Xu et~al.(2024)Xu, Gao, Zuo, and Ozbay]{Xu2024EstimatingStudy}
+Chuan Xu, Jingqin Gao, Fan Zuo, and Kaan Ozbay.
+\newblock {Estimating Urban Traffic Safety and Analyzing Spatial Patterns through the Integration of City-Wide Near-Miss Data: A New York City Case Study}.
+\newblock \emph{Applied Sciences (Switzerland)}, 14\penalty0 (14), 7 2024.
+\newblock ISSN 20763417.
+\newblock \doi{10.3390/app14146378}.
+
+\bibitem[Amoadu et~al.(2024)Amoadu, Akoto-Buabeng, Commey, and Abraham]{Amoadu2024PrevalenceGhana}
+Mustapha Amoadu, William Akoto-Buabeng, Isaac~Tetteh Commey, and Susanna~Aba Abraham.
+\newblock {Prevalence and predictors of near misses and road traffic crashes among long-distance bus drivers in Ghana}.
+\newblock \emph{Discover Psychology}, 4\penalty0 (1), 12 2024.
+\newblock ISSN 27314537.
+\newblock \doi{10.1007/s44202-024-00255-x}.
+
+\bibitem[Jomnonkwao et~al.(2023)Jomnonkwao, Champahom, Se, Hantanong, and Ratanavaraha]{Jomnonkwao2023ContributingApproach}
+Sajjakaj Jomnonkwao, Thanapong Champahom, Chamroeun Se, Natthaporn Hantanong, and Vatanavongs Ratanavaraha.
+\newblock {Contributing factors to near-miss experiences of motorcyclists in Thailand: A random parameter probit model approach}.
+\newblock \emph{Heliyon}, 9\penalty0 (12), 12 2023.
+\newblock ISSN 24058440.
+\newblock \doi{10.1016/j.heliyon.2023.e22625}.
+
+\bibitem[Boylan et~al.(2024)Boylan, Meyer, and Chen]{Boylan2024ABehaviours}
+James Boylan, Denny Meyer, and Won~Sun Chen.
+\newblock {A systematic review of the use of in-vehicle telematics in monitoring driving behaviours}.
+\newblock \emph{Accident Analysis {\&} Prevention}, 199:\penalty0 107519, 5 2024.
+\newblock ISSN 0001-4575.
+\newblock \doi{10.1016/J.AAP.2024.107519}.
+\newblock URL \url{https://www.sciencedirect.com/science/article/pii/S0001457524000642}.
+
+\bibitem[Nie et~al.(2025)Nie, Zhang, Wang, Zhang, and Zhao]{Nie2025VehicleAnalysis}
+Yuhan Nie, Min Zhang, Bo~Wang, Chi Zhang, and Yijing Zhao.
+\newblock {Vehicle trajectory fractal theory for macro-level highway crash rate analysis}.
+\newblock \emph{Accident Analysis {\&} Prevention}, 215:\penalty0 107989, 6 2025.
+\newblock ISSN 0001-4575.
+\newblock \doi{10.1016/J.AAP.2025.107989}.
+\newblock URL \url{https://www.sciencedirect.com/science/article/pii/S0001457525000752}.
+
+\bibitem[Guo et~al.(2010{\natexlab{a}})Guo, Klauer, Hankey, and Dingus]{Guo2010NearStudies}
+Feng Guo, Sheila~G Klauer, Jonathan~M Hankey, and Thomas~A Dingus.
+\newblock {Near crashes as crash surrogate for naturalistic driving studies}.
+\newblock \emph{Transportation Research Record}, 2147\penalty0 (1):\penalty0 66--74, 2010{\natexlab{a}}.
+\newblock \doi{10.3141/2147-09}.
+
+\bibitem[Dingus et~al.(2006)Dingus, Klauer, Neale, Petersen, Lee, Sudweeks, Perez, Hankey, Ramsey, Gupta, Bucher, Doerzaph, Jermeland, and Knipling]{Dingus2006TheExperiment}
+Thomas~A. Dingus, S.~G. Klauer, Vicki L. (Vicki~Lewis) Neale, A.~Petersen, S.~E. Lee, J~Sudweeks, M.~A. Perez, J.~Hankey, D.~Ramsey, S.~Gupta, C.~Bucher, Zachary R. (Zachary~Richard) Doerzaph, J.~Jermeland, and R.~R. (Ronald~R.) Knipling.
+\newblock {The 100-Car Naturalistic Driving Study, Phase II - Results of the 100-Car Field Experiment}.
+\newblock Technical report, 4 2006.
+\newblock URL \url{http://rosap.ntl.bts.gov/view/dot/37370}.
+
+\bibitem[McLaughlin et~al.(2008)McLaughlin, Hankey, and Dingus]{McLaughlin2008AData}
+Shane~B. McLaughlin, Jonathan~M. Hankey, and Thomas~A. Dingus.
+\newblock {A method for evaluating collision avoidance systems using naturalistic driving data}.
+\newblock \emph{Accident Analysis {\&} Prevention}, 40\penalty0 (1):\penalty0 8--16, 1 2008.
+\newblock ISSN 0001-4575.
+\newblock \doi{10.1016/J.AAP.2007.03.016}.
+\newblock URL \url{https://www.sciencedirect.com/science/article/pii/S0001457507000632}.
+
+\bibitem[Bagdadi(2013)]{Bagdadi2013AssessingStudies}
+Omar Bagdadi.
+\newblock {Assessing safety critical braking events in naturalistic driving studies}.
+\newblock \emph{Transportation Research Part F: Traffic Psychology and Behaviour}, 16:\penalty0 117--126, 1 2013.
+\newblock ISSN 1369-8478.
+\newblock \doi{10.1016/J.TRF.2012.08.006}.
+\newblock URL \url{https://www.sciencedirect.com/science/article/pii/S1369847812000770}.
+
+\bibitem[Desai et~al.(2020)Desai, Li, Mathew, Cheng, Habib, and Bullock]{Desai2020CorrelatingIndiana}
+Jairaj Desai, Howell Li, Jijo~K. Mathew, Yi-Ting Cheng, Ayman Habib, and Darcy~M. Bullock.
+\newblock {Correlating Hard-Braking Activity with Crash Occurrences on Interstate Construction Projects in Indiana}.
+\newblock \emph{Journal of Big Data Analytics in Transportation 2020 3:1}, 3\penalty0 (1):\penalty0 27--41, 11 2020.
+\newblock ISSN 2523-3564.
+\newblock \doi{10.1007/S42421-020-00024-X}.
+\newblock URL \url{https://link.springer.com/article/10.1007/s42421-020-00024-x}.
+
+\bibitem[Hossain et~al.(2026)Hossain, Lee, Besenski, and Spasovic]{Hossain2026EvaluatingTelematics}
+Md~Tufajjal Hossain, Joyoung Lee, Dejan Besenski, and Lazar Spasovic.
+\newblock {Evaluating Harsh Braking Events as a Surrogate Measure of Crash Risk Using Connected-Vehicle Telematics}.
+\newblock \emph{Vehicles 2026, Vol. 8, Page 68}, 8\penalty0 (3):\penalty0 68, 3 2026.
+\newblock ISSN 2624-8921.
+\newblock \doi{10.3390/VEHICLES8030068}.
+\newblock URL \url{https://www.mdpi.com/2624-8921/8/3/68/htm https://www.mdpi.com/2624-8921/8/3/68}.
+
+\bibitem[Liu et~al.(2023)Liu, Racz, Vaillancourt, Michelman, Barnes, Mellem, Eastham, Green, Armstrong, Bal, O'Banion, and Guo]{Liu2023Smartphone-basedServices}
+Luyang Liu, David Racz, Kara Vaillancourt, Julie Michelman, Matt Barnes, Stefan Mellem, Paul Eastham, Bradley Green, Charles Armstrong, Rishi Bal, Shawn O'Banion, and Feng Guo.
+\newblock {Smartphone-based hard-braking event detection at scale for road safety services}.
+\newblock \emph{Transportation Research Part C: Emerging Technologies}, 146:\penalty0 103949, 1 2023.
+\newblock ISSN 0968-090X.
+\newblock \doi{10.1016/J.TRC.2022.103949}.
+\newblock URL \url{https://www.sciencedirect.com/science/article/pii/S0968090X2200362X}.
+
+\bibitem[Yasmin et~al.(2018)Yasmin, Momtaz, Nashad, and Eluru]{Yasmin2018AModel}
+Shamsunnahar Yasmin, Salah~Uddin Momtaz, Tammam Nashad, and Naveen Eluru.
+\newblock {A multivariate copula-based macro-level crash count model}.
+\newblock \emph{Transportation Research Record}, 2672\penalty0 (30):\penalty0 64--75, 12 2018.
+\newblock ISSN 21694052.
+\newblock \doi{10.1177/0361198118801348}.
+\newblock URL \url{https://www.scopus.com/pages/publications/85060931615?origin=resultslist}.
+
+\bibitem[Mothafer et~al.(2018)Mothafer, Yamamoto, and Shankar]{Mothafer2018ATypes}
+Ghasak~I.M.A. Mothafer, Toshiyuki Yamamoto, and Venkataraman~N. Shankar.
+\newblock {A multivariate heterogeneous-dispersion count model for asymmetric interdependent freeway crash types}.
+\newblock \emph{Transportation Research Part B: Methodological}, 108:\penalty0 84--105, 2 2018.
+\newblock ISSN 01912615.
+\newblock \doi{10.1016/j.trb.2017.12.008}.
+\newblock URL \url{https://www.scopus.com/pages/publications/85040548109?origin=resultslist}.
+
+\bibitem[Park et~al.(2021)Park, Oh, Ahn, and Oh]{Park2021BayesianCopulas}
+Eun~Sug Park, Rosy Oh, Jae~Youn Ahn, and Man~Suk Oh.
+\newblock {Bayesian analysis of multivariate crash counts using copulas}.
+\newblock \emph{Accident Analysis and Prevention}, 149, 1 2021.
+\newblock ISSN 00014575.
+\newblock \doi{10.1016/j.aap.2019.105431}.
+\newblock URL \url{https://www.scopus.com/pages/publications/85080062610?origin=resultslist}.
+
+\bibitem[Bhowmik et~al.(2021)Bhowmik, Rahman, Yasmin, and Eluru]{Bhowmik2021ExploringModeling}
+Tanmoy Bhowmik, Moshiur Rahman, Shamsunnahar Yasmin, and Naveen Eluru.
+\newblock {Exploring analytical, simulation-based, and hybrid model structures for multivariate crash frequency modeling}.
+\newblock \emph{Analytic Methods in Accident Research}, 31, 9 2021.
+\newblock ISSN 22136657.
+\newblock \doi{10.1016/j.amar.2021.100167}.
+\newblock URL \url{https://www.scopus.com/pages/publications/85106252906?origin=resultslist}.
+
+\bibitem[Yang et~al.(2021)Yang, Xie, Ozbay, Zhao, and Yang]{Yang2021Copula-basedMargins}
+Di~Yang, Kun Xie, Kaan Ozbay, Zifeng Zhao, and Hong Yang.
+\newblock {Copula-based joint modeling of crash count and conflict risk measures with accommodation of mixed count-continuous margins}.
+\newblock \emph{Analytic Methods in Accident Research}, 31, 9 2021.
+\newblock ISSN 22136657.
+\newblock \doi{10.1016/j.amar.2021.100162}.
+
+\bibitem[Ahmad et~al.(2023)Ahmad, Gayah, and Donnell]{Ahmad2023Copula-basedVehicles}
+Numan Ahmad, Vikash~V. Gayah, and Eric~T. Donnell.
+\newblock {Copula-based bivariate count data regression models for simultaneous estimation of crash counts based on severity and number of vehicles}.
+\newblock \emph{Accident Analysis and Prevention}, 181, 3 2023.
+\newblock ISSN 00014575.
+\newblock \doi{10.1016/j.aap.2022.106928}.
+
+\bibitem[Lian et~al.(2025)Lian, Yasmin, and Haque]{Lian2025InfluenceProcess}
+Yanqi Lian, Shamsunnahar Yasmin, and Md~Mazharul Haque.
+\newblock {Influence of road safety policies on the long-term trends in fatal Crashes: A Gaussian Copula-based time series count model with an autoregressive moving average process}.
+\newblock \emph{Accident Analysis and Prevention}, 211, 3 2025.
+\newblock ISSN 00014575.
+\newblock \doi{10.1016/j.aap.2024.107795}.
+\newblock URL \url{https://www.scopus.com/pages/publications/85212577022?origin=resultslist}.
+
+\bibitem[Song and Sze(2026)]{Song2026JointApproach}
+Penglin Song and N.~N. Sze.
+\newblock {Joint modeling of collision type and driver injury severities in truck-involved crashes: A copula-based multivariate approach}.
+\newblock \emph{Transportation Research Part A: Policy and Practice}, 211:\penalty0 105136, 9 2026.
+\newblock ISSN 0965-8564.
+\newblock \doi{10.1016/J.TRA.2026.105136}.
+\newblock URL \url{https://www.sciencedirect.com/science/article/pii/S0965856426002776?via%3Dihub#s0090}.
+
+\bibitem[Zheng et~al.(2019)Zheng, Sayed, and Essa]{Zheng2019ValidatingIndicators}
+Lai Zheng, Tarek Sayed, and Mohamed Essa.
+\newblock {Validating the bivariate extreme value modeling approach for road safety estimation with different traffic conflict indicators}.
+\newblock \emph{Accident Analysis {\&} Prevention}, 123:\penalty0 314--323, 2 2019.
+\newblock ISSN 0001-4575.
+\newblock \doi{10.1016/J.AAP.2018.12.007}.
+
+\bibitem[Prentice(1989)]{Prentice1989SurrogateCriteria}
+Ross~L Prentice.
+\newblock {Surrogate endpoints in clinical trials: Definition and operational criteria}.
+\newblock \emph{Statistics in Medicine}, 8\penalty0 (4):\penalty0 431--440, 1989.
+\newblock \doi{10.1002/sim.4780080407}.
+
+\bibitem[Nikolaou et~al.(2023)Nikolaou, Ziakopoulos, and Yannis]{Nikolaou2023AInvestigations}
+Dimitrios Nikolaou, Apostolos Ziakopoulos, and George Yannis.
+\newblock {A Review of Surrogate Safety Measures Uses in Historical Crash Investigations}.
+\newblock \emph{Sustainability (Switzerland)}, 15\penalty0 (9), 5 2023.
+\newblock ISSN 20711050.
+\newblock \doi{10.3390/su15097580}.
+\newblock URL \url{https://www.scopus.com/pages/publications/85159313492?origin=resultslist}.
+
+\bibitem[Davis and Gao(2025)]{Davis2025TransferringConsiderations}
+Gary~A. Davis and Jingru Gao.
+\newblock {Transferring crash modification factors to automated vehicle environments using surrogate endpoints: Theoretical considerations}.
+\newblock \emph{Accident Analysis and Prevention}, 220, 9 2025.
+\newblock ISSN 00014575.
+\newblock \doi{10.1016/j.aap.2025.108112}.
+\newblock URL \url{https://www.scopus.com/pages/publications/105007721887?origin=resultslist}.
+
+\bibitem[Tarko et~al.(2009)Tarko, Davis, Saunier, Sayed, and Washington]{Tarko2009SurrogateMeasures}
+Andrew Tarko, Gary Davis, Nicolas Saunier, Tarek Sayed, and Simon Washington.
+\newblock {Surrogate measures of safety}.
+\newblock White paper, Transportation Research Board, Committee on Safety Data, Analysis and Evaluation (ANB25), Washington, DC, 2009.
+
+\bibitem[Tarko(2012)]{Tarko2012UseCrash}
+Andrew~P. Tarko.
+\newblock {Use of crash surrogates and exceedance statistics to estimate road safety}.
+\newblock \emph{Accident Analysis {\&} Prevention}, 45:\penalty0 230--240, 2012.
+\newblock \doi{10.1016/j.aap.2011.06.038}.
+
+\bibitem[Guo et~al.(2010{\natexlab{b}})Guo, Klauer, McGill, and Dingus]{Guo2010EvaluatingRelationship}
+Feng Guo, Sheila~G. Klauer, Michael~T. McGill, and Thomas~A. Dingus.
+\newblock {Evaluating the relationship between near-crashes and crashes: Can near-crashes serve as a surrogate safety metric for crashes?}
+\newblock \emph{Accident Analysis {\&} Prevention}, 42\penalty0 (6):\penalty0 1637--1646, 2010{\natexlab{b}}.
+\newblock \doi{10.1016/j.aap.2010.04.010}.
+
+\bibitem[Lord and Mannering(2010{\natexlab{b}})]{LordMannering2010StatisticalAnalysis}
+Dominique Lord and Fred Mannering.
+\newblock {The statistical analysis of crash-frequency data: A review and assessment of methodological alternatives}.
+\newblock \emph{Transportation Research Part A: Policy and Practice}, 44\penalty0 (5):\penalty0 291--305, 2010{\natexlab{b}}.
+\newblock \doi{10.1016/j.tra.2010.02.001}.
+
+\bibitem[Mannering et~al.(2016)Mannering, Shankar, and Bhat]{Mannering2016UnobservedHeterogeneity}
+Fred Mannering, Venkataraman Shankar, and Chandra~R. Bhat.
+\newblock {Unobserved heterogeneity and the statistical analysis of highway accident data}.
+\newblock \emph{Analytic Methods in Accident Research}, 11:\penalty0 1--16, 2016.
+\newblock \doi{10.1016/j.amar.2016.04.001}.
+
+\end{thebibliography}

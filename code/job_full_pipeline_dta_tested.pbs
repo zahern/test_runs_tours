@@ -47,7 +47,8 @@ mkdir -p saved_data
 echo "=========================================="
 echo "PBS job $PBS_JOBID  full_pipeline_dta_tested"
 echo "Working dir: $PBS_O_WORKDIR"
-echo "Output dir:  runs/full_pipeline_dta_tested/"
+echo "Run tag:     ${RUN_TAG:-full_pipeline_dta_tested_${PBS_JOBID}}"
+echo "Output dir:  runs/full_pipeline_dta_tested__${RUN_TAG:-full_pipeline_dta_tested_${PBS_JOBID}}/  (actual tagged dir from pbs_pipeline_mode.pbs)"
 echo "Started:     $(date)"
 echo "=========================================="
 

@@ -130,12 +130,31 @@ _LARCH_ENGINE = os.environ.get("LARCH_ENGINE", "jax")
 _LARCH_FALLBACK = "numba"
 
 def _lx_engine(require_jax: bool = False) -> str:
+    """JAX-first engine selector (large-model policy: always JAX).
+
+    Large Larch models (MNL/NL/MXL on 371 zones) must be JAX-based to fit.
+    Honors LARCH_ENGINE only for small/debug models; large callers should pass
+    require_jax=True. Ensures CPU float64 env via larch_jax_enforce.
+    """
+    # Default large-model policy: require JAX unless explicitly disabled.
+    _force = os.environ.get("LARCH_FORCE_JAX", "1").strip() != "0"
+    if _force:
+        require_jax = True
+    try:
+        import larch_jax_enforce as _jfe  # noqa: F401
+        try:
+            _jfe.ensure_jax_environment()
+        except Exception:
+            pass
+    except Exception:
+        pass
     try:
         import jax  # noqa: F401
         return "jax"
     except ImportError:
         if require_jax:
-            raise RuntimeError("JAX unavailable; cannot run JAX-only estimator")
+            raise RuntimeError("JAX unavailable; cannot run JAX-only estimator "
+                               "(large models require JAX: pip install jax[cpu])")
         return _LARCH_FALLBACK
 
 
@@ -365,6 +384,25 @@ def _fit_larch_mxl(df: pd.DataFrame,
         return None
 
 
+def _sl_setup(m, X, y_onehot, varnames, alts, **extra):
+    """Version-tolerant SearchLibrium setup (one-hot → long-format fallback).
+
+    SearchLibrium ≥ ~0.0.2xx requires y as a 1-D long-format chosen-alt vector
+    ("y must be an array of one dimension in long format"); older releases
+    take the one-hot matrix. Try one-hot first (old canonical), and on that
+    specific ValueError retry with argmax long format. Anything else raises.
+    """
+    try:
+        m.setup(X, y_onehot, varnames=varnames, alts=alts, **extra)
+        return
+    except ValueError as e:
+        if 'long format' not in str(e).lower():
+            raise
+    import numpy as _np
+    y_long = _np.asarray(y_onehot).argmax(axis=1).astype(int)
+    m.setup(X, y_long, varnames=varnames, alts=alts, **extra)
+
+
 def _fit_sl_mnl(df: pd.DataFrame,
                 feat_cols: List[str],
                 choice_col: str,
@@ -379,7 +417,7 @@ def _fit_sl_mnl(df: pd.DataFrame,
         J = df[choice_col].nunique()
         y = pd.get_dummies(df[choice_col]).values.astype(float)
         m = SL_MNL(_jax=use_jax)
-        m.setup(X, y, varnames=feat_cols, alts=list(range(J)))
+        _sl_setup(m, X, y, varnames=feat_cols, alts=list(range(J)))
         m.fit()
         ll  = float(m.loglik)
         k   = X.shape[1] * (J - 1) + (J - 1)
@@ -411,7 +449,7 @@ def _fit_sl_nested(df: pd.DataFrame,
         J = df[choice_col].nunique()
         y = pd.get_dummies(df[choice_col]).values.astype(float)
         m = SL_NL(_jax=use_jax)
-        m.setup(X, y, varnames=feat_cols, alts=list(range(J)), nests=_nests)
+        _sl_setup(m, X, y, varnames=feat_cols, alts=list(range(J)), nests=_nests)
         m.fit()
         ll  = float(m.loglik)
         k   = X.shape[1] + (J - 1) + len(_nests)
@@ -512,30 +550,96 @@ def _mcr_fit(df: pd.DataFrame,
     """
     Generic MCR wrapper for count/continuous families:
     nb2, zip, zinb, tobit, lognormal, gaussian, poisson.
+
+    Delegates construction/fitting to ga_external_estimators'
+    version-tolerant layer (_create_metacount_builder +
+    _fit_metacount_manual_model) so model_zoo tracks the INSTALLED
+    metacountregressor API instead of a hardcoded one — the 1.0.151 release
+    replaced ExperimentBuilder(X=, y=, varnames=, ...) with
+    ExperimentBuilder(df, id_col=, y_col=, ...) + fit_manual_model, which
+    broke every direct old-style call. Returns None when unusable; the
+    registry treats None as backend-unavailable and tries the next backend.
+    (engine is accepted for signature compatibility; JAX is the package
+    default in 1.0.151.)
     """
     try:
-        from metacountregressor import ExperimentBuilder, ModelConstraints
+        from ga_external_estimators import (
+            _create_metacount_builder, _fit_metacount_manual_model,
+            _extract_metacount_coefs, _METACOUNT_OK,
+        )
     except ImportError:
         return None
+    if not _METACOUNT_OK:
+        return None
     try:
-        X = df[feat_cols].values
-        y = df[y_col].values
-        builder = ExperimentBuilder(
-            X=X, y=y, varnames=feat_cols,
-            family=family, default_engine=engine,
-        )
-        result = builder.run()
-        ll  = float(result.get("loglik",  result.get("log_likelihood", np.nan)))
-        k   = int(result.get("n_params",  len(feat_cols) + 1))
-        n   = len(df)
-        bic = k * np.log(n) - 2 * ll
-        pf  = result.get("params_df", pd.DataFrame())
-        t_s = pf["t_stat"] if isinstance(pf, pd.DataFrame) and "t_stat" in pf.columns else None
+        feats = [c for c in list(feat_cols or []) if c in df.columns]
+        if not feats or y_col not in df.columns:
+            return None
+        y = pd.to_numeric(df[y_col], errors='coerce')
+        if int(y.notna().sum()) < 30:
+            return None
+        df2 = df[[y_col] + feats].copy()
+        df2['_mcr_id'] = np.arange(len(df2))
+        builder = _create_metacount_builder(
+            df2, id_col='_mcr_id', y_col=y_col, family=family)
+        spec = {
+            'fixed_terms':      feats,
+            'rdm_terms':        [],
+            'rdm_cor_terms':    [],
+            'grouped_terms':    [],
+            'hetro_in_means':   [],
+            'zi_terms':         [],
+            'membership_terms': [],
+            'dispersion':       1 if family in ('nb2', 'negbin') else 0,
+            'latent_classes':   1,
+        }
+        R = int(os.environ.get('MCR_FIT_DRAWS', '200'))
+        fitted = _fit_metacount_manual_model(
+            builder, spec, R=R, family=family)
+        if fitted is None:
+            return None
+        # fit_manual_model returns dict {'summary':{'bic':…,'loglik':…},…};
+        # older API used attributes — accept both, derive what's missing.
+        if isinstance(fitted, dict):
+            _summary = fitted.get('summary') or {}
+            ll = _summary.get('loglik')
+            bic = _summary.get('bic')
+        else:
+            ll = (getattr(fitted, 'loglik', None)
+                  or getattr(fitted, 'log_lik', None))
+            bic = (getattr(fitted, 'bic', None)
+                   or getattr(fitted, 'BIC', None))
+        n = len(df2)
+        k = len(feats) + 1
+        try:
+            ll = float(ll)
+        except Exception:
+            ll = float('nan')
+        if not np.isfinite(ll):
+            return None
+        try:
+            bic = float(bic)
+        except Exception:
+            bic = float('nan')
+        if not np.isfinite(bic):
+            bic = k * np.log(max(n, 2)) - 2.0 * ll
+        rows = _extract_metacount_coefs(fitted)
+        if rows:
+            pf = pd.DataFrame(rows)
+            try:
+                t_s = pd.Series(
+                    [float(r.get('t_stat', float('nan'))) for r in rows],
+                    index=[str(r.get('param', f'x{i}'))
+                           for i, r in enumerate(rows)])
+            except Exception:
+                t_s = None
+        else:
+            pf, t_s = pd.DataFrame(), None
         return ModelResult(
             backend=f"mcr_{family}", loglik=ll,
             aic=2*k - 2*ll, bic=bic,
             n_params=k, n_obs=n,
-            params_df=pf, t_stats=t_s, model_obj=result,
+            params_df=pf, t_stats=t_s, model_obj=fitted,
         )
     except Exception as e:
         log.debug(f"mcr_{family} failed: {e}")

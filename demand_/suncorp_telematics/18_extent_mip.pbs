@@ -1,0 +1,89 @@
+#!/bin/bash -l
+#PBS -N suncorp_extent_mip
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=4:mem=16GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+#PBS -J 1-4
+
+# Job 18: pure-speeding P4 solved separately per planning extent around
+# Suncorp Stadium (array job: 4 extents, one task each). Requires 47/43
+# segment predictions; chain after 17b (or run once those outputs exist).
+# Small extents auto-scale K and step down on infeasibility (see 48b audit).
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results
+FIG_DIR=$PROJ_DIR/figures
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export JAX_PLATFORMS=cpu
+
+case "$PBS_ARRAY_INDEX" in
+  1) RADIUS=1000;  TAG=precinct_1km  ;;
+  2) RADIUS=2000;  TAG=inner_2km     ;;
+  3) RADIUS=3500;  TAG=district_3p5km;;
+  4) RADIUS=0;     TAG=full          ;;
+  *) echo "FATAL: unexpected PBS_ARRAY_INDEX=$PBS_ARRAY_INDEX"; exit 1 ;;
+esac
+
+echo "=================================================================="
+echo "Job $PBS_JOBID task $PBS_ARRAY_INDEX started on $(hostname) at $(date)"
+echo "Extent: $TAG (radius=${RADIUS} m)"
+echo "=================================================================="
+
+cd "$SCRIPT_DIR"
+[ -s "$RESULTS_DIR/segment_speeding_pred_fixture_hourly.csv.gz" ] \
+  || [ -s "$RESULTS_DIR/finable_speeding_segments.csv" ] \
+  || { echo "FATAL: no segment predictions (run 43 or 17a/17b first)"; exit 1; }
+
+python -u 48b_extent_mip.py --radius-m "$RADIUS" --tag "$TAG" \
+  --k 0 --k-full 14 --delta-m 800 2>&1
+EXIT_CODE=$?
+
+MIP_CSV="$RESULTS_DIR/extent_posts_${TAG}.csv"
+if [ -s "$MIP_CSV" ]; then
+  MIP_HEADER=$(head -n 1 "$MIP_CSV")
+  case "$MIP_HEADER" in
+    *road_osmid*post_geometry*)
+      echo "OK: segment-level extent_posts_${TAG}.csv"
+      ;;
+    *)
+      echo "FATAL: extent output for $TAG lacks road_osmid/post_geometry columns"
+      EXIT_CODE=1
+      ;;
+  esac
+else
+  echo "FATAL: missing extent output for $TAG"
+  EXIT_CODE=1
+fi
+
+# --- sync this extent's outputs into the manuscript tree (single source of
+# truth: pipeline writes results/ + figures/; the paper reads
+# manuscript/results/ + manuscript/figures/). Per-task sync only touches its
+# own tag, so parallel array tasks never race.
+echo ""
+echo "Syncing extent $TAG into manuscript/..."
+MS_DIR=$PROJ_DIR/manuscript
+mkdir -p "$MS_DIR/results" "$MS_DIR/figures"
+[ -f "$RESULTS_DIR/extent_posts_${TAG}.tex" ] \
+  && cp -u "$RESULTS_DIR/extent_posts_${TAG}.tex" "$MS_DIR/results/extent_posts_${TAG}.tex" \
+  && echo "  sync results/extent_posts_${TAG}.tex"
+[ -f "$FIG_DIR/extent_posts_${TAG}.png" ] \
+  && cp -u "$FIG_DIR/extent_posts_${TAG}.png" "$MS_DIR/figures/extent_posts_${TAG}.png" \
+  && echo "  sync figures/extent_posts_${TAG}.png"
+
+echo "=================================================================="
+echo "Task $PBS_ARRAY_INDEX ($TAG) finished at $(date) - exit_code=$EXIT_CODE"
+echo "=================================================================="
+exit $EXIT_CODE

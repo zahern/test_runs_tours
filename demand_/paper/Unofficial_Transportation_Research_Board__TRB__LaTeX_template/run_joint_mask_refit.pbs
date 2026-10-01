@@ -1,0 +1,48 @@
+#!/bin/bash -l
+#PBS -N joint_mask_refit
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -j oe
+#PBS -r n
+# Significance pruning for the Gumbel joint-searched masks (promoted
+# eb_search_joint_best.csv: HB 25 / crash 16 vars). The joint search scores
+# raw joint BIC with no per-coefficient penalty, so its masks are large;
+# this job refits each mask as fixed-effect NB (VMT-years exposure offset)
+# and backward-eliminates to p<0.10, supplying the coefficient tables +
+# significance verdicts the search itself does not record.
+# Outputs (project root = paper inputs, auto-populate the gated tables):
+#   joint_mask_refit_{hb,crash}.tex/.csv, joint_mask_refit_verdict.csv
+# Est: minutes to ~2h on 4 cpus (HB-25 elimination dominates).
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+# ALWAYS ensure the pinned estimator: flock-serialized so concurrent paper jobs
+# don't race pip into the shared env (hardened after jobs 25258209/25271015).
+mkdir -p /mnt/hpccs01/home/ahernz/test_runs_tours/code
+(
+    flock -w 900 9 2>/dev/null || echo "(flock unavailable, proceeding without lock)"
+    pip install --quiet --upgrade --retries 5 --timeout 60 "metacountregressor==1.0.154" 2>&1 | tail -5
+) 9>/mnt/hpccs01/home/ahernz/test_runs_tours/code/.pkg_upgrade.lock
+# Hard gate (this file has NO `set -e`, so a bare failing assert would NOT stop
+# the job -- reads distribution metadata, NOT m.__version__).
+python -c "from importlib.metadata import version as _v; v=tuple(map(int, _v('metacountregressor').split('.')[:3])); assert v>=(1,0,154), f\"stale mcr {_v('metacountregressor')} -- aborting\"; print('mcr', _v('metacountregressor'), 'OK')" || exit 1
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
+export JAX_PLATFORMS=cpu
+cd "$PROJ_DIR"
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+python -u joint_mask_refit.py --data "$PROJ_DIR/near_miss_hb_ecf.csv" --out-dir "$PROJ_DIR" --masks-csv "$PROJ_DIR/eb_search_joint_best.csv" 2>&1
+EXIT_CODE=$?
+# Gate: pruned coefficient tables + verdict must exist.
+for f in "$PROJ_DIR/joint_mask_refit_hb.tex" "$PROJ_DIR/joint_mask_refit_hb.csv" \
+         "$PROJ_DIR/joint_mask_refit_crash.tex" "$PROJ_DIR/joint_mask_refit_crash.csv" \
+         "$PROJ_DIR/joint_mask_refit_verdict.csv"; do
+  if [ ! -f "$f" ]; then echo "MISSING mask-refit output: $f"; EXIT_CODE=1; fi
+done
+echo "Job finished at $(date) exit=$EXIT_CODE"
+exit $EXIT_CODE

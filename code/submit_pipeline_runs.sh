@@ -34,6 +34,7 @@ PAPER_BANDIT_EXPERIMENT=0       # sa_bandit ga+ga_staged + safety chain for pape
 STAGE5_SMOKE_PRESET=0           # ga_stage5_smoke only (quick wiring check)
 GA_ESTIMATOR=default            # GA_ESTIMATOR for the primary MODES above
 INSTALL_ESTIMATORS=1            # default: install latest estimator packages at job start
+GA_ENGINE="${GA_ENGINE:-agds}"  # search engine for GA stages: agds|ga|sa|bandit|portfolio (default SparseEA-AGDS)
 GA_USE_SA=0                     # 1 = force SimulatedAnnealing for all stages (overrides per-stage logic)
 GA_BUDGET="${GA_BUDGET:-standard}"  # budget profile passed to PBS jobs: smoke|ultrafast|fast|standard|thorough
 GA_BUDGET_BANDIT="${GA_BUDGET_BANDIT:-ultrafast}"  # budget override for SA-Bandit chain (ultrafast ~45min/purpose for MetaCount)
@@ -50,7 +51,7 @@ ANALYSIS_MEM=32GB
 ANALYSIS_WALLTIME=02:00:00
 PAPER_COLLECT_MEM=8GB
 PAPER_COLLECT_WALLTIME=01:00:00
-# MCR ExperimentBuilder structure-search jobs (metacountregressor 1.0.49+)
+# MCR ExperimentBuilder structure-search jobs (metacountregressor 1.0.150+)
 # Each family (count, duration, linear, cmf) runs an independent PBS job.
 # --mcr-algo all submits SA+DE+HS variants per family (3× more jobs).
 INCLUDE_MCR_SEARCH=0
@@ -148,7 +149,7 @@ Options:
                              --run-root before submit.
                              WARNING: destructive. Leave off unless needed.
      --include-mcr-search           Submit MCR ExperimentBuilder structure-search jobs
-                                    (metacountregressor 1.0.49+ required).
+                                    (metacountregressor 1.0.150+ required).
                                     One PBS job per family (default: count, duration, linear).
                                     Use --mcr-algo all to also run DE and HS variants.
      --mcr-algo sa|de|hs|all        Search algorithm for MCR jobs.   Default: sa
@@ -720,7 +721,7 @@ submit_one() {
         job_name="saw_${mode}_${estimator}"
     fi
     local vars out_f err_f
-    vars="MODE=${mode},ZONE_ARG=${ZONE_ARG},CONDA_ENV=${CONDA_ENV},THREADS=${THREADS},S5_WORKERS=${S5_WORKERS},RUN_ROOT=${RUN_ROOT},PIPELINE_ACCELERATOR=${ACCELERATOR},GA_ESTIMATOR=${estimator},INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-0},GA_BUDGET=${GA_BUDGET}"
+    vars="MODE=${mode},ZONE_ARG=${ZONE_ARG},CONDA_ENV=${CONDA_ENV},THREADS=${THREADS},S5_WORKERS=${S5_WORKERS},RUN_ROOT=${RUN_ROOT},PIPELINE_ACCELERATOR=${ACCELERATOR},GA_ESTIMATOR=${estimator},INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS},GA_ENGINE=${GA_ENGINE},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-0},GA_BUDGET=${GA_BUDGET}"
     if [ -n "$GA_PARALLEL_SEGMENTS" ]; then
         vars="${vars},GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS}"
     fi
@@ -937,9 +938,9 @@ submit_ga_estimator_chain() {
 # Sets GA_ESTIMATOR=sa_bandit, GA_USE_BANDIT_SA=1, GA_USE_SA=1.
 # Run dirs land in sa_ga_sa_bandit__<JOBID>/ and sa_ga_staged_sa_bandit__<JOBID>/
 # because pbs_pipeline_mode.pbs prepends sa_ when GA_USE_SA=1 or GA_USE_BANDIT_SA=1.
-# The PBS install block forces ESTIMATOR_SOURCE=editable when GA_USE_BANDIT_SA=1
-# so MetaCount (adaptive_search.BanditGuidedSA) and SearchLibrium (banditsa.BanditSA)
-# are installed from the upstream HPC source paths.
+# Estimators stay on PyPI-latest (the bandit-SA modules ship in
+# metacountregressor>=1.0.151 / SearchLibrium>=0.0.154); pass
+# ESTIMATOR_SOURCE=editable explicitly only for package development.
 submit_sa_bandit_chain() {
     local depend="${1:-}"
     local _prev_sa="$GA_USE_SA"
@@ -1339,7 +1340,7 @@ fi
 # One PBS job per (family, algo) combination.  All run independently (parallel).
 # Families: count, duration, linear  [+ cmf if --mcr-families includes it]
 # Algorithms: sa | de | hs | all
-# metacountregressor 1.0.49+ required; jaxopt must be in the environment.
+# metacountregressor 1.0.150+ required; jaxopt must be in the environment.
 if [ "$INCLUDE_MCR_SEARCH" -eq 1 ]; then
     # MCR search jobs are independent of the main pipeline chain.
     # Pass an optional dependency on main if --sequential was given.

@@ -1,0 +1,102 @@
+#!/bin/bash -l
+# Build EXACT drive-egress time + transfer-wait skims (r5py DetailedItineraries)
+# and embed them into the 371-zone OMX.
+#
+# Fills the two transit-LOS matrices missing from ../demand_/skims_371.omx:
+#   WLK_LOC_DRV_DTIM__AM   drive-egress leg minutes (park-and-ride egress)
+#   WLK_LOC_WLK_XWAIT__AM  transfer-wait minutes (replaces the WAIT/BOARDS
+#                          approximation the pipeline currently derives)
+# The pipeline consumes real matrices automatically when present (DTIM over
+# its TOTIVT proxy; derived XWAIT is skipped).
+#
+# Runtime: itineraries cost ~1 s+/OD over the 137k grid — this does NOT fit one
+# slot. Origins run in batches with per-batch parquet checkpoints
+# (saved_data/dtim_xwait_work/); if walltime kills the job, resubmit the SAME
+# command to resume (completed origins are skipped). Expect ~2 chained 48 h
+# slots for the full build.
+# Smoke test first (recommended): qsub -v ORIGIN_STEP=20 job_transit_dtim.pbs
+#
+# Submit from the code dir:
+#   qsub job_transit_dtim.pbs
+# DTIM only:  qsub -v DTIM_ONLY=1 job_transit_dtim.pbs
+# XWAIT only: qsub -v XWAIT_ONLY=1 job_transit_dtim.pbs
+#PBS -N transit_dtim_xwait
+#PBS -m n
+#PBS -r y
+# 128 GB + exclusive placement: 19-origin DetailedItineraries frames OOMed a
+# 64 GB slot in 5 min (job 25329147: 65.4 GB RSS during the probe). Batches are
+# smaller now (BATCH_ORIGINS=6) but the 4 h-window SEQ+GTFS network is heavy;
+# place=excl also keeps the cgroup contiguous (no split-slice OOM).
+#PBS -l select=1:ncpus=8:mem=128GB
+#PBS -l place=excl
+#PBS -l walltime=48:00:00
+
+set -euo pipefail
+
+# geotfenv: fresh conda-forge env with a working r5py/geopandas/openmatrix
+# (zigenv has a broken pip/conda-mixed geopandas install — do not use it here)
+CONDA_ENV=${CONDA_ENV:-geotfenv}
+
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# Defensive PATH: activation can lose the PATH-order fight against the
+# Anaconda3 module (bare `python` then resolves to the module interpreter
+# instead of the env's, so imports fail despite being installed). Pin the
+# env first and clear bash's cached command paths.
+export PATH="$CONDA_PREFIX/bin:$PATH"
+hash -r
+echo "[env] python=$(which python) prefix=$CONDA_PREFIX"
+
+# Force UTF-8 I/O
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+# r5py uses Java heavily
+export OMP_NUM_THREADS=2
+export OPENBLAS_NUM_THREADS=2
+export MKL_NUM_THREADS=2
+
+# Set Java heap for r5py
+export JAVA_TOOL_OPTIONS="-Xmx12G"
+
+# Batched resume build (ORIGIN_STEP/BATCH_ORIGINS/DTIM_ONLY/XWAIT_ONLY
+# honoured by the builder; defaults = full grid, 19 origins per checkpoint)
+export ORIGIN_STEP=${ORIGIN_STEP:-1}
+export BATCH_ORIGINS=${BATCH_ORIGINS:-19}
+
+echo "=== Verify r5py/geopandas imports ==="
+python -c "
+import r5py; print('r5py:', r5py.__version__)
+import openmatrix as omx; print('openmatrix OK')
+import geopandas; print('geopandas OK')
+try:
+    import pyarrow; print('pyarrow OK (parquet checkpoints)')
+except ImportError:
+    print('pyarrow MISSING (pickle checkpoints will be used instead)')
+"
+
+echo "=== Build DTIM + XWAIT skims (resumable) ==="
+python -u build_transit_dtim_xwait.py 2>&1
+EXIT_CODE=$?
+
+echo "=== Verify OMX ==="
+python -c "
+import openmatrix as omx
+import numpy as np
+f = omx.open_file('../demand_/skims_371.omx', 'r')
+for name in ['WLK_LOC_DRV_DTIM__AM', 'WLK_LOC_WLK_XWAIT__AM']:
+    if name in f:
+        a = np.asarray(f[name][:], dtype=float)
+        print(f'{name}: mean={np.nanmean(a):.1f} nonzero={(a > 0).mean():.1%} nan={np.isnan(a).sum()}')
+    else:
+        print(f'{name}: MISSING')
+f.close()
+"
+
+echo "=== Done (exit_code=${EXIT_CODE}; resubmit same command to continue if batches remain) ==="
+exit "${EXIT_CODE}"

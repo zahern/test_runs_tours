@@ -1,0 +1,100 @@
+#!/bin/bash -l
+#PBS -m n
+#PBS -r y
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=4:mem=128GB
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+
+CONDA_ENV="${CONDA_ENV:-zigenv}"
+STAGE5_ARM="${STAGE5_ARM:?STAGE5_ARM is required}"
+STAGE5_DEST_ESTIMATOR="${STAGE5_DEST_ESTIMATOR:?STAGE5_DEST_ESTIMATOR is required}"
+STAGE5_COMPARE_DIR="${STAGE5_COMPARE_DIR:-runs/stage5_compare/${STAGE5_ARM}_${PBS_JOBID:-local}}"
+STAGE5_DEST_SAMPLE_SIZE="${STAGE5_DEST_SAMPLE_SIZE:-20}"
+STAGE5_CONVERGENCE_MIN_ESS="${STAGE5_CONVERGENCE_MIN_ESS:-20}"
+STAGE5_REQUIRED_SEGMENTS="${STAGE5_REQUIRED_SEGMENTS:-work,edu,nonmand}"
+THREADS="${THREADS:-1}"
+PIPELINE_ACCELERATOR="${PIPELINE_ACCELERATOR:-cpu}"
+ESTIMATOR_SOURCE="${ESTIMATOR_SOURCE:-pypi}"
+# Default 0: compute nodes cannot reach PyPI (pypi.ngc.nvidia.com does not
+# resolve there) and both larch + SearchLibrium are already in zigenv, so a
+# forced `pip install --upgrade` only adds a fatal network dependency.
+# Pass -v INSTALL_ESTIMATORS=1 to force a refresh; failures warn, not abort.
+INSTALL_ESTIMATORS="${INSTALL_ESTIMATORS:-0}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV}"
+module unload Anaconda3
+
+if [[ "${INSTALL_ESTIMATORS}" == "1" ]]; then
+    set +e
+    if [[ "${ESTIMATOR_SOURCE}" == "editable" && -d "/mnt/hpccs01/home/ahernz/source/SearchLibrium" ]]; then
+        pip install -e /mnt/hpccs01/home/ahernz/source/SearchLibrium --upgrade -q
+    else
+        pip install --upgrade -q SearchLibrium
+    fi
+    _pip_rc=$?
+    set -e
+    if [[ ${_pip_rc} -ne 0 ]]; then
+        echo "WARNING: estimator refresh failed (rc=${_pip_rc}); continuing with env packages" >&2
+    fi
+fi
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export PYTHONPATH="${PBS_O_WORKDIR}:${PYTHONPATH:-}"
+export PIPELINE_ACCELERATOR
+export JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
+export LARCH_FORCE_JAX="${LARCH_FORCE_JAX:-1}"
+export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+export OMP_NUM_THREADS="${THREADS}"
+export OPENBLAS_NUM_THREADS="${THREADS}"
+export MKL_NUM_THREADS="${THREADS}"
+export NUMEXPR_NUM_THREADS="${THREADS}"
+
+export NEW_POP="${NEW_POP:-1}"
+export NEW_POP_MAPPED="${NEW_POP_MAPPED:-0}"
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+if [[ -z "${PIPELINE_SKIMS_PATH:-}" && "${NEW_POP}" == "1" && "${NEW_POP_MAPPED}" != "1" ]]; then
+    export PIPELINE_SKIMS_PATH="../demand_/skims_371.omx"
+fi
+
+export STAGE5_ARM STAGE5_DEST_ESTIMATOR STAGE5_DEST_SAMPLE_SIZE
+export STAGE5_CONVERGENCE_MIN_ESS STAGE5_REQUIRED_SEGMENTS
+export STAGE5_REQUIRE_DEST_ESTIMATION="${STAGE5_REQUIRE_DEST_ESTIMATION:-1}"
+export STAGE5_STRICT_ESTIMATION="${STAGE5_STRICT_ESTIMATION:-1}"
+export STAGE5_MIN_TOURS="${STAGE5_MIN_TOURS:-30}"
+export STAGE5_CLEAR_SHARROW_CACHE="${STAGE5_CLEAR_SHARROW_CACHE:-1}"
+export STAGE5_ENABLE_MXL="${STAGE5_ENABLE_MXL:-0}"
+export STAGE5_ENABLE_GSE="${STAGE5_ENABLE_GSE:-0}"
+
+mkdir -p "${STAGE5_COMPARE_DIR}/plots"
+LOG_OUT="${STAGE5_COMPARE_DIR}/job.out"
+LOG_ERR="${STAGE5_COMPARE_DIR}/job.err"
+{
+    echo "Stage 5 estimator comparison arm"
+    echo "PBS job       : ${PBS_JOBID:-local}"
+    echo "Arm           : ${STAGE5_ARM}"
+    echo "Estimator     : ${STAGE5_DEST_ESTIMATOR}"
+    echo "Output        : ${STAGE5_COMPARE_DIR}"
+    echo "Skims         : ${PIPELINE_SKIMS_PATH:-default}"
+    echo "Started       : $(date)"
+} | tee -a "${LOG_OUT}"
+
+set +e
+python -u stage5_compare_runner.py \
+    --out-dir "${STAGE5_COMPARE_DIR}" \
+    --min-ess "${STAGE5_CONVERGENCE_MIN_ESS}" \
+    --required-segments "${STAGE5_REQUIRED_SEGMENTS}" \
+    > "${STAGE5_COMPARE_DIR}/runner.stdout" \
+    2> "${STAGE5_COMPARE_DIR}/runner.stderr"
+EXIT_CODE=$?
+set -e
+
+cat "${STAGE5_COMPARE_DIR}/runner.stdout" >> "${LOG_OUT}"
+cat "${STAGE5_COMPARE_DIR}/runner.stderr" >> "${LOG_ERR}"
+echo "Finished: $(date) exit_code=${EXIT_CODE}" | tee -a "${LOG_OUT}"
+exit "${EXIT_CODE}"

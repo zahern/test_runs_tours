@@ -90,6 +90,42 @@ def parse_origin_dat(path: str) -> dict[int, set[int]]:
     return zone_nodes
 
 
+def build_origin_link_map(origin_dat_path: str) -> dict[int, tuple[int, int]]:
+    """Build {zone_id: (usec, dsec)} from a DynusT origin.dat.
+
+    Each zone lists its generation links ("usec dsec length"); the FIRST link
+    (with distinct nodes) is chosen as the representative generation link for
+    the zone. DynusT rejects vehicles whose upstream == downstream node, so
+    zones with no distinct-node link are simply omitted — callers should drop
+    vehicles for those zones.
+    """
+    links: dict[int, tuple[int, int]] = {}
+    with open(origin_dat_path) as f:
+        lines = f.read().split('\n')
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+        parts = line.split()
+        if len(parts) < 3 or not parts[1].isdigit():
+            i += 1
+            continue
+        zid, n_conn = int(parts[0]), int(parts[1])
+        for k in range(1, n_conn + 1):
+            if i + k >= n:
+                break
+            toks = lines[i + k].split()
+            if len(toks) >= 2:
+                u, d = int(toks[0]), int(toks[1])
+                if u != d:
+                    links[zid] = (u, d)
+                    break
+        i += n_conn + 1
+    return links
+
+
 def build_dynust_zone_centroids(dta_dir: str) -> pd.DataFrame:
     """Return DataFrame[zone, utm_e, utm_n, lon, lat, n_nodes] for every
     DynusT zone in the network at dta_dir, using origin.dat connector

@@ -1,0 +1,94 @@
+#!/bin/bash -l
+#PBS -N run_new_python_additions
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r n
+# No-restarts policy: do not auto-rerun.
+
+# Cluster paths
+SCRIPT_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template
+DATA_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_
+RESULTS_DIR=$DATA_DIR/results
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+mkdir -p "$RESULTS_DIR"
+
+# Ensure metacountregressor is at the latest version
+echo "Upgrading metacountregressor ..."
+pip install --upgrade metacountregressor 2>&1 | tail -3
+
+# JAX / XLA settings — CPU-only analysis
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
+export JAX_PLATFORMS=cpu
+export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
+cd "$SCRIPT_DIR"
+
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "Script dir:  $SCRIPT_DIR"
+echo "Data:        $DATA_DIR"
+echo "Results dir: $RESULTS_DIR (archival copy; see below)"
+
+# Run the new Python additions
+echo ""
+echo "============================================"
+echo "Running hb_time_intervention.py"
+echo "============================================"
+python -u hb_time_intervention.py \
+    --out-dir "$SCRIPT_DIR"
+EXIT1=$?
+echo "[$(date)] hb_time_intervention.py finished  exit_code=$EXIT1"
+if [ "$EXIT1" -ne 0 ]; then
+    echo "hb_time_intervention.py FAILED"
+fi
+
+echo ""
+echo "============================================"
+echo "Running hb_randomwalk_validation.py"
+echo "============================================"
+python -u hb_randomwalk_validation.py \
+    --out-dir "$SCRIPT_DIR"
+EXIT2=$?
+echo "[$(date)] hb_randomwalk_validation.py finished  exit_code=$EXIT2"
+if [ "$EXIT2" -ne 0 ]; then
+    echo "hb_randomwalk_validation.py FAILED"
+fi
+
+echo ""
+echo "============================================"
+echo "Running trb_empirical_bayes.py"
+echo "============================================"
+python -u trb_empirical_bayes.py
+EXIT3=$?
+echo "[$(date)] trb_empirical_bayes.py finished  exit_code=$EXIT3"
+if [ "$EXIT3" -ne 0 ]; then
+    echo "trb_empirical_bayes.py FAILED"
+fi
+
+echo ""
+echo "============================================"
+echo "Running nearmiss_hb_analysis.py"
+echo "============================================"
+python -u nearmiss_hb_analysis.py
+EXIT4=$?
+echo "[$(date)] nearmiss_hb_analysis.py finished  exit_code=$EXIT4"
+if [ "$EXIT4" -ne 0 ]; then
+    echo "nearmiss_hb_analysis.py FAILED"
+fi
+
+echo ""
+echo "Job finished at $(date) — exit_code=$((EXIT1 + EXIT2 + EXIT3 + EXIT4))"
+if [ $((EXIT1 + EXIT2 + EXIT3 + EXIT4)) -ne 0 ]; then
+    echo "One or more analyses FAILED -- check the PBS .o file for the full traceback above"
+fi
+exit $((EXIT1 + EXIT2 + EXIT3 + EXIT4))

@@ -6,7 +6,7 @@ in saved_data/zone_ids_sa2/ and save the result to saved_data/synth_population.c
 
 This script is a one-time (or re-run-on-demand) pre-processing step.  Once
 synth_population.csv exists the pipeline can load it directly — much faster
-than re-reading 329 zone CSVs every run.
+than re-reading 371 zone CSVs every run.
 
 What it does
 ------------
@@ -24,7 +24,7 @@ What it does
 
 Usage
 -----
-    # Build from all 329 zones (default — takes ~2 min):
+    # Build from all 371 zones (default — takes ~2 min):
     python build_synth_population.py
 
     # Build from a subset of zones for testing:
@@ -624,18 +624,24 @@ def build_synth_population(
 # 324-ZONE MAPPED POPULATION  (new_pop files → ORDER-based OTAZ)
 # ---------------------------------------------------------------------------
 
-#: SA2->ORDER crosswalk. Prefer the 371-zone rebuild
+#: SA2->ORDER crosswalk. HARD REQUIREMENT: the 371-zone rebuild
 #: (demand_/20b_build_sa2_to_order_crosswalk_371.py) so mapped-ORDER lines up
-#: with the 371 landuse+skim; fall back to the legacy 330-system crosswalk
-#: (demand_/20_build_sa2_to_order_crosswalk.py) only if the 371 file is absent.
-#: Override explicitly with SA2_ORDER_CROSSWALK.
+#: with the 371 landuse+skim. The legacy 330-system crosswalk is NEVER used —
+#: ORDER 330 is a real zone in the 371 system. Override explicitly with
+#: SA2_ORDER_CROSSWALK (must still be a 371-system file).
 _demand_dir = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'demand_'))
 _xwalk_371 = os.path.join(_demand_dir, 'sa2_to_order_crosswalk_371.csv')
 _xwalk_legacy = os.path.join(_demand_dir, 'sa2_to_order_crosswalk.csv')
+if os.path.exists(_xwalk_legacy) and not os.path.exists(_xwalk_371):
+    raise FileNotFoundError(
+        f"371-zone crosswalk not found: {_xwalk_371}\n"
+        f"Refusing to fall back to legacy 330-system {_xwalk_legacy}. "
+        f"Run demand_/20b_build_sa2_to_order_crosswalk_371.py first."
+    )
 _DEFAULT_CROSSWALK = (
     os.environ.get('SA2_ORDER_CROSSWALK')
-    or (_xwalk_371 if os.path.exists(_xwalk_371) else _xwalk_legacy)
+    or _xwalk_371
 )
 
 OUT_MAPPED_FULL    = 'saved_data/synth_population_mapped.csv'
@@ -655,20 +661,20 @@ def build_synth_population_mapped(
 ) -> pd.DataFrame:
     """
     Load the new_pop 507-zone SA2 files, remap OTAZ from SA2 code → ORDER
-    number using demand_/sa2_to_order_crosswalk.csv, and return an enriched
-    synthetic population ready for the 329-zone pipeline.
+    number using demand_/sa2_to_order_crosswalk_371.csv, and return an enriched
+    synthetic population ready for the 371-zone pipeline.
 
-    Non-324-zone SA2 people are merged into their nearest 324-zone neighbour's
-    ORDER zone (crosswalk match_type='via_nearest_324').  Zones with zero
-    persons in the new_pop CSV files are silently skipped.
+    Zones with zero persons in the new_pop CSV files are reported and left
+    blank — they are NEVER backfilled from legacy 330-system order_N.csv
+    files (misaligned ORDER scheme).
 
-    Run demand_/20_build_sa2_to_order_crosswalk.py first to generate the
+    Run demand_/20b_build_sa2_to_order_crosswalk_371.py first to generate the
     crosswalk.
 
     Parameters
     ----------
-    crosswalk_path : path to sa2_to_order_crosswalk.csv
-                     (default: ../demand_/sa2_to_order_crosswalk.csv)
+    crosswalk_path : path to sa2_to_order_crosswalk_371.csv
+                     (default: ../demand_/sa2_to_order_crosswalk_371.csv)
     new_pop_dir    : root of new_pop scope
                      (default: NEW_POP_DIR env var or Z:/test_runs_tours/new_pop)
     out_full / out_persons / out_summary : output CSV paths
@@ -682,7 +688,8 @@ def build_synth_population_mapped(
     if not os.path.exists(_xwalk_path):
         raise FileNotFoundError(
             f"Crosswalk not found: {_xwalk_path}\n"
-            f"Run demand_/20_build_sa2_to_order_crosswalk.py first."
+            f"Run demand_/20b_build_sa2_to_order_crosswalk_371.py first. "
+            f"The legacy 330-system crosswalk is never accepted."
         )
     _np_dir  = new_pop_dir or os.environ.get('NEW_POP_DIR', NEW_POP_DIR)
     _np_zone = os.path.join(_np_dir, 'saved_data', 'zone_ids_sa2')
@@ -739,58 +746,49 @@ def build_synth_population_mapped(
     if not frames:
         raise ValueError("No zone CSVs loaded — check new_pop_dir and crosswalk.")
 
-    # ── Fill empty SA2 zones from legacy 329-zone order_N.csv files ────────
+    # ── Empty SA2 zones: warn and leave blank ──────────────────────────────
     # Some SA2 zones in the new_pop have zero people in their CSV (skipped_empty).
-    # For those ORDER zones, fall back to the legacy per-zone files so the
-    # destination-choice model still sees people in every ORDER zone.
+    # They are NEVER backfilled from legacy 330-system order_N.csv files: the
+    # legacy ORDER scheme is misaligned with the 371 system and would corrupt
+    # zone indexing downstream.
     if skipped_empty:
         for _empty_sa2 in skipped_empty:
             _empty_order = sa2_to_order.get(_empty_sa2)
-            if _empty_order is None:
-                continue
-            _legacy_path = os.path.join(SYNTH_DIR, f'order_{_empty_order}.csv')
-            if os.path.exists(_legacy_path):
-                try:
-                    _df = pd.read_csv(_legacy_path, low_memory=False)
-                    if len(_df) > 0:
-                        _df['OTAZ']     = _empty_order
-                        _df['HOME_SA2'] = _empty_sa2
-                        _df['_in324']   = 1 if _empty_sa2 in sa2_in_324 else 0
-                        frames.append(_df)
-                        logger.info(
-                            f"  Filled empty SA2 {_empty_sa2} → ORDER {_empty_order} "
-                            f"from legacy {_legacy_path} ({len(_df):,} persons)"
-                        )
-                except Exception as _leg_exc:
-                    logger.warning(
-                        f"  Legacy fallback failed for SA2 {_empty_sa2} "
-                        f"ORDER {_empty_order}: {_leg_exc}"
-                    )
-            else:
-                logger.warning(
-                    f"  No legacy fallback for empty SA2 {_empty_sa2} "
-                    f"(ORDER {_empty_order}) — {_legacy_path} not found; zone left blank"
-                )
+            logger.warning(
+                f"  Empty SA2 {_empty_sa2} (ORDER {_empty_order}) has zero "
+                f"persons — zone left blank (no legacy backfill on 371 system)"
+            )
 
     synth = pd.concat(frames, ignore_index=True)
 
-    # Assign person_id using HOME_SA2 (original SA2 code, unique per source file)
-    # NOT OTAZ (ORDER), because multiple SA2s can map to the same ORDER zone which
-    # causes OTAZ * 1M + abspid collisions for people whose abspid values overlap.
+    # Assign person_id as a compact, collision-free integer: HOME_SA2 * 1M +
+    # dense rank within the SA2.
+    #
+    # HOME_SA2 (not OTAZ/ORDER) is correct because multiple SA2s map to the same
+    # ORDER zone. But the `+ abspid` term is unsound and was removed: measured
+    # over all 325 zone files in saved_data/zone_ids_sa2 (3,745,771 persons),
+    # abspid is neither unique within a file nor bounded by the 1M stride
+    # (max 1,048,569), so:
+    #     OTAZ*1e6 + abspid       -> 134,726 colliding rows
+    #     HOME_SA2*1e6 + abspid   ->  36,729 colliding rows  (still broken)
+    #     HOME_SA2*1e6 + rank     ->       0 collisions
+    # Dense rank within an SA2 peaks at 25,466, so the 1M stride is ample.
+    # See pipeline_logger.py's equivalent block for the full measurement.
     id_src = next((c for c in ['abspid', 'PERSID'] if c in synth.columns), None)
-    if id_src:
-        synth['person_id'] = (
-            synth['HOME_SA2'].astype(np.int64) * 1_000_000
-            + synth[id_src].astype(np.int64)
-        )
-        if synth['person_id'].duplicated().any():
-            n_dup = synth['person_id'].duplicated().sum()
-            logger.warning(f"  {n_dup:,} duplicate person_ids even with HOME_SA2 — falling back to row index")
-            synth['person_id'] = np.arange(len(synth), dtype=np.int64)
-        else:
-            logger.info(f"  person_id: {synth['person_id'].nunique():,} unique (HOME_SA2 × 1M + {id_src})")
-    else:
+    synth['person_id'] = (
+        synth['HOME_SA2'].astype(np.int64) * 1_000_000
+        + synth.groupby('HOME_SA2').cumcount().astype(np.int64)
+    )
+    if synth['person_id'].duplicated().any():
+        n_dup = int(synth['person_id'].duplicated().sum())
+        logger.warning(f"  {n_dup:,} duplicate person_ids even with HOME_SA2 rank "
+                       f"— falling back to row index")
         synth['person_id'] = np.arange(len(synth), dtype=np.int64)
+    else:
+        logger.info(f"  person_id: {synth['person_id'].nunique():,} unique "
+                    f"(HOME_SA2 × 1M + dense rank within SA2"
+                    + (f"; ignored unsound id column {id_src}" if id_src else "")
+                    + ")")
 
     n_in324 = int((synth['_in324'] == 1).sum())
     logger.info(

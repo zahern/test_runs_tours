@@ -81,7 +81,7 @@ import openmatrix as omx
 import pipeline_logger as pl
 from stage6_plan_finalisation import run_stage6
 from spatial_assignment import get_zone_centroids_rich
-from build_dynust_zone_crosswalk import build_crosswalk
+from build_dynust_zone_crosswalk import build_crosswalk, build_origin_link_map
 
 # Target network switched 2026-07: DTA_Brisbane_tested's zone files were
 # stale from 2019-01; SEQ_Running_UE is the actively-maintained network
@@ -192,6 +192,18 @@ def main() -> None:
     sa2_geo = get_zone_centroids_rich(landuse, cache_dir='saved_data/osm_cache')
     sa2_geo = sa2_geo[['ORDER', 'lat', 'lon']].copy()
 
+    # Generation-link nodes per zone from the network's origin.dat. Without
+    # this, vehicles fall back to usec=dsec=zone and DynusT rejects them
+    # ("UP AND DOWNSTREAM NODES are the same").
+    origin_dat = os.path.join(DTA_DIR, 'origin.dat')
+    if os.path.exists(origin_dat):
+        origin_link_map = build_origin_link_map(origin_dat)
+        print(f"  origin.dat generation links: {len(origin_link_map)} zones")
+    else:
+        origin_link_map = None
+        print(f"  WARNING: {origin_dat} missing — vehicle.dat will have "
+              f"degenerate generation links and may be rejected by DynusT")
+
     run_stage6(
         plan                  = scheduled_dest,
         persons               = hhts_persons,
@@ -204,6 +216,7 @@ def main() -> None:
         repair_dwells         = False,   # stage5_models not reloaded in this script — skip repair loop
         dynus_sim_start_min   = 360,
         dynus_value_of_time   = 15.0,
+        origin_link_map       = origin_link_map,
     )
     skims.close()
 
@@ -216,6 +229,14 @@ def main() -> None:
         print(f"Backed up existing vehicle.dat -> {backup}")
     shutil.copy2(src, dst)
     print(f"vehicle.dat written -> {dst}")
+
+    # path.dat must ship with vehicle.dat (DynusT terminates at demand
+    # generation if path.dat is empty).
+    src_p = os.path.join(SCRATCH_DIR, 'path.dat')
+    dst_p = os.path.join(DTA_DIR, 'path.dat')
+    if os.path.exists(src_p):
+        shutil.copy2(src_p, dst_p)
+        print(f"path.dat written -> {dst_p}")
 
 
 if __name__ == '__main__':

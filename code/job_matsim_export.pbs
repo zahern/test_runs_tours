@@ -1,0 +1,66 @@
+#!/bin/bash -l
+# Export a completed tours-pipeline run to a MATSim scenario
+# (plans.xml + facilities.xml + config.xml) under <RUN_DIR>/matsim.
+#
+# The staged ga_staged prediction job already auto-exports MATSim via the
+# finalisation path (PIPELINE_MATSIM=1). This job is the standalone, re-runnable
+# equivalent: point it at any finished run directory.
+#
+# Usage:
+#   qsub -v "RUN_ROOT=runs/ga_parallel,RUN_TAG=exp1,CONDA_ENV=zigenv" job_matsim_export.pbs
+#   qsub -v "RUN_DIR=runs/agds_metacount_mv_staged__12345,CONDA_ENV=zigenv" job_matsim_export.pbs
+#   qsub -v "RUN_DIR_MARKER=runs/ga_parallel/exp1/prediction_run_dir.txt,CONDA_ENV=zigenv" job_matsim_export.pbs
+
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=1:mem=16GB
+#PBS -l walltime=00:30:00
+
+set -euo pipefail
+
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:-}
+RUN_DIR=${RUN_DIR:-}
+RUN_DIR_MARKER=${RUN_DIR_MARKER:-}
+MATSIM_CRS=${MATSIM_CRS:-EPSG:28356}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+
+cd "$PBS_O_WORKDIR"
+
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+conda activate "$CONDA_ENV"
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+# Resolve the run directory:
+# 1. Explicit RUN_DIR wins
+# 2. RUN_DIR_MARKER file (written by prediction job) wins
+# 3. RUN_ROOT + RUN_TAG fallback
+if [ -n "${RUN_DIR_MARKER}" ] && [ -f "${RUN_DIR_MARKER}" ]; then
+  RUN_DIR=$(cat "${RUN_DIR_MARKER}" | tr -d '\n\r')
+  echo "Resolved RUN_DIR from marker: ${RUN_DIR}"
+elif [ -z "${RUN_DIR}" ]; then
+  if [ -z "${RUN_TAG}" ]; then
+    echo "ERROR: set RUN_DIR, RUN_DIR_MARKER, or RUN_ROOT + RUN_TAG" >&2
+    exit 2
+  fi
+  RUN_DIR="${RUN_ROOT}/${RUN_TAG}"
+fi
+
+if [ ! -d "${RUN_DIR}" ]; then
+  echo "ERROR: run dir ${RUN_DIR} does not exist" >&2
+  exit 2
+fi
+
+# Guard: only run if a final plan CSV exists somewhere under RUN_DIR
+# (matsim_export walks recursively for stage6_output.csv / trips_for_aimsun.csv).
+if ! find "${RUN_DIR}" -maxdepth 4 \( -name stage6_output.csv -o -name trips_for_aimsun.csv \) 2>/dev/null | grep -q .; then
+  echo "No stage6_output.csv / trips_for_aimsun.csv under ${RUN_DIR} — nothing to export."
+  exit 0
+fi
+
+echo "MATSim export: RUN_DIR=${RUN_DIR}  CRS=${MATSIM_CRS}"
+python -u -X utf8 matsim_export.py --run-dir "${RUN_DIR}" --crs "${MATSIM_CRS}"
+
+echo "MATSim export complete: ${RUN_DIR}/matsim"

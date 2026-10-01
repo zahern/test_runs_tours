@@ -24,6 +24,11 @@ import scipy.special as sp_special
 warnings.filterwarnings("ignore")
 os.environ["JAX_LOG_COMPILES"] = "0"
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _metacount_source import activate as _activate_metacount_source
+
+_activate_metacount_source()
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -245,10 +250,15 @@ def fit_model(df, features, y_col, offset_col, dispersion=1, label="", verbose=F
 # 3. SIMULATED ANNEALING — parsimonious feature selection
 # ===================================================================
 def simulated_annealing_search(df, candidates, y_col, offset_col, max_iter=1200,
-                               label="SA", plot_path=None, p_threshold=0.10,
+                               label="SA-legacy", plot_path=None, p_threshold=0.10,
                                penalty_per_insig=10.0, T_start=8.0, T_end=0.01,
-                               cooling_rate=0.995, n_restarts=3):
-    """Simulated Annealing with significance penalty for parsimonious models.
+                               cooling_rate=0.995, n_restarts=1):
+    """LEGACY Simulated Annealing -- retained only for prior-generation reference.
+
+    The reported search is now the single-run GA
+    (differential_evolution_feature_search, no restarts). This function is
+    kept so older SA tables/figures reproduce, but defaults to a single run
+    (n_restarts=1) to match the no-restarts policy. Do not use for new results.
 
     Algorithm:
       1. Start with a random feature subset at temperature T_start
@@ -408,13 +418,15 @@ def differential_evolution_feature_search(
     label="DE", plot_path=None, p_threshold=0.10,
     penalty_per_insig=10.0, seed=42,
 ):
-    """Differential Evolution for binary feature selection with significance penalty.
+    """Single-run Genetic Algorithm (via differential evolution) for binary
+    feature selection with significance penalty. No restarts.
 
     Each candidate feature gets one continuous gene in [0, 1]; a gene > 0.5
     includes that feature.  scipy's ``differential_evolution`` minimises
-    penalised_BIC = raw_BIC + n_insig * penalty_per_insig.
+    penalised_BIC = raw_BIC + n_insig * penalty_per_insig in ONE continuous
+    run (tol=0, polish=False) so the convergence trace is uninterrupted.
     """
-    print(f"\n  DIFFERENTIAL EVOLUTION [{label}] — y = {y_col}")
+    print(f"\n  GA (single run, no restarts) [{label}] — y = {y_col}")
     print(f"  {len(candidates)} candidates, maxiter={maxiter}, popsize={popsize}, "
           f"p-threshold={p_threshold}, penalty={penalty_per_insig}/insig")
 
@@ -487,14 +499,20 @@ def differential_evolution_feature_search(
         print(f"    {sig:3s} {_V(f):<50s} {p_str}")
 
     if plot_path:
+        # Single-run GA trace: per-generation best (faint) + best-so-far (bold).
+        # history[] holds the generation-best penalised BIC; best_so_far is its
+        # monotone envelope. Plotting both shows improvement AND diversity loss.
         fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(range(1, len(best_so_far) + 1), best_so_far, "darkorange", linewidth=1.2, alpha=0.8)
-        ax.axhline(y=min(best_so_far), color="red", linestyle="--", alpha=0.5,
-                   label=f"Best = {min(best_so_far):.2f}")
-        ax.set_xlabel("Generation")
-        ax.set_ylabel("Penalised BIC (best so far)")
-        ax.set_title(f"Differential Evolution Convergence — {label}\n"
-                     f"(penalty={penalty_per_insig} per p > {p_threshold})")
+        gens = range(1, len(history) + 1)
+        ax.plot(gens, history, color="darkorange", linewidth=0.9, alpha=0.45,
+                label="Generation best")
+        ax.plot(range(1, len(best_so_far) + 1), best_so_far, color="#B34700",
+                linewidth=1.8, label=f"Best so far = {min(best_so_far):.2f}")
+        ax.set_xlabel("Generation (single run, no restarts)")
+        ax.set_ylabel("Penalised BIC")
+        ax.set_title(f"Single-run GA Convergence — {label}\n"
+                     f"(penalty={penalty_per_insig} per p > {p_threshold}; "
+                     f"seeded; full budget run)")
         ax.legend()
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
@@ -1666,13 +1684,15 @@ def random_params_analysis(df, nm_col, sel_nm_feats, sel_crash_feats, full_nm, f
 # ===================================================================
 
 def mcr_model_search(df, y_col, feats_subset, offset_col,
-                     label="MCR-DE", n_starts=2, max_iter=500,
+                     label="MCR-GA", n_starts=1, max_iter=500,
                      R=5, max_latent_classes=1, out_dir=None,
                      N_max=1500, max_time_per_start=1800,
                      solver="de", pop_size=30):
-    """Search over parameter roles (fixed / random-indep / random-corr) for a
-    given feature set using metacountregressor StructureEvaluatorLC.
+    """Single-start search over parameter roles (fixed / random-indep /
+    random-corr) for a given feature set. No restarts by policy (n_starts=1).
 
+    solver='de' uses NSGA2Engine + AdaptiveDE (the single-run GA path).
+    solver='sa' is legacy and no longer used for reported results.
     solver='de' uses NSGA2Engine + AdaptiveDE (differential evolution).
     solver='sa' uses AdvancedSimulatedAnnealing (legacy).
     
@@ -1974,13 +1994,13 @@ def main():
 
     mcr_nm = mcr_model_search(
         df, nm_col, hs_nm_feats, "log_len",
-        label="NM", n_starts=2, max_iter=500, R=5,
+        label="NM", n_starts=1, max_iter=500, R=5,
         max_latent_classes=1, out_dir=OUTPUT_DIR,
         N_max=1500, solver="de", pop_size=20,
     )
     mcr_crash = mcr_model_search(
         df, "ObsCrashes", hs_crash_feats, "log_len",
-        label="Crash", n_starts=2, max_iter=500, R=5,
+        label="Crash", n_starts=1, max_iter=500, R=5,
         max_latent_classes=1, out_dir=OUTPUT_DIR,
         N_max=1500, solver="de", pop_size=20,
     )

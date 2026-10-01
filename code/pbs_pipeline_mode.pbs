@@ -20,9 +20,7 @@ PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
 PIPELINE_RUN_TAG=${PIPELINE_RUN_TAG:-${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}
 GA_ESTIMATOR=${GA_ESTIMATOR:-default}
 INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS:-1}
-# Record whether the caller set ESTIMATOR_SOURCE explicitly (so an explicit
-# 'pypi' can override the bandit-SA editable forcing below — "always PyPI").
-_ESRC_SET=${ESTIMATOR_SOURCE:+1}
+# ESTIMATOR_SOURCE=pypi (default, PyPI-latest) or editable (local dev trees).
 ESTIMATOR_SOURCE=${ESTIMATOR_SOURCE:-pypi}
 
 # 507-zone SA2 population scope — forward to pipeline_logger.py via os.environ.
@@ -69,17 +67,21 @@ _HPC_MC=/mnt/hpccs01/home/ahernz/source/MetaCount
 _HPC_SL=/mnt/hpccs01/home/ahernz/source/SearchLibrium
 
 # ── Always keep estimators current from PyPI ───────────────────────────────
-# PyPI has the newest releases (metacountregressor >=1.0.107,
+# PyPI has the newest releases (metacountregressor >=1.0.151,
 # SearchLibrium >=0.0.154). The 0.0.138 seen before was a STALE installed copy
-# that never upgraded — the guarded blocks below only ran for metacount/*
-# GA_ESTIMATOR modes. This unconditional step force-upgrades both from PyPI on
-# every job so the version is always latest. Set ESTIMATORS_SKIP_UPGRADE=1 to
-# skip, or ESTIMATOR_SOURCE=editable to use local dev checkouts instead.
-if [ "$ESTIMATOR_SOURCE" != "editable" ] && [ "${ESTIMATORS_SKIP_UPGRADE:-0}" != "1" ]; then
+# that never upgraded. This step force-upgrades both from PyPI on EVERY job —
+# ALWAYS, no skip: the ESTIMATORS_SKIP_UPGRADE bypass is retired. Concurrent
+# jobs serialize with flock (shared lock in the code dir) instead of racing
+# pip installs into the shared env. ESTIMATOR_SOURCE=editable uses local dev
+# checkouts instead.
+if [ "$ESTIMATOR_SOURCE" != "editable" ]; then
     echo "[pkg] Upgrading MetaCount + SearchLibrium to latest PyPI release..."
-    pip install --upgrade -q metacountregressor SearchLibrium \
-        && echo "[pkg] MetaCount + SearchLibrium upgraded (PyPI latest)" \
-        || echo "[pkg] WARNING: PyPI estimator upgrade failed (offline?) — using whatever is installed"
+    (
+        flock -w 900 9 2>/dev/null || echo "[pkg] (flock unavailable, proceeding without lock)"
+        pip install --upgrade -q --retries 1 --timeout 20 metacountregressor SearchLibrium \
+            && echo "[pkg] MetaCount + SearchLibrium upgraded (PyPI latest)" \
+            || echo "[pkg] WARNING: PyPI estimator upgrade failed (offline?) — using whatever is installed"
+    ) 9>"${PBS_O_WORKDIR:-.}/.pkg_upgrade.lock"
 fi
 
 _need_metacount=0
@@ -92,10 +94,10 @@ case "$GA_ESTIMATOR" in
     sa_bandit)     _need_metacount=1; _need_searchlib=1 ;;
 esac
 # Bandit SA mode historically needed editable installs for banditsa/adaptive_search.
-# PyPI (>=1.0.107) now ships these, so only auto-force editable when the caller
-# did NOT explicitly pick a source. Pass ESTIMATOR_SOURCE=pypi to stay on PyPI.
+# PyPI (>=1.0.151) now ships these, so the default stays on PyPI-latest: only an
+# explicit ESTIMATOR_SOURCE=editable opts out. Pass ESTIMATOR_SOURCE=editable
+# yourself if you are developing the estimator packages.
 if [ "${GA_USE_BANDIT_SA:-0}" = "1" ]; then
-    [ "$_ESRC_SET" != "1" ] && ESTIMATOR_SOURCE=editable
     _need_metacount=1
     _need_searchlib=1
 fi
@@ -219,6 +221,9 @@ export PIPELINE_RUN_ROOT="$RUN_ROOT"
 export GA_ESTIMATOR
 export GA_USE_SA="${GA_USE_SA:-0}"
 export GA_USE_BANDIT_SA="${GA_USE_BANDIT_SA:-0}"
+# Search engine: default to SparseEA-AGDS (overridable with -v GA_ENGINE=ga|sa|bandit).
+# GA_ENGINE has precedence over GA_USE_SA/GA_USE_BANDIT_SA in _resolve_search_engine.
+export GA_ENGINE="${GA_ENGINE:-agds}"
 # When 1, GA_STAGED skips re-running estimation and loads ga_results.pkl from
 # the prior 'ga' run dir (resolved via per-estimator alias or GA_STAGED_GA_DIR).
 # Set automatically by submit_pipeline_runs.sh --split-estimation.
@@ -327,7 +332,15 @@ else
 fi
 run_suffix="${run_suffix}__${PIPELINE_RUN_TAG}"
 
-mkdir -p "$RUN_ROOT/$run_suffix/plots"
+RUN_DIR="${PIPELINE_RUN_DIR:-${RUN_ROOT}/${run_suffix}}"
+mkdir -p "${RUN_DIR}/plots"
+
+# Write the actual prediction run directory to a marker file for dependent jobs
+# (MATSim export, full scenario, SimWrapper, etc.) to discover.
+# The chain script expects this at ${RUN_ROOT}/${PIPELINE_RUN_TAG}/prediction_run_dir.txt
+mkdir -p "${RUN_ROOT}/${PIPELINE_RUN_TAG}"
+echo "${RUN_ROOT}/${run_suffix}" > "${RUN_ROOT}/${PIPELINE_RUN_TAG}/prediction_run_dir.txt"
+echo "Wrote prediction run dir marker: ${RUN_ROOT}/${PIPELINE_RUN_TAG}/prediction_run_dir.txt -> ${RUN_ROOT}/${run_suffix}"
 
 echo "=========================================="
 echo "PBS job ${PBS_JOBID:-unknown}"
@@ -346,7 +359,7 @@ echo "=========================================="
 
 # ── Write run outline ───────────────────────────────────────────────────────
 # Describes what this job is testing so outputs in the run dir are self-contained.
-_outline="${RUN_ROOT}/${run_suffix}/run_outline.txt"
+_outline="${RUN_DIR}/run_outline.txt"
 cat > "$_outline" <<OUTLINE
 Run Outline
 ===========
@@ -364,7 +377,7 @@ Resources     : $(qstat -f "${PBS_JOBID:-unknown}" 2>/dev/null | grep Resource_L
 Conda env     : ${CONDA_ENV}
 Working dir   : ${PBS_O_WORKDIR}
 Run dir       : ${RUN_ROOT}/${run_suffix}
-Log file      : ${RUN_ROOT}/${run_suffix}/pipeline_run.log
+Log file      : ${RUN_DIR}/pipeline_run.log
 Started       : $(date -Iseconds)
 
 What this job tests
@@ -459,19 +472,19 @@ echo "  run_outline.txt → ${_outline}"
 set +e
 if [ "$MODE" = "sa_smoke" ]; then
     stdbuf -oL python -u _test_sa_smoke.py \
-        2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+        2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
 elif [ "$MODE" = "safety_analysis" ]; then
     stdbuf -oL python -u safety_experiment_analysis.py \
-        2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+        2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
 elif [ "$MODE" = "paper_collect" ]; then
     # Phase A: Generate synthetic population vs HHTS comparison report.
     stdbuf -oL python -u compare_synth_hhts.py \
-        2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+        2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
 
     # Phase B: Collect paper-ready outputs from the SA-bandit and safety_analysis runs
     # and copy them to abm_safety/Figures/ for LaTeX inclusion.
     stdbuf -oL python -u - << 'PYEOF' \
-        2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+        2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
 import shutil, os, glob, sys
 
 RUN_ROOT = os.environ.get('PIPELINE_RUN_ROOT', 'runs')
@@ -619,7 +632,7 @@ elif [ "$MODE" = "joint_model" ]; then
     # Loads data and the already-estimated Stage 2 models from the most-recent
     # main run, then runs estimate_stage2_joint() and writes the comparison HTML.
     stdbuf -oL python -u - << 'PYEOF' \
-        2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+        2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
 import sys, os
 sys.path.insert(0, '.')
 os.environ.setdefault('JOINT_PARTICIPATION_MODEL', '1')
@@ -651,10 +664,10 @@ PYEOF
 else
     if [ -n "$ZONE_ARG" ]; then
         stdbuf -oL python -u pipeline_logger.py "$MODE" "$ZONE_ARG" \
-            2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+            2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
     else
         stdbuf -oL python -u pipeline_logger.py "$MODE" \
-            2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+            2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
     fi
 fi
 EXIT_CODE=$?

@@ -1,0 +1,89 @@
+#!/bin/bash -l
+# =====================================================================
+# job_mtc_ab.pbs — Prototype-MTC transfer test (M0/M1/M2 Stage-5 comparison).
+#
+# Runs mtc_compare.py on ActivitySim's canonical prototype_mtc example:
+#   M0 ActivitySim regress final_trips.csv reference (no fitting),
+#   M1 pipeline default spec, M2 searched spec (small GA budget),
+# on the FULL MTC prototype population (all persons/tours in the files).
+# MTC source files download once from raw.githubusercontent.com (needs
+# egress; pre-download into runs/mtc_ab/source/ on an egress node otherwise).
+#
+# ARTIFACT SEPARATION: everything lands under runs/mtc_ab/
+# (models, metrics, mapped CSVs, skim copy, logs). NOTHING is written to
+# saved_data/ or any QLD run tree; the driver refuses non-mtc roots.
+#
+# Submit from the code dir:
+#   qsub job_mtc_ab.pbs
+# Override:
+#   qsub -v OUTDIR=runs/mtc_ab2,CONDA_ENV=zigenv job_mtc_ab.pbs
+# Full-model M0 (instead of the 79-row regress fixture):
+#   qsub -v MTC_TRIPS_CSV=runs/mtc_asim_full/output/final_trips.csv job_mtc_ab.pbs
+# (produce the file first via job_asim_mtc_full.pbs).
+# =====================================================================
+#PBS -N mtc_ab
+#PBS -l select=1:ncpus=8:mem=64gb
+#PBS -l walltime=08:00:00
+#PBS -j oe
+#PBS -m n
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+OUTDIR=${OUTDIR:-runs/mtc_ab}
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# ── House numerical environment (mirrors job_ga_stage_single.pbs) ──────────
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-false}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export TF_CPP_MIN_LOG_LEVEL=${TF_CPP_MIN_LOG_LEVEL:-3}
+export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
+# Small GA budget for the M2 arm (MTC prototype zones/tours: fits are seconds).
+# Override for extensive benchmark searches, e.g.:
+#   qsub -v OUTDIR=runs/mtc_ab_x,MTC_M2_GENS=150,MTC_M2_S5_GENS=120,MTC_M2_RESTARTS=2 job_mtc_ab.pbs
+export MTC_M2_POP=${MTC_M2_POP:-12}
+export MTC_M2_GENS=${MTC_M2_GENS:-8}
+export MTC_M2_RESTARTS=${MTC_M2_RESTARTS:-1}
+export MTC_M2_S5_GENS=${MTC_M2_S5_GENS:-10}
+export GA_ENGINE=${GA_ENGINE:-agds}
+export GA_MAX_WORKERS=${GA_MAX_WORKERS:-1}
+export GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-2}
+# MTC prototype has 25 TAZ zones; the skim reader defaults to the 371-zone
+# QLD system and refuses anything else. Declare the alternate zone count
+# (also set inside mtc_compare.py for direct launches).
+export ZONE_SYSTEM_N_ZONES=${ZONE_SYSTEM_N_ZONES:-25}
+# M0 trips source override: path to FULL ActivitySim final_trips.csv
+# (job_asim_mtc_full.pbs output). Empty (default) = regress fixture.
+export MTC_TRIPS_CSV=${MTC_TRIPS_CSV:-}
+
+mkdir -p "$OUTDIR"
+
+echo "=========================================="
+echo "Prototype-MTC transfer test (M0/M1/M2)"
+echo "PBS job     : ${PBS_JOBID:-unknown}"
+echo "Code dir    : $(pwd)"
+echo "Out dir     : ${OUTDIR}"
+echo "Conda env   : ${CONDA_ENV}"
+echo "Search eng. : ${GA_ENGINE}"
+echo "Started     : $(date)"
+echo "=========================================="
+
+python -u mtc_compare.py --outdir "$OUTDIR" \
+  > "${OUTDIR}/mtc_compare.out" 2> "${OUTDIR}/mtc_compare.err"
+EXIT_CODE=$?
+
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+echo "Metrics : ${OUTDIR}/mtc_metrics.json"
+exit "${EXIT_CODE}"

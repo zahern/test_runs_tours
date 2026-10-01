@@ -1,0 +1,66 @@
+#!/bin/bash -l
+# =====================================================================
+# job_benchmark_exampville.pbs — local benchmark suite, executed on HPC.
+#
+# Runs benchmark_exampville_local.py (stdlib + pandas/numpy/scipy/
+# statsmodels/matplotlib ONLY — no larch, openmatrix, jax, SearchLibrium)
+# against the Exampville data. Produces the B0--B3 benchmark models that the
+# Larch/JAX pipeline arms (E0/E1/E2 in exampville_compare.py) must beat.
+#
+# Data: downloaded once from raw.githubusercontent.com (needs egress).
+# Pre-stage on the login node BEFORE submitting (compute nodes cannot egress):
+#   mkdir -p runs/benchmark_exampville_hpc/source
+#   cp runs/benchmark_exampville/source/* runs/benchmark_exampville_hpc/source/
+# The script reuses present-valid files and only fetches what is missing.
+#
+# Submit from the code dir:
+#   qsub job_benchmark_exampville.pbs
+# =====================================================================
+#PBS -N benchmark_exampville
+#PBS -l select=1:ncpus=4:mem=16GB
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -m n
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+OUTDIR=${OUTDIR:-runs/benchmark_exampville_hpc}
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+
+mkdir -p "$OUTDIR"
+
+echo "=========================================="
+echo "Exampville benchmark suite (HPC execution)"
+echo "PBS job     : ${PBS_JOBID:-unknown}"
+echo "Code dir    : $(pwd)"
+echo "Out dir     : ${OUTDIR}"
+echo "Conda env   : ${CONDA_ENV}"
+echo "Started     : $(date)"
+echo "=========================================="
+echo "--- dependency check (stdlib + pandas/numpy/scipy/statsmodels only) ---"
+python -c "
+import pandas, numpy, scipy, statsmodels, matplotlib
+print('pandas', pandas.__version__, '| numpy', numpy.__version__,
+      '| scipy', scipy.__version__, '| statsmodels', statsmodels.__version__)
+"
+
+python -u benchmark_exampville_local.py --outdir "$OUTDIR" \
+  > "${OUTDIR}/benchmark_hpc.out" 2> "${OUTDIR}/benchmark_hpc.err"
+EXIT_CODE=$?
+
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+echo "Metrics : ${OUTDIR}/benchmark_metrics.json"
+exit "${EXIT_CODE}"

@@ -1,0 +1,153 @@
+#!/bin/bash -l
+#PBS -N exploded_logit_test
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=8:mem=32GB
+#PBS -j oe
+#PBS -m abe
+
+cd $PBS_O_WORKDIR
+
+echo "=== Exploded Logit vs MNL Comparison Test ==="
+echo "Job: $PBS_JOBID on $(hostname)"
+echo "Start: $(date)"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+# Environment check
+python -c "import larch, numpy, pandas, openmatrix; print('Imports OK')"
+
+# Run the test
+python - <<'PY'
+import sys
+sys.path.insert(0, '.')
+import pandas as pd
+import numpy as np
+from smoke_exploded_logit import run_exploded_logit_test
+import openmatrix as omx
+
+# Load REAL data from the pipeline (if available)
+# Otherwise create synthetic
+import os
+
+skims_path = 'downcasted_matrices_base.omx'
+landuse_path = 'saved_data/landuse.csv'
+trips_path = 'saved_data/stage5_trips.csv'
+persons_path = 'saved_data/persons.csv'
+
+if all(os.path.exists(p) for p in [skims_path, landuse_path, trips_path, persons_path]):
+    print("Loading real pipeline data...")
+    landuse = pd.read_csv(landuse_path)
+    trips = pd.read_csv(trips_path)
+    persons = pd.read_csv(persons_path)
+    
+    # Test on each purpose with enough data
+    for purpose in ['work', 'shop', 'social', 'eat', 'escort']:
+        stop_count = len(trips[(trips.get('is_tour_dest_leg', 0) == 0) & (trips['purpose'] == purpose)])
+        if stop_count >= 50:
+            print(f"\n--- Testing {purpose} (n={stop_count}) ---")
+            result = run_exploded_logit_test(
+                trips=trips,
+                persons=persons,
+                skims_path=skims_path,
+                landuse=landuse,
+                purpose=purpose,
+                max_alts=30,
+            )
+            if "comparison" in result:
+                print(f"MNL LL={result['summary']['mnl_ll']:.1f}, BIC={result['summary']['mnl_bic']:.1f}")
+                print(f"Exploded LL={result['summary']['exploded_ll']:.1f}, BIC={result['summary']['exploded_bic']:.1f}")
+                print("Top parameter differences:")
+                comp = result['comparison']
+                comp['abs_diff'] = comp['diff'].abs()
+                print(comp.nlargest(5, 'abs_diff')[['parameter', 'mnl_coef', 'exploded_coef', 'diff']].to_string(index=False))
+else:
+    print("Real data not found, running synthetic test...")
+    # Synthetic test (same as __main__)
+    np.random.seed(42)
+    n_trips = 200
+    n_zones = 50
+    
+    trips = pd.DataFrame({
+        'trip_id': range(n_trips),
+        'tour_id': np.repeat(range(n_trips // 4), 4)[:n_trips],
+        'person_id': np.random.randint(1, 50, n_trips),
+        'trip_num_in_tour': np.tile([1, 2, 3, 4], n_trips // 4)[:n_trips],
+        'is_outbound': np.tile([1, 1, 0, 0], n_trips // 4)[:n_trips],
+        'origin_taz': np.random.randint(1, n_zones + 1, n_trips),
+        'dest_taz': np.random.randint(1, n_zones + 1, n_trips),
+        'purpose': np.random.choice(['work', 'shop', 'social'], n_trips),
+        'mode': np.random.choice(['auto', 'transit', 'walk'], n_trips),
+        'depart_time_min': np.random.randint(0, 1440, n_trips),
+        'arrive_time_min': np.random.randint(0, 1440, n_trips),
+        'travel_time_min': np.random.randint(5, 60, n_trips),
+    })
+    
+    trips['is_tour_dest_leg'] = 0
+    for tour_id in trips['tour_id'].unique():
+        mask = (trips['tour_id'] == tour_id) & (trips['is_outbound'] == 1)
+        if mask.any():
+            last = trips.loc[mask, 'trip_num_in_tour'].max()
+            trips.loc[mask & (trips['trip_num_in_tour'] == last), 'is_tour_dest_leg'] = 1
+    
+    persons = pd.DataFrame({
+        'person_id': range(1, 51),
+        'home_taz': np.random.randint(1, n_zones + 1, 50),
+        'is_female': np.random.randint(0, 2, 50),
+        'income_hi': np.random.randint(0, 2, 50),
+        'hh_child': np.random.randint(0, 2, 50),
+        'occp_group': np.random.randint(1, 5, 50),
+        'ptype_FullTimeWorker': np.random.randint(0, 2, 50),
+        'ptype_UniversityStudent': np.random.randint(0, 2, 50),
+        'mtwp': np.random.randint(0, 2, 50),
+        'WFHWEEK': np.random.randint(0, 2, 50),
+        'incp': np.random.randn(50),
+    })
+    
+    landuse = pd.DataFrame({
+        'zone_id': range(1, n_zones + 1),
+        'TOTEMP': np.random.randint(0, 500, n_zones),
+        'FPSEMPN': np.random.randint(0, 100, n_zones),
+        'HEREMPN': np.random.randint(0, 100, n_zones),
+        'RETEMPN': np.random.randint(0, 100, n_zones),
+        'TOTPOP': np.random.randint(0, 1000, n_zones),
+        'TOTHH': np.random.randint(0, 500, n_zones),
+        'HSENROLL': np.random.randint(0, 200, n_zones),
+    })
+    
+    omx_path = 'test_exploded_skims.omx'
+    with omx.open_file(omx_path, 'w') as f:
+        n = n_zones
+        f.create_matrix('DIST', (n, n))
+        f['DIST'][:] = np.random.rand(n, n) * 20
+        f.create_matrix('DISTWALK', (n, n))
+        f['DISTWALK'][:] = f['DIST'][:]
+        f.create_matrix('DISTBIKE', (n, n))
+        f['DISTBIKE'][:] = f['DIST'][:]
+        f.create_matrix('SOVTOLL_TIME__AM', (n, n))
+        f['SOVTOLL_TIME__AM'][:] = np.random.rand(n, n) * 30 + 5
+        f.create_matrix('WLK_LOC_WLK_TOTIVT__AM', (n, n))
+        f['WLK_LOC_WLK_TOTIVT__AM'][:] = np.random.rand(n, n) * 40 + 10
+        f.create_matrix('CRASH', (n, n))
+        f['CRASH'][:] = np.random.rand(n, n) * 0.1
+    
+    result = run_exploded_logit_test(
+        trips=trips,
+        persons=persons,
+        skims_path=omx_path,
+        landuse=landuse,
+        purpose="work",
+        max_alts=20,
+    )
+    
+    if "comparison" in result:
+        print("\n=== Synthetic Test Results ===")
+        print(result["comparison"].to_string(index=False))
+        print(f"\nSummary: {result['summary']}")
+
+print(f"\nEnd: $(date)")
+PY
+
+echo "Test completed at $(date)"

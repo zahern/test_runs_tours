@@ -1,0 +1,148 @@
+#!/bin/bash -l
+# Run ONE GA shard (one stage + one segment) as an independent PBS job.
+# Submitted by job_submit_ga_sharded.pbs; see SHARDED_JOBS.md.
+#
+# Required -v: STAGE_ID (0..5), SHARD_SEGMENT (e.g. work), RUN_TAG.
+# Optional -v: RUN_ROOT, CONDA_ENV, GA_SHARD_VARIANTS (1/0), GA_S4_VARIANTS,
+#   GA_S5_MODE_VARIANTS, GA_S5_DEST_VARIANTS, plus the usual GA_* knobs
+#   (they are exported below so _run_ga_shard.py and the search see them).
+
+#PBS -m n
+#PBS -r y
+#PBS -P FPAXJW8067
+#PBS -l walltime=06:00:00
+#PBS -l select=1:ncpus=2:mem=16GB
+
+set -euo pipefail
+
+STAGE_ID=${STAGE_ID:?STAGE_ID is required, expected 0..5}
+SHARD_SEGMENT=${SHARD_SEGMENT:?SHARD_SEGMENT is required, e.g. work}
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:?RUN_TAG is required}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+
+NEW_POP=${NEW_POP:-1}
+NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+if [ "${NEW_POP}" = "1" ] && [ "${NEW_POP_MAPPED}" != "1" ]; then
+    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+else
+    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-}
+fi
+
+GA_BUDGET=${GA_BUDGET:-fast}
+GA_ESTIMATOR=${GA_ESTIMATOR:-metacount_mv}
+GA_ENGINE=${GA_ENGINE:-agds}
+GA_N_RESTARTS=${GA_N_RESTARTS:-0}
+GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-1}
+GA_SHARD_VARIANTS=${GA_SHARD_VARIANTS:-1}
+# NOTE: qsub -v is comma-separated, so multi-value knobs use ';' here
+# (ga_shard._env_list accepts ';'). Never pass commas inside these values.
+GA_S4_VARIANTS=${GA_S4_VARIANTS:-rrm;tdd}
+GA_STAGE4_MXL_SEARCH=${GA_STAGE4_MXL_SEARCH:-0}
+GA_STAGE4_GENS=${GA_STAGE4_GENS:-}
+GA_STAGE4_RESTARTS=${GA_STAGE4_RESTARTS:-}
+GA_STAGE4_EARLY_STOP=${GA_STAGE4_EARLY_STOP:-1}
+GA_STAGE4_EARLY_STOP_PATIENCE=${GA_STAGE4_EARLY_STOP_PATIENCE:-120}
+GA_STAGE4_EARLY_STOP_MIN_GENS=${GA_STAGE4_EARLY_STOP_MIN_GENS:-120}
+GA_SA2_GENS=${GA_SA2_GENS:-}
+GA_SA2_RESTARTS=${GA_SA2_RESTARTS:-}
+STAGE2_MH=${STAGE2_MH:-0}
+STAGE2_MH_BURN=${STAGE2_MH_BURN:-1000}
+STAGE2_MH_DRAWS=${STAGE2_MH_DRAWS:-2000}
+STAGE2_MH_THIN=${STAGE2_MH_THIN:-2}
+STAGE2_MH_SEED=${STAGE2_MH_SEED:-42}
+STAGE2_MH_PROPOSAL_SCALE=${STAGE2_MH_PROPOSAL_SCALE:-1.0}
+GA_S5_MODE_VARIANTS=${GA_S5_MODE_VARIANTS:-nl;mnl}
+GA_S5_DEST_VARIANTS=${GA_S5_DEST_VARIANTS:-mnl;nl_dist}
+# Stage-5 overrun controls (see job_submit_ga_sharded.pbs header comments).
+GA_STAGE5_GENS=${GA_STAGE5_GENS:-}
+GA_STAGE5_RESTARTS=${GA_STAGE5_RESTARTS:-}
+GA_STAGE0_GENS=${GA_STAGE0_GENS:-}
+GA_STAGE0_RESTARTS=${GA_STAGE0_RESTARTS:-}
+GA_STAGE51_GENS=${GA_STAGE51_GENS:-}
+GA_STAGE51_RESTARTS=${GA_STAGE51_RESTARTS:-}
+GA_STAGE5_STAG=${GA_STAGE5_STAG:-}
+GA_WALLTIME_MARGIN_SECONDS=${GA_WALLTIME_MARGIN_SECONDS:-300}
+GA_STAGE5_RUN_MODE=${GA_STAGE5_RUN_MODE:-1}
+GA_STAGE5_RUN_DEST=${GA_STAGE5_RUN_DEST:-1}
+GA_SEED=${GA_SEED:-}
+GA_L1_L2_ALPHA=${GA_L1_L2_ALPHA:-1e-3}
+STAGE5B_CA_FULLGRID_CASES=${STAGE5B_CA_FULLGRID_CASES:-1500}
+# Stage-0 CDAP Mixed Logit is report-only (prediction uses the MNL); default
+# OFF for shards (see job_submit_ga_sharded.pbs) to avoid the 29GB+ OOM.
+# CDAP_MXL=mh selects the JAX-free RWMH heterogeneity path instead.
+CDAP_MXL=${CDAP_MXL:-0}
+CDAP_MXL_DRAWS=${CDAP_MXL_DRAWS:-50}
+CDAP_MXL_MAX_N=${CDAP_MXL_MAX_N:-2000}
+CDAP_MH_BURN=${CDAP_MH_BURN:-1000}
+CDAP_MH_DRAWS=${CDAP_MH_DRAWS:-2000}
+CDAP_MH_THIN=${CDAP_MH_THIN:-5}
+CDAP_MH_SEED=${CDAP_MH_SEED:-42}
+CDAP_MH_PRIOR_SD=${CDAP_MH_PRIOR_SD:-5.0}
+
+cd "$PBS_O_WORKDIR"
+# Single-conda rule: activate by explicit prefix so the job can never silently
+# resolve a same-named env from another Anaconda install (e.g. module Anaconda3
+# vs ~/miniconda3). CONDA_ENV is the env *name* under ${CONDA_BASE}/envs.
+CONDA_BASE=${CONDA_BASE:-/mnt/hpccs01/home/ahernz/miniconda3}
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_BASE}/envs/${CONDA_ENV}"
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+echo "python: $(which python) ($(python --version 2>&1))"
+export PYTHONPATH="${PBS_O_WORKDIR}/compat:${PYTHONPATH:-}"
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+export GA_METACOUNT_FORCE_CPU=${GA_METACOUNT_FORCE_CPU:-1}
+export TF_CPP_MIN_LOG_LEVEL=${TF_CPP_MIN_LOG_LEVEL:-3}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-1}
+export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-false}
+export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
+
+for _v in GA_BUDGET GA_ESTIMATOR GA_ENGINE GA_N_RESTARTS GA_PARALLEL_SEGMENTS \
+         GA_SHARD_VARIANTS GA_S4_VARIANTS GA_STAGE4_MXL_SEARCH GA_STAGE4_GENS \
+         GA_STAGE4_RESTARTS GA_STAGE4_EARLY_STOP GA_STAGE4_EARLY_STOP_PATIENCE \
+         GA_STAGE4_EARLY_STOP_MIN_GENS GA_SA2_GENS GA_SA2_RESTARTS \
+         STAGE2_MH STAGE2_MH_BURN STAGE2_MH_DRAWS STAGE2_MH_THIN \
+         STAGE2_MH_SEED STAGE2_MH_PROPOSAL_SCALE \
+         GA_S5_MODE_VARIANTS GA_S5_DEST_VARIANTS \
+         GA_STAGE5_GENS GA_STAGE5_RESTARTS GA_STAGE0_GENS GA_STAGE0_RESTARTS GA_STAGE51_GENS GA_STAGE51_RESTARTS GA_STAGE5_STAG \
+         GA_WALLTIME_MARGIN_SECONDS GA_STAGE5_RUN_MODE GA_STAGE5_RUN_DEST \
+         GA_SEED GA_L1_L2_ALPHA STAGE5B_CA_FULLGRID_CASES \
+         CDAP_MXL CDAP_MXL_DRAWS CDAP_MXL_MAX_N \
+         CDAP_MH_BURN CDAP_MH_DRAWS CDAP_MH_THIN CDAP_MH_SEED CDAP_MH_PRIOR_SD \
+         NEW_POP NEW_POP_MAPPED NEW_POP_DIR PIPELINE_SKIMS_PATH; do
+  export "$_v"
+done
+# Extra overrides passed via -v EXTRA_ENV as ';'-separated VAR=val pairs
+# (';'-separated because qsub -v itself is comma-separated).
+if [ -n "${EXTRA_ENV:-}" ]; then
+  IFS=';' read -ra _pairs <<< "${EXTRA_ENV}"
+  for _p in "${_pairs[@]}"; do export "${_p?}"; done
+fi
+
+echo "=========================================="
+echo "GA shard job : ${PBS_JOBID:-unknown}"
+echo "Stage/segment: ${STAGE_ID} / ${SHARD_SEGMENT}"
+echo "Run tag      : ${RUN_TAG}"
+echo "Variants     : SHARD=${GA_SHARD_VARIANTS} S4=${GA_S4_VARIANTS} S5MODE=${GA_S5_MODE_VARIANTS} S5DEST=${GA_S5_DEST_VARIANTS}"
+echo "Started      : $(date)"
+echo "=========================================="
+
+ARGS=(--stage-id "${STAGE_ID}" --segment "${SHARD_SEGMENT}" \
+      --run-root "${RUN_ROOT}" --run-tag "${RUN_TAG}")
+if [ "${GA_SHARD_VARIANTS}" = "0" ]; then
+  ARGS+=(--no-variants)
+fi
+
+python -u -X utf8 _run_ga_shard.py "${ARGS[@]}"
+EXIT_CODE=$?
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+exit "${EXIT_CODE}"

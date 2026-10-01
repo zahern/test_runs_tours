@@ -1,12 +1,12 @@
-"""
+﻿"""
 Hard-Braking Category Proxy Variable Analysis
 ==============================================
 Tests whether hard-braking category counts (Candidate / Critical-Likely / Extreme)
 can serve as proxy/leading indicators for crash frequency at the road-segment level.
 
 Econometric Framework:
-  1. Differential Evolution — find best geometry features for HB vs crashes
-  2. MCR Structure Search — roles: fixed / random-indep / random-corr
+  1. Differential Evolution â€” find best geometry features for HB vs crashes
+  2. MCR Structure Search â€” roles: fixed / random-indep / random-corr
   3. Full models (all geometry baseline)
   4. Coefficient Proportionality Test
   5. Specification Transfer
@@ -22,13 +22,17 @@ RESUME SUPPORT: Each step saves a checkpoint CSV. On re-run, completed steps
 are detected and skipped. Delete the relevant checkpoint to force re-computation.
 """
 
-import os, sys, warnings, argparse, json
+import os, sys, re, warnings, argparse, json
 import numpy as np
 import pandas as pd
 import scipy.special as sp_special
 
 warnings.filterwarnings("ignore")
 os.environ["JAX_LOG_COMPILES"] = "0"
+
+from _metacount_source import activate as _activate_metacount_source
+
+_activate_metacount_source()
 
 import matplotlib
 matplotlib.use("Agg")
@@ -323,13 +327,27 @@ def fit_model(df, features, y_col, offset_col, dispersion=1, label="", verbose=F
     if "ind_sd" in pi:
         ss, es = pi["ind_sd"]
         rdm_sd_names += ["RND sd(" + _V(rdm_terms[i].split(":")[0]) + ")" for i in range(es - ss)]
+    # Cholesky-factor elements of the random-correlated block. Previously these
+    # fell through the gap-filler below and were reported as anonymous
+    # "param15..param24" rows; label them with the variable pair each element
+    # couples (lower-triangular, row-major).
+    chol_names = []
+    if "chol" in pi:
+        s_ch, e_ch = pi["chol"]
+        n_ch = e_ch - s_ch
+        mcor = len(rdm_cor_terms)
+        if mcor and n_ch == mcor * (mcor + 1) // 2:
+            cvars = [_V(t.split(":")[0]) for t in rdm_cor_terms]
+            for i in range(mcor):
+                for j in range(i + 1):
+                    chol_names.append(f"chol({cvars[i]}|{cvars[j]})")
     # SDs are stored on a log basis (softplus used in likelihood); report exp back
     sd_slice = params[pi["ind_sd"][0]:pi["ind_sd"][1]] if "ind_sd" in pi else np.array([])
     sd_reported = np.asarray([np.log1p(np.exp(np.clip(v, -20, 20))) for v in sd_slice])
 
     # Build full ordered name vector aligned to param layout:
-    # [fixed..., ind_mean..., cor_mean..., ind_sd..., dispersion]
-    names_full = names[:1] + [_V(f) for f in features] + rdm_mean_names + rdm_sd_names
+    # [fixed..., ind_mean..., cor_mean..., ind_sd..., chol..., dispersion]
+    names_full = names[:1] + [_V(f) for f in features] + rdm_mean_names + rdm_sd_names + chol_names
     if spec.model == "nb" and "dispersion" in pi:
         dpos = pi["dispersion"]
         for j in range(len(names_full), dpos):
@@ -344,9 +362,22 @@ def fit_model(df, features, y_col, offset_col, dispersion=1, label="", verbose=F
     if "ind_sd" in pi:
         est[pi["ind_sd"][0]:pi["ind_sd"][1]] = sd_reported
 
+    # IRR = exp(beta) is only meaningful for mean-type parameters (intercept,
+    # fixed effects, random-parameter means). SD / Cholesky / dispersion rows
+    # get NaN (rendered as "--"), fixing the inconsistent column where a
+    # transformed-SD row showed Estimate=+0.268 next to IRR=0.307 (exp of the
+    # raw log-scale parameter, not of the displayed estimate).
+    irr = np.full(K, np.nan)
+    mean_pos = list(range(0, len(features) + 1))
+    if "ind_mean" in pi:
+        mean_pos += list(range(pi["ind_mean"][0], pi["ind_mean"][1]))
+    if "cor_mean" in pi:
+        mean_pos += list(range(pi["cor_mean"][0], pi["cor_mean"][1]))
+    irr[mean_pos] = np.exp(params[mean_pos])
+
     coef_tbl = pd.DataFrame({
         "Variable": names_full, "Estimate": est, "Std.Err": se[:K],
-        "z": z[:K], "p": p[:K], "IRR": np.exp(params[:K]),
+        "z": z[:K], "p": p[:K], "IRR": irr,
     })
 
     return {"label": label, "ll": ll, "aic": aic, "bic": bic, "k": k, "n": n,
@@ -363,9 +394,19 @@ def fit_model(df, features, y_col, offset_col, dispersion=1, label="", verbose=F
 def differential_evolution_feature_search(
     df, candidates, y_col, offset_col, maxiter=60, popsize=15,
     label="DE", plot_path=None, p_threshold=0.10,
-    penalty_per_insig=10.0, seed=42,
+    penalty_per_insig=10.0, seed=42, solver="de",
 ):
-    print(f"\n  DIFFERENTIAL EVOLUTION [{label}] — y = {y_col}")
+    """Single-run Genetic Algorithm. No restarts.
+
+    solver="de": each candidate gets one continuous gene in [0,1] optimised
+        by scipy.differential_evolution (gene > 0.5 includes that feature;
+        one continuous run, tol=0, polish=False).
+    solver="sparsea-agds": binary inclusion masks optimised by the
+        SparseEA-AGDS-style search in sparsea_agds.py (adaptive genetic
+        operator + dynamic variable scoring + dominance-layer environmental
+        selection; single run, no restarts).
+    """
+    print(f"\n  GA (single run, no restarts, solver={solver}) [{label}] — y = {y_col}")
     print(f"  {len(candidates)} candidates, maxiter={maxiter}, popsize={popsize}")
     print(f"  p-threshold={p_threshold}, penalty={penalty_per_insig}/insig")
 
@@ -392,17 +433,39 @@ def differential_evolution_feature_search(
     def _callback(xk, convergence=None):
         history.append(_score(xk))
 
-    print(f"  Launching scipy.differential_evolution (seed={seed}) ...")
-    res = differential_evolution(
-        _score, bounds=[(0.0, 1.0)] * Kf,
-        maxiter=maxiter, popsize=popsize, seed=seed,
-        mutation=(0.4, 1.4), recombination=0.7,
-        tol=0.0, polish=False, callback=_callback,
-    )
-    history.append(_score(res.x))
-    best_so_far = np.minimum.accumulate(history)
+    if solver == "sparsea-agds":
+        from sparsea_agds import sparsea_agds_search
 
-    best_mask = (np.asarray(res.x) > 0.5).astype(int)
+        def _mask_score(mask):
+            x = np.asarray(mask, dtype=float)  # 1.0 = include, 0.0 = exclude
+            return _score(x)
+
+        print(f"  Launching SparseEA-AGDS-style masked search (seed={seed}) ...")
+        out = sparsea_agds_search(
+            _mask_score, Kf, pop_size=max(popsize * 4, 32),
+            max_gen=maxiter, seed=seed,
+        )
+        best_mask = np.asarray(out["best_mask"]).astype(int)
+        history = list(out["history_best"])
+        best_so_far = np.minimum.accumulate(history)
+        # Population traces (new in sparsea_agds.py): per-generation current
+        # best / mean / median plus full per-individual fitness vectors.
+        pop_traces = {k: out.get(k) for k in (
+            "history_gen_best", "history_mean", "history_median",
+            "history_min", "history_max", "history_pop")}
+    else:
+        print(f"  Launching scipy.differential_evolution (seed={seed}) ...")
+        res = differential_evolution(
+            _score, bounds=[(0.0, 1.0)] * Kf,
+            maxiter=maxiter, popsize=popsize, seed=seed,
+            mutation=(0.4, 1.4), recombination=0.7,
+            tol=0.0, polish=False, callback=_callback,
+        )
+        history.append(_score(res.x))
+        best_so_far = np.minimum.accumulate(history)
+        pop_traces = {}
+
+        best_mask = (np.asarray(res.x) > 0.5).astype(int)
     bf = [af[i] for i in range(Kf) if best_mask[i] == 1]
     if len(bf) < 2:
         bf = list(np.random.choice(af, max(2, min(8, len(af))), replace=False))
@@ -427,12 +490,45 @@ def differential_evolution_feature_search(
         print(f"    {sig:3s} {_V(f):<50s} {p_str}")
 
     if plot_path:
+        # Single-run convergence: best-so-far (bold) + generation-best
+        # current (faint) + population traces (mean/median, min-max band,
+        # and faint per-individual traces when history_pop is available).
         fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(range(1, len(best_so_far) + 1), best_so_far, "darkorange", linewidth=1.2, alpha=0.8)
-        ax.axhline(y=min(best_so_far), color="red", linestyle="--", alpha=0.5)
-        ax.set_xlabel("Generation")
-        ax.set_ylabel("Penalised BIC (best so far)")
-        ax.set_title(f"Differential Evolution Convergence — {label}")
+        gens = range(1, len(history) + 1)
+        ax.plot(gens, history, color="darkorange", linewidth=0.9, alpha=0.45,
+                label="Generation best")
+        ax.plot(range(1, len(best_so_far) + 1), best_so_far, color="#B34700",
+                linewidth=1.8, label=f"Best so far = {min(best_so_far):.2f}")
+        try:
+            _hp = (pop_traces or {}).get("history_pop")
+            _hm = (pop_traces or {}).get("history_mean")
+            _hd = (pop_traces or {}).get("history_median")
+            _hmin = (pop_traces or {}).get("history_min")
+            _hmax = (pop_traces or {}).get("history_max")
+            if _hm is not None and len(_hm) == len(history):
+                ax.plot(gens, _hm, color="#4477AA", linewidth=1.0,
+                        alpha=0.7, linestyle="--", label="Population mean")
+            if _hd is not None and len(_hd) == len(history):
+                ax.plot(gens, _hd, color="#44AA77", linewidth=1.0,
+                        alpha=0.7, linestyle=":", label="Population median")
+            if (_hmin is not None and _hmax is not None
+                    and len(_hmin) == len(history)):
+                ax.fill_between(list(gens), _hmin, _hmax, color="gray",
+                                alpha=0.15, label="Population range")
+            if _hp is not None and len(_hp) == len(history):
+                import numpy as _np
+                _P = min(len(np.atleast_1d(_hp[0])), 32)
+                for _pi in range(_P):
+                    _tr = [float(np.atleast_1d(_v)[_pi])
+                           if len(np.atleast_1d(_v)) > _pi else float("nan")
+                           for _v in _hp]
+                    ax.plot(gens, _tr, color="gray", linewidth=0.4,
+                            alpha=0.25)
+        except Exception:
+            pass
+        ax.set_xlabel("Generation (single run, no restarts)")
+        ax.set_ylabel("Penalised BIC")
+        ax.set_title(f"Single-run SparseEA-AGDS Convergence — {label}")
         ax.legend(); ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(plot_path, dpi=150)
@@ -446,11 +542,14 @@ def differential_evolution_feature_search(
 # ===================================================================
 def model_to_latex(model, filename, caption, label):
     tbl = model["coef_table"].copy()
+    # captions are user-facing LaTeX: escape specials (e.g. category names
+    # like hb_candidate previously emitted a bare underscore into \caption{})
+    caption = caption.replace("_", "\\_").replace("%", "\\%").replace("&", "\\&")
     latex_rows = []
     for _, row in tbl.iterrows():
         var = row["Variable"].replace("_", "\\_").replace("\\%", "%").replace("%", "\\%")
         est = f"{row['Estimate']:+.4f}"
-        irr = f"{row['IRR']:.4f}"
+        irr = f"{row['IRR']:.4f}" if np.isfinite(row['IRR']) else "--"
         zs = f"{row['z']:.2f}" if np.isfinite(row['z']) else "--"
         ps = f"{row['p']:.4f}" if np.isfinite(row['p']) else "--"
         sig = "***" if not np.isnan(row['p']) and row['p'] < 0.01 else \
@@ -575,7 +674,7 @@ def mixed_coefficient_proportionality(model_hb, model_crash, out_dir):
     b_cr = np.array([beta_cr[f] for f in common_f])
 
     if len(b_nm) < 2:
-        print(f"  Only {len(b_nm)} jointly-significant common features — "
+        print(f"  Only {len(b_nm)} jointly-significant common features â€” "
               "insufficient for proportionality R^2")
         return {"corr": np.nan, "R2_prop": np.nan, "k": np.nan, "n_common": len(b_nm)}
 
@@ -847,7 +946,16 @@ def fit_bivariate_copula(df, nm_col, nm_model, crash_model, copula_name="kimeldo
     }
 
 
-def conditional_crash_prediction(fit_r, max_y2=60):
+def conditional_crash_prediction(fit_r, max_y2=200, mass_tol=1e-6):
+    """Copula-conditional crash mean E[Y2 | Y1 = y1, X].
+
+    The sum over the crash-count support is truncated at K, now chosen
+    ADAPTIVELY: the smallest K at which every segment's crash NB CDF reaches
+    1 - mass_tol, bounded by `max_y2`. Earlier runs used a flat K=60 cap,
+    which was arbitrary (observed crash counts reach 142) and silently
+    truncated the conditional mean on heavy-tailed segments; `max_y2` remains
+    as a hard safety cap only.
+    """
     cop_fn   = _COPULA_FNS[fit_r["copula"]]
     theta    = fit_r["theta"]
     mu1, alpha1 = fit_r["mu1"], fit_r["alpha1"]
@@ -859,7 +967,13 @@ def conditional_crash_prediction(fit_r, max_y2=60):
     p_y1 = np.maximum(_nb_pmf(fit_r["y1"], mu1, alpha1), eps)
     E_y2 = np.zeros(n)
 
-    for k in range(max_y2 + 1):
+    K = 0
+    while K < max_y2:
+        if np.min(_nb_cdf(np.full(n, K), mu2, alpha2)) >= 1.0 - mass_tol:
+            break
+        K += 1
+
+    for k in range(K + 1):
         k_arr  = np.full(n, k)
         u2c_k  = np.clip(_nb_cdf(k_arr, mu2, alpha2), eps, 1 - eps)
         u2p_k  = np.where(k > 0, np.clip(_nb_cdf(k_arr - 1, mu2, alpha2), 0.0, 1 - eps), 0.0)
@@ -870,7 +984,7 @@ def conditional_crash_prediction(fit_r, max_y2=60):
 
 def bivariate_copula_analysis(df, nm_col, nm_model, crash_model, out_dir):
     print("\n" + "=" * 70)
-    print("  BIVARIATE COPULA ANALYSIS — Frank / Normal / Kimeldorf")
+    print("  BIVARIATE COPULA ANALYSIS â€” Frank / Normal / Kimeldorf")
     print("=" * 70)
 
     fits = {}
@@ -938,7 +1052,7 @@ def bivariate_copula_analysis(df, nm_col, nm_model, crash_model, out_dir):
     ax.set_ylabel("Segment count")
     ax.set_title("Per-Segment Prediction Improvement")
 
-    fig.suptitle(f"Bivariate Copula Crash Prediction — {best_cn}", fontsize=12)
+    fig.suptitle(f"Bivariate Copula Crash Prediction â€” {best_cn}", fontsize=12)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "hb_copula_prediction_comparison.png"), dpi=150)
     plt.close(fig)
@@ -956,7 +1070,7 @@ def bivariate_copula_analysis(df, nm_col, nm_model, crash_model, out_dir):
 # 10. MCR STRUCTURE SEARCH (from original)
 # ===================================================================
 def mcr_model_search(df, y_col, feats_subset, offset_col,
-                     label="MCR-DE", n_starts=2, max_iter=500,
+                     label="MCR-GA", n_starts=1, max_iter=500,
                      R=5, max_latent_classes=1, out_dir=None,
                      N_max=1500, max_time_per_start=1800,
                      solver="de", pop_size=30):
@@ -1010,7 +1124,7 @@ def mcr_model_search(df, y_col, feats_subset, offset_col,
 
     AdvancedSimulatedAnnealing.generate_neighbor = _fixed_generate_neighbor
 
-    print(f"\n  MCR STRUCTURE SEARCH [{label}] — y = {y_col}")
+    print(f"\n  MCR STRUCTURE SEARCH [{label}] â€” y = {y_col}")
     print(f"  {len(feats_subset)} features, n_starts={n_starts}, max_iter={max_iter}, N_max={N_max}")
 
     df_m = df.dropna(subset=feats_subset + [y_col, offset_col]).reset_index(drop=True).copy()
@@ -1206,7 +1320,7 @@ def _apply_model_ll(df_sub, model):
     """Log-likelihood of df_sub under a fitted source model (transfer evaluation).
 
     Standardizes features with the source model's scaler and evaluates the NB
-    negative log-likelihood using the source model's parameters — the core of
+    negative log-likelihood using the source model's parameters â€” the core of
     any transferability index. Random terms of the source model are preserved
     so the parameter vector aligns with the spec used at fit time.
     """
@@ -1433,7 +1547,7 @@ def main():
     cp_cats = Checkpoint("step_10_hb_categories")
     cp_transf = Checkpoint("step_11_transferability")
 
-    # ── DATA ──
+    # â”€â”€ DATA â”€â”€
     if not cp_main.is_done():
         df, GEO, NM_RESP = load_data()
         nm_col = "nm_total"
@@ -1443,14 +1557,14 @@ def main():
         df, GEO, NM_RESP = load_data()
         nm_col = "nm_total"
 
-    # ── STEP 1: DE FEATURE SEARCH ──
+    # â”€â”€ STEP 1: DE FEATURE SEARCH â”€â”€
     # Sub-checkpoint per response so partial progress survives walltime kills.
     nm_features_csv = os.path.join(OUTPUT_DIR, "hb_de_features_nm.csv")
     cr_features_csv = os.path.join(OUTPUT_DIR, "hb_de_features_crash.csv")
 
     if not cp_de.is_done():
         print("\n\n" + "#"*70)
-        print("#  STEP 1: DIFFERENTIAL EVOLUTION — Best geometry for HB vs crashes")
+        print("#  STEP 1: SINGLE-RUN GA â€” Best geometry for HB vs crashes")
         print("#"*70)
 
         # --- 1a: HB response DE ---
@@ -1468,9 +1582,12 @@ def main():
             cp_de_nm.mark_done()
             print("  STEP 1a (HB DE) COMPLETE")
         else:
-            print("\n  STEP 1a (HB DE) already complete (resume)")
+            print("\n  STEP 1a (HB GA) already complete (resume) -- refitting best model")
             de_nm_feats = pd.read_csv(nm_features_csv)["feature"].tolist()
-            de_nm = fit_model(df, de_nm_feats, nm_col, "log_len", label="DE-HB (resumed)")
+            de_nm = fit_model(df, de_nm_feats, nm_col, "log_len", label="GA-HB (resumed)")
+            # Best model is always rewritten so the paper never goes stale.
+            model_to_latex(de_nm, os.path.join(OUTPUT_DIR, "hb_de_best_nm.tex"),
+                           "GA Best Model: Hard-Braking Response", "tab:hb_de_nm")
             de_nm_hist = []  # history not saved; skip combined plot
 
         # --- 1b: Crash response DE ---
@@ -1479,7 +1596,7 @@ def main():
             de_crash, de_crash_feats, de_crash_hist = differential_evolution_feature_search(
                 df, GEO, "ObsCrashes", "log_len",
                 label="Crash_response", p_threshold=0.05, penalty_per_insig=3.0,
-                maxiter=60, popsize=12, seed=43,
+                maxiter=30, popsize=8, seed=43,
                 plot_path=os.path.join(OUTPUT_DIR, "hb_de_convergence_crash.png"))
 
             pd.DataFrame({"feature": de_crash_feats, "response": "Crash", "step": "DE"}).to_csv(
@@ -1489,43 +1606,51 @@ def main():
             cp_de_cr.mark_done()
             print("  STEP 1b (Crash DE) COMPLETE")
         else:
-            print("\n  STEP 1b (Crash DE) already complete (resume)")
+            print("\n  STEP 1b (Crash GA) already complete (resume) -- refitting best model")
             de_crash_feats = pd.read_csv(cr_features_csv)["feature"].tolist()
-            de_crash = fit_model(df, de_crash_feats, "ObsCrashes", "log_len", label="DE-Crash (resumed)")
+            de_crash = fit_model(df, de_crash_feats, "ObsCrashes", "log_len", label="GA-Crash (resumed)")
+            # Best model is always rewritten so the paper never goes stale.
+            model_to_latex(de_crash, os.path.join(OUTPUT_DIR, "hb_de_best_crash.tex"),
+                           "GA Best Model: Crash Response", "tab:hb_de_crash")
             de_crash_hist = []  # history not saved; skip combined plot
 
         # Combined convergence plot (only if both histories present)
         if len(de_nm_hist) and len(de_crash_hist):
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
             ax1.plot(range(1, len(de_nm_hist)+1), de_nm_hist, "darkorange", linewidth=0.8)
-            ax1.set_title("DE: Hard-Braking Response"); ax1.set_xlabel("Generation"); ax1.grid(True, alpha=0.3)
+            ax1.set_title("GA: Hard-Braking Response"); ax1.set_xlabel("Generation"); ax1.grid(True, alpha=0.3)
             ax2.plot(range(1, len(de_crash_hist)+1), de_crash_hist, "darkorange", linewidth=0.8)
-            ax2.set_title("DE: Crash Response"); ax2.set_xlabel("Generation"); ax2.grid(True, alpha=0.3)
-            fig.suptitle("Differential Evolution Convergence (NB, significance-penalised)")
+            ax2.set_title("GA: Crash Response (single run)"); ax2.set_xlabel("Generation"); ax2.grid(True, alpha=0.3)
+            fig.suptitle("Single-run GA Convergence (NB, significance-penalised, no restarts)")
             fig.tight_layout()
             fig.savefig(os.path.join(OUTPUT_DIR, "hb_de_convergence_combined.png"), dpi=150)
             plt.close(fig)
             cp_de.mark_done()
             print("  STEP 1 COMPLETE")
     else:
-        print("\n  STEP 1 already complete (resume)")
+        print("\n  STEP 1 already complete (resume) -- refitting + rewriting best models")
         de_nm_feats = pd.read_csv(nm_features_csv)["feature"].tolist()
         de_crash_feats = pd.read_csv(cr_features_csv)["feature"].tolist()
-        de_nm = fit_model(df, de_nm_feats, nm_col, "log_len", label="DE-HB (resumed)")
-        de_crash = fit_model(df, de_crash_feats, "ObsCrashes", "log_len", label="DE-Crash (resumed)")
+        de_nm = fit_model(df, de_nm_feats, nm_col, "log_len", label="GA-HB (resumed)")
+        de_crash = fit_model(df, de_crash_feats, "ObsCrashes", "log_len", label="GA-Crash (resumed)")
+        # Best models are always rewritten even on resume (no stale paper tables).
+        model_to_latex(de_nm, os.path.join(OUTPUT_DIR, "hb_de_best_nm.tex"),
+                       "GA Best Model: Hard-Braking Response", "tab:hb_de_nm")
+        model_to_latex(de_crash, os.path.join(OUTPUT_DIR, "hb_de_best_crash.tex"),
+                       "GA Best Model: Crash Response", "tab:hb_de_crash")
 
-    # ── STEP 2: MCR STRUCTURE SEARCH ──
+    # â”€â”€ STEP 2: MCR STRUCTURE SEARCH â”€â”€
     if not cp_mcr.is_done():
         print("\n\n" + "#"*70)
         print("#  STEP 2: MCR STRUCTURE SEARCH")
         print("#"*70)
 
         mcr_nm = mcr_model_search(df, nm_col, de_nm_feats, "log_len",
-                                  label="HB", n_starts=3, max_iter=800, R=25,
+                                  label="HB", n_starts=1, max_iter=800, R=25,
                                   max_latent_classes=1, out_dir=OUTPUT_DIR,
                                   N_max=4000, solver="de", pop_size=24)
         mcr_crash = mcr_model_search(df, "ObsCrashes", de_crash_feats, "log_len",
-                                     label="Crash", n_starts=3, max_iter=800, R=25,
+                                     label="Crash", n_starts=1, max_iter=800, R=25,
                                      max_latent_classes=1, out_dir=OUTPUT_DIR,
                                      N_max=4000, solver="de", pop_size=24)
 
@@ -1592,7 +1717,7 @@ def main():
     model_to_latex(spec_crash_model, os.path.join(OUTPUT_DIR, "hb_final_spec_crash.tex"),
                    "MCR-Searched Final Model: Crash Response", "tab:hb_final_crash")
 
-    # ── STEP 3: FULL MODELS ──
+    # â”€â”€ STEP 3: FULL MODELS â”€â”€
     print("\n\n" + "#"*70)
     print("#  STEP 3: Full models (all geometry baseline)")
     print("#"*70)
@@ -1600,8 +1725,12 @@ def main():
     full_crash = fit_model(df, GEO, "ObsCrashes", "log_len", label="Full: Geo -> Crashes", verbose=False)
     print(f"  HB full model:    LL={full_hb['ll']:.2f}, BIC={full_hb['bic']:.2f}, k={full_hb['k']}")
     print(f"  Crash full model: LL={full_crash['ll']:.2f}, BIC={full_crash['bic']:.2f}, k={full_crash['k']}")
+    model_to_latex(full_hb, os.path.join(OUTPUT_DIR, "hb_full_geo_nm.tex"),
+                   "Full Geometry Model: Hard-Braking Response", "tab:hb_full_nm")
+    model_to_latex(full_crash, os.path.join(OUTPUT_DIR, "hb_full_geo_crash.tex"),
+                   "Full Geometry Model: Crash Response", "tab:hb_full_crash")
 
-    # ── STEP 4: COEFFICIENT PROPORTIONALITY ──
+    # â”€â”€ STEP 4: COEFFICIENT PROPORTIONALITY â”€â”€
     prop = coefficient_proportionality_test(full_hb, full_crash, OUTPUT_DIR)
     prop_srch = mixed_coefficient_proportionality(spec_hb_model, spec_crash_model, OUTPUT_DIR)
     pd.DataFrame([{"test": "full", "k": prop["k"], "r": prop["corr"], "R2": prop["R2_prop"]},
@@ -1611,7 +1740,61 @@ def main():
                    "n_common": prop_srch.get("n_common", np.nan)}])\
         .to_csv(os.path.join(OUTPUT_DIR, "hb_proportionality.csv"), index=False)
 
-    # ── STEP 5: SPECIFICATION TRANSFER ──
+    def _tex_escape(s):
+        """Escape LaTeX specials in generated cell/note text.
+
+        Fixes the compile failures in regenerated tables: bare underscores
+        (hb_candidate, EB_xfit), bare 'R^2' outside math mode, and stray
+        '%' that commented out the rest of a table row. Math spans already
+        wrapped in $...$ are passed through untouched.
+        """
+        s = str(s)
+        spans = []
+        def _keep(m):
+            spans.append(m.group(1))
+            return f"\x00{len(spans) - 1}\x00"
+        s = re.sub(r"\$([^$]*)\$", _keep, s)                  # protect math spans
+        s = s.replace("R^2", "\x00R2M\x00").replace("R2=", "\x00R2M\x00 = ")
+        for k, v in (("\\", r"\textbackslash{}"), ("&", r"\&"), ("%", r"\%"),
+                     ("$", r"\$"), ("#", r"\#"), ("_", r"\_"), ("{", r"\{"),
+                     ("}", r"\}"), ("~", r"\textasciitilde{}"),
+                     ("^", r"\textasciicircum{}")):
+            s = s.replace(k, v)
+        s = re.sub(r"\x00(\d+)\x00", lambda m: f"${spans[int(m.group(1))]}$", s)
+        s = s.replace("\x00R2M\x00", "$R^2$")
+        return s.replace("->", r"$\to$")
+
+    def _save_tex_table(rows, headers, filename, caption, label, notes=""):
+        lines = [
+            "\\begin{table}[htbp]\n\\centering\n\\caption{" + _tex_escape(caption)
+            + "}\\label{" + label + "}\\small",
+            "\\begin{tabular}{" + ("l" + "r" * (len(headers) - 1)) + "}\n\\hline",
+            " & ".join(_tex_escape(h) for h in headers) + "\\\\\n\\hline",
+        ]
+        for row in rows:
+            lines.append(" & ".join(_tex_escape(v) for v in row) + "\\\\")
+        lines.append("\\hline\n\\end{tabular}")
+        if notes:
+            lines.append("\\footnotesize{" + _tex_escape(notes) + "}")
+        lines.append("\\end{table}")
+        with open(os.path.join(OUTPUT_DIR, filename), "w") as f:
+            f.write("\n".join(lines))
+
+    _save_tex_table(
+        [["Proportionality factor k", f"{prop['k']:.4f}"],
+         ["Correlation r", f"{prop['corr']:.4f}"],
+         ["Full-model R^2", f"{prop['R2_prop']:.4f}"],
+         ["Searched r", f"{prop_srch.get('corr', float('nan')):.4f}"],
+         ["Searched R^2", f"{prop_srch.get('R2_prop', float('nan')):.4f}"],
+         ["Common sig. features", str(prop_srch.get('n_common', 0))]],
+        ["Statistic", "Value"],
+        "hb_proportionality.tex",
+        "Coefficient Proportionality: HB vs Crash",
+        "tab:proportionality",
+        f"k = {prop['k']:.3f} (full model), r = {prop_srch.get('corr', float('nan')):.3f} (searched).",
+    )
+
+    # â”€â”€ STEP 5: SPECIFICATION TRANSFER â”€â”€
     if not cp_transfer.is_done():
         transfer = specification_transfer(df, hb_final_feats, crash_final_feats, OUTPUT_DIR)
         cp_transfer.mark_done()
@@ -1619,7 +1802,17 @@ def main():
         print("\n  STEP 5 already complete (resume)")
         transfer = specification_transfer(df, hb_final_feats, crash_final_feats, OUTPUT_DIR)
 
-    # ── STEP 6: ENCOMPASSING TEST ──
+    _save_tex_table(
+        [[m["label"], f"{m['bic']:.2f}", f"{m['aic']:.2f}", f"{m['ll']:.2f}", str(m['k'])]
+         for m in transfer.values()],
+        ["Model", "BIC", "AIC", "LL", "k"],
+        "hb_specification_transfer.tex",
+        "Specification Transfer: HB and Crash Feature Sets",
+        "tab:spec_transfer",
+        "Native = model's own specification; penalty = BIC difference.",
+    )
+
+    # â”€â”€ STEP 6: ENCOMPASSING TEST â”€â”€
     if not cp_enc.is_done():
         enc = encompassing_test(df, hb_final_feats, crash_final_feats, OUTPUT_DIR)
         cp_enc.mark_done()
@@ -1627,7 +1820,21 @@ def main():
         print("\n  STEP 6 already complete (resume)")
         enc = encompassing_test(df, hb_final_feats, crash_final_feats, OUTPUT_DIR)
 
-    # ── STEP 7: BIVARIATE LATENT RISK ──
+    _save_tex_table(
+        [["LR statistic", f"{enc['lr_stat']:.2f}"],
+         ["df", str(enc["df"])],
+         ["p-value", f"{enc['p']:.6f}"],
+         ["BIC restricted (Geo only)", f"{enc['bic_r']:.2f}"],
+         ["BIC unrestricted (+predHB)", f"{enc['bic_u']:.2f}"],
+         ["delta BIC", f"{enc['bic_u'] - enc['bic_r']:+.2f}"]],
+        ["Statistic", "Value"],
+        "hb_encompassing.tex",
+        "Encompassing Test: does predicted HB encompass geometry in predicting crashes?",
+        "tab:encompassing",
+        "Significant p-value means predicted HB provides information beyond geometry alone.",
+    )
+
+    # â”€â”€ STEP 7: BIVARIATE LATENT RISK â”€â”€
     if not cp_biv.is_done():
         geo_control_feats = sorted(set(hb_final_feats) | set(crash_final_feats))
         biv = bivariate_latent_risk(df, geo_control_feats, nm_col, OUTPUT_DIR)
@@ -1637,7 +1844,18 @@ def main():
         geo_control_feats = sorted(set(hb_final_feats) | set(crash_final_feats))
         biv = bivariate_latent_risk(df, geo_control_feats, nm_col, OUTPUT_DIR)
 
-    # ── STEP 8: BIVARIATE COPULA ──
+    _save_tex_table(
+        [["Raw Spearman rho", f"{biv['spearman_r']:.4f}"],
+         ["Partial Spearman rho (after geo)", f"{biv['partial_r']:.4f}"],
+         ["Partial p-value", f"{biv['partial_p']:.2e}"]],
+        ["Statistic", "Value"],
+        "hb_bivariate_latent.tex",
+        "Bivariate Latent Risk: shared unobserved risk between HB and crashes",
+        "tab:bivariate_latent",
+        "Partial correlation controls for geometry; positive => shared latent risk.",
+    )
+
+    # â”€â”€ STEP 8: BIVARIATE COPULA â”€â”€
     if not cp_cop.is_done():
         cop = bivariate_copula_analysis(df, nm_col, spec_hb_model, spec_crash_model, OUTPUT_DIR)
         cp_cop.mark_done()
@@ -1645,7 +1863,24 @@ def main():
         print("\n  STEP 8 already complete (resume)")
         cop = bivariate_copula_analysis(df, nm_col, spec_hb_model, spec_crash_model, OUTPUT_DIR)
 
-    # ── STEP 10: HB CATEGORY MULTIVARIATE ──
+    cop_rows = [["BIC independent", f"{cop.get('bic_indep', float('nan')):.2f}"]]
+    for name, fit in cop.get("fits", {}).items():
+        cop_rows.append([f"{name} theta", f"{fit.get('theta', float('nan')):.4f}"])
+        cop_rows.append([f"{name} LR stat", f"{fit.get('lr_stat', float('nan')):.1f}"])
+        cop_rows.append([f"{name} p_lr", f"{fit.get('p_lr', float('nan')):.2e}"])
+        cop_rows.append([f"{name} BIC joint", f"{fit.get('bic_joint', float('nan')):.2f}"])
+    cop_rows.append(["Best copula", str(cop.get("best_copula", ""))])
+    cop_rows.append(["Marginal r", f"{cop.get('pred', {}).get('r_marg', float('nan')):.4f}"])
+    cop_rows.append(["Copula r", f"{cop.get('pred', {}).get('r_cond', float('nan')):.4f}"])
+    _save_tex_table(
+        cop_rows, ["Statistic", "Value"],
+        "hb_bivariate_copula.tex",
+        "Bivariate Copula: dependence structure between HB and crash residuals",
+        "tab:copula",
+        "Kimeldorf/Frank/Normal copulas; p<0.05 implies dependence beyond independence.",
+    )
+
+    # â”€â”€ STEP 10: HB CATEGORY MULTIVARIATE â”€â”€
     if not cp_cats.is_done():
         cat_models, cat_copula = hb_category_multivariate_analysis(df, hb_final_feats, OUTPUT_DIR)
         cp_cats.mark_done()
@@ -1653,7 +1888,24 @@ def main():
         print("\n  STEP 10 already complete (resume)")
         cat_models, cat_copula = hb_category_multivariate_analysis(df, hb_final_feats, OUTPUT_DIR)
 
-    # ── STEP 11: SPATIAL TRANSFERABILITY ──
+    for cat, m in cat_models.items():
+        model_to_latex(m, os.path.join(OUTPUT_DIR, f"hb_category_{cat}.tex"),
+                       f"HB Category Model: {cat}", f"tab:cat_{cat}")
+    cat_rows = [["Category", "theta", "LL joint", "BIC joint", "BIC indep", "LR stat", "p"]]
+    cat_display = {"hb_candidate": "Candidate", "hb_critical": "Critical-Likely",
+                   "hb_extreme": "Extreme"}
+    for cat, r in cat_copula.items():
+        cat_rows.append([cat_display.get(cat, cat), f"{r['theta']:.4f}", f"{r['ll_joint']:.1f}",
+                         f"{r['bic_joint']:.1f}", f"{r['bic_indep']:.1f}",
+                         f"{r['lr_stat']:.1f}", f"{r['p_lr']:.2e}"])
+    _save_tex_table(
+        cat_rows, cat_rows[0], "hb_category_copula.tex",
+        "Bivariate Copula: HB categories vs Crashes (Kimeldorf)",
+        "tab:cat_copula",
+        "Significant p-value means the HB category and crashes share dependence.",
+    )
+
+    # â”€â”€ STEP 11: SPATIAL TRANSFERABILITY â”€â”€
     if not cp_transf.is_done():
         transf, transf_stab = transferability_analysis(
             df, hb_final_feats, crash_final_feats, nm_col, OUTPUT_DIR)
@@ -1663,7 +1915,7 @@ def main():
         transf = pd.read_csv(os.path.join(OUTPUT_DIR, "hb_transferability_lga.csv"))
         transf_stab = pd.read_csv(os.path.join(OUTPUT_DIR, "hb_transferability_coef_stability.csv"))
 
-    # ── SYNTHESIS ──
+    # â”€â”€ SYNTHESIS â”€â”€
     print("\n\n" + "="*70)
     print("  SYNTHESIS: Is Hard-Braking a Valid Crash Proxy?")
     print("="*70)
@@ -1674,7 +1926,7 @@ def main():
     else:
         evidence.append(("CON", f"Coefficients NOT proportional: r={prop['corr']:.3f}, R2={prop['R2_prop']:.3f}"))
 
-    # Searched (mixed) model proportionality is the cleaner signal — prefer it
+    # Searched (mixed) model proportionality is the cleaner signal â€” prefer it
     # when it yields a meaningful common-feature set.
     if prop_srch.get("n_common", 0) >= 2:
         r2s = prop_srch.get("R2_prop", np.nan)
@@ -1737,23 +1989,41 @@ def main():
 
     pro = sum(1 for e in evidence if e[0] == "PRO")
     con = sum(1 for e in evidence if e[0] == "CON")
+    net = pro - con
 
     print(f"\n  {'Evidence':<80s} {'Verdict':>10s}")
     print(f"  {'-'*90}")
     for tag, msg in evidence:
         print(f"  {msg:<80s} {'[+]' if tag=='PRO' else '[-]'}")
 
-    print(f"\n  Score: {pro} PRO / {con} CON")
-    if pro >= 4:
+    print(f"\n  Score: {pro} PRO / {con} CON (net {net:+d})")
+    # Verdict weighs CON evidence as well: a high PRO count alone previously
+    # produced "STRONG PROXY" even at 6 PRO / 6 CON, contradicting the
+    # complementary-not-surrogate conclusion the diagnostics actually support.
+    if pro >= 4 and con <= 2 and net >= 2:
         ver = "STRONG PROXY: HB can serve as a crash surrogate"
-    elif pro >= 2:
+    elif net > 0:
         ver = "PARTIAL PROXY: HB provides complementary information"
+    elif net == 0:
+        ver = ("COMPLEMENTARY SIGNAL: mixed evidence - HB augments crash-risk "
+               "screening but is not a structural surrogate for crash-count models")
     else:
         ver = "WEAK PROXY: HB and crashes have different structural drivers"
     print(f"  VERDICT: {ver}")
 
-    pd.DataFrame([{"Tag": t, "Evidence": m} for t, m in evidence]).to_csv(
+    pd.DataFrame([{"Tag": t, "Evidence": m} for t, m in evidence]
+                 + [{"Tag": "NET", "Evidence": f"net={net:+d} ({pro} PRO / {con} CON)"},
+                    {"Tag": "VERDICT", "Evidence": ver}]).to_csv(
         os.path.join(OUTPUT_DIR, "hb_proxy_evidence.csv"), index=False)
+
+    _save_tex_table(
+        [[tag, msg] for tag, msg in evidence],
+        ["Verdict", "Evidence"],
+        "hb_synthesis_evidence.tex",
+        "Synthesis of Evidence: Can Hard-Braking Serve as a Crash Proxy?",
+        "tab:synthesis",
+        f"Score: {pro} PRO / {con} CON. Verdict: {ver}.",
+    )
 
     print(f"\n  All outputs in: {OUTPUT_DIR}")
     print("="*70)

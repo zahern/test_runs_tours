@@ -51,6 +51,18 @@ from scipy.stats import norm
 logger = logging.getLogger(__name__)
 
 
+def _default_seed():
+    """Reproducible sampling seed (override per-run via PIPELINE_SEED).
+
+    Previously predict_sampled(seed=None) drew from OS entropy, making every
+    prediction run — and GA fitness evaluation — irreproducible.
+    """
+    try:
+        return int(os.environ.get('PIPELINE_SEED', '42'))
+    except ValueError:
+        return 42
+
+
 def add_total_activity_counts(tours: pd.DataFrame) -> pd.DataFrame:
     """
     Combine n_{purpose}_out + n_{purpose}_in → n_{purpose}_out (and _total).
@@ -535,6 +547,16 @@ def prepare_frequency_data(
     keep = ['person_id', 'ptype'] + [c for c in wanted if c in pers.columns]
     pers = pers[keep]
 
+    # person_id dtype guard: prototype feeds (e.g. MTC) can hand tours with
+    # str keys and persons with Int64 keys (or vice versa), which pandas
+    # refuses to merge. Coerce both sides only when they disagree, so the
+    # main pipeline path (consistent dtypes) is byte-for-byte unchanged.
+    if counts['person_id'].dtype != pers['person_id'].dtype:
+        counts = counts.copy()
+        pers = pers.copy()
+        counts['person_id'] = counts['person_id'].astype(str)
+        pers['person_id'] = pers['person_id'].astype(str)
+
     df = counts.merge(pers, on='person_id', how='left')
 
     # fill any missing feature columns with sensible defaults
@@ -572,6 +594,7 @@ class OrderedLogit:
         self.std_err_   = None
         self.t_stat_    = None
         self.p_value_   = None
+        self.threshold_std_err_ = None   # delta-method SEs for thresholds_
 
     def _pack(self, beta, raw_cuts):
         return np.concatenate([beta, raw_cuts])
@@ -668,8 +691,27 @@ class OrderedLogit:
             cov = np.linalg.pinv(hess)
             params = np.concatenate([self.coef_, self.thresholds_])
             raw_se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
-            # Report thresholds on the transformed scale; use the same variance slots.
-            self.std_err_ = raw_se
+            # Delta-method SEs for thresholds on the reported (cumsum-exp)
+            # scale. cuts[0] = raw[0] (SE exact); cuts[j] = r0 + Σ exp(r_k),
+            # so row j of J is [1, exp(r_1), …, exp(r_j), 0, …].
+            n_cuts = max(J - 1, 0)
+            thr_se = np.full(n_cuts, np.nan)
+            try:
+                if n_cuts:
+                    _raw = np.asarray(res.x[K:], dtype=float)
+                    _C = np.asarray(cov[K:, K:], dtype=float)
+                    _J = np.zeros((n_cuts, n_cuts))
+                    for _j in range(n_cuts):
+                        _J[_j, 0] = 1.0
+                        for _k in range(1, _j + 1):
+                            _J[_j, _k] = float(np.exp(_raw[_k]))
+                    _V = _J @ _C @ _J.T
+                    thr_se = np.sqrt(np.clip(np.diag(_V), 0.0, None))
+            except Exception:
+                pass
+            self.threshold_std_err_ = thr_se
+            # Report thresholds on the transformed scale with delta-method SEs.
+            self.std_err_ = np.concatenate([raw_se[:K], thr_se]) if n_cuts else raw_se[:K]
             self.t_stat_ = np.divide(
                 params,
                 self.std_err_,
@@ -682,6 +724,7 @@ class OrderedLogit:
             self.std_err_ = np.full(size, np.nan)
             self.t_stat_ = np.full(size, np.nan)
             self.p_value_ = np.full(size, np.nan)
+            self.threshold_std_err_ = np.full(max(J - 1, 0), np.nan)
         return self
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -711,7 +754,7 @@ class OrderedLogit:
 
     def predict_sampled(self, X: np.ndarray, seed: int = None) -> np.ndarray:
         """Sample a count from the predicted probability distribution."""
-        rng   = np.random.default_rng(seed)
+        rng   = np.random.default_rng(_default_seed() if seed is None else seed)
         proba = self.predict_proba(X)
         J     = len(self.classes_)
         out   = np.array([
@@ -894,7 +937,7 @@ class ZeroInflatedOrderProbit:
         return self.classes_[proba.argmax(axis=1)]
 
     def predict_sampled(self, X: np.ndarray, seed: int = None) -> np.ndarray:
-        rng   = np.random.default_rng(seed)
+        rng   = np.random.default_rng(_default_seed() if seed is None else seed)
         proba = self.predict_proba(X)
         J     = len(self.classes_)
         out   = np.array([
@@ -979,6 +1022,30 @@ def estimate_frequency_models(
                            probit stage on top of the ordered count link.
     """
     data = prepare_frequency_data(tours, persons, landuse=landuse)
+    # ── GA dict override: recreate the engineered search-frame columns ────
+    # _run_ga_stage1 enriches its frame with ptype dummies, is_female,
+    # income flags, mandatory_role and _enrich_ga_data additions; a GA
+    # best_features dict can reference any of them. prepare_frequency_data
+    # only keeps columns named in DEFAULT_FEATURES_BY_PURPOSE (+ *_acc), so
+    # ensure them here or the "c in data.columns" filter silently drops
+    # every engineered GA selection.
+    if isinstance(feature_override, dict) and feature_override:
+        _attrs = dict(data.attrs)
+        try:
+            from ga_hypothesis_testing import ensure_ga_search_columns
+            data = ensure_ga_search_columns(data, persons, stage_id=1)
+            _missing = sorted(
+                {str(f) for vals in feature_override.values() for f in (vals or [])}
+                - set(data.columns)
+            )
+            logger.info(
+                f"GA feature override: ensured search-frame columns; "
+                f"unresolvable features: {_missing or 'none'}"
+            )
+        except Exception as _ee:
+            logger.warning(f"GA feature-column enrichment failed: {_ee}")
+        finally:
+            data.attrs.update(_attrs)
     models = {}
 
     for purpose in PURPOSES:
@@ -1319,6 +1386,29 @@ def predict_activity_frequency(
     if landuse is not None:
         from synth_attributes import attach_person_accessibility
         df = attach_person_accessibility(df, landuse)
+    # Rebuild every other GA-searchable derived feature (workstat/studying
+    # flags, age bins, INDUSTRY/occp, household flags, taste interactions) so
+    # GA-selected terms resolve here instead of being silently zero-filled
+    # downstream. Non-fatal and idempotent (skips columns already built).
+    try:
+        from ga_hypothesis_testing import ensure_prediction_features
+        df = ensure_prediction_features(df, stage_id=1)
+    except Exception as _e:
+        logger.warning(f"prediction feature enrichment skipped: {_e}")
+
+    # ── day-pattern conditioning (ActivitySim hierarchy) ──────────────────
+    # If the GA selected dap_M/dap_N candidates, the synth side needs the same
+    # columns. Derive them from the predicted CDAP letter (written by
+    # predict_cdap / coordinate_household_cdap, which run before stage 1);
+    # dap_H is the reference category.
+    _cdap_col = next((c for c in ('CDAP', 'dap') if c in df.columns), None)
+    if _cdap_col is not None and ('dap_M' not in df.columns
+                                  or 'dap_N' not in df.columns):
+        _dap_letters = df[_cdap_col].astype(str).str.upper().str[0]
+        if 'dap_M' not in df.columns:
+            df['dap_M'] = (_dap_letters == 'M').astype(int)
+        if 'dap_N' not in df.columns:
+            df['dap_N'] = (_dap_letters == 'N').astype(int)
 
     # initialise output columns
     for purpose in PURPOSES:

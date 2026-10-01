@@ -294,6 +294,30 @@ def aggregate_person_day(
 # 1.  MODELS  (Tobit censored regression + lognormal budget)
 # ---------------------------------------------------------------------------
 
+def _numerical_hessian(func, params: np.ndarray, eps: float = 1e-4) -> np.ndarray:
+    """Central-difference Hessian of `func` at `params` (same convention as the
+    stage 1/3/4 helpers): func returns the objective VALUE being minimised."""
+    params = np.asarray(params, dtype=float)
+    n = len(params)
+    hess = np.zeros((n, n), dtype=float)
+    f0 = func(params)
+    for i in range(n):
+        ei = np.zeros(n, dtype=float)
+        ei[i] = eps
+        fph = func(params + ei)
+        fmh = func(params - ei)
+        hess[i, i] = (fph - 2.0 * f0 + fmh) / (eps * eps)
+        for j in range(i + 1, n):
+            ej = np.zeros(n, dtype=float)
+            ej[j] = eps
+            fip = func(params + ei + ej)
+            fim = func(params + ei - ej)
+            fjp = func(params - ei + ej)
+            fjm = func(params - ei - ej)
+            hess[i, j] = hess[j, i] = (fip - fim - fjp + fjm) / (4.0 * eps * eps)
+    return hess
+
+
 class TobitModel:
     """
     Tobit Type-I censored regression for bounded continuous outcomes.
@@ -303,11 +327,16 @@ class TobitModel:
     """
 
     def __init__(self, lo: float = -np.inf, hi: float = np.inf,
-                 log_y: bool = False, ridge: float = 0.01):
+                 log_y: bool = False, ridge: float = None):
         self.lo = lo
         self.hi = hi
         self.log_y = log_y
-        self.ridge = ridge   # L2 penalty on slope coefficients (not intercept)
+        # L2 penalty on slope coefficients (not intercept), EMBEDDED in _neg_ll
+        # so the fit AND the Hessian used for std_err/p_value both carry the
+        # ≈λ eigenvalue lift — keeps inference finite on collinear designs
+        # (mirrors SearchLibrium's l2_penalty on z-scored coefficients).
+        self.ridge = float(os.environ.get('GA_S2_RIDGE', '0.5')) \
+            if ridge is None else float(ridge)
         self.coef_ = None
         self.intercept_ = None
         self.log_sigma_ = None
@@ -371,6 +400,82 @@ class TobitModel:
             neg_ll += self.ridge * float(np.sum(params[1:n_feat + 1] ** 2))
         return neg_ll
 
+    def fit_mh(self, X: np.ndarray, y: np.ndarray, n_burn: int = 1000,
+               n_draw: int = 2000, thin: int = 2, seed: int = 42,
+               proposal_scale: float = 1.0):
+        """Sample the fitted censored-regression posterior with RWMH."""
+        if self.coef_ is None:
+            self.fit(X, y)
+
+        Xs = np.column_stack([np.ones(len(X)), (X - self.mu_) / self.sd_])
+        start = np.concatenate([[self.intercept_], self.coef_,
+                                [self.log_sigma_]])
+        n_feat = X.shape[1]
+        lower = np.concatenate([[self.lo if np.isfinite(self.lo) else -1440.0],
+                                np.full(n_feat, COEF_CLIP_LO), [-4.0]])
+        upper = np.concatenate([[self.hi if np.isfinite(self.hi) else 1440.0],
+                                np.full(n_feat, COEF_CLIP_HI), [5.0]])
+
+        def logpost(params):
+            params = np.asarray(params, dtype=float)
+            if np.any(params < lower) or np.any(params > upper):
+                return -np.inf
+            return -float(self._neg_ll(params, Xs, y))
+
+        from mh_choice_estimator import GaussianRandomWalkProposal
+
+        rng = np.random.default_rng(seed)
+        sigma = max(float(self.sigma_), 1e-3)
+        base = max(sigma / np.sqrt(max(len(y), 1)), 0.05)
+        scales = np.full(len(start), base, dtype=float)
+        scales[0] = max(base, 0.5)
+        scales[-1] = 0.05
+        proposal = GaussianRandomWalkProposal(
+            len(start), init_cov=np.diag(scales ** 2),
+            scaling=float(proposal_scale), seed=seed + 17)
+
+        theta = start.copy()
+        current = logpost(theta)
+        draws = []
+        accepted = 0
+        total = max(int(n_burn), 0) + max(int(n_draw), 1) * max(int(thin), 1)
+        for iteration in range(1, total + 1):
+            candidate = proposal.propose(theta)
+            proposed = logpost(candidate)
+            if np.log(rng.uniform()) < proposed - current:
+                theta, current = candidate, proposed
+                accepted += 1
+            proposal.adapt(theta)
+            if iteration > n_burn and (iteration - n_burn) % max(int(thin), 1) == 0:
+                draws.append(theta.copy())
+
+        posterior = np.asarray(draws, dtype=float)
+        if posterior.ndim != 2 or len(posterior) < 2:
+            raise RuntimeError("Stage 2 MH produced too few posterior draws")
+        mean = posterior.mean(axis=0)
+        self.intercept_ = float(mean[0])
+        self.coef_ = mean[1:n_feat + 1]
+        self.log_sigma_ = float(mean[-1])
+        self.sigma_ = float(np.exp(self.log_sigma_))
+        self._clip_coefficients()
+        self.std_err_ = posterior.std(axis=0, ddof=1)
+        params = np.concatenate([[self.intercept_], self.coef_, [self.log_sigma_]])
+        self.t_stat_ = np.divide(
+            params, self.std_err_, out=np.full_like(params, np.nan),
+            where=self.std_err_ > 0)
+        self.p_value_ = 2.0 * norm.sf(np.abs(self.t_stat_))
+        self.ll_ = -float(self._neg_ll(
+            np.concatenate([[self.intercept_], self.coef_, [self.log_sigma_]]),
+            Xs, y))
+        yhat = self.predict(X)
+        self.rmse_ = float(np.sqrt(np.mean((y - yhat) ** 2)))
+        self.n_ = len(y)
+        self.converged_ = True
+        self.fit_method_ = 'rwmh'
+        self.mh_accept_rate_ = accepted / max(total, 1)
+        self.mh_n_draws_ = len(posterior)
+        return self
+
     def fit(self, X: np.ndarray, y: np.ndarray, maxiter: int = 600):
         from scipy.optimize import minimize
 
@@ -410,13 +515,22 @@ class TobitModel:
         self.ll_ = float(-res.fun)
         self.n_ = len(y)
         self.converged_ = bool(res.success)
+        self.fit_method_ = 'mle'
         self._clip_coefficients()
 
         try:
-            hess_inv = res.hess_inv.todense() if hasattr(res.hess_inv, 'todense') else np.asarray(res.hess_inv)
-            hess_inv = np.asarray(hess_inv, dtype=float)
+            # Numerical Hessian of the SAME penalised objective that was fitted
+            # (_neg_ll includes self.ridge) — the ≈2·ridge eigenvalue lift keeps
+            # the pinv well-conditioned. The previous res.hess_inv (L-BFGS
+            # quasi-Newton approximation) regularly returned garbage diagonals
+            # → NaN std_err/p_value.
+            _hess = _numerical_hessian(
+                lambda p: self._neg_ll(p, Xs, y), res.x)
+            _lift = np.zeros_like(_hess)
+            _lift[1:n_feat + 1, 1:n_feat + 1] = np.eye(n_feat) * 2.0 * self.ridge
+            cov = np.linalg.pinv(_hess + _lift)
             params = np.concatenate([[self.intercept_], self.coef_, [self.log_sigma_]])
-            self.std_err_ = np.sqrt(np.clip(np.diag(hess_inv), 0.0, None))
+            self.std_err_ = np.sqrt(np.clip(np.diag(cov), 0.0, None))
             self.t_stat_ = np.divide(params, self.std_err_, out=np.full_like(params, np.nan), where=self.std_err_ > 0)
             self.p_value_ = 2.0 * norm.sf(np.abs(self.t_stat_))
         except Exception:
@@ -602,7 +716,8 @@ def _build_X(
 # ---------------------------------------------------------------------------
 
 def estimate_day_models(person_day: pd.DataFrame,
-                        feature_override: list = None) -> dict:
+                        feature_override: list = None,
+                        persons: pd.DataFrame = None) -> dict:
     """
     Fit three models:
       'start'  : predict start_of_day (minutes)
@@ -612,6 +727,17 @@ def estimate_day_models(person_day: pd.DataFrame,
     Parameters
     ----------
     person_day : from aggregate_person_day()
+    feature_override : GA-selected features — a list applied to every target,
+        or a dict keyed by target ('start' / 'end' / 'budget') as produced by
+        the stage-2 GA search.
+    persons : person-level table; required for GA dict overrides so the
+        engineered search-frame columns (CARLICENCE, age bands, household
+        flags, income bands, ...) can be recreated via
+        ga_hypothesis_testing.ensure_ga_search_columns().
+
+    Set STAGE2_MH=1 to replace the final start/end Tobit point estimates with
+    posterior means from random-walk Metropolis-Hastings; burn-in, draws,
+    thinning, seed, and proposal scale are controlled by STAGE2_MH_*.
 
     Returns
     -------
@@ -619,6 +745,34 @@ def estimate_day_models(person_day: pd.DataFrame,
     LinearModel and the feature column list used.
     """
     person_day = _augment_day_features(person_day)
+    # ── GA dict override: recreate the engineered search-frame columns ────
+    # _run_ga_stage2 enriches its frame with ptype dummies, is_female,
+    # income flags, mandatory_role and _enrich_ga_data additions; without
+    # this step the "c in person_day.columns" filter silently drops every
+    # engineered GA selection and the refit degrades to the default spec.
+    if isinstance(feature_override, dict) and feature_override:
+        _attrs = dict(person_day.attrs)
+        try:
+            if persons is None:
+                raise ValueError(
+                    "estimate_day_models: persons= is required to resolve "
+                    "a GA dict feature override"
+                )
+            from ga_hypothesis_testing import ensure_ga_search_columns
+            person_day = ensure_ga_search_columns(person_day, persons, stage_id=2,
+                                                 zone_col='HOME_SA2_2021')
+            _missing = sorted(
+                {str(f) for vals in feature_override.values() for f in (vals or [])}
+                - set(person_day.columns)
+            )
+            logger.info(
+                f"GA feature override: ensured search-frame columns; "
+                f"unresolvable features: {_missing or 'none'}"
+            )
+        except Exception as _ee:
+            logger.warning(f"GA feature-column enrichment failed: {_ee}")
+        finally:
+            person_day.attrs.update(_attrs)
     ptypes = sorted(person_day['ptype'].dropna().unique())
 
     # â”€â”€ diagnostic: confirm training targets are in minutes â”€â”€â”€â”€â”€â”€
@@ -642,6 +796,13 @@ def estimate_day_models(person_day: pd.DataFrame,
     # the latent departure time correctly.
     _s2_zthresh = float(os.environ.get('GA_SIG_COEF_ZERO', '0.01'))
     _s2_pthresh = float(os.environ.get('GA_SIG_PVAL_THRESH', '0.10'))
+    _s2_mh_enabled = os.environ.get(
+        'STAGE2_MH', os.environ.get('GA_STAGE2_MH', '0')).strip() == '1'
+    _s2_mh_burn = int(os.environ.get('STAGE2_MH_BURN', '1000'))
+    _s2_mh_draws = int(os.environ.get('STAGE2_MH_DRAWS', '2000'))
+    _s2_mh_thin = int(os.environ.get('STAGE2_MH_THIN', '2'))
+    _s2_mh_seed = int(os.environ.get('STAGE2_MH_SEED', '42'))
+    _s2_mh_scale = float(os.environ.get('STAGE2_MH_PROPOSAL_SCALE', '1.0'))
     _pf = _stage2_person_features(feature_override, 'start', person_day)
     derived_feats = ['n_mandatory', 'n_discretionary', 'mandatory_share', 'escort_share', 'vehs_per_person', 'income_per_person']
     start_feats = ACTIVITY_COLS + derived_feats + _pf
@@ -668,6 +829,15 @@ def estimate_day_models(person_day: pd.DataFrame,
         m_start = TobitModel(lo=MIN_START, hi=MAX_START, log_y=False)
         m_start.fit(X_start, y_start)
         m_start.feature_names_ = start_cols
+    if _s2_mh_enabled:
+        try:
+            m_start.fit_mh(X_start, y_start, n_burn=_s2_mh_burn,
+                           n_draw=_s2_mh_draws, thin=_s2_mh_thin,
+                           seed=_s2_mh_seed, proposal_scale=_s2_mh_scale)
+            logger.info("start_of_day MH acceptance=%.3f draws=%d",
+                        m_start.mh_accept_rate_, m_start.mh_n_draws_)
+        except Exception as exc:
+            logger.warning("start_of_day MH failed; retaining MLE fit: %s", exc)
     logger.info(f"start_of_day Tobit  RMSE={m_start.rmse_:.1f} min  LL={m_start.ll_:.1f}")
 
     # â”€â”€ end_of_day â€” Tobit right-censored at MAX_END â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -705,6 +875,15 @@ def estimate_day_models(person_day: pd.DataFrame,
         m_end = TobitModel(lo=MIN_END, hi=MAX_END, log_y=False, ridge=0.05)
         m_end.fit(X_end, y_end, maxiter=_end_maxiter)
         m_end.feature_names_ = end_cols
+    if _s2_mh_enabled:
+        try:
+            m_end.fit_mh(X_end, y_end, n_burn=_s2_mh_burn,
+                         n_draw=_s2_mh_draws, thin=_s2_mh_thin,
+                         seed=_s2_mh_seed + 1, proposal_scale=_s2_mh_scale)
+            logger.info("end_of_day MH acceptance=%.3f draws=%d",
+                        m_end.mh_accept_rate_, m_end.mh_n_draws_)
+        except Exception as exc:
+            logger.warning("end_of_day MH failed; retaining MLE fit: %s", exc)
     logger.info(
         f"end_of_day Tobit    RMSE={m_end.rmse_:.1f} min  LL={m_end.ll_:.1f}  "
         f"maxiter={_end_maxiter}"
@@ -826,6 +1005,16 @@ def predict_day_budget(
     # fill n_tours if absent
     if 'n_tours' not in df.columns:
         df['n_tours'] = df['n_total'].clip(lower=1)
+
+    # Rebuild GA-searchable derived features (workstat/studying/age flags,
+    # INDUSTRY/occp, household flags, home-zone acc, taste interactions) so a
+    # GA-selected term resolves here instead of being silently zero-filled by
+    # _build_X_exact below (which biases predictions toward the reference).
+    try:
+        from ga_hypothesis_testing import ensure_prediction_features
+        df = ensure_prediction_features(df, stage_id=2)
+    except Exception as _e:
+        logger.warning(f"prediction feature enrichment skipped: {_e}")
 
     def _build_X_exact(df, model_obj):
         """
@@ -1070,7 +1259,8 @@ def run_stage2(
     person_day = aggregate_person_day(tours, persons)
 
     print("\n[1/2] Estimating models...")
-    models = estimate_day_models(person_day, feature_override=feature_override)
+    models = estimate_day_models(person_day, feature_override=feature_override,
+                                 persons=persons)
 
     if save_path:
         save_models(models, save_path)

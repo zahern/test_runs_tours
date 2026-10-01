@@ -21,7 +21,92 @@ This document explains the new PBS launcher files and the commands they submit.
 - `job_merge_ga_results.pbs`
   PBS worker that merges completed stage outputs.
 - `job_submit_ga_parallel_chain.pbs`
-  PBS submitter job that launches stage 1..5 in parallel, then merge, then `ga_staged` prediction.
+  PBS submitter job that launches stage 1..5 in parallel, then merge, then `ga_staged` prediction,
+  then MATSim export.
+- `matsim_export.py`
+  Converts a finished run's final activity plan into a MATSim scenario
+  (`plans.xml` + `facilities.xml` + `config.xml`).
+- `job_matsim_export.pbs`
+  Standalone PBS worker that runs `matsim_export.py` over a finished run directory.
+- `job_matsim_scenario.pbs`
+  Builds + runs a MATSim scenario (export → Controler → analysis) from a finished run.
+- `matsim_analysis.py`
+  Network-level analysis of a MATSim `output/` dir (link volumes, congestion, mode profiles).
+- `matsim/`
+  Staged MATSim toolkit: the pt2matsim jar, the population-independent network + GTFS transit
+  base inputs, the run driver, and rebuild scripts (see `matsim/README.md`).
+
+## Search Engine: SparseEA-AGDS (default)
+
+Every GA stage now runs the **SparseEA-AGDS** search engine by default (adaptive genetic operator +
+dynamic scoring + reference-point selection; Wang et al. 2025). It is selected with `GA_ENGINE=agds`,
+which every PBS worker defaults to (`job_ga_stage_single.pbs`, `pbs_pipeline_mode.pbs`,
+`job_stage3_model_suite.pbs`, and the `job_submit_ga_parallel_chain.pbs` fan-out). `GA_ENGINE` has
+precedence over the legacy `GA_USE_SA` / `GA_USE_BANDIT_SA` flags in
+`ga_hypothesis_testing._resolve_search_engine`.
+
+Override per run or per stage:
+
+```bash
+# whole chain back to landscape-routed portfolio
+qsub -v RUN_TAG=exp1,GA_ENGINE=portfolio job_submit_ga_parallel_chain.pbs
+# force plain GA everywhere
+qsub -v RUN_TAG=exp1,GA_ENGINE=ga job_submit_ga_parallel_chain.pbs
+# one stage only (single-stage worker)
+qsub -v STAGE_ID=5,RUN_TAG=exp1,GA_ENGINE_STAGE5=bandit job_ga_stage_single.pbs
+```
+
+Run directories are labelled by engine, e.g. `runs/agds_metacount_mv_staged__<jobid>/`.
+
+## MATSim Export
+
+Every full run emits a runnable **MATSim** scenario alongside the existing Aimsun/DynusT CSVs. The
+`ga_staged` prediction and the `stage3_model_suite` Stage 5/6 path auto-export via the finalisation
+step (`PIPELINE_MATSIM=1`, default on); the parallel chain also submits a dependent
+`job_matsim_export.pbs` (`GA_MATSIM=1`, default on). Output lands in `<run_dir>/matsim/`:
+
+```
+matsim/plans.xml            ← population: one plan per person (activities + mode legs)
+matsim/facilities.xml       ← one facility per zone centroid
+matsim/config.xml           ← minimal runnable MATSim config (CRS + inputs + scoring)
+matsim/export_manifest.json ← counts, CRS, source CSV, mode/activity histograms
+```
+
+Coordinates are the pipeline's zone centroids reprojected to **GDA94 / MGA Zone 56 (EPSG:28356)**;
+if the trip CSV carries per-trip coordinates (it does) those are used directly. Set
+`MATSIM_CRS=EPSG:4326` for raw lat/lon. Disable with `PIPELINE_MATSIM=0` (auto-export) /
+`GA_MATSIM=0` (chain job). Re-run standalone on any finished run:
+
+```bash
+qsub -v RUN_ROOT=runs/ga_parallel,RUN_TAG=exp1 job_matsim_export.pbs
+# or locally:
+python matsim_export.py --run-dir runs/<run> --crs EPSG:28356
+```
+
+### Population sampling
+
+The full synthetic population is ~2M agents, so a 100% `plans.xml` is multi-GB. Sample it:
+`MATSIM_SAMPLE_FRAC=0.1` (auto-export env) or `--sample-frac 0.1` (CLI) keeps a random 10%;
+`MATSIM_MAX_PERSONS` / `--max-persons` is a hard cap. Unset = full population.
+
+## MATSim: run the scenario + network analysis
+
+`job_matsim_scenario.pbs` turns a finished run into a **runnable MATSim scenario** and network-level
+plots. It reuses the population-independent base inputs staged in `matsim/` (a multimodal car+pt
+**network** from the OSM extract and the **SEQ GTFS transit** schedule — see `matsim/README.md`), so a
+run only: exports sampled plans → runs the MATSim Controler → renders analysis.
+
+```bash
+qsub -v "RUN_DIR=runs/agds_metacount_mv_staged__12345,MATSIM_SAMPLE_FRAC=0.1,MATSIM_ITERS=20,MATSIM_HEAP=64g" job_matsim_scenario.pbs
+```
+
+Car is routed on the network, pt uses the GTFS schedule, walk/bike/ride are teleported, and the flow +
+storage capacity are scaled to `MATSIM_SAMPLE_FRAC` (standard MATSim sample scaling). Outputs land in
+`RUN_DIR/matsim/`: `output/` (full MATSim output incl. events, trips, experienced plans) and `analysis/`
+(`network_volume_car.png`, `network_volume_total.png`, `network_congestion.png`,
+`mode_departure_profile.png`, `trip_distance_by_mode.png`, `summary.json`). For the full 2M population use
+a small sample with a big node; `MATSIM_SAMPLE_FRAC=1.0` only on a large-memory node. Standalone analysis
+on any MATSim output: `python matsim_analysis.py --output-dir <run>/matsim/output`.
 
 ## Parallel Stage Chain (GA Fan-out + Merge + Prediction)
 

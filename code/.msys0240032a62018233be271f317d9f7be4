@@ -1,0 +1,345 @@
+#!/bin/bash -l
+# Orchestrator PBS job.
+# Submits 5 stage jobs in parallel, then merge, then ga_staged prediction.
+#
+# IMPORTANT — resource shape variables (STAGE_SELECT / PRED_SELECT) contain
+# colons, which collide with PBS -v delimiter syntax.  Pass resources as
+# separate atomic variables and assemble the select string inside this script.
+#
+# Correct submission:
+#   qsub -v "RUN_TAG=exp,GA_BUDGET=standard,STAGE_NCPUS=8,STAGE_MEM=128GB,STAGE_WALLTIME=36:00:00,PRED_NCPUS=8,PRED_MEM=250GB,PRED_WALLTIME=24:00:00" job_submit_ga_parallel_chain.pbs
+#
+# Do NOT pass STAGE_SELECT or PRED_SELECT directly via -v; the colons in their
+# values (e.g. 1:ncpus=8:mem=128GB) will be misread by PBS as variable separators.
+
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=1:mem=2GB
+#PBS -l walltime=00:30:00
+
+set -euo pipefail
+
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:-ga_parallel_${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+
+# On each submit, prune AUTO-named job-run dirs older than RUN_RETENTION_DAYS
+# days from RUN_ROOT (see the prune block below). Only auto-name patterns are
+# touched; hand-named experiment dirs (mv*, s5diag, …) are never removed.
+# RUN_PRUNE=0 disables; RUN_RETENTION_DAYS changes the age cutoff.
+RUN_PRUNE=${RUN_PRUNE:-1}
+RUN_RETENTION_DAYS=${RUN_RETENTION_DAYS:-2}
+
+# Estimation settings propagated to stage jobs.
+# Defaults are the aligned 371 + search-quality config (a bare
+#   qsub -v "RUN_TAG=xxx" job_submit_ga_parallel_chain.pbs
+# now runs the intended metacount_mv / GA-engine 371 pipeline). Override any of
+# these via -v as needed.
+GA_BUDGET=${GA_BUDGET:-standard}
+GA_ESTIMATOR=${GA_ESTIMATOR:-metacount_mv}
+# Search engine: 'portfolio' routes each stage by landscape — Bandit-SA for the
+# noisy model-based stages (0,1,5) and GA (reheat/mutation-floor) for the smooth
+# fast-proxy stages (2,3,4). Overrides the legacy GA_USE_SA/GA_USE_BANDIT_SA
+# flags below. Set GA_ENGINE=ga|sa|bandit to force one engine everywhere.
+GA_ENGINE=${GA_ENGINE:-portfolio}
+GA_USE_SA=${GA_USE_SA:-0}                  # legacy fallback (GA_ENGINE wins)
+GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-0}    # legacy fallback (GA_ENGINE wins)
+GA_N_RESTARTS=${GA_N_RESTARTS:-0}
+GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-4}
+# GA_PROFILE=1 runs every stage job (and the predict job) under cProfile,
+# writing profile_estimation_stage<N>_<tag>.pstats. Default off = no change.
+GA_PROFILE=${GA_PROFILE:-0}
+# GA_COMPLEXITY_PENALTY scales the BIC complexity penalty in the Stage 2/3 fast
+# GA oracle. 1.0 = standard BIC (sparse); lower (e.g. 0.3-0.5) keeps more
+# predictors — use it to "open up" flat Stage 2/3 searches.
+GA_COMPLEXITY_PENALTY=${GA_COMPLEXITY_PENALTY:-0.4}
+# GA_REHEAT_FRACTION: fraction of the population replaced by fresh random
+# individuals on each plateau generation (partial reheat) so the search keeps
+# perturbing/improving instead of flatlining. 0 disables; 0.3 is the default.
+GA_REHEAT_FRACTION=${GA_REHEAT_FRACTION:-0.3}
+# More generations for the cheap stages 1-3 (multiplier on the budget's gens),
+# and a hard mutation floor so the population never freezes/collapses.
+GA_STAGE123_GENS_MULT=${GA_STAGE123_GENS_MULT:-2.0}
+GA_MUTATION_MIN=${GA_MUTATION_MIN:-0.05}
+# GA_MEM_PER_WORKER_GB caps parallel segment workers to what the job's memory
+# can hold (mem_limit // this). Prevents the Stage-1 OOM (BrokenProcessPool).
+# Empty = no cap (rely on STAGE_MEM being large enough).
+GA_MEM_PER_WORKER_GB=${GA_MEM_PER_WORKER_GB:-}
+# Dest-estimation sampling + mode-degeneracy tuning. These are forwarded to
+# the stage and predict jobs explicitly (they are NOT always inherited by
+# nested qsubs). DEST_EST_SAMPLE_SIZE is the legacy name; STAGE5_DEST_SAMPLE_SIZE
+# is what stage5_destination_choice.py actually reads (preferred).
+DEST_EST_SAMPLE_SIZE=${DEST_EST_SAMPLE_SIZE:-30}
+STAGE5_DEST_SAMPLE_SIZE=${STAGE5_DEST_SAMPLE_SIZE:-${DEST_EST_SAMPLE_SIZE}}
+GA_MODE_DEGEN_PENALTY=${GA_MODE_DEGEN_PENALTY:-20}
+ESTIMATORS_SKIP_UPGRADE=${ESTIMATORS_SKIP_UPGRADE:-1}
+STAGE23_JOINT=${STAGE23_JOINT:-0}
+GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT:-1.50}
+GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH:-0.05}
+# Behavioural knobs forwarded to the stage jobs (defaults match the code defaults).
+GA_EARLY_STOP=${GA_EARLY_STOP:-1}
+GA_S1_RIDGE=${GA_S1_RIDGE:-2.0}
+GA_IMPUTE_INCOME=${GA_IMPUTE_INCOME:-1}
+GA_RESOLVE_CONFLICTS=${GA_RESOLVE_CONFLICTS:-1}
+# Stage-5 mixed logit (random coefficients). OFF by default — needs a stable
+# converged MNL base first; enable with STAGE5_ENABLE_MXL=1 for an MXL run.
+STAGE5_ENABLE_MXL=${STAGE5_ENABLE_MXL:-0}
+# GSE (Gradient Score Enhanced) mixed logit: systematic γ·g_origin loadings on
+# the random taste params. Implies MXL. Enable with STAGE5_ENABLE_GSE=1.
+STAGE5_ENABLE_GSE=${STAGE5_ENABLE_GSE:-1}
+# Destination-model identification treatments (make dead terms identifiable so
+# the search gets a real gradient instead of a flat landscape):
+#  • crash 0->max densification + intrazonal->min (removes sparse-zero crash);
+#  • GP-over-space smoothing of the mode logsum (was near-constant across zones,
+#    which left c_logsum unidentified -> dropped to 0).
+STAGE5_CRASH_ZERO_TO_MAX=${STAGE5_CRASH_ZERO_TO_MAX:-1}
+STAGE5_LOGSUM_SMOOTH=${STAGE5_LOGSUM_SMOOTH:-1}
+#  • Orthogonalize the mode logsum against distance WITHIN each case: this network
+#    floors ASC_Transit, so the logsum is ~pure f(DIST) and collinear with the
+#    dest c_dist/c_log_dist terms -> c_logsum absorbed to 0. Residualizing lets
+#    c_logsum identify on accessibility INDEPENDENT of raw distance. Off with =0.
+STAGE5_LOGSUM_ORTHOG=${STAGE5_LOGSUM_ORTHOG:-1}
+#  • Larch estimated size/quantity term (Exampville-style): the per-attractor
+#    size weights are estimated jointly instead of using the fixed size_term.
+#    OFF by default — verify on HPC first (needs Larch quantity_ca). =1 to enable.
+#  • Larch-style modeled-vs-observed choice-distribution histograms (dest_hist_*).
+STAGE5_DEST_QUANTITY=${STAGE5_DEST_QUANTITY:-0}
+STAGE5_DEST_HIST=${STAGE5_DEST_HIST:-1}
+# GA feature-search for the pre-day numpy models (mobility_models, wfh_telecommute)
+# — searches their covariate subset by BIC like the stages. Off with =0.
+GA_SEARCH_PREDAY=${GA_SEARCH_PREDAY:-1}
+# Constrain each tour's trip legs to one consistent tour mode (ActivitySim-style
+# vehicle continuity). 'relaxed'/1 (default) keeps genuine walk access/egress legs
+# inside Transit/SR/Walk tours; 'strict' forces every leg to the tour mode; 0=off.
+STAGE6_TOUR_MODE_CONSISTENCY=${STAGE6_TOUR_MODE_CONSISTENCY:-1}
+# ActivitySim mandatory-tour-scheduling keystone: feed period-varying home→usual-
+# location auto commute LOS (AM/MD/PM/EV + PM/MD peak ratio) into the work/school
+# departure-time model as GA-searchable covariates, so scheduling responds to peak
+# congestion. OFF by default — verify on HPC (needs the period skims + usual
+# locations in the Stage-4 frame); safe no-op (columns stay 0) when disabled. =1 on.
+STAGE4_MANDATORY_LOS=${STAGE4_MANDATORY_LOS:-0}
+# Stage-4 timing estimator: 'rrm' (default, departure-period RRM), 'hybrid'/'rum'/
+# 'auto', OR 'tdd' = the FULL joint (start,end,duration) time-of-day-departure
+# choice (ActivitySim mandatory_tour_scheduling): 21 (start,end) period-pair
+# alternatives, duration becomes a scheduling OUTPUT. GA still selects the person
+# interactions (feature_override). Falls back to RRM per purpose if a TDD fit fails.
+STAGE4_TIMING_MODEL=${STAGE4_TIMING_MODEL:-rrm}
+# POLARIS-style sub-zonal micro-location placement in the final plan: keep the
+# SA2 destination models but place every activity at a specific micro-location
+# inside its SA2 by land use (home/work/school anchored per person; discretionary
+# ∝ lu_area). Adds location_id/loc_x/loc_y to stage6_output.csv for microsim.
+# OFF by default; needs saved_data/location_table.csv (qsub job_location_table.pbs).
+MICRO_LOCATIONS=${MICRO_LOCATIONS:-0}
+# A/B the comprehensive Overture-derived land use (build_zone_landuse_overture.py
+# → saved_data/zone_landuse_overture.csv, a strict superset of the baseline). =1
+# loads it as the active land use (extra n_*/area_* feature cols available). Add
+# OVERTURE_REFRESH_SIZE=1 to also swap the size-term inputs to the Overture counts.
+USE_OVERTURE_LANDUSE=${USE_OVERTURE_LANDUSE:-0}
+OVERTURE_REFRESH_SIZE=${OVERTURE_REFRESH_SIZE:-0}
+# ActivitySim-style household CDAP coordination (joint 2-way logit).
+# ON by default (=1): coordinates M/N/H at household level AND estimates+saves the
+# household/joint-tour coefficients from HHTS — DAP utilities, 2/3/4/5-way
+# INTERACTION_COEFFICIENTS, and joint-tour frequency/participation/purpose — to
+# {OUT_DIR}/household_cdap_coefficients.{csv,html,pkl} (the ActivitySim-style joint
+# coefficient report). Falls back to heuristic priors on any failure. =0 disables
+# (individual-only CDAP, no joint coefficients). CDAP_HH_ESTIMATE=0 keeps the
+# coordination but skips re-estimation (uses the baked-in priors).
+CDAP_HOUSEHOLD_COORD=${CDAP_HOUSEHOLD_COORD:-1}
+CDAP_HH_ESTIMATE=${CDAP_HH_ESTIMATE:-1}
+# JOINT_TOURS=1 runs the FULL structural joint-tour path (joint_tour_frequency
+# + participation + purpose), so the "number of joint travel" is predicted per
+# household and folded into the Stage-1 purpose counts (n_joint_<purpose>_out)
+# in predict_stage1 and tagged onto Stage-3 activity rows — i.e. the PREDICTIONS
+# are made from the joint outcomes, not just the coordinated CDAP. ON by default
+# now (pairs with CDAP_HOUSEHOLD_COORD=1); the Stage-1 reconcile is fully guarded
+# (non-fatal, skips cleanly if no joint tours were generated). =0 disables.
+# Only affects the PREDICT job (generation happens in cdap()); forwarded to stage
+# jobs too so mode=ga_staged reuse sees the same setting.
+JOINT_TOURS=${JOINT_TOURS:-1}
+# Shared per-person latent ("travel style") threaded through stages 1-5 so the
+# same individual is consistently mobile/immobile across stages. Off by default.
+PIPELINE_PERSON_LATENT=${PIPELINE_PERSON_LATENT:-0}
+# lr4 WFH/telecommute pre-day module: estimate P(WFH) on HHTS workers and assign
+# wfh/WFHWEEK onto the synth population before CDAP. Off by default.
+PIPELINE_WFH=${PIPELINE_WFH:-0}
+# Zero-inflated mobility models (transit/car/bike weekly trips + household
+# vehicles/bikes), assigned before CDAP with a validation report per model.
+PIPELINE_MOBILITY=${PIPELINE_MOBILITY:-0}
+# CDAP tour-level operation: ordered tour-purpose sequence per active person.
+PIPELINE_TOUR_SEQ=${PIPELINE_TOUR_SEQ:-0}
+
+# ── Resource shapes ───────────────────────────────────────────────────────────
+# Pass STAGE_NCPUS / STAGE_MEM / PRED_NCPUS / PRED_MEM individually via -v
+# to avoid colon-collision with the PBS variable-list delimiter.
+# The select strings are assembled here from those atomic variables.
+STAGE_NCPUS=${STAGE_NCPUS:-4}
+STAGE_MEM=${STAGE_MEM:-96GB}
+STAGE_WALLTIME=${STAGE_WALLTIME:-24:00:00}
+
+MERGE_NCPUS=${MERGE_NCPUS:-1}
+MERGE_MEM=${MERGE_MEM:-8GB}
+MERGE_WALLTIME=${MERGE_WALLTIME:-01:00:00}
+
+PRED_NCPUS=${PRED_NCPUS:-8}
+PRED_MEM=${PRED_MEM:-250GB}
+PRED_WALLTIME=${PRED_WALLTIME:-24:00:00}
+
+# Assembled select strings: prefer a directly-set value, fall back to atomic parts
+STAGE_SELECT=${STAGE_SELECT:-"1:ncpus=${STAGE_NCPUS}:mem=${STAGE_MEM}"}
+MERGE_SELECT="1:ncpus=${MERGE_NCPUS}:mem=${MERGE_MEM}"
+PRED_SELECT=${PRED_SELECT:-"1:ncpus=${PRED_NCPUS}:mem=${PRED_MEM}"}
+
+# Prediction mode settings for pbs_pipeline_mode.pbs
+THREADS=${THREADS:-1}
+S5_WORKERS=${S5_WORKERS:-8}
+PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS:-1}
+# Build SimWrapper dashboards (summarize/) after the prediction job.
+# GA_SIMWRAPPER=0 disables; SKIP_MAP=1 skips the geojson choropleth (faster).
+GA_SIMWRAPPER=${GA_SIMWRAPPER:-1}
+SKIP_MAP=${SKIP_MAP:-0}
+# Build the POLARIS-style demand SQLite store (<tag>-Demand.sqlite) after
+# prediction. GA_POLARIS=0 disables.
+GA_POLARIS=${GA_POLARIS:-1}
+
+# Zone scope. Default = the fully-aligned SA2-direct 371 system: population# (OTAZ = 9-digit SA2), landuse (ORDER = SA2) and the 371 skim are all one zone
+# space — no legacy-ORDER remap, no 485/{371,324} mismatch. NEW_POP=1 wins over
+# NEW_POP_MAPPED in the loader. Set NEW_POP_MAPPED=1 (with the regenerated 371
+# crosswalk, demand_/sa2_to_order_crosswalk_371.csv) only if you need integer
+# 1..371 ORDER ids in the DynusT export.
+# NEW_POP_DIR: parent of saved_data/zone_ids_sa2/ (relative to PBS_O_WORKDIR).
+NEW_POP=${NEW_POP:-1}
+NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+# Skim path default depends on mode:
+#   NEW_POP=1 (507-zone SA2 direct) : the openmatrix-spec converted OMX is
+#             required (run demand_/11_convert_skims_to_openmatrix.py first).
+#   NEW_POP_MAPPED=1 or standard 329: leave empty so pipeline_logger.py picks
+#             downcasted_matrices_base.omx based on its own mode flags.
+if [ "${NEW_POP}" = "1" ] && [ "${NEW_POP_MAPPED}" != "1" ]; then
+    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+else
+    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-}
+fi
+
+cd "$PBS_O_WORKDIR"
+
+echo "=========================================="
+echo "Parallel GA chain submitter"
+echo "Submitter job : ${PBS_JOBID:-unknown}"
+echo "Run root      : ${RUN_ROOT}"
+echo "Run tag       : ${RUN_TAG}"
+echo "Estimator     : ${GA_ESTIMATOR}"
+echo "Budget        : ${GA_BUDGET}"
+echo "Restarts      : ${GA_N_RESTARTS}"
+echo "Stage select  : ${STAGE_SELECT}  walltime=${STAGE_WALLTIME}"
+echo "Pred  select  : ${PRED_SELECT}   walltime=${PRED_WALLTIME}"
+echo "New-pop (507) : NEW_POP=${NEW_POP}  NEW_POP_DIR=${NEW_POP_DIR}"
+echo "Skims path    : ${PIPELINE_SKIMS_PATH}"
+echo "=========================================="
+
+# ── Prune old auto-named job runs + stale PBS log files ──────────────────────
+# On each submit, remove things older than RUN_RETENTION_DAYS days:
+#   (a) AUTO-generated run dirs in RUN_ROOT — ONLY the auto-name patterns
+#       (ga_parallel_* and sa_*_staged__*); deliberately-named experiment dirs
+#       (mv*, s5diag, …) are NEVER removed;
+#   (b) PBS stdout/stderr files (<name>.o<jobid> / <name>.e<jobid>, ≥5-digit id)
+#       in the submit dir (PBS_O_WORKDIR, else cwd).
+# The age gate means the run being submitted and any still-running job's files
+# (both brand-new) are never matched. Best-effort: `|| true` keeps a prune
+# hiccup from aborting the submit under `set -e`.
+if [ "${RUN_PRUNE}" = "1" ]; then
+  if [ -d "${RUN_ROOT}" ]; then
+    echo "Pruning auto-named runs older than ${RUN_RETENTION_DAYS} days in ${RUN_ROOT} ..."
+    for _pat in 'ga_parallel_*' 'sa_*_staged__*'; do
+      find "${RUN_ROOT}" -maxdepth 1 -mindepth 1 -type d -name "${_pat}" \
+           -mtime +${RUN_RETENTION_DAYS} -print -exec rm -rf {} + 2>/dev/null || true
+    done
+  fi
+  _logdir="${PBS_O_WORKDIR:-.}"
+  echo "Pruning PBS .o/.e log files older than ${RUN_RETENTION_DAYS} days in ${_logdir} ..."
+  find "${_logdir}" -maxdepth 1 -type f -name '*.[oe][0-9][0-9][0-9][0-9][0-9]*' \
+       -mtime +${RUN_RETENTION_DAYS} -print -delete 2>/dev/null || true
+  echo "=========================================="
+fi
+
+submit_stage() {
+  local sid="$1"
+  # Note: -v list uses comma as separator; no colon-containing values here.
+  qsub \
+    -N "ga_s${sid}_${RUN_TAG}" \
+    -l "select=${STAGE_SELECT}" \
+    -l "walltime=${STAGE_WALLTIME}" \
+    -v "STAGE_ID=${sid},RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},GA_BUDGET=${GA_BUDGET},GA_ESTIMATOR=${GA_ESTIMATOR},GA_ENGINE=${GA_ENGINE},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA},GA_N_RESTARTS=${GA_N_RESTARTS},GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS},PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR},STAGE23_JOINT=${STAGE23_JOINT},GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT},GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH},GA_EARLY_STOP=${GA_EARLY_STOP},GA_S1_RIDGE=${GA_S1_RIDGE},GA_IMPUTE_INCOME=${GA_IMPUTE_INCOME},GA_RESOLVE_CONFLICTS=${GA_RESOLVE_CONFLICTS},STAGE5_ENABLE_MXL=${STAGE5_ENABLE_MXL},STAGE5_ENABLE_GSE=${STAGE5_ENABLE_GSE},STAGE5_CRASH_ZERO_TO_MAX=${STAGE5_CRASH_ZERO_TO_MAX},STAGE5_LOGSUM_SMOOTH=${STAGE5_LOGSUM_SMOOTH},STAGE5_LOGSUM_ORTHOG=${STAGE5_LOGSUM_ORTHOG},STAGE5_DEST_QUANTITY=${STAGE5_DEST_QUANTITY},STAGE5_DEST_HIST=${STAGE5_DEST_HIST},STAGE4_MANDATORY_LOS=${STAGE4_MANDATORY_LOS},STAGE4_TIMING_MODEL=${STAGE4_TIMING_MODEL},MICRO_LOCATIONS=${MICRO_LOCATIONS},NEW_POP=${NEW_POP},NEW_POP_MAPPED=${NEW_POP_MAPPED},NEW_POP_DIR=${NEW_POP_DIR},PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH},GA_PROFILE=${GA_PROFILE},GA_COMPLEXITY_PENALTY=${GA_COMPLEXITY_PENALTY},GA_REHEAT_FRACTION=${GA_REHEAT_FRACTION},GA_STAGE123_GENS_MULT=${GA_STAGE123_GENS_MULT},GA_MUTATION_MIN=${GA_MUTATION_MIN},PIPELINE_PERSON_LATENT=${PIPELINE_PERSON_LATENT},PIPELINE_WFH=${PIPELINE_WFH},PIPELINE_MOBILITY=${PIPELINE_MOBILITY},PIPELINE_TOUR_SEQ=${PIPELINE_TOUR_SEQ},GA_MEM_PER_WORKER_GB=${GA_MEM_PER_WORKER_GB},CDAP_HOUSEHOLD_COORD=${CDAP_HOUSEHOLD_COORD},CDAP_HH_ESTIMATE=${CDAP_HH_ESTIMATE},JOINT_TOURS=${JOINT_TOURS},DEST_EST_SAMPLE_SIZE=${DEST_EST_SAMPLE_SIZE},STAGE5_DEST_SAMPLE_SIZE=${STAGE5_DEST_SAMPLE_SIZE},GA_MODE_DEGEN_PENALTY=${GA_MODE_DEGEN_PENALTY},ESTIMATORS_SKIP_UPGRADE=${ESTIMATORS_SKIP_UPGRADE}" \
+    job_ga_stage_single.pbs | awk '{print $1}'
+}
+
+jid0=$(submit_stage 0)
+jid1=$(submit_stage 1)
+jid2=$(submit_stage 2)
+jid3=$(submit_stage 3)
+jid4=$(submit_stage 4)
+jid5=$(submit_stage 5)
+
+echo "Submitted stages: ${jid0} ${jid1} ${jid2} ${jid3} ${jid4} ${jid5}"
+
+deps="${jid0}:${jid1}:${jid2}:${jid3}:${jid4}:${jid5}"
+
+jid_merge=$(qsub \
+  -N "ga_merge_${RUN_TAG}" \
+  -W "depend=afterok:${deps}" \
+  -l "select=${MERGE_SELECT}" \
+  -l "walltime=${MERGE_WALLTIME}" \
+  -v "RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},STAGE_IDS=0_1_2_3_4_5,STRICT_MERGE=1" \
+  job_merge_ga_results.pbs | awk '{print $1}')
+
+echo "Submitted merge: ${jid_merge}"
+
+MERGED_DIR="${RUN_ROOT}/${RUN_TAG}/merged"
+
+jid_pred=$(qsub \
+  -N "ga_pred_${RUN_TAG}" \
+  -W "depend=afterok:${jid_merge}" \
+  -l "select=${PRED_SELECT}" \
+  -l "walltime=${PRED_WALLTIME}" \
+  -v "MODE=ga_staged,CONDA_ENV=${CONDA_ENV},RUN_ROOT=${RUN_ROOT},THREADS=${THREADS},S5_WORKERS=${S5_WORKERS},GA_ESTIMATOR=${GA_ESTIMATOR},GA_ENGINE=${GA_ENGINE},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA},STAGE5_CRASH_ZERO_TO_MAX=${STAGE5_CRASH_ZERO_TO_MAX},STAGE5_LOGSUM_SMOOTH=${STAGE5_LOGSUM_SMOOTH},STAGE5_LOGSUM_ORTHOG=${STAGE5_LOGSUM_ORTHOG},STAGE5_DEST_QUANTITY=${STAGE5_DEST_QUANTITY},STAGE5_DEST_HIST=${STAGE5_DEST_HIST},STAGE4_MANDATORY_LOS=${STAGE4_MANDATORY_LOS},STAGE4_TIMING_MODEL=${STAGE4_TIMING_MODEL},MICRO_LOCATIONS=${MICRO_LOCATIONS},GA_BUDGET=${GA_BUDGET},GA_STAGED_REUSE_ESTIMATOR=1,GA_STAGED_GA_DIR=${MERGED_DIR},INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS},PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR},GA_N_RESTARTS=${GA_N_RESTARTS},GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT},GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH},NEW_POP=${NEW_POP},NEW_POP_MAPPED=${NEW_POP_MAPPED},NEW_POP_DIR=${NEW_POP_DIR},PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH},GA_PROFILE=${GA_PROFILE},GA_COMPLEXITY_PENALTY=${GA_COMPLEXITY_PENALTY},GA_REHEAT_FRACTION=${GA_REHEAT_FRACTION},CDAP_HOUSEHOLD_COORD=${CDAP_HOUSEHOLD_COORD},CDAP_HH_ESTIMATE=${CDAP_HH_ESTIMATE},JOINT_TOURS=${JOINT_TOURS},PIPELINE_PERSON_LATENT=${PIPELINE_PERSON_LATENT},PIPELINE_WFH=${PIPELINE_WFH},PIPELINE_MOBILITY=${PIPELINE_MOBILITY},PIPELINE_TOUR_SEQ=${PIPELINE_TOUR_SEQ},GA_MEM_PER_WORKER_GB=${GA_MEM_PER_WORKER_GB},GA_SEARCH_PREDAY=${GA_SEARCH_PREDAY},STAGE6_TOUR_MODE_CONSISTENCY=${STAGE6_TOUR_MODE_CONSISTENCY},STAGE4_MANDATORY_LOS=${STAGE4_MANDATORY_LOS},STAGE4_TIMING_MODEL=${STAGE4_TIMING_MODEL},MICRO_LOCATIONS=${MICRO_LOCATIONS},DEST_EST_SAMPLE_SIZE=${DEST_EST_SAMPLE_SIZE},STAGE5_DEST_SAMPLE_SIZE=${STAGE5_DEST_SAMPLE_SIZE},GA_MODE_DEGEN_PENALTY=${GA_MODE_DEGEN_PENALTY},ESTIMATORS_SKIP_UPGRADE=${ESTIMATORS_SKIP_UPGRADE}" \
+  pbs_pipeline_mode.pbs | awk '{print $1}')
+
+echo "Submitted prediction: ${jid_pred}"
+
+# Optional SimWrapper dashboard build, runs after prediction completes.
+jid_summarize=""
+if [ "${GA_SIMWRAPPER}" = "1" ]; then
+  jid_summarize=$(qsub \
+    -N "ga_summarize_${RUN_TAG}" \
+    -W "depend=afterok:${jid_pred}" \
+    -l "select=1:ncpus=1:mem=8GB" \
+    -l "walltime=01:00:00" \
+    -v "RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},SKIP_MAP=${SKIP_MAP}" \
+    job_simwrapper_summaries.pbs | awk '{print $1}')
+  echo "Submitted summarize: ${jid_summarize}"
+fi
+
+# Optional POLARIS-style demand store build (after prediction).
+jid_polaris=""
+if [ "${GA_POLARIS}" = "1" ]; then
+  jid_polaris=$(qsub \
+    -N "ga_polaris_${RUN_TAG}" \
+    -W "depend=afterok:${jid_pred}" \
+    -l "select=1:ncpus=2:mem=48GB" \
+    -l "walltime=01:00:00" \
+    -v "RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV}" \
+    job_build_polaris_store.pbs | awk '{print $1}')
+  echo "Submitted polaris store: ${jid_polaris}"
+fi
+
+echo "=========================================="
+echo "Submission chain complete"
+echo "Run tag         : ${RUN_TAG}"
+echo "Stage deps      : ${deps}"
+echo "Merge job       : ${jid_merge}"
+echo "Prediction job  : ${jid_pred}"
+echo "Summarize job   : ${jid_summarize:-disabled}"
+echo "Polaris job     : ${jid_polaris:-disabled}"
+echo "Merged GA dir   : ${MERGED_DIR}"
+echo "=========================================="

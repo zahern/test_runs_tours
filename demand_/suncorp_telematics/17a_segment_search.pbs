@@ -1,0 +1,85 @@
+#!/bin/bash -l
+#PBS -N suncorp_seg_search
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=8:mem=128GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# Job 17a: speeding -> segment SEARCH only. Checkpoints the
+# best spec to results/segment_search47_best.json for job 17b to resume from.
+# speeding (43) then one SparseEA-AGDS segment search (47 search-only). Deploy lives in 17b.
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results
+FIG_DIR=$PROJ_DIR/figures
+export SUNCORP_PROJ="$PROJ_DIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+# BLAS thread pools capped at 4: single-process search (n_jobs=1) on small
+# design matrices gains nothing from 8-way BLAS threading; this halves
+# per-thread workspace (OOM job o25828879 used 66GB on 64GB node).
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export JAX_PLATFORMS=cpu
+
+# metacountregressor: always use the latest PyPI release.
+python -m pip install --upgrade metacountregressor || { echo "FATAL: latest metacountregressor install from PyPI failed"; exit 1; }
+python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,159), v" || { echo "FATAL: metacountregressor older than 1.0.159 or import failed"; exit 1; }
+
+cd "$SCRIPT_DIR"
+python -u 00_mcr_api_check.py 2>&1 || { echo "FATAL: metacountregressor API check failed"; exit 1; }
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "Order: speeding (43) -> segment search (47 search-only)"
+echo "=================================================================="
+
+for f in "$RESULTS_DIR/event_points_full.csv.gz" "$DATA_DIR/osm_roads_suncorp.geojson" \
+         "$DATA_DIR/fixture_calendar.csv" "$RESULTS_DIR/post_selection_mip.csv" \
+         "$DATA_DIR/near_miss_hb_ecf.csv" "$DATA_DIR/road_meta.csv"; do
+  [ -s "$f" ] || { echo "FATAL: missing input $f"; exit 1; }
+done
+
+echo ""
+echo "Step 1/2: speeding - running 43_finable_speeding.py..."
+if [ -s "$RESULTS_DIR/finable_exceedances.csv.gz" ] \
+   && [ -s "$RESULTS_DIR/finable_exceedances_outliers.csv.gz" ]; then
+  echo "Skipping 43: reusing bounded finable_exceedances.csv.gz and QA tail."
+else
+  python -u 43_finable_speeding.py --margin 10 --max-exceedance 30 --staffed-p 5 2>&1
+fi
+[ $? -ne 0 ] && { echo "FATAL: 43 speeding failed"; exit 1; }
+[ -s "$RESULTS_DIR/finable_exceedances.csv.gz" ] || { echo "FATAL: 43 missing finable_exceedances.csv.gz"; exit 1; }
+echo "Speeding OK."
+
+echo ""
+echo "Step 2/2: segment search - running 47 (search-only, chunked checkpoints)..."
+python -u 47_segment_speeding_predictive.py --search-only \
+  --max-exceedance 30 --engine jax \
+  --search-algo agds --search-iters 120 --search-chunk-iters 120 \
+  --search-R 40 --search-jobs 1 --trace-fitness 2>&1
+EXIT_CODE=$?
+
+[ -f "$RESULTS_DIR/segment_search47_best.json" ] \
+  && echo "Checkpoint OK: segment_search47_best.json" \
+  || { echo "FATAL: no best-spec checkpoint"; EXIT_CODE=1; }
+[ -f "$RESULTS_DIR/segment_search47_progress.csv" ] \
+  && echo "Progress trace OK: segment_search47_progress.csv" \
+  || echo "WARN: no search progress trace (non-fatal)"
+[ -s "$FIG_DIR/segment_search47_dynamic_harmony.png" ] \
+  && echo "DynamicHarmony plot OK: figures/segment_search47_dynamic_harmony.png" \
+  || echo "WARN: no published DynamicHarmony plot (non-fatal)"
+
+echo "=================================================================="
+echo "Job finished at $(date) - exit_code=$EXIT_CODE"
+echo "=================================================================="
+exit $EXIT_CODE

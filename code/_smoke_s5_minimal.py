@@ -10,6 +10,11 @@ from stage5_destination_choice import run_stage5
 os.environ['PANDAS_USE_NUMEXPR'] = '0'
 os.environ['STAGE5_BATCH_SIZE'] = '1'
 os.environ['STAGE5_FAIL_FAST'] = '1'
+SMOKE_SEGMENTS = [
+    segment.strip()
+    for segment in os.environ.get('STAGE5_SMOKE_SEGMENTS', 'work').split(',')
+    if segment.strip()
+]
 
 
 def main() -> int:
@@ -32,7 +37,7 @@ def main() -> int:
             tours=out['tours'],
             seed=7,
             save_path='runs/stage5_minimal_models.pkl',
-            segments=['work'],
+            segments=SMOKE_SEGMENTS,
             verbose=False,
         )
     except Exception as exc:

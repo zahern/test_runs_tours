@@ -97,6 +97,9 @@ def load_zones():
 def build(args):
     # osmnx / networkx imported lazily so --help and dry inspection work without
     # the geo stack, and so the (heavy) import cost is only paid on a real run.
+    # Suppress matplotlib import in osmnx (causes dataclasses issues in some envs)
+    import os
+    os.environ.setdefault('MPLBACKEND', 'Agg')
     try:
         import osmnx as ox
         import networkx as nx

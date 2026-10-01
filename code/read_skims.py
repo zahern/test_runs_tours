@@ -60,19 +60,126 @@ logger = logging.getLogger(__name__)
 EXPECTED_N_ZONES = int(os.environ.get('ZONE_SYSTEM_N_ZONES', '371'))
 
 
+# ---------------------------------------------------------------------------
+# SKIM UNIT SIDECAR (demand_/skim_units.json) — measured, not guessed.
+# Value-range guessing (val>600 → seconds, >200 → tenths) misclassifies
+# genuine long trips: skims_371.omx stores MINUTES, so a real 250-min
+# Toowoomba trip was read as 25 min. The sidecar records the measured divisor
+# per matrix (raw/divisor = minutes). Applies only when the loaded file's
+# zone count matches the sidecar (default 371); otherwise None (= unknown →
+# callers keep legacy guessing). Override path via SKIM_UNITS_FILE.
+# ---------------------------------------------------------------------------
+_SKIM_UNITS_CACHE = None
+_SKIM_UNITS_N_ZONES = None
+
+
+def _skim_units_path() -> Optional[str]:
+    env = os.environ.get('SKIM_UNITS_FILE', '').strip()
+    if env and os.path.isfile(env):
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = os.path.normpath(os.path.join(here, '..', 'demand_', 'skim_units.json'))
+    return cand if os.path.isfile(cand) else None
+
+
+def load_skim_unit_divisors() -> dict:
+    """{matrix_name: divisor} from the sidecar (cached; {} when unavailable)."""
+    global _SKIM_UNITS_CACHE, _SKIM_UNITS_N_ZONES
+    if _SKIM_UNITS_CACHE is not None:
+        return _SKIM_UNITS_CACHE
+    _SKIM_UNITS_CACHE = {}
+    try:
+        import json as _json
+        _p = _skim_units_path()
+        if _p:
+            with open(_p, 'r', encoding='utf-8') as _fh:
+                _doc = _json.load(_fh)
+            if isinstance(_doc, dict) and isinstance(_doc.get('time_divisors'), dict):
+                _SKIM_UNITS_CACHE = {str(k): float(v)
+                                     for k, v in _doc['time_divisors'].items()}
+                _SKIM_UNITS_N_ZONES = int(_doc.get('n_zones', -1))
+    except Exception as _e:
+        logger.debug(f"load_skim_unit_divisors skipped ({_e})")
+    return _SKIM_UNITS_CACHE
+
+
+def skim_time_divisor(matrix_name: str, n_zones=None) -> Optional[float]:
+    """Divisor converting a raw time-matrix value to minutes, or None if unknown.
+
+    Sidecar-gated: returns None unless the loaded file's zone count matches
+    the sidecar's n_zones (371). Pass n_zones=None only when the caller has
+    already validated the file (e.g. post-guard paths) — otherwise the legacy
+    value-guessing fallback applies.
+    """
+    try:
+        _divs = load_skim_unit_divisors()
+        if not _divs or str(matrix_name) not in _divs:
+            return None
+        if n_zones is not None and int(n_zones) != int(_SKIM_UNITS_N_ZONES or -1):
+            return None
+        return float(_divs[str(matrix_name)])
+    except Exception:
+        return None
+
+
+_ANNOUNCED_UNITS: set = set()
+
+
+def to_minutes(matrix_name: str, values, n_zones=None):
+    """Convert raw skim value(s) to minutes. Scalars stay scalar.
+
+    Sidecar path (measured file): divide by the recorded divisor (1.0 =
+    already minutes for every skims_371.omx time matrix). Unknown matrix or
+    zone-count mismatch: legacy value-guessing (>600 → /60, >200 → /10).
+    The legacy path is a known misclassifier in [200, 600] (a genuine 250-min
+    trip reads as 25 min) — it only survives for unmeasured files.
+    """
+    try:
+        import numpy as _np
+        _div = skim_time_divisor(matrix_name, n_zones=n_zones)
+        _arr = _np.asarray(values, dtype=float)
+        _scalar = (_arr.ndim == 0)
+        if _div is not None and _div > 0:
+            if matrix_name not in _ANNOUNCED_UNITS:
+                _ANNOUNCED_UNITS.add(matrix_name)
+                logger.info(f"skim units: '{matrix_name}' per sidecar "
+                            f"(/{_div:g} -> minutes, no value-guessing)")
+            out = _arr / _div
+            return float(out) if _scalar else out
+        # — legacy fallback for unmeasured matrices/files —
+        if matrix_name not in _ANNOUNCED_UNITS:
+            _ANNOUNCED_UNITS.add(matrix_name)
+            logger.warning(f"skim units: '{matrix_name}' NOT in sidecar — "
+                           "legacy value-guessing applies (misclassifies "
+                           "genuine 200–600 min trips)")
+        if _scalar:
+            _v = float(_arr)
+            if _v > 600:
+                return _v / 60.0
+            if _v > 200:
+                return _v / 10.0
+            return _v
+        _med = float(_np.median(_arr[_arr > 0])) if (_arr > 0).any() else 0.0
+        if _med > 600:
+            return _arr / 60.0
+        if _med > 200:
+            return _arr / 10.0
+        return _arr
+    except Exception:
+        return values
+
+
 def _active_zone_ref_csv() -> Optional[str]:
     """Path to the active ORDER↔SA2 zone reference CSV.
 
-    ZONE MIGRATION (371): prefer the 371-zone seq_zone_ids_371.csv; fall back to
-    the legacy seq_zone_ids_.csv only if the 371 file is absent. Both expose
-    SA2_MAIN16 + ORDER columns, so callers building an ORDER→col bridge work
-    unchanged against whichever is active.
+    371-only: the 371-zone seq_zone_ids_371.csv is required. The legacy
+    seq_zone_ids_.csv (330 system) is NEVER consulted — ORDER 330 is a real
+    zone in the 371 system. Returns None if the 371 file is absent.
     """
     _here = os.path.dirname(os.path.abspath(__file__))
-    for _cand in (os.path.join(_here, 'saved_data', 'seq_zone_ids_371.csv'),
-                  os.path.join(_here, 'seq_zone_ids_.csv')):
-        if os.path.exists(_cand):
-            return _cand
+    _cand = os.path.join(_here, 'saved_data', 'seq_zone_ids_371.csv')
+    if os.path.exists(_cand):
+        return _cand
     return None
 
 
@@ -203,11 +310,11 @@ def load_sa1_walk_skims(path: Optional[str] = None) -> Optional[dict]:
             distwalk  = np.array(f['DISTWALK'], dtype=np.float32)
             distbike  = np.array(f['DISTBIKE'],  dtype=np.float32)
         sa2_to_col = {int(c): i for i, c in enumerate(sa2_codes)}
-        # Build ORDER→col for the 329-zone pipeline (ORDER number → skim col index).
+        # Build ORDER→col for the 371-zone pipeline (ORDER number → skim col index).
         # The destination dimension of the SA1 skim uses 9-digit SA2 codes; in the
-        # 329-zone pipeline DTAZ is an ORDER number (1-330).  Read seq_zone_ids_.csv
-        # (which maps ORDER → SA2_MAIN16, equivalent to SA2_CODE21 for ~93% of SEQ
-        # zones) to build the bridge so stage5 can look up either zone system.
+        # 371-zone pipeline DTAZ is an ORDER number (1-371).  Read the 371 zone
+        # reference (ORDER → SA2_MAIN16) to build the bridge so stage5 can look
+        # up either zone system.
         order_to_col = {}
         try:
             _seq_csv = _active_zone_ref_csv()
@@ -357,6 +464,8 @@ def _omx_to_dataframe_h5py(
         available = list(f['data'].keys())
         logger.info(f"OMX (h5py): {len(available)} matrices available: {available}")
 
+        if matrices == 'all':
+            matrices = list(available)
         if matrices is None:
             matrices = [m for m in DEFAULT_MATRICES if m in available]
             if not matrices:
@@ -371,7 +480,38 @@ def _omx_to_dataframe_h5py(
             raise ValueError(f"No readable matrices found in {omx_path}. Available: {available}")
 
         lookup_names = list(f['lookup'].keys()) if 'lookup' in f else []
-        lookup_name = zone_index if zone_index in lookup_names else (lookup_names[0] if lookup_names else None)
+        lookup_name = None
+        if zone_index in lookup_names:
+            lookup_name = zone_index
+        else:
+            # An OMX may carry several lookup tables (larch's Exampville file
+            # ships TAZ_AREA_TYPE strings next to TAZ_ID). Taking
+            # lookup_names[0] blindly crashed with int('SUB') — score ID-like
+            # names first and only accept a table whose entries all parse.
+            def _as_int(_z):
+                try:
+                    return int(_z.decode() if isinstance(_z, bytes) else _z)
+                except Exception:
+                    return None
+
+            _id_like = ('TAZ_ID', 'TAZ', 'taz_id', 'taz', 'ZONE', 'zone',
+                        'ZONES', 'zones', 'ID', 'id')
+            _ordered = [n for n in lookup_names if n in _id_like]
+            _ordered += [n for n in lookup_names if n not in _ordered]
+            for _n in _ordered:
+                try:
+                    _raw = f['lookup'][_n][...]
+                    if len(_raw) and all(_as_int(_z) is not None for _z in _raw):
+                        lookup_name = _n
+                        break
+                except Exception:
+                    continue
+            if lookup_name is not None:
+                logger.info(f"OMX (h5py): zone lookup '{lookup_name}' chosen "
+                            f"from {lookup_names}")
+            elif lookup_names:
+                logger.warning(f"OMX (h5py): no integer-parseable lookup in "
+                               f"{lookup_names} — 1-based fallback")
 
         if lookup_name:
             raw = f['lookup'][lookup_name][...]
@@ -470,6 +610,8 @@ def omx_to_dataframe(
     available = f.list_matrices()
     logger.info(f"OMX: {len(available)} matrices available: {available}")
 
+    if matrices == 'all':
+        matrices = list(available)
     if matrices is None:
         # try the default candidates first
         matrices = [m for m in DEFAULT_MATRICES if m in available]
@@ -496,12 +638,16 @@ def omx_to_dataframe(
     # ── zone mapping ──────────────────────────────────────────────────
     mappings = f.list_mappings()
     logger.info(f"OMX zone mappings: {mappings}")
-
-    if zone_index is None:
-        if mappings:
-            zone_index = mappings[0]
-        else:
-            zone_index = None
+    # An OMX may carry several mappings (larch's Exampville file ships a
+    # TAZ_AREA_TYPE string table next to TAZ_ID). Score ID-like names first
+    # and take the first fully int-parseable mapping instead of mappings[0].
+    _id_like = ('TAZ_ID', 'TAZ', 'taz_id', 'taz', 'ZONE', 'zone',
+                'ZONES', 'zones', 'ID', 'id')
+    if zone_index is not None and zone_index in mappings:
+        _map_cands = [zone_index]
+    else:
+        _map_cands = [m for m in mappings if m in _id_like]
+        _map_cands += [m for m in mappings if m not in _map_cands]
 
     # ── zone mapping — handle different openmatrix API versions ──
     # The mapping dict is {zone_id (np.uint32): row_index (int)}
@@ -512,9 +658,9 @@ def omx_to_dataframe(
     zone_ids  = None
     row_order = None
 
-    if zone_index and zone_index in mappings:
+    for _zi in _map_cands:
         try:
-            raw = f.mapping(zone_index)
+            raw = f.mapping(_zi)
             if isinstance(raw, dict):
                 # sort by row index (value) so zone_ids[i] matches matrix row i
                 sorted_pairs = sorted(raw.items(), key=lambda kv: kv[1])
@@ -523,8 +669,12 @@ def omx_to_dataframe(
             else:
                 zone_ids  = np.array(raw, dtype=int).ravel()
                 row_order = np.arange(len(zone_ids), dtype=int)
+            if len(zone_ids):
+                logger.info(f"OMX zone mapping '{_zi}': {len(zone_ids)} zones")
+                break
+            zone_ids = None
         except Exception as e:
-            logger.warning(f"Could not read zone mapping '{zone_index}': {e}")
+            logger.warning(f"Could not read zone mapping '{_zi}': {e}")
             zone_ids = None
 
     if zone_ids is None or len(zone_ids) == 0:
@@ -680,7 +830,9 @@ def read_omx_skims(
     Parameters
     ----------
     omx_path    : path to .omx file
-    matrices    : matrix names to read; None = auto-detect
+    matrices    : matrix names to read; None = auto-detect (SEQ defaults
+                  first, all-available fallback); 'all' = every matrix
+                  (transfer-test OMXs with non-SEQ names)
     zone_index  : OMX zone mapping name; None = auto-detect
     add_derived : if True, add derived columns:
                     tt_avg    = mean of AM and PM travel times
@@ -726,8 +878,15 @@ def read_omx_skims(
     # are identical to each other and only 0.9x auto DIST) with the real
     # pedestrian-network walk distance and the detour-scaled bike distance.
     # No-op until that file exists, so this is inert on the branch and
-    # self-activates once the builder has run.
-    df = _overlay_real_walk_bike(df)
+    # self-activates once the builder has run. 371-system data ONLY: never
+    # overlay onto a transfer-test zone system (ids 1..N overlap SA2 ids
+    # numerically but mean different zones — a silent corruption).
+    if int(EXPECTED_N_ZONES) == 371:
+        df = _overlay_real_walk_bike(df)
+    else:
+        logger.info(
+            f"read_omx_skims: skipping OSM walk/bike overlay "
+            f"(ZONE_SYSTEM_N_ZONES={EXPECTED_N_ZONES}, not the 371 system)")
 
     if add_derived:
         # ── average travel time ───────────────────────────────────────
@@ -748,7 +907,7 @@ def read_omx_skims(
             logger.warning("No travel time skim found — tt_avg set to 0")
 
         # ── log distance ──────────────────────────────────────────────
-        dist_col = next((c for c in ['DIST', 'distance_km', 'dist']
+        dist_col = next((c for c in ['DIST', 'distance_km', 'dist', 'AUTO_DIST']
                          if c in df.columns), None)
         if dist_col:
             df['log_dist'] = np.log1p(df[dist_col])
@@ -878,25 +1037,24 @@ def prepare_skims_from_omx(
 # to use crash/near-miss exposure as a destination- or route-choice factor
 # (e.g. alongside spatial_assignment.py / safety_experiment_analysis.py's
 # existing safety angle). Matrices available:
-#   crash_matrices_507.omx     : crash_total, crash_headon, crash_rearend,
+#   crash_matrices_371.omx       : crash_total, crash_headon, crash_rearend,
 #                                 crash_runoff, crash_intersection, crash_other,
-#                                 crash_length_km, crash_rate_total
-#                                 (genuinely OD-specific — sourced from a
-#                                 pre-built SA2_OD_Crash_Matrix.xlsx).
+#                                 crash_length_km, crash_rate_total — the 371-zone
+#                                 cut of crash_matrices_507.omx (58 peripheral
+#                                 zones donor-filled from nearest covered SA2 by
+#                                 centroid; covered 313² block bit-identical).
 #                                 crash_rate_total (crashes/km) is the
 #                                 canonical ECF (Expected Crash Frequency)
 #                                 safety component used by the ABM — see
 #                                 merge_ecf_component() below.
-#   nearmiss_ecf_skim_507.omx  : ecf_total, ecf_per_km, nm_total, nm_per_km_total,
+#   nearmiss_ecf_skim_371.omx    : ecf_total, ecf_per_km, nm_total, nm_per_km_total,
 #                                 nm_{am,op,pm,ev}, safety_index_total,
 #                                 route_length_km — route-aggregated near-miss/
-#                                 ExpCrashes exposure from
-#                                 demand_/15_nearmiss_ecf_od_skim.py. Available
-#                                 for supplementary analysis via
+#                                 ExpCrashes exposure (371-zone cut of
+#                                 nearmiss_ecf_skim_507.omx, 47 zones donor-filled).
+#                                 Available for supplementary analysis via
 #                                 merge_safety_skims(sources=['ecf']), but NOT
-#                                 the model's ECF component (only ~31% OD
-#                                 coverage — it's a curated subset of the road
-#                                 network, not every road).
+#                                 the model's ECF component.
 #   nearmiss_skim_507.omx      : DEPRECATED — kept only for backward
 #                                 compatibility. nearmiss_{origin,dest,total}_*
 #                                 are flat per-zone counts broadcast across
@@ -904,8 +1062,8 @@ def prepare_skims_from_omx(
 #                                 origin or destination zone gets an identical
 #                                 value) — NOT OD-pair-specific.
 SAFETY_OMX_FILES = {
-    'crash':    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'demand_', 'crash_matrices_507.omx'),
-    'ecf':      os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'demand_', 'nearmiss_ecf_skim_507.omx'),
+    'crash':    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'demand_', 'crash_matrices_371.omx'),
+    'ecf':      os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'demand_', 'nearmiss_ecf_skim_371.omx'),
     'nearmiss': os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'demand_', 'nearmiss_skim_507.omx'),
 }
 
@@ -915,12 +1073,11 @@ ECF_SOURCE_MATRIX = 'crash_rate_total'  # the model's single ECF safety componen
 def merge_ecf_component(skims_df: pd.DataFrame) -> pd.DataFrame:
     """
     Left-merge the model's single ECF (Expected Crash Frequency) safety
-    component — crash_rate_total (crashes/km) from crash_matrices_507.omx —
+    component — crash_rate_total (crashes/km) from crash_matrices_371.omx —
     onto a flat OTAZ/DTAZ skims DataFrame, as a column named 'ECF'.
 
-    This is the canonical safety factor for the 507-zone activity model
-    (chosen over the route-aggregated near-miss/ExpCrashes skim in
-    nearmiss_ecf_skim_507.omx, which only covers ~31% of OD pairs).
+    Full 371² coverage (58 peripheral zones donor-filled); no fillna(0) gaps
+    remain, but the fill is kept as a guard.
     """
     path = SAFETY_OMX_FILES['crash']
     if not os.path.exists(path):
@@ -955,10 +1112,9 @@ def merge_safety_skims(skims_df: pd.DataFrame, sources: Optional[List[str]] = No
 
     Returns
     -------
-    skims_df with additional crash_*/ecf_*/nm_* columns. Rows with no safety
-    data for that OD pair (e.g. pairs outside the EMME-mapped 303/507 zones,
-    or outside the ~31% of OD pairs the road-segment network in
-    nearmiss_ecf_skim_507.omx actually routes through) get 0, not NaN.
+    skims_df with additional crash_*/ecf_*/nm_* columns. The 371-zone safety
+    files give full OD coverage (peripheral zones donor-filled at build);
+    rows missing safety data for any other reason get 0, not NaN.
     """
     sources = sources or ['crash']
     out = skims_df

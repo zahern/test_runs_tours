@@ -41,6 +41,7 @@ import pandas as pd
 import logging
 import os
 import pickle
+import traceback
 from typing import Optional
 from scipy.stats import norm
 
@@ -544,11 +545,39 @@ def _inf_pf(model):
     return pf if pf is not None else model.pf
 
 
+def _rho_sq_null_safe(model, ll=None) -> float:
+    """rho-squared via larch_patches' compatibility shim, cause logged once.
+
+    The underlying defect: larch 6.0.44 has no ``rho_sq_null()`` method at all
+    (confirmed -- ``hasattr(larch.Model, 'rho_sq_null')`` is False and Model has
+    no 'rho'-named members), so every call site raised AttributeError and
+    printed rho2=nan for every model. Visible in runs/exampville_ab_x2 and
+    runs/mtc_ab_x2, where all four CDAP arms report rho2=nan while the baseline
+    arm reported None -- which is why it read as a result rather than a crash.
+    larch_patches.apply() now installs the method (computing 1 - LL/LL_null
+    from ``loglike_null()``), so this delegates to that single implementation.
+    The warning stays so any *other* failure, e.g. loglike_null() raising, is
+    still visible instead of silently degrading to nan.
+    """
+    global _RHO_SQ_NULL_WARNED
+    try:
+        return float(model.rho_sq_null())
+    except Exception as _e:
+        if not _RHO_SQ_NULL_WARNED:
+            _RHO_SQ_NULL_WARNED = True
+            print(f"  WARNING: rho_sq_null() failed ({type(_e).__name__}: {_e}); "
+                  f"reporting nan. Further occurrences suppressed.\n"
+                  f"{traceback.format_exc()}", flush=True)
+        return float('nan')
+
+
+_RHO_SQ_NULL_WARNED = False
+
+
 def _print_larch_table(model, label: str):
     pf  = _inf_pf(model)
     ll  = getattr(model, '_cached_ll', float('nan'))
-    try:    rho2 = float(model.rho_sq_null())
-    except: rho2 = float('nan')
+    rho2 = _rho_sq_null_safe(model)
     print(f"\n  ┌─ {label}  LL={ll:.1f}  ρ²={rho2:.3f}  n_params={len(pf)} ──────")
     print(f"  {'Parameter':<38} {'Value':>9}  {'Std Err':>8}  {'t-stat':>7}  Sig")
     print(f"  {'─'*74}")
@@ -568,8 +597,7 @@ def _save_cdap_html(mnl, mxl, path):
         if model is None: return f'<p><em>{title} — not available</em></p>'
         pf = _inf_pf(model)
         ll = getattr(model, '_cached_ll', float('nan'))
-        try:    rho2 = float(model.rho_sq_null())
-        except: rho2 = float('nan')
+        rho2 = _rho_sq_null_safe(model)
         rows = ''
         for name in pf.index:
             row = pf.loc[name]

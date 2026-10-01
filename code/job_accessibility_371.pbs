@@ -7,7 +7,7 @@
 # Submit from the code dir (AFTER land use is built):
 #   qsub job_accessibility_371.pbs
 # Override inputs via -v, e.g.:
-#   qsub -v PIPELINE_SKIMS_PATH=../demand_/sa2_skims_507_omxspec.omx job_accessibility_371.pbs
+#   qsub -v PIPELINE_SKIMS_PATH=../demand_/skims_371.omx job_accessibility_371.pbs
 
 #PBS -N accessibility_371
 #PBS -m n

@@ -290,6 +290,11 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             # collinearity with ownership terms.
             'c_transit_use_transit': 'pos', 'c_car_use_da': 'pos',
             'c_bike_use_bike': 'pos',
+            # Work-zone employment density (MTC wkempden): denser destination
+            # employment favours the non-auto modes (parking/congestion/transit
+            # supply), so each alt-specific density term attracts (≥ 0).
+            'c_empden_transit': 'pos', 'c_empden_walk': 'pos',
+            'c_empden_bike': 'pos', 'c_empden_sr': 'pos',
         },
         # ── Protected backbone (never removed by _prune_and_refit) ───────────
         'protected_backbone': [
@@ -297,8 +302,33 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             'Mu_Motor', 'Mu_NonMotor', 'Mu_Root',
             'c_ivt_auto', 'c_ivt_transit', 'c_walk_time', 'c_bike_time',
             # Zone-varying accessibility: breaks logsum-distance collinearity
-            'c_transit_access',
+            'c_transit_access', 'c_empden_transit',
         ],
+        # ── Orthogonalization (mode choice) ────────────────────────────────
+        # Same {coeff: base} semantics as stage5_dest, consumed by
+        # _mode_tree (materialises residual columns on the tour/person frames
+        # BEFORE the DataTree is built) + _build_mode_utility (verified swap).
+        # Base may be a MODE_UEC coefficient key (e.g. 'c_veh_da') or a direct
+        # 'node.column' reference (e.g. 'od.DIST') when no distance coefficient
+        # exists in the mode spec — MODE_UEC carries no c_log_dist/c_dist term.
+        'orthogonalize_on': {
+            # Time terms residualized on OD network distance (tour-level)
+            'c_walk_time':   'od.DIST',
+            'c_bike_time':   'od.DIST',
+            'c_ivt_auto':    'od.DIST',
+            'c_ivt_transit': 'od.DIST',
+            # Crash exposure residualized on OD distance (tour-level): crash
+            # accumulates with trip length, so the raw term confounds safety
+            # sensitivity with distance deterrence. The residual identifies
+            # the crash effect independent of length. Freely estimated
+            # (sign-constrained neg); orthogonalisation does NOT fix its value.
+            'c_crash_veh':   'od.DIST',
+            # Income residualized on household vehicles (person-level)
+            'c_incp_da':     'c_veh_da',
+            'c_incp_sr':     'c_veh_sr',
+            'c_incp_transit':'c_veh_da',
+            'c_incp_active': 'c_veh_da',
+        },
     },
     # Stage 5 — destination choice (Larch MNL, flat CA)
     'stage5_dest': {
@@ -335,12 +365,18 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             # piecewise distance-bin spline, never both (they span the same
             # distance axis and are collinear together).
             ['c_dist', 'c_dist_0_2', 'c_dist_2_5', 'c_dist_5_10'],
-            # Accessibility form: the mode-choice logsum and the raw log-distance
-            # term both encode OD separation and are collinear, so at most ONE is
-            # active. Combined with the require-one group below this means EXACTLY
-            # one of {c_logsum, c_log_dist} — which stops the logsum coefficient
-            # being holdfast-at-0 / pruned for collinearity with c_log_dist.
-            ['c_logsum', 'c_log_dist'],
+            # Accessibility form: NO mutex between mode-choice logsum and raw
+            # log-distance (ActivitySim reflection). ActivitySim specs carry
+            # BOTH mode_choice_logsum and distance terms with freely estimated
+            # coefficients — the logsum is computed from the FULL mode spec
+            # (access, density, tolls — not time-only), so it is not collinear
+            # with distance once the logsum carries genuine access signal (see
+            # _logsums_numpy_fallback zone-varying terms + STAGE5_LOGSUM_ORTHOG,
+            # which separates any residual distance component honestly).
+            # The old exactly-one mutex structurally excluded c_logsum whenever
+            # c_log_dist won, i.e. it FORCED the "logsum sits at 0" symptom.
+            # Distance signal is still guaranteed by the require-one below
+            # (now at-least-one, so both may coexist and BIC decides).
         ],
         # Semantic pairing: when occupation-type person terms steer work
         # destinations, at least one matching industry attractor must be
@@ -348,15 +384,23 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         # on the map (occupation x distance alone has nothing to aim at).
         'min_behavioral': [
             (1, ['c_indp_finance', 'c_indp_health', 'c_indp_retail']),
-            # At least one accessibility/distance term must survive; with the
-            # c_logsum/c_log_dist mutex above this guarantees EXACTLY one is
-            # present, so the destination model never loses distance signal.
+            # At least one accessibility/distance term must survive (at-least-one:
+            # both may coexist — ActivitySim carries logsum AND distance — so
+            # the destination model never loses distance signal while the
+            # logsum is free to identify on access variation.
             (1, ['c_logsum', 'c_log_dist']),
             # At least one agglomeration term must survive so spatial-structure
-            # signal is never dropped entirely. With c_aggl no longer forced,
-            # this require-one lets the search satisfy it with the blended term
-            # OR (preferably) one/more of the per-type themed components.
-            (1, ['c_aggl', 'c_aggl_retail', 'c_aggl_office', 'c_aggl_edu',
+            # signal is never dropped entirely. The generic blended c_aggl is
+            # DELIBERATELY EXCLUDED from this require-one: it is collinear with the
+            # fixed size_term (both ≈ log Σ size·decay), so whenever the search
+            # satisfied require-one with c_aggl the coefficient died at ~0 and the
+            # activity-specific themed terms never got their turn (the "ACDC
+            # component is all zeros" symptom). Requiring a THEMED term forces the
+            # search to say WHICH activity type's spatial spillover matters
+            # (retail/office/edu/…) with a coefficient identified independently of
+            # the aggregate size_term. c_aggl stays a mutex member (still
+            # selectable) but no longer counts toward the requirement.
+            (1, ['c_aggl_retail', 'c_aggl_office', 'c_aggl_edu',
                  'c_aggl_leisure', 'c_aggl_parks', 'c_aggl_health',
                  'c_aggl_food', 'c_aggl_civic']),
         ],
@@ -380,6 +424,22 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             'c_walk_acc': 'pos', 'c_transit_acc': 'pos', 'c_auto_work_acc': 'pos',
             # Mode-choice logsum: better accessibility -> more attractive dest.
             'c_logsum': 'pos',
+            # Newly-wired meaningful landuse attractors: more of the relevant
+            # land use -> more attractive destination (size-term semantics).
+            'c_nonmand_health': 'pos', 'c_nonmand_shop': 'pos',
+            'c_nonmand_hh': 'pos', 'c_edu_size': 'pos',
+            # Overture occupancy residuals: positive Overture news (more jobs /
+            # enrolments than census implies) -> more attractive destination.
+            'c_est_workers_resid': 'pos', 'c_est_students_resid': 'pos',
+            # Extended accessibility: crime/crash deter (neg); density,
+            # transit and visitability attract (pos).
+            'c_crime_violent': 'neg', 'c_crash_smooth': 'neg',
+            'c_transit_int': 'pos',
+            'c_attract_shop': 'pos', 'c_attract_food': 'pos',
+            'c_attract_health': 'pos', 'c_attract_edu': 'pos',
+            'c_attract_rec': 'pos',
+            'c_visit_work': 'pos', 'c_visit_edu': 'pos',
+            'c_visit_shop': 'pos', 'c_visit_social': 'pos',
         },
         # ── Protected backbone (never removed by _prune_and_refit) ───────────
         'protected_backbone': [
@@ -389,6 +449,57 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             # group guarantees one of the two is always present regardless.
             'c_size_term', 'log_correction', 'c_crash',
         ],
+        # ── Orthogonalization: when both terms are selected, residualize one on the other
+        # Maps term -> term_to_residualize_on. The residualized version replaces the
+        # original term in the utility, so collinear effects are separated.
+        # Example: 'c_crash' -> 'c_log_dist' means
+        #   log_CRASH_1_resid_on_log_DIST_1 = log_CRASH_1 - beta*log_DIST_1
+        # materialised in _dest_tree BEFORE the Dataset is built, then referenced
+        # by _build_dest_utility (verified swap — the column must exist in the
+        # dataset, otherwise the original expression is kept with a warning).
+        # NOTE: mode-choice pairs live under 'stage5_mode' (not here) — this dict
+        # must only contain DESTINATION coefficients (DEST_UEC / DEST_UEC_FLAT).
+        'orthogonalize_on': {
+            # Destination choice: crash residualized on distance
+            'c_crash':       'c_log_dist',
+            'c_crash_safety_dest': 'c_log_dist',
+            # NOTE: income pairs (c_incp_* on c_veh_*) are MODE coefficients and
+            # live under stage5_mode.orthogonalize_on — listing them here is
+            # dead weight (neither key is in DEST_UEC/DEST_UEC_FLAT) and trips
+            # the health-check overlap gate.
+            # Agglomeration: residualize on size_term
+            'c_aggl':        'c_size_term',
+            'c_aggl_retail': 'c_size_term',
+            'c_aggl_office': 'c_size_term',
+            'c_aggl_edu':    'c_size_term',
+            'c_aggl_leisure':'c_size_term',
+            'c_aggl_parks':  'c_size_term',
+            'c_aggl_health': 'c_size_term',
+            'c_aggl_food':   'c_size_term',
+            'c_aggl_civic':  'c_size_term',
+            # Landuse attractors share TOTEMP-derived size variance: residualize
+            # on size_term so the GA reads their marginal (not size-duplicated) pull.
+            'c_nonmand_health': 'c_size_term',
+            'c_nonmand_shop':   'c_size_term',
+            'c_nonmand_hh':     'c_size_term',
+            'c_edu_size':       'c_size_term',
+            # Extended accessibility: crime/crash deterrents residualize on
+            # distance (mirrors c_crash); densities/transit/visitability on
+            # size_term (mirrors the landuse attractors above). The ortho
+            # machinery keeps the original term if materialisation fails.
+            'c_crime_violent':  'c_log_dist',
+            'c_crash_smooth':   'c_log_dist',
+            'c_transit_int':    'c_size_term',
+            'c_attract_shop':   'c_size_term',
+            'c_attract_food':   'c_size_term',
+            'c_attract_health': 'c_size_term',
+            'c_attract_edu':    'c_size_term',
+            'c_attract_rec':    'c_size_term',
+            'c_visit_work':     'c_size_term',
+            'c_visit_edu':      'c_size_term',
+            'c_visit_shop':     'c_size_term',
+            'c_visit_social':   'c_size_term',
+        },
     },
 }
 
@@ -414,7 +525,11 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
 #        "mutually_exclusive": [["c_aggl","c_aggl_retail"]],
 #        "min_behavioral": [[1, ["c_indp_finance","c_indp_health"]]],
 #        "sign_constraints": {"c_dist": "neg"},
+#        "orthogonalize_on": {"c_crash": "c_log_dist"},
 #        "generic_groups": { ... }               # advanced (mode only)
+#     },
+#     "stage5_mode": {
+#        "orthogonalize_on": {"c_ivt_auto": "od.DIST"},
 #     },
 #     "ptype_land": [                              # ptype ↔ land-attribute affinity
 #        {"ptype": "ptype_UniversityStudent", "land": "Education",
@@ -523,6 +638,12 @@ def _merge_constraint_dicts(base: dict, over: dict) -> dict:
                     groups.append(g)
             out['min_behavioral'] = groups
             continue
+        if key == 'orthogonalize_on':
+            # Merge orthogonalize_on dicts (overlay entries win)
+            bval = out.get(key, {})
+            if isinstance(bval, dict) and isinstance(oval, dict):
+                out[key] = {**bval, **oval}
+            continue
         bval = out.get(key)
         if isinstance(bval, list) and isinstance(oval, list):
             merged = list(bval)
@@ -607,6 +728,20 @@ def sign_constraints(stage: Optional[str]) -> Dict[str, str]:
     """
     c = get_constraints(stage) if stage else {}
     return dict(c.get('sign_constraints', {}))
+
+
+def orthogonalize_on(stage: Optional[str]) -> Dict[str, str]:
+    """
+    Collinearity residualization map for a stage: {coeff: base}.
+
+    When both terms are active, the builder replaces coeff's column/expression
+    with its OLS residual on base (materialised at tree-build time, swapped by
+    verified presence — never a silent no-op). Merged with the user overlay
+    like every other dict-valued constraint. Empty dict when undeclared.
+    """
+    c = get_constraints(stage) if stage else {}
+    val = c.get('orthogonalize_on', {})
+    return dict(val) if isinstance(val, dict) else {}
 
 
 def protected_backbone(stage: Optional[str]) -> List[str]:
@@ -750,3 +885,30 @@ def stage5_extra_random_params() -> List[str]:
     """Extra Larch param names to randomise in the stage-5 mode MXL."""
     raw = os.environ.get('GA_STAGE5_RAND', '').strip()
     return [p.strip() for p in raw.split(',') if p.strip()] if raw else []
+
+
+def stage5_mxl_distribution_features() -> List[str]:
+    """Return MXL parameter families exposed as AGDS distribution genes."""
+    return ['c_ivt', 'c_walk', 'c_bike']
+
+
+def stage5_mxl_distribution_options() -> Dict[str, tuple]:
+    """Read per-family AGDS choices; fixed/Normal/negative-LogNormal are valid."""
+    options = {
+        name: ('fixed', 'normal', 'neglognormal')
+        for name in stage5_mxl_distribution_features()
+    }
+    raw = os.environ.get('GA_STAGE5_MXL_DISTS', '').strip()
+    if not raw:
+        return options
+    for item in raw.split(','):
+        if '=' not in item:
+            continue
+        name, values = (part.strip().lower() for part in item.split('=', 1))
+        if name not in options:
+            continue
+        parsed = tuple(value.strip() for value in values.split('|')
+                       if value.strip() in {'fixed', 'normal', 'neglognormal'})
+        if parsed:
+            options[name] = tuple(dict.fromkeys(('fixed',) + parsed))
+    return options

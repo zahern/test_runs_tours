@@ -127,6 +127,33 @@ PERIOD_ENDS    = np.array([p[2] for p in TIME_PERIODS])
 # Minimum gap between activities (minutes)
 MIN_TRAVEL_GAP = 10
 
+# ── Joint time-of-day-departure (tdd) alternative set ───────────────────────
+# ActivitySim mandatory_tour_scheduling models a JOINT (start, end, duration)
+# choice. Here the alternatives are all (start_period, end_period) pairs with
+# start ≤ end over the 6 TIME_PERIODS → 21 tdd alternatives, each with a derived
+# duration. Selected via STAGE4_TIMING_MODEL=tdd (see TDDChoiceModel).
+_PERIOD_CENTERS = np.array([(s + e) / 2.0 for _, s, e in TIME_PERIODS])  # minutes
+
+
+def _build_tdd_alts():
+    """(start_period_idx, end_period_idx, duration_hours) for start ≤ end pairs."""
+    alts = []
+    for i in range(len(TIME_PERIODS)):
+        for j in range(i, len(TIME_PERIODS)):
+            dur_hr = max((_PERIOD_CENTERS[j] - _PERIOD_CENTERS[i]) / 60.0, 0.5)
+            alts.append((i, j, float(dur_hr)))
+    return alts
+
+
+TDD_ALTS = _build_tdd_alts()          # 21 (start, end, duration) alternatives
+_TDD_START = np.array([a[0] for a in TDD_ALTS])
+_TDD_END   = np.array([a[1] for a in TDD_ALTS])
+_TDD_DUR   = np.array([a[2] for a in TDD_ALTS])
+_N_PERIODS = len(TIME_PERIODS)
+# map a period index → its commute-LOS column (mandatory-scheduling keystone)
+_PERIOD_LOS_COL = {0: 'commute_am', 1: 'commute_am', 2: 'commute_md',
+                   3: 'commute_pm', 4: 'commute_ev', 5: 'commute_ev'}
+
 PURPOSES = list(PURPOSE_PRIORITY.keys())
 
 PERSON_FEATURES = ['sexp', 'vehrd', 'nprd']
@@ -138,20 +165,65 @@ ACC_FEATURES = [
 ]
 
 DEFAULT_FEATURES_BY_PURPOSE = {
-    'work': ['CARLICENCE', 'vehrd', 'ptype_FullTimeWorker', 'ptype_WorkingStudent', 'wfh', 'auto_work_acc', 'transit_acc'],
-    'edu': ['ptype_SchoolChild', 'ptype_UniversityStudent', 'age_child', 'age_teen', 'transit_acc', 'walk_acc', 'auto_edu_acc'],
-    'escort': ['hh_child', 'vehrd', 'has_vehicle', 'nprd', 'auto_nonmand_acc', 'walk_acc'],
-    'shopping': ['incp', 'vehrd', 'has_vehicle', 'nprd', 'walk_acc', 'auto_shop_acc'],
-    'social': ['is_female', 'nprd', 'age_teen', 'age_older', 'walk_acc', 'transit_acc'],
-    'othmaint': ['vehrd', 'nprd', 'auto_nonmand_acc', 'walk_acc'],
-    'othdiscr': ['incp', 'vehrd', 'age_older', 'walk_acc', 'auto_nonmand_acc'],
-    'eat': ['incp', 'nprd', 'walk_acc', 'transit_acc'],
+    'work': ['CARLICENCE', 'vehrd', 'ptype_FullTimeWorker', 'ptype_WorkingStudent', 'wfh', 'auto_work_acc', 'transit_acc',
+             'job_fulltime', 'has_work_anchor', 'same_zone_work', 'occp_prof',
+             'cdap_M', 'cdap_hh_n_children', 'is_joint_traveller'],
+    'edu': ['ptype_SchoolChild', 'ptype_UniversityStudent', 'age_child', 'age_teen', 'transit_acc', 'walk_acc', 'auto_edu_acc',
+            'has_school_anchor', 'same_zone_school', 'cdap_M', 'cdap_is_child'],
+    'escort': ['hh_child', 'vehrd', 'has_vehicle', 'nprd', 'auto_nonmand_acc', 'walk_acc', 'has_school_anchor',
+               'escort_duty', 'pickup_anchor', 'is_joint_act', 'joint_party_n'],
+    'shopping': ['incp', 'vehrd', 'has_vehicle', 'nprd', 'walk_acc', 'auto_shop_acc', 'job_fulltime', 'is_joint_act'],
+    'social': ['is_female', 'nprd', 'age_teen', 'age_older', 'walk_acc', 'transit_acc', 'wfh', 'is_joint_act', 'joint_party_n'],
+    'othmaint': ['vehrd', 'nprd', 'auto_nonmand_acc', 'walk_acc', 'has_work_anchor', 'is_joint_act'],
+    'othdiscr': ['incp', 'vehrd', 'age_older', 'walk_acc', 'auto_nonmand_acc', 'job_fulltime', 'is_joint_act', 'joint_party_n'],
+    'eat': ['incp', 'nprd', 'walk_acc', 'transit_acc', 'job_fulltime', 'is_joint_act', 'joint_party_n'],
 }
+
+
+def _attach_origin_job_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Origin-wise + job-wise timing conditionals (all safe, col-gated).
+
+    Creates 0/1 flags only from columns already present — never raises for
+    missing inputs. Conditioning timing on home origin (OTAZ), usual
+    job/school anchors (WORK_TAZ/SCHOOL_TAZ) and job type (WORKSTAT /
+    occp_group / INDUSTRY / wfh) makes work/edu departure peaks sound:
+    fixed-workplace full-timers anchor to am_peak, wfh/part-time spread out.
+    """
+    try:
+        if 'OTAZ' in df.columns and 'WORK_TAZ' in df.columns:
+            _o = pd.to_numeric(df['OTAZ'], errors='coerce')
+            _w = pd.to_numeric(df['WORK_TAZ'], errors='coerce')
+            df['has_work_anchor'] = ((_w > 0) & _w.notna()).astype(float)
+            df['same_zone_work'] = ((_o == _w) & _o.notna() & _w.notna()).astype(float)
+        if 'OTAZ' in df.columns and 'SCHOOL_TAZ' in df.columns:
+            _o = pd.to_numeric(df['OTAZ'], errors='coerce')
+            _s = pd.to_numeric(df['SCHOOL_TAZ'], errors='coerce')
+            df['has_school_anchor'] = ((_s > 0) & _s.notna()).astype(float)
+            df['same_zone_school'] = ((_o == _s) & _o.notna() & _s.notna()).astype(float)
+        if 'WORKSTAT' in df.columns:
+            _ws = pd.to_numeric(df['WORKSTAT'], errors='coerce').fillna(0)
+            df['job_fulltime'] = (_ws == 1).astype(float)
+            df['job_parttime'] = (_ws == 2).astype(float)
+            df['is_worker'] = _ws.isin([1, 2]).astype(float)
+        if 'occp_group' in df.columns:
+            _oc = df['occp_group'].astype(str).str.lower()
+            df['occp_prof'] = _oc.str.contains('prof|manag|techn', regex=True, na=False).astype(float)
+            df['occp_blue'] = _oc.str.contains('labour|machine|trade|driver|service', regex=True, na=False).astype(float)
+        if 'wfh' not in df.columns and 'WFHWEEK' in df.columns:
+            df['wfh'] = (pd.to_numeric(df['WFHWEEK'], errors='coerce').fillna(0) > 0).astype(float)
+    except Exception as e:
+        logger.warning('_attach_origin_job_features failed (non-fatal): %s', e)
+    return df
 
 
 def _timing_person_features(df: pd.DataFrame, purpose: str, feature_override=None) -> list:
     if isinstance(feature_override, dict):
-        names = feature_override.get(purpose, feature_override.get('*', []))
+        names = feature_override.get(purpose)
+        if names is None and purpose in {'escort', 'shopping', 'social',
+                                         'othmaint', 'othdiscr', 'eat'}:
+            names = feature_override.get('nonmand')
+        if names is None:
+            names = feature_override.get('*', [])
     elif feature_override is not None:
         names = feature_override
     else:
@@ -212,6 +284,182 @@ def _encode_period(period_idx: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# ActivitySim mandatory-tour-scheduling keystone: time-period-varying commute LOS
+# ---------------------------------------------------------------------------
+_MANDATORY_LOS_COLS = ['commute_am', 'commute_md', 'commute_pm', 'commute_ev',
+                       'commute_peak_ratio']
+
+
+def _attach_mandatory_los(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach period-varying auto commute LOS for work/school (mandatory) tours.
+
+    ActivitySim's ``mandatory_tour_scheduling`` keystone: because the destination
+    of a work/school tour is the KNOWN usual location, the schedule can respond to
+    time-period congestion — a long PM-peak commute pushes departure earlier/later.
+    For each work/edu row we look up the home→usual-location auto time in each
+    period (SOVTOLL_TIME__AM/MD/PM/EV) and expose:
+        commute_am/md/pm/ev   – minutes by period
+        commute_peak_ratio    – PM-peak / midday (congestion pressure)
+    These become GA-searchable scheduling covariates (respecting the metaheuristic
+    — see ga_hypothesis_testing _S4_PURPOSE_OPTIONAL work/edu). Gated by
+    STAGE4_MANDATORY_LOS; leaves the columns at 0 on any failure (safe no-op), so
+    it never breaks a run when skims/OD are unavailable. Needs OTAZ + WORK_TAZ/
+    SCHOOL_TAZ in df (merged by prepare_timing_data) and the period skims in the OMX.
+    """
+    for _c in _MANDATORY_LOS_COLS:
+        if _c not in df.columns:
+            df[_c] = np.float32(0.0)
+    if os.environ.get('STAGE4_MANDATORY_LOS', '0') != '1':
+        return df
+    try:
+        if 'OTAZ' not in df.columns or 'purpose' not in df.columns:
+            return df
+        _o = pd.to_numeric(df['OTAZ'], errors='coerce')
+        _d = pd.to_numeric(df.get('WORK_TAZ', pd.Series(np.nan, index=df.index)), errors='coerce')
+        if 'SCHOOL_TAZ' in df.columns:
+            _d = _d.where(_d > 0, pd.to_numeric(df['SCHOOL_TAZ'], errors='coerce'))
+        _mand = df['purpose'].isin(['work', 'edu'])
+        _valid = _mand & _o.notna() & _d.notna() & (_d > 0)
+        if int(_valid.sum()) == 0:
+            logger.info("  _attach_mandatory_los: no work/edu rows with OTAZ+usual-location; skipped")
+            return df
+        from stage5_destination_choice import _open_skims, _skim_flat
+        _sk_obj, _close = _open_skims(os.environ.get('PIPELINE_SKIMS_PATH'))
+        _sk = _skim_flat(_sk_obj)
+        if _close:
+            try:
+                _sk_obj.close()
+            except Exception:
+                pass
+        # one (OTAZ,DTAZ) → row map; look up each query pair
+        _pos = pd.Series(np.arange(len(_sk)),
+                         index=pd.MultiIndex.from_arrays(
+                             [_sk['OTAZ'].astype(int), _sk['DTAZ'].astype(int)]))
+        _qk = pd.MultiIndex.from_arrays([_o.fillna(-1).astype(int), _d.fillna(-1).astype(int)])
+        _row = _pos.reindex(_qk).to_numpy()
+        _ok = np.isfinite(_row)
+        _periods = {'commute_am': 'SOVTOLL_TIME__AM', 'commute_md': 'SOVTOLL_TIME__MD',
+                    'commute_pm': 'SOVTOLL_TIME__PM', 'commute_ev': 'SOVTOLL_TIME__EV'}
+        _mand_np = _mand.to_numpy()
+        for _col, _skcol in _periods.items():
+            if _skcol not in _sk.columns:
+                continue
+            _sv = _sk[_skcol].to_numpy()
+            _t = np.zeros(len(df), dtype=np.float64)
+            _t[_ok] = _sv[_row[_ok].astype(int)]
+            _pos_t = _t[_t > 0]
+            if _pos_t.size and float(np.median(_pos_t)) > 600:   # seconds → minutes
+                _t = _t / 60.0
+            df[_col] = np.where(_mand_np, _t, 0.0).astype(np.float32)
+        _md = df['commute_md'].replace(0, np.nan)
+        df['commute_peak_ratio'] = np.where(
+            _mand_np, (df['commute_pm'] / _md).fillna(1.0).clip(0, 5), 0.0).astype(np.float32)
+        logger.info(f"  _attach_mandatory_los: period commute LOS attached for "
+                    f"{int(_valid.sum())} work/edu tours "
+                    f"(pm/md ratio μ={df.loc[_valid, 'commute_peak_ratio'].mean():.2f})")
+    except Exception as _e:
+        logger.debug(f"_attach_mandatory_los skipped ({_e})")
+    return df
+
+
+def _attach_joint_features(df: pd.DataFrame, tours: Optional[pd.DataFrame] = None,
+                         persons: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Joint-travel conditionals for timing (pickup / travelling together).
+
+    Estimation: needs to know who travels together. HHTS joint tours come
+    from cdap_households_estimation.derive_observed_joint_tours (flag column
+    or HHID+OD+time heuristic); prediction frames already carry
+    is_joint / joint_tour_id / joint_participants tagged from the joint map
+    (pipeline_logger.predict_stage3 via tag_joint_activities).
+
+    Creates 0/1 flags only from columns present — never raises, and every
+    flag column is ALWAYS created (zeros when there is no evidence) so
+    downstream code (GA candidates, timing features) never KeyErrors:
+      is_joint_act     this activity is a shared household tour
+      joint_party_n    party size (from joint_participants list length)
+      escort_duty      escort-purpose row in a household with children
+      pickup_anchor    escort row with school-pickup duty: the row's school
+                       anchor when known (derived inline from SCHOOL_TAZ if
+                       has_school_anchor is absent), else a child in the
+                       household as the school-run proxy
+      joint_worker     joint row by a worker (tight peak coupling)
+    """
+    try:
+        if 'is_joint' not in df.columns or df['is_joint'].isna().all():
+            _jt = None
+            try:
+                from cdap_households_estimation import derive_observed_joint_tours
+                if tours is not None and len(tours):
+                    _jt = derive_observed_joint_tours(tours)
+            except Exception:
+                _jt = None
+            if _jt is not None and len(_jt) and 'participants' in _jt.columns:
+                _members = set()
+                for _lst in _jt['participants'].dropna():
+                    _l = _lst if isinstance(_lst, (list, tuple)) else [ _lst ]
+                    for _p in _l:
+                        _members.add(str(_p))
+                if 'person_id' in df.columns and _members:
+                    df['is_joint_act'] = df['person_id'].astype(str).isin(_members).astype(float)
+        else:
+            df['is_joint_act'] = pd.to_numeric(df['is_joint'], errors='coerce').fillna(0).clip(0, 1).astype(float)
+        # Contract: the flag must always exist downstream (GA candidates,
+        # timing features). Default 0 when no joint evidence was found.
+        if 'is_joint_act' not in df.columns:
+            df['is_joint_act'] = 0.0
+        if 'joint_party_n' not in df.columns:
+            if 'joint_participants' in df.columns:
+                def _plen(v):
+                    if v is None or (isinstance(v, float) and np.isnan(v)) or str(v).strip() in ('', 'nan'):
+                        return 0.0
+                    s = str(v)
+                    return float(len([x for x in s.replace('|', ',').split(',') if x.strip()]) or 1.0)
+                df['joint_party_n'] = df['joint_participants'].map(_plen).astype(float)
+            else:
+                df['joint_party_n'] = df.get('is_joint_act', 0.0)
+        _has_child = None
+        for _cc in ('hh_child', 'n_children', 'has_child'):
+            if _cc in df.columns:
+                _has_child = pd.to_numeric(df[_cc], errors='coerce').fillna(0) > 0
+                break
+        _is_escort = (df['purpose'] == 'escort') if 'purpose' in df.columns else False
+        if _has_child is not None:
+            df['escort_duty'] = ((_is_escort) & _has_child).astype(float)
+        elif 'purpose' in df.columns:
+            df['escort_duty'] = (_is_escort).astype(float)
+        else:
+            df['escort_duty'] = 0.0
+        # School anchor: derive inline when absent — callers may run joint
+        # features before _attach_origin_job_features (which normally creates
+        # has_school_anchor from SCHOOL_TAZ).
+        if 'has_school_anchor' not in df.columns and 'SCHOOL_TAZ' in df.columns:
+            _s = pd.to_numeric(df['SCHOOL_TAZ'], errors='coerce')
+            df['has_school_anchor'] = ((_s > 0) & _s.notna()).astype(float)
+        # pickup_anchor: escort trip with school-pickup duty — the row's school
+        # anchor when known, else a child in the household as the school-run
+        # proxy. Always created (zeros when no evidence) so downstream code
+        # never KeyErrors.
+        if 'has_school_anchor' in df.columns:
+            _school = pd.to_numeric(df['has_school_anchor'], errors='coerce').fillna(0) > 0
+            if _has_child is not None:
+                df['pickup_anchor'] = ((_is_escort) & (_school | _has_child)).astype(float)
+            else:
+                df['pickup_anchor'] = ((_is_escort) & _school).astype(float)
+        elif _has_child is not None:
+            df['pickup_anchor'] = ((_is_escort) & _has_child).astype(float)
+        else:
+            df['pickup_anchor'] = 0.0
+        if 'is_joint_act' in df.columns and 'WORKSTAT' in df.columns:
+            _ws = pd.to_numeric(df['WORKSTAT'], errors='coerce').fillna(0)
+            df['joint_worker'] = ((df['is_joint_act'] > 0) & _ws.isin([1, 2])).astype(float)
+        elif 'joint_worker' not in df.columns:
+            df['joint_worker'] = 0.0
+    except Exception as e:
+        logger.warning('_attach_joint_features failed (non-fatal): %s', e)
+    return df
+
+
+# ---------------------------------------------------------------------------
 # 1.  PREPARE ESTIMATION DATA FROM SURVEY TRIPS
 # ---------------------------------------------------------------------------
 
@@ -258,8 +506,12 @@ def prepare_timing_data(
     raw_to_code = {
         'Work (my workplace)': 'work', 'Work (other work reason)': 'work',
         'Direct Work Commute': 'work', 'Work Related': 'work',
+        'Full-time Work': 'work', 'Part-time Work': 'work', 'Work': 'work',
         'Education': 'edu', 'Childcare or Kindergarten': 'edu',
         'Childcare or kindergarten': 'edu',
+        'Primary School': 'edu', 'Secondary School': 'edu',
+        'Full-time TAFE/Uni': 'edu', 'Part-time TAFE/Uni': 'edu',
+        'Childcare/Kindergarten': 'edu',
         'Social Visit': 'social', 'Recreation/leisure activity': 'social',
         'Recreation': 'social', 'Social': 'social',
         'Pick up or drop off a passenger': 'escort',
@@ -274,6 +526,37 @@ def prepare_timing_data(
     unique_vals = df['purpose'].dropna().unique()
     if not set(unique_vals).issubset(set(PURPOSES) | {'home'}):
         df['purpose'] = df['purpose'].map(raw_to_code).fillna(df['purpose'])
+        # token fallback for raw HHTS strings missing from the exact map
+        _miss = ~df['purpose'].isin(set(PURPOSES) | {'home'}) & df['purpose'].notna()
+        if _miss.any():
+            def _token_code(v):
+                s = str(v).strip().lower()
+                if not s or s in ('nan', 'none'):
+                    return None
+                if 'home' in s:
+                    return 'home'
+                if 'work' in s:
+                    return 'work'
+                if any(t in s for t in ('school', 'tafe', 'univers',
+                                        'kinder', 'childcare', 'educat')):
+                    return 'edu'
+                if 'eat' in s or 'drink' in s or 'dine' in s:
+                    return 'eat'
+                if 'shop' in s:
+                    return 'shopping'
+                if 'social' in s or 'recreation' in s or 'visit' in s \
+                        or 'leisure' in s:
+                    return 'social'
+                if 'escort' in s or 'pickup' in s or 'dropoff' in s \
+                        or 'accompan' in s:
+                    return 'escort'
+                if 'business' in s or 'personal' in s:
+                    return 'othmaint'
+                return 'othdiscr'
+            df.loc[_miss, 'purpose'] = df.loc[_miss, 'purpose'].map(_token_code)
+            logger.info(f"  stage4 token fallback coded "
+                        f"{int(df.loc[_miss, 'purpose'].isin(PURPOSES).sum())}"
+                        f"/{int(_miss.sum())} raw purposes")
 
     # keep only trips with valid times and known purposes
     df = df[df['STARTIME'].notna() & df['purpose'].notna()].copy()
@@ -329,10 +612,41 @@ def prepare_timing_data(
         pers['ptype'] = 'NonWorker'
 
     _extra_pers = [c for c in ['AGEGROUP'] + ACC_FEATURES if c in pers.columns]
+    # Usual-location OD for the mandatory-scheduling LOS keystone (only merged
+    # from persons when not already on the trips frame).
+    _od_pers = [c for c in ('OTAZ', 'WORK_TAZ', 'SCHOOL_TAZ')
+                if c in pers.columns and c not in df.columns]
+    # Origin/job conditionals: carry job + origin attributes so timing can be
+    # conditioned on where people live/work and what job they hold. Only merged
+    # when present — _timing_person_features filters to df.columns, so absent
+    # cols are safely ignored at fit/predict.
+    _job_pers = [c for c in ('WORKSTAT', 'STUDYING', 'occp_group', 'INDUSTRY',
+                             'wfh', 'WFHWEEK', 'incp', 'CARLICENCE')
+                 if c in pers.columns and c not in df.columns]
+    # Observed-CDAP conditionals (attached in process_survey via
+    # attach_cdap_to_hhts): household coordination signal for timing —
+    # DAP dummies, hh composition, joint-tour counts. Same filter applies.
+    _cdap_pers = [c for c in ('cdap_M', 'cdap_N', 'cdap_H',
+                              'cdap_hh_n_workers', 'cdap_hh_n_children',
+                              'cdap_hh_has_home_adult',
+                              'cdap_child_x_home_adult', 'cdap_is_child',
+                              'n_joint_tours_hh', 'is_joint_traveller')
+                  if c in pers.columns and c not in df.columns]
     keep = (['person_id', 'ptype'] +
             [c for c in PERSON_FEATURES if c in pers.columns] +
-            _extra_pers)
+            _extra_pers + _od_pers + _job_pers + _cdap_pers)
     df = df.merge(pers[keep], on='person_id', how='left')
+    # Origin/job-derived timing conditionals (safe: only from cols present).
+    df = _attach_origin_job_features(df)
+    # Joint-travel conditionals: who travels together / pickup duty. Uses HHTS
+    # tours on the estimation path, tagged is_joint cols on predict frames.
+    try:
+        df = _attach_joint_features(df, tours=tours, persons=persons)
+    except Exception:
+        df = _attach_joint_features(df)
+    # ActivitySim mandatory-scheduling keystone: period-varying commute LOS
+    # (gated STAGE4_MANDATORY_LOS; safe no-op otherwise).
+    df = _attach_mandatory_los(df)
 
     defaults = {'sexp': 1, 'vehrd': 1, 'nprd': 2, 'WORKSTAT': 0, 'STUDYING': 0}
     for col, val in defaults.items():
@@ -395,6 +709,11 @@ class MNLTimingModel:
         self.sd_            = None
         self._const_mask    = np.array([], dtype=bool)   # set by _fit_scipy
         self.n_periods_     = len(TIME_PERIODS)
+        # Ridge on the (z-scored) coefficients, EMBEDDED in _neg_ll so the fit
+        # AND the numerical Hessian used for std_err/p_value both carry the
+        # ≈λ eigenvalue lift — keeps inference finite under collinearity
+        # (mirrors SearchLibrium's l2_penalty on z-scored coefficients).
+        self.ridge          = float(os.environ.get('GA_S4_RIDGE', '0.5'))
         self.coef_export_names_ = None
         self.coef_export_values_ = None
         self.std_err_export_ = None
@@ -412,7 +731,14 @@ class MNLTimingModel:
         self.kept_purposes_ = None
 
     def _build_X(self, df: pd.DataFrame) -> np.ndarray:
-        """Build feature matrix for MNL estimation / prediction."""
+        """Build feature matrix for MNL estimation / prediction.
+
+        The fit-time design is locked on first call (kept_purposes_ plus the
+        column order below); later calls align to that locked design with
+        zeros for missing columns instead of silently dropping them (a
+        dropped middle column used to shift every later column left against
+        coef_, and a fully-missed purpose collapsed to the default period).
+        """
         arrays = []
         cols   = []
 
@@ -450,14 +776,22 @@ class MNLTimingModel:
         if self.include_person_features_:
             feature_list = feature_list + PERSON_FEATURES
         feature_list = list(dict.fromkeys(feature_list))  # deduplicate, preserve order
+        _avail = {}
         for col in feature_list:
             if col in df.columns:
-                arrays.append(
-                    pd.to_numeric(df[col], errors='coerce').fillna(0).values
-                )
-                cols.append(col)
+                _avail[col] = pd.to_numeric(
+                    df[col], errors='coerce').fillna(0).values
+        if self.feature_names_ is None:
+            # fit call: lock the design actually built (purp/ptype dummies
+            # first, in the fixed order above, then present features).
+            self.feature_names_ = cols + [c for c in feature_list if c in _avail]
+        for col in self.feature_names_:
+            if col in cols:
+                continue  # dummy already appended above
+            arrays.append(_avail[col] if col in _avail
+                          else np.zeros(len(df), dtype=float))
+            cols.append(col)
 
-        self.feature_names_ = cols
         return np.column_stack(arrays).astype(float)
 
     def _softmax(self, Z: np.ndarray) -> np.ndarray:
@@ -476,6 +810,9 @@ class MNLTimingModel:
         Z    = X @ coef_full.T           # (N, K)
         prob = self._softmax(Z)
         ll   = np.sum(np.log(np.clip(prob[np.arange(len(y)), y], 1e-12, 1)))
+        # embedded ridge: lifts every Hessian eigenvalue by ≈2·self.ridge so the
+        # inference step stays invertible on flat/collinear directions
+        ll -= 0.5 * self.ridge * float(np.dot(coef_flat, coef_flat))
         return -ll
 
     def _neg_ll_grad(self, coef_flat: np.ndarray,
@@ -568,7 +905,10 @@ class MNLTimingModel:
         for k in range(K - 1):
             init[k * F] = init_intercepts[k]
 
-        L2 = 1e-3
+        # SAME embedded ridge as self._neg_ll (used by the Hessian for
+        # std_err/p_value) — fit and inference must differentiate the same
+        # penalised objective or flat directions stay flat.
+        L2 = float(self.ridge)
 
         def neg_ll_reg(coef_flat):
             coef = coef_flat.reshape(K - 1, F)
@@ -639,7 +979,7 @@ class MNLTimingModel:
         Xs = np.where(self._const_mask, X, (X - self.mu_) / self.sd_).astype(np.float32)
         X_jax = jnp.asarray(Xs, dtype=jnp.float32)
         y_jax = jnp.asarray(y, dtype=jnp.int32)
-        L2 = 1e-3
+        L2 = float(self.ridge)
 
         @jax.jit
         def _nll(params):
@@ -707,7 +1047,7 @@ class MNLTimingModel:
                 mnl.wide_setup(
                     X_wide=X, y_chosen=y, varnames=feat_names, n_alts=K,
                     empirical_init=True,
-                    l2_penalty=1e-3,
+                    l2_penalty=float(self.ridge),
                 )
             else:
                 # ── Manual wide → long (backward compat) ──────────────────
@@ -732,7 +1072,7 @@ class MNLTimingModel:
                     isvars=feat_names,
                     ids=ids_sorted,
                     base_alt=0,
-                    l2_penalty=1e-3,
+                    l2_penalty=float(self.ridge),
                 )
         except Exception:
             self._fit_scipy(X, y)
@@ -816,6 +1156,79 @@ def _sample_within_period_fraction(model: Optional[MNLTimingModel],
         if arr is not None and len(arr) > 0:
             return float(arr[rng.integers(0, len(arr))])
     return float(rng.triangular(0.05, 0.5, 0.95))
+
+
+def _attach_schedule_context(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach stable sequence, window, and known-anchor fields for Stage 5."""
+    if df is None or df.empty or 'person_id' not in df.columns:
+        return df
+    if 'STARTIME' not in df.columns or 'ENDTIME' not in df.columns:
+        return df
+
+    work = df.copy()
+    work['_schedule_orig'] = np.arange(len(work), dtype=int)
+    order_col = next((c for c in ('planning_order', 'activity_seq', 'STARTIME')
+                      if c in work.columns), None)
+    if order_col is None:
+        work['_schedule_order'] = work['_schedule_orig']
+    else:
+        work['_schedule_order'] = pd.to_numeric(
+            work[order_col], errors='coerce').fillna(work['_schedule_orig'])
+    work = work.sort_values(
+        ['person_id', '_schedule_order', 'STARTIME', '_schedule_orig'],
+        kind='stable').reset_index(drop=True)
+    work['schedule_seq'] = work.groupby('person_id', sort=False).cumcount().astype(int)
+    work['schedule_n_activities'] = work.groupby('person_id', sort=False)['person_id'].transform('size').astype(int)
+    work['sched_prev_end'] = work.groupby('person_id', sort=False)['ENDTIME'].shift(1)
+    work['sched_prev_end'] = work['sched_prev_end'].fillna(
+        pd.to_numeric(work.get('start_of_day', 0.0), errors='coerce').fillna(0.0))
+    work['sched_next_start'] = work.groupby('person_id', sort=False)['STARTIME'].shift(-1)
+    work['sched_next_start'] = work['sched_next_start'].fillna(
+        pd.to_numeric(work.get('end_of_day', 1440.0), errors='coerce').fillna(1440.0))
+
+    home = pd.Series(np.nan, index=work.index, dtype=float)
+    for col in ('OTAZ', 'HOME_TAZ', 'home_taz', 'home_zone'):
+        if col in work.columns:
+            values = pd.to_numeric(work[col], errors='coerce')
+            home = home.where(home.notna() & (home > 0), values)
+    known = pd.Series(np.nan, index=work.index, dtype=float)
+    if 'DTAZ' in work.columns:
+        values = pd.to_numeric(work['DTAZ'], errors='coerce')
+        known = known.where(known.notna() & (known > 0), values)
+    if 'purpose' in work.columns:
+        purpose = work['purpose'].astype(str).str.lower()
+        for purpose_name, col in (('work', 'WORK_TAZ'), ('edu', 'SCHOOL_TAZ')):
+            if col in work.columns:
+                values = pd.to_numeric(work[col], errors='coerce')
+                known = known.where(
+                    ~((purpose == purpose_name) & values.gt(0)), values)
+
+    prev_anchor = np.full(len(work), np.nan, dtype=float)
+    next_anchor = np.full(len(work), np.nan, dtype=float)
+    for positions in work.groupby('person_id', sort=False).groups.values():
+        positions = np.asarray(list(positions), dtype=int)
+        anchors = known.to_numpy(dtype=float)[positions]
+        homes = home.to_numpy(dtype=float)[positions]
+        prev_value = np.nan
+        for offset, position in enumerate(positions):
+            prev_anchor[position] = prev_value if np.isfinite(prev_value) else homes[offset]
+            if np.isfinite(anchors[offset]):
+                prev_value = anchors[offset]
+        next_value = np.nan
+        for offset in range(len(positions) - 1, -1, -1):
+            position = positions[offset]
+            next_anchor[position] = next_value if np.isfinite(next_value) else homes[offset]
+            if np.isfinite(anchors[offset]):
+                next_value = anchors[offset]
+    work['sched_prev_taz'] = prev_anchor
+    work['sched_next_taz'] = next_anchor
+    if 'ptour_id' not in work.columns:
+        work['ptour_id'] = (
+            work['person_id'].astype(str) + '_' + work['schedule_seq'].astype(str))
+    else:
+        work['ptour_id'] = work['ptour_id'].astype(str)
+    work = work.sort_values('_schedule_orig', kind='stable')
+    return work.drop(columns=['_schedule_orig', '_schedule_order'], errors='ignore')
 
 
 class RRMTimeModel:
@@ -1031,6 +1444,171 @@ def _fit_regret_timing_model(subset: pd.DataFrame, purpose: str, mode: str):
     return best
 
 
+class TDDChoiceModel:
+    """Joint (start, end, duration) time-of-day-departure MNL — ActivitySim
+    ``mandatory_tour_scheduling`` structure.
+
+    Alternatives are the 21 (start_period, end_period) pairs in TDD_ALTS (start ≤
+    end over the 6 TIME_PERIODS); each defines a duration. Unlike the departure-
+    period-only softmax (MNLTimingModel), this chooses START and END jointly, so
+    duration is an OUTPUT of scheduling rather than an input from Stage 3.
+
+    Utility (idca) per alternative a:
+        V_a = Σ dep_asc[start_a]  (period≠midday ref)
+            + Σ arr_asc[end_a]
+            + b_dur·dur_a + b_dur2·dur_a²
+            + Σ_f person_f·(g_f_dep·start_norm_a + g_f_dur·dur_a)   # GA-selected f
+            + b_los·commute_los(start_a)                            # period congestion
+
+    The person×schedule interactions are the metaheuristic-searchable part
+    (feature_override_ from the GA, same convention as MNLTimingModel). Estimated
+    by a scipy MNL with ridge; predicted with day-window availability.
+    """
+    REF_PERIOD = 2   # midday reference for departure/arrival constants
+
+    def __init__(self):
+        self.beta_ = None
+        self.param_names_ = None
+        self.person_feats_ = None
+        self.feature_override_ = None
+        self.purpose_ = None
+        self.fit_status_ = 'not_fit'
+        self.n_obs_ = 0
+        self.ll_final_ = None
+        self._has_los_ = False
+        self.coef_export_names_ = None
+        self.coef_export_values_ = None
+        self.std_err_export_ = None
+        self.t_stat_export_ = None
+        self.p_value_export_ = None
+
+    def _person_feats(self, df: pd.DataFrame):
+        names = None
+        if self.feature_override_:
+            names = self.feature_override_.get(self.purpose_,
+                                               self.feature_override_.get('*'))
+        if not names:
+            names = DEFAULT_FEATURES_BY_PURPOSE.get(self.purpose_, PERSON_FEATURES)
+        return [f for f in names if f in df.columns]
+
+    def _design(self, df: pd.DataFrame, person_feats):
+        """Return (D, names) with D of shape (n_obs, n_alts, n_params)."""
+        N = len(df)
+        A = len(TDD_ALTS)
+        cols, names = [], []
+        for p in range(_N_PERIODS):                       # departure ASCs
+            if p == self.REF_PERIOD:
+                continue
+            cols.append(np.tile((_TDD_START == p).astype(float), (N, 1)))
+            names.append(f'dep_{PERIOD_LABELS[p]}')
+        for p in range(_N_PERIODS):                       # arrival ASCs
+            if p == self.REF_PERIOD:
+                continue
+            cols.append(np.tile((_TDD_END == p).astype(float), (N, 1)))
+            names.append(f'arr_{PERIOD_LABELS[p]}')
+        cols.append(np.tile(_TDD_DUR, (N, 1)));       names.append('duration_hr')
+        cols.append(np.tile(_TDD_DUR ** 2, (N, 1)));  names.append('duration_hr_sq')
+        _start_norm = (_TDD_START - 2.5) / 2.5            # centered start index
+        for f in person_feats:
+            # defensive: a feature present at fit-time may be absent from a
+            # single-row prediction frame → treat as 0 (interaction inactive).
+            if f in df.columns:
+                fv = pd.to_numeric(df[f], errors='coerce').fillna(0.0).to_numpy().reshape(N, 1)
+            else:
+                fv = np.zeros((N, 1))
+            cols.append(fv * np.tile(_start_norm, (N, 1))); names.append(f'{f}_x_departure')
+            cols.append(fv * np.tile(_TDD_DUR, (N, 1)));    names.append(f'{f}_x_duration')
+        # period-varying commute LOS at each alt's START period (keystone)
+        _los = np.zeros((N, A), dtype=float)
+        for a in range(A):
+            _c = _PERIOD_LOS_COL[int(_TDD_START[a])]
+            if _c in df.columns:
+                _los[:, a] = pd.to_numeric(df[_c], errors='coerce').fillna(0.0).to_numpy()
+        if np.abs(_los).sum() > 0:
+            cols.append(_los / 60.0); names.append('commute_los_hr'); self._has_los_ = True
+        return np.stack(cols, axis=-1), names
+
+    @staticmethod
+    def _chosen_idx(df: pd.DataFrame):
+        _idx = {(s, e): k for k, (s, e, _) in enumerate(TDD_ALTS)}
+        sp = pd.to_numeric(df['period'], errors='coerce').fillna(2).to_numpy().astype(int)
+        sp = np.clip(sp, 0, _N_PERIODS - 1)
+        _end_t = (pd.to_numeric(df['STARTIME'], errors='coerce').fillna(540.0)
+                  + pd.to_numeric(df.get('duration_min', 60.0), errors='coerce').fillna(60.0))
+        ep = np.clip(np.array([_period_of(float(t)) for t in _end_t]), 0, _N_PERIODS - 1)
+        ep = np.maximum(ep, sp)
+        return np.array([_idx[(int(s), int(e))] for s, e in zip(sp, ep)], dtype=int)
+
+    def fit(self, df: pd.DataFrame):
+        from scipy.optimize import minimize
+        person_feats = self._person_feats(df)
+        self.person_feats_ = person_feats
+        D, names = self._design(df, person_feats)
+        y = self._chosen_idx(df)
+        N, A, P = D.shape
+        self.n_obs_ = N
+        _l2 = float(os.environ.get(
+            'GA_S4_RIDGE', os.environ.get('STAGE4_TDD_L2', '0.5')))
+        _rows = np.arange(N)
+
+        def _negll(beta):
+            V = D @ beta
+            V -= V.max(axis=1, keepdims=True)
+            eV = np.exp(V)
+            p = eV / eV.sum(axis=1, keepdims=True)
+            ll = np.log(p[_rows, y] + 1e-12).sum()
+            ED = np.einsum('na,nap->np', p, D)
+            grad = -(D[_rows, y, :] - ED).sum(axis=0) + 2.0 * _l2 * beta
+            return -ll + _l2 * float(beta @ beta), grad
+
+        res = minimize(_negll, np.zeros(P), jac=True, method='L-BFGS-B',
+                       options={'maxiter': 400})
+        self.beta_ = res.x
+        self.param_names_ = names
+        self.ll_final_ = -float(res.fun)
+        self.fit_status_ = 'fit'
+        # standard errors via numerical Hessian of the PENALISED objective
+        # (_negll[0] includes the _l2 ridge — the ≈2·_l2 eigenvalue lift is what
+        # keeps the pinv well-conditioned on flat directions)
+        try:
+            H = _numerical_hessian(lambda b: _negll(b)[0], self.beta_)
+            _cov = np.linalg.pinv(H)
+            se = np.sqrt(np.clip(np.diag(_cov), 0.0, None))
+            with np.errstate(divide='ignore', invalid='ignore'):
+                t = self.beta_ / se
+            from scipy.stats import norm as _norm
+            self.std_err_export_ = se
+            self.t_stat_export_ = t
+            self.p_value_export_ = 2.0 * _norm.sf(np.abs(t))
+        except Exception:
+            pass
+        self.coef_export_names_ = names
+        self.coef_export_values_ = self.beta_
+        return self
+
+    def predict_tdd(self, feat_row: pd.DataFrame, start_of_day: float,
+                    end_of_day: float, current_time: float,
+                    rng: np.random.Generator):
+        """Sample a joint (start_min, end_min) respecting the remaining day window."""
+        D, _ = self._design(feat_row, self.person_feats_ or [])
+        V = (D @ self.beta_)[0]
+        avail = np.ones(len(TDD_ALTS), dtype=bool)
+        for a in range(len(TDD_ALTS)):
+            st, en = _PERIOD_CENTERS[int(_TDD_START[a])], _PERIOD_CENTERS[int(_TDD_END[a])]
+            if st < current_time - 90.0 or en > end_of_day + 1e-6 or en < st:
+                avail[a] = False
+        if not avail.any():
+            avail[:] = True
+        V = np.where(avail, V, -1e9)
+        V -= V.max()
+        p = np.exp(V)
+        p = p / p.sum()
+        a = int(rng.choice(len(TDD_ALTS), p=p))
+        st = max(float(_PERIOD_CENTERS[int(_TDD_START[a])]), current_time, start_of_day)
+        en = max(float(_PERIOD_CENTERS[int(_TDD_END[a])]), st + 30.0)
+        return st, min(en, end_of_day)
+
+
 # ---------------------------------------------------------------------------
 # 3.  ESTIMATE — ONE MODEL PER PURPOSE
 # ---------------------------------------------------------------------------
@@ -1044,6 +1622,16 @@ def estimate_timing_models(
 ) -> dict:
     """Fit one MNLTimingModel per activity purpose."""
     data   = prepare_timing_data(trips, tours, persons)
+    # Recreate GA search-frame columns (engineered flags, acc join) so a
+    # GA-selected feature resolves at refit exactly as it did in the search.
+    # Previously absent here (unlike stages 1-3), so any GA-selected engineered
+    # or accessibility feature was silently dropped from the final fit.
+    try:
+        from ga_hypothesis_testing import ensure_ga_search_columns
+        data = ensure_ga_search_columns(data, persons, stage_id=4,
+                                        zone_col='HOME_SA2_2021')
+    except Exception as _ee:
+        logger.warning(f"GA feature-column enrichment failed: {_ee}")
     ptypes = sorted(data['ptype'].dropna().unique())
 
     models = {}
@@ -1076,7 +1664,29 @@ def estimate_timing_models(
             logger.warning(f"  timing/{purpose}: only 1 period observed — skipping")
             continue
 
-        if _timing_estimator in ('rrm', 'searchlibrium'):
+        if _timing_estimator == 'tdd':
+            # Full joint (start, end, duration) tdd choice (ActivitySim
+            # mandatory_tour_scheduling). Duration becomes an OUTPUT of scheduling.
+            try:
+                _tdd = TDDChoiceModel()
+                _tdd.purpose_ = purpose
+                # resolve GA/override person features the same way the MNL path
+                # does (handles list-or-dict + ptype filtering), wrapped as a dict
+                # so TDDChoiceModel._person_feats picks up this purpose's set.
+                _tdd.feature_override_ = {
+                    purpose: _timing_person_features(subset, purpose, feature_override)}
+                _tdd.fit(subset)
+                if _tdd.fit_status_ == 'fit':
+                    models[purpose] = _tdd
+                    logger.info(f"  timing/{purpose}: joint TDD choice, n={_tdd.n_obs_}, "
+                                f"LL={_tdd.ll_final_:.1f}, {len(_tdd.param_names_)} params"
+                                + ("  (+commute LOS)" if _tdd._has_los_ else ""))
+                    continue
+                logger.warning(f"  timing/{purpose}: TDD fit failed — falling back to RRM")
+            except Exception as _tdde:
+                logger.warning(f"  timing/{purpose}: TDD error ({_tdde}) — falling back to RRM")
+
+        if _timing_estimator in ('rrm', 'searchlibrium', 'tdd'):
             rrm_model = _fit_rrm_timing_model(subset, purpose)
             if rrm_model is not None:
                 rrm_model.fit_within_period_offsets(subset)
@@ -1297,38 +1907,50 @@ def build_schedule(
         duration_min = durations[i]
         model        = timing_models.get(purpose)
 
-        if model is not None:
-            # Build feature dict using pre-extracted arrays — avoids pd.DataFrame
-            feat_dict = {
-                'purpose':        purpose,
-                'ptype':          ptypes[i],
-                'day_position':   i / max(n - 1, 1),
-                'time_consumed':  current_time - start_of_day,
-                'duration_min':   duration_min,
-                'time_remaining': max(end_of_day - current_time, 0.0),
-            }
-            for col in PERSON_FEATURES:
-                feat_dict[col] = float(person_feats[col][i])
-            for col in ACC_FEATURES:
-                feat_dict[col] = float(acc_feats[col][i])
-
-            # Single-row DataFrame built from pre-computed dict
-            feat_row   = pd.DataFrame([feat_dict])
-            X          = model._build_X(feat_row)
-            period_idx = int(model.predict_sampled(X, rng)[0])
+        if isinstance(model, TDDChoiceModel):
+            # Full joint (start, end, duration) choice: the model sets BOTH the
+            # start and the end (duration is an output, overriding Stage 3). Pass
+            # the real activity row so person interactions + commute LOS apply.
+            startime, endtime = model.predict_tdd(
+                df.iloc[[i]], start_of_day, end_of_day, current_time, rng)
+            startime = max(startime, current_time + MIN_TRAVEL_GAP, start_of_day)
+            endtime  = max(endtime, startime + 1.0)
+            if endtime > end_of_day:
+                endtime = end_of_day
+            period_idx = _period_of(startime)
         else:
-            period_idx = _period_of(current_time)
+            if model is not None:
+                # Build feature dict using pre-extracted arrays — avoids pd.DataFrame
+                feat_dict = {
+                    'purpose':        purpose,
+                    'ptype':          ptypes[i],
+                    'day_position':   i / max(n - 1, 1),
+                    'time_consumed':  current_time - start_of_day,
+                    'duration_min':   duration_min,
+                    'time_remaining': max(end_of_day - current_time, 0.0),
+                }
+                for col in PERSON_FEATURES:
+                    feat_dict[col] = float(person_feats[col][i])
+                for col in ACC_FEATURES:
+                    feat_dict[col] = float(acc_feats[col][i])
 
-        startime = _sample_startime_in_period(
-            period_idx, duration_min, current_time, end_of_day, rng, model=model)
-        startime = max(startime, current_time + MIN_TRAVEL_GAP)
-        endtime  = startime + duration_min
+                # Single-row DataFrame built from pre-computed dict
+                feat_row   = pd.DataFrame([feat_dict])
+                X          = model._build_X(feat_row)
+                period_idx = int(model.predict_sampled(X, rng)[0])
+            else:
+                period_idx = _period_of(current_time)
 
-        if startime >= end_of_day:
-            startime = end_of_day - duration_min
-            endtime  = end_of_day
-        startime = max(startime, start_of_day)
-        endtime  = max(endtime,  startime + 1.0)
+            startime = _sample_startime_in_period(
+                period_idx, duration_min, current_time, end_of_day, rng, model=model)
+            startime = max(startime, current_time + MIN_TRAVEL_GAP)
+            endtime  = startime + duration_min
+
+            if startime >= end_of_day:
+                startime = end_of_day - duration_min
+                endtime  = end_of_day
+            startime = max(startime, start_of_day)
+            endtime  = max(endtime,  startime + 1.0)
 
         startimes[i]  = round(startime)
         endtimes[i]   = round(endtime)
@@ -1339,7 +1961,7 @@ def build_schedule(
     out['STARTIME']    = startimes.astype(int)
     out['ENDTIME']     = endtimes.astype(int)
     out['time_period'] = periods
-    return out
+    return _attach_schedule_context(out)
 
 
 # ---------------------------------------------------------------------------
@@ -1402,6 +2024,38 @@ def predict_schedule(
         if col not in df.columns:
             df[col] = val
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(val)
+
+    # Origin/job conditionals at predict time (same builder as estimation —
+    # keeps fit/predict columns aligned; safe no-op when sources absent).
+    df = _attach_origin_job_features(df)
+    # Joint-travel flags at predict time (from tagged is_joint /
+    # joint_participants cols when the joint map exists; else zeros).
+    df = _attach_joint_features(df)
+    # Predict-side CDAP equivalents: synth persons carry COORDINATED dap (not
+    # observed), so mirror the estimation cdap_* names from prediction columns.
+    # Keeps fit/predict aligned when models selected cdap_* features.
+    try:
+        if 'cdap_M' not in df.columns and 'dap' in df.columns:
+            _dap = df['dap'].astype(str)
+            df['cdap_M'] = (_dap == 'M').astype(float)
+            df['cdap_N'] = (_dap == 'N').astype(float)
+            df['cdap_H'] = (_dap == 'H').astype(float)
+        if 'is_joint_traveller' not in df.columns and 'is_joint_act' in df.columns:
+            df['is_joint_traveller'] = df['is_joint_act']
+        if 'n_joint_tours_hh' not in df.columns and 'joint_tour_ids' in df.columns:
+            df['n_joint_tours_hh'] = df['joint_tour_ids'].astype(str).ne('').astype(float)
+    except Exception as _cdap_p_e:
+        logger.warning('_attach predict-CDAP mirror skipped (%s)', _cdap_p_e)
+
+    # Rebuild GA-searchable derived features (workstat/studying/age flags,
+    # INDUSTRY/occp, household flags, home-zone acc, taste interactions) so
+    # GA-selected terms resolve here. Without this, _build_X silently drops
+    # missing columns and the whole purpose can collapse to the default period.
+    try:
+        from ga_hypothesis_testing import ensure_prediction_features
+        df = ensure_prediction_features(df, stage_id=4)
+    except Exception as _e:
+        logger.warning('prediction feature enrichment skipped (%s)', _e)
 
     # Reclassify adult edu activities with STUDYING=0 → 3 (post-secondary).
     # Mirrors the same fix in prepare_timing_data and stage5 _dest_tree.
@@ -1483,13 +2137,30 @@ def predict_schedule(
                     _target = _target / _target.sum()
                     proba = (1.0 - _alpha) * proba + _alpha * _target.reshape(1, -1)
                     proba = proba / np.clip(proba.sum(axis=1, keepdims=True), 1e-12, None)
-            idxs  = np.array([rng.choice(model.n_periods_, p=proba[i].astype(np.float64))
-                               for i in range(len(proba))])
+            idxs = np.empty(len(proba), dtype=int)
+            # Vectorized categorical sampling: (cumsum > u).argmax(1)
+            u = rng.random((len(proba), 1))
+            cumsum = np.cumsum(proba, axis=1)
+            idxs = (cumsum > u).argmax(axis=1)
             period_col[mask] = idxs
         except Exception as e:
             logger.warning(f"Stage 4 batch predict failed for '{purpose}': {e}")
 
     df['_period_idx'] = period_col
+    # ── Joint coupling: members of one joint tour travel together, so they
+    # share one period draw (else parent pickup + child drop-off split across
+    # periods). One draw = first member's; safe no-op when untagged.
+    try:
+        if 'joint_tour_id' in df.columns:
+            _jt = df['joint_tour_id'].astype(str)
+            _has_jt = _jt.ne('') & _jt.ne('nan') & _jt.ne('None')
+            if _has_jt.any():
+                _first = df.loc[_has_jt].groupby(_jt[_has_jt])['_period_idx'].transform('first')
+                df.loc[_has_jt, '_period_idx'] = _first.astype(int)
+                logger.info(f"  Joint coupling: shared period for {int(_has_jt.sum()):,} joint rows "
+                            f"({int(_jt[_has_jt].nunique()):,} tours)")
+    except Exception as _jc_e:
+        logger.warning(f"  Joint period coupling skipped ({_jc_e})")
     logger.info(f"  Phase A complete: periods assigned for {n_acts:,} activities")
 
     # ── Phase B: time arithmetic per person ──────────────────────────────
@@ -1561,6 +2232,20 @@ def predict_schedule(
     df['STARTIME']    = startimes.astype(int)
     df['ENDTIME']     = endtimes.astype(int)
     df['time_period'] = period_labels
+    df = _attach_schedule_context(df)
+    # ── Joint time sync: co-travellers share one realised start (group median)
+    # so pickup/drop-off pairs stay feasible together. Safe no-op untagged.
+    try:
+        if 'joint_tour_id' in df.columns:
+            _jt2 = df['joint_tour_id'].astype(str)
+            _m2 = _jt2.ne('') & _jt2.ne('nan') & _jt2.ne('None')
+            if _m2.any():
+                _med = df.loc[_m2].groupby(_jt2[_m2])['STARTIME'].transform('median')
+                _dur = (df.loc[_m2, 'ENDTIME'] - df.loc[_m2, 'STARTIME']).clip(lower=1)
+                df.loc[_m2, 'STARTIME'] = _med.astype(int).values
+                df.loc[_m2, 'ENDTIME'] = (_med.astype(int) + _dur.astype(int)).values
+    except Exception as _js_e:
+        logger.warning(f"  Joint time sync skipped ({_js_e})")
     out = df
     out = out.drop(columns=['_priority'], errors='ignore')
 

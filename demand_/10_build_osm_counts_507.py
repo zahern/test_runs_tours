@@ -1,7 +1,15 @@
 """
 10_build_osm_counts_507.py
-Rebuild OSM POI tag-value counts for all 507 SA2 zones (superset of the
+Rebuild OSM POI tag-value counts for the 371-zone SA2 universe (superset of the
 existing 329-zone Z:\\test_runs_tours\\code\\SEQ_SA2_2016_OSM_counts.csv).
+
+NAMING NOTE: the "507" in this filename, ZONE_LIST_507, CACHE_DIR and the
+output CSV is historical — the new_pop scope was 507 zones when this was
+written, but zone_ids_sa_only_507.txt now lists exactly the 371 modelled SA2s
+(verified identical to saved_data/seq_zone_ids_371.csv, 2026-09). The names are
+kept frozen because data_connect.py, 09_build_landuse_507.py and several jobs
+reference these paths; renaming would churn live pipeline paths for cosmetics.
+Content is 371, whatever the filename says.
 
 No builder script for that legacy file was found in the codebase, so this
 reimplements it from scratch: for each SA2 zone polygon (from the ABS SA2
@@ -12,9 +20,11 @@ a count column per distinct tag VALUE seen (regardless of which key it came
 from) — matching the legacy file's flattened-by-value column convention
 (e.g. 'school', 'cafe', 'residential' are each a single count column).
 
-Network-bound and slow (507 Overpass polygon queries) — results are cached
+Network-bound and slow (371 Overpass polygon queries) — results are cached
 to disk per zone (saved_data/osm_cache_507/<sa2_code>.json) so the script is
-safely resumable/restartable.
+safely resumable/restartable. FAILED queries are never cached (an empty cache
+file once poisoned 4 zones — St Lucia/Springwood/Lawnton/Mullumbimby — into
+all-zero rows that silently dropped out of the CSV).
 
 Output: Z:\\test_runs_tours\\new_pop\\saved_data\\SA2_2016_OSM_counts_507.csv,
 one row per SA2 zone, one column per OSM tag value + SA2_MAIN16 + zone
@@ -92,10 +102,17 @@ def fetch_zone_counts(sa2_code, geom):
     query = _polygon_query(coords, TAG_KEYS)
     data = _overpass_query(query)
 
+    # Never cache a failed response: an empty/failed query cached as [] is
+    # indistinguishable from a genuinely POI-less zone and silently drops the
+    # zone from downstream fills (this poisoned 4 zones pre-2026-09).
+    if data is None:
+        print(f"    SA2 {sa2_code}: query failed after retries — NOT cached, "
+              f"will retry next run")
+        return []
+
     tags_seen = []
-    if data is not None:
-        for el in data.get("elements", []):
-            tags_seen.append(el.get("tags", {}))
+    for el in data.get("elements", []):
+        tags_seen.append(el.get("tags", {}))
 
     with open(cache_path, "w") as f:
         json.dump(tags_seen, f)

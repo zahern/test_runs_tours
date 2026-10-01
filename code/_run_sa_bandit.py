@@ -98,7 +98,7 @@ _TRT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 NEW_POP_DIR = os.environ.get('NEW_POP_DIR') or os.path.join(_TRT, 'new_pop')
 if NEW_POP:
     os.environ.setdefault('PIPELINE_SKIMS_PATH',
-                          os.path.join(_TRT, 'demand_', 'sa2_skims_507_omxspec.omx'))
+                          os.path.join(_TRT, 'demand_', 'skims_371.omx'))
 
 # ─────────────────────────────── ENV SETUP ───────────────────────────────────
 # All env-vars MUST be set before any pipeline or JAX import.

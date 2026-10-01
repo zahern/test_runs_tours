@@ -4,7 +4,8 @@
 #PBS -l select=1:ncpus=4:mem=64GB
 #PBS -j oe
 #PBS -m abe
-#PBS -r y
+#PBS -r n
+# No-restarts policy: single-run GA; do not auto-rerun.
 
 # ── Cluster paths ───────────────────────────────────────────────────────────
 SCRIPT_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template
@@ -69,11 +70,18 @@ print(f'Prepared {len(dfg)} segments')
 " 2>&1
 fi
 
-# Run the main analysis (with resume support via checkpoints)
+# Run the main analysis (single-run GA, no restarts; checkpoints only skip
+# search -- best models are always refit + rewritten by the python driver)
 python -u nearmiss_hb_analysis.py \
     --data    "$SCRIPT_DIR/near_miss_hb_ecf.csv" \
     --out-dir "$SCRIPT_DIR"
 EXIT_CODE=$?
+
+# Best-model gate: the paper's reported best models must always be produced.
+for f in "$SCRIPT_DIR/hb_de_best_nm.tex" "$SCRIPT_DIR/hb_de_best_crash.tex" \
+         "$SCRIPT_DIR/hb_de_convergence_nm.png" "$SCRIPT_DIR/hb_de_convergence_crash.png"; do
+  if [ ! -f "$f" ]; then echo "MISSING best-model output: $f"; EXIT_CODE=1; fi
+done
 
 # Archive results
 ARCHIVE_DIR="$RESULTS_DIR/$(date +%Y%m%d_%H%M%S)_${PBS_JOBID}"

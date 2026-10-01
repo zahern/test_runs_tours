@@ -1,0 +1,123 @@
+#!/bin/bash -l
+#PBS -N suncorp_segtime_seg
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=4:mem=96GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+set -euo pipefail
+
+# Variant of 61_segment_time_mip.pbs for the segment-grouped test:
+#   --group-by segment  -> each road_osmid gets its own persistent propensity
+#                         (compound-symmetry serial correlation substitute)
+# Outputs are isolated under results_seg/ + figures_seg/ so this job can run
+# side-by-side with the highway-grouped 61 job without clobbering it.
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results_seg
+FIG_DIR=$PROJ_DIR/figures_seg
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export JAX_PLATFORMS=cpu
+
+cd "$SCRIPT_DIR"
+mkdir -p "$RESULTS_DIR" "$FIG_DIR"
+
+python -m pip install --upgrade metacountregressor
+python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,165), v"
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "61b: segment-grouped search -> segment midpoint MIP (isolated outputs)"
+echo "=================================================================="
+
+[ -s "$PROJ_DIR/results/segment_15min_panel.parquet" ] \
+  || { echo "FATAL: missing segment_15min_panel.parquet; run 58 first"; exit 1; }
+[ -s "$DATA_DIR/fixture_calendar.csv" ] \
+  || { echo "FATAL: missing fixture_calendar.csv"; exit 1; }
+[ -s "$DATA_DIR/osm_roads_suncorp.geojson" ] \
+  || { echo "FATAL: missing osm_roads_suncorp.geojson"; exit 1; }
+
+SEARCH_ARGS=(
+  --search-iters 40 --search-chunk 20 --chunk-time 7200
+  --wall-budget 20000 --n-starts 1
+  --search-R 25 --refit-R 100 --search-vars slim
+  --target trips_mean_gt_10 --group-by segment
+  --out-dir "$RESULTS_DIR" --fig-dir "$FIG_DIR"
+)
+# Fresh search in the isolated dir (SEARCH_GEN=3 checkpoint lives in results/;
+# sharing it across group-by modes would mix highway/segment warm starts).
+[ -s "$RESULTS_DIR/game_day_search_best.json" ] && SEARCH_ARGS+=(--resume)
+
+echo "[61b/1] searching (segment-grouped) + predicting future games..."
+python -u 59_game_day_search_predict.py "${SEARCH_ARGS[@]}" 2>&1
+
+for f in game_day_pred_15min.parquet game_day_holdout_metrics.json \
+         game_day_search_best.json; do
+  [ -s "$RESULTS_DIR/$f" ] || { echo "FATAL: missing search output $f"; exit 1; }
+done
+
+# Quality-before-MIP gate (same rule as 61; paths point at the isolated dir).
+python - "$RESULTS_DIR/game_day_search_best.json" "$RESULTS_DIR/game_day_holdout_metrics.json" <<'EOF'
+import json, os, sys
+d = json.load(open(sys.argv[1]))
+done, total = int(d.get("iters_completed", 0)), int(d.get("iters", 0))
+converged = total > 0 and done >= total
+ok_quality = False
+try:
+    m = json.load(open(sys.argv[2]))["metrics"]
+    slope = float(m.get("calibration_slope", float("nan")))
+    top20 = float(m.get("segment_top20", 0.0) or 0.0)
+    rmse = float(m.get("rmse", float("inf")))
+    ok_quality = (0.2 <= slope <= 5.0) and (top20 >= 0.05) and (rmse < 10.0)
+    print(f"holdout quality: slope={slope:.3f} top20={top20:.3f} rmse={rmse:.3f}")
+except Exception as exc:
+    print(f"WARN: no readable holdout metrics ({exc})")
+print(f"search: {done}/{total} converged={converged}")
+if converged or ok_quality:
+    print("GATE PASS: solving MIP" + (" (on partial search, quality-verified)" if not converged else ""))
+elif os.environ.get("REQUIRE_CONVERGED") == "1":
+    print(f"FATAL: REQUIRE_CONVERGED=1 and search partial ({done}/{total})")
+    sys.exit(1)
+else:
+    print(f"FATAL: search partial ({done}/{total}) AND predictions unusable; refusing MIP. Resubmit 61b to resume.")
+    sys.exit(1)
+EOF
+[ $? -ne 0 ] && exit 1
+
+echo "[61b/2] solving time-indexed segment-midpoint MIP..."
+python -u 60_game_day_mip.py \
+  --pred "$RESULTS_DIR/game_day_pred_15min.parquet" \
+  --out-dir "$RESULTS_DIR" --fig-dir "$FIG_DIR" \
+  --min-marg 0.5 --max-segments 250 \
+  --travel-speed-kmh 43.2 --detour-factor 1.3 \
+  --setup-min 5 --max-travel-m 4000 --obs-m 100 2>&1
+
+for f in game_day_mip_sites.csv game_day_mip_plans.csv \
+         game_day_mip_schedule.csv game_day_mip_summary.json \
+         game_day_mip.tex; do
+  [ -s "$RESULTS_DIR/$f" ] || { echo "FATAL: missing MIP output $f"; exit 1; }
+done
+
+for f in game_day_search_convergence.png game_day_calibration.png \
+         game_day_surfaces.png game_day_coefs.png \
+         game_day_mip_map.png game_day_mip_schedules.png \
+         game_day_mip_coverage.png game_day_mip_summary.png; do
+  [ -s "$FIG_DIR/$f" ] || echo "WARN: missing figure $f"
+done
+
+echo "=================================================================="
+echo "61b OK: segment-grouped predictions and MIP (results_seg/)"
+echo "Job finished at $(date)"
+echo "=================================================================="

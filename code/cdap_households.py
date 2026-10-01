@@ -142,6 +142,16 @@ class HouseholdCdapConfig:
     interaction5: dict = field(default_factory=lambda: {
         ('AAAAA', 'N'): 0.03, ('AAAAC', 'N'): 0.03,
     })
+    # ── Per-household-size tables for the DRAW STAGE ──────────────────────
+    # Populated by cdap_households_estimation when CDAP_HH_JOINT_PER_SIZE=1:
+    #   {size: {'interaction': …, 'interaction3': …,
+    #           'interaction4': …, 'interaction5': …}}
+    # Each entry holds that size's DEDICATED estimated model (which perturbed
+    # only the terms structurally appropriate at that size). During the joint
+    # draw, a household whose size has an entry co-determines its members'
+    # patterns from ITS OWN tables; sizes without an entry fall back to the
+    # shared tables above (estimated-shared or heuristic priors).
+    per_size_tables: dict = field(default_factory=dict)
     # Joint-tour frequency: base Poisson rate + per-feature increments.
     joint_base_rate: float = 0.25
     joint_rate_per_child: float = 0.20
@@ -218,11 +228,14 @@ def _pair_class(is_child_i: bool, is_child_j: bool) -> str:
 
 
 def _interaction_util(cfg: 'HouseholdCdapConfig', cls: str,
-                      d_i: str, d_j: str) -> float:
-    """Symmetric 2-way interaction lookup (pattern order doesn't matter)."""
+                      d_i: str, d_j: str, tbl=None) -> float:
+    """Symmetric 2-way interaction lookup (pattern order doesn't matter).
+    `tbl` overrides the shared table — used by the draw stage when the
+    household's size has dedicated estimated tables."""
+    src = tbl if tbl is not None else cfg.interaction
     a, b = sorted((d_i, d_j))
-    return float(cfg.interaction.get((cls, a, b),
-                 cfg.interaction.get((cls, b, a), 0.0)))
+    return float(src.get((cls, a, b),
+                 src.get((cls, b, a), 0.0)))
 
 
 def _group_class(is_child_subset) -> str:
@@ -233,9 +246,13 @@ def _group_class(is_child_subset) -> str:
     return 'A' * (k - c) + 'C' * c
 
 
-def _higher_order_util(cfg: 'HouseholdCdapConfig', k: int, gcls: str, d: str) -> float:
+def _higher_order_util(cfg: 'HouseholdCdapConfig', k: int, gcls: str, d: str,
+                       tbls=None) -> float:
     """k-way (k=3,4,5) interaction coefficient for a subset of k members that all
-    take pattern `d`, keyed by (group_class, pattern). 0 if the table/key absent."""
+    take pattern `d`, keyed by (group_class, pattern). `tbls` optionally maps
+    k → per-size table override from the draw stage. 0 if absent."""
+    if tbls and tbls.get(k):
+        return float(tbls[k].get((gcls, d), 0.0))
     tbl = getattr(cfg, f'interaction{k}', None)
     return float(tbl.get((gcls, d), 0.0)) if tbl else 0.0
 
@@ -260,26 +277,36 @@ def _person_dap_utilities(row, cfg: 'HouseholdCdapConfig', n_workers: int) -> di
 
 
 def _joint_cdap_draw(members: list, cfg: 'HouseholdCdapConfig',
-                     rng: np.random.Generator) -> dict:
+                     rng: np.random.Generator,
+                     tables: Optional[dict] = None) -> dict:
     """Draw a coordinated pattern for a set of household members via the joint
     logit over the Cartesian product of their {M,N,H} patterns:
 
         U(combo) = Σ_i u_i(d_i) + Σ_{i<j} interaction(class_ij, d_i, d_j)
+                 + higher-order all-same-pattern terms
 
-    `members` is a list of (key, util_dict, is_child). Returns {key: pattern}.
+    `members` is a list of (key, util_dict, is_child). `tables`, when given,
+    is this household size's DEDICATED estimated table set (from
+    HouseholdCdapConfig.per_size_tables) and takes precedence over the shared
+    config tables. Returns {key: pattern}.
     """
     import itertools
+    tables = tables or {}
+    t2 = tables.get('interaction')
+    ths = {kk: tables.get(f'interaction{kk}') for kk in (3, 4, 5)}
     n = len(members)
     keys      = [m[0] for m in members]
     utils     = [m[1] for m in members]
     children  = [m[2] for m in members]
     combos    = list(itertools.product(DAP_CLASSES, repeat=n))
     # Precompute the k-member subsets (k=3..5) that carry a non-empty
-    # higher-order table, with each subset's composition class, so the per-combo
-    # loop only does same-pattern lookups.
+    # higher-order table (shared OR this household's dedicated tables), with
+    # each subset's composition class, so the per-combo loop only does
+    # same-pattern lookups.
     ho_subsets = []   # (subset_tuple, group_class, k)
     for k in (3, 4, 5):
-        if k <= n and getattr(cfg, f'interaction{k}', None):
+        if k <= n and ((ths.get(k) is not None and len(ths[k]) > 0)
+                       or getattr(cfg, f'interaction{k}', None)):
             for sub in itertools.combinations(range(n), k):
                 ho_subsets.append((sub, _group_class([children[i] for i in sub]), k))
     logits    = np.empty(len(combos), dtype=float)
@@ -290,12 +317,12 @@ def _joint_cdap_draw(members: list, cfg: 'HouseholdCdapConfig',
         for i in range(n):
             for j in range(i + 1, n):
                 s += _interaction_util(cfg, _pair_class(children[i], children[j]),
-                                       combo[i], combo[j])
+                                       combo[i], combo[j], tbl=t2)
         # higher-order: any subset whose members ALL share one pattern
         for sub, gcls, k in ho_subsets:
             d0 = combo[sub[0]]
             if all(combo[i] == d0 for i in sub[1:]):
-                s += _higher_order_util(cfg, k, gcls, d0)
+                s += _higher_order_util(cfg, k, gcls, d0, tbls=ths)
         logits[c] = s
     logits -= logits.max()
     p = np.exp(logits)
@@ -344,8 +371,13 @@ def coordinate_household_cdap(persons: pd.DataFrame,
                        key=lambda k: (members[k][2],  # adults (False) first
                                       str(grp.at[members[k][0], cfg.person_id_col])))
         cap = max(1, int(cfg.n_cdap_persons))
+        # Draw stage: households use their OWN size's estimated tables when
+        # CDAP_HH_JOINT_PER_SIZE populated per_size_tables; bucketing matches
+        # the estimation (min(actual size, cap)).
+        bucket = min(len(members), cap)
+        hh_tables = dict(cfg.per_size_tables.get(bucket) or {})
         core = [members[k] for k in order[:cap]]
-        drawn = _joint_cdap_draw(core, cfg, hh_rng)
+        drawn = _joint_cdap_draw(core, cfg, hh_rng, tables=hh_tables)
         for k in order[cap:]:
             idx, util, child = members[k]
             # condition on the already-drawn members via their interaction terms
@@ -354,7 +386,8 @@ def coordinate_household_cdap(persons: pd.DataFrame,
                 dchild = bool(is_child.loc[dkey])
                 cls = _pair_class(child, dchild)
                 for d in DAP_CLASSES:
-                    cond[d] += _interaction_util(cfg, cls, d, dval)
+                    cond[d] += _interaction_util(cfg, cls, d, dval,
+                                                 tbl=hh_tables.get('interaction'))
             drawn[idx] = _softmax_choice(cond, hh_rng)
         for idx, pattern in drawn.items():
             daps[df.index.get_loc(idx)] = pattern

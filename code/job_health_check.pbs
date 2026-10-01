@@ -1,0 +1,55 @@
+#!/bin/bash -l
+#PBS -N health_check
+#PBS -l select=1:ncpus=2:mem=32gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+#
+# Pipeline health check: exercises every subsystem fixed this cycle and
+# reports detailed caveats for anything not working.
+#
+#   qsub job_health_check.pbs
+#   qsub -v HEALTH_RUN_FITS=0 job_health_check.pbs        # static checks only (fast)
+#   qsub -v HEALTH_N_TOURS=800,HEALTH_N_DRAWS=100 job_health_check.pbs
+#
+# Exit code 0 = no FAILs (SKIPs allowed). Read the .o log top-to-bottom;
+# every non-PASS line carries '!' caveat lines explaining cause + fix.
+set -uo pipefail
+
+CODE=/mnt/hpccs01/home/ahernz/test_runs_tours/code
+SCRATCH=$(mktemp -d /tmp/health_check.XXXXXX)
+cd "$SCRATCH"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export JAX_PLATFORMS=cpu
+export JAX_ENABLE_X64=1
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
+# tuning knobs (override with qsub -v)
+export HEALTH_RUN_FITS="${HEALTH_RUN_FITS:-1}"
+export HEALTH_N_TOURS="${HEALTH_N_TOURS:-400}"
+export HEALTH_N_DRAWS="${HEALTH_N_DRAWS:-60}"
+export HEALTH_OUT="$SCRATCH/health_report.json"
+# write-isolation: nothing may land in the production code/data tree
+export PYTHONPYCACHEPREFIX="$SCRATCH/pycache"
+export TMPDIR="$SCRATCH/tmp"
+export XDG_CACHE_HOME="$SCRATCH/cache"
+export MPLCONFIGDIR="$SCRATCH/mpl"
+mkdir -p "$PYTHONPYCACHEPREFIX" "$TMPDIR" "$XDG_CACHE_HOME" "$MPLCONFIGDIR"
+
+echo "=== health_check started $(date) ==="
+echo "isolation: cwd + all caches under $SCRATCH ; code/data tree read-only"
+echo "knobs: RUN_FITS=$HEALTH_RUN_FITS N_TOURS=$HEALTH_N_TOURS N_DRAWS=$HEALTH_N_DRAWS"
+python -u "$CODE/test_pipeline_health.py"
+_ec=$?
+echo "=== health_check finished $(date) exit=$_ec ==="
+if [ -f "$SCRATCH/health_report.json" ]; then
+  echo "--- JSON report (also in .o log above) ---"
+  python -c "import json;d=json.load(open('$SCRATCH/health_report.json'));print(json.dumps(d['counts']))"
+fi
+rm -rf "$SCRATCH"
+exit $_ec

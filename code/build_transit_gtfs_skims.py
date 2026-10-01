@@ -2,7 +2,7 @@
 """
 Build zone-to-zone transit travel-time matrices from TransLink GTFS
 (r5py 1.1.7 API) and write them into the SA2 371-zone OMX that the model
-actually consumes (../demand_/sa2_skims_507_omxspec.omx).
+actually consumes (../demand_/skims_371.omx).
 
 The GA predict chain reads its transit LOS from:
     WLK_LOC_WLK_TOTIVT__AM   (od travel time, minutes)   — main c_ivt_transit var
@@ -28,7 +28,7 @@ Usage:
     python build_transit_gtfs_skims.py
 
 Env:
-    OMX_PATH       target OMX (default ../demand_/sa2_skims_507_omxspec.omx)
+    OMX_PATH       target OMX (default ../demand_/skims_371.omx)
     DEPARTURE_HOUR AM-peak departure hour (default 8)
     JVM_MEMORY     Java heap for r5py (default 12G)
     ORIGIN_STEP    if set >1, compute the TravelTimeMatrix on a strided origin
@@ -46,7 +46,7 @@ log = logging.getLogger(__name__)
 OMX_PATH = os.environ.get(
     "OMX_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                 "..", "demand_", "sa2_skims_507_omxspec.omx"),
+                 "..", "demand_", "skims_371.omx"),
 )
 CENTROIDS_PATH = os.environ.get(
     "CENTROIDS_PATH",

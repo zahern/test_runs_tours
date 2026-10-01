@@ -1,0 +1,173 @@
+#!/bin/bash -l
+#PBS -N t3hazard
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=4:mem=96GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# T3 — hazard (offset) vs free exposure coefficient, on REAL data.
+#
+# The first genuinely scientific comparison in this series. Two runs with
+# identical search settings, differing only in --exposure, plus the nested
+# LRT from each. The question:
+#
+#   Is the projected flow channel (seg_flow * bin_factor * uplift)
+#   correctly specified?
+#
+# Pinning the exposure coefficient at 1 is a one-parameter RESTRICTION of
+# estimating it, so the two are nested and the LRT is valid (1 df, 95%
+# crit 3.84). Interpretation:
+#
+#   * chi2 <= 3.84 and free coef near 1
+#       -> flow projection is trustworthy; the hazard form costs nothing
+#          and is the more defensible specification.
+#   * chi2 > 3.84, or free coef far from 1
+#       -> the flow projection is misspecified, and a FREE coefficient has
+#          been silently absorbing that error. That is the real argument
+#          for pinning it: not a different model, but one that stops hiding
+#          flow-projection error.
+#
+# GATED on T2 (26056836) passing its log assertions.
+# Cost: ~2 full searches. Deliberate, not a default.
+set -u
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+OUT_FREE=$PROJ_DIR/results_tests/t3_free
+OUT_HAZ=$PROJ_DIR/results_tests/t3_hazard
+FIG=$PROJ_DIR/figures_tests/t3
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export JAX_PLATFORMS=cpu
+export PYTHONIOENCODING=utf-8
+
+cd "$SCRIPT_DIR"
+mkdir -p "$OUT_FREE" "$OUT_HAZ" "$FIG"
+
+# Same search budget for both arms so the BICs are comparable at all.
+# SEARCH_GEN is 7 and checkpoints are per-out-dir, so neither arm resumes
+# the other's search: this is a clean paired comparison from zero.
+SEARCH_ARGS=(
+  --search-iters 40 --search-chunk 20 --chunk-time 7200
+  --wall-budget 20000 --n-starts 1
+  --search-R 25 --refit-R 100 --search-vars slim
+  --target trips_mean_gt_10 --group-by segment
+  --temporal-refit ar1
+)
+
+echo "=================================================================="
+echo "T3 hazard-vs-free exposure test started on $(hostname) at $(date)"
+echo "=================================================================="
+echo "package: $(python -c 'from importlib.metadata import version; print(version("metacountregressor"))')"
+echo
+
+FAILED=0
+
+# ---------------------------------------------------------------- arm A
+echo "### ARM A: free exposure coefficient ###"
+rm -rf "$OUT_FREE"; mkdir -p "$OUT_FREE"
+python -u 59_game_day_search_predict.py \
+  "${SEARCH_ARGS[@]}" \
+  --out-dir "$OUT_FREE" --fig-dir "$FIG" \
+  --exposure free --exposure-lrt on \
+  2>&1
+RC_A=$?
+echo "ARM A exit: $RC_A"
+echo
+
+# ---------------------------------------------------------------- arm B
+echo "### ARM B: hazard / offset exposure (coefficient pinned at 1) ###"
+rm -rf "$OUT_HAZ"; mkdir -p "$OUT_HAZ"
+python -u 59_game_day_search_predict.py \
+  "${SEARCH_ARGS[@]}" \
+  --out-dir "$OUT_HAZ" --fig-dir "$FIG" \
+  --exposure offset --exposure-lrt on \
+  2>&1
+RC_B=$?
+echo "ARM B exit: $RC_B"
+echo
+
+echo "=================================================================="
+echo "T3 COMPARISON"
+echo "=================================================================="
+python - "$OUT_FREE" "$OUT_HAZ" <<'PY'
+import json, sys, os
+free, haz = sys.argv[1], sys.argv[2]
+
+
+def load(d, name):
+    p = os.path.join(d, name)
+    if not os.path.exists(p):
+        return None
+    try:
+        return json.load(open(p))
+    except Exception:
+        return None
+
+
+ok = True
+for tag, d in (("FREE", free), ("HAZARD", haz)):
+    m = load(d, "game_day_holdout_metrics.json")
+    if not m:
+        print(f"{tag}: no holdout metrics (job failed?)")
+        ok = False
+        continue
+    a = m.get("audit", {})
+    lrt = a.get("exposure_lrt", {}) or {}
+    r = a.get("refit", {}) or {}
+    met = m.get("metrics", {})
+    print(f"--- {tag} ---")
+    print(f"  exposure_mode   : {r.get('exposure_mode')}")
+    print(f"  exposure_coef   : {r.get('exposure_coef')}")
+    print(f"  refit model     : {r.get('refit_model')}")
+    print(f"  alpha           : {r.get('alpha')}")
+    print(f"  BIC             : {r.get('bic')}")
+    print(f"  LRT chi2(1)     : {lrt.get('lr_stat')} (crit 3.84)")
+    print(f"  LRT verdict     : {lrt.get('verdict')}")
+    print(f"  holdout top20   : {met.get('segment_top20')}")
+    print(f"  holdout slope   : {met.get('calibration_slope')}")
+    print(f"  holdout rmse    : {met.get('rmse')}")
+    print()
+
+# cross-arm read
+mf = load(free, "game_day_holdout_metrics.json")
+mh = load(haz, "game_day_holdout_metrics.json")
+if mf and mh:
+    af = (mf.get("audit", {}).get("exposure_lrt") or {})
+    print("=== verdict ===")
+    print(f"  free-coef LRT chi2(1) = {af.get('lr_stat')}")
+    print(f"  free exposure coef    = {af.get('free_exposure_coef')}")
+    tf = af.get("verdict", "?")
+    print(f"  {tf}")
+    if af.get("lr_stat") is not None and float(af["lr_stat"]) <= 3.84:
+        print("  -> exposure channel consistent with the count model; the")
+        print("     hazard parameterisation is a defensible default.")
+    elif af.get("lr_stat") is not None:
+        print("  -> exposure channel is MISSPECIFIED. A free coefficient was")
+        print("     absorbing the error; pin it and fix the flow projection.")
+    else:
+        ok = False
+        print("  -> LRT missing; treat as INCONCLUSIVE")
+
+print("COMPARISON_COMPLETE")
+PY
+CMP_RC=$?
+
+echo
+echo "=================================================================="
+echo "T3 arm exits: A=$RC_A B=$RC_B  comparison=$CMP_RC"
+echo "finished at $(date)"
+echo "=================================================================="
+if [ "$RC_A" -ne 0 ] || [ "$RC_B" -ne 0 ] || [ "$CMP_RC" -ne 0 ]; then
+  FAILED=1
+fi
+exit $FAILED

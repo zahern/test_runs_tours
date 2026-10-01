@@ -1,0 +1,89 @@
+#!/bin/bash -l
+#PBS -N suncorp_speedtime_refit
+#PBS -l walltime=06:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ======================================================================
+# REFIT JOB: speeding-only Fig5, no zero-inflation (analyst constraint:
+# zeros are at-risk sampling zeros since all rows have trips > 0, not
+# structural "safe states", so ZI/hurdle mixing weights are inadmissible).
+#
+# Why: 12_speeding_timewise_fix.pbs ran green but its NB random-parameters
+# SPFs collapsed (alpha 0.001-0.079, mean EB weight ~1.0) and underpredicted
+# observed speeding 3-5x per stratum. Those EB totals must not enter the paper.
+#
+# Runs: scripts/43_speeding_timewise_refit.py
+#   per-stratum fixed-effects NB (full -> lean -> base, statsmodels, same
+#   estimator as the convergent screening speeding SPF in script 41),
+#   each accepted only if converged + 0<alpha<=100 + fitted total within
+#   10% of observed; else Poisson-GLM lean + Pearson moment alpha (totals
+#   match by construction). Aborts unless every stratum EB total is within
+#   5% of observed. Hourly line broken at unobserved-hour gaps.
+#
+# Paper inputs out: results/speeding_timewise_refit.tex,
+#   figures/speeding_timewise_refit_phase_curve.png,
+#   figures/speeding_timewise_refit_hourly.png
+# Submit: cd $PROJ_DIR && qsub 14_speeding_timewise_refit.pbs
+# ======================================================================
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
+cd "$SCRIPT_DIR"
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "=================================================================="
+
+for f in "$DATA_DIR/segment_roads_part0_5000.csv.gz" \
+         "$DATA_DIR/road_geometry_features.csv"; do
+  if [ ! -s "$f" ]; then echo "FATAL: missing input $f"; exit 1; fi
+done
+echo "Inputs OK."
+
+python -u 43_speeding_timewise_refit.py 2>&1
+EXIT_CODE=$?
+if [ $EXIT_CODE -ne 0 ]; then echo "FATAL: refit script failed (exit=$EXIT_CODE)"; exit 1; fi
+
+python - "$RESULTS_DIR/speeding_timewise_refit_audit.json" <<'EOF'
+import json, os
+base = "/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics"
+a = json.load(open(f"{base}/results/speeding_timewise_refit_audit.json"))
+assert a["total_speeding"] > 0, "no speeding counts modelled"
+assert "no_zero_inflation" in a, "ZI-free constraint not recorded"
+n_fb = 0
+for k in ["Event/pre", "Event/during", "Event/post",
+          "Control/pre", "Control/during", "Control/post"]:
+    s = a[k]
+    assert abs(s["eb"] - s["obs"]) / max(s["obs"], 1) < 0.05, f"EB off in {k}"
+    assert abs(s["exp"] - s["obs"]) / max(s["obs"], 1) < 0.10, f"mean fidelity off in {k}"
+    assert 0 < s["alpha"] <= 100, f"degenerate alpha in {k}"
+    n_fb += bool(s["fallback"])
+for f in ["results/speeding_timewise_refit.tex",
+          "figures/speeding_timewise_refit_phase_curve.png",
+          "figures/speeding_timewise_refit_hourly.png"]:
+    assert os.path.getsize(f"{base}/{f}") > 0, f"missing {f}"
+print(f"OK: speeding={a['total_speeding']:.0f} fallbacks={n_fb}/6 "
+      f"unobserved_hours={a['unobserved_hours']}")
+EOF
+EXIT_CODE=$?
+
+echo "=================================================================="
+echo "Job finished at $(date) - exit_code=$EXIT_CODE"
+echo "=================================================================="
+exit $EXIT_CODE

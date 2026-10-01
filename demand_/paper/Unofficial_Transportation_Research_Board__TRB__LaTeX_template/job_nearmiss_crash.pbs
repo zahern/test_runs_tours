@@ -4,7 +4,9 @@
 #PBS -l select=1:ncpus=4:mem=32GB
 #PBS -j oe
 #PBS -m abe
-#PBS -r y
+#PBS -r n
+# No-restarts policy: single-run GA; do not auto-rerun (a rerun would duplicate
+# a seeded single trajectory and confuse convergence reporting).
 
 # ============================================================================
 # Near-Miss / Crash Proxy Analysis -- full paper pipeline

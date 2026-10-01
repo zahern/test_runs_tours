@@ -1,0 +1,87 @@
+#!/bin/bash -l
+# =============================================================================
+# Build the POLARIS-style Location table from OVERTURE MAPS Places (cleaner /
+# better-categorised than raw OSM). Output: saved_data/location_table.csv
+# (same schema as job_location_table.pbs → micro_location_placement.py consumes it).
+#
+# ⚠ Overture is cloud-hosted (S3 GeoParquet). Two modes:
+#   ONLINE  — needs internet egress on the compute node (DuckDB → Overture S3).
+#   OFFLINE — pre-download once on a node/login-host WITH egress:
+#       overturemaps download --bbox=152.0,-28.4,153.6,-26.5 \
+#           --type=place -f geoparquet -o saved_data/overture_places_seq.parquet
+#     then submit with OFFLINE:  qsub -v OVERTURE_PLACES=saved_data/overture_places_seq.parquet job_location_table_overture.pbs
+#
+# Submit (online):   qsub job_location_table_overture.pbs
+# Submit (offline):  qsub -v "OVERTURE_PLACES=saved_data/overture_places_seq.parquet" job_location_table_overture.pbs
+# =============================================================================
+#PBS -N location_table_ovm
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=4:mem=48GB
+#PBS -l walltime=04:00:00
+
+set -euo pipefail
+
+CONDA_ENV=${CONDA_ENV:-geotfenv}
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+# ── Keep metacountregressor current from PyPI ────────────────────────────
+# ALWAYS attempts the upgrade on every job (no skip): the location table
+# feeds the occupancy/size-term pipeline, so a stale wheel here silently
+# diverges from GA/predict. Serialized with flock; a failed upgrade
+# (offline?) is non-fatal — the job continues with whatever is installed.
+# ESTIMATOR_SOURCE=editable uses a local dev tree instead of PyPI.
+if [ "${ESTIMATOR_SOURCE:-pypi}" != "editable" ]; then
+    echo "[pkg] Ensuring pinned metacountregressor==1.0.159 (with constraints)..."
+    (
+        flock -w 900 9 2>/dev/null || echo "[pkg] (flock unavailable, proceeding without lock)"
+        pip install --upgrade -q --retries 1 --timeout 20 -c "${PBS_O_WORKDIR:-.}/constraints.txt" "metacountregressor==1.0.159" \
+            && echo "[pkg] metacountregressor pinned version ensured" \
+            || echo "[pkg] WARNING: metacountregressor upgrade failed (offline?) — using whatever is installed"
+    ) 9>"${PBS_O_WORKDIR:-.}/.pkg_upgrade.lock"
+    pip show metacountregressor 2>/dev/null | awk '/^Version:/{print "[pkg] metacountregressor " $0}'
+fi
+
+echo "=== Verify duckdb (+ spatial/httpfs) ==="
+python - <<'PY'
+import duckdb
+c = duckdb.connect()
+try:
+    c.execute("INSTALL spatial; LOAD spatial;")
+    print("duckdb", duckdb.__version__, "spatial OK")
+except Exception as e:
+    print("duckdb spatial load failed:", e)
+    print("  install:  conda activate geotfenv && pip install duckdb")
+PY
+
+echo "=== Build location table from Overture ==="
+python -u build_location_table_overture.py
+
+echo "=== Verify output ==="
+python - <<'PY'
+import pandas as pd, os
+p = os.environ.get('LOCATION_OUT', 'saved_data/location_table.csv')
+d = pd.read_csv(p)
+print(f"location_table.csv: {len(d):,} locations, {d['zone'].nunique()} zones")
+print("land_use mix:", d['land_use'].value_counts().to_dict())
+assert {'location','zone','x','y','land_use','lu_area','avg_parking_cost','tod_distance',
+        'is_home','is_work','is_school','is_discretionary'} <= set(d.columns)
+# New-schema columns (unlock jobs/education/medical numbers downstream):
+# poi_category feeds the amenity counts (n_doctors_clinics/n_schools/...);
+# est_persons/person_kind feeds est_workers/est_students per zone.
+assert {'poi_category','est_persons','person_kind'} <= set(d.columns), \
+    "new-schema columns missing — amenity + occupancy pipeline stays dark"
+print(f"is_work={int(d['is_work'].sum()):,} is_school={int(d['is_school'].sum()):,}")
+print("est_persons by kind:", d.groupby('person_kind')['est_persons'].sum().to_dict())
+print("OK")
+PY
+
+echo "Done. Output: saved_data/location_table.csv"

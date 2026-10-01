@@ -1,0 +1,50 @@
+#!/bin/bash -l
+# =====================================================================
+# job_diag_stage5_nan.pbs — dependency-light stage-5 NaN diagnostic.
+#
+# Runs diag_stage5_nan.py on the REAL inputs (skims_371.omx, crash source,
+# landuse, tours) and reports where the 93.8% NaN utilities in the stage-5
+# destination warm-start come from. No estimation, no JAX/Larch import —
+# finishes in minutes on 1 CPU.
+#
+# Submit from the code dir:
+#   qsub job_diag_stage5_nan.pbs
+# Override skims:
+#   qsub -v PIPELINE_SKIMS_PATH=../demand_/skims_371.omx job_diag_stage5_nan.pbs
+# =====================================================================
+#PBS -N diag_s5_nan
+#PBS -l select=1:ncpus=1:mem=16GB
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -m n
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+export PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORMS=cpu
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+echo "=========================================="
+echo "Stage-5 NaN diagnostic"
+echo "PBS job : ${PBS_JOBID:-unknown}"
+echo "Skims   : ${PIPELINE_SKIMS_PATH}"
+echo "Started : $(date)"
+echo "=========================================="
+
+python -u diag_stage5_nan.py --out "diag_stage5_nan_${PBS_JOBID:-local}.txt"
+EXIT_CODE=$?
+
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+exit "${EXIT_CODE}"

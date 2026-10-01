@@ -11,11 +11,12 @@ overwrite Stage 5's correctly-estimated modes.
 
 Stage 6 now does three things:
 
-  1. VALIDATION — check the trip chain for impossible records and fix them:
-       - Schedule gaps (time between activity ENDTIME and next trip STARTIME)
-       - Overnight trips (ENDTIME > 1439 / midnight)
-       - Zero or negative travel times
-       - Invalid zones (OTAZ or DTAZ = 0 or 330)
+   1. VALIDATION — check the trip chain for impossible records and fix them:
+        - Schedule gaps (time between activity ENDTIME and next trip STARTIME)
+        - Overnight trips (ENDTIME > 1439 / midnight)
+        - Zero or negative travel times
+        - Invalid zones (OTAZ or DTAZ = 0, 999 fringe/external, or outside 1-371.
+          NOTE: ORDER 330 is a REAL zone in the 371 system, never a catch-all)
        - Mode-distance mismatches (Walk for 50km, Bike for 80km)
        - Duplicate rows per person
 
@@ -130,8 +131,10 @@ def validate_and_fix(plan: pd.DataFrame,
     - Negative or zero travtime → replaced with mode-default (10 min)
     - ENDTIME > 1439 → clipped to 1439 (midnight)
     - STARTIME < 240 → warn (pre-4am trips are unusual but not removed)
-    - OTAZ or DTAZ == 0 → flag; set DTAZ = OTAZ (intra-zonal fallback)
-    - OTAZ or DTAZ == 330 → the catch-all zone; warn
+     - OTAZ or DTAZ == 0 → flag; set DTAZ = OTAZ (intra-zonal fallback)
+     - OTAZ or DTAZ == 999 → fringe/external sentinel; warn (kept, excluded
+       from valid-zone metrics). Values outside 1-371 (other than 999) → flag.
+       ORDER 330 is a real 371-system zone and is NEVER treated as catch-all
     - Schedule gap between activity ENDTIME and next trip STARTIME →
       adjust next trip's STARTIME to close the gap
     - Mode-distance mismatch → downgrade to DA if walk/bike distance
@@ -190,11 +193,14 @@ def validate_and_fix(plan: pd.DataFrame,
                 if other in df.columns:
                     df.loc[zero_mask, col] = df.loc[zero_mask, other]
 
-            z330 = df[col] == 330
-            if z330.any():
-                _flag(z330, f'{col}=330_catchall')
+            # 371-only: 999 = fringe/external sentinel; out-of-range (excl. 999)
+            # is invalid. ORDER 330 is a real zone — never flagged.
+            zext = (df[col] == 999) | (~df[col].between(1, N_VALID_ZONES, inclusive='both'))
+            if zext.any():
+                _flag(zext, f'{col}=external_or_out_of_range')
                 if verbose:
-                    print(f"  WARNING: {z330.sum()} rows use catch-all zone 330 for {col}")
+                    print(f"  WARNING: {zext.sum()} rows have external/out-of-range {col} "
+                          f"(999 fringe or outside 1-{N_VALID_ZONES})")
 
     # ── 4. schedule gap repair (per person) ───────────────────────────────
     # ── Tier-1 time-window scheduler: conflict-free per-person day ───────────
@@ -264,7 +270,10 @@ def validate_and_fix(plan: pd.DataFrame,
 # 2. DESTINATION ZONE VALIDATION
 # ===========================================================================
 
-N_VALID_ZONES = 329   # zones 1–329; zone 330 = catch-all invalid
+# 371-system: zones 1-371 are all real; 999 = fringe/external sentinel.
+# ORDER 330 is a real zone and is NEVER a catch-all.
+N_VALID_ZONES = 371
+FRINGE_ZONE = 999
 
 
 def compute_zone_validation_metrics(
@@ -277,8 +286,8 @@ def compute_zone_validation_metrics(
 
     Metrics returned
     ----------------
-    pct_valid_dtaz        : % of trip rows with DTAZ in 1-329
-    pct_catchall_dtaz     : % of trip rows with DTAZ == 330 (invalid catch-all)
+    pct_valid_dtaz        : % of trip rows with DTAZ in 1-371
+    pct_catchall_dtaz     : % of trip rows with DTAZ == 999 (fringe/external)
     pct_intrazonal        : % of trips where OTAZ == DTAZ (stayed in zone)
     n_unique_dtaz         : number of distinct DTAZ values used
     mean_dtaz_per_person  : average number of unique destination zones per person
@@ -300,7 +309,7 @@ def compute_zone_validation_metrics(
         return {}
 
     valid_mask    = dtaz.between(1, N_VALID_ZONES, inclusive='both')
-    catchall_mask = dtaz == 330
+    catchall_mask = dtaz == FRINGE_ZONE
     intra_mask    = (otaz == dtaz) & valid_mask
 
     pct_valid    = valid_mask.sum() / n * 100
@@ -335,7 +344,7 @@ def compute_zone_validation_metrics(
     if 'mode_name' in trips.columns:
         for mode, grp in trips.groupby('mode_name'):
             n_mode = len(grp)
-            n_ca   = int((pd.to_numeric(grp['DTAZ'], errors='coerce') == 330).sum())
+            n_ca   = int((pd.to_numeric(grp['DTAZ'], errors='coerce') == FRINGE_ZONE).sum())
             catchall_by_mode[str(mode)] = round(n_ca / n_mode * 100, 2) if n_mode else 0.0
 
     metrics = {
@@ -356,7 +365,7 @@ def compute_zone_validation_metrics(
     if verbose:
         print("\n  ── Destination Zone Validation ──────────────────────────")
         print(f"     Valid DTAZ (1-{N_VALID_ZONES}): {pct_valid:.1f}%   "
-              f"Catch-all (330): {pct_catchall:.1f}%")
+              f"Fringe/external (999): {pct_catchall:.1f}%")
         print(f"     Intrazonal trips:  {pct_intra:.1f}%")
         print(f"     Unique zones used: {n_unique} / {N_VALID_ZONES}   "
               f"Entropy (0=concentrated, 1=uniform): {entropy:.3f}")
@@ -759,7 +768,9 @@ def write_dynus_vehicle_dat(
     """
     Write a DynusT/DYNASMART-P vehicle.dat file from the motorised trip splits.
 
-    Format reference: DSP User's Guide v1.3.0, Section 4.23 (Table 4-27 / Figure 4-26)
+    Format reference: DSP User's Guide v1.3.0, Section 4.23 (Table 4-27 /
+    Figure 4-26) — page 78-79.  The 15 written fields mirror the layout of
+    the reference output_vehicle.dat file.
 
     ┌──────────────────────────────────────────────────────────────────┐
     │  VEHICLE.DAT FORMAT (DYNASMART-P / DynusT)                       │
@@ -767,6 +778,7 @@ def write_dynus_vehicle_dat(
     │  Record 1  (Basic data — one line)                               │
     │    Field 1  INT   Number of vehicles to load                     │
     │    Field 2  INT   Max destinations per vehicle (1 for O-D only)  │
+    │    Field 3  Text  Optional description                           │
     │                                                                  │
     │  Record 2  (Header comment line)                                 │
     │                                                                  │
@@ -774,41 +786,51 @@ def write_dynus_vehicle_dat(
     │    Field 1   veh_id     Vehicle ID (sequential from 1)           │
     │    Field 2   usec       Upstream node of generation link         │
     │    Field 3   dsec       Downstream node of generation link       │
-    │    Field 4   stime      Departure time in MINUTES (ascending)    │
-    │    Field 5   vehcls     5=passenger car 6=HOV 2=truck            │
+    │    Field 4   stime      Starting time (min), ascending order     │
+    │    Field 5   vehcls     Vehicle class: 5=car 6=HOV 2=truck       │
     │    Field 6   vehtype    1=car 2=truck                            │
-    │    Field 7   ioc        0=LOV 1=shared-ride                      │
-    │    Field 8   #ONode     Origin network node                      │
-    │    Field 9   #IntDe     Intermediate destinations (=max stops)   │
+    │    Field 7   ioc        Occupancy: 0=LOV 1=shared-ride           │
+    │    Field 8   #ONode     Nodes in path (1 = no path.dat used)     │
+    │    Field 9   #IntDe     Destinations incl. intermediate + final  │
     │    Field 10  info       En-route info: 0=none 1=available        │
-    │    Field 11  ribf       Indifference band (min) for mode switch   │
+    │    Field 11  ribf       Indifference band (min)                  │
     │    Field 12  comp       Compliance rate 0.0–1.0                  │
-    │    Field 13  izone      Origin zone number                       │
-    │    Field 14  Evac       0=non-evacuation vehicle                  │
-    │    Field 15  InitPos    Initial position (departure hour frac)    │
-    │    Field 16  VoT        Value of time ($/hour)                   │
-    │    Field 17  tFlag      0                                          │
-    │    Field 18  pArrTime   Planned arrival time (min)               │
-    │    Field 19  TP         Time period (1=AM peak)                  │
-    │    Field 20  IniGas     Initial gas (0)                           │
+    │    Field 13  izone      Origin zone                              │
+    │    Field 14  Evac       0=non-evacuation vehicle                 │
+    │    Field 15  InitPos    Random initial position 0-1              │
     │                                                                  │
     │  Record 4+ (Destinations — one line per destination per vehicle) │
-    │    Field 1   dest_zone  Zone number of destination               │
-    │    Field 2   dwell      Activity duration at destination (min)   │
-    │                      Always 0.00 for the FINAL destination        │
+    │    Field 1   dest_zone  Zone number of the destination           │
+    │    Field 2   dwell      Activity duration at destination (min);  │
+    │                      0.00 for the final destination (always)     │
     └──────────────────────────────────────────────────────────────────┘
 
-    Mode → DynusT vehicle type + occupancy + user class mapping
-    ------------------------------------------------------------
-    DA (mode 1)      veh_type=1 car,   occ=1 LOV, user_class=3 UE
-    Other/SR (mode 2) veh_type=1 car,  occ=2 HOV, user_class=3 UE
-    Transit (mode 5) veh_type=2 truck, occ=1 LOV, user_class=1 unresponsive
+    Exact column widths (15 fields, 105 chars/record; veh_id starts each
+    line with an 8-space leading offset, matching the reference file):
+
+      veh_id %9d  usec %7d  dsec %7d  stime %8.2f  vehcls %6d
+      vehtype %6d  ioc %6d  #ONode %6d  #IntDe %6d  info %6d
+      ribf %8.4f  comp %8.4f  izone %5d  Evac %5d  InitPos %12.8f
+
+    Mode → DynusT vehicle class + type + occupancy mapping
+    --------------------------------------------------------
+    DA (mode 1)       vehcls=5 car,  vehtype=1, ioc=0 LOV,  ribf=0.2000 comp=1.0000
+    Other/SR (mode 2) vehcls=5 car,  vehtype=1, ioc=1 shared-ride
+    Transit (mode 5)  vehcls=2 truck,vehtype=2, ioc=0 LOV
 
     Note: vehicles must be listed in ASCENDING departure-time order.
     usec/dsec are the upstream/downstream nodes of the generation link
-    for the origin zone.  If origin_link_map is not supplied, OTAZ is
-    used as a proxy for both (acceptable when DynusT resolves generation
-    links automatically from origin.dat).
+    for the origin zone (DynusT rejects vehicles whose upstream ==
+    downstream node).  If origin_link_map is not supplied, OTAZ is
+    used as a proxy for both and such vehicles are dropped — always
+    pass the map built from the network's origin.dat.  #ONode is the
+    number of path nodes (1 = no pre-specified path).  InitPos is a
+    random draw in [0,1], matching the reference output_vehicle.dat.
+
+    A matching path.dat is ALWAYS written next to vehicle.dat (one line
+    per vehicle: the upstream node of its generation link).  DynusT
+    terminates at demand generation when path.dat is empty, even with
+    #ONode=1.
 
     Parameters
     ----------
@@ -849,8 +871,14 @@ def write_dynus_vehicle_dat(
     n_vehicles = len(all_trips)
     max_stops  = 1   # one final destination per trip (no intermediate stops)
 
-    # ── Resolve numeric columns ────────────────────────────────────────────
-    dep_min  = pd.to_numeric(all_trips['departure_time'], errors='coerce').fillna(0.0)
+    # ── Normalise departure times to a 0-120 minute scale ──────────────────
+    # Reference output_vehicle.dat uses stime 0-120; shift so the earliest
+    # departure starts at 0 and scale the whole day to fit within 120 min.
+    dep_min     = pd.to_numeric(all_trips['departure_time'], errors='coerce').fillna(0.0)
+    _s0 = float(dep_min.min())
+    _s1 = float(dep_min.max())
+    _dep_range = (_s1 - _s0) or 1.0
+    dep_min_120 = (dep_min - _s0) * (120.0 / _dep_range)
     otaz_arr = pd.to_numeric(all_trips['OTAZ'], errors='coerce').fillna(1).astype(int)
     dtaz_arr = pd.to_numeric(all_trips['DTAZ'], errors='coerce').fillna(1).astype(int)
 
@@ -870,69 +898,109 @@ def write_dynus_vehicle_dat(
     veh_type_arr  = mode_int.map({1: 1, 2: 1, 5: 2}).fillna(1).astype(int)
     occupancy_arr = mode_int.map({1: 1, 2: 2, 5: 1}).fillna(1).astype(int)
 
-    # ribf/compliance: always 0.2000/1.0000 (standard DynusT defaults)
+    # ribf/compliance: 0.2000/1.0000 (matching the reference output_vehicle.dat)
     ribf_arr  = np.full(n_vehicles, 0.2000, dtype=float)
     comp_arr  = np.full(n_vehicles, 1.0000, dtype=float)
 
+    # ── Generation-link nodes ──────────────────────────────────────────────
+    # usec/dsec must be a real, distinct-node generation link for the origin
+    # zone (DynusT rejects vehicles whose upstream == downstream node). Use the
+    # origin_link_map when available; otherwise fall back to the zone number as
+    # a node proxy. Any vehicle left with usec == dsec (e.g. a zone with no
+    # entry in origin_link_map) is DROPPED — DynusT cannot load it.
+    otaz_vals = otaz_arr.to_numpy()
+    if origin_link_map:
+        _lk = origin_link_map
+        usec_arr = np.array([_lk.get(int(z), (int(z), int(z)))[0] for z in otaz_vals], dtype=int)
+        dsec_arr = np.array([_lk.get(int(z), (int(z), int(z)))[1] for z in otaz_vals], dtype=int)
+    else:
+        usec_arr = otaz_arr.to_numpy()
+        dsec_arr = otaz_arr.to_numpy()
+
+    keep = usec_arr != dsec_arr
+    if not bool(keep.all()):
+        n_drop = int((~keep).sum())
+        logger.warning(
+            f"write_dynus_vehicle_dat: dropping {n_drop:,} vehicles whose "
+            f"generation link has identical up/downstream nodes (DynusT cannot "
+            f"load them)"
+        )
+        keep_ix = np.flatnonzero(keep)
+        usec_arr   = usec_arr[keep_ix]
+        dsec_arr   = dsec_arr[keep_ix]
+        otaz_arr   = otaz_arr.iloc[keep_ix].reset_index(drop=True)
+        dtaz_arr   = dtaz_arr.iloc[keep_ix].reset_index(drop=True)
+        dep_min_120= dep_min_120.iloc[keep_ix].reset_index(drop=True)
+        mode_int   = mode_int.iloc[keep_ix].reset_index(drop=True)
+        veh_type_arr   = veh_type_arr.iloc[keep_ix].reset_index(drop=True)
+        occupancy_arr  = occupancy_arr.iloc[keep_ix].reset_index(drop=True)
+        ribf_arr   = ribf_arr[keep_ix]
+        comp_arr   = comp_arr[keep_ix]
+        n_vehicles = int(keep.sum())
+        print(f"  Dropped {n_drop:,} vehicles with invalid generation links; "
+              f"{n_vehicles:,} remaining")
+
+    # InitPos: random initial position in [0,1] (as in the reference
+    # output_vehicle.dat), seeded so repeated runs are reproducible.
+    _seed_ip = int(n_vehicles) % (2**31 - 1)
+    _initpos_arr = np.random.default_rng(_seed_ip).random(n_vehicles)
+
     # ── Write file ────────────────────────────────────────────────────────
-    with open(path, 'w') as f:
+    # newline='' keeps the explicit \r\n endings untranslated (avoids
+    # \r\r\n on Windows); matches the reference file's CRLF line endings.
+    # path.dat MUST be written too: DynusT terminates at demand generation
+    # if path.dat is empty — one line per vehicle with the upstream node of
+    # the generation link (matches #ONode=1; DynusT then builds the real
+    # path itself, as seen in output_vehicle.dat).
+    path_dat = os.path.join(save_dir, 'path.dat')
+    with open(path, 'w', newline='') as f, open(path_dat, 'w', newline='') as fpath:
 
         # Record 1: vehicle count, max stops, description
-        f.write(f"{n_vehicles:12d}{max_stops:12d}    # of vehicles in the file, Max # of STOPs\r\n")
+        # (8-space leading offset; description matches reference file)
+        f.write(f"{n_vehicles:15d}{max_stops:12d}    # of vehicles in the file, Max # of STOPs\r\n")
 
-        # Record 2: column header (comment)
+        # Record 2: column header (comment) — same as reference file
         f.write("        #   usec   dsec   stime vehcls vehtype ioc #ONode"
                 " #IntDe info ribf    comp   izone Evac InitPos"
                 "    VoT  tFlag pArrTime TP IniGas\r\n")
 
-        # Generate pseudo-random VOT (5-25) seeded for repeatability
-        _seed_vot = int(n_vehicles) % (2**31 - 1)
-        _rng = np.random.default_rng(_seed_vot)
-        _vot_arr = (5.0 + _rng.random(n_vehicles) * 20.0).round(4)
-
         for i in range(n_vehicles):
+            usec = int(usec_arr[i])
+            dsec = int(dsec_arr[i])
             otaz = int(otaz_arr.iloc[i])
             dtaz = int(dtaz_arr.iloc[i])
 
-            # Generation link nodes — use origin_link_map if provided
-            if origin_link_map and otaz in origin_link_map:
-                usec, dsec = origin_link_map[otaz]
-            else:
-                usec = dsec = otaz   # fallback: zone number as node proxy
-
-            stime   = float(dep_min.iloc[i])
+            stime   = float(dep_min_120.iloc[i])
             vt      = int(veh_type_arr.iloc[i])
             occ     = int(occupancy_arr.iloc[i])
             ribf    = float(ribf_arr[i])
             comp    = float(comp_arr[i])
-            vot     = float(_vot_arr[i])
+            initpos = float(_initpos_arr[i])
 
-            # vehcls: 5=passenger car (default), 6=HOV (occ>1), 2=truck (transit)
-            vehcls = 5 if vt == 1 else (6 if vt == 1 and occ > 1 else 2)
-            # ioc: 0=drive-alone, 1=shared-ride (not LOV occupancy)
+            # vehcls: 5=passenger car, 2=truck (transit proxy)
+            vehcls = 5 if vt == 1 else 2
+            # ioc: 0=drive-alone (LOV), 1=shared-ride (HOV)
             ioc = 0 if occ == 1 else 1
 
+            # 15-field vehicle record matching the reference output_vehicle.dat:
+            # veh_id, usec, dsec, stime, vehcls, vehtype, ioc, #ONode, #IntDe,
+            # info, ribf, comp, izone, Evac, InitPos.
             f.write(
-                f"{i+1:9d}"          # veh_id
-                f"{usec:7d}"         # usec (upstream node of generation link)
-                f"{dsec:7d}"         # dsec (downstream node)
-                f"{stime:8.2f}"      # stime (departure minutes)
-                f"{vehcls:6d}"       # vehcls (5=passenger, 6=HOV, 2=truck)
-                f"{vt:6d}"           # vehtype (1=car, 2=truck)
-                f"{ioc:4d}"          # ioc (0=LOV, 1=shared)
-                f"{usec:5d}"         # #ONode (origin network node)
-                f"{max_stops:7d}"    # #IntDe (intermediate destinations)
-                f"{0:5d}"            # info (en-route info flag)
-                f"{ribf:8.4f}"       # ribf (indifference band, min)
-                f"{comp:8.4f}"       # comp (compliance rate)
-                f"{otaz:7d}"         # izone (origin zone number)
-                f"{0:5d}"            # Evac
-                f"{stime/60:.8f}"    # InitPos (departure hour fraction)
-                f"{vot:8.4f}"        # VoT (value of time, $)
-                f"{0:6d}"            # tFlag
-                f"{stime:9.2f}"      # pArrTime (planned arrival)
-                f"{1:3d}"            # TP (time period, 1=AM peek)
-                f"{0:7d}"            # IniGas (initial gas, 0)
+                f"{i+1:9d}"           # veh_id (8-space leading offset)
+                f"{usec:7d}"          # usec (upstream node of generation link)
+                f"{dsec:7d}"          # dsec (downstream node)
+                f"{stime:8.2f}"       # stime (departure minutes, normalised to 0-120)
+                f"{vehcls:6d}"        # vehcls (5=car, 2=truck)
+                f"{vt:6d}"            # vehtype (1=car, 2=truck)
+                f"{ioc:6d}"           # ioc (0=LOV, 1=shared-ride)
+                f"{1:6d}"             # #ONode (nodes in path; 1 = no path.dat)
+                f"{max_stops:6d}"     # #IntDe (destinations incl. final)
+                f"{0:6d}"             # info (en-route info: 0=none, 1=available)
+                f"{ribf:8.4f}"        # ribf (indifference band, min)
+                f"{comp:8.4f}"        # comp (compliance rate 0-1.0)
+                f"{otaz:5d}"          # izone (origin zone number)
+                f"{0:5d}"             # Evac (0=non-evacuation)
+                f"{initpos:12.8f}"    # InitPos (random initial position 0-1)
                 f"\r\n"
             )
 
@@ -940,16 +1008,20 @@ def write_dynus_vehicle_dat(
             # Activity duration = 0.00 for the final destination (always)
             f.write(f"{dtaz:12d}{0.0:7.2f}\r\n")
 
+            # path.dat: one line per vehicle — initial path node = upstream
+            # node of the generation link (per DSP User's Guide §4.24).
+            fpath.write(f"{usec}\r\n")
+
     # ── Summary ───────────────────────────────────────────────────────────
     n_da      = int((mode_int == 1).sum())
     n_sr      = int((mode_int == 2).sum())
     n_transit = int((mode_int == 5).sum())
     print(
-        f"  Saved: vehicle.dat  ({n_vehicles:,} vehicles — "
+        f"  Saved: vehicle.dat + path.dat  ({n_vehicles:,} vehicles — "
         f"DA={n_da:,}  SR={n_sr:,}  Transit={n_transit:,})"
     )
     logger.info(
-        f"write_dynus_vehicle_dat: {n_vehicles} vehicles → {path} | "
+        f"write_dynus_vehicle_dat: {n_vehicles} vehicles → {path} (+ path.dat) | "
         f"DA={n_da} SR={n_sr} Transit={n_transit} | "
         f"dep_time range: {dep_min.min():.1f}–{dep_min.max():.1f} min"
     )
@@ -974,7 +1046,7 @@ DYNUS_OD_PERIODS = [
 def write_dynus_od_dat(
     trips: pd.DataFrame,
     save_dir: str,
-    n_zones: int = 329,
+    n_zones: int = 371,
     periods: list = None,
     modes: list = None,
     filename: str = 'od.dat',
@@ -999,7 +1071,7 @@ def write_dynus_od_dat(
     ----------
     trips      : Aimsun trip table (departure_time, OTAZ, DTAZ, mode columns)
     save_dir   : output directory
-    n_zones    : number of zones (329 for SEQ)
+    n_zones    : number of zones (371 for SEQ)
     periods    : list of (start_min, end_min, label) tuples (default DYNUS_OD_PERIODS)
     modes      : restrict to these mode_name values (None = all motorised modes)
     filename   : output filename (default 'od.dat')
@@ -1531,6 +1603,7 @@ def run_stage6(
     max_repair_iterations: int = 3,
     dynus_sim_start_min: int = DYNUS_SIM_START_MIN,
     dynus_value_of_time: float = 15.0,
+    origin_link_map: Optional[dict] = None,
     verbose: bool = True,
 ) -> tuple:
     """
@@ -1562,6 +1635,12 @@ def run_stage6(
     max_repair_iterations : how many times to tighten distance per person
     dynus_sim_start_min : DynusT simulation start (minutes from midnight, default 360=6am)
     dynus_value_of_time : value of time written to vehicle.dat ($/hour)
+    origin_link_map   : {zone: (usec, dsec)} — generation-link node pairs per
+                        zone (from the network's origin.dat). Pass this so
+                        vehicle.dat gets real, distinct up/downstream nodes;
+                        otherwise zones fall back to the zone number as a node
+                        proxy and any vehicle left with identical nodes is
+                        dropped (DynusT cannot load it).
     verbose            : print progress
 
     Returns
@@ -1742,7 +1821,8 @@ def run_stage6(
         motorised_splits = apply_dynust_zone_crosswalk(motorised_splits, dynust_zone_crosswalk)
     write_dynus_vehicle_dat(
         motorised_splits,
-        save_dir = save_dir,
+        save_dir        = save_dir,
+        origin_link_map = origin_link_map,
     )
     write_dynus_od_dat(
         trips    = trips_aimsun_all,

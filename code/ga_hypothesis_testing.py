@@ -1236,9 +1236,10 @@ def _save_best_ckpt(searcher, individual) -> None:
         path = os.path.join(ckpt_dir, f'best_{slug}.npz')
         tmp = path + '.tmp.npz'
         feat_names = list(getattr(searcher, 'feature_names', None) or [])
+        _genes = np.asarray(individual.genes, dtype=np.int8)
         np.savez_compressed(
             tmp,
-            genes=np.asarray(individual.genes, dtype=np.int8),
+            genes=_genes,
             fitness=float(getattr(individual, 'fitness', -np.inf)),
             feat_names=np.array(feat_names, dtype=object),
             label=np.array(label),
@@ -1246,6 +1247,25 @@ def _save_best_ckpt(searcher, individual) -> None:
             saved_at=np.array(_time.strftime('%Y-%m-%d %H:%M:%S')),
         )
         os.replace(tmp, path)
+        # ── Convergence trace (paper-grade improvement curves) ─────────
+        # One appended row per new global best: (timestamp, label, fitness,
+        # n_features). build_convergence_report.py turns these per-shard
+        # traces into best-so-far-over-time curves, so improving convergence
+        # is showable even when jobs die at the wall and resume later —
+        # something the single-entry aggregate histories cannot do.
+        try:
+            _trace = os.path.join(ckpt_dir, 'convergence_trace.csv')
+            _need_hdr = not os.path.isfile(_trace)
+            with open(_trace, 'a') as _fh:
+                if _need_hdr:
+                    _fh.write('timestamp,label,fitness,n_features,'
+                              'fitness_metric\n')
+                _fh.write(f"{_time.strftime('%Y-%m-%d %H:%M:%S')},"
+                          f"\"{label}\",{float(getattr(individual, 'fitness', float('nan'))):.6f},"
+                          f"{int(_genes.sum())},"
+                          f"\"{str(getattr(searcher, 'fitness_metric', ''))}\"\n")
+        except Exception:
+            pass
     except Exception:                                # noqa: BLE001
         pass                                         # never break a search
 
@@ -10010,10 +10030,22 @@ def _run_ga_stage5_trip(trips, persons, skims, landuse, ga_kwargs,
 
     Results are labelled  "<Purpose>   Mode (trip)"  and  "<Purpose>   Dest (trip)".
     Majority-vote consensus across purposes selects the final feature sets.
+
+    Resume across PBS walltimes: the mode GA result per purpose persists in
+    the ga_stage5_sidesearch.pkl sidecar (key f"trip_{purp}") and best_*.npz
+    files. A resubmitted job adopts a converged mode best instead of
+    re-searching it, and seeds the dest GA with the prior dest best — so
+    repeated 12h rounds ratchet forward instead of restarting. Disable the
+    mode-reuse per submit with GA_STAGE51_REUSE_MODE=0.
     """
     import openmatrix as omx
     from stage6_mode_choice import prepare_mode_data, PURPOSES as TRIP_PURPOSES
     from stage5_destination_choice import _skim_flat
+
+    # Walltime-aware like the tour worker: a near-limit kill stops the current
+    # generation gracefully (partial history + best_*.npz written) instead of
+    # losing the segment with no checkpoint (Exit -29 with nothing to show).
+    _init_walltime_guard()
 
     print("\n[Stage 51   TRIP LEVEL] Preparing HHTS trip estimation data...")
 
@@ -10075,9 +10107,27 @@ def _run_ga_stage5_trip(trips, persons, skims, landuse, ga_kwargs,
 
     for purp in valid_purposes:
         purp_label = _TRIP_PURP_LABELS.get(purp, f'{purp} (trip)')
+        _trip_seg = f"trip_{purp}"
+        _trip_side = _s5_sidecar_load().get(_trip_seg, {})
+        _reuse_mode = (os.environ.get('GA_STAGE51_REUSE_MODE', '1').strip()
+                       != '0')
 
-        #  Mode GA
+        #  Mode GA (skipped when a prior round converged it — the mode best
+        #  has been byte-identical across four batches)
         print(f"\n  [Stage 51   {purp_label}] Mode GA ...")
+        _mode_adopted = None
+        if _reuse_mode:
+            try:
+                _sc_m = (_trip_side.get('mode') or {})
+                _sc_mg = np.asarray(_sc_m.get('genes'), dtype=int).ravel()
+                _sc_mf = float(_sc_m.get('fitness', -np.inf))
+                if (_sc_mg.size == len(mode_cands) and np.isfinite(_sc_mf)
+                        and _sc_mf > -1e8):
+                    _mode_adopted = (_sc_mg, _sc_mf)
+                    print(f"    Mode search SKIPPED — reusing sidecar best "
+                          f"BIC/n={-_sc_mf:.4f}")
+            except Exception:
+                _mode_adopted = None
 
         def _trip_mode_fit(genes, _p=purp):
             """Trip-level mode model BIC/n for one purpose."""
@@ -10111,9 +10161,27 @@ def _run_ga_stage5_trip(trips, persons, skims, landuse, ga_kwargs,
             collinear_groups    = STAGE_COLLINEAR_GROUPS.get('5_mode', []),
             require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get('5_mode', []),
             fixed_features   = [f for f in ['CRASH'] if f in mode_cands],
+            progress_label   = f"Stage51 {purp_label} Mode",
             **ga_kwargs,
         )
-        mode_best, mode_hist, mode_pop = mode_ga.run_with_restarts(n_restarts=n_restarts)
+        if _mode_adopted is not None:
+            _am_g, _am_f = _mode_adopted
+            mode_best = Individual(genes=np.asarray(_am_g, dtype=int),
+                                   fitness=float(_am_f))
+            mode_hist, mode_pop = [], [mode_best]
+            print(f"    Mode best vars (adopted): "
+                  f"{[v for v, g in zip(mode_cands, mode_best.genes) if g == 1]}"
+                  f"  BIC/n={-mode_best.fitness:.4f}")
+        else:
+            mode_best, mode_hist, mode_pop = mode_ga.run_with_restarts(n_restarts=n_restarts)
+            try:
+                _s5_sidecar_save(_trip_seg, 'mode', {
+                    'vars': [v for v, g in zip(mode_cands, mode_best.genes) if g == 1],
+                    'genes': np.asarray(mode_best.genes, dtype=int).tolist(),
+                    'fitness': float(mode_best.fitness),
+                })
+            except Exception:
+                pass
         best_mode_vars = [v for v, g in zip(mode_cands, mode_best.genes) if g == 1]
         print(f"    Mode best vars: {best_mode_vars}  BIC/n={-mode_best.fitness:.4f}")
 
@@ -10150,11 +10218,33 @@ def _run_ga_stage5_trip(trips, persons, skims, landuse, ga_kwargs,
             collinear_groups    = STAGE_COLLINEAR_GROUPS.get('5_dest', []),
             require_one_groups  = STAGE_REQUIRE_ONE_GROUPS.get('5_dest', []),
             fixed_features   = [f for f in ['detour_dist_km', 'log_size'] if f in dest_cands],
+            progress_label   = f"Stage51 {purp_label} Dest",
             **ga_kwargs,
         )
-        dest_best, dest_hist, dest_pop = dest_ga.run_with_restarts(n_restarts=n_restarts)
+        _dest_seeds = []
+        try:
+            _sc_d = (_trip_side.get('dest') or {})
+            _sc_dg = np.asarray(_sc_d.get('genes'), dtype=int).ravel()
+            _sc_df = float(_sc_d.get('fitness', -np.inf))
+            if (_sc_dg.size == len(dest_cands) and np.isfinite(_sc_df)
+                    and _sc_df > -1e8):
+                _dest_seeds = [Individual(genes=_sc_dg, fitness=_sc_df)]
+                print(f"    Dest search seeded with sidecar best "
+                      f"(BIC/n={-_sc_df:.4f})")
+        except Exception:
+            _dest_seeds = []
+        dest_best, dest_hist, dest_pop = dest_ga.run_with_restarts(
+            n_restarts=n_restarts, seed_individuals=_dest_seeds or None)
         best_dest_vars = [v for v, g in zip(dest_cands, dest_best.genes) if g == 1]
         print(f"    Dest best vars: {best_dest_vars}  BIC/n={-dest_best.fitness:.4f}")
+        try:
+            _s5_sidecar_save(_trip_seg, 'dest', {
+                'vars': list(best_dest_vars),
+                'genes': np.asarray(dest_best.genes, dtype=int).tolist(),
+                'fitness': float(dest_best.fitness),
+            })
+        except Exception:
+            pass
 
         dest_seg_result = GAResult(
             stage=51, best_features={'mode': best_mode_vars, 'dest': best_dest_vars},
@@ -11548,6 +11638,11 @@ def run_ga_stage(
     if stage == 2:
         _stage_gens = _positive_env_int('GA_SA2_GENS', 'GA_STAGE2_GENS')
         _stage_restarts = _positive_env_int('GA_SA2_RESTARTS', 'GA_STAGE2_RESTARTS')
+    elif stage == 0:
+        # CDAP: the 263-gen standard budget never fits a 12h box (s0 SIGKILLs
+        # with no artifact). Cap via env so s0 completes and shows its curve.
+        _stage_gens = _positive_env_int('GA_STAGE0_GENS')
+        _stage_restarts = _positive_env_int('GA_STAGE0_RESTARTS')
     elif stage == 4:
         _stage_gens = _positive_env_int('GA_STAGE4_GENS')
         _stage_restarts = _positive_env_int('GA_STAGE4_RESTARTS')

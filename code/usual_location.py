@@ -496,6 +496,32 @@ def _assign_choosers_capacity(probs_dict: dict,
     keys    = [(int(k[0]), int(k[1])) for k in indices]
     counts  = {k: int(len(indices[k])) for k in keys}
 
+    # ── Soften capacity when total demand exceeds total supply ──────────────
+    # The land-use capacity columns (TOTEMP / school_enrol+Education) are
+    # absolute counts; the synthetic population can legitimately contain MORE
+    # workers/students than recorded seats/jobs (e.g. 868k students vs 461k
+    # school places). A strict cap then overflows 40% of choosers to their
+    # home zone, which badly corrupts the assigned destination distribution.
+    # Fix: scale every zone's capacity up by a single common factor so total
+    # capacity == total demand. This keeps the RELATIVE capacity differences
+    # (which drive the shadow-price equilibrium and shape the MNL distribution)
+    # intact while removing the forced mass home-zone fallback.
+    _total_demand = int(len(chooser_df))
+    _total_cap    = int(cap.sum())
+    if _total_cap > 0 and _total_demand > _total_cap:
+        _scale = _total_demand / _total_cap
+        cap = np.ceil(cap * _scale).astype(np.int64)
+        logger.info(
+            f"    [{label}] capacity softened: {_total_demand:,} choosers vs "
+            f"{_total_cap:,} seats — scaled caps ×{_scale:.2f} "
+            f"(total {int(cap.sum()):,})"
+        )
+    elif _total_cap == 0:
+        logger.warning(
+            f"    [{label}] zero total capacity ({_total_cap:,}) for "
+            f"{_total_demand:,} choosers — capacity constraint disabled"
+        )
+
     # ── destination shadow-price equilibrium across ALL origin classes ──
     def _p1d(k):
         v = np.asarray(probs_dict[k], dtype=np.float64).reshape(-1)
@@ -1119,7 +1145,11 @@ def _validate_usual_locations(
         _work_source = 'persons'
     else:
         work_mask_hhts = hhts_tours[purp_col].astype(str).str.lower().isin(
-            ['work', 'full-time work', 'part-time work', 'workfulltime', 'workparttime'])
+            ['work', 'full-time work', 'part-time work', 'workfulltime', 'workparttime',
+             # raw QTS OVERALL_PURPOSE strings (data_connect.purpose map → 'work')
+             'direct work commute', 'work related', 'my workplace',
+             'work (my workplace)', 'work (other work reason)',
+             'other work-related place'])
         obs_work = hhts_tours.loc[work_mask_hhts, dtaz_col]
         _work_source = 'tours'
     syn_work_taz  = df.loc[is_worker, 'WORK_TAZ']
@@ -1153,7 +1183,10 @@ def _validate_usual_locations(
     else:
         school_mask_hhts = hhts_tours[purp_col].astype(str).str.lower().isin(
             ['edu', 'education', 'primary school', 'secondary school',
-             'full-time tafe/uni', 'part-time tafe/uni', 'school', 'university'])
+             'full-time tafe/uni', 'part-time tafe/uni', 'school', 'university',
+             # raw QTS OVERALL_PURPOSE strings (data_connect.purpose map → 'edu')
+             'primary or secondary school', 'my campus', 'childcare or kindergarten',
+             'other study-related place'])
         obs_school = hhts_tours.loc[school_mask_hhts, dtaz_col]
         _sch_source = 'tours'
     syn_school_taz  = df.loc[is_student, 'SCHOOL_TAZ']

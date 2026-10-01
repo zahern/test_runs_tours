@@ -1,0 +1,46 @@
+#!/bin/bash -l
+# Build the POLARIS-style demand SQLite store for a completed GA run.
+# Usage:
+#   qsub -v "RUN_ROOT=runs/ga_parallel,RUN_TAG=destfix,CONDA_ENV=zigenv" job_build_polaris_store.pbs
+#   qsub -v "RUN_DIR_MARKER=runs/ga_parallel/exp1/prediction_run_dir.txt,CONDA_ENV=zigenv" job_build_polaris_store.pbs
+
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=2:mem=48GB
+#PBS -l walltime=01:00:00
+
+set -euo pipefail
+
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:-}
+RUN_DIR_MARKER=${RUN_DIR_MARKER:-}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+
+cd "$PBS_O_WORKDIR"
+
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+conda activate "$CONDA_ENV"
+
+# Resolve run directory:
+# 1. RUN_DIR_MARKER file (written by prediction job) wins
+# 2. RUN_ROOT + RUN_TAG fallback
+if [ -n "${RUN_DIR_MARKER}" ] && [ -f "${RUN_DIR_MARKER}" ]; then
+  RUN_DIR=$(cat "${RUN_DIR_MARKER}" | tr -d '\n\r')
+  echo "Resolved RUN_DIR from marker: ${RUN_DIR}"
+else
+  [ -n "${RUN_TAG}" ] || { echo "ERROR: set RUN_TAG or RUN_DIR_MARKER" >&2; exit 2; }
+  RUN_DIR="${RUN_ROOT}/${RUN_TAG}"
+fi
+
+# Prefer this run's own stage6 output if present, else the shared one.
+STAGE6="saved_data/stage6_output.csv"
+if [ -f "${RUN_DIR}/stage6/stage6_output.csv" ]; then
+  STAGE6="${RUN_DIR}/stage6/stage6_output.csv"
+fi
+
+OUT="${RUN_DIR}/${RUN_TAG}-Demand.sqlite"
+mkdir -p "${RUN_DIR}"
+
+python build_polaris_demand_store.py --stage6 "${STAGE6}" --out "${OUT}"
+
+echo "Polaris demand store complete: ${OUT}"

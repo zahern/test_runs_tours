@@ -49,7 +49,12 @@ os.makedirs(PLOTS_DIR, exist_ok=True)
 MODE_NAMES  = {1:'Drive Alone',2:'Shared Ride',3:'Walk',4:'Bike',5:'Transit'}
 MODE_COLORS = {'Drive Alone':'#E74C3C','Shared Ride':'#E67E22',
                'Walk':'#2ECC71','Bike':'#3498DB','Transit':'#9B59B6'}
+_NEW_POP_DIR = os.environ.get('NEW_POP_DIR', os.path.join('..', 'new_pop'))
 LANDUSE_CANDIDATES = [
+    # 371-zone system first (SA2-keyed; ORDER derived from SA2_MAIN16 below)
+    os.path.join(_NEW_POP_DIR, 'saved_data', 'zone_landuse_357.csv'),
+    os.path.join('saved_data', 'zone_landuse_overture.csv'),
+    # legacy 330-zone fallbacks
     'zone_order_and_landuse.csv',
     os.path.join('saved_data', 'zone_order_and_landuse.csv'),
 ]
@@ -78,6 +83,11 @@ def load_landuse():
             try:
                 df = pd.read_csv(p)
                 print(f"  ✓ landuse: {p} ({len(df):,} zones)")
+                # 371 convention (mirrors data_connect): ORDER carries the
+                # SA2 code when no legacy ORDER column exists.
+                if 'ORDER' not in df.columns and 'SA2_MAIN16' in df.columns:
+                    df['ORDER'] = pd.to_numeric(df['SA2_MAIN16'],
+                                                errors='coerce')
                 return df
             except Exception as e:
                 print(f"  × landuse failed from {p}: {e}")
@@ -254,8 +264,8 @@ def build_safety_proxy_summary():
         return {}
     lu = LANDUSE.copy()
     for col in ['EATOUT', 'Shopping', 'Entertainment', 'community', 'civic',
-                'park', 'sport', 'childcare', 'Healthcare', 'commercial',
-                'retail', 'industrial', 'TOTPOP']:
+                'park', 'sport', 'recreation_ground', 'childcare', 'Healthcare',
+                'commercial', 'retail', 'industrial', 'TOTPOP']:
         if col not in lu.columns:
             lu[col] = 0.0
         lu[col] = pd.to_numeric(lu[col], errors='coerce').fillna(0.0)
@@ -266,7 +276,12 @@ def build_safety_proxy_summary():
     lu['community_presence_proxy'] = (
         lu['community'] + lu['civic'] + lu['childcare'] + lu['Healthcare']
     )
-    lu['open_space_proxy'] = lu['park'] + lu['sport']
+    # open_space_proxy: `park`/`sport` are ~empty in the SEQ extract
+    # (327/329 zones exactly 0 — verified 2026-09); open space in this build
+    # lives in `recreation_ground`, so anchor on it with park/sport as
+    # add-ons rather than the base.
+    lu['open_space_proxy'] = (lu['recreation_ground'] + lu['park']
+                              + lu['sport'])
     lu['exposure_proxy'] = lu['TOTPOP'] + 0.25 * lu['industrial']
     return {
         'frontage_top3': lu.nlargest(3, 'activity_frontage_proxy')[['ORDER', 'activity_frontage_proxy']]

@@ -1,0 +1,81 @@
+#!/bin/bash -l
+# Run ONE phase of the phase-sharded prediction run (see _run_predict_phase.py
+# and job_submit_predict_sharded.pbs).
+#
+# Required -v: PREDICT_PHASE (prep|s1|s23|s4|s5|finalize), RUN_TAG,
+#              PIPELINE_RUN_DIR, GA_STAGED_GA_DIR.
+# Optional -v: RUN_ROOT, CONDA_ENV, GA_ESTIMATOR, GA_ENGINE, NEW_POP*,
+#              PIPELINE_SKIMS_PATH (same conventions as the shard jobs).
+
+#PBS -m n
+#PBS -r y
+#PBS -P FPAXJW8067
+#PBS -l select=1:ncpus=4:mem=24GB
+#PBS -l walltime=04:00:00
+
+set -euo pipefail
+
+PREDICT_PHASE=${PREDICT_PHASE:?PREDICT_PHASE is required}
+RUN_TAG=${RUN_TAG:?RUN_TAG is required}
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+GA_ESTIMATOR=${GA_ESTIMATOR:-metacount_mv}
+GA_ENGINE=${GA_ENGINE:-agds}
+
+PIPELINE_RUN_DIR=${PIPELINE_RUN_DIR:-${RUN_ROOT}/${RUN_TAG}/predict}
+export PIPELINE_RUN_DIR
+export PIPELINE_OUT_DIR="${PIPELINE_RUN_DIR}"
+
+GA_STAGED_GA_DIR=${GA_STAGED_GA_DIR:-${RUN_ROOT}/${RUN_TAG}/merged}
+export GA_STAGED_GA_DIR
+export GA_STAGED_REUSE_ESTIMATOR=1
+
+NEW_POP=${NEW_POP:-1}
+NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+if [ "${NEW_POP}" = "1" ] && [ "${NEW_POP_MAPPED}" != "1" ]; then
+    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+else
+    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-}
+fi
+
+cd "$PBS_O_WORKDIR"
+CONDA_BASE=${CONDA_BASE:-/mnt/hpccs01/home/ahernz/miniconda3}
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_BASE}/envs/${CONDA_ENV}"
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+echo "python: $(which python) ($(python --version 2>&1))"
+export PYTHONPATH="${PBS_O_WORKDIR}/compat:${PYTHONPATH:-}"
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+export GA_METACOUNT_FORCE_CPU=${GA_METACOUNT_FORCE_CPU:-1}
+export TF_CPP_MIN_LOG_LEVEL=${TF_CPP_MIN_LOG_LEVEL:-3}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-1}
+export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-false}
+# Stage-5 zone plans stream to CSV; workers only parallelise prediction at the
+# cost of ~2-4 GB RSS each (spawned, shared frames via parquet). Default 1.
+export STAGE5_WORKERS=${STAGE5_WORKERS:-1}
+
+export PREDICT_PHASE GA_ESTIMATOR GA_ENGINE
+export NEW_POP NEW_POP_MAPPED NEW_POP_DIR PIPELINE_SKIMS_PATH
+
+echo "=========================================="
+echo "Predict phase job : ${PBS_JOBID:-unknown}"
+echo "Phase             : ${PREDICT_PHASE}"
+echo "Run tag           : ${RUN_TAG}"
+echo "Out dir           : ${PIPELINE_RUN_DIR}"
+echo "Merged source     : ${GA_STAGED_GA_DIR}/ga_results.pkl"
+echo "Started           : $(date)"
+echo "=========================================="
+
+python -u -X utf8 _run_predict_phase.py
+EXIT_CODE=$?
+echo "Finished phase ${PREDICT_PHASE}: $(date) exit_code=${EXIT_CODE}"
+exit "${EXIT_CODE}"

@@ -1,0 +1,104 @@
+#!/bin/bash
+#PBS -N hb_crash_pred_search
+#PBS -l nodes=1:ppn=4
+#PBS -l walltime=48:00:00
+#PBS -l mem=64gb
+#PBS -l software=metacountregressor
+#PBS -j oe
+#PBS -o hb_vs_crash_search.log
+#PBS -m ae
+#PBS -M ahernz@qut.edu.au
+
+# ======================================================================
+# PBS Job: HB vs Crash Prediction Model Search
+# ======================================================================
+# Uses metacountregressor (StructureEvaluatorLC + AdaptiveDE/SA) to
+# search for the hard-braking vs crash prediction model with explicit
+# transferability analysis.
+#
+# Steps:
+#   1. DE feature selection (separate per response)
+#   2. MCR structure search (roles: fixed/random-independent/random-correlated)
+#   3. Specification transfer (hard-braking transferability)
+#   4. Encompassing test
+#   5. Bivariate copula (Frank / Normal / Kimeldorf)
+#   6. Transferability summary + figures
+#
+# Usage:
+#   qsub hb_vs_crash_pbs.pbs
+#   qdel <jobid>   # to cancel
+# ======================================================================
+
+# --- Module loading ---
+module purge
+module load python/3.11
+module load jax/0.4.30
+
+# --- Environment ---
+export JAX_PLATFORM_NAME=cpu
+export JAX_ENABLE_X64=1
+export JAX_LOG_COMPILES=0
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
+# --- Working directory ---
+cd "$PBS_O_WORKDIR"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OUT_DIR="${SCRIPT_DIR}/../"
+
+echo "============================================"
+echo "  HB vs Crash Prediction Search"
+echo "  Script dir:  $SCRIPT_DIR"
+echo "  Output dir:  $OUT_DIR"
+echo "  Node:        $(hostname)"
+echo "  Start:       $(date)"
+echo "============================================"
+
+# --- Verify Python environment ---
+python -c "import metacountregressor; print('metacountregressor', metacountregressor.__version__)"
+python -c "import jax; print('JAX', jax.__version__, 'platform:', jax.default_backend())"
+python -c "import metacountregressor.experiment_package; print('StructureEvaluatorLC OK')"
+
+# --- Run the analysis ---
+python3 << 'PYTHON_EOF'
+import os, sys, json
+
+# Add the paper template dir to path so the script can import from the conda env
+SCRIPT_DIR = os.environ.get("PBS_O_WORKDIR", ".")
+sys.path.insert(0, SCRIPT_DIR)
+
+os.chdir(SCRIPT_DIR)
+
+# Import and run
+from hb_vs_crash_prediction_search import main as run_search
+
+# Parse optional args from environment
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--out-dir", default=os.path.dirname(SCRIPT_DIR))
+parser.add_argument("--n-jobs", type=int, default=1)
+parser.add_argument("--resume", action="store_true")
+parser.add_argument("--de-only", action="store_true")
+parser.add_argument("--maxiter", type=int, default=60)
+parser.add_argument("--popsize", type=int, default=15)
+parser.add_argument("--mcr-n-starts", type=int, default=2)
+parser.add_argument("--mcr-max-iter", type=int, default=500)
+parser.add_argument("--solver", default="de", choices=["de", "sa"])
+args = parser.parse_args([])
+
+# Override out-dir to parent of script dir (the paper template)
+args.out_dir = os.path.dirname(SCRIPT_DIR)
+
+run_search()
+PYTHON_EOF
+
+echo "============================================"
+echo "  End:       $(date)"
+echo "============================================"
+
+# --- Collect output ---
+echo ""
+echo "--- Output files ---"
+ls -la "${OUT_DIR}/"*.csv "${OUT_DIR}/"*.tex "${OUT_DIR}/"*.png "${OUT_DIR}/"*.json 2>/dev/null || true
+ls -la "${OUT_DIR}/checkpoints/"*.done 2>/dev/null || true

@@ -1,4 +1,7 @@
 # pipeline_logger.py
+# NumPy 2.0 compatibility shim - MUST BE FIRST IMPORT
+import compat.numpy_shim
+
 import argparse
 import time
 import logging
@@ -7,6 +10,7 @@ import os
 import glob
 import gc
 import sys
+import traceback
 import pickle
 import re
 import json
@@ -18,6 +22,13 @@ from typing import Optional
 # them afterwards has no effect.
 #   TF_CPP_MIN_LOG_LEVEL=3 → suppress all XLA/LLVM INFO and WARNING messages
 #   XLA_FLAGS=...          → disable slow constant-folding warnings from large
+#                            gather/scatter ops during Larch JAX compilation
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+# Note: --xla_constant_folding_limit is not a valid XLA flag in the JAX-bundled
+# XLA version on HPC — setting it causes a FATAL abort at optimisation time.
+# TF_CPP_MIN_LOG_LEVEL=3 (above) already suppresses the XLA INFO/WARNING
+# messages that were the original target.
+# XLA_FLAGS=...          → disable slow constant-folding warnings from large
 #                            gather/scatter ops during Larch JAX compilation
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
 # Note: --xla_constant_folding_limit is not a valid XLA flag in the JAX-bundled
@@ -190,10 +201,17 @@ def _setup_logging(mode: str = 'main', arg: str = None) -> None:
     _ga_mode = mode in ('ga', 'ga_staged', 'ga_stage5_smoke')
     _use_sa = os.environ.get('GA_USE_SA', '0').strip() == '1'
     _use_bandit_sa = os.environ.get('GA_USE_BANDIT_SA', '0').strip() == '1'
+    _ga_engine = os.environ.get('GA_ENGINE', '').strip().lower()
     if _ga_mode:
-        # For GA modes: always include estimator name; prefix with sa_ vs ga_ based on SA flags.
+        # For GA modes: always include estimator name; prefix reflects the search
+        # engine. GA_ENGINE (e.g. 'agds') has precedence over the legacy SA flags,
+        # so a self-identifying prefix mirrors _resolve_search_engine.
         _estim_label = ga_estimator if ga_estimator else 'default'
-        if _use_sa or _use_bandit_sa:
+        if _ga_engine in ('agds', 'sparseea'):
+            _search_prefix = 'agds'
+        elif _ga_engine in ('ga', 'sa', 'bandit', 'bandit_sa', 'portfolio'):
+            _search_prefix = _ga_engine.replace('bandit_sa', 'bandit')
+        elif _use_sa or _use_bandit_sa:
             # sa_bandit estimator with SA flags -> 'sa_bandit' (not 'sa_ga_sa_bandit')
             if _estim_label == 'sa_bandit':
                 _estim_label = 'bandit'
@@ -226,7 +244,7 @@ def _setup_logging(mode: str = 'main', arg: str = None) -> None:
         suffix = f"{suffix}__{safe_tag}"
 
     run_root = os.environ.get('PIPELINE_RUN_ROOT', 'runs')
-    OUT_DIR = os.path.join(run_root, suffix)
+    OUT_DIR = os.environ.get('PIPELINE_RUN_DIR', '').strip() or os.path.join(run_root, suffix)
     os.makedirs(OUT_DIR,                        exist_ok=True)
     os.makedirs(os.path.join(OUT_DIR, 'plots'), exist_ok=True)
 
@@ -442,7 +460,7 @@ from stage2_day_duration        import run_stage2
 from stage3_activity_duration   import run_stage3
 from stage4_schedule_placement  import run_stage4
 from stage5_destination_choice  import run_stage5
-from stage5b_trip_destination   import run_stage5b
+from stage5b_trip_destination   import run_stage5b, trip_destination_feature_mask
 from stage6_plan_finalisation   import run_stage6
 from cdap                       import run_cdap
 from usual_location             import run_usual_locations
@@ -479,30 +497,30 @@ _TRT_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file
 NEW_POP_DIR = os.environ.get('NEW_POP_DIR') or os.path.join(_TRT_ROOT, 'new_pop')
 
 # NEW_POP_MAPPED=1: load from new_pop 507-zone files but remap OTAZ from SA2
-# code → ORDER number via demand_/sa2_to_order_crosswalk.csv, so the existing
-# 329-zone ORDER skims (downcasted_matrices_base.omx) remain the destination
-# skim while the 324-zone SA1/Lvl4 walk/bike skims supply fine-grain active-
-# mode origins.  Run demand_/20_build_sa2_to_order_crosswalk.py first, then
+# code → ORDER number via demand_/sa2_to_order_crosswalk_371.csv (371 system;
+# the legacy 330 crosswalk is never accepted — see build_synth_population).
+# Destination skims are the 371-zone 507 system. Run
+# demand_/20b_build_sa2_to_order_crosswalk_371.py first, then
 # build_synth_population.py --new-pop-mapped to pre-build the population CSV.
 NEW_POP_MAPPED = os.environ.get('NEW_POP_MAPPED', '0').strip() == '1'
 
 
 def _resolve_507_skims() -> str:
-    """Canonical 371-zone skim path (507 SA2 system).
+    """Canonical 371-zone skim path (demand_/skims_371.omx).
 
     ZONE MIGRATION (371): the legacy 330-zone downcasted_matrices_base.omx has
-    been retired — every mode now uses the 371-zone sa2_skims_507 skims. Prefer
-    the omx-spec-compliant re-encode (11_convert_skims_to_openmatrix.py output,
-    Blosc2-safe for PyTables) and fall back to the raw aggregation. read_skims
-    hard-errors if whatever loads here is not 371×371, so the 330 system can
-    never be silently reintroduced.
+    been retired — every mode now uses the 371-zone SA2 skims. Prefer
+    skims_371.omx (renamed from sa2_skims_507_omxspec.omx; identical content —
+    the omx-spec-compliant re-encode from 11_convert_skims_to_openmatrix.py,
+    Blosc2-safe for PyTables), then the pre-rename file (kept for in-flight
+    jobs), then the raw aggregation. read_skims hard-errors if whatever loads
+    here is not 371×371, so the 330 system can never be silently reintroduced.
     """
-    _p = os.path.join(_TRT_ROOT, 'demand_', 'sa2_skims_507_omxspec.omx')
-    if not os.path.exists(_p):
-        _raw = os.path.join(_TRT_ROOT, 'demand_', 'sa2_skims_507.omx')
-        if os.path.exists(_raw):
-            _p = _raw
-    return _p
+    for _cand in ('skims_371.omx', 'sa2_skims_507_omxspec.omx', 'sa2_skims_507.omx'):
+        _p = os.path.join(_TRT_ROOT, 'demand_', _cand)
+        if os.path.exists(_p):
+            return _p
+    return os.path.join(_TRT_ROOT, 'demand_', 'skims_371.omx')
 
 
 _SKIMS_507 = _resolve_507_skims()
@@ -772,25 +790,45 @@ def load_synth_all_zones(synth_dir: str = SYNTH_DIR,
     # are duplicated across zones — causing "non-unique MultiIndex" errors
     # in Larch's from_idca() in CDAP, stage5, and any other DataTree build.
     if 'person_id' not in synth.columns:
+        # Build a globally unique, COMPACT integer id: OTAZ * 1M + dense rank
+        # within the zone.
+        #
+        # Do NOT use `+ abspid` here. Measured on all 325 zone files in
+        # saved_data/zone_ids_sa2 (3,745,771 persons):
+        #   * abspid is NOT unique within a file, and
+        #   * abspid reaches 1,048,569 -- larger than the 1M stride.
+        # So `OTAZ*1e6 + abspid` overflows into the neighbouring zone's block:
+        #   OTAZ*1e6 + abspid -> 134,726 colliding rows (3,611,045 distinct).
+        # `SA2_MAIN16*1e6 + abspid` (build_synth_population.py) reduces that to
+        # 36,729 but still collides, because the abspid term itself is unsound.
+        # Dense rank within the zone is bounded (max 40,051 per OTAZ), so the
+        # 1M stride is ample and the result is collision-free, int64-safe and
+        # invariant to row order. build_synth_population.py:764-772 documents
+        # the original collision for the same reason.
         id_src = next((c for c in ['abspid', 'PERSID', 'person_id']
                        if c in synth.columns), None)
-        if id_src:
-            # Build globally unique id: OTAZ * 1_000_000 + local_id
-            # Each zone has at most ~40k persons so * 1M gives no collisions
-            synth['person_id'] = (
-                synth['OTAZ'].astype(int) * 1_000_000
-                + synth[id_src].astype(int)
-            )
-        else:
-            synth['person_id'] = np.arange(len(synth), dtype=np.int64)
+        synth['person_id'] = (
+            synth['OTAZ'].astype('int64') * 1_000_000
+            + synth.groupby('OTAZ').cumcount().astype('int64')
+        )
     else:
         # person_id already present — check for duplicates and fix if needed
+        n_uniq_before = int(synth['person_id'].nunique())
         if synth['person_id'].duplicated().any():
-            n_dup = synth['person_id'].duplicated().sum()
-            logger.warning(f"  {n_dup:,} duplicate person_ids detected — reassigning unique ids")
+            n_dup = int(synth['person_id'].duplicated().sum())
+            # duplicated().sum() counts ROWS in a duplicated group, not excess
+            # ids. With 2 distinct ids over 3.99M rows it reports 3,992,825
+            # "duplicates", which reads like a minor dedup issue when it is
+            # total corruption. Report both so the severity is visible.
+            logger.warning(
+                f"  person_id is degenerate: only {n_uniq_before:,} distinct "
+                f"value(s) across {len(synth):,} rows ({n_dup:,} rows share a "
+                f"duplicate id) — this is NOT a minor dedup issue, the incoming "
+                f"ids carry no information. Reassigning from OTAZ + rank."
+            )
             synth['person_id'] = (
-                synth['OTAZ'].astype(int) * 1_000_000
-                + synth.groupby('OTAZ').cumcount()
+                synth['OTAZ'].astype('int64') * 1_000_000
+                + synth.groupby('OTAZ').cumcount().astype('int64')
             )
     logger.info(f"  person_id: {synth['person_id'].nunique():,} unique / {len(synth):,} total")
 
@@ -1008,15 +1046,17 @@ def cdap(out, synth, landuse=None, feature_override=None):
                 pass
     synth = run_cdap(out["persons"], synth, feature_override=feature_override)
 
-    # ── Optional ActivitySim-style household coordination (gated) ─────────────
-    # Off by default (independent per-person CDAP above). CDAP_HOUSEHOLD_COORD=1
-    # re-draws each household's members JOINTLY via a 2-way interaction logit
+    # ── Optional ActivitySim-style household coordination ──────────────────
+    # ON by default (independent per-person CDAP runs first, then members are
+    # re-drawn jointly). CDAP_HOUSEHOLD_COORD=0 restores independent draws.
+    # Coordination runs via a 2-way interaction logit
     # (cdap_households.coordinate_household_cdap), so members co-determine their
     # M/N/H patterns (worker schedule alignment, child escort, home supervision)
     # instead of being independent. It sits on top of the fitted individual model
     # by consuming its per-person log-utilities (cdap_util_M/N/H) as the
-    # individual utilities; interaction coefficients are priors until estimated
-    # from HHTS (cdap_households_estimation).
+    # individual utilities; interaction coefficients come from the saved
+    # stage-0 fit when available (CDAP_HH_MODELS_PKL), else re-estimated
+    # from HHTS (cdap_households_estimation), else heuristic priors.
     #
     # CDAP_HOUSEHOLD_COORD=joint (or JOINT_TOURS=1) additionally runs the FULL
     # structural joint-tour path: joint_tour_frequency + joint_tour_participation
@@ -1026,7 +1066,7 @@ def cdap(out, synth, landuse=None, feature_override=None):
     # joint tours are saved to {OUT_DIR}/household_joint_tours.csv and reconciled
     # into the Stage-1 purpose counts in predict_stage1() (n_joint_<purpose>_out,
     # joint_tour_ids) and tagged on Stage-3 activity rows in predict_stage3().
-    _hh_mode = os.environ.get('CDAP_HOUSEHOLD_COORD', '0').strip().lower()
+    _hh_mode = os.environ.get('CDAP_HOUSEHOLD_COORD', '1').strip().lower()
     _joint_tours = (os.environ.get('JOINT_TOURS', '0').strip() == '1') \
         or _hh_mode in ('joint', '2', 'true')
     if _hh_mode in ('1', 'joint', '2', 'true') or _joint_tours:
@@ -1049,7 +1089,26 @@ def cdap(out, synth, landuse=None, feature_override=None):
                 # (SearchLibrium) and SAVE them, instead of using the heuristic
                 # priors baked into HouseholdCdapConfig. Gate CDAP_HH_ESTIMATE=0
                 # to keep the priors. Falls back to priors on any failure.
-                if os.environ.get('CDAP_HH_ESTIMATE', '1').strip() != '0':
+                # Prefer a SAVED fit when available (CDAP_HH_MODELS_PKL, else
+                # OUT_DIR/stage0_cdap_household_models.pkl from the stage-0
+                # shard): the estimated H/M/N joint tables are then baked into
+                # prediction instead of being re-estimated or ignored.
+                _cfg_loaded = False
+                _pkl_cands = [os.environ.get('CDAP_HH_MODELS_PKL', '').strip(),
+                              os.path.join(OUT_DIR, 'stage0_cdap_household_models.pkl')]
+                for _pkl in [p for p in _pkl_cands if p]:
+                    if os.path.isfile(_pkl):
+                        try:
+                            from cdap_households_estimation import load_household_cdap_config as _load_hh
+                            _cfg = _load_hh(_pkl, base=_cfg)
+                            logger.info(f"CDAP household config LOADED from saved fit → {_pkl} "
+                                        f"(no re-estimation)")
+                            _cfg_loaded = True
+                        except Exception as _e_ld:
+                            logger.warning(f"saved household CDAP load failed ({_pkl}: {_e_ld}); "
+                                           "falling through to estimation")
+                        break
+                if not _cfg_loaded and os.environ.get('CDAP_HH_ESTIMATE', '1').strip() != '0':
                     try:
                         from cdap_households_estimation import estimate_household_cdap as _est_hh
                         from cdap import build_person_profiles as _bpp
@@ -1062,12 +1121,32 @@ def cdap(out, synth, landuse=None, feature_override=None):
                                         "estimated from HHTS and saved "
                                         f"→ {OUT_DIR}/household_cdap_coefficients.csv")
                     except Exception as _ehe:
-                        logger.warning(f"household CDAP estimation failed ({_ehe}); "
-                                       "using heuristic priors")
+                        # This path silently swaps estimated coefficients for
+                        # heuristic priors, so the cause must stay visible --
+                        # logging only str(exc) hid "The truth value of a
+                        # DataFrame is ambiguous" with no file:line, which is
+                        # how two real bugs surfaced only as an opaque message.
+                        logger.warning(
+                            "household CDAP estimation failed (%s: %s); "
+                            "using heuristic priors\n%s",
+                            type(_ehe).__name__, _ehe,
+                            traceback.format_exc())
                 _before = synth['CDAP'].value_counts(normalize=True).to_dict() \
                     if 'CDAP' in synth.columns else {}
                 _coord = coordinate_household_cdap(synth, _cfg)
                 synth['CDAP'] = _coord['dap'].values
+                # Persist household-coordinated pattern types for downstream use:
+                # CDAP_HH_PATTERN = sorted member {M,N,H} pattern of the person's
+                # household (estimation-side counterpart: HHTS cdap_* + joint-tour
+                # columns from attach_cdap_to_hhts), CDAP_COORDINATED flags rows
+                # drawn jointly rather than independently.
+                try:
+                    _hhp = _coord.groupby(_hhcol)['dap'].apply(
+                        lambda s: '|'.join(sorted(s.astype(str))))
+                    synth['CDAP_HH_PATTERN'] = synth[_hhcol].map(_hhp)
+                    synth['CDAP_COORDINATED'] = True
+                except Exception as _e_hp:
+                    logger.warning(f"CDAP household-pattern columns skipped ({_e_hp})")
                 _after = synth['CDAP'].value_counts(normalize=True).to_dict()
                 logger.info(
                     "CDAP household coordination applied "
@@ -1089,14 +1168,40 @@ def cdap(out, synth, landuse=None, feature_override=None):
                         _jt_save.to_csv(_jt_out, index=False)
                         logger.info(
                             f"JOINT_TOURS: {len(_jt_save):,} joint tours → {_jt_out}")
-                        if len(_jt_save) and 'purpose' in _jt_save.columns:
-                            _jp_dist = _jt_save['purpose'].value_counts().to_dict()
-                            _jc_dist = _jt_save['composition'].value_counts().to_dict()
+                        # ── Volume sanity-check summary ─────────────────────────
+                        # Makes it easy to eyeball whether joint-tour volumes are
+                        # plausible before they fold into Stage-1 (typical ABM: a
+                        # minority of households make ~0.2-0.5 joint tours/hh).
+                        try:
+                            _n_jt = len(_jt_save)
+                            _n_hh = int(synth[_hhcol].nunique()) if _hhcol in synth.columns else 0
+                            _jt_hhcol = next((c for c in ('household_id', 'HHID', 'hhid',
+                                                          'abshid', _hhcol)
+                                              if c in _jt_save.columns), None)
+                            _hh_with = int(_jt_save[_jt_hhcol].nunique()) if _jt_hhcol else 0
+                            _rate = (_n_jt / _n_hh) if _n_hh else float('nan')
+                            _pct_hh = (100.0 * _hh_with / _n_hh) if _n_hh else float('nan')
+                            _avg_party = (
+                                float(np.mean([len(str(p).split('|'))
+                                               for p in _jt_save['participants']]))
+                                if 'participants' in _jt_save.columns and _n_jt else float('nan'))
                             logger.info(
-                                "  joint purposes: "
-                                + ", ".join(f"{k}={v}" for k, v in sorted(_jp_dist.items()))
+                                f"  volume: {_rate:.3f} joint tours/hh over {_n_hh:,} hh  |  "
+                                f"{_pct_hh:.1f}% of hh make ≥1  |  "
+                                f"avg party size {_avg_party:.2f}")
+                        except Exception as _jv_e:
+                            logger.warning(f"  joint-tour volume summary skipped: {_jv_e}")
+                        if len(_jt_save) and 'purpose' in _jt_save.columns:
+                            _jp_cnt = _jt_save['purpose'].value_counts()
+                            _jc_cnt = _jt_save['composition'].value_counts()
+                            _tot = max(int(_jp_cnt.sum()), 1)
+                            logger.info(
+                                "  joint purpose share: "
+                                + ", ".join(f"{k}={v} ({100.0*v/_tot:.1f}%)"
+                                            for k, v in _jp_cnt.sort_index().items())
                                 + "  |  composition: "
-                                + ", ".join(f"{k}={v}" for k, v in sorted(_jc_dist.items())))
+                                + ", ".join(f"{k}={v} ({100.0*v/_tot:.1f}%)"
+                                            for k, v in _jc_cnt.sort_index().items()))
                     except Exception as _jts_e:
                         logger.warning(f"  joint-tour CSV save failed: {_jts_e}")
             else:
@@ -1263,13 +1368,30 @@ def _save_stage_coef_csv(models: dict, stage_name: str, save_dir: str):
                 if hasattr(inner, 'feature_names_') and not getattr(inner, 'feature_names_', None):
                     inner.feature_names_ = obj.get('features', [])
                 _extract(key, inner)
-                # Also log OrderedLogit thresholds — these aren't in coef_ but are model params
+                # Also log OrderedLogit thresholds — these aren't in coef_ but are model params.
+                # SEs come from the estimator (delta-method threshold_std_err_ tail of
+                # t_stat_/p_value_; NOT a SearchLibrium artefact — OrderedLogit is
+                # scipy L-BFGS-B with a numerical-Hessian inference block).
                 if hasattr(inner, 'thresholds_') and inner.thresholds_ is not None:
+                    _thr_se_raw = getattr(inner, 'threshold_std_err_', None)
+                    _thr_t_raw = getattr(inner, 't_stat_', None)
+                    _thr_p_raw = getattr(inner, 'p_value_', None)
+                    _thr_se = (np.asarray(_thr_se_raw, dtype=float).ravel().tolist()
+                               if _thr_se_raw is not None else [])
+                    _thr_t = (np.asarray(_thr_t_raw, dtype=float).ravel().tolist()
+                              if _thr_t_raw is not None else [])
+                    _thr_p = (np.asarray(_thr_p_raw, dtype=float).ravel().tolist()
+                              if _thr_p_raw is not None else [])
+                    _n_thr = len(list(inner.thresholds_))
+                    _n_beta = max(len(_thr_t) - _n_thr, 0) if _thr_t else 0
                     for j, thresh in enumerate(inner.thresholds_):
+                        _se = float(_thr_se[j]) if j < len(_thr_se) else float('nan')
+                        _tt = float(_thr_t[_n_beta + j]) if _n_beta + j < len(_thr_t) else float('nan')
+                        _pv = float(_thr_p[_n_beta + j]) if _n_beta + j < len(_thr_p) else float('nan')
                         rows.append({'stage': stage_name, 'segment': key,
                                      'param': f'threshold_{j}', 'value': float(thresh),
-                                     'std_err': float('nan'), 't_stat': float('nan'),
-                                     'p_value': float('nan'), 'source': 'ordered_logit_threshold'})
+                                     'std_err': _se, 't_stat': _tt,
+                                     'p_value': _pv, 'source': 'ordered_logit_threshold'})
                 return
             coef  = obj.get('coef', obj.get('coefficients', {}))
             # MXL result uses 'std_err' (not 'std_errors'); check all variants
@@ -1325,7 +1447,8 @@ def _save_stage_coef_csv(models: dict, stage_name: str, save_dir: str):
 
             if not feats:
                 feats = [f'x{i}' for i in range(len(coef_flat))]
-            offset = 1 if len(std_err) >= len(coef_flat) + 1 else 0
+            offset = (1 if intercept is not None and
+                      len(std_err) >= len(coef_flat) + 1 else 0)
             for i, (feat, val) in enumerate(zip(feats, coef_flat)):
                 rows.append({
                     'stage':   stage_name,
@@ -2426,6 +2549,7 @@ def estimate_stage5(out, landuse):
     # starting point than the hand-coded SEGMENT_COEFFICIENTS defaults.
     # This typically reduces estimation time and improves fit (fewer local optima).
     _warm_coefs: dict = {}   # {seg: {coef_name: value}}
+    _ga_mode_dist: dict = {}
     try:
         from stage5_destination_choice import SEGMENT_COEFFICIENTS as _SC
         import importlib
@@ -2460,6 +2584,7 @@ def estimate_stage5(out, landuse):
                     )
                     _ga_mode_feats = None
                     _ga_dest_feats = None
+                    _ga_mode_dist = {}
                     _mode_feats = None
                     _dest_feats = None
                 else:
@@ -2477,12 +2602,16 @@ def estimate_stage5(out, landuse):
                     # Store feature overrides; these are passed to _run_segment below
                     _ga_mode_feats = _mode_feats
                     _ga_dest_feats = _dest_feats
+                    _ga_mode_dist = getattr(_s5_ga, 'metadata', {}).get(
+                        'mode_distribution_by_segment', {})
             else:
                 _ga_mode_feats = None
                 _ga_dest_feats = None
+                _ga_mode_dist = {}
         else:
             _ga_mode_feats = None
             _ga_dest_feats = None
+            _ga_mode_dist = {}
 
         # Priority 2: previous stage5_models.pkl — extract fitted coefficients
         # as warm starts even if no GA results are present.
@@ -2521,6 +2650,7 @@ def estimate_stage5(out, landuse):
         logger.debug(f"  Warm-start setup failed: {_ws_e}")
         _ga_mode_feats = None
         _ga_dest_feats = None
+        _ga_mode_dist = {}
 
     segments = ['work', 'edu', 'nonmand']
     models = {}
@@ -2535,6 +2665,7 @@ def estimate_stage5(out, landuse):
                 skims, skim_df, seed=42,
                 mode_feature_override=_ga_mode_feats,
                 dest_feature_override=_ga_dest_feats,
+                mode_distribution_override=_ga_mode_dist.get(seg, {}),
                 coef_warm_start=_seg_warm,     # NEW: inject previous coefficients
             )
             if result:
@@ -3079,7 +3210,9 @@ def _trips_to_seg_table(trips: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFr
                      if c in t.columns), None)
     from stage5_destination_choice import MODE_MAP
     if mode_col and 'tour_mode' not in t.columns:
-        t['tour_mode'] = t[mode_col].map(MODE_MAP).fillna(2).astype(int)
+        # Unknown labels → DA (1), consistent with the missing-column default
+        # (verified zero unmapped HHTS labels; behavior-neutral on real data).
+        t['tour_mode'] = t[mode_col].map(MODE_MAP).fillna(1).astype(int)
     elif 'tour_mode' not in t.columns:
         t['tour_mode'] = 1
 
@@ -3616,6 +3749,41 @@ def predict_stage1(synth, models=None, hhts_persons=None, hhts_tours=None):
         models = load_models(os.path.join(OUT_DIR, 'stage1_models.pkl'))
     logger.info(f"  Predicting activity frequency for {len(synth):,} persons...")
     result = predict_activity_frequency(synth, models)
+    # ── Joint copula counts → simulated tours ──────────────────────────
+    # When the Stage-1 multivariate fit exists, replace the independent
+    # per-purpose draws above with JOINT (copula-correlated) draws, so the
+    # dependence between activity types flows into stage1_output.csv and
+    # everything downstream (stages 2-4, simulated tours). Guarded: any
+    # failure keeps the separate-model counts. Disable with GA_MV_PREDICT=0.
+    if os.environ.get('GA_MV_PREDICT', '1').strip() == '1':
+        _mv_path = os.path.join(OUT_DIR, 'stage1_multivariate_fit.pkl')
+        if os.path.exists(_mv_path):
+            try:
+                from stage1_multivariate import predict_joint_counts
+                from stage1_activity_frequency import (
+                    PURPOSES as _MV_PURPOSES,
+                    NONMAND_PURPOSES as _MV_NONMAND,
+                    MAX_COUNT as _MV_MAX,
+                )
+                _joint = predict_joint_counts(result, bundle_path=_mv_path,
+                                              seed=42)
+                for _p in _MV_PURPOSES:
+                    _c = f'n_{_p}_out'
+                    result[_c] = _joint[_c].reindex(
+                        result.index).fillna(0).astype(int).values
+                _nm = [f'n_{_p}_out' for _p in _MV_NONMAND]
+                result['n_nonmand_out'] = result[_nm].sum(axis=1).clip(
+                    upper=int(_MV_MAX.get('nonmand', 18))).astype(int)
+                logger.info("  Stage 1 counts replaced with joint copula "
+                            "draws (MV fit) — dependence now in "
+                            "simulated tours")
+            except Exception as _mv_e:
+                logger.warning(f"  Joint MV draws skipped ({_mv_e!r}) — "
+                               f"keeping independent per-purpose counts")
+        else:
+            logger.info("  No stage1_multivariate_fit.pkl — independent "
+                        "per-purpose counts (fit the MV model with "
+                        "GA_ESTIMATOR=metacount_mv to enable joint draws)")
     if hhts_persons is not None and hhts_tours is not None:
         try:
             result = calibrate_activity_rates(
@@ -3737,6 +3905,17 @@ def predict_stage4(activities, models=None):
     logger.info(f"  Building schedules for {len(activities):,} activities "
                 f"({activities['person_id'].nunique():,} persons)...")
     result = predict_schedule(activities, models)
+    # Optional OR-Tools CP-SAT repair (pass 1, pre-dest): no-op unless
+    # SCHEDULE_OPTIMIZE=1 and ortools importable. Enforces day-window /
+    # no-overlap feasibility while keeping MNL order. Pass 2 (post dest/mode)
+    # can be run downstream via schedule_optimizer.maybe_repair_schedules
+    # with travel_col='travel_min' once realized times exist.
+    try:
+        from schedule_optimizer import maybe_repair_schedules as _sched_repair
+        _n_overlap_before = None
+        result = _sched_repair(result)
+    except Exception as _so_e:
+        logger.warning('  schedule repair skipped (non-fatal): %s', _so_e)
     result.to_csv(os.path.join(OUT_DIR, 'stage4_output.csv'), index=False)
     logger.info(f"  ✓  Stage 4 output: {len(result):,} rows → {OUT_DIR}/stage4_output.csv")
     _write_stage_checkpoint_report(
@@ -4143,8 +4322,74 @@ def _resolve_stage5b_reuse_path() -> Optional[str]:
     return None
 
 
+def _stage51_tripdest_mask(ga_results) -> Optional[list[int]]:
+    """Resolve the independent Stage 51 destination selection for Stage 5b."""
+    if ga_results is None:
+        return None
+    results = getattr(ga_results, 'results', None)
+    stage51 = results.get(51) if isinstance(results, dict) else None
+    features = getattr(stage51, 'best_features', None)
+    selected = features.get('dest') if isinstance(features, dict) else None
+    if selected is None:
+        return None
+    try:
+        return trip_destination_feature_mask(selected)
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            "Stage 51 trip-destination selection is invalid; "
+            "using legacy Stage 5b specification: %s", exc,
+        )
+        return None
+
+
+def stage5b_logsums_from_stage5_models(models):
+    """Combine live Stage 5 segment logsum surfaces for Stage 5b."""
+    if not isinstance(models, dict):
+        return None
+
+    surfaces = []
+    for result in models.values():
+        if not isinstance(result, dict):
+            continue
+        surface = result.get('logsums')
+        if surface is None or not hasattr(surface, 'coords') or not hasattr(surface, 'values'):
+            continue
+        try:
+            if 'cases' not in surface.coords or 'zones' not in surface.coords:
+                continue
+            surface = surface.transpose('cases', 'zones')
+            if np.asarray(surface.values).ndim != 2:
+                continue
+            surfaces.append(surface)
+        except Exception as exc:
+            logger.debug("Stage 5b: skipped invalid Stage 5 logsum surface: %s", exc)
+
+    if not surfaces:
+        return None
+    if len(surfaces) == 1:
+        return surfaces[0]
+
+    try:
+        import xarray as xr
+        return xr.concat(surfaces, dim='cases')
+    except Exception as exc:
+        logger.warning("Stage 5b: could not combine Stage 5 logsum surfaces: %s", exc)
+        return None
+
+
 @timer("Stage 5b — trip-level destination choice")
-def stage5b(out, scheduled_dest, landuse, reuse_models_path=None):
+def stage5b(
+    out,
+    scheduled_dest,
+    landuse,
+    reuse_models_path=None,
+    g_tripdest=None,
+    calibration_trips=None,
+    prediction_persons=None,
+    validate=True,
+    return_result=False,
+    logsums=None,
+):
     """Estimate + predict trip-level intermediate-stop destination choice.
 
     Used by GA_main / GA_STAGED (combined estimate+predict pattern).
@@ -4153,6 +4398,19 @@ def stage5b(out, scheduled_dest, landuse, reuse_models_path=None):
 
     When GA_STAGED_REUSE_ESTIMATOR=1 and a prior stage5b_models.pkl can be
     resolved, skips re-estimation and predicts using the reused coefficients.
+
+    ``g_tripdest`` is the stage-51 trip-destination GA bit vector over
+    ``stage5b_trip_destination.GA_CANDIDATE_VARS`` (None = legacy default).
+
+    ``calibration_trips`` optionally separates observed HHTS calibration from
+    ``scheduled_dest`` synthetic prediction. When supplied, models are fitted
+    on the observed table and the saved bundle is required for prediction.
+    ``prediction_persons`` supplies person covariates for the prediction
+    population; it defaults to ``out["persons"]`` for legacy callers.
+    ``return_result=True`` returns the full Stage 5b result dictionary instead
+    of only the augmented trip DataFrame.
+    ``logsums`` optionally supplies the live Stage 5 case-by-destination mode
+    logsum surface for calibration and in-sample prediction.
     """
     if reuse_models_path is None:
         reuse_models_path = _resolve_stage5b_reuse_path()
@@ -4161,17 +4419,118 @@ def stage5b(out, scheduled_dest, landuse, reuse_models_path=None):
     # skim) instead of falling back to the trips' TAZ codes — that fallback keyed
     # on a >371 zone range and overflowed the 371×371 skim (index 485 crash).
     _s5b_zone_col = 'ORDER' if 'ORDER' in getattr(landuse, 'columns', []) else 'zone_id'
+    _calibration_result = None
+    _hhts_prediction_result = None
+
+    if calibration_trips is not None and reuse_models_path is None:
+        logger.info(
+            "Stage 5b: estimating on observed calibration trips before "
+            "predicting synthetic trips (%d rows)",
+            len(calibration_trips),
+        )
+        _calibration_result = run_stage5b(
+            trips              = calibration_trips,
+            persons            = out["persons"],
+            skims_path         = PIPELINE_SKIMS_PATH,
+            landuse            = landuse,
+            zone_id_col        = _s5b_zone_col,
+            output_dir         = OUT_DIR,
+            predict            = False,
+            validate           = validate,
+            save_models        = True,
+            g_tripdest         = g_tripdest,
+            logsums            = logsums,
+        )
+        _calibration_path = os.path.join(OUT_DIR, 'stage5b_models.pkl')
+        if not os.path.isfile(_calibration_path):
+            raise RuntimeError(
+                "Stage 5b calibration completed without writing "
+                f"the fitted model bundle: {_calibration_path}"
+            )
+        reuse_models_path = _calibration_path
+        logger.info(
+            "Stage 5b: using observed calibration bundle for prediction "
+            "(bic_total=%s)",
+            _calibration_result.get('bic_total', float('nan')),
+        )
+
+    if calibration_trips is not None:
+        _hhts_prediction_dir = os.path.join(OUT_DIR, 'stage5b_hhts_prediction')
+        logger.info(
+            "Stage 5b: predicting observed HHTS trips in-sample for paper "
+            "validation (%d rows)",
+            len(calibration_trips),
+        )
+        _hhts_prediction_result = run_stage5b(
+            trips              = calibration_trips,
+            persons            = out["persons"],
+            skims_path         = PIPELINE_SKIMS_PATH,
+            landuse            = landuse,
+            zone_id_col        = _s5b_zone_col,
+            output_dir         = _hhts_prediction_dir,
+            reuse_models_path  = reuse_models_path,
+            g_tripdest         = g_tripdest,
+            predict            = True,
+            validate           = True,
+            save_models        = False,
+            logsums            = logsums,
+        )
+        logger.info(
+            "Stage 5b: HHTS in-sample prediction written to %s",
+            _hhts_prediction_dir,
+        )
+
     result = run_stage5b(
         trips              = scheduled_dest,
-        persons            = out["persons"],
+        persons            = (prediction_persons
+                              if prediction_persons is not None
+                              else out["persons"]),
         skims_path         = PIPELINE_SKIMS_PATH,
         landuse            = landuse,
         zone_id_col        = _s5b_zone_col,
         output_dir         = OUT_DIR,
         reuse_models_path  = reuse_models_path,
+        g_tripdest         = g_tripdest,
+        validate           = validate if calibration_trips is None else False,
+        logsums            = logsums,
     )
+    if isinstance(result, dict) and calibration_trips is not None:
+        result.setdefault('metadata', {})
+        result['metadata'].update({
+            'calibration_source': 'observed_hhts',
+            'prediction_source': 'synthetic_stage5',
+            'calibration_model_path': reuse_models_path,
+            'calibration_bic_total': _calibration_result.get(
+                'bic_total', float('nan')
+            ) if _calibration_result is not None else float('nan'),
+        })
+        if _hhts_prediction_result is not None:
+            _hhts_prediction_dir = os.path.join(OUT_DIR, 'stage5b_hhts_prediction')
+            _hhts_validation = _hhts_prediction_result.get(
+                'validation', pd.DataFrame()
+            )
+            result['metadata'].update({
+                'hhts_prediction_source': 'observed_hhts_in_sample',
+                'hhts_prediction_output_dir': _hhts_prediction_dir,
+                'hhts_prediction_csv': os.path.join(
+                    _hhts_prediction_dir, 'stage5b_trips.csv'
+                ),
+                'hhts_validation_csv': os.path.join(
+                    _hhts_prediction_dir, 'stage5b_validation.csv'
+                ),
+                'hhts_prediction_n_rows': len(
+                    _hhts_prediction_result.get('trips', pd.DataFrame())
+                ),
+                'hhts_validation_n_rows': len(_hhts_validation),
+            })
+        if _calibration_result is not None:
+            result['calibration_validation'] = _calibration_result.get(
+                'validation', pd.DataFrame()
+            )
     # run_stage5b always returns a dict {'trips': df, ...}; extract the DataFrame
     # so callers (stage6, GA paths) always receive a DataFrame, not a dict.
+    if return_result:
+        return result
     if isinstance(result, dict):
         return result.get('trips', scheduled_dest)
     return result
@@ -4215,6 +4574,31 @@ def stage6(out, scheduled_dest, landuse,
         save_dir           = OUT_DIR,
     )
     logger.info(f"  Per-zone folders: {OUT_DIR}/zones/zone_*/")
+
+    # ── POLARIS-style micro-location placement (MICRO_LOCATIONS=1) ───────────
+    # Keep the SA2-level destination models, but place every activity at a
+    # specific micro-location inside its chosen SA2 by land use (home→is_home,
+    # work→is_work, edu→is_school, discretionary→is_discretionary, ∝ lu_area).
+    # Anchors (home/workplace/school) are drawn once per person and reused. Adds
+    # location_id + loc_x/loc_y to the final plan for microsimulation. Non-fatal;
+    # needs saved_data/location_table.csv (build_location_table.py / job).
+    if os.environ.get('MICRO_LOCATIONS', '0') == '1':
+        try:
+            from micro_location_placement import MicroLocator
+            _lt = os.environ.get('LOCATION_TABLE', 'saved_data/location_table.csv')
+            if os.path.exists(_lt):
+                _ml = MicroLocator(_lt)
+                _pp = _ml.assign_anchor_locations(out['persons'])
+                final_plan = _ml.place_activities(final_plan, _pp)
+                final_plan.to_csv(os.path.join(OUT_DIR, 'stage6_output.csv'), index=False)
+                logger.info("  MICRO_LOCATIONS: activities placed at sub-zonal locations "
+                            f"→ location_id/loc_x/loc_y (table {_lt})")
+            else:
+                logger.warning(f"  MICRO_LOCATIONS=1 but {_lt} not found — run "
+                               "job_location_table.pbs first; skipping micro-placement")
+        except Exception as _mle:
+            logger.warning(f"  micro-location placement skipped ({_mle})")
+
     _write_stage_checkpoint_report(
         stage_tag='legacy_stage6',
         title='Legacy Stage 6 - Finalisation and Export',
@@ -4227,6 +4611,77 @@ def stage6(out, scheduled_dest, landuse,
         },
         table=final_plan,
     )
+
+    # ── Stage 7: Parking Choice (POLARIS-style) ────────────────────────────────
+    # Adds precise parking location + walk leg for every auto trip.
+    # Output compatible with MATSim/SUMO (exact parking coordinates, walk access).
+    if os.environ.get('STAGE7_PARKING', '1') == '1':
+        try:
+            from stage7_parking_choice import stage7 as _stage7
+            _loc_table = None
+            _lt_path = os.environ.get('LOCATION_TABLE', 'saved_data/location_table.csv')
+            if os.path.exists(_lt_path):
+                _loc_table = pd.read_csv(_lt_path)
+            final_plan = _stage7(
+                plan=final_plan,
+                persons=out['persons'],
+                landuse=landuse,
+                location_table=_loc_table,
+                skims_path=PIPELINE_SKIMS_PATH,
+                skim_lookup=skim_lookup,
+                output_dir=OUT_DIR,
+            )
+            logger.info("  Stage 7 parking choice complete")
+        except Exception as _s7e:
+            logger.warning(f"  Stage 7 parking choice skipped ({_s7e})")
+
+    # ── DTA Feedback Loop: Run MATSim/SUMO → new skims → re-estimate ────────────
+    # Iterate: demand model → DTA → updated skims → demand model
+    # Controlled by: DTA_FEEDBACK_ITERS (default 0 = no feedback), DTA_ENGINE (matsim|sumo|dynust)
+    _dta_iters = int(os.environ.get('DTA_FEEDBACK_ITERS', '0'))
+    if _dta_iters > 0:
+        logger.info(f"Starting DTA feedback loop: {_dta_iters} iterations")
+        try:
+            from dta_feedback import run_dta_feedback_loop
+            final_plan, updated_skims = run_dta_feedback_loop(
+                plan=final_plan,
+                persons=out['persons'],
+                landuse=landuse,
+                skim_path=PIPELINE_SKIMS_PATH,
+                iterations=_dta_iters,
+                engine=os.environ.get('DTA_ENGINE', 'matsim'),
+                output_dir=OUT_DIR,
+            )
+            logger.info(f"DTA feedback loop complete; updated skims at {updated_skims}")
+        except Exception as _dta_e:
+            logger.warning(f"DTA feedback loop failed ({_dta_e})")
+
+    # ── MATSim export (PIPELINE_MATSIM=1, default on) ────────────────────────
+    # Convert the final activity plan into a runnable MATSim scenario
+    # (plans.xml + facilities.xml + config.xml) under OUT_DIR/matsim, using the
+    # pipeline's own zone centroids reprojected to GDA94/MGA Zone 56
+    # (EPSG:28356). Non-fatal — a MATSim export failure never fails the run.
+    if os.environ.get('PIPELINE_MATSIM', '1').strip() != '0':
+        try:
+            from matsim_export import export_matsim
+            _crs = os.environ.get('MATSIM_CRS', 'EPSG:28356')
+            # Sampling: on a full synthetic population (~2M) a 100% plans.xml is
+            # multi-GB. Default to MATSIM_SAMPLE_FRAC (unset = full); MATSIM_MAX_PERSONS
+            # is a hard cap. Set MATSIM_SAMPLE_FRAC=0.1 for a 10% sample.
+            _sf = os.environ.get('MATSIM_SAMPLE_FRAC', '').strip()
+            _mp = os.environ.get('MATSIM_MAX_PERSONS', '').strip()
+            _mani = export_matsim(
+                OUT_DIR, out_dir=os.path.join(OUT_DIR, 'matsim'),
+                landuse=landuse, crs=_crs,
+                sample_frac=float(_sf) if _sf else None,
+                max_persons=int(_mp) if _mp else None)
+            logger.info(
+                f"  MATSim export: {_mani['n_persons_out']}/{_mani.get('n_persons_total','?')} "
+                f"persons, {_mani['n_activities']} activities, {_mani['n_legs']} legs "
+                f"→ {OUT_DIR}/matsim (crs={_mani['crs']}, sample_frac={_mani.get('sample_frac')})")
+        except Exception as _mx:
+            logger.warning(f"  MATSim export skipped ({_mx})")
+
     return final_plan, trips_aimsun
 
 
@@ -4374,7 +4829,19 @@ def ga_all(out, landuse):
     os.environ.setdefault('GA_ESTIMATOR_FALLBACK', '0')
     os.environ.setdefault('GA_STAGE5_FALLBACK_TO_MAIN', '0')
     os.environ.setdefault('GA_STAGE5_PREFIT_BASELINE', '1')
-    _run_ga_stages_with_checkpoints(out, landuse)
+    all_ga = _run_ga_stages_with_checkpoints(out, landuse)
+
+    # The staged entry point exports these artifacts after estimation, but the
+    # regular `ga` entry point historically discarded the result and never did.
+    ga_reports_dir = os.path.join(OUT_DIR, 'ga_reports')
+    try:
+        all_ga.export_reports(ga_reports_dir)
+        all_ga.plot_all(save_path=os.path.join(OUT_DIR, 'plots', 'ga_all_stages.png'))
+        logger.info(f"GA reports exported → {ga_reports_dir}/")
+        logger.info(f"GA combined plot   → {OUT_DIR}/plots/ga_all_stages.png")
+    except Exception as _gae:
+        logger.warning(f"GA report/plot export failed: {_gae}", exc_info=True)
+    return all_ga
 
 
 def _save_ga_checkpoint(all_ga, stage_id=None, failed=False):
@@ -4388,11 +4855,15 @@ def _save_ga_checkpoint(all_ga, stage_id=None, failed=False):
         'timestamp': pd.Timestamp.now().isoformat(),
     }
 
-    # Keep a rolling partial plus the canonical ga_results.pkl.
-    for _path in (
-        os.path.join(OUT_DIR, 'ga_results_checkpoint.pkl'),
-        os.path.join(OUT_DIR, 'ga_results.pkl'),
-    ):
+    # Quarantine: a FAILED run must never leave a live ga_results.pkl behind.
+    # Presence-checks downstream (resume driver, merge) mistook an empty
+    # AllStagesResult for success (observed: stage 5 blessed "complete" with
+    # zero completed segments). Failed artifacts go under .FAILED names;
+    # per-segment checkpoints are untouched so resume/salvage still work, and
+    # the deliberate salvage path (failed=False + PARTIAL marker) is unaffected.
+    _suffix = '.FAILED.pkl' if failed else '.pkl'
+    for _base in ('ga_results_checkpoint', 'ga_results'):
+        _path = os.path.join(OUT_DIR, _base + _suffix)
         try:
             with open(_path, 'wb') as _f:
                 pickle.dump(all_ga, _f)
@@ -4412,6 +4883,91 @@ def _save_ga_checkpoint(all_ga, stage_id=None, failed=False):
         all_ga.export_reports(_reports_dir)
     except Exception as _e:
         logger.warning(f"Could not export GA checkpoint reports: {_e}")
+
+    # Attempt to generate convergence plots from the checkpoint (including
+    # partial results). This ensures a visual artifact exists even if the run
+    # is killed by walltime mid-search. Silently skip if plotting fails.
+    try:
+        _plots_dir = os.path.join(OUT_DIR, 'plots')
+        os.makedirs(_plots_dir, exist_ok=True)
+        all_ga.plot_all(save_path=os.path.join(_plots_dir, 'ga_all_stages.png'))
+        logger.debug(f"GA checkpoint plot saved → {_plots_dir}/ga_all_stages.png")
+    except Exception as _e:
+        logger.debug(f"GA checkpoint plot skipped: {_e}")
+
+
+def regenerate_ga_plots_from_pkl(ga_results_pkl: str, out_dir: str = None) -> str:
+    """
+    Regenerate GA convergence plots from a saved ga_results.pkl.
+    
+    Useful for salvaging visual artifacts from a partial/walltime-killed run.
+    
+    Parameters
+    ----------
+    ga_results_pkl : path to ga_results.pkl (can be partial)
+    out_dir : output directory for plots (defaults to dirname of pkl)
+    
+    Returns
+    -------
+    Path to the generated plot directory
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import pickle
+    
+    if out_dir is None:
+        out_dir = os.path.dirname(ga_results_pkl)
+    plots_dir = os.path.join(out_dir, 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    with open(ga_results_pkl, 'rb') as f:
+        all_ga = pickle.load(f)
+    
+    # Generate combined all-stages plot
+    try:
+        all_ga.plot_all(save_path=os.path.join(plots_dir, 'ga_all_stages.png'))
+        logger.info(f"GA combined plot saved → {plots_dir}/ga_all_stages.png")
+    except Exception as e:
+        logger.warning(f"GA combined plot failed: {e}")
+    
+    # Generate per-stage plots (with segment subplots if available)
+    for stage in [0, 1, 2, 3, 4, 5, 51]:
+        res = all_ga.results.get(stage)
+        if res is None:
+            continue
+        
+        try:
+            seg_results = getattr(res, 'metadata', {}).get('segment_results', {})
+            if seg_results:
+                n = len(seg_results)
+                cols = 2
+                rows = (n + cols - 1) // cols
+                fig, axes = plt.subplots(rows, cols, figsize=(13, 4.5 * rows),
+                                         facecolor='white', squeeze=False)
+                axes = axes.flatten()
+                for i, (seg_label, seg_res) in enumerate(sorted(seg_results.items())):
+                    if i < len(axes):
+                        seg_res.plot_convergence(ax=axes[i], segment_label=seg_label)
+                for j in range(len(seg_results), len(axes)):
+                    axes[j].set_visible(False)
+                fig.suptitle(f'GA Variable Selection — Stage {stage}', fontsize=13,
+                             fontweight='bold', y=1.01)
+            else:
+                fig, ax = plt.subplots(figsize=(10, 4.5), facecolor='white')
+                res.plot_convergence(ax=ax)
+                fig.suptitle(f'GA Variable Selection — Stage {stage}', fontsize=13,
+                             fontweight='bold', y=1.01)
+            
+            plt.tight_layout()
+            save_path = os.path.join(plots_dir, f'ga_stage{stage}.png')
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            logger.info(f"GA stage {stage} plot saved → {save_path}")
+        except Exception as e:
+            logger.warning(f"GA stage {stage} plot failed: {e}")
+    
+    return plots_dir
 
 
 def _format_ga_checkpoint_summary(res) -> dict:
@@ -4539,8 +5095,41 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                 headers = "".join(f"<th>{c}</th>" for c in _df_coef.columns)
                 html_body = (f"<table border='1' style='border-collapse:collapse;font-size:0.9em'>"
                              f"<thead><tr>{headers}</tr></thead><tbody>{rows_html}</tbody></table>")
+                # ── Stamp what the GA searched-and-selected into the report ───
+                # Without this the HTML is indistinguishable from a default-spec
+                # fit; with it, any future regression where the GA override fails
+                # to reach the refit is immediately visible.
+                _feat_html = ""
+                try:
+                    import html as _html_mod
+                    _bf = getattr(res, 'best_features', None)
+                    _fm = str(getattr(res, 'fitness_metric', '') or '')
+
+                    def _fmt_feat_list(vals):
+                        return ', '.join(str(v) for v in (vals or [])) or '(none)'
+
+                    if isinstance(_bf, dict):
+                        _feat_html = (
+                            "<p style='font-size:0.85em;color:#333;background:#f5f7fa;"
+                            "padding:8px;border-left:3px solid #2c3e50'>"
+                            "<b>GA-selected features</b> <i>("
+                            f"{_html_mod.escape(_fm)}</i>):<br>"
+                            + "<br>".join(
+                                f"<b>{_html_mod.escape(str(k))}</b>: "
+                                f"{_html_mod.escape(_fmt_feat_list(v))}"
+                                for k, v in _bf.items())
+                            + "</p>")
+                    elif _bf:
+                        _feat_html = (
+                            "<p style='font-size:0.85em;color:#333;background:#f5f7fa;"
+                            "padding:8px;border-left:3px solid #2c3e50'>"
+                            "<b>GA-selected features</b> <i>("
+                            f"{_html_mod.escape(_fm)}</i>): "
+                            f"{_html_mod.escape(_fmt_feat_list(list(_bf)))}</p>")
+                except Exception:
+                    _feat_html = ""
                 with open(_html_path, 'w', encoding='utf-8') as _fh:
-                    _fh.write(f"<html><body><h2>GA {stage_name} coefficients</h2>{html_body}</body></html>")
+                    _fh.write(f"<html><body><h2>GA {stage_name} coefficients</h2>{_feat_html}{html_body}</body></html>")
                 logger.info(f"GA {stage_name} coefficients HTML → {_html_path}")
         except Exception as _he:
             logger.warning(f"GA {stage_name} HTML write failed: {_he}")
@@ -4569,6 +5158,33 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                 for feat in (_s0_summary['best_features'] or []):
                     _f.write(f"  {feat}\n")
             logger.info(f"GA stage0 (CDAP) text report → {_s0_txt}")
+
+            # ── Joint household CDAP, stratified by household size 1..5 ──────
+            # ActivitySim estimates one COORDINATED plan per household: the
+            # alternatives are the product of every member's {M,N,H} pattern,
+            # with 2/3/4/5-way intra-household interaction coefficients. This
+            # replaces the heuristic priors in HouseholdCdapConfig with
+            # estimated behaviour and writes its own coefficient report here.
+            # Runs BEFORE the individual-CDAP HTML is built so the report's
+            # cross-link to stage0_cdap_household_coefficients.html is live.
+            if os.environ.get('CDAP_HH_JOINT', '1') == '1':
+                try:
+                    from cdap_households_estimation import (
+                        estimate_joint_cdap_by_hh_size as _est_jhh,
+                        save_joint_cdap_html as _jhh_html,
+                    )
+                    _jhh = _est_jhh(out['persons'], out['tours'])
+                    _jhh_pkl = os.path.join(OUT_DIR, 'stage0_cdap_household_models.pkl')
+                    with open(_jhh_pkl, 'wb') as _jf:
+                        pickle.dump(_jhh, _jf)
+                    _jhh_html(_jhh, OUT_DIR)   # stage0_cdap_household_coefficients.html
+                    logger.info(
+                        f"GA stage0 joint household CDAP (sizes "
+                        f"{sorted((_jhh.get('sizes') or {}).keys())}) → {_jhh_pkl}")
+                except Exception as _jhh_e:
+                    logger.warning(
+                        f"Joint household-size CDAP estimation failed "
+                        f"(individual CDAP unaffected): {_jhh_e}", exc_info=True)
 
             # Fit the final CDAP model with the GA-winning features and persist
             # models + coefficients into the stage directory (mirrors stages 1-5).
@@ -4616,9 +5232,47 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                         html_body = (
                             f"<table border='1' style='border-collapse:collapse;font-size:0.9em'>"
                             f"<thead><tr>{headers}</tr></thead><tbody>{rows_html}</tbody></table>")
+                        # Cross-links: the JOINT household CDAP report (written
+                        # by this same job — see CDAP_HH_JOINT block below) and
+                        # the household / joint-tour coefficient report (written
+                        # by cdap_households_estimation when CDAP_HOUSEHOLD_COORD
+                        # is enabled in the prediction job).
+                        _jhh_html = os.path.join(OUT_DIR, 'stage0_cdap_household_coefficients.html')
+                        _hh_html = os.path.join(OUT_DIR, 'household_cdap_coefficients.html')
+                        _links = []
+                        if os.path.exists(_jhh_html):
+                            _links.append(
+                                "<a href='stage0_cdap_household_coefficients.html'>"
+                                "<b>Joint household CDAP by size (1–5) — estimated "
+                                "this run</b></a> (coordinated M/N/H plan per "
+                                "household size, 2/3/4/5-way interaction "
+                                "coefficients)")
+                        else:
+                            _links.append(
+                                "<span style='color:#666'>Joint household CDAP "
+                                "(<code>stage0_cdap_household_coefficients.html</code>) "
+                                "not found — the CDAP_HH_JOINT block may have "
+                                "failed; check the job log.</span>")
+                        if os.path.exists(_hh_html):
+                            _links.append(
+                                "<a href='household_cdap_coefficients.html'>"
+                                "Household &amp; joint-tour coefficients</a> "
+                                "(DAP utilities, joint-tour frequency / "
+                                "participation / purpose)")
+                        else:
+                            _links.append(
+                                "<span style='color:#666'>Joint-tour coefficients "
+                                "(<code>household_cdap_coefficients.html</code>) "
+                                "are written by the prediction job when "
+                                "<code>CDAP_HOUSEHOLD_COORD=1</code>.</span>")
+                        _joint_link = ("<p style='font-size:0.95em'>→ "
+                                       + " | ".join(_links) + "</p>")
                         with open(_s0_html_path, 'w', encoding='utf-8') as _fh:
                             _fh.write(
                                 f"<html><body><h2>GA stage0 CDAP coefficients</h2>"
+                                f"<p style='color:#555'>Individual person-level M/N/H utilities. "
+                                f"Household coordination &amp; joint-tour coefficients are reported "
+                                f"separately.</p>{_joint_link}"
                                 f"{html_body}</body></html>")
                     logger.info(
                         f"GA stage0 CDAP model → {_s0_model_pkl}  "
@@ -4627,11 +5281,14 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                     logger.warning(
                         f"GA stage0 CDAP model fit/save failed (feature JSON + txt "
                         f"already saved): {_s0_me}", exc_info=True)
+
         elif sid == 1:
             from stage1_activity_frequency import estimate_frequency_models
             models = estimate_frequency_models(
                 out['tours'], out['persons'],
-                feature_override=best_feats if isinstance(best_feats, list) else None,
+                # GA stage-1 best_features is a purpose-keyed dict; the
+                # estimator resolves per-purpose lists from it.
+                feature_override=best_feats if isinstance(best_feats, (list, dict)) else None,
                 landuse=landuse,
             )
             _persist(models, 'stage1')
@@ -4659,14 +5316,23 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
             pd_df = aggregate_person_day(out['tours'], out['persons'])
             models = estimate_day_models(
                 pd_df,
-                feature_override=best_feats if isinstance(best_feats, list) else None,
+                # GA stage-2 best_features is a target-keyed dict
+                # ('start' / 'end' / 'budget'); persons= lets the estimator
+                # recreate the engineered search-frame columns.
+                feature_override=best_feats if isinstance(best_feats, (list, dict)) else None,
+                persons=out.get('persons'),
             )
             _persist(models, 'stage2')
         elif sid == 3:
             from stage3_activity_duration import estimate_duration_models
             models = estimate_duration_models(
                 out['tours'], out['persons'], trips=out.get('trips'),
-                feature_override=best_feats if isinstance(best_feats, list) else None,
+                # GA stage-3 best_features is a purpose-keyed dict; the
+                # estimator recreates the engineered search-frame columns
+                # from it. Passing None here would silently refit the
+                # DEFAULT spec and the coefficient report would show
+                # nothing the GA actually searched.
+                feature_override=best_feats if isinstance(best_feats, (list, dict)) else None,
             )
             _persist(models, 'stage3')
         elif sid == 4:
@@ -5195,39 +5861,63 @@ def _ga_plot_stage_result(res, save_path: str) -> None:
     res.metadata['segment_results'].  This helper detects that structure and
     renders a multi-panel figure — one panel per segment — so the convergence
     history is not blank.
+
+    NEVER raises: a plotting failure must not fail an otherwise-successful GA
+    job (this is exactly why runs whose stage-5 GA crashed show no
+    ga_stage5.png while their coefficient reports still exist).
     """
     import math as _math
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    import traceback as _tb
+    fig = None
+    n = 0
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
 
-    seg_results = {}
-    if hasattr(res, 'metadata') and isinstance(res.metadata, dict):
-        seg_results = res.metadata.get('segment_results', {})
+        seg_results = {}
+        if hasattr(res, 'metadata') and isinstance(res.metadata, dict):
+            seg_results = res.metadata.get('segment_results', {})
 
-    if seg_results:
-        plot_items = list(seg_results.items())   # [(label, GAResult), ...]
-    else:
-        plot_items = [('', res)]
+        if seg_results:
+            plot_items = list(seg_results.items())   # [(label, GAResult), ...]
+        else:
+            plot_items = [('', res)]
 
-    n    = len(plot_items)
-    cols = min(3, n)
-    rows = _math.ceil(n / max(cols, 1))
-    fig, axes = plt.subplots(rows, cols,
-                             figsize=(7 * cols, 4.5 * rows),
-                             facecolor='white', squeeze=False)
-    axes_flat = axes.flatten()
-    for i, (label, r) in enumerate(plot_items):
-        if i < len(axes_flat):
-            r.plot_convergence(ax=axes_flat[i], segment_label=label)
-    for j in range(n, len(axes_flat)):
-        axes_flat[j].set_visible(False)
+        # drop segments with no usable history instead of failing the figure
+        plot_items = [(lbl, r) for lbl, r in plot_items
+                      if getattr(r, 'history', None)]
+        if not plot_items:
+            logger.warning(f"GA plot skipped (no history): {save_path}")
+            return
 
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    logger.info(f"  GA plot saved → {save_path}  ({n} segment(s))")
+        n    = len(plot_items)
+        cols = min(3, n)
+        rows = _math.ceil(n / max(cols, 1))
+        fig, axes = plt.subplots(rows, cols,
+                                 figsize=(7 * cols, 4.5 * rows),
+                                 facecolor='white', squeeze=False)
+        axes_flat = axes.flatten()
+        for i, (label, r) in enumerate(plot_items):
+            if i < len(axes_flat):
+                try:
+                    r.plot_convergence(ax=axes_flat[i], segment_label=label)
+                except Exception as _pe:
+                    logger.warning(f"GA plot segment '{label}' failed: {_pe}")
+                    axes_flat[i].set_visible(False)
+        for j in range(n, len(axes_flat)):
+            axes_flat[j].set_visible(False)
+
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        logger.info(f"  GA plot saved → {save_path}  ({n} segment(s))")
+    except Exception as _exc:
+        logger.warning(f"GA convergence plot failed (non-fatal) "
+                       f"{save_path}: {_exc}\n{_tb.format_exc()}")
+    finally:
+        if fig is not None:
+            plt.close(fig)
 
 
 @timer("GA — Stage 0 (CDAP activity pattern)")
@@ -5244,9 +5934,11 @@ def ga_stage1(out, landuse=None):
     from census_bridge import run_ga_stage1
     # MULTIVARIATE option: GA_ESTIMATOR=metacount_mv also fits MetaCount's joint
     # multivariate activity-count model (per-purpose counts estimated together
-    # with a copula) and writes stage1_multivariate_* reports to OUT_DIR. It runs
-    # alongside the normal per-purpose search (which still produces the models
-    # prediction needs); it's fully guarded so it can't break the stage.
+    # with a copula) and writes stage1_multivariate_* reports + a fit bundle
+    # to OUT_DIR. predict_stage1 then draws JOINT copula-correlated counts
+    # from that bundle (GA_MV_PREDICT=0 disables), so the dependence flows
+    # into simulated tours; the per-purpose search still runs as fallback.
+    # Fully guarded so it can't break the stage.
     if os.environ.get('GA_ESTIMATOR', '').strip().lower() == 'metacount_mv':
         try:
             from stage1_multivariate import fit_stage1_multivariate
@@ -5346,6 +6038,25 @@ def ga_stage5(out, landuse):
     _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage5.png'))
     print(f"  mode:    {res.best_features.get('mode')}")
     print(f"  dest:    {res.best_features.get('dest')}")
+    return res
+
+
+@timer("GA — Stage 51 (trip-level mode + destination)")
+def ga_stage51(out, landuse):
+    """Stage 51 shim: conditional trip-level destination (+ trip mode) search."""
+    from ga_hypothesis_testing import run_ga_stage
+    _bp = _ga_budget_params()
+    res = run_ga_stage(
+        stage=51,
+        trips=out["trips"], persons=out["persons"],
+        landuse=landuse,
+        skims=PIPELINE_SKIMS_PATH,
+        tours=out.get("tours"),
+        **_bp,
+    )
+    _ga_plot_stage_result(res, os.path.join(OUT_DIR, 'plots', 'ga_stage51.png'))
+    print(f"  trip mode: {res.best_features.get('mode')}")
+    print(f"  trip dest: {res.best_features.get('dest')}")
     return res
 
 
@@ -5754,7 +6465,9 @@ def _write_interactive_safety_dashboard(
                 logger.warning("Interactive safety dashboard skipped: landuse data unavailable")
                 return None
 
-        zone_map = pd.read_csv('seq_zone_ids_.csv')
+        # 371-only: legacy seq_zone_ids_.csv (330 system) is never used —
+        # ORDER 330 is a real zone in the 371 system.
+        zone_map = pd.read_csv('saved_data/seq_zone_ids_371.csv')
 
         def _pick_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
             for c in candidates:
@@ -7089,10 +7802,22 @@ def GA_main(filepath: str = None):
 
     import openmatrix as omx
     from stage5_destination_choice import _skim_flat, _skim_lookup
-    skims     = omx.open_file('downcasted_matrices_base.omx', 'r')
+    # 371-only: never open the retired 330-system downcasted_matrices_base.omx.
+    skims     = omx.open_file(PIPELINE_SKIMS_PATH, 'r')
     sk        = _skim_lookup(_skim_flat(skims))
     try:
-        scheduled_dest = stage5b(out, scheduled_dest, landuse)
+        _stage5b_result = stage5b(
+            out,
+            scheduled_dest,
+            landuse,
+            g_tripdest=_stage51_tripdest_mask(ga_results),
+            calibration_trips=out.get('trips'),
+            prediction_persons=travellers,
+            validate=False,
+            return_result=True,
+            logsums=stage5b_logsums_from_stage5_models(s5_models),
+        )
+        scheduled_dest = _stage5b_result.get('trips', scheduled_dest)
     except Exception as _s5b_e:
         import traceback as _tb_s5b
         logger.warning(
@@ -7164,6 +7889,13 @@ def GA_STAGED(filepath: str = None):
             )
             with open(_ga_pkl, 'rb') as _f:
                 all_ga = pickle.load(_f)
+            # Generate convergence plots from the loaded (possibly partial) results
+            try:
+                from pipeline_logger import regenerate_ga_plots_from_pkl
+                regenerate_ga_plots_from_pkl(_ga_pkl, _ga_dir)
+                logger.info(f"[GA_STAGED] Regenerated GA plots from loaded results")
+            except Exception as _e:
+                logger.warning(f"[GA_STAGED] Plot regeneration skipped: {_e}")
         else:
             # Secondary fallback: if GA_STAGED_GA_DIR points to a 'merged' subdir
             # but that pkl is missing, try to auto-merge from adjacent stage PKLs.
@@ -7198,6 +7930,13 @@ def GA_STAGED(filepath: str = None):
                         f"[GA_STAGED] auto-merged {len(all_ga.results)} stage PKLs "
                         f"→ {_ga_pkl}"
                     )
+                    # Generate convergence plots from the auto-merged results
+                    try:
+                        from pipeline_logger import regenerate_ga_plots_from_pkl
+                        regenerate_ga_plots_from_pkl(_ga_pkl, _ga_dir)
+                        logger.info(f"[GA_STAGED] Regenerated GA plots from auto-merged results")
+                    except Exception as _e:
+                        logger.warning(f"[GA_STAGED] Plot regeneration skipped: {_e}")
             if not _auto_merged:
                 logger.warning(
                     f"[GA_STAGED] GA_STAGED_REUSE_ESTIMATOR=1 requested but no valid "
@@ -7210,15 +7949,19 @@ def GA_STAGED(filepath: str = None):
         all_ga = _run_ga_stages_with_checkpoints(out, landuse)
 
     # ── Export per-stage history CSVs + combined convergence plot ─────────
+    ga_reports_dir = os.path.join(OUT_DIR, 'ga_reports')
     try:
-        ga_reports_dir = os.path.join(OUT_DIR, 'ga_reports')
         all_ga.export_reports(ga_reports_dir)
-        # Combined multi-panel convergence figure (all stages, all segments)
-        all_ga.plot_all(save_path=os.path.join(OUT_DIR, 'plots', 'ga_all_stages.png'))
         logger.info(f"GA reports exported → {ga_reports_dir}/")
-        logger.info(f"GA combined plot   → {OUT_DIR}/plots/ga_all_stages.png")
     except Exception as _gae:
-        logger.warning(f"GA report export failed: {_gae}")
+        logger.warning(f"GA report export failed: {_gae}", exc_info=True)
+    try:
+        # Keep plot generation independent from CSV/HTML report generation.
+        # A malformed report row must not suppress the convergence figure.
+        all_ga.plot_all(save_path=os.path.join(OUT_DIR, 'plots', 'ga_all_stages.png'))
+        logger.info(f"GA combined plot   → {OUT_DIR}/plots/ga_all_stages.png")
+    except Exception as _gpe:
+        logger.warning(f"GA combined plot export failed: {_gpe}", exc_info=True)
 
     # ── Load synth only after all GA stages complete ───────────────────
     synth = (load_synth(filepath, landuse=landuse) if filepath and os.path.isfile(filepath)
@@ -7266,7 +8009,18 @@ def GA_STAGED(filepath: str = None):
     skims   = omx.open_file(PIPELINE_SKIMS_PATH, 'r')
     sk      = _skim_lookup(_skim_flat(skims))
     try:
-        scheduled_dest = stage5b(out, scheduled_dest, landuse)
+        _stage5b_result = stage5b(
+            out,
+            scheduled_dest,
+            landuse,
+            g_tripdest=_stage51_tripdest_mask(all_ga),
+            calibration_trips=out.get('trips'),
+            prediction_persons=travellers,
+            validate=False,
+            return_result=True,
+            logsums=stage5b_logsums_from_stage5_models(s5_models),
+        )
+        scheduled_dest = _stage5b_result.get('trips', scheduled_dest)
     except Exception as _s5b_e:
         import traceback as _tb_s5b
         logger.warning(

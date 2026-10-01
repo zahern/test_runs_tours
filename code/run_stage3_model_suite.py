@@ -249,13 +249,21 @@ def run_suite(args: argparse.Namespace) -> dict:
     s3_feats = _best_features(ga_results.get(3))
     s4_feats = _best_features(ga_results.get(4))
     s5_feats = _best_features(ga_results.get(5))
+    s51_feats = _best_features(ga_results.get(51))
+    s51_dest_feats = (
+        s51_feats.get("dest")
+        if isinstance(s51_feats, dict)
+        else None
+    )
     if ga_results:
         LOGGER.info(
-            "GA feature overrides: stage3=%s stage4=%s stage5(mode)=%s stage5(dest)=%s",
+            "GA feature overrides: stage3=%s stage4=%s stage5(mode)=%s "
+            "stage5(dest)=%s stage51(trip-dest)=%s",
             list(s3_feats.keys()) if isinstance(s3_feats, dict) else s3_feats,
             list(s4_feats.keys()) if isinstance(s4_feats, dict) else s4_feats,
             (s5_feats or {}).get("mode"),
             (s5_feats or {}).get("dest"),
+            s51_dest_feats,
         )
 
     LOGGER.info("Loading HHTS survey data once for %d model variants", len(specs))
@@ -491,45 +499,95 @@ def run_suite(args: argparse.Namespace) -> dict:
         from stage6_mode_choice import run_stage6
         if args.run_stage5b:
             from stage5b_trip_destination import run_stage5b
+            from stage5b_trip_destination import trip_destination_feature_mask
             # Stage 5b estimation on the full predicted population builds a dense
             # obs x zones design matrix, so the estimator reuses a single fit
             # (saved from the first variant) for predict-only runs.
             stage5b_shared = out_dir / "stage5b_models.pkl"
             stage5b_estimated = False
+            stage5b_hhts_predicted = False
+            stage5b_feature_mask = trip_destination_feature_mask(s51_dest_feats)
         s5_mode_feats = (s5_feats or {}).get("mode") if isinstance(s5_feats, dict) else s5_feats
         s5_dest_feats = (s5_feats or {}).get("dest") if isinstance(s5_feats, dict) else None
         for model_index, (_, _, model_name) in enumerate(specs):
             variant_dir = out_dir / model_name
             scheduled_path = variant_dir / "stage4_output.csv"
             scheduled = pd.read_csv(scheduled_path)
-            LOGGER.info("[%s] Running Stage 5 destination/mode/trip-chain estimation", model_name)
-            stage5_path = variant_dir / "stage5_models.pkl"
-            previous_pipeline_out = os.environ.get("PIPELINE_OUT_DIR")
-            os.environ["PIPELINE_OUT_DIR"] = str(variant_dir)
-            try:
-                stage5_output, _ = run_stage5(
-                    survey["trips"],
-                    synth_persons,
-                    scheduled,
-                    skims=str(skims_path),
-                    landuse=landuse,
-                    tours=survey["tours"],
-                    seed=args.seed + model_index,
-                    save_path=str(stage5_path),
-                    hhts_persons=survey["persons"],
-                    mode_feature_override=s5_mode_feats,
-                    dest_feature_override=s5_dest_feats,
-                )
-            finally:
-                if previous_pipeline_out is None:
-                    os.environ.pop("PIPELINE_OUT_DIR", None)
+            
+            # ── Benchmark: distance-band NL destination vs MNL ──
+            # If RUN_STAGE5_NL_DEST=1, run each variant twice:
+            #   1. MNL (default)
+            #   2. NL distance-band (STAGE5_DEST_NL_DISTANCE=1)
+            nl_variants = ['mnl']
+            if args.run_stage5_nl_dest:
+                nl_variants.append('nl_distance')
+            
+            for nl_variant in nl_variants:
+                variant_suffix = f"_{nl_variant}" if nl_variant != 'mnl' else ""
+                variant_dir_nl = out_dir / f"{model_name}{variant_suffix}"
+                variant_dir_nl.mkdir(parents=True, exist_ok=True)
+                
+                scheduled_path_nl = variant_dir_nl / "stage4_output.csv"
+                if not scheduled_path_nl.exists():
+                    # Copy stage4 output to NL variant dir
+                    import shutil
+                    shutil.copy2(scheduled_path, scheduled_path_nl)
+                scheduled_nl = pd.read_csv(scheduled_path_nl)
+                
+                LOGGER.info("[%s] Running Stage 5 destination/mode/trip-chain estimation [%s]", 
+                           model_name, nl_variant)
+                stage5_path = variant_dir_nl / "stage5_models.pkl"
+                previous_pipeline_out = os.environ.get("PIPELINE_OUT_DIR")
+                os.environ["PIPELINE_OUT_DIR"] = str(variant_dir_nl)
+                
+                # Set NL distance band env var
+                previous_nl_dest = os.environ.get("STAGE5_DEST_NL_DISTANCE")
+                if nl_variant == 'nl_distance':
+                    os.environ["STAGE5_DEST_NL_DISTANCE"] = "1"
                 else:
-                    os.environ["PIPELINE_OUT_DIR"] = previous_pipeline_out
-            stage5_csv = variant_dir / "stage5_output.csv"
-            stage5_output.to_csv(stage5_csv, index=False)
+                    os.environ.pop("STAGE5_DEST_NL_DISTANCE", None)
+                
+                try:
+                    stage5_output, _ = run_stage5(
+                        survey["trips"],
+                        synth_persons,
+                        scheduled_nl,
+                        skims=str(skims_path),
+                        landuse=landuse,
+                        tours=survey["tours"],
+                        seed=args.seed + model_index,
+                        save_path=str(stage5_path),
+                        hhts_persons=survey["persons"],
+                        mode_feature_override=s5_mode_feats,
+                        dest_feature_override=s5_dest_feats,
+                    )
+                finally:
+                    if previous_pipeline_out is None:
+                        os.environ.pop("PIPELINE_OUT_DIR", None)
+                    else:
+                        os.environ["PIPELINE_OUT_DIR"] = previous_pipeline_out
+                    if previous_nl_dest is not None:
+                        os.environ["STAGE5_DEST_NL_DISTANCE"] = previous_nl_dest
+                    else:
+                        os.environ.pop("STAGE5_DEST_NL_DISTANCE", None)
+                
+                stage5_csv = variant_dir_nl / "stage5_output.csv"
+                stage5_output.to_csv(stage5_csv, index=False)
+                
+                # Store NL variant info in manifest
+                if 'nl_variants' not in manifest["variants"][model_name]:
+                    manifest["variants"][model_name]['nl_variants'] = {}
+                manifest["variants"][model_name]['nl_variants'][nl_variant] = {
+                    "stage5_models": str(stage5_path),
+                    "stage5_csv": str(stage5_csv),
+                    "n_stage5_rows": len(stage5_output),
+                }
+                _write_json(out_dir / "manifest.json", manifest)
+            
+            # Use MNL variant for Stage 6 continuation
+            stage6_input = stage5_output
             LOGGER.info("[%s] Running Stage 6 mode-choice estimation", model_name)
             stage6_path = variant_dir / "stage6_models.pkl"
-            stage6_input = stage5_output
             if args.run_stage5b:
                 # ── Stage 5b (TikZ): trip-level intermediate-stop destination ──
                 stage5b_reuse = str(stage5b_shared) if stage5b_shared.is_file() else None
@@ -539,6 +597,59 @@ def run_suite(args: argparse.Namespace) -> dict:
                     " (reusing fitted models)" if stage5b_reuse else "",
                 )
                 try:
+                    if not stage5b_estimated:
+                        # Calibrate on observed HHTS trips first. The synthetic
+                        # Stage 5 output is prediction input only.
+                        run_stage5b(
+                            survey["trips"],
+                            survey["persons"],
+                            skims_path=str(skims_path),
+                            landuse=landuse,
+                            output_dir=str(variant_dir),
+                            g_tripdest=stage5b_feature_mask,
+                            predict=False,
+                            validate=True,
+                            save_models=True,
+                        )
+                        _s5b_first = variant_dir / "stage5b_models.pkl"
+                        if not _s5b_first.is_file():
+                            raise RuntimeError(
+                                "Stage 5b observed calibration did not produce "
+                                f"a model bundle: {_s5b_first}"
+                            )
+                        stage5b_shared.write_bytes(_s5b_first.read_bytes())
+                        stage5b_estimated = True
+                        LOGGER.info("Stage 5b observed models shared at %s", stage5b_shared)
+
+                    stage5b_reuse = str(stage5b_shared)
+                    if not stage5b_hhts_predicted:
+                        # Reapply the shared observed calibration bundle to
+                        # HHTS so paper validation is separate from the
+                        # synthetic population output used by Stage 6.
+                        hhts_prediction_dir = out_dir / "stage5b_hhts_prediction"
+                        hhts_res = run_stage5b(
+                            survey["trips"],
+                            survey["persons"],
+                            skims_path=str(skims_path),
+                            landuse=landuse,
+                            output_dir=str(hhts_prediction_dir),
+                            reuse_models_path=stage5b_reuse,
+                            save_models=False,
+                            g_tripdest=stage5b_feature_mask,
+                            predict=True,
+                            validate=True,
+                        )
+                        manifest["stage5b_hhts_prediction"] = {
+                            "source": "observed_hhts_in_sample",
+                            "models": str(stage5b_shared),
+                            "output_dir": str(hhts_prediction_dir),
+                            "trips_csv": str(hhts_prediction_dir / "stage5b_trips.csv"),
+                            "validation_csv": str(hhts_prediction_dir / "stage5b_validation.csv"),
+                            "n_trips_rows": len(hhts_res.get("trips", pd.DataFrame())),
+                            "n_validation_rows": len(hhts_res.get("validation", pd.DataFrame())),
+                        }
+                        _write_json(out_dir / "manifest.json", manifest)
+                        stage5b_hhts_predicted = True
                     s5b_res = run_stage5b(
                         stage5_output,
                         synth_persons,
@@ -546,17 +657,12 @@ def run_suite(args: argparse.Namespace) -> dict:
                         landuse=landuse,
                         output_dir=str(variant_dir),
                         reuse_models_path=stage5b_reuse,
-                        save_models=not stage5b_estimated,
+                        save_models=False,
+                        g_tripdest=stage5b_feature_mask,
+                        predict=True,
+                        validate=False,
                     )
                     stage6_input = s5b_res["trips"]
-                    # First estimate saved stage5b_models.pkl inside the variant
-                    # dir; move it to the suite root so later variants reuse it.
-                    if not stage5b_estimated:
-                        _s5b_first = variant_dir / "stage5b_models.pkl"
-                        if _s5b_first.is_file():
-                            stage5b_shared.write_bytes(_s5b_first.read_bytes())
-                            stage5b_estimated = True
-                            LOGGER.info("Stage 5b models shared at %s", stage5b_shared)
                 except Exception as exc:
                     LOGGER.warning("[%s] Stage 5b failed (%s) — Stage 6 continues on Stage 5 output", model_name, exc)
             stage6_output, _ = run_stage6(
@@ -618,6 +724,10 @@ def build_parser() -> argparse.ArgumentParser:
                         default=os.environ.get("RUN_STAGE5B", "0") == "1",
                         help="Continue every variant through Stage 5b trip-level "
                              "stop-destination choice (implies --run-stage5-6)")
+    parser.add_argument("--run-stage5-nl-dest", action="store_true",
+                        default=os.environ.get("RUN_STAGE5_NL_DEST", "0") == "1",
+                        help="Run distance-band Nested Logit destination benchmark "
+                             "(STAGE5_DEST_NL_DISTANCE=1) alongside MNL for comparison")
     parser.add_argument("--ownership", action="store_true",
                         default=os.environ.get("RUN_OWNERSHIP", "1") == "1",
                         help="Predict household vehicle/bike ownership for the "
@@ -639,7 +749,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("GA_RESULTS_PKL", ""),
         help=("Path to a merged AllStagesResult pickle. When given, the GA-optimised "
               "feature sets are used for Stage 3 (duration), Stage 4 (timing) and "
-              "Stage 5 (mode/dest) instead of the defaults."),
+              "Stage 5 (mode/dest) and Stage 51 (trip destination) instead of "
+              "the defaults."),
     )
     return parser
 

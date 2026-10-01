@@ -46,10 +46,12 @@ export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
 export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
 # Serial so cProfile sees all the work (see header).
 export GA_PARALLEL_SEGMENTS=1
-# Same SA/bandit estimator settings as the production batch.
+# Same estimator settings as the production batch (AGDS engine everywhere;
+# GA_ENGINE takes precedence over the legacy flags in _resolve_search_engine).
 export GA_ESTIMATOR=${GA_ESTIMATOR:-default}
-export GA_USE_SA=${GA_USE_SA:-1}
-export GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-1}
+export GA_ENGINE=${GA_ENGINE:-agds}
+export GA_USE_SA=${GA_USE_SA:-0}
+export GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-0}
 # 371-zone SA2-native.
 export NEW_POP=${NEW_POP:-1}
 export NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}

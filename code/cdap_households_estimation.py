@@ -102,6 +102,27 @@ def _searchlibrium_logistic():
 # ---------------------------------------------------------------------------
 # 0. Observed-outcome derivation from HHTS
 # ---------------------------------------------------------------------------
+_MANDATORY_PURPOSE_TOKENS = ('work', 'school', 'educat', 'univers',
+                             'tafe', 'kinder', 'childcare')
+
+
+def _purpose_is_mandatory(p) -> bool:
+    """
+    True when a tour purpose denotes a MANDATORY (work/education) activity.
+
+    Matches BOTH coded purposes ('work', 'edu') AND raw QTS/HHTS strings
+    ('Full-time Work', 'Direct Work Commute', 'Primary School',
+     'Full-time TAFE/Uni', 'Childcare/Kindergarten', ...), so the joint
+    household CDAP uses the same mandatory definition as the individual
+    model's MANDATORY_ACTS / prepare_cdap_data() — previously the narrow
+    coded-only set misclassified every raw-string worker/student as 'N'.
+    """
+    s = str(p).strip().lower()
+    if s in ('', 'nan', 'none'):
+        return False
+    return any(tok in s for tok in _MANDATORY_PURPOSE_TOKENS)
+
+
 def derive_observed_dap(persons: pd.DataFrame, tours: pd.DataFrame,
                         cfg: Optional[HouseholdCdapConfig] = None) -> pd.Series:
     """
@@ -109,23 +130,220 @@ def derive_observed_dap(persons: pd.DataFrame, tours: pd.DataFrame,
         M (Mandatory)     — has ≥1 work/education tour
         N (NonMandatory)  — has tours, none mandatory
         H (Home)          — made no tours
-    Returns a Series 'dap' aligned to `persons[person_id]`.
+    Returns a Series 'dap' aligned to `persons[person_id]`. Diagnostics are
+    attached via .attrs (purpose column used, counts of tour-less persons).
     """
     cfg = cfg or HouseholdCdapConfig()
     pid = cfg.person_id_col
-    purp = next((c for c in ('main_purpose', 'primary_purpose', 'purpose', 'PURPOSE')
-                 if c in tours.columns), None)
-    mand = {'work', 'edu', 'education', 'university', 'school',
-            'Direct Work Commute', 'Education'}
+    t = tours
+    if pid not in t.columns and 'PERSID' in t.columns:
+        t = t.rename(columns={'PERSID': pid})
+    purp = next((c for c in ('main_purpose', 'primary_purpose', 'purpose',
+                             'PURPOSE', 'DESTPURP')
+                 if c in t.columns), None)
     per_person = {}
     if purp is not None:
-        g = tours.groupby(pid)[purp]
-        for p, s in g:
-            vals = set(str(x) for x in s.dropna().unique())
-            per_person[p] = 'M' if (vals & mand) else 'N'
+        for p, s in t.groupby(pid)[purp]:
+            vals = [v for v in s.dropna().unique()
+                    if str(v).strip() not in ('', 'nan', 'None')]
+            if not vals:
+                continue
+            per_person[p] = 'M' if any(_purpose_is_mandatory(v)
+                                       for v in vals) else 'N'
     dap = persons[pid].map(per_person).fillna('H')   # no tours → Home
     dap.name = 'dap'
+    dap.attrs['purpose_col'] = purp
+    dap.attrs['n_persons_with_tours'] = len(per_person)
     return dap
+
+
+def attach_cdap_to_hhts(persons: pd.DataFrame, tours: pd.DataFrame,
+                        cfg: Optional[HouseholdCdapConfig] = None) -> pd.DataFrame:
+    """Attach OBSERVED CDAP attributes to HHTS travellers for joint estimation.
+
+    Estimation-side counterpart of the prediction path (`coordinate_household_
+    cdap` + `joint_tour_frequency/participation` draw sampled values for the
+    synthetic population). Here every attribute is a deterministic function of
+    the respondent's OWN observed tours — the ActivitySim observed-vs-simulated
+    pattern — so downstream estimators (stage 1/4/5, ...) can condition on
+    household coordination with no leakage and no randomness:
+
+      cdap_M / cdap_N / cdap_H  observed DAP dummies (from derive_observed_dap)
+      hh_n_workers / hh_n_children / hh_has_home_adult / child_x_home_adult
+                                household-composition coordination signal
+      n_joint_tours_hh          observed joint-tour count of the household
+      is_joint_traveller        in ≥1 observed joint tour
+      joint_party_n             mean observed party size (0 when solo-only)
+
+    Idempotent (skips when 'cdap_M' present) and never raises — returns
+    `persons` unchanged on any failure. Callers merge the new columns onto
+    trips/tours via person_id like any person covariate.
+    """
+    cfg = cfg or HouseholdCdapConfig()
+    try:
+        df = persons.copy()
+        pid = cfg.person_id_col if cfg.person_id_col in df.columns else (
+            'person_id' if 'person_id' in df.columns else None)
+        if pid is None:
+            return persons
+        if 'cdap_M' in df.columns:
+            return df  # already attached
+        # 1. observed DAP + dummies
+        try:
+            _dap = derive_observed_dap(df, tours, cfg)
+            df['cdap_dap'] = _dap.values
+        except Exception:
+            df['cdap_dap'] = 'H'
+        for _d in ('M', 'N', 'H'):
+            df[f'cdap_{_d}'] = (df['cdap_dap'] == _d).astype(float)
+        # 2. household composition (same builder the CDAP logit estimates on)
+        try:
+            _comp = _hh_composition_features(df, cfg)
+            for _c in ('hh_n_workers', 'hh_n_children', 'hh_has_home_adult',
+                       'child_x_home_adult', 'is_child'):
+                if _c in _comp.columns:
+                    df[f'cdap_{_c}'] = pd.to_numeric(
+                        _comp[_c], errors='coerce').fillna(0).values
+        except Exception:
+            pass
+        for _c in ('cdap_hh_n_workers', 'cdap_hh_n_children',
+                   'cdap_hh_has_home_adult', 'cdap_child_x_home_adult',
+                   'cdap_is_child'):
+            if _c not in df.columns:
+                df[_c] = 0.0
+        # 3. observed joint-tour attributes (flag or HHID+OD+time heuristic)
+        try:
+            _jt = derive_observed_joint_tours(tours, cfg)
+            _hhid = cfg.hh_id_col if cfg.hh_id_col in df.columns else (
+                'HHID' if 'HHID' in df.columns else None)
+            if _jt is not None and len(_jt) and _hhid:
+                _cnt = _jt.groupby(cfg.hh_id_col).size().to_dict() \
+                    if cfg.hh_id_col in _jt.columns else {}
+                df['n_joint_tours_hh'] = df[_hhid].map(_cnt).fillna(0).astype(float)
+                _members, _psize = set(), {}
+                for _, _r in _jt.iterrows():
+                    _pl = _r.get('participants', [])
+                    _pl = list(_pl) if isinstance(_pl, (list, tuple)) else [_pl]
+                    for _p in _pl:
+                        _members.add(str(_p))
+                        _psize[str(_p)] = max(_psize.get(str(_p), 0), len(_pl))
+                df['is_joint_traveller'] = df[pid].astype(str).isin(_members).astype(float)
+                df['joint_party_n'] = df[pid].astype(str).map(_psize).fillna(0).astype(float)
+            else:
+                for _c in ('n_joint_tours_hh', 'is_joint_traveller', 'joint_party_n'):
+                    df[_c] = 0.0
+        except Exception:
+            for _c in ('n_joint_tours_hh', 'is_joint_traveller', 'joint_party_n'):
+                if _c not in df.columns:
+                    df[_c] = 0.0
+        return df
+    except Exception:
+        return persons
+
+
+def validate_joint_cdap_inputs(persons: pd.DataFrame, tours: pd.DataFrame,
+                               cfg: Optional[HouseholdCdapConfig] = None,
+                               max_size: int = 5) -> dict:
+    """
+    Sanity-check the HHTS inputs that build the joint household CDAP models:
+      * household-id column presence / coverage
+      * duplicate person ids
+      * purpose-column availability and how tour purposes classify to M/N
+        (exact coded vs token-matched raw strings)
+      * household-size buckets actually populated at estimation time
+      * agreement with the individual CDAP ground truth (ANYSTOPS + MAINACT,
+        the same source prepare_cdap_data uses) when those columns exist
+
+    Returns a report dict; prints loud warnings for anything that would bias
+    the estimated patterns.
+    """
+    cfg = cfg or HouseholdCdapConfig()
+    rep = {'fatal': []}
+    pid = cfg.person_id_col
+
+    if persons[pid].duplicated().any():
+        rep['duplicate_person_rows'] = int(persons[pid].duplicated().sum())
+        print(f"[cdap-hh validate] WARNING {rep['duplicate_person_rows']} "
+              f"duplicate person_id rows")
+
+    hhc = next((c for c in (cfg.hh_id_col, 'HHID', 'household_id', 'hhid')
+                if c in persons.columns), None)
+    rep['household_col'] = hhc
+    if hhc is None:
+        print('[cdap-hh validate] WARNING no household-id column found — '
+              'every person would be treated as a size-1 household and all '
+              'interaction terms are UNIDENTIFIED. Joint estimation needs '
+              'persons[HHID].')
+        rep['fatal'].append('no household id column')
+    elif persons[hhc].isna().any():
+        rep['persons_missing_hhid'] = int(persons[hhc].isna().sum())
+        print(f"[cdap-hh validate] WARNING {rep['persons_missing_hhid']} "
+              f"persons have no {hhc} (excluded from joint buckets)")
+
+    dap = derive_observed_dap(persons, tours, cfg)
+    rep['persons'] = int(len(persons))
+    rep['persons_with_tours'] = int(dap.attrs.get('n_persons_with_tours', 0))
+    rep['dap_distribution'] = dap.value_counts().to_dict()
+
+    purp_col = dap.attrs.get('purpose_col')
+    rep['purpose_column'] = purp_col
+    if purp_col is None:
+        print('[cdap-hh validate] FATAL: tours table carries no purpose column '
+              '(main_purpose/purpose/PURPOSE/DESTPURP)')
+        rep['fatal'].append('no purpose column in tours')
+    else:
+        uniq = tours[purp_col].dropna().astype(str)
+        uniq = uniq[~uniq.str.strip().str.lower().isin(('', 'nan', 'none'))]
+        coded = {'work', 'edu', 'education', 'university', 'school'}
+        low = uniq.str.strip().str.lower()
+        cls = uniq.map(_purpose_is_mandatory)
+        rep['unique_purposes'] = int(uniq.nunique())
+        rep['mandatory_tour_share'] = round(float(cls.mean()), 4)
+        rep['token_matched_share'] = round(
+            float((~low.isin(coded)).mean()), 4)
+        rep['top_purposes'] = {
+            str(k): (int(v), 'M' if _purpose_is_mandatory(k) else 'N')
+            for k, v in uniq.value_counts().head(12).items()}
+        print(f"[cdap-hh validate] purpose col '{purp_col}': "
+              f"{rep['unique_purposes']} unique purposes, "
+              f"mandatory-tour share={rep['mandatory_tour_share']:.1%} "
+              f"(token-matched non-coded: {rep['token_matched_share']:.0%})")
+        if rep['mandatory_tour_share'] == 0.0:
+            print('[cdap-hh validate] FATAL: zero tours classified mandatory — '
+                  'check purpose strings/coding.')
+            rep['fatal'].append('no mandatory tours detected')
+
+    if hhc is not None:
+        sizes = persons.groupby(hhc).size().clip(upper=max_size)
+        buckets = sizes.value_counts().sort_index()
+        rep['households_by_bucket'] = {int(k): int(v)
+                                       for k, v in buckets.items()}
+        thin = {int(k): int(v) for k, v in buckets.items() if v < 30}
+        if thin:
+            print(f'[cdap-hh validate] thin buckets (<30 households): {thin} '
+                  '— prefer shared-coefficient mode there')
+
+    # cross-check against the individual CDAP ground-truth columns
+    if {'ANYSTOPS', 'MAINACT'}.issubset(persons.columns):
+        anystops = persons['ANYSTOPS'].astype(str).str.lower().isin(
+            ('true', '1', 'yes', 'y'))
+        mand = persons['MAINACT'].fillna('').astype(str).map(
+            _purpose_is_mandatory)
+        ref = np.where(~anystops, 'H', np.where(mand, 'M', 'N'))
+        agree = float((dap.to_numpy() == ref).mean())
+        rep['individual_cdap_agreement'] = round(agree, 4)
+        mm_mask = dap.to_numpy() != ref
+        rep['mismatch_mainact_top'] = (
+            persons.loc[mm_mask, 'MAINACT'].astype(str)
+            .value_counts().head(8).to_dict())
+        print(f"[cdap-hh validate] agreement with ANYSTOPS/MAINACT "
+              f"CDAP truth: {agree:.1%}")
+        if agree < 0.90:
+            print('[cdap-hh validate] WARNING <90% agreement with the '
+                  'individual CDAP target — top mismatching MAINACT values:')
+            for k, v in rep['mismatch_mainact_top'].items():
+                print(f'    {k!r}: {v}')
+    return rep
 
 
 def _tour_purpose(sub: pd.DataFrame) -> str:
@@ -479,6 +697,98 @@ def estimate_joint_purpose(persons: pd.DataFrame, tours: pd.DataFrame,
 # ---------------------------------------------------------------------------
 # Orchestrator: HHTS → estimated HouseholdCdapConfig
 # ---------------------------------------------------------------------------
+def _save_household_cdap_html(df: pd.DataFrame, out_dir: str) -> None:
+    """Render the estimated household-CDAP / joint-tour coefficients as an
+    ActivitySim-style HTML report (household_cdap_coefficients.html): individual
+    DAP utilities, the 2/3/4/5-way household INTERACTION_COEFFICIENTS, and the
+    joint-tour frequency / participation / purpose coefficients — one table per
+    model group, matching the layout of ActivitySim's CDAP component docs so the
+    joint coefficients are inspectable next to the individual utilities."""
+    # model-group → (section title, explanatory note), in display order
+    _SECTIONS = [
+        ('cdap_dap_utility',      'Individual DAP utilities',
+         'Per person-type utility of M (mandatory) and N (non-mandatory); H (home) is the base = 0.'),
+        ('interaction_2way',      'Household interaction coefficients — 2-way',
+         'ActivitySim INTERACTION_COEFFICIENTS: utility added when a household pair shares an activity pattern.'),
+        ('interaction_3way',      'Household interaction coefficients — 3-way',
+         'Utility added when three household members share an activity pattern.'),
+        ('interaction_4way',      'Household interaction coefficients — 4-way',
+         'Utility added when four household members share an activity pattern.'),
+        ('interaction_5way',      'Household interaction coefficients — 5-way',
+         'Utility added when five household members share an activity pattern.'),
+        ('cdap_interaction',      'Household interaction (scalar composition boosts)',
+         'Legacy scalar coordination effects folded into the config.'),
+        ('joint_frequency',       'Joint-tour frequency',
+         'Poisson rate of joint tours per household by composition.'),
+        ('joint_participation',   'Joint-tour participation',
+         'Per-role probability that a member joins a joint tour.'),
+        ('joint_purpose_utility', 'Joint-tour purpose utility',
+         'Composition-conditional purpose utilities (link to Stage-1 activity purpose).'),
+    ]
+
+    def _fmt(x, nd=4):
+        try:
+            if x is None or (isinstance(x, float) and not np.isfinite(x)):
+                return '—'
+            return f'{float(x):.{nd}f}'
+        except Exception:
+            return '—'
+
+    def _stars(p):
+        try:
+            p = float(p)
+        except Exception:
+            return ''
+        if not np.isfinite(p):
+            return ''
+        return '***' if p < 0.01 else '**' if p < 0.05 else '*' if p < 0.10 else ''
+
+    parts = [
+        '<html><head><meta charset="utf-8"><title>Household CDAP &amp; joint-tour coefficients</title>',
+        '<style>body{font-family:system-ui,Arial,sans-serif;margin:24px;color:#1a1a1a}'
+        'h2{margin-top:0}h3{margin:22px 0 4px;color:#0b5}'
+        'p.note{margin:2px 0 8px;color:#555;font-size:13px}'
+        'table{border-collapse:collapse;margin:4px 0 10px;font-size:13px}'
+        'th,td{border:1px solid #ccc;padding:3px 9px;text-align:right}'
+        'th{background:#f2f2f2}td.p{text-align:left}'
+        '.sig{color:#0a7}.na{color:#bbb}</style></head><body>',
+        '<h2>Household CDAP &amp; joint-tour coefficients</h2>',
+        '<p class="note">Estimated from HHTS. Mirrors ActivitySim CDAP: individual DAP utilities, '
+        'household interaction coefficients (2/3/4/5-way), and the joint-tour models. '
+        '<code>t</code> and <code>p</code> are shown where the estimator exposed standard errors '
+        '(stars: *** p&lt;.01, ** p&lt;.05, * p&lt;.10).</p>',
+    ]
+    has_col = set(df.columns)
+    for _model, _title, _note in _SECTIONS:
+        _sub = df[df['model'] == _model]
+        if _sub.empty:
+            continue
+        parts.append(f'<h3>{_title}</h3><p class="note">{_note}</p>')
+        parts.append('<table><tr><th class="p">parameter</th><th>value</th>'
+                     '<th>std err</th><th>t</th><th>p</th></tr>')
+        for _, r in _sub.iterrows():
+            _se = r.get('std_err', np.nan) if 'std_err' in has_col else np.nan
+            _t  = r.get('t_stat',  np.nan) if 't_stat'  in has_col else np.nan
+            _p  = r.get('p_value', np.nan) if 'p_value' in has_col else np.nan
+            _star = _stars(_p)
+            parts.append(
+                f'<tr><td class="p">{r["param"]}</td>'
+                f'<td>{_fmt(r["value"])}</td>'
+                f'<td class="{"na" if _se!=_se else ""}">{_fmt(_se)}</td>'
+                f'<td>{_fmt(_t, 2)}</td>'
+                f'<td class="sig">{_fmt(_p, 3)}{(" " + _star) if _star else ""}</td></tr>'
+            )
+        parts.append('</table>')
+    parts.append('</body></html>')
+    try:
+        with open(os.path.join(out_dir, 'household_cdap_coefficients.html'), 'w',
+                  encoding='utf-8') as fh:
+            fh.write('\n'.join(parts))
+        print(f"[cdap-hh estimate] wrote household_cdap_coefficients.html")
+    except Exception as _e:
+        print(f"[cdap-hh estimate] html save skipped: {_e}")
+
+
 def save_household_cdap_coefficients(dap: dict, freq: dict, part: dict, purp: dict,
                                      out_dir: str, cfg=None) -> None:
     """Write the estimated household-CDAP / joint-tour coefficients to
@@ -527,25 +837,593 @@ def save_household_cdap_coefficients(dap: dict, freq: dict, part: dict, purp: di
         df.to_csv(os.path.join(out_dir, 'household_cdap_coefficients.csv'), index=False)
         with open(os.path.join(out_dir, 'household_cdap_coefficients.pkl'), 'wb') as fh:
             pickle.dump({'dap': dap, 'freq': freq, 'participation': part, 'purpose': purp}, fh)
+        _save_household_cdap_html(df, out_dir)
         print(f"[cdap-hh estimate] saved {len(df)} coefficients -> "
               f"{out_dir}/household_cdap_coefficients.csv")
     except Exception as _e:
         print(f"[cdap-hh estimate] save skipped: {_e}")
 
 
+# ---------------------------------------------------------------------------
+# 1b. JOINT household CDAP, stratified by household size 1..5 (ActivitySim)
+# ---------------------------------------------------------------------------
+# ActivitySim estimates CDAP as a JOINT choice per household: the alternatives
+# are the Cartesian product of every member's {M,N,H} pattern, utilities are
+# additive in member terms plus 2/3/4/5-way intra-household interaction terms,
+# estimated SEPARATELY for each household size (1,2,3,4,5+). This function fits
+# exactly that model on HHTS and emits coefficients in the same key format as
+# HouseholdCdapConfig.interaction / interaction3 / interaction4 / interaction5,
+# so the heuristic priors can be replaced by estimated behaviour with no
+# call-site changes (coordinate_household_cdap consumes the same tables).
+
+_JOINT_DAP_PROFILE_VARS = [
+    # compact individual utility covariates — all derived defensively below
+    'is_female', 'has_vehicle', 'has_licence', 'income_midplus',
+    'age_child', 'age_teen', 'age_working', 'age_older', 'age_senior',
+    'mandatory_role',
+]
+_JOINT_CHILD_PTYPES = ('SchoolChild', 'Preschool')
+
+
+def _joint_dap_profile(persons: pd.DataFrame) -> pd.DataFrame:
+    """Self-contained person-profile matrix for the joint CDAP (no Larch)."""
+    df = persons.copy()
+    if cfg_ptype_col() not in df.columns:
+        for cand in ('ptype', 'PTYPE', 'person_type'):
+            if cand in df.columns:
+                df = df.rename(columns={cand: cfg_ptype_col()})
+                break
+    pt = df.get(cfg_ptype_col())
+    if pt is not None:
+        pt = pt.astype(str)
+    age = pd.to_numeric(df.get('AGEGROUP', pd.Series(np.nan, index=df.index)),
+                        errors='coerce')
+    out = pd.DataFrame(index=df.index)
+    out['is_female'] = (pd.to_numeric(df['sexp'], errors='coerce') == 2) \
+        .astype(float) if 'sexp' in df.columns else 0.0
+    out['has_vehicle'] = (pd.to_numeric(df['vehrd'], errors='coerce').fillna(0) > 0) \
+        .astype(float) if 'vehrd' in df.columns else 0.0
+    out['has_licence'] = pd.to_numeric(df['CARLICENCE'], errors='coerce') \
+        .fillna(0).clip(0, 1).astype(float) if 'CARLICENCE' in df.columns else 0.0
+    out['income_midplus'] = (pd.to_numeric(df['incp'], errors='coerce') >= 8) \
+        .astype(float) if 'incp' in df.columns else 0.0
+    if age.notna().any():
+        out['age_child']   = (age <= 3).astype(float)    # 0-14
+        out['age_teen']    = (age == 4).astype(float)    # 15-19
+        out['age_working'] = age.between(5, 8).astype(float)
+        out['age_older']   = (age >= 9).astype(float)    # 40+
+        out['age_senior']  = (age >= 11).astype(float)   # 50+
+    else:
+        for c in ('age_child', 'age_teen', 'age_working', 'age_older', 'age_senior'):
+            out[c] = 0.0
+    if pt is not None:
+        for d in pt.unique():
+            out[f'pt_{d}'] = (pt == d).astype(float)
+        out['mandatory_role'] = pt.isin(
+            ['FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+             'UniversityStudent', 'SchoolChild']).astype(float)
+        child_mask = pt.isin(_JOINT_CHILD_PTYPES).to_numpy()
+    else:
+        _ws = df['WORKSTAT'] if 'WORKSTAT' in df.columns \
+            else pd.Series(0, index=df.index)
+        out['mandatory_role'] = (pd.to_numeric(_ws, errors='coerce') >= 1) \
+            .astype(float)
+        child_mask = (age <= 3).fillna(False).to_numpy()
+    out['_is_child'] = child_mask.astype(float)
+    return out.fillna(0.0)
+
+
+def cfg_ptype_col() -> str:
+    """Default ptype column used by the joint CDAP builder."""
+    return 'ptype'
+
+
+def _fit_conditional_logit(situations, l2: float = 1e-4, maxiter: int = 800):
+    """
+    McFadden conditional logit on pre-built alternative designs.
+
+    situations : list of (Z, y_idx) where Z is (n_alts × n_feat) and y_idx the
+                 chosen row. One shared coefficient vector θ; P(a) ∝ exp(z_a·θ).
+    Returns dict(theta, std_err, ll, k, n_sit, converged).
+    Standard errors come from scipy's BFGS/L-BFGS inverse-Hessian approximation.
+    """
+    from scipy.optimize import minimize
+
+    K = situations[0][0].shape[1]
+
+    def neg_ll(th):
+        ll = 0.0
+        g = np.zeros(K)
+        for Z, ych in situations:
+            v = Z @ th
+            v = v - v.max()
+            p = np.exp(v)
+            s = p.sum()
+            ll += v[ych] - np.log(s)
+            # g accumulates d(dataNegLL)/dth = -(z_y - sum_a p_a z_a)
+            g -= Z[ych] - (p @ Z) / s
+        return -ll + l2 * float(th @ th), g + 2.0 * l2 * th
+
+    th0 = np.zeros(K)
+    res = minimize(neg_ll, th0, jac=True, method='L-BFGS-B',
+                   options={'maxiter': 2000, 'ftol': 1e-9})
+    theta = res.x
+    ll = -res.fun + l2 * float(theta @ theta)
+    try:
+        se = np.sqrt(np.abs(np.asarray(res.hess_inv.todense()).diagonal()))
+    except Exception:
+        se = np.full(K, np.nan)
+    # status 1 = iteration cap: with a shared-θ stacked design this still yields
+    # stable, usable estimates, so treat it as converged for the caller's gate.
+    return {'theta': theta, 'std_err': se, 'll': float(ll), 'k': K,
+            'n_sit': len(situations),
+            'converged': bool(res.success or res.status in (0, 1))}
+
+
+def estimate_joint_cdap_by_hh_size(persons: pd.DataFrame,
+                                   tours: pd.DataFrame,
+                                   cfg: Optional[HouseholdCdapConfig] = None,
+                                   max_size: int = 5,
+                                   l2: float = 1e-4,
+                                   per_size: Optional[bool] = None) -> dict:
+    """
+    Estimate the ActivitySim-style JOINT household CDAP separately for each
+    household size 1..max_size (5+ collapsed into the max_size bucket, members
+    capped adults-first like coordinate_household_cdap's n_cdap_persons).
+
+    Utility of a joint pattern combination:
+        U(combo) = Σ_i [ASC_{d_i} + x_i·β_{d_i}]           (individual part;
+                     H is the reference alternative)
+                 + Σ_{i<j} θ2(class_ij, d_i, d_j)          (2-way interactions)
+                 + Σ_{k-subsets, k=3..s} θk(gcls, d)       (all-same-pattern)
+
+    Two coefficient regimes
+    -----------------------
+    * shared (default): ONE coefficient vector estimated across all sizes —
+      robust when sizes 3–5 have few households. Structurally-inapplicable
+      terms shrink to ~0 under L2.
+    * per_size=True (or CDAP_HH_JOINT_PER_SIZE=1): a DEDICATED model per
+      household size that perturbs ONLY the terms appropriate to that size —
+        size 1: ASC + individual β            (no intra-household terms exist)
+        size 2: + 2-way pair interactions
+        size 3: + 3-way · size 4: + 4-way · size 5: + 5-way
+      Each size's coefficients, interaction tables and fit statistics are
+      reported independently under 'size_models'. The prediction-side config
+      continues to use the shared tables (the runtime coordination layer holds
+      one table); the dedicated per-size models are saved for inspection and
+      future per-size runtime use.
+
+    Returns a dict with:
+      sizes       : {s: {n_hh, ll, acc, bic}}   fit diagnostics per bucket
+      coef        : DataFrame(param, value, std_err, t_stat, p_value)  [shared]
+      size_models : {} or {s: {coef, interaction, interaction3/4/5, ll, acc,
+                                bic, n_hh, converged}}                [per_size]
+      interaction / interaction3 / interaction4 / interaction5 :
+              estimated SHARED tables keyed EXACTLY like HouseholdCdapConfig's
+      dap_utility : {ptype: {M, N, H}} evaluated at each ptype's mean profile
+    """
+    import itertools
+    from scipy.stats import norm as _norm
+
+    if per_size is None:
+        per_size = os.environ.get('CDAP_HH_JOINT_PER_SIZE', '0') == '1'
+
+    cfg = cfg or HouseholdCdapConfig()
+    hh_col = next((c for c in (cfg.hh_id_col, 'HHID', 'household_id', 'hhid')
+                   if c in persons.columns), None)
+    prof = _joint_dap_profile(persons)
+    pt_series = persons[cfg_ptype_col()].astype(str) \
+        if cfg_ptype_col() in persons.columns else None
+    dap = derive_observed_dap(persons, tours, cfg)
+
+    # ── HHTS input validation: are we really seeing the right patterns? ────
+    validation = validate_joint_cdap_inputs(persons, tours, cfg,
+                                            max_size=max_size)
+    if validation.get('fatal'):
+        raise RuntimeError(
+            'joint household CDAP: input validation failed — '
+            + '; '.join(validation['fatal']))
+
+    # ── assemble estimation situations per household-size bucket ─────────
+    member_rows = []   # one entry per household: (bucket_size, prof_rows, children, daps)
+    if hh_col is not None:
+        groups = persons.groupby(hh_col, sort=False)
+    else:
+        groups = [(i, persons.iloc[[i]]) for i in range(len(persons))]
+    for _, grp in groups:
+        idx = grp.index
+        child = prof.loc[idx, '_is_child'].to_numpy().astype(bool)
+        # deterministic ordering mirroring coordinate_household_cdap:
+        # adults first, then by person_id string
+        pid_key = [str(x) for x in idx]
+        order = sorted(range(len(idx)),
+                       key=lambda k: (bool(child[k]), str(pid_key[k])))
+        core = order[:max(1, int(max_size))]
+        bucket = len(core)
+        member_rows.append((
+            bucket,
+            prof.loc[idx[core]],
+            [bool(child[k]) for k in core],
+            [dap.loc[i] for i in idx[core]],
+        ))
+
+    var_cols = [c for c in prof.columns if c != '_is_child']
+    DAPS = ['H', 'M', 'N']                     # alphabetical: matches sorted() lookups
+    param_names: list = []
+    col_defs: list = []                        # name → builder fn(prof_rows, daps_tuple)
+
+    # All column builders share one signature: (mlist, children, daps) where
+    # mlist is a list of per-member profile dicts, children the matching
+    # is-child flags, and daps the combination tuple being scored.
+    def _add(name, fn):
+        param_names.append(name)
+        col_defs.append(fn)
+
+    # ASC_N / ASC_M (H reference)
+    _add('ASC_N', lambda ml, ch, ds: float(sum(1 for d in ds if d == 'N')))
+    _add('ASC_M', lambda ml, ch, ds: float(sum(1 for d in ds if d == 'M')))
+    # individual covariates, alternative-specific (N / M)
+    for d in ('N', 'M'):
+        for k in var_cols:
+            _add(f'b_{d}_{k}',
+                 lambda ml, ch, ds, d=d, k=k:
+                 float(sum(r.get(k, 0.0) for r, dd in zip(ml, ds) if dd == d)))
+    # 2-way interactions: count of pairs matching (class, unordered patterns)
+    i2_start = len(param_names)
+    for cls in ('AA', 'AC', 'CC'):
+        for a, b in itertools.combinations_with_replacement(DAPS, 2):
+            _add(f'i2_{cls}_{a}{b}',
+                 lambda ml, ch, ds, cls=cls, a=a, b=b:
+                 float(sum(1 for i in range(len(ds)) for j in range(i + 1, len(ds))
+                           if (('CC' if (ch[i] and ch[j])
+                               else 'AC' if (ch[i] or ch[j]) else 'AA') == cls
+                               and tuple(sorted((ds[i], ds[j])))
+                               == tuple(sorted((a, b)))))))
+    i2_end = len(param_names)
+    # higher-order all-same-pattern subsets (3/4/5-way). Term blocks are laid
+    # out contiguously so a size-s model can restrict itself to the terms that
+    # structurally exist at that size: core + i2 + ... + i{min(s,5)}.
+    order_ends = {}
+    for kk in (3, 4, 5):
+        for n_c in range(kk, -1, -1):
+            gcls = 'A' * (kk - n_c) + 'C' * n_c
+            for d in DAPS:
+                _add(f'i{kk}_{gcls}_{d}',
+                     lambda ml, ch, ds, kk=kk, gcls=gcls, d=d:
+                     float(sum(1 for sub in itertools.combinations(range(len(ds)), kk)
+                               if ('A' * (kk - sum(1 for t in sub if ch[t]))
+                                   + 'C' * sum(1 for t in sub if ch[t])) == gcls
+                               and all(ds[t] == d for t in sub))))
+        order_ends[kk] = len(param_names)
+
+    def _term_slice_for_size(s: int) -> slice:
+        """Columns appropriate for a household of size s: core terms plus every
+        interaction order up to min(s, 5) — nothing else is estimable there."""
+        top = min(s, 5)
+        if s < 2:
+            return slice(0, i2_start)          # ASC + individual β only
+        if top < 3:
+            return slice(0, i2_end)            # + 2-way
+        return slice(0, order_ends[top])       # + 3/4/5-way
+
+    situations = []
+    sit_buckets = []
+    for bucket, mrows, children, daps_list in member_rows:
+        mlist = mrows[var_cols].to_dict('records') if hasattr(mrows, 'columns') \
+            else mrows
+        combos = list(itertools.product(DAPS, repeat=bucket))
+        obs_key = tuple(daps_list)
+        if obs_key not in combos:
+            continue
+        Zbase = np.empty((len(combos), len(param_names)), dtype=float)
+        for ci, combo in enumerate(combos):
+            Zbase[ci] = [fn(mlist, children, combo) for fn in col_defs]
+        situations.append((Zbase, combos.index(obs_key)))
+        sit_buckets.append(bucket)
+
+    if not situations:
+        raise RuntimeError('joint CDAP: no usable households after DAP derivation')
+
+    fit = _fit_conditional_logit(situations, l2=l2)
+    theta, se = fit['theta'], fit['std_err']
+
+    # per-bucket diagnostics under the shared θ
+    ll_by, acc_by, nh_by = {}, {}, {}
+    for (Z, y_idx), bucket in zip(situations, sit_buckets):
+        v = Z @ theta
+        logsum = float(np.log(np.exp(v - v.max()).sum())) + float(v.max())
+        ll_by[bucket] = ll_by.get(bucket, 0.0) + float(v[y_idx] - logsum)
+        acc_by[bucket] = acc_by.get(bucket, 0) + int(int(np.argmax(v)) == y_idx)
+        nh_by[bucket] = nh_by.get(bucket, 0) + 1
+    sizes_out = {}
+    for s in sorted(nh_by):
+        sizes_out[s] = {
+            'n_hh': int(nh_by[s]),
+            'll': round(ll_by[s], 3),
+            'acc': round(acc_by[s] / nh_by[s], 4),
+            'bic': round(-2 * ll_by[s] + fit['k'] * np.log(max(nh_by[s], 1)), 3),
+        }
+
+    def _extract_tables(names, vals):
+        """Interaction tables from a coefficient vector, keyed exactly like
+        HouseholdCdapConfig.interaction / interaction3 / interaction4/5."""
+        inter = {}
+        for pname, val in zip(names, vals):
+            if pname.startswith('i2_'):
+                cls, ab = pname[3:].split('_', 1)
+                inter[(cls, ab[0], ab[1])] = round(float(val), 6)
+
+        def _ho(kk):
+            tbl = {}
+            pre = f'i{kk}_'
+            for pname, val in zip(names, vals):
+                if pname.startswith(pre):
+                    body = pname[len(pre):]     # gcls run then '_' + pattern
+                    gi = 0
+                    while gi < len(body) and body[gi] in 'AC':
+                        gi += 1
+                    tbl[(body[:gi], body[gi + 1:])] = round(float(val), 6)
+            return tbl
+        return inter, {kk: _ho(kk) for kk in (3, 4, 5)}
+
+    # ── dedicated per-size models: perturb ONLY the appropriate terms ──────
+    # size 1 → ASC+β · size 2 → +2-way · size s → +{3..s}-way interactions.
+    size_models = {}
+    if per_size:
+        _min_hh = max(1, int(os.environ.get('CDAP_HH_JOINT_MIN_HH', '30')))
+        for s in sorted(set(sit_buckets)):
+            sl = _term_slice_for_size(s)
+            sits_s = [(Z[:, sl], y)
+                      for (Z, y), b in zip(situations, sit_buckets) if b == s]
+            n_hh_s = len(sits_s)
+            if n_hh_s < _min_hh:
+                print(f"[cdap-hh estimate] joint CDAP size {s}: only "
+                      f"{n_hh_s} households (< {_min_hh}) — no dedicated model")
+                continue
+            fit_s = _fit_conditional_logit(sits_s, l2=l2)
+            th_s = fit_s['theta']
+            names_s = param_names[sl]
+            ll_s, acc_s = 0.0, 0
+            for Z, y_idx in sits_s:
+                v = Z @ th_s
+                logsum = float(np.log(np.exp(v - v.max()).sum())) + float(v.max())
+                ll_s += float(v[y_idx] - logsum)
+                acc_s += int(int(np.argmax(v)) == y_idx)
+            coef_s = pd.DataFrame({'param': names_s, 'value': th_s,
+                                   'std_err': fit_s['std_err']})
+            coef_s['t_stat'] = coef_s['value'] / coef_s['std_err'].replace(0, np.nan)
+            coef_s['p_value'] = [float(2.0 * _norm.sf(abs(t)))
+                                 if np.isfinite(t) else np.nan
+                                 for t in coef_s['t_stat']]
+            inter_s, ho_s = _extract_tables(names_s, th_s)
+            size_models[s] = {
+                'n_hh': n_hh_s,
+                'll': round(ll_s, 3),
+                'acc': round(acc_s / n_hh_s, 4),
+                'bic': round(-2 * ll_s + len(names_s) * np.log(n_hh_s), 3),
+                'converged': fit_s['converged'],
+                'coef': coef_s,
+                'terms': {'core': True,
+                          'i2': s >= 2, 'i3': s >= 3,
+                          'i4': s >= 4, 'i5': s >= 5},
+                'interaction': inter_s,
+                'interaction3': ho_s[3], 'interaction4': ho_s[4],
+                'interaction5': ho_s[5],
+            }
+            print(f"[cdap-hh estimate] joint CDAP size {s}: dedicated model on "
+                  f"{len(names_s)} terms — n={n_hh_s} acc={size_models[s]['acc']:.3f}")
+
+    coef_df = pd.DataFrame({
+        'param': param_names,
+        'value': theta,
+        'std_err': se,
+    })
+    coef_df['t_stat'] = coef_df['value'] / coef_df['std_err'].replace(0, np.nan)
+    coef_df['p_value'] = [float(2.0 * _norm.sf(abs(t))) if np.isfinite(t) else np.nan
+                          for t in coef_df['t_stat']]
+
+    interaction, ho_tables = _extract_tables(param_names, theta)
+
+    # dap_utility per ptype: ASC + β·mean(x) evaluated at each ptype mean profile
+    dap_utility = {}
+    if pt_series is not None:
+        bcols = {(d, k): f'b_{d}_{k}' for d in ('N', 'M') for k in var_cols}
+        th_map = dict(zip(param_names, theta))
+        for pt_val, grp_idx in prof.groupby(pt_series.values).groups.items():
+            mx = prof.loc[grp_idx, var_cols].mean()
+            u = {}
+            for d in DAPS:
+                if d == 'H':
+                    u[d] = 0.0
+                else:
+                    u[d] = float(th_map.get(f'ASC_{d}', 0.0)
+                                 + sum(th_map.get(bcols[(d, k)], 0.0) * float(mx[k])
+                                       for k in var_cols))
+            u = {dd: round(max(min(vv, 12.0), -12.0), 4) for dd, vv in u.items()}
+            dap_utility[str(pt_val)] = u
+
+    return {
+        'sizes': sizes_out,
+        'coef': coef_df,
+        'theta': dict(zip(param_names, map(float, theta))),
+        'interaction': interaction,
+        'interaction3': ho_tables[3],
+        'interaction4': ho_tables[4],
+        'interaction5': ho_tables[5],
+        'size_models': size_models,
+        'per_size': bool(per_size),
+        'input_validation': validation,
+        'dap_utility': dap_utility,
+        'converged': fit['converged'],
+        'n_households': int(sum(nh_by.values())),
+        'model_form': ('joint MNL over product(M,N,H)^s per household size s=1..%d; '
+                       'individual terms (ASC + x·β, ref=H) + 2-way '
+                       '(class, sorted-pattern-pair) + 3/4/5-way all-same-pattern '
+                       'interactions; coefficient regime: %s; L2=%g'
+                       % (max_size,
+                          'dedicated per-size (appropriate terms only)'
+                          if per_size else 'shared across sizes',
+                          l2)),
+    }
+
+
+def save_joint_cdap_html(res: dict, out_dir: str,
+                         fname: str = 'stage0_cdap_household_coefficients.html') -> None:
+    """Render the per-household-size joint CDAP model as an HTML report."""
+    import html as _h
+    os.makedirs(out_dir, exist_ok=True)
+    parts = [
+        '<html><head><meta charset="utf-8">'
+        '<title>Joint household CDAP by household size</title>'
+        '<style>body{font-family:Arial;margin:20px;font-size:13px}'
+        'table{border-collapse:collapse;margin-bottom:18px}'
+        'th{background:#2c3e50;color:#fff;padding:5px 10px;text-align:left}'
+        'td{border:1px solid #ddd;padding:4px 10px}'
+        '</style></head><body>',
+        '<h2>Joint household CDAP — one coordinated plan per household size</h2>',
+        '<p class="note">ActivitySim-style joint logit: alternatives are the '
+        'Cartesian product of each member\'s {M,N,H} pattern, stratified by '
+        'household size 1..5 (5+ capped adults-first). Individual terms '
+        '(ASC + x·β, reference = H) plus 2/3/4/5-way intra-household '
+        'interaction coefficients, shared across sizes.</p>',
+    ]
+    if res.get('sizes'):
+        rows = ''.join(
+            f"<tr><td>{s}</td><td>{v['n_hh']}</td><td>{v['ll']}</td>"
+            f"<td>{v['acc']}</td><td>{v['bic']}</td></tr>"
+            for s, v in sorted(res['sizes'].items()))
+        parts.append('<h3>Per-size fit (shared coefficients)</h3>'
+                     '<table><tr><th>HH size</th><th>n households</th>'
+                     '<th>LogLik</th><th>arg-max accuracy</th><th>BIC</th></tr>'
+                     + rows + '</table>')
+    coef = res.get('coef')
+    if coef is not None and len(coef):
+        def _star(p):
+            if not np.isfinite(p):
+                return ''
+            return '***' if p < 0.001 else '**' if p < 0.01 else \
+                '*' if p < 0.05 else '.' if p < 0.10 else ''
+        rows = ''.join(
+            f"<tr><td>{_h.escape(str(r.param))}</td><td>{r.value:.4f}</td>"
+            f"<td>{r.std_err:.4f}</td><td>{r.t_stat:.2f}</td>"
+            f"<td>{r.p_value:.3g} {_star(r.p_value)}</td></tr>"
+            for r in coef.itertuples())
+        parts.append('<h3>Coefficients (shared across sizes)</h3>'
+                     '<table><tr><th>param</th><th>value</th><th>std_err</th>'
+                     '<th>t</th><th>p</th></tr>' + rows + '</table>')
+    for label, key in (('Estimated 2-way interactions '
+                        '(pair class, pattern pair)', 'interaction'),
+                       ('Estimated 3-way (all-same-pattern)',
+                        'interaction3'),
+                       ('Estimated 4-way', 'interaction4'),
+                       ('Estimated 5-way', 'interaction5')):
+        tbl = res.get(key) or {}
+        if tbl:
+            rows = ''.join(f"<tr><td>{_h.escape(str(k))}</td><td>{v:.4f}</td></tr>"
+                           for k, v in sorted(tbl.items(), key=str))
+            parts.append(f'<h3>{label}</h3><table><tr><th>key</th>'
+                         f'<th>value</th></tr>{rows}</table>')
+
+    # ── dedicated per-size models (CDAP_HH_JOINT_PER_SIZE=1) ───────────────
+    # Each household size gets its OWN estimated model, perturbing only the
+    # terms structurally appropriate to that size.
+    for s, sm in sorted((res.get('size_models') or {}).items()):
+        _terms = sm.get('terms', {})
+        _tlist = ', '.join(t for t, on in _terms.items() if on)
+        parts.append(
+            f"<h3>Dedicated model — household size {s}</h3>"
+            f"<p class='note'>perturbed terms: {_h.escape(_tlist)} | "
+            f"n={sm['n_hh']} households | LogLik={sm['ll']} | "
+            f"acc={sm['acc']} | BIC={sm['bic']}</p>")
+        _c = sm.get('coef')
+        if _c is not None and len(_c):
+            def _star2(p):
+                if not np.isfinite(p):
+                    return ''
+                return '***' if p < 0.001 else '**' if p < 0.01 else \
+                    '*' if p < 0.05 else '.' if p < 0.10 else ''
+            _rows = ''.join(
+                f"<tr><td>{_h.escape(str(r.param))}</td>"
+                f"<td>{r.value:.4f}</td><td>{_star2(r.p_value)}</td></tr>"
+                for r in _c.itertuples())
+            parts.append('<table><tr><th>param</th><th>value</th>'
+                         '<th>sig</th></tr>' + _rows + '</table>')
+    du = res.get('dap_utility') or {}
+    if du:
+        rows = ''.join(
+            f"<tr><td>{_h.escape(str(pt))}</td><td>{u.get('M', 0):.3f}</td>"
+            f"<td>{u.get('N', 0):.3f}</td><td>{u.get('H', 0):.3f}</td></tr>"
+            for pt, u in sorted(du.items()))
+        parts.append('<h3>Implied per-person-type DAP utilities (mean profile)</h3>'
+                     '<table><tr><th>ptype</th><th>M</th><th>N</th><th>H</th>'
+                     '</tr>' + rows + '</table>')
+    parts.append('</body></html>')
+    try:
+        with open(os.path.join(out_dir, fname), 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(parts))
+        print(f"[cdap-hh estimate] wrote {fname}")
+    except Exception as _e:
+        print(f"[cdap-hh estimate] joint-cdap html save skipped: {_e}")
+
+
+
 def estimate_household_cdap(persons: pd.DataFrame, tours: pd.DataFrame,
                             base: Optional[HouseholdCdapConfig] = None,
                             out_dir: Optional[str] = None) -> HouseholdCdapConfig:
-    """Fit all four models and fold the coefficients into a HouseholdCdapConfig.
-    When out_dir is given, also save the estimated coefficients (incl. joint-tour)
-    to household_cdap_coefficients.csv/.pkl."""
+    """Fit all household-CDAP models and fold the coefficients into a
+    HouseholdCdapConfig.
+
+    Models: person-level DAP MNL (dap_utility + composition boosts), the
+    ActivitySim-style JOINT CDAP stratified by household size 1..5 (replaces
+    the heuristic interaction / interaction3 / interaction4 / interaction5
+    priors), joint-tour frequency (Poisson), participation and purpose.
+    When out_dir is given, also save the estimated coefficients (incl.
+    joint-tour) to household_cdap_coefficients.csv/.pkl."""
     cfg = base or HouseholdCdapConfig()
     dap = estimate_cdap_coefficients(persons, tours, cfg)
     freq = estimate_joint_frequency(persons, tours, cfg)
     part = estimate_joint_participation(persons, tours, cfg)
     purp = estimate_joint_purpose(persons, tours, cfg)
 
+    # ── Joint-by-household-size CDAP (ActivitySim) ────────────────────────
+    # Estimated joint pattern-combination logit; overwrites the prior
+    # interaction tables with estimated behaviour when it fits cleanly.
+    joint = None
+    try:
+        joint = estimate_joint_cdap_by_hh_size(persons, tours, cfg)
+        if joint.get('converged'):
+            if joint['interaction']:
+                cfg.interaction.clear()
+                cfg.interaction.update(joint['interaction'])
+            for attr in ('interaction3', 'interaction4', 'interaction5'):
+                tbl = joint.get(attr)
+                if tbl:
+                    getattr(cfg, attr).clear()
+                    getattr(cfg, attr).update(tbl)
+            # Draw-stage tables: dedicated per-size models (when the per-size
+            # regime ran) let each household co-determine its members from
+            # ITS OWN size's coefficients.
+            if joint.get('size_models'):
+                cfg.per_size_tables = {
+                    int(s): {'interaction': sm.get('interaction') or {},
+                             'interaction3': sm.get('interaction3') or {},
+                             'interaction4': sm.get('interaction4') or {},
+                             'interaction5': sm.get('interaction5') or {}}
+                    for s, sm in joint['size_models'].items()}
+        cfg._joint_cdap_by_size = joint   # type: ignore[attr-defined]
+        _sz = joint.get('sizes', {})
+        print("[cdap-hh estimate] joint-by-size CDAP: "
+              + ", ".join(f"size {s}: n={v['n_hh']} acc={v['acc']:.3f}"
+                          for s, v in sorted(_sz.items())))
+    except Exception as _jhh_e:
+        print(f"[cdap-hh estimate] joint-by-size CDAP skipped ({_jhh_e}); "
+              "coordination keeps prior interaction coefficients")
+
     cfg.dap_utility.update(dap['dap_utility'])
+    # Prefer the JOINT model's implied per-ptype utilities (they are identified
+    # against observed household patterns, not just marginal ones).
+    if joint is not None and joint.get('converged') and joint.get('dap_utility'):
+        cfg.dap_utility.update(joint['dap_utility'])
     cfg.more_workers_boost_M = dap['interaction']['more_workers_boost_M']
     cfg.adult_home_boosts_child_N = dap['interaction']['adult_home_boosts_child_N']
     cfg.joint_base_rate = freq['joint_base_rate']
@@ -563,6 +1441,84 @@ def estimate_household_cdap(persons: pd.DataFrame, tours: pd.DataFrame,
           f"joint-purpose n={purp['n_obs']}")
     if out_dir:
         save_household_cdap_coefficients(dap, freq, part, purp, out_dir, cfg=cfg)
+        try:
+            import pickle as _pk
+            with open(os.path.join(out_dir, 'stage0_cdap_household_models.pkl'),
+                      'wb') as _fh:
+                _pk.dump({'joint_by_size': joint, 'config': cfg}, _fh)
+        except Exception as _pe:
+            print(f"[cdap-hh estimate] stage0_cdap_household_models.pkl "
+                  f"save skipped: {_pe}")
+        if joint is not None:
+            save_joint_cdap_html(
+                joint, out_dir,
+                fname='stage0_cdap_household_coefficients.html')
+    return cfg
+
+
+def load_household_cdap_config(pkl_path: str,
+                               base: Optional[HouseholdCdapConfig] = None) -> HouseholdCdapConfig:
+    """Load a fitted household-CDAP config saved by estimation.
+
+    Handles both on-disk formats:
+      * predict-time saves: {'joint_by_size': joint, 'config': cfg}
+        → returns the saved config (column-name fields refreshed from
+        `base` when given so hh/person id columns match the caller).
+      * stage-0 shard saves: the joint-by-size result dict itself
+        (keys sizes/coef/theta/interaction/interaction3/4/5/...) →
+        folds the estimated interaction tables (+ per-size tables,
+        dap_utility when present) into `base` (or a fresh config).
+
+    Individual-level theta terms (ASC_N/M, b_N_*/b_M_*) are reported in
+    the HTML/CSV but intentionally NOT mapped onto per-ptype
+    dap_utility priors (different structure); the joint tables are the
+    H/M/N coordination core. Raises informative errors (never silent
+    priors) so callers fall back explicitly.
+    """
+    import pickle as _pk
+    with open(pkl_path, 'rb') as _fh:
+        obj = _pk.load(_fh)
+    if isinstance(obj, dict) and 'config' in obj and obj['config'] is not None:
+        cfg = obj['config']
+        if base is not None:
+            for _f in ('hh_id_col', 'person_id_col', 'ptype_col',
+                       'vehicles_col', 'seed'):
+                try:
+                    setattr(cfg, _f, getattr(base, _f))
+                except Exception:
+                    pass
+        return cfg
+    joint = None
+    if isinstance(obj, dict) and 'joint_by_size' in obj and obj['joint_by_size'] is not None:
+        joint = obj['joint_by_size']
+    elif isinstance(obj, dict) and 'interaction' in obj:
+        joint = obj
+    if joint is None:
+        raise ValueError(f"{pkl_path}: unrecognised household-CDAP content "
+                         f"(keys={sorted(obj.keys()) if isinstance(obj, dict) else type(obj)})")
+    cfg = base or HouseholdCdapConfig()
+    if joint.get('interaction'):
+        cfg.interaction.clear()
+        cfg.interaction.update({tuple(k): float(v)
+                                for k, v in joint['interaction'].items()})
+    for _attr in ('interaction3', 'interaction4', 'interaction5'):
+        _tbl = joint.get(_attr)
+        if _tbl:
+            getattr(cfg, _attr).clear()
+            getattr(cfg, _attr).update({tuple(k): float(v)
+                                        for k, v in _tbl.items()})
+    if joint.get('size_models'):
+        cfg.per_size_tables = {
+            int(s): {'interaction': {tuple(k): float(v) for k, v in (sm.get('interaction') or {}).items()},
+                     'interaction3': {tuple(k): float(v) for k, v in (sm.get('interaction3') or {}).items()},
+                     'interaction4': {tuple(k): float(v) for k, v in (sm.get('interaction4') or {}).items()},
+                     'interaction5': {tuple(k): float(v) for k, v in (sm.get('interaction5') or {}).items()}}
+            for s, sm in joint['size_models'].items()}
+    if joint.get('dap_utility'):
+        try:
+            cfg.dap_utility.update(joint['dap_utility'])
+        except Exception:
+            pass
     return cfg
 
 

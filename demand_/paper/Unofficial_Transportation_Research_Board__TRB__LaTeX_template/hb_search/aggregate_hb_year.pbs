@@ -1,0 +1,31 @@
+#!/bin/bash
+#PBS -N hb_year_aggregate
+#PBS -l select=1:ncpus=4:mem=32gb
+#PBS -l walltime=03:00:00
+#PBS -j oe
+#PBS -o hb_year_aggregate.log
+
+# Phase 0 — re-aggregate the full-year hard-braking telematics onto SEQ segments.
+# Produces near_miss_hb_ecf_year.csv (+ panel + provenance) in the paper dir.
+
+set -e
+cd "$PBS_O_WORKDIR"
+
+echo "============================================"
+echo "  HB full-year aggregation"
+echo "  Node:  $(hostname)"
+echo "  Start: $(date)"
+echo "============================================"
+
+PAPER_DIR="$(dirname "$PBS_O_WORKDIR")"
+
+python aggregate_hb_year.py \
+    --events "$PAPER_DIR/hard_braking_events_year.csv" \
+    --base   "$PAPER_DIR/near_miss_hb_ecf.csv" \
+    --out-dir "$PAPER_DIR" \
+    --max-dist 500 \
+    --chunksize 2000000
+
+echo "============================================"
+echo "  End: $(date)"
+echo "============================================"

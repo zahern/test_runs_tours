@@ -1,0 +1,45 @@
+#!/bin/bash -l
+#PBS -N eb_search_mcrdeep
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -j oe
+#PBS -r n
+# Deep MCR random-parameter role search (S4 follow-up to job 25402029, which
+# ran a single start, 300 iters, N=1500 subsample): 3 starts, 600 iters,
+# N=3000 subsample, 1h per start. Writes to a SCRATCH dir; the winner is
+# promoted to $PROJ_DIR manually after comparing BICs.
+# Est: several hours on 4 cpus.
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template
+SCR4=$PROJ_DIR/eb_deep_mcr
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+# ALWAYS ensure the pinned estimator: flock-serialized so concurrent paper jobs
+# don't race pip into the shared env (hardened after jobs 25258209/25271015).
+mkdir -p /mnt/hpccs01/home/ahernz/test_runs_tours/code
+(
+    flock -w 900 9 2>/dev/null || echo "(flock unavailable, proceeding without lock)"
+    pip install --quiet --upgrade --retries 5 --timeout 60 "metacountregressor==1.0.151" 2>&1 | tail -5
+) 9>/mnt/hpccs01/home/ahernz/test_runs_tours/code/.pkg_upgrade.lock
+# Hard gate (this file has NO `set -e`, so a bare failing assert would NOT stop
+# the job -- reads distribution metadata, NOT m.__version__).
+python -c "from importlib.metadata import version as _v; v=tuple(map(int, _v('metacountregressor').split('.')[:3])); assert v>=(1,0,151), f\"stale mcr {_v('metacountregressor')} -- aborting\"; print('mcr', _v('metacountregressor'), 'OK')" || exit 1
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
+export JAX_PLATFORMS=cpu
+cd "$PROJ_DIR"
+mkdir -p "$SCR4"
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+python -u eb_searched_rp.py --data "$PROJ_DIR/near_miss_hb_ecf.csv" --out-dir "$SCR4" --search mcr-role --load-best --best-dir "$PROJ_DIR" --mcr-starts 3 --mcr-maxiter 600 --mcr-nmax 3000 --mcr-maxtime 3600 2>&1
+EXIT_CODE=$?
+# MCR role searches are best-effort (StructureEvaluatorLC may be unavailable
+# on some nodes): warn but do not fail the job if absent.
+for f in "$SCR4/eb_search_mcr_role_HB.csv" "$SCR4/eb_search_mcr_role_Crash.csv"; do
+  if [ ! -f "$f" ]; then echo "WARNING: optional MCR role output absent: $f"; fi
+done
+echo "Job finished at $(date) exit=$EXIT_CODE"
+exit $EXIT_CODE

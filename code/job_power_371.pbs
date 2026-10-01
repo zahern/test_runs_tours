@@ -1,0 +1,65 @@
+#!/bin/bash -l
+# =============================================================================
+# Power network (URBANopt-anchored) for the 371 SA2 zones + power accessibility.
+# Chain: build_power_network_371.py -> run_opendss_371.py -> power_accessibility.py
+# Outputs: saved_data/power/{zone_power_371.csv, sa2_371_electric.geojson,
+#          electrical_database.json, profiles/, opendss_results_371.csv,
+#          scenario_report_opendss.json, power_accessibility_371.csv,
+#          accessibility_371_with_power.csv}
+#
+# Offline: no internet needed. True OpenDSS used iff OpenDSSDirect.py is
+# installed (see check_urbanopt_stack.py); otherwise the labelled proxy engine
+# runs with the same output schema. Timeseries solve: qsub -v "TIMESERIES=1".
+#
+# Submit:  qsub job_power_371.pbs
+# =============================================================================
+#PBS -N power_371
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -l walltime=02:00:00
+
+set -euo pipefail
+CONDA_ENV=${CONDA_ENV:-geotfenv}
+cd "$PBS_O_WORKDIR"
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+
+echo "=== 0. URBANopt stack readiness (informational) ==="
+python -u check_urbanopt_stack.py || true
+
+echo "=== 1. Build synthetic distribution network (371 zones) ==="
+python -u build_power_network_371.py
+
+echo "=== 2. Powerflow + violations + upgrade costs ==="
+if [ "${TIMESERIES:-0}" = "1" ]; then
+    python -u run_opendss_371.py --timeseries
+else
+    python -u run_opendss_371.py
+fi
+
+echo "=== 3. Power accessibility + merge with transport accessibility ==="
+python -u power_accessibility.py --merge-with saved_data/accessibility_371.csv
+
+echo "=== Verify ==="
+python - <<'PY'
+import pandas as pd, os, json
+for p, keys in [('saved_data/power/zone_power_371.csv', {'peak_kw', 'feeder_km'}),
+                ('saved_data/power/opendss_results_371.csv',
+                 {'xfmr_loading_pct', 'min_pu_voltage', 'upgrade_cost_aud'}),
+                ('saved_data/power/power_accessibility_371.csv',
+                 {'power_reliability_acc', 'ev_hosting_acc'})]:
+    assert os.path.exists(p), f"MISSING: {p}"
+    d = pd.read_csv(p)
+    assert keys <= set(d.columns), f"{p} missing {keys - set(d.columns)}"
+    print(f"{p}: {len(d)} zones")
+rep = json.load(open('saved_data/power/scenario_report_opendss.json'))
+print(f"engine={rep['engine']} peak={rep['system_peak_mw']}MW "
+      f"viol_zones={rep['zones_with_violations']}/{rep['n_zones']} "
+      f"upgrade=${rep['total_upgrade_cost_aud']/1e6:.1f}M")
+print("OK")
+PY
+echo "Done. Next: wire power_*_acc columns into GA specs / stage utilities as needed."

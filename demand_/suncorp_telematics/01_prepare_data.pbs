@@ -1,0 +1,74 @@
+#!/bin/bash -l
+#PBS -N suncorp_prepare
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Job 1: Prepare EB Dataset for Suncorp Telematics Analysis
+# Creates near_miss_hb_ecf.csv from hard braking events and road segments
+# ══════════════════════════════════════════════════════════════════════════════
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results
+
+# ── Load environment ──────────────────────────────────────────────────────────
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+# Ensure required packages are present in the conda env (force-repair broken installs)
+echo "Checking/installing required Python packages..."
+python -c "import geopandas" 2>/dev/null || pip install --force-reinstall --no-deps geopandas pyogrio
+python -c "import scipy" 2>/dev/null || pip install --force-reinstall --no-deps scipy
+
+# ── Environment variables ─────────────────────────────────────────────────────
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
+cd "$SCRIPT_DIR"
+
+echo "════════════════════════════════════════════════════════════════════════════"
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "Project dir:  $PROJ_DIR"
+echo "Data dir:     $DATA_DIR"
+echo "Results dir:  $RESULTS_DIR"
+echo "════════════════════════════════════════════════════════════════════════════"
+
+# ── Update paths in Python script ─────────────────────────────────────────────
+echo "Updating paths for HPC environment..."
+sed -i "s|PROJ = r\"C:\\\\Users\\\\ahernz.*\"|PROJ = \"$PROJ_DIR\"|g" 18_prepare_eb_dataset.py
+sed -i "s|ROOT = r\"C:\\\\Users\\\\ahernz.*\"|ROOT = \"$DATA_DIR\"|g" 18_prepare_eb_dataset.py
+
+# ── Run data preparation ──────────────────────────────────────────────────────
+echo ""
+echo "Running 18_prepare_eb_dataset.py..."
+echo ""
+
+python -u 18_prepare_eb_dataset.py 2>&1
+EXIT_CODE=$?
+
+# ── Check output ──────────────────────────────────────────────────────────────
+if [ -f "$DATA_DIR/near_miss_hb_ecf.csv" ]; then
+    echo ""
+    echo "✓ Success! Created near_miss_hb_ecf.csv"
+    wc -l "$DATA_DIR/near_miss_hb_ecf.csv"
+else
+    echo ""
+    echo "✗ FAILED: near_miss_hb_ecf.csv not created"
+    EXIT_CODE=1
+fi
+
+echo ""
+echo "════════════════════════════════════════════════════════════════════════════"
+echo "Job finished at $(date) — exit_code=$EXIT_CODE"
+echo "════════════════════════════════════════════════════════════════════════════"
+
+exit $EXIT_CODE

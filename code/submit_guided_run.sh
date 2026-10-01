@@ -75,7 +75,7 @@ COMMON+=",GA_PARALLEL_SEGMENTS=4"
 COMMON+=",GA_JAX_CACHE_MEM_LIMIT_GB=38,GA_JAX_CACHE_CHECK_EVERY=50"
 COMMON+=",GA_RAND_PARAM_SEARCH=1,STAGE5_ENABLE_MXL=1"
 # NEW_POP=1: full-SEQ SA2-direct scope (371 zones incl. Tweed/NSW/Toowoomba,
-# skims sa2_skims_507_omxspec.omx with CRASH, landuse zone_landuse_507.csv).
+# skims skims_371.omx with CRASH, landuse zone_landuse_507.csv).
 # The legacy 330-zone ORDER scope (NEW_POP=0) predates the 2026-07 zone work.
 COMMON+=",NEW_POP=1,NEW_POP_MAPPED=0,NEW_POP_DIR=../new_pop,PIPELINE_SKIMS_PATH="
 COMMON+=",PIPELINE_RUN_TAG=${TAG}"

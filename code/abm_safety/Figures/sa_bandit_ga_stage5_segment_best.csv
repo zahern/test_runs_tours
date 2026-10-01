@@ -1,7 +1,0 @@
-stage,segment,best_fitness,best_bic_per_obs,n_features,best_features
-5,Work (tour) Mode,-1.5954891779847598,1.5954891779847598,5,"mode:incp, mode:is_female, mode:nprd, mode:vehrd, mode:CRASH"
-5,Work (tour) Dest,-6.025024585519871,6.025024585519871,6,"mode:incp, mode:is_female, mode:nprd, mode:vehrd, mode:CRASH, dest:incp"
-5,School/Edu (tour) Mode,-1.8130512251578068,1.8130512251578068,5,"mode:bikes, mode:is_female, mode:nprd, mode:vehrd, mode:CRASH"
-5,School/Edu (tour) Dest,-3.706982198606275,3.706982198606275,6,"mode:bikes, mode:is_female, mode:nprd, mode:vehrd, mode:CRASH, dest:incp"
-5,Non-Mandatory (tour) Mode,-1.883845078134058,1.883845078134058,5,"mode:income_lo, mode:mandatory_role, mode:nprd, mode:vehrd, mode:CRASH"
-5,Non-Mandatory (tour) Dest,-3.709883036760417,3.709883036760417,6,"mode:income_lo, mode:mandatory_role, mode:nprd, mode:vehrd, mode:CRASH, dest:incp"

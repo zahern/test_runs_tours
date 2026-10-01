@@ -109,12 +109,13 @@ def compute_logsum_accessibility(
 
     zone_col = 'ORDER' if 'ORDER' in landuse.columns else (
         landuse.index.name or landuse.columns[0])
+    # 371-only: no `!= 330` drop — ORDER 330 is a real zone in the 371 system.
     if zone_ids_override is not None:
-        zone_ids = sorted(int(z) for z in zone_ids_override if int(z) > 0 and int(z) != 330)
+        zone_ids = sorted(int(z) for z in zone_ids_override if int(z) > 0)
     else:
         zone_ids = sorted(
             int(z) for z in landuse[zone_col].astype(int).unique()
-            if int(z) > 0 and int(z) != 330)
+            if int(z) > 0)
     if len(zone_ids) < 10:
         zone_ids = _default_zone_universe()
     n_zones = len(zone_ids)

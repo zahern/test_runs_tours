@@ -1,8 +1,8 @@
 ==============================
 Current Time               :       1.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
+Total # of Gen Vehs        :        23
+Total # of Out Vehs        :         4
+Total # of In Vehs         :        19
 Avg Travel Time All Vehs   :       0.0
 Avg Travel Time for out Veh:       0.0
 Avg speed for all links    :      59.1
@@ -10,9 +10,9 @@ Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :       2.0
-Total # of Gen Vehs        :         0
+Total # of Gen Vehs        :        47
 Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
+Total # of In Vehs         :        47
 Avg Travel Time All Vehs   :       0.0
 Avg Travel Time for out Veh:       0.0
 Avg speed for all links    :      59.1
@@ -20,9 +20,9 @@ Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :       3.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
+Total # of Gen Vehs        :        64
+Total # of Out Vehs        :         2
+Total # of In Vehs         :        62
 Avg Travel Time All Vehs   :       0.0
 Avg Travel Time for out Veh:       0.0
 Avg speed for all links    :      59.1
@@ -30,9 +30,9 @@ Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :       4.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
+Total # of Gen Vehs        :        82
+Total # of Out Vehs        :         2
+Total # of In Vehs         :        80
 Avg Travel Time All Vehs   :       0.0
 Avg Travel Time for out Veh:       0.0
 Avg speed for all links    :      59.1
@@ -40,1171 +40,1171 @@ Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :       5.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
+Total # of Gen Vehs        :       105
+Total # of Out Vehs        :         2
+Total # of In Vehs         :       103
 Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Avg Travel Time for out Veh:       1.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :       6.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
+Total # of Gen Vehs        :       132
+Total # of Out Vehs        :         4
+Total # of In Vehs         :       128
 Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Avg Travel Time for out Veh:       0.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :       7.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       153
+Total # of Out Vehs        :         4
+Total # of In Vehs         :       149
+Avg Travel Time All Vehs   :       0.1
+Avg Travel Time for out Veh:       2.0
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :       8.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
+Total # of Gen Vehs        :       167
+Total # of Out Vehs        :         3
+Total # of In Vehs         :       164
 Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Avg Travel Time for out Veh:       2.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :       9.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
+Total # of Gen Vehs        :       187
+Total # of Out Vehs        :         6
+Total # of In Vehs         :       181
 Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Avg Travel Time for out Veh:       1.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      10.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       198
+Total # of Out Vehs        :         8
+Total # of In Vehs         :       190
+Avg Travel Time All Vehs   :       0.1
+Avg Travel Time for out Veh:       3.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      11.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       215
+Total # of Out Vehs        :         8
+Total # of In Vehs         :       207
+Avg Travel Time All Vehs   :       0.2
+Avg Travel Time for out Veh:       5.3
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      12.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       236
+Total # of Out Vehs        :        12
+Total # of In Vehs         :       224
+Avg Travel Time All Vehs   :       0.2
+Avg Travel Time for out Veh:       3.6
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      13.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       258
+Total # of Out Vehs        :        11
+Total # of In Vehs         :       247
+Avg Travel Time All Vehs   :       0.2
+Avg Travel Time for out Veh:       5.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      14.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       278
+Total # of Out Vehs        :        11
+Total # of In Vehs         :       267
+Avg Travel Time All Vehs   :       0.2
+Avg Travel Time for out Veh:       5.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      15.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       302
+Total # of Out Vehs        :        18
+Total # of In Vehs         :       284
+Avg Travel Time All Vehs   :       0.4
+Avg Travel Time for out Veh:       6.3
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      16.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       325
+Total # of Out Vehs        :        25
+Total # of In Vehs         :       300
+Avg Travel Time All Vehs   :       0.5
+Avg Travel Time for out Veh:       7.0
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      17.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       339
+Total # of Out Vehs        :        26
+Total # of In Vehs         :       313
+Avg Travel Time All Vehs   :       0.5
+Avg Travel Time for out Veh:       7.0
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      18.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       352
+Total # of Out Vehs        :        29
+Total # of In Vehs         :       323
+Avg Travel Time All Vehs   :       0.7
+Avg Travel Time for out Veh:       8.0
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      19.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       376
+Total # of Out Vehs        :        38
+Total # of In Vehs         :       338
+Avg Travel Time All Vehs   :       0.9
+Avg Travel Time for out Veh:       9.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      20.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       397
+Total # of Out Vehs        :        42
+Total # of In Vehs         :       355
+Avg Travel Time All Vehs   :       0.9
+Avg Travel Time for out Veh:       8.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      21.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       414
+Total # of Out Vehs        :        46
+Total # of In Vehs         :       368
+Avg Travel Time All Vehs   :       1.0
+Avg Travel Time for out Veh:       8.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      22.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       441
+Total # of Out Vehs        :        51
+Total # of In Vehs         :       390
+Avg Travel Time All Vehs   :       1.1
+Avg Travel Time for out Veh:       9.2
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      23.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       461
+Total # of Out Vehs        :        60
+Total # of In Vehs         :       401
+Avg Travel Time All Vehs   :       1.2
+Avg Travel Time for out Veh:       9.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      24.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       486
+Total # of Out Vehs        :        65
+Total # of In Vehs         :       421
+Avg Travel Time All Vehs   :       1.3
+Avg Travel Time for out Veh:       9.6
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      25.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       504
+Total # of Out Vehs        :        69
+Total # of In Vehs         :       435
+Avg Travel Time All Vehs   :       1.4
+Avg Travel Time for out Veh:       9.9
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      26.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       530
+Total # of Out Vehs        :        77
+Total # of In Vehs         :       453
+Avg Travel Time All Vehs   :       1.4
+Avg Travel Time for out Veh:       9.3
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      27.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       541
+Total # of Out Vehs        :        79
+Total # of In Vehs         :       462
+Avg Travel Time All Vehs   :       1.5
+Avg Travel Time for out Veh:      10.5
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      28.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       566
+Total # of Out Vehs        :        90
+Total # of In Vehs         :       476
+Avg Travel Time All Vehs   :       1.6
+Avg Travel Time for out Veh:      10.3
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      29.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       590
+Total # of Out Vehs        :        94
+Total # of In Vehs         :       496
+Avg Travel Time All Vehs   :       1.8
+Avg Travel Time for out Veh:      11.2
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      30.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       609
+Total # of Out Vehs        :       101
+Total # of In Vehs         :       508
+Avg Travel Time All Vehs   :       1.9
+Avg Travel Time for out Veh:      11.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      31.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       628
+Total # of Out Vehs        :       107
+Total # of In Vehs         :       521
+Avg Travel Time All Vehs   :       2.0
+Avg Travel Time for out Veh:      11.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      32.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       646
+Total # of Out Vehs        :       116
+Total # of In Vehs         :       530
+Avg Travel Time All Vehs   :       2.2
+Avg Travel Time for out Veh:      12.0
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      33.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       667
+Total # of Out Vehs        :       124
+Total # of In Vehs         :       543
+Avg Travel Time All Vehs   :       2.2
+Avg Travel Time for out Veh:      12.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      34.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       684
+Total # of Out Vehs        :       141
+Total # of In Vehs         :       543
+Avg Travel Time All Vehs   :       2.6
+Avg Travel Time for out Veh:      12.6
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      35.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       705
+Total # of Out Vehs        :       145
+Total # of In Vehs         :       560
+Avg Travel Time All Vehs   :       2.7
+Avg Travel Time for out Veh:      13.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      36.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       722
+Total # of Out Vehs        :       158
+Total # of In Vehs         :       564
+Avg Travel Time All Vehs   :       3.0
+Avg Travel Time for out Veh:      13.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      37.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       745
+Total # of Out Vehs        :       169
+Total # of In Vehs         :       576
+Avg Travel Time All Vehs   :       3.1
+Avg Travel Time for out Veh:      13.6
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      38.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       761
+Total # of Out Vehs        :       185
+Total # of In Vehs         :       576
+Avg Travel Time All Vehs   :       3.5
+Avg Travel Time for out Veh:      14.3
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      39.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       778
+Total # of Out Vehs        :       195
+Total # of In Vehs         :       583
+Avg Travel Time All Vehs   :       3.6
+Avg Travel Time for out Veh:      14.5
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      40.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       793
+Total # of Out Vehs        :       202
+Total # of In Vehs         :       591
+Avg Travel Time All Vehs   :       3.8
+Avg Travel Time for out Veh:      14.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      41.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       804
+Total # of Out Vehs        :       211
+Total # of In Vehs         :       593
+Avg Travel Time All Vehs   :       3.9
+Avg Travel Time for out Veh:      14.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      42.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       827
+Total # of Out Vehs        :       222
+Total # of In Vehs         :       605
+Avg Travel Time All Vehs   :       4.2
+Avg Travel Time for out Veh:      15.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      43.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       842
+Total # of Out Vehs        :       234
+Total # of In Vehs         :       608
+Avg Travel Time All Vehs   :       4.4
+Avg Travel Time for out Veh:      15.9
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      44.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       862
+Total # of Out Vehs        :       241
+Total # of In Vehs         :       621
+Avg Travel Time All Vehs   :       4.5
+Avg Travel Time for out Veh:      16.0
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      45.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       882
+Total # of Out Vehs        :       247
+Total # of In Vehs         :       635
+Avg Travel Time All Vehs   :       4.5
+Avg Travel Time for out Veh:      16.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      46.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       904
+Total # of Out Vehs        :       257
+Total # of In Vehs         :       647
+Avg Travel Time All Vehs   :       4.6
+Avg Travel Time for out Veh:      16.3
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      47.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       926
+Total # of Out Vehs        :       266
+Total # of In Vehs         :       660
+Avg Travel Time All Vehs   :       4.8
+Avg Travel Time for out Veh:      16.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      48.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       946
+Total # of Out Vehs        :       275
+Total # of In Vehs         :       671
+Avg Travel Time All Vehs   :       4.9
+Avg Travel Time for out Veh:      16.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      49.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       969
+Total # of Out Vehs        :       283
+Total # of In Vehs         :       686
+Avg Travel Time All Vehs   :       5.1
+Avg Travel Time for out Veh:      17.3
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      50.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :       988
+Total # of Out Vehs        :       294
+Total # of In Vehs         :       694
+Avg Travel Time All Vehs   :       5.2
+Avg Travel Time for out Veh:      17.6
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      51.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1005
+Total # of Out Vehs        :       306
+Total # of In Vehs         :       699
+Avg Travel Time All Vehs   :       5.5
+Avg Travel Time for out Veh:      18.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      52.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1029
+Total # of Out Vehs        :       319
+Total # of In Vehs         :       710
+Avg Travel Time All Vehs   :       5.7
+Avg Travel Time for out Veh:      18.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      53.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1042
+Total # of Out Vehs        :       332
+Total # of In Vehs         :       710
+Avg Travel Time All Vehs   :       6.0
+Avg Travel Time for out Veh:      18.9
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      54.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1059
+Total # of Out Vehs        :       340
+Total # of In Vehs         :       719
+Avg Travel Time All Vehs   :       6.2
+Avg Travel Time for out Veh:      19.2
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      55.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1083
+Total # of Out Vehs        :       357
+Total # of In Vehs         :       726
+Avg Travel Time All Vehs   :       6.3
+Avg Travel Time for out Veh:      19.2
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      56.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1110
+Total # of Out Vehs        :       371
+Total # of In Vehs         :       739
+Avg Travel Time All Vehs   :       6.6
+Avg Travel Time for out Veh:      19.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      57.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1132
+Total # of Out Vehs        :       383
+Total # of In Vehs         :       749
+Avg Travel Time All Vehs   :       6.7
+Avg Travel Time for out Veh:      19.9
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      58.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1152
+Total # of Out Vehs        :       396
+Total # of In Vehs         :       756
+Avg Travel Time All Vehs   :       6.8
+Avg Travel Time for out Veh:      19.9
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      59.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1176
+Total # of Out Vehs        :       410
+Total # of In Vehs         :       766
+Avg Travel Time All Vehs   :       7.1
+Avg Travel Time for out Veh:      20.5
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      60.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1194
+Total # of Out Vehs        :       419
+Total # of In Vehs         :       775
+Avg Travel Time All Vehs   :       7.3
+Avg Travel Time for out Veh:      20.9
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      61.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1210
+Total # of Out Vehs        :       431
+Total # of In Vehs         :       779
+Avg Travel Time All Vehs   :       7.5
+Avg Travel Time for out Veh:      21.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      62.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1228
+Total # of Out Vehs        :       445
+Total # of In Vehs         :       783
+Avg Travel Time All Vehs   :       7.8
+Avg Travel Time for out Veh:      21.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      63.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1244
+Total # of Out Vehs        :       464
+Total # of In Vehs         :       780
+Avg Travel Time All Vehs   :       8.1
+Avg Travel Time for out Veh:      21.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      64.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1260
+Total # of Out Vehs        :       480
+Total # of In Vehs         :       780
+Avg Travel Time All Vehs   :       8.5
+Avg Travel Time for out Veh:      22.3
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      65.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1291
+Total # of Out Vehs        :       490
+Total # of In Vehs         :       801
+Avg Travel Time All Vehs   :       8.5
+Avg Travel Time for out Veh:      22.5
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      66.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1317
+Total # of Out Vehs        :       504
+Total # of In Vehs         :       813
+Avg Travel Time All Vehs   :       8.6
+Avg Travel Time for out Veh:      22.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      67.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1334
+Total # of Out Vehs        :       521
+Total # of In Vehs         :       813
+Avg Travel Time All Vehs   :       8.9
+Avg Travel Time for out Veh:      22.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      68.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1356
+Total # of Out Vehs        :       538
+Total # of In Vehs         :       818
+Avg Travel Time All Vehs   :       9.2
+Avg Travel Time for out Veh:      23.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      69.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1376
+Total # of Out Vehs        :       561
+Total # of In Vehs         :       815
+Avg Travel Time All Vehs   :       9.7
+Avg Travel Time for out Veh:      23.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      70.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1399
+Total # of Out Vehs        :       582
+Total # of In Vehs         :       817
+Avg Travel Time All Vehs   :      10.1
+Avg Travel Time for out Veh:      24.2
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      71.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1416
+Total # of Out Vehs        :       600
+Total # of In Vehs         :       816
+Avg Travel Time All Vehs   :      10.4
+Avg Travel Time for out Veh:      24.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      72.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1438
+Total # of Out Vehs        :       614
+Total # of In Vehs         :       824
+Avg Travel Time All Vehs   :      10.6
+Avg Travel Time for out Veh:      24.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      73.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1458
+Total # of Out Vehs        :       629
+Total # of In Vehs         :       829
+Avg Travel Time All Vehs   :      10.9
+Avg Travel Time for out Veh:      25.3
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      74.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1474
+Total # of Out Vehs        :       642
+Total # of In Vehs         :       832
+Avg Travel Time All Vehs   :      11.1
+Avg Travel Time for out Veh:      25.6
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      75.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1481
+Total # of Out Vehs        :       663
+Total # of In Vehs         :       818
+Avg Travel Time All Vehs   :      11.6
+Avg Travel Time for out Veh:      26.0
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      76.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1497
+Total # of Out Vehs        :       670
+Total # of In Vehs         :       827
+Avg Travel Time All Vehs   :      11.7
+Avg Travel Time for out Veh:      26.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      77.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1508
+Total # of Out Vehs        :       682
+Total # of In Vehs         :       826
+Avg Travel Time All Vehs   :      11.8
+Avg Travel Time for out Veh:      26.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      78.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1528
+Total # of Out Vehs        :       701
+Total # of In Vehs         :       827
+Avg Travel Time All Vehs   :      12.1
+Avg Travel Time for out Veh:      26.3
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      79.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1545
+Total # of Out Vehs        :       718
+Total # of In Vehs         :       827
+Avg Travel Time All Vehs   :      12.3
+Avg Travel Time for out Veh:      26.6
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      80.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1571
+Total # of Out Vehs        :       745
+Total # of In Vehs         :       826
+Avg Travel Time All Vehs   :      12.6
+Avg Travel Time for out Veh:      26.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      81.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1586
+Total # of Out Vehs        :       762
+Total # of In Vehs         :       824
+Avg Travel Time All Vehs   :      13.0
+Avg Travel Time for out Veh:      27.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      82.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1602
+Total # of Out Vehs        :       780
+Total # of In Vehs         :       822
+Avg Travel Time All Vehs   :      13.3
+Avg Travel Time for out Veh:      27.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      83.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1622
+Total # of Out Vehs        :       802
+Total # of In Vehs         :       820
+Avg Travel Time All Vehs   :      13.6
+Avg Travel Time for out Veh:      27.6
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      84.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1636
+Total # of Out Vehs        :       819
+Total # of In Vehs         :       817
+Avg Travel Time All Vehs   :      13.9
+Avg Travel Time for out Veh:      27.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      85.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1653
+Total # of Out Vehs        :       829
+Total # of In Vehs         :       824
+Avg Travel Time All Vehs   :      14.0
+Avg Travel Time for out Veh:      27.9
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      86.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1673
+Total # of Out Vehs        :       852
+Total # of In Vehs         :       821
+Avg Travel Time All Vehs   :      14.4
+Avg Travel Time for out Veh:      28.2
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      87.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1692
+Total # of Out Vehs        :       873
+Total # of In Vehs         :       819
+Avg Travel Time All Vehs   :      14.7
+Avg Travel Time for out Veh:      28.6
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      88.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1709
+Total # of Out Vehs        :       886
+Total # of In Vehs         :       823
+Avg Travel Time All Vehs   :      14.9
+Avg Travel Time for out Veh:      28.6
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      89.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1727
+Total # of Out Vehs        :       898
+Total # of In Vehs         :       829
+Avg Travel Time All Vehs   :      14.9
+Avg Travel Time for out Veh:      28.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      90.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1738
+Total # of Out Vehs        :       906
+Total # of In Vehs         :       832
+Avg Travel Time All Vehs   :      15.2
+Avg Travel Time for out Veh:      29.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      91.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1763
+Total # of Out Vehs        :       920
+Total # of In Vehs         :       843
+Avg Travel Time All Vehs   :      15.3
+Avg Travel Time for out Veh:      29.3
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      92.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1790
+Total # of Out Vehs        :       931
+Total # of In Vehs         :       859
+Avg Travel Time All Vehs   :      15.3
+Avg Travel Time for out Veh:      29.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      93.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1806
+Total # of Out Vehs        :       941
+Total # of In Vehs         :       865
+Avg Travel Time All Vehs   :      15.4
+Avg Travel Time for out Veh:      29.6
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      94.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1822
+Total # of Out Vehs        :       957
+Total # of In Vehs         :       865
+Avg Travel Time All Vehs   :      15.6
+Avg Travel Time for out Veh:      29.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      95.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1846
+Total # of Out Vehs        :       984
+Total # of In Vehs         :       862
+Avg Travel Time All Vehs   :      15.9
+Avg Travel Time for out Veh:      29.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      96.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1863
+Total # of Out Vehs        :       998
+Total # of In Vehs         :       865
+Avg Travel Time All Vehs   :      16.1
+Avg Travel Time for out Veh:      30.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      97.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1881
+Total # of Out Vehs        :      1011
+Total # of In Vehs         :       870
+Avg Travel Time All Vehs   :      16.3
+Avg Travel Time for out Veh:      30.3
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      98.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1900
+Total # of Out Vehs        :      1026
+Total # of In Vehs         :       874
+Avg Travel Time All Vehs   :      16.4
+Avg Travel Time for out Veh:      30.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :      99.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1918
+Total # of Out Vehs        :      1039
+Total # of In Vehs         :       879
+Avg Travel Time All Vehs   :      16.5
+Avg Travel Time for out Veh:      30.5
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     100.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1941
+Total # of Out Vehs        :      1057
+Total # of In Vehs         :       884
+Avg Travel Time All Vehs   :      16.7
+Avg Travel Time for out Veh:      30.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     101.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1958
+Total # of Out Vehs        :      1077
+Total # of In Vehs         :       881
+Avg Travel Time All Vehs   :      17.0
+Avg Travel Time for out Veh:      30.9
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     102.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      1979
+Total # of Out Vehs        :      1100
+Total # of In Vehs         :       879
+Avg Travel Time All Vehs   :      17.1
+Avg Travel Time for out Veh:      30.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     103.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2003
+Total # of Out Vehs        :      1123
+Total # of In Vehs         :       880
+Avg Travel Time All Vehs   :      17.3
+Avg Travel Time for out Veh:      30.9
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     104.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2029
+Total # of Out Vehs        :      1142
+Total # of In Vehs         :       887
+Avg Travel Time All Vehs   :      17.6
+Avg Travel Time for out Veh:      31.2
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     105.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2050
+Total # of Out Vehs        :      1161
+Total # of In Vehs         :       889
+Avg Travel Time All Vehs   :      17.8
+Avg Travel Time for out Veh:      31.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     106.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2073
+Total # of Out Vehs        :      1176
+Total # of In Vehs         :       897
+Avg Travel Time All Vehs   :      17.8
+Avg Travel Time for out Veh:      31.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     107.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2093
+Total # of Out Vehs        :      1189
+Total # of In Vehs         :       904
+Avg Travel Time All Vehs   :      17.9
+Avg Travel Time for out Veh:      31.5
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     108.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2113
+Total # of Out Vehs        :      1207
+Total # of In Vehs         :       906
+Avg Travel Time All Vehs   :      18.1
+Avg Travel Time for out Veh:      31.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     109.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2136
+Total # of Out Vehs        :      1233
+Total # of In Vehs         :       903
+Avg Travel Time All Vehs   :      18.4
+Avg Travel Time for out Veh:      31.9
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     110.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2153
+Total # of Out Vehs        :      1241
+Total # of In Vehs         :       912
+Avg Travel Time All Vehs   :      18.6
+Avg Travel Time for out Veh:      32.2
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     111.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2162
+Total # of Out Vehs        :      1260
+Total # of In Vehs         :       902
+Avg Travel Time All Vehs   :      19.0
+Avg Travel Time for out Veh:      32.6
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     112.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2185
+Total # of Out Vehs        :      1282
+Total # of In Vehs         :       903
+Avg Travel Time All Vehs   :      19.2
+Avg Travel Time for out Veh:      32.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     113.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2206
+Total # of Out Vehs        :      1298
+Total # of In Vehs         :       908
+Avg Travel Time All Vehs   :      19.3
+Avg Travel Time for out Veh:      32.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     114.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2221
+Total # of Out Vehs        :      1319
+Total # of In Vehs         :       902
+Avg Travel Time All Vehs   :      19.6
+Avg Travel Time for out Veh:      33.0
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     115.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2239
+Total # of Out Vehs        :      1333
+Total # of In Vehs         :       906
+Avg Travel Time All Vehs   :      19.7
+Avg Travel Time for out Veh:      33.1
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     116.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2261
+Total # of Out Vehs        :      1359
+Total # of In Vehs         :       902
+Avg Travel Time All Vehs   :      20.1
+Avg Travel Time for out Veh:      33.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     117.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2279
+Total # of Out Vehs        :      1371
+Total # of In Vehs         :       908
+Avg Travel Time All Vehs   :      20.1
+Avg Travel Time for out Veh:      33.4
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     118.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2304
+Total # of Out Vehs        :      1385
+Total # of In Vehs         :       919
+Avg Travel Time All Vehs   :      20.2
+Avg Travel Time for out Veh:      33.6
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     119.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2325
+Total # of Out Vehs        :      1404
+Total # of In Vehs         :       921
+Avg Travel Time All Vehs   :      20.4
+Avg Travel Time for out Veh:      33.7
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     120.0
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2345
+Total # of Out Vehs        :      1416
+Total # of In Vehs         :       929
+Avg Travel Time All Vehs   :      20.4
+Avg Travel Time for out Veh:      33.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4
 ==============================
 Current Time               :     120.1
-Total # of Gen Vehs        :         0
-Total # of Out Vehs        :         0
-Total # of In Vehs         :         0
-Avg Travel Time All Vehs   :       0.0
-Avg Travel Time for out Veh:       0.0
+Total # of Gen Vehs        :      2345
+Total # of Out Vehs        :      1417
+Total # of In Vehs         :       928
+Avg Travel Time All Vehs   :      20.4
+Avg Travel Time for out Veh:      33.8
 Avg speed for all links    :      59.1
 Avg speed for freeways     :      88.9
 Avg speed for arterials    :      58.4

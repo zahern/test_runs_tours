@@ -1,0 +1,103 @@
+#!/bin/bash -l
+# job_smoke_full.pbs — full-pipeline SMOKE on SYNTHETIC data, as one PBS job.
+#
+#   estimate (one model per stage: CDAP-individual, joint household CDAP
+#   shared+per-size, S1..S4, S5 when skims present)
+#      -> predict the whole chain (CDAP -> coordination -> counts -> budget ->
+#         durations -> schedule times)
+#      -> export MATSim plans/facilities/config + trips_for_aimsun.csv
+#      -> [optional] chain the REAL MATSim Controler run via
+#         job_matsim_scenario.pbs (depend=afterok), using matsim/ base inputs.
+#
+# Submit:
+#   qsub -v "RUN_TAG=smoke_test" job_smoke_full.pbs
+#
+# Knobs (-v):
+#   SMOKE_PERSONS=400            synthetic population size
+#   RUN_TAG=smoke_<jobid>        output dir runs/<RUN_TAG>
+#   CONDA_ENV=zigenv             python env
+#   CDAP_HH_JOINT_PER_SIZE=1     dedicated per-size joint CDAP models
+#   SMOKE_SKIMS=<omx>            enable stage-5 estimation; auto-set when
+#                                downcasted_matrices_base.omx exists; '' forces skip
+#   SMOKE_RUN_MATSIM=1           chain the real MATSim Controler after export
+#   MATSIM_ITERS=2               controler iterations for the smoke scenario
+#   MATSIM_SAMPLE_FRAC=1.0       population sample for the controler
+#
+# Exit code = python smoke exit code (non-zero on any FAIL).
+
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=2:mem=16GB
+#PBS -l walltime=02:00:00
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+
+SMOKE_PERSONS=${SMOKE_PERSONS:-400}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+RUN_TAG=${RUN_TAG:-smoke_${PBS_JOBID:-manual}}
+OUT_DIR="runs/${RUN_TAG}"
+
+module purge 2>/dev/null || true
+module load Anaconda3/2024.02-1 2>/dev/null || true
+conda activate "$CONDA_ENV"
+module unload Anaconda3 2>/dev/null || true
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+
+echo "=========================================================="
+echo "Full-pipeline smoke job"
+echo "  out dir : ${OUT_DIR}"
+echo "  persons : ${SMOKE_PERSONS}"
+echo "  env     : ${CONDA_ENV}"
+echo "  started : $(date)"
+echo "=========================================================="
+mkdir -p "${OUT_DIR}"
+
+# ── knobs for _smoke_pipeline_matsim.py ──────────────────────────────────────
+export CDAP_HH_JOINT=${CDAP_HH_JOINT:-1}
+export CDAP_HH_JOINT_PER_SIZE=${CDAP_HH_JOINT_PER_SIZE:-1}
+if [ -z "${SMOKE_SKIMS:-}" ] && [ -f "downcasted_matrices_base.omx" ]; then
+  # skims exist next to the code -> exercise stage 5 too
+  SMOKE_SKIMS="downcasted_matrices_base.omx"
+fi
+if [ -n "${SMOKE_SKIMS:-}" ]; then
+  echo "Stage-5 skims enabled: ${SMOKE_SKIMS}"
+  export SMOKE_SKIMS
+else
+  echo "Stage-5 skims NOT set — S5 will SKIP"
+fi
+
+# ── run the smoke ────────────────────────────────────────────────────────────
+set +e
+python -u -X utf8 _smoke_pipeline_matsim.py \
+    --out "${OUT_DIR}" --persons "${SMOKE_PERSONS}" \
+    2>&1 | tee "${OUT_DIR}/smoke_job.log"
+RC=${PIPESTATUS[0]}
+set -e
+
+FAILS=$(grep -c "\[FAIL\]" "${OUT_DIR}/smoke_job.log" || true)
+echo "smoke exit=${RC}  FAIL lines=${FAILS}  finished=$(date)"
+
+# ── optional: real MATSim Controler on the exported scenario ────────────────
+# job_matsim_scenario.pbs re-exports from <out>/trips_for_aimsun.csv (written
+# by the harness), runs matsim/RunScenario and renders analysis plots.
+if [ "${RC}" = "0" ] && [ "${SMOKE_RUN_MATSIM:-1}" = "1" ] \
+   && [ -f "matsim/pt2matsim-shaded.jar" ]; then
+  MID=$(qsub \
+      -N "matsim_${RUN_TAG}" \
+      -W "depend=afterok:${PBS_JOBID}" \
+      -l "select=1:ncpus=4:mem=32GB" \
+      -l "walltime=02:00:00" \
+      -v "RUN_DIR=${OUT_DIR},MATSIM_SAMPLE_FRAC=${MATSIM_SAMPLE_FRAC:-1.0},MATSIM_ITERS=${MATSIM_ITERS:-2},MATSIM_END_HOURS=30,MATSIM_HEAP=${MATSIM_HEAP:-24g},MATSIM_CRS=${MATSIM_CRS:-EPSG:28356},CONDA_ENV=${CONDA_ENV}" \
+      job_matsim_scenario.pbs | awk '{print $1}')
+  echo "Chained MATSim Controler run: ${MID}  (depend=afterok:${PBS_JOBID})"
+  echo "Check with: qstat -f ${MID}   |   outputs under ${OUT_DIR}/matsim/"
+else
+  if [ "${RC}" != "0" ]; then
+    echo "MATSim chain skipped — smoke FAILED (see ${OUT_DIR}/smoke_job.log)"
+  else
+    echo "MATSim chain skipped (SMOKE_RUN_MATSIM=0 or matsim/ base inputs missing)"
+  fi
+fi
+
+exit "${RC}"

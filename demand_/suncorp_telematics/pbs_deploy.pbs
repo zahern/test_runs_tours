@@ -1,0 +1,70 @@
+#!/bin/bash
+#PBS -N suncorp_deploy
+#PBS -l select=1:ncpus=8:mem=32gb
+#PBS -l walltime=03:00:00
+#PBS -j oe
+#PBS -o logs/deploy.log
+
+# Full deployment rebuild on the REAL extracted events.  Run AFTER
+# pbs_50_extract.pbs has finished and the shards are merged.
+#
+#   python scripts/50b_merge_shards.py          # -> results/event_points_full.csv.gz
+#   qsub pbs_deploy.pbs
+
+cd "$PBS_O_WORKDIR" || exit 1
+mkdir -p logs results figures
+module load miniconda3 2>/dev/null || true
+source activate zigenv 2>/dev/null || true
+
+set -e
+
+# Guard: refuse to run the deployment on an empty/missing event file
+# (the usual failure is the raw data not being present on the cluster).
+EVENTS=results/event_points_full.csv.gz
+if [ ! -s "$EVENTS" ] || [ "$(zcat "$EVENTS" 2>/dev/null | head -5 | wc -l)" -lt 2 ]; then
+  echo "FATAL: $EVENTS is missing or empty. Run pbs_50_extract.pbs + 50b_merge_shards.py first"
+  echo "(the raw trip files raw_near_miss_2026/ must be present on this machine)."
+  exit 1
+fi
+
+# Fixture calendar is CURATED: data/fixture_calendar.csv holds the 43 real
+# Suncorp events (all codes) for 2025-01..2026-03, source-verified from
+# austadiums/Wikipedia. Do NOT regenerate it here; 52 reads it directly.
+# (To rebuild the Broncos-only subset instead:
+#   python scripts/51_detect_fixtures.py --fixtures data/fixtures_all.csv --mode known )
+echo "== using curated data/fixture_calendar.csv =="
+wc -l data/fixture_calendar.csv
+
+echo "== 28 candidate-post selection (P4) =="
+python scripts/28_post_selection_mip.py --k 14
+
+echo "== build benefits cache (for K / weight analyses) =="
+python scripts/build_benefits_cache.py
+
+echo "== 52 build surfaces =="
+python scripts/52_build_surfaces.py \
+    --calendar data/fixture_calendar.csv \
+    --ordinary 2026-03-18T18:00:00
+
+echo "== 32 officer-token AGGREGATE schedule figure (fig32) =="
+python scripts/32_officer_tokens.py
+
+echo "== 30 aggregate movement stats =="
+python scripts/30_movement_temporal.py
+
+echo "== 55 PER-GAME deployment (<=1 move/officer, per-game squad+posts, predicted) -> fig34, tab:pergame =="
+python scripts/55_pergame_deploy.py
+
+echo "== 33 choose K =="
+python scripts/33_choose_K.py
+
+echo "== 34 phased posts =="
+python scripts/34_phased_posts.py
+
+echo "== 31 weight sensitivity =="
+python scripts/31_eq1_sensitivity.py
+
+echo "== 35 temporal figure =="
+python scripts/35_fig_temporal.py
+
+echo "deploy pipeline complete at $(date)"

@@ -29,9 +29,9 @@ IMPORTANT — read before running
    predict pass BEFORE applying GA-selected features, to guard against
    validating a broken GA feature set. This roughly doubles Stage 5 cost;
    set GA_STAGE5_PREFIT_BASELINE=0 to skip it if you trust the GA result.
-3. Population: new_pop, loaded via NEW_POP_MAPPED=1 (remaps new_pop's raw
-   SA2 codes back onto the ABM's 1-330 ORDER scheme so OTAZ/DTAZ stay
-   compatible with both the stage models and the zone crosswalk).
+3. Population: new_pop, loaded via NEW_POP=1 (SA2-native 371 scope; OTAZ/DTAZ
+   stay as SA2 codes, compatible with both the stage models and the 371
+   skim/landuse. NEW_POP_MAPPED is OFF — the legacy 330 ORDER remap is retired).
 4. Zone crosswalk: only ~228/330 ABM zones are inside DTA_Brisbane_tested's
    coverage (see build_dynust_zone_crosswalk.py) — trips to/from the other
    ~102 (Sunshine Coast, Gold Coast, regional) are dropped rather than
@@ -65,9 +65,10 @@ import openmatrix as omx
 import pipeline_logger as pl
 from ga_hypothesis_testing import apply_ga_results_to_pipeline
 from stage5_destination_choice import _skim_flat, _skim_lookup
+from stage5b_trip_destination import trip_destination_feature_mask
 from stage6_plan_finalisation import run_stage6
 from spatial_assignment import get_zone_centroids_rich
-from build_dynust_zone_crosswalk import build_crosswalk
+from build_dynust_zone_crosswalk import build_crosswalk, build_origin_link_map
 
 DTA_DIR        = os.environ.get('DTA_DIR') or os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), '..', 'DTA', 'DTA_Brisbane_tested'))
@@ -129,7 +130,43 @@ def main() -> None:
 
     print("Stage 5b predict (trip-level intermediate-stop destinations)...")
     try:
-        scheduled_dest = pl.stage5b(out, scheduled_dest, landuse)
+        # Stage 51 searches trip-destination variables independently from the
+        # tour-level Stage 5 search.  Convert its consensus names at the
+        # production boundary so Stage 5b uses the selected specification.
+        _stage51_result = all_ga.results.get(51)
+        _stage51_features = getattr(_stage51_result, 'best_features', None)
+        _stage51_dest = (
+            _stage51_features.get('dest')
+            if isinstance(_stage51_features, dict)
+            else None
+        )
+        _stage51_mask = trip_destination_feature_mask(_stage51_dest)
+        if _stage51_mask is not None:
+            print(
+                "  Stage 51 trip-destination features applied: "
+                f"{sum(_stage51_mask)}/{len(_stage51_mask)}"
+            )
+        else:
+            print("  No Stage 51 trip-destination selection; using legacy Stage 5b specification")
+        _stage5b_result = pl.stage5b(
+            out,
+            scheduled_dest,
+            landuse,
+            g_tripdest=_stage51_mask,
+            calibration_trips=out.get('trips'),
+            prediction_persons=travellers,
+            validate=False,
+            return_result=True,
+            logsums=pl.stage5b_logsums_from_stage5_models(s5_models),
+        )
+        scheduled_dest = _stage5b_result.get('trips', scheduled_dest)
+        _s5b_meta = _stage5b_result.get('metadata', {})
+        if _s5b_meta:
+            print(
+                "  Stage 5b provenance: "
+                f"{_s5b_meta.get('calibration_source')} -> "
+                f"{_s5b_meta.get('prediction_source')}"
+            )
     except Exception as e:
         print(f"  Stage 5b failed (non-fatal): {e}")
 
@@ -138,6 +175,18 @@ def main() -> None:
     sk = _skim_lookup(_skim_flat(skims))
     sa2_geo = get_zone_centroids_rich(landuse, cache_dir='saved_data/osm_cache')
     sa2_geo = sa2_geo[['ORDER', 'lat', 'lon']].copy()
+
+    # Generation-link nodes per zone from the network's origin.dat. Without
+    # this, vehicles fall back to usec=dsec=zone and DynusT rejects them
+    # ("UP AND DOWNSTREAM NODES are the same").
+    origin_dat = os.path.join(DTA_DIR, 'origin.dat')
+    if os.path.exists(origin_dat):
+        origin_link_map = build_origin_link_map(origin_dat)
+        print(f"  origin.dat generation links: {len(origin_link_map)} zones")
+    else:
+        origin_link_map = None
+        print(f"  WARNING: {origin_dat} missing — vehicle.dat will have "
+              f"degenerate generation links and may be rejected by DynusT")
 
     run_stage6(
         plan                  = scheduled_dest,
@@ -152,6 +201,7 @@ def main() -> None:
         repair_dwells         = True,
         dynus_sim_start_min   = 360,
         dynus_value_of_time   = 15.0,
+        origin_link_map       = origin_link_map,
     )
     skims.close()
 
@@ -164,6 +214,14 @@ def main() -> None:
         print(f"Backed up existing vehicle.dat -> {backup}")
     shutil.copy2(src, dst)
     print(f"vehicle.dat written -> {dst}")
+
+    # path.dat must ship with vehicle.dat (DynusT terminates at demand
+    # generation if path.dat is empty).
+    src_p = os.path.join(SAVE_DIR, 'path.dat')
+    dst_p = os.path.join(DTA_DIR, 'path.dat')
+    if os.path.exists(src_p):
+        shutil.copy2(src_p, dst_p)
+        print(f"path.dat written -> {dst_p}")
 
 
 if __name__ == '__main__':

@@ -1,0 +1,49 @@
+#!/bin/bash -l
+#PBS -N exampville_ga_search
+#PBS -l select=1:ncpus=8:mem=64gb
+#PBS -l walltime=12:00:00
+#PBS -j oe
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+
+# Source conda from the shared filesystem (works on compute nodes)
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+
+# Use zigenv for GA search (has larch, searchlibrium, metacountregressor)
+conda activate zigenv
+
+# Ensure conda's bin is first in PATH
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+
+# Add compat directory to PYTHONPATH for NumPy 2.0 compatibility shim
+export PYTHONPATH="${PBS_O_WORKDIR}/compat:${PYTHONPATH:-}"
+
+# Exampville network
+export ZONE_SYSTEM_N_ZONES=40
+export NEW_POP=0
+export PIPELINE_SKIMS_PATH=../demand_/exampville_skims.omx
+export NEW_POP_DIR=../new_pop
+
+# GA settings
+export GA_ENGINE=agds
+export GA_MAX_WORKERS=1
+export GA_WALLTIME_SECONDS=43200
+export GA_ENGINE=agds
+export GA_MAX_WORKERS=1
+export GA_PARALLEL_SEGMENTS=2
+export STAGE5_ESTIMATE_MU=1
+export GA_ENGINE=agds
+
+# Load shared environment (installs packages, detects GPU)
+source ./setup_env.sh
+
+# Run the GA chain for Exampville (stages 1-5)
+python -u _run_ga_chain.py \
+    --stages 1_2_3_4_5 \
+    --run-root runs/ga_exampville \
+    --run-tag "exampville_ga_$(date +%Y%m%d_%H%M%S)" \
+    --zone-system 40 \
+    --skim-path ../demand_/exampville_skims.omx \
+    --exampville

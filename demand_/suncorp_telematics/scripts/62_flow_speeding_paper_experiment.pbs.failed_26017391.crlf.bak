@@ -1,0 +1,55 @@
+#!/bin/bash -l
+#PBS -N suncorp_flow_speed_paper
+#PBS -l walltime=08:00:00
+#PBS -l select=1:ncpus=8:mem=96GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+set -euo pipefail
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+RESULTS_DIR=$PROJ_DIR/results
+OUT_DIR=$RESULTS_DIR/paper_flow_speeding
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export JAX_PLATFORMS=cpu
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+
+cd "$SCRIPT_DIR"
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "62: paper-ready flow/speeding NB2 experiment"
+echo "=================================================================="
+
+[ -s "$RESULTS_DIR/segment_15min_panel.parquet" ] \
+  || { echo "FATAL: missing combined 15-min panel (run 58 first)"; exit 1; }
+[ -s "$PROJ_DIR/data/fixture_calendar.csv" ] \
+  || { echo "FATAL: missing data/fixture_calendar.csv"; exit 1; }
+[ -s "$PROJ_DIR/data/road_geometry_features.csv" ] \
+  || { echo "FATAL: missing data/road_geometry_features.csv"; exit 1; }
+[ -s "$PROJ_DIR/data/near_miss_hb_ecf.csv" ] \
+  || { echo "FATAL: missing data/near_miss_hb_ecf.csv"; exit 1; }
+
+python 62_flow_speeding_paper_experiment.py \
+  --output-dir "$OUT_DIR" \
+  --holdout-fixtures 6 \
+  --background-rows 250000 \
+  --max-train-rows 0 \
+  --maxiter 500 \
+  --shared-maxiter 1200
+
+for artifact in audit.json model_comparison.csv coefficients.csv predictions.parquet model_comparison.tex; do
+  [ -s "$OUT_DIR/$artifact" ] || { echo "FATAL: missing or empty $OUT_DIR/$artifact"; exit 1; }
+done
+
+echo "62 completed successfully at $(date)"

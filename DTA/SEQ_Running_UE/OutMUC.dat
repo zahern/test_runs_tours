@@ -1,39 +1,4 @@
  **********************************************
  **  Summaries for mtc Iteration Procedures  **
  **********************************************
-  SIMULATION START  DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   8   7  11  35  28
- 
- Number of Epochs =           12
- # of re-assigned vehicles and re-assignment rate =             0.0        NaN%
-  ASSIGNMENT COMPLETION DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   8   7  11  41  29
- 
- **********************************************
- **  Summaries for mtc Iteration Procedures  **
- **********************************************
-  SIMULATION START  DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   8   7  11  41  37
- 
- Number of Epochs =           12
- # of re-assigned vehicles and re-assignment rate =             0.0        NaN%
-  ASSIGNMENT COMPLETION DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   8   7  11  45   8
- 
- **********************************************
- **  Summaries for mtc Iteration Procedures  **
- **********************************************
-  SIMULATION START  DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   8   7  11  45  16
- 
- Number of Epochs =           12
- # of re-assigned vehicles and re-assignment rate =             0.0        NaN%
-  ASSIGNMENT COMPLETION DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   8   7  11  48  45
- 
- **********************************************
- **  Summaries for mtc Iteration Procedures  **
- **********************************************
-  SIMULATION START  DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   8   7  11  48  56
- Writing Out CPU Time. Note to get actual clock time please subtract from time stamps printed for each iteration. 
- 
- CPU Times of operation were         845.25 seconds  
- CPU Times of simulation were        843.73 seconds   99.82 % of total)
- CPU Times of assignment were          1.28 seconds    0.15 % of total)
- CPU Times of others were              0.23 seconds    0.03 % of total)
- CPU Time of operation was                   845.31 seconds by DTime
- User and System Time of operation was       232.73      612.58 seconds by DTime
+  SIMULATION START  DATE/TIME (yy/mm/dd/hh/mm/ss): 2026   8  19  11  55   7

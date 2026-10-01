@@ -1,4 +1,0 @@
-stage,segment,best_fitness,best_bic_per_obs,n_features,best_features
-2,Stage2 Start-of-Day,-12.10575239771523,12.10575239771523,14,"n_work_out, n_edu_out, ptype_FullTimeWorker, ptype_PartTimeWorker, ptype_SchoolChild, ptype_UniversityStudent, vehrd, WFHWEEK, n_escort_out, n_shopping_out, n_othmaint_out, is_female, incp, n_eat_out"
-2,Stage2 Day Duration (B),-5.451716812238113,5.451716812238113,16,"n_total, n_work_out, n_edu_out, ptype_FullTimeWorker, ptype_PartTimeWorker, ptype_SchoolChild, ptype_UniversityStudent, incp, vehrd, n_social_out, n_escort_out, n_othmaint_out, age_working, age_older, ptype_Retired, n_eat_out"
-2,Stage2 End-of-Day,-17.133745913189017,17.133745913189017,8,"n_work_out, n_edu_out, n_tours, ptype_FullTimeWorker, ptype_PartTimeWorker, ptype_SchoolChild, ptype_UniversityStudent, vehrd"

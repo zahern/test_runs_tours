@@ -1,0 +1,126 @@
+#!/bin/bash -l
+#PBS -N t2smoke
+#PBS -l walltime=01:30:00
+#PBS -l select=1:ncpus=4:mem=96gb
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# T2 — smoke test: one SHORT real run of stage 59 on the actual 64M-row panel.
+#
+# Purpose: prove the new code paths execute end-to-end on real data before
+# a 7.5h search. Deliberately tiny (3 search iters, R=10, 2 future
+# fixtures) so it finishes in ~1h instead of a full day. It is NOT a
+# scientific run: the spec it finds is meaningless. It answers only
+# "does it crash, and do the new diagnostics say something sensible?".
+#
+# Checks that must appear in the log:
+#   * train/future split on fixture_id, with the label-collision NOTE
+#   * [grouped] probe lines with real BICs (not 1e12 / delta 0.0)
+#   * refit likelihood honours the searched dispersion gene
+#   * exposure mode echoed, hazard offset applied
+#   * [search] rejected structures breakdown printed
+#   * [exposure] LRT verdict, if enabled
+set -u
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+OUT_DIR=$PROJ_DIR/results_tests/t2_smoke
+FIG_DIR=$PROJ_DIR/figures_tests/t2_smoke
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export JAX_PLATFORMS=cpu
+export PYTHONIOENCODING=utf-8
+
+cd "$SCRIPT_DIR"
+rm -rf "$OUT_DIR" "$FIG_DIR"
+mkdir -p "$OUT_DIR" "$FIG_DIR"
+
+echo "=================================================================="
+echo "T2 smoke test started on $(hostname) at $(date)"
+echo "=================================================================="
+echo "package:"
+python -c "from importlib.metadata import version; print('  metacountregressor', version('metacountregressor'))"
+echo
+
+# 3 iterations, tiny R, 2 future fixtures. --group-by segment so the
+# segment-identity carrier is exercised. --exposure-lrt on to get the
+# nested test, which is the one genuinely new scientific claim here.
+python -u 59_game_day_search_predict.py \
+  --out-dir "$OUT_DIR" --fig-dir "$FIG_DIR" \
+  --search-iters 3 --search-chunk 3 --wall-budget 2400 \
+  --n-starts 1 --search-R 10 --refit-R 30 \
+  --search-vars slim --target trips_mean_gt_10 \
+  --group-by segment \
+  --n-future 2 \
+  --exposure free --exposure-lrt on \
+  --temporal-refit none \
+  2>&1
+
+RC=$?
+echo
+echo "=================================================================="
+echo "T2 python exit code: $RC"
+echo
+
+# Post-hoc checks on the log, so a silent regression cannot pass as success.
+echo "--- log assertions ---"
+# PBS names the output file from the (truncated) #PBS -N, i.e. t2smoke.o<jobid>,
+# NOT suncorp_*. The previous version looked for the wrong name and always
+# reported "no job output file found".
+LOG="$(ls -t "$PROJ_DIR"/t2smoke.o* 2>/dev/null | head -1)"
+if [ -z "$LOG" ]; then
+  echo "FAIL: no job output file found (expected $PROJ_DIR/t2smoke.o*)"
+  exit 1
+fi
+echo "log: $LOG"
+FAIL=0
+assert_grep() {
+  if grep -qE "$1" "$LOG"; then
+    echo "  [ok]   $2"
+  else
+    echo "  [MISS] $2   (pattern: $1)"
+    FAIL=1
+  fi
+}
+assert_nogrep() {
+  if grep -qE "$1" "$LOG"; then
+    echo "  [BAD]  $2   (unexpected pattern: $1)"
+    FAIL=1
+  else
+    echo "  [ok]   $2"
+  fi
+}
+assert_grep "train fixtures=[0-9]+ rows=[0-9]+ future fixtures=[0-9]+" \
+            "split reports explicit row counts"
+assert_grep "share a label with another row" \
+            "label collision detected and reported"
+assert_grep "\[grouped\] term=" "grouped probe ran"
+assert_nogrep "\[grouped\].*1e12" \
+            "no grouped probe arm fell back to the 1e12 sentinel"
+assert_nogrep "delta=\+0\.0 -> grouped loses" \
+            "no degenerate all-zero grouped deltas"
+assert_grep "refit likelihood: (nb|poisson)" \
+            "refit likelihood follows the search"
+assert_grep "exposure: (free|offset)" "exposure mode echoed"
+assert_grep "\[exposure\] LRT" "nested exposure LRT reported"
+assert_nogrep "Traceback \(most recent call last\)" "no unhandled traceback"
+assert_nogrep "bad dispersion alpha=inf" "no alpha overflow rejection"
+
+echo
+if [ "$FAIL" -ne 0 ]; then
+  echo "T2 RESULT: FAILED one or more log assertions"
+  echo "=================================================================="
+  exit 1
+fi
+echo "T2 RESULT: all log assertions passed (smoke only, spec is not scientific)"
+echo "=================================================================="
+exit 0

@@ -30,9 +30,29 @@ explicit alpha is passed.
 """
 from __future__ import annotations
 
+import logging
 import os
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+try:
+    import jax
+    import jax.numpy as jnp
+    _HAVE_JAX = True
+    # Force float64 globally so all gradients trace correctly through the
+    # elastic-net penalty (alpha ~1e-3). Without x64, float32 underflow
+    # zeros the penalty gradient → JAX phase-1 stuck → numba fallback loop.
+    try:
+        jax.config.update("jax_enable_x64", True)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"jax_enable_x64 set failed: {e}")
+except Exception:  # pragma: no cover - jax is an optional dependency
+    jax = None
+    jnp = None
+    _HAVE_JAX = False
 
 # Elastic-net strength (mean-loss/logloss space) and L1 vs L2 mix, mirroring
 # metacountregressor's reg_penalty knob. Overridable via env vars so a run
@@ -134,25 +154,161 @@ class elasticnet_objective:
         ref_arr = self._resolve(self.reference, 0.0)
         w_arr = self._resolve(self.weights, 1.0)
 
-        def penalized_logloss(x=None, **kwargs):
-            base = orig_logloss(x, **kwargs)
-            pvals = x if x is not None else model.pvals
-            penalty, _ = elasticnet_penalty_and_grad(pvals, getattr(model, "pholdfast", None),
-                                                       alpha, l1_ratio,
-                                                       reference=ref_arr, weights=w_arr)
-            return base + penalty
+        # JAX-native penalty so jax.grad can differentiate the *full* penalized
+        # objective.  The previous numpy implementation (np.asarray / np.abs /
+        # np.sign on the parameter vector) is NOT traceable: under jax.grad the
+        # tracer hits np.asarray and the trace aborts, so jax silently returns a
+        # zero gradient for the whole objective -> SLSQP stops at iteration 0 and
+        # every coefficient is left at its starting prior ("jax engine gradient
+        # is broken for this model family").  Using jnp keeps the penalty inside
+        # the autodiff graph so the (Larch) jax base gradient flows through and
+        # estimation proceeds.  Numba keeps the original numpy path.
+        _engine = str(getattr(model, "compute_engine", "") or "").lower()
+        _use_jax = _HAVE_JAX and "jax" in _engine
 
-        def penalized_d_logloss(x=None, **kwargs):
-            grad = np.asarray(orig_d_logloss(x, **kwargs), dtype=float)
-            pvals = x if x is not None else model.pvals
-            _, pen_grad = elasticnet_penalty_and_grad(pvals, getattr(model, "pholdfast", None),
-                                                        alpha, l1_ratio,
-                                                        reference=ref_arr, weights=w_arr)
-            return grad + pen_grad
+        if _use_jax:
+            # x64 is set globally at import time; just verify it's active.
+            if not jax.config.jax_enable_x64:
+                logger.error("larch_regularization: jax_enable_x64 is False — "
+                              "JAX gradients will be unreliable in float32; "
+                              "switching to numba engine")
+                _use_jax = False
+
+            # reference/weights may be None (destination MNL passes no priors),
+            # so fall back to zeros (ref) / ones (w) of the right length.
+            _n = len(model.pnames)
+            _ref = None if ref_arr is None else jnp.asarray(np.asarray(ref_arr, dtype=float))
+            _w = jnp.ones(_n) if w_arr is None else jnp.asarray(np.asarray(w_arr, dtype=float))
+            _hf = getattr(model, "pholdfast", None)
+            _hf_j = None if _hf is None else jnp.asarray(np.asarray(_hf, dtype=bool))
+
+            # Larch's model.logloss / model.loglike assign self.pvals = x through a
+            # numpy setter (np.asanyarray), which raises TracerArrayConversionError
+            # under jax.grad.  Use the jax-native model.jax_loglike(params) instead:
+            # it computes the log-likelihood straight from params without touching
+            # the numpy setter, so the whole penalized objective stays traceable.
+            # model.logloss == -loglike / total_weight (MEAN loss scale - see
+            # NumbaModel.logloss), while model.jax_loglike returns the raw TOTAL
+            # summed log-likelihood.  Divide by total_weight so the patched
+            # objective/gradient match the scale Larch's SLSQP path (and the
+            # numba branch here) actually optimize; otherwise ftol/gtol and the
+            # elastic-net alpha are silently rescaled by ~n_cases on jax.
+            _base_loglike = getattr(model, "jax_loglike", None)
+            if _base_loglike is None:
+                # Model not mangled yet - jax_loglike is created during mangle().
+                # Force mangle to get jax_loglike for flat models too.
+                try:
+                    model.mangle()
+                    _base_loglike = getattr(model, "jax_loglike", None)
+                except Exception:
+                    pass
+            if _base_loglike is not None:
+                try:
+                    _w_scale = float(model.total_weight())
+                except Exception:
+                    _w_scale = 1.0
+                if not np.isfinite(_w_scale) or _w_scale <= 0:
+                    _w_scale = 1.0
+
+                def _base_logloss(x):
+                    return -_base_loglike(x) / _w_scale
+            else:
+                _w_scale = 1.0
+                _base_logloss = orig_logloss
+
+            def _penalty_only(x):
+                xj = jnp.asarray(x)
+                dev = xj if _ref is None else xj - _ref
+                if _hf_j is not None:
+                    dev = jnp.where(_hf_j, 0.0, dev)
+                l1 = jnp.sum(_w * jnp.abs(dev))
+                l2 = jnp.sum(_w * jnp.square(dev))
+                return alpha * (l1_ratio * l1 + (1.0 - l1_ratio) * l2)
+
+            def penalized_logloss(x=None, **kwargs):
+                xv = x if x is not None else model.pvals
+                return _base_logloss(xv) + _penalty_only(xv)
+
+            def penalized_d_logloss(x=None, **kwargs):
+                xv = jnp.asarray(x if x is not None else model.pvals)
+                # NOTE: the /_w_scale inside _base_logloss is part of the traced
+                # objective, so autodiff already carries it into g. Do NOT divide
+                # again here.
+                g = np.asarray(jax.grad(penalized_logloss)(xv))
+                if _hf_j is not None:
+                    g = np.where(np.asarray(_hf_j), 0.0, g)
+                # Fail LOUDLY on a dead gradient.  A silent all-zero/NaN jac
+                # makes scipy SLSQP "converge" at iteration 0 with every
+                # coefficient left at its prior (the jax-stuck failure mode),
+                # which downstream code then misreads as a legitimate fit.
+                if not np.all(np.isfinite(g)):
+                    # nanmin/nanmax IGNORE NaN, so reporting only min/max shows
+                    # 0.0/0.0 even when the gradient is NaN-poisoned (job
+                    # 25254924: "non-finite jax gradient (min=0.0, max=0.0)").
+                    # Report NaN/Inf counts + finite range so the cause is clear.
+                    try:
+                        _n_nan = int(np.isnan(g).sum())
+                        _n_inf = int(np.isinf(g).sum())
+                        _fin = g[np.isfinite(g)]
+                        _fmin = float(_fin.min()) if _fin.size else float('nan')
+                        _fmax = float(_fin.max()) if _fin.size else float('nan')
+                    except Exception:
+                        _n_nan, _n_inf, _fmin, _fmax = -1, -1, float('nan'), float('nan')
+                    # Name the poisoned params (job 25277106: "n_nan=3" with no
+                    # names wasted a 4h run). pvals/pnames share Larch's param
+                    # order, so positions map to names.
+                    try:
+                        _pnames = [str(_n) for _n in list(model.pnames)]
+                        _bad = [_pnames[_i] for _i in range(min(len(_pnames), len(g)))
+                                if not np.isfinite(g[_i])]
+                    except Exception:
+                        _bad = []
+                    raise RuntimeError(
+                        "elasticnet_objective: non-finite jax gradient "
+                        f"(n_nan={_n_nan}, n_inf={_n_inf}, "
+                        f"finite_min={_fmin:.3g}, finite_max={_fmax:.3g}, "
+                        f"nanmin={np.nanmin(g)}, nanmax={np.nanmax(g)}); "
+                        f"poisoned params={_bad[:12]}; the jax "
+                        "objective is NaN/Inf-poisoned for this data — check for "
+                        "NaN utilities (fringe/missing OD/emp lookups, NaN skims)"
+                    )
+                _n_free = int(0 if _hf_j is None else int(np.count_nonzero(~np.asarray(_hf_j))))
+                if _n_free > 0 and float(np.abs(g).sum()) == 0.0:
+                    raise RuntimeError(
+                        "elasticnet_objective: jax gradient is exactly zero on "
+                        f"{_n_free} free parameters; base loglike does not "
+                        "depend on the parameters under the jax engine"
+                    )
+                return g
+
+        else:
+            def penalized_logloss(x=None, **kwargs):
+                base = orig_logloss(x, **kwargs)
+                pvals = x if x is not None else model.pvals
+                penalty, _ = elasticnet_penalty_and_grad(pvals, getattr(model, "pholdfast", None),
+                                                         alpha, l1_ratio,
+                                                         reference=ref_arr, weights=w_arr)
+                return base + penalty
+
+            def penalized_d_logloss(x=None, **kwargs):
+                grad = np.asarray(orig_d_logloss(x, **kwargs), dtype=float)
+                pvals = x if x is not None else model.pvals
+                _, pen_grad = elasticnet_penalty_and_grad(pvals, getattr(model, "pholdfast", None),
+                                                          alpha, l1_ratio,
+                                                          reference=ref_arr, weights=w_arr)
+                return grad + pen_grad
 
         model.logloss = penalized_logloss
         model.d_logloss = penalized_d_logloss
         self._patched = True
+        # Stash the penalty spec ON the model so the ridge-aware covariance
+        # patch (larch_patches.apply) can differentiate the SAME penalised
+        # objective for std_err/p_value — Larch's calculate_parameter_covariance
+        # reads d2_loglike/jax_param_cov, which do NOT see the logloss wrapper.
+        model._larch_reg_alpha = float(alpha)
+        model._larch_reg_l1_ratio = float(l1_ratio)
+        model._larch_reg_ref = ref_arr
+        model._larch_reg_w = w_arr
         return model
 
     def __exit__(self, exc_type, exc_val, exc_tb):

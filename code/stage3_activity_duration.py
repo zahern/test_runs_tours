@@ -231,6 +231,40 @@ def _apply_quantile_profile(values: np.ndarray, profile: dict) -> np.ndarray:
     return out
 
 
+# Columns that carry a genuine trip/tour distance (same units within a frame).
+# OTAZ/DTAZ-style zone identifiers must NEVER be differenced: with SA2 codes
+# the difference is meaningless, and with ORDER indices it is at best an
+# ordinal proxy. Prefer a real distance column; otherwise emit an explicit
+# zero (no distance signal) with a loud warning instead of ID arithmetic.
+_DISTANCE_CANDIDATES = (
+    'tour_distance', 'DIST', 'dist', 'distance_km', 'TRIPDIST',
+    'trip_distance',
+)
+
+_logged_stage3_warnings: set = set()
+
+
+def _resolve_log_dist(df: pd.DataFrame) -> pd.Series:
+    """log1p distance for duration features, estimation/prediction-safe.
+
+    Uses the first real distance column present in the frame. Falls back to
+    0.0 with a one-time warning when no distance column exists — never
+    `abs(DTAZ - OTAZ)`.
+    """
+    for col in _DISTANCE_CANDIDATES:
+        if col in df.columns:
+            vals = pd.to_numeric(df[col], errors='coerce').fillna(0.0).clip(lower=0.0)
+            return np.log1p(vals)
+    if 'stage3_log_dist' not in _logged_stage3_warnings:
+        _logged_stage3_warnings.add('stage3_log_dist')
+        logger.warning(
+            "prepare_duration_data: no distance column %s — log_dist=0 "
+            "(zone-ID differencing disabled as invalid)",
+            list(_DISTANCE_CANDIDATES),
+        )
+    return pd.Series(0.0, index=df.index)
+
+
 # ---------------------------------------------------------------------------
 # 0.  PREPARE ESTIMATION DATA  (one row per tour from HHTS)
 # ---------------------------------------------------------------------------
@@ -274,6 +308,39 @@ def prepare_duration_data(
     # tour-level activity counts (n_work_out etc.)
     act_count_cols = [c for c in ACTIVITY_COLS if c in t.columns]
     tour_counts = t.groupby('person_id')[act_count_cols].sum().reset_index()
+
+    # ── person-level day aggregates (GA candidates) ──────────────────
+    # budget_per_activity_hr, day_span_hr, n_mandatory, n_discretionary.
+    # The GA spec lists them but nothing ever built them — the search could
+    # only see per-activity attributes, never day context. Built once here,
+    # merged in both branches below (trips branch refines the per-activity
+    # budget with actual activity-row counts).
+    _n_act = t.groupby('person_id').size().rename('n_activities')
+    _bkey = budget.set_index('person_id')['B']
+    day_aggs = pd.DataFrame({'n_activities': _n_act})
+    day_aggs['budget_per_activity_hr'] = (
+        _bkey.reindex(day_aggs.index).fillna(0)
+        / day_aggs['n_activities'].clip(lower=1))
+    if 'start_time' in t.columns and 'end_time' in t.columns:
+        _st = pd.to_numeric(t['start_time'], errors='coerce')
+        _et = pd.to_numeric(t['end_time'], errors='coerce')
+        day_aggs['day_span_hr'] = (
+            (_et.groupby(t['person_id']).max()
+             - _st.groupby(t['person_id']).min()) / 60.0)
+    else:
+        day_aggs['day_span_hr'] = np.nan
+    # span covers gaps too, so the budget is a safe lower-bound fallback
+    day_aggs['day_span_hr'] = day_aggs['day_span_hr'].fillna(
+        _bkey.reindex(day_aggs.index)).clip(lower=0.5)
+    _tc = tour_counts.set_index('person_id')
+    _mand_cols = [c for c in ('n_work_out', 'n_edu_out') if c in _tc.columns]
+    day_aggs['n_mandatory'] = _tc[_mand_cols].sum(axis=1).fillna(0) \
+        if _mand_cols else 0.0
+    _dis_cols = [c for c in ACTIVITY_COLS
+                 if c not in ('n_work_out', 'n_edu_out') and c in _tc.columns]
+    day_aggs['n_discretionary'] = _tc[_dis_cols].sum(axis=1).fillna(0) \
+        if _dis_cols else 0.0
+    day_aggs = day_aggs.reset_index()
 
     # start_time for start_hr feature
     tour_start = (
@@ -323,7 +390,8 @@ def prepare_duration_data(
                 if col not in df.columns:
                     df[col] = 0
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
-            df['log_dist'] = np.log1p(np.abs(df['DTAZ'] - df['OTAZ']))
+            # Never abs(DTAZ - OTAZ): zone IDs are not distances.
+            df['log_dist'] = _resolve_log_dist(df)
 
             # start hour
             st_col = next((c for c in ['STARTIME', 'start_time', 'depart']
@@ -334,9 +402,29 @@ def prepare_duration_data(
             )
 
             # merge person attrs + budget
+            df = df.drop(columns=[c for c in ACTIVITY_COLS if c in df.columns])
             df = df.merge(pers[keep], on='person_id', how='left')
             df = df.merge(budget, on='person_id', how='left')
             df = df.merge(tour_counts, on='person_id', how='left')
+            df = df.merge(day_aggs, on='person_id', how='left')
+            # refine with actual activity-row counts (post home-filter rows).
+            # LEAKAGE FIX: B sums ALL of the person's durations including this
+            # row's own target, so B/n leaks the target into its features.
+            # Use leave-one-out budget (B minus own duration, n minus 1) —
+            # the day-context signal without the target feeding itself.
+            df['duration_hr'] = (pd.to_numeric(df['duration'], errors='coerce')
+                                 .fillna(0) / 60.0).clip(lower=0)
+            _act_n = df.groupby('person_id').size().rename('_n_act_rows')
+            df = df.merge(_act_n, on='person_id', how='left')
+            df['budget_per_activity_hr'] = (
+                (df['B'] - df['duration_hr']) / (df['_n_act_rows'] - 1).clip(lower=1))
+            df = df.drop(columns=['_n_act_rows', 'duration_hr'])
+            for _cc in ('n_mandatory', 'n_discretionary'):
+                df[_cc] = pd.to_numeric(df[_cc], errors='coerce').fillna(0)
+            df['budget_per_activity_hr'] = pd.to_numeric(
+                df['budget_per_activity_hr'], errors='coerce').fillna(df['B'])
+            df['day_span_hr'] = pd.to_numeric(
+                df['day_span_hr'], errors='coerce').fillna(df['B']).clip(lower=0.5)
 
             logger.info(
                 f"prepare_duration_data: using TRIPS table "
@@ -361,12 +449,34 @@ def prepare_duration_data(
 
         orig = df.get('tour_origin', pd.Series(0, index=df.index)).fillna(0)
         dest = df.get('tour_destination', pd.Series(0, index=df.index)).fillna(0)
-        df['log_dist'] = np.log1p(np.abs(dest - orig))
+        # tour_origin/_destination are zone IDs, not coordinates — a real
+        # distance column (e.g. tour_distance) is used when present.
+        df['log_dist'] = _resolve_log_dist(df)
         df['start_hr'] = df.get('start_time', pd.Series(480, index=df.index)) / 60
+
+        # The tours table carries PER-ROW n_*_out flags; the person-level
+        # tour_counts aggregates carry the same names. Merging without
+        # dropping first collides them into _x/_y suffixes and leaves the
+        # canonical column as the per-row flag (or all-zero) — killing every
+        # activity-count feature and their taste interactions. Drop the
+        # per-row copies so the person-level aggregates win the name.
+        df = df.drop(columns=[c for c in ACTIVITY_COLS if c in df.columns])
 
         df = df.merge(pers[keep], on='person_id', how='left')
         df = df.merge(budget, on='person_id', how='left')
         df = df.merge(tour_counts, on='person_id', how='left')
+        df = df.merge(day_aggs, on='person_id', how='left')
+        # Same leave-one-out budget correction as the trips branch: B includes
+        # this row's own target duration, so B/n would leak the target.
+        _fallback_dur_hr = (
+            pd.to_numeric(df['duration'], errors='coerce').fillna(0) / 60.0
+        ).clip(lower=0)
+        _fallback_n = df.groupby('person_id').size().rename('_n_act_rows')
+        df = df.merge(_fallback_n, on='person_id', how='left')
+        df['budget_per_activity_hr'] = (
+            (df['B'] - _fallback_dur_hr) / (df['_n_act_rows'] - 1).clip(lower=1)
+        )
+        df = df.drop(columns=['_n_act_rows'])
 
     # ── common cleanup ─────────────────────────────────────────────
     for col in ACTIVITY_COLS:
@@ -399,8 +509,15 @@ class BudgetLognormal:
     Accelerated Failure Time (AFT) lognormal duration model.
     """
 
-    def __init__(self, l2: float = 1e-4):
-        self.l2 = l2
+    def __init__(self, l2: float = None):
+        # Ridge on the z-scored coefficients, EMBEDDED in the objective that is
+        # both fitted AND differentiated: _neg_ll carries the penalty, so the
+        # numerical Hessian used for std_err/p_value inherits a ≈λ eigenvalue
+        # lift on every coefficient direction — collinear/flat directions stay
+        # invertible instead of producing NaN inference (mirrors SearchLibrium's
+        # l2_penalty=0.5 on z-scored coefficients). GA_S3_RIDGE overrides.
+        self.l2 = float(os.environ.get('GA_S3_RIDGE', '0.5')) if l2 is None \
+            else float(l2)
         self.coef_ = None
         self.intercept_ = None
         self.log_sigma_ = None
@@ -808,7 +925,15 @@ def _augment_duration_features(df: pd.DataFrame) -> pd.DataFrame:
         df['B'] = 8.0
     df['B'] = pd.to_numeric(df['B'], errors='coerce').fillna(8.0)
     total_acts = df[ACTIVITY_COLS].sum(axis=1).clip(lower=1.0)
-    df['budget_per_activity_hr'] = df['B'] / total_acts
+    # Preserve a leave-one-out budget supplied by prepare_duration_data(): that
+    # column already removes the current activity's own target duration.
+    # Recomputing B/total_acts here would overwrite it and reintroduce leakage.
+    if 'budget_per_activity_hr' not in df.columns:
+        df['budget_per_activity_hr'] = df['B'] / total_acts
+    else:
+        df['budget_per_activity_hr'] = pd.to_numeric(
+            df['budget_per_activity_hr'], errors='coerce'
+        ).fillna(df['B'] / total_acts)
     if 'start_of_day' in df.columns and 'end_of_day' in df.columns:
         df['day_span_hr'] = np.clip((df['end_of_day'] - df['start_of_day']) / 60.0, 0.25, 18.0)
     else:
@@ -865,6 +990,35 @@ def estimate_duration_models(
                         layer around the lognormal marginal.
     """
     data    = _augment_duration_features(prepare_duration_data(tours, persons, trips=trips))
+    # ── GA dict override: recreate the engineered search-frame columns ────
+    # The GA search frame (see _run_ga_stage3) carries ptype dummies,
+    # is_female, income flags, mandatory_role and the _enrich_ga_data
+    # additions (vehicle/licence/household/age-band columns + interactions).
+    # prepare_duration_data only keeps PERSON_FEATURES, so without this step
+    # every GA-selected engineered feature is silently dropped by the
+    # "c in df.columns" filter and the refit degrades to the default spec.
+    if isinstance(feature_override, dict) and feature_override:
+        _attrs   = dict(data.attrs)
+        _want_pt = {str(f) for vals in feature_override.values()
+                    for f in (vals or []) if str(f).startswith('ptype_')}
+        try:
+            from ga_hypothesis_testing import ensure_ga_search_columns
+            data = ensure_ga_search_columns(data, persons, ptype_subset=_want_pt,
+                                            stage_id=3, zone_col='DESTSA2_2021')
+            _missing = sorted(
+                {str(f) for vals in feature_override.values() for f in (vals or [])}
+                - set(data.columns)
+            )
+            logger.info(
+                f"GA feature override: ensured search-frame columns "
+                f"({_want_pt and len(_want_pt) or 0} ptype dummies); "
+                f"unresolvable features: {_missing or 'none'}"
+            )
+        except Exception as _ee:
+            logger.warning(f"GA feature-column enrichment failed: {_ee}")
+        finally:
+            # merges inside the helper drop DataFrame.attrs ('ptypes' needed below)
+            data.attrs.update(_attrs)
     duration_model = (duration_model or os.environ.get(
         'STAGE3_DURATION_MODEL', 'lognormal'
     )).strip().lower()
@@ -895,8 +1049,12 @@ def estimate_duration_models(
     raw_to_code = {
         'Work (my workplace)': 'work', 'Work (other work reason)': 'work',
         'Direct Work Commute': 'work', 'Work Related': 'work',
+        'Full-time Work': 'work', 'Part-time Work': 'work', 'Work': 'work',
         'Education': 'edu', 'Childcare or Kindergarten': 'edu',
         'Childcare or kindergarten': 'edu',
+        'Primary School': 'edu', 'Secondary School': 'edu',
+        'Full-time TAFE/Uni': 'edu', 'Part-time TAFE/Uni': 'edu',
+        'Childcare/Kindergarten': 'edu',
         'Social Visit': 'social', 'Recreation/leisure activity': 'social',
         'Recreation': 'social', 'Social': 'social',
         'Accompanying Someone': 'social', 'Accompany Someone': 'social',
@@ -916,6 +1074,37 @@ def estimate_duration_models(
     if not already_coded:
         logger.info("Mapping raw survey strings → purpose codes")
         data['_purpose_coded'] = data[purpose_col].map(raw_to_code)
+        # token fallback for raw HHTS strings not in the exact map
+        # ('Full-time Work', 'Primary School', 'Full-time TAFE/Uni', ...)
+        _miss = data['_purpose_coded'].isna() & data[purpose_col].notna()
+        if _miss.any():
+            def _token_code(v):
+                s = str(v).strip().lower()
+                if not s or s == 'nan':
+                    return None
+                if 'work' in s:
+                    return 'work'
+                if any(t in s for t in ('school', 'tafe', 'univers',
+                                        'kinder', 'childcare', 'educat')):
+                    return 'edu'
+                if 'escort' in s or 'pickup' in s or 'dropoff' in s \
+                        or 'accompan' in s:
+                    return 'escort'
+                if 'shop' in s:
+                    return 'shopping'
+                if 'social' in s or 'recreation' in s or 'visit' in s \
+                        or 'leisure' in s:
+                    return 'social'
+                if 'business' in s or 'personal' in s:
+                    return 'othmaint'
+                if 'eat' in s or 'drink' in s or 'dine' in s:
+                    return 'eat'
+                return 'othdiscr'
+            data.loc[_miss, '_purpose_coded'] = data.loc[
+                _miss, purpose_col].map(_token_code)
+            logger.info(
+                f"  token fallback coded {int(data.loc[_miss, '_purpose_coded'].notna().sum())}"
+                f"/{int(_miss.sum())} remaining raw purposes")
     else:
         data['_purpose_coded'] = data[purpose_col]
 
@@ -1373,7 +1562,8 @@ def predict_activity_durations(
            acts.get('OTAZ', pd.Series(0, index=acts.index))).fillna(0)
     dest = acts.get('tour_destination',
            acts.get('DTAZ', pd.Series(0, index=acts.index))).fillna(0)
-    acts['log_dist'] = np.log1p(np.abs(dest - orig))
+    # Zone IDs are not distances — same resolution rule as estimation.
+    acts['log_dist'] = _resolve_log_dist(acts)
 
     # budget column
     if 'B' not in acts.columns:
@@ -1394,6 +1584,15 @@ def predict_activity_durations(
 
     acts = _augment_duration_features(acts)
     acts['_copula_order_u'] = _activity_order_quantile(acts)
+    # Rebuild GA-searchable derived features (workstat/studying/age flags,
+    # INDUSTRY/occp, household flags, day aggregates, home-zone acc standing
+    # in for destination acc pre-stage-5, taste interactions) so GA-selected
+    # terms resolve here instead of being silently zero-filled below.
+    try:
+        from ga_hypothesis_testing import ensure_prediction_features
+        acts = ensure_prediction_features(acts, stage_id=3)
+    except Exception as _e:
+        logger.warning(f"prediction feature enrichment skipped: {_e}")
     acts['predicted_duration_min'] = np.nan
 
     # predict per purpose

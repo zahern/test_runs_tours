@@ -52,7 +52,7 @@ CONDA_ENV=${CONDA_ENV:-zigenv}
 # 507-zone scope switches
 NEW_POP=1
 NEW_POP_DIR=${NEW_POP_DIR:-/mnt/hpccs01/home/ahernz/test_runs_tours/new_pop}
-PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/sa2_skims_507_omxspec.omx}
+PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/skims_371.omx}
 # ─────────────────────────────────────────────────────────────────────────────
 
 cd "$PBS_O_WORKDIR"

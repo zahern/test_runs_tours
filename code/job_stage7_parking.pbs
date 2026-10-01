@@ -1,0 +1,98 @@
+#!/bin/bash -l
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -l walltime=02:00:00
+
+# Stage 7: Parking Choice
+# Runs after prediction (ga_staged) to add precise parking locations
+# for auto trips (DA, SR) and walk access legs.
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+echo "=========================================="
+echo "Stage 7 Parking Choice"
+echo "Job ID        : ${PBS_JOBID}"
+echo "Run Root      : ${RUN_ROOT}"
+echo "Run Tag       : ${RUN_TAG}"
+echo "Skims Path    : ${PIPELINE_SKIMS_PATH}"
+echo "=========================================="
+
+# Load environment
+source ~/.bashrc
+conda activate "${CONDA_ENV:-zigenv}"
+
+# Run Stage 7 parking choice (heredoc: the previous `python -c """` form
+# closed the quote early and left the remaining lines to run as shell)
+python - <<'PYEOF'
+import os
+import sys
+sys.path.insert(0, '.')
+import pandas as pd
+
+# Resolve prediction run directory:
+# 1. RUN_DIR_MARKER file (written by prediction job) wins
+# 2. Fallback: compute from RUN_TAG, GA_ESTIMATOR, GA_USE_SA, etc.
+RUN_DIR_MARKER = os.environ.get('RUN_DIR_MARKER', '')
+if RUN_DIR_MARKER and os.path.exists(RUN_DIR_MARKER):
+    with open(RUN_DIR_MARKER, 'r') as f:
+        pred_dir = f.read().strip()
+    print(f'Resolved pred_dir from marker: {pred_dir}')
+else:
+    _run_tag = os.environ.get('RUN_TAG', '')
+    _estim = os.environ.get('GA_ESTIMATOR', 'default')
+    _pfx = 'ga'
+    if os.environ.get('GA_USE_SA', '0') == '1' or os.environ.get('GA_USE_BANDIT_SA', '0') == '1':
+        _pfx = 'sa'
+        if _estim == 'sa_bandit':
+            _estim = 'bandit'
+    pred_dir = os.path.join(os.environ.get('RUN_ROOT', 'runs/ga_parallel'), f'{_pfx}_{_estim}_staged__{_run_tag}')
+    print(f'Computed pred_dir (fallback): {pred_dir}')
+
+plan_path = os.path.join(pred_dir, 'stage6_output.csv')
+if not os.path.exists(plan_path):
+    # Fallback: look in merged dir
+    plan_path = os.path.join(os.environ.get('RUN_ROOT', 'runs/ga_parallel'), _run_tag, 'merged', 'stage6_output.csv')
+
+if not os.path.exists(plan_path):
+    print(f'ERROR: stage6_output.csv not found at {plan_path}')
+    sys.exit(1)
+
+plan = pd.read_csv(plan_path)
+print(f'Loaded plan: {len(plan)} rows')
+
+# Load persons
+persons_path = os.path.join(pred_dir, 'persons.csv')
+if not os.path.exists(persons_path):
+    persons_path = os.path.join(os.environ.get('RUN_ROOT', 'runs/ga_parallel'), _run_tag, 'merged', 'persons.csv')
+persons = pd.read_csv(persons_path)
+print(f'Loaded persons: {len(persons)}')
+
+landuse_path = 'saved_data/zone_landuse_overture.csv'
+if not os.path.exists(landuse_path):
+    landuse_path = 'saved_data/zone_order_and_landuse.csv'
+landuse = pd.read_csv(landuse_path) if os.path.exists(landuse_path) else pd.DataFrame()
+
+# Load location table
+location_table = pd.read_csv('saved_data/location_table.csv') if os.path.exists('saved_data/location_table.csv') else None
+
+# Run Stage 7
+from stage7_parking_choice import run_stage7
+result = run_stage7(
+    plan=plan,
+    persons=persons,
+    location_table=location_table,
+    landuse=landuse,
+    skims_path=os.environ.get('PIPELINE_SKIMS_PATH', 'downcasted_matrices_base.omx'),
+    output_plan_path=os.path.join(pred_dir, 'stage7_output.csv'),
+    save_path=os.path.join(pred_dir, 'stage7_parking_models.pkl'),
+)
+
+print('Stage 7 complete')
+print(f'  Plan: {len(result["plan"])} rows')
+print(f'  Parking summary: {result["parking_summary"]}')
+PYEOF
+
+echo "Stage 7 parking choice complete"

@@ -1,0 +1,265 @@
+\begin{thebibliography}{10}
+
+\bibitem{Bhat1993ActivityProgram}
+C~R Bhat and F~S Koppelman.
+\newblock {A conceptual framework of individual activity program generation}.
+\newblock {\em Transportation Research Part A}, 1993.
+
+\bibitem{Recker1986ComplexTravel}
+W~W Recker, M~G McNally, and G~S Root.
+\newblock {A model of complex travel behavior: Part I-Theoretical development}.
+\newblock {\em Transportation Research Part A: General}, 1986.
+
+\bibitem{Bowman2001Activity-BasedSchedules}
+J~L Bowman and M~E Ben-Akiva.
+\newblock {Activity-Based Disaggregate Travel Demand Model System with Activity
+  Schedules}, 2001.
+
+\bibitem{BekkerGrobRyanGerard2012Review}
+Esther~W de~Bekker-Grob, Mandy Ryan, and Karen Gerard.
+\newblock {Discrete choice experiments in health economics: a review of the
+  literature}.
+\newblock {\em Health Economics}, 21(2):145--172, 2012.
+
+\bibitem{Gossling2024ChildrensSpace}
+Stefan G{\"{o}}ssling, Jessica Kees, Rafael Hologa, Nils Riach, and Rul von
+  St{\"{u}}lpnagel.
+\newblock {Childrenâ€™s safe routes to school: Real and perceived risks,
+  and evidence of an incapacity-incapability space}.
+\newblock {\em Journal of Cycling and Micromobility Research}, 2:100019, 2024.
+
+\bibitem{Swain2024ChildrensTravel}
+Ritwik Swain, Prue Oswin, Verity Truelove, and GrÃ©goire~S Larue.
+\newblock {Childrenâ€™s and parentsâ€™ perceptions on safe routes to
+  schools: a mixed-methods study investigating factors influencing active
+  school travel}.
+\newblock {\em Journal of Urban Design}, 29(2):208--230, 2024.
+
+\bibitem{Duren2023IdentifyingComponents}
+Michelle Duren, Bryce Corrigan, Ryan~David Kennedy, Keshia~M Pollack~Porter,
+  and Johnathon Ehsani.
+\newblock {Identifying and Assessing Perceived Cycling Safety Components}.
+\newblock {\em Safety}, 9(4), 2023.
+
+\bibitem{Huang2025YoungApproach}
+Yue Huang, Hongcheng Gan, Maria~Nadia Postorino, Ke~Wang, and Xuelian Wu.
+\newblock {Young people preferences about enhanced transportation services for
+  intercity trips: An integrated choice and latent variable approach}.
+\newblock {\em Research in Transportation Economics}, 114, 12 2025.
+
+\bibitem{Tzouras2025ExploringChoices}
+Panagiotis~G. Tzouras, Valentina Pastia, Ioannis Kaparias, and Konstantinos
+  Kepaptsoglou.
+\newblock {Exploring the effect of perceived safety in first/last mile mode
+  choices}.
+\newblock {\em Transportation}, 52(5):2145--2183, 10 2025.
+
+\bibitem{Perera2026Data}
+Supun Perera and Michael Bell.
+\newblock Beyond the four-step model: Structural differences and a data
+  integration framework for activity-based transport modelling.
+\newblock In {\em Australasian Transport Research Forum 2026 Proceedings},
+  Sydney, Australia, November 2026.
+
+\bibitem{SwaitBenAkiva1987PLC}
+J~Swait and M~Ben-Akiva.
+\newblock {Empirical test of a constrained choice discrete model: mode choice
+  in Sao Paulo, Brazil}.
+\newblock {\em Transportation Research Part B: Methodological}, 21(2):103--115,
+  1987.
+
+\bibitem{Auld2011PlanningConstrained}
+J~Auld and A~Mohammadian.
+\newblock {Planning-constrained destination choice in activity-based model:
+  agent-based dynamic activity planning and travel scheduling}.
+\newblock {\em Transportation Research Record}, 2254(1):170--179, 2011.
+
+\bibitem{Volakakis2025IntegratingChoice}
+V~Volakakis, M~Said, Y~Chen, and H~S Mahmassani.
+\newblock {Integrating choice and predictive theories: a comparative study of
+  set generation and machine learning in consideration set modeling}.
+\newblock {\em Data Science for Transportation}, 7:21, 2025.
+
+\bibitem{Yao2022VAE}
+R~Yao and S~Bekhor.
+\newblock {A variational autoencoder approach for choice set generation and
+  implicit perception of alternatives in choice modeling}.
+\newblock {\em Transportation Research Part B: Methodological}, 158:273--294,
+  2022.
+
+\bibitem{Phan2022NewApproach}
+D~T Phan, H~L Vu, and E~J Miller.
+\newblock {A new approach to improve destination choice by ranking personal
+  preferences}.
+\newblock {\em Transportation Research Part C: Emerging Technologies}, 143,
+  2022.
+
+\bibitem{Golshani2018ActivityModels}
+N~Golshani, S~Ramin, A~Joshua, and A~Mohammadian.
+\newblock {Activity Start Time and Duration: Incorporating Regret Theory into
+  Joint Discreteâ€"Continuous Models}.
+\newblock {\em Transportmetrica A: Transport Science}, 14(9):809--827, 2018.
+
+\bibitem{Hess2026Significance}
+Stephane Hess, Andrew Daly, Michiel Bliemer, Angelo Guevara, Ricardo Daziano,
+  and Thijs Dekker.
+\newblock {Statistical significance in choice modelling: computation, usage and
+  reporting}.
+\newblock {\em Journal of Choice Modelling}, 60:100611, 2026.
+
+\bibitem{AllenbyRossi1998Heterogeneity}
+Greg~M Allenby and Peter~E Rossi.
+\newblock {Marketing models of consumer heterogeneity}.
+\newblock {\em Journal of Econometrics}, 89(1-2):57--78, 1998.
+
+\bibitem{HessRose2009Intra}
+Stephane Hess and John~M Rose.
+\newblock {Allowing for intra-respondent variations in coefficients estimated
+  on repeated choice data}.
+\newblock {\em Transportation Research Part B: Methodological}, 43(6):708--719,
+  2009.
+
+\bibitem{BliemerRoseHess2008Approx}
+Michiel C~J Bliemer, John~M Rose, and Stephane Hess.
+\newblock {Approximation of {Bayesian} efficiency in experimental choice
+  designs}.
+\newblock {\em Journal of Choice Modelling}, 1(1):98--127, 2008.
+
+\bibitem{RoseBliemerHensherCollins2008Designing}
+John~M Rose, Michiel C~J Bliemer, David~A Hensher, and Andrew~T Collins.
+\newblock {Designing efficient stated choice experiments in the presence of
+  reference alternatives}.
+\newblock {\em Transportation Research Part B: Methodological}, 42(4):395--406,
+  2008.
+
+\bibitem{BekkerGrobRoseBliemer2013Closer}
+Esther~W de~Bekker-Grob, John~M Rose, and Michiel C~J Bliemer.
+\newblock {A closer look at decision and analyst error by including
+  nonlinearities in discrete choice models: implications on willingness-to-pay
+  estimates derived from discrete choice data in healthcare}.
+\newblock {\em PharmacoEconomics}, 31(12):1169--1183, 2013.
+
+\bibitem{BekkerGrobHole2024Editorial}
+Esther~W de~Bekker-Grob and Arne~Risa Hole.
+\newblock {Special issue on choice modelling in health - Editorial}.
+\newblock {\em Journal of Choice Modelling}, 2024.
+
+\bibitem{LarchExampvilleDocs}
+J~Newman.
+\newblock {Exampville simulator (Larch v5.7.0 travel-model example: simulated
+  data, mode choice, logsums, destination choice)}.
+\newblock \url{https://larch.newman.me/v5.7.0/example/exampville.html}, 2021.
+
+\bibitem{ActivitySimConsortium}
+{ActivitySim Consortium}.
+\newblock {ActivitySim: an open platform for activity-based travel modeling}.
+\newblock \url{https://github.com/ActivitySim/activitysim}.
+\newblock {Accessed 2026}.
+
+\bibitem{ActivitySimPrototypeMTC}
+{ActivitySim Consortium}.
+\newblock {prototype\_mtc: canonical Bay Area prototype example (regress test
+  fixtures, TAZ skims, land use) shipped with ActivitySim}.
+\newblock
+  \url{https://github.com/ActivitySim/activitysim/tree/main/activitysim/examples/prototype_mtc}.
+\newblock {Accessed 2026; provides the \texttt{test/regress/final\_trips.csv}
+  reference outputs used as the M0 arm}.
+
+\bibitem{ABMDTAConvergence2024}
+{Faster convergence of integrated activity-based models in dynamic multimodal
+  transit assignment using macroscopic road congestion estimation}, 2024.
+
+\bibitem{Arentze2013MultiDay}
+T~A Arentze, D~Ettema, and H~J~P Timmermans.
+\newblock {Location choice in the context of multi-day activity-travel
+  patterns: model development and empirical results}.
+\newblock {\em Transportmetrica A: Transport Science}, 2013.
+
+\bibitem{Xu2018RandomUtility}
+Z~Xu, J~E Kang, and R~Chen.
+\newblock {A random utility based estimation framework for the household
+  activity pattern problem}.
+\newblock {\em Transportation Research Part A: Policy and Practice}, 2018.
+
+\bibitem{Palma2021MDCEV}
+David Palma, Annesha Enam, Stephane Hess, Chiara Calastri, and Romain
+  Crastes~dit Sourd.
+\newblock {Modelling multiple occurrences of activities during a day: an
+  extension of the MDCEV model}.
+\newblock {\em Transportmetrica B: Transport Dynamics}, 9(1):456--478, 2021.
+
+\bibitem{Kim2017Duration}
+K~Kim and L~Wang.
+\newblock {Activity duration analysis: discrete-time approach for recurrent
+  events, competing risks, and multiple states}.
+\newblock {\em Transportation Research Record}, 2017.
+
+\bibitem{Khaddar2023Episode}
+S~Khaddar, S~Saxena, M~R Fatmi, and A~R Pinjari.
+\newblock {An episode-level joint model for activity engagement, duration, and
+  destination location choice decisions}.
+\newblock {\em Transportation Letters}, 2023.
+
+\bibitem{Telework2026Timing}
+{Telework reshapes non-work activity timing and duration}, 2026.
+\newblock {Cited for the finding that telework redistributes non-work
+  activities toward late morning and early afternoon, with distinct evening
+  peaks under hybrid work}.
+
+\bibitem{Ben-Akiva1985DiscreteDemand}
+M~E Ben-Akiva and S~R Lerman.
+\newblock {\em {Discrete choice analysis: Theory and application to travel
+  demand}}, volume~9.
+\newblock MIT Press, 1985.
+
+\bibitem{Nerella2004Sampling}
+S~Nerella and C~R Bhat.
+\newblock {Numerical analysis of effect of sampling of alternatives in discrete
+  choice models}.
+\newblock {\em Transportation Research Record}, 2004.
+
+\bibitem{Swait1987RandomConstraints}
+J~Swait.
+\newblock {Incorporating random constraints in discrete models of choice set
+  generation}.
+\newblock {\em Transportation Research Part B: Methodological}, 1987.
+
+\bibitem{Mariante2018Detour}
+G~Leite~Mariante, T-Y Ma, and V~Van~Acker.
+\newblock {Modeling discretionary activity location choice using detour factors
+  and sampling of alternatives for mixed logit models}.
+\newblock {\em Journal of Transport Geography}, 2018.
+
+\bibitem{Board2014Activity-BasedPrimer}
+Transportation~Research Board, {of Sciences Engineering}, and {Medicine}.
+\newblock {\em {Activity-Based Travel Demand Models: A Primer}}.
+\newblock The National Academies Press, 2014.
+
+\bibitem{Yao2020DataDriven}
+R~Yao and S~Bekhor.
+\newblock {Data-driven choice set generation and estimation of route choice
+  models}.
+\newblock {\em Transportation Research Part C: Emerging Technologies}, 2020.
+
+\bibitem{Haghi2026VAEWork}
+H~Haghi, Z~Patterson, and B~Farooq.
+\newblock {Choice Set Generation in Work Destination Choice Modeling with
+  Variational Autoencoders}.
+\newblock {\em Transportation Research Record}, 2026.
+
+\bibitem{AASHTO2010HighwayManual}
+{AASHTO}.
+\newblock {\em {Highway Safety Manual}}, volume~2.
+\newblock Washington, D.C., 2010.
+
+\bibitem{hartley2003multiple}
+Richard Hartley and Andrew Zisserman.
+\newblock {\em Multiple view geometry in computer vision}.
+\newblock Cambridge university press, 2003.
+
+\bibitem{dijkstra_algorithm}
+Donald~B. Johnson.
+\newblock Efficient algorithms for shortest paths in sparse networks.
+\newblock {\em J. ACM}, 24(1):1â€"13, 1977.
+
+\end{thebibliography}

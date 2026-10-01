@@ -1,0 +1,65 @@
+# QLD Activity-Based Model — estimation pipeline environment.
+#
+# This is the "run the QLD pipeline as normal" environment: larch + jax +
+# metacountregressor/SearchLibrium estimation, stages 0-6, the GA search, and
+# prediction. Replaces the drifted `zigenv` (which broke from repeated
+# pip-on-conda installs: numpy 2.5.1 > numba's <2.4 ceiling, scipy 1.18 >
+# larch's <1.16 ceiling, a corrupted partial sharrow, and duplicate numpy/
+# scipy/metacountregressor installs).
+#
+# The version bounds below are the INTERSECTION of every hard requirement in
+# the stack, so nothing can drift back out of range:
+#   numba 0.62    -> numpy <2.4
+#   jax  >=0.4.30 -> numpy >=2.1, scipy >=1.15   (jax 0.11 also needs py>=3.12)
+#   larch 6.0.46  -> scipy <1.16, numba >=0.60, sharrow >=2.15
+#   metacountregressor -> numpy >=1.26.4, scipy >=1.11, pandas >=2.1, jax >=0.4.30
+#   searchlibrium      -> numpy >=2.0, pandas >=2.0, jax >=0.4.30
+# => numpy in [2.1, 2.4), scipy in [1.15, 1.16), python 3.12.
+#
+# Compiled/C deps come from conda-forge (pinned so a later `pip install` can
+# never bump numpy/scipy out of range); the estimation packages that are
+# pip-only (metacountregressor, SearchLibrium) or that were only ever installed
+# via pip (larch, sharrow, jax) come from pip and slot onto the pinned base.
+#
+# Build (fresh, on the HPC):
+#   module load Anaconda3/2024.02-1
+#   conda env create -f environment_qld.yml -n zigenv
+name: zigenv
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  # ── pinned compiled base (keeps numpy/scipy inside every ceiling) ──
+  - "numpy>=2.1,<2.4"
+  - "scipy>=1.15,<1.16"
+  - "numba>=0.60,<0.63"
+  - "pandas>=2.1,<3"
+  - xarray
+  - pyarrow
+  # ── skims / IO / spatial (light geo use on the estimation path) ──
+  - openmatrix
+  - pytables
+  - h5py
+  - pyproj
+  - geopandas
+  - statsmodels
+  - matplotlib-base
+  # ── sharrow's runtime deps (so the pip sharrow slots on cleanly) ──
+  - flatbuffers
+  - filelock
+  - platformdirs
+  - pip
+  - pip:
+      # larch 6.x + sharrow: pinned known-good pair (larch needs sharrow>=2.15
+      # with the sharrow.dataset module the corrupted install was missing).
+      - "larch==6.0.46"
+      - "sharrow>=2.15"
+      # jax estimation stack (metacount/searchlibrium need jax>=0.4.30; the
+      # conda-pinned numpy>=2.1 lets pip take the current jax without disturbing
+      # the base).
+      - "jax>=0.4.30"
+      - "jaxlib>=0.4.30"
+      - "jaxopt>=0.8.5"
+      # QLD estimators (pip-only). Pinned to HPC-tested 2026-09-22.
+      - "metacountregressor==1.0.159"
+      - "searchlibrium==0.0.241"

@@ -1,0 +1,56 @@
+#!/bin/bash -l
+#PBS -N suncorp_gameday_mip
+#PBS -l walltime=03:00:00
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+set -euo pipefail
+
+# Job 60: police site-selection MIP on the predicted future-game 15-min surfaces.
+# Depends on 59 (game_day_pred_15min.parquet).
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+RESULTS_DIR=$PROJ_DIR/results
+FIG_DIR=$PROJ_DIR/figures
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+
+cd "$SCRIPT_DIR"
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "60: game-day police site-selection MIP"
+echo "=================================================================="
+
+[ -s "$RESULTS_DIR/game_day_pred_15min.parquet" ] \
+  || { echo "FATAL: missing results/game_day_pred_15min.parquet (run 59 first)"; exit 1; }
+[ -s "$PROJ_DIR/data/osm_roads_suncorp.geojson" ] \
+  || { echo "FATAL: missing data/osm_roads_suncorp.geojson (segment midpoints)"; exit 1; }
+
+python -u 60_game_day_mip.py \
+  --min-marg 0.5 --max-segments 250 \
+  --travel-speed-kmh 43.2 --detour-factor 1.3 \
+  --setup-min 5 --max-travel-m 4000 2>&1
+
+for f in game_day_mip_sites.csv game_day_mip_plans.csv game_day_mip_summary.json \
+         game_day_mip_schedule.csv game_day_mip.tex; do
+  [ -s "$RESULTS_DIR/$f" ] || { echo "FATAL: 60 missing $f"; exit 1; }
+done
+for f in game_day_mip_map.png game_day_mip_schedules.png \
+         game_day_mip_coverage.png game_day_mip_summary.png; do
+  [ -s "$FIG_DIR/$f" ] || echo "WARN: missing figure $f"
+done
+
+echo "60 OK"
+echo "Job finished at $(date)"

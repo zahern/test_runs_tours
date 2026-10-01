@@ -631,6 +631,7 @@ def validate_stage5(out: dict, s5_models: dict, save_dir: str) -> dict:
 
     all_obs_modes  = []
     all_pred_modes = []
+    _cal_rows = []
 
     for ax, seg in zip(axes, segs):
         seg_df  = _filter_seg(hhts_tours, seg)
@@ -697,12 +698,45 @@ def validate_stage5(out: dict, s5_models: dict, save_dir: str) -> dict:
 
         metrics[f'{seg}_mode_obs']  = obs_share.to_dict()
         metrics[f'{seg}_mode_pred'] = pred_share.to_dict()
+        try:
+            for _m in range(1, 6):
+                _cal_rows.append({
+                    'segment': seg,
+                    'mode': MODE_NAMES.get(_m, str(_m)),
+                    'observed_pct': float(obs_share.get(_m, 0.0)),
+                    'predicted_pct': float(pred_share.get(_m, 0.0)),
+                    'delta_pp': float(pred_share.get(_m, 0.0)
+                                      - obs_share.get(_m, 0.0)),
+                })
+        except Exception:
+            pass
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     p = os.path.join(save_dir, 'val_stage5_mode_shares.png')
     fig.savefig(p, dpi=130, bbox_inches='tight'); plt.close(fig)
     logger.info(f"    saved → {os.path.basename(p)}")
     figs.append(p)
+
+    # Calibrated mode-share table: predicted shares here already reflect the
+    # post-estimation ASC calibration (SR/Walk/Bike/Transit log-share
+    # corrected, DA reference), because probability() reads live pf values.
+    # Persisted as a citable artifact (manuscript Table 3 source).
+    try:
+        if _cal_rows:
+            _cal_df = pd.DataFrame(
+                _cal_rows,
+                columns=['segment', 'mode', 'observed_pct',
+                         'predicted_pct', 'delta_pp'])
+            _cal_path = os.path.join(save_dir, 'stage5_mode_shares_calibrated.csv')
+            _cal_df.to_csv(_cal_path, index=False)
+            metrics['mode_shares_calibrated_csv'] = _cal_path
+            _max_gap = float(_cal_df['delta_pp'].abs().max())
+            metrics['mode_share_max_gap_pp'] = _max_gap
+            logger.info(f"    calibrated mode-share table → "
+                        f"{os.path.basename(_cal_path)} "
+                        f"(max |delta| = {_max_gap:.2f} pp)")
+    except Exception as _ce:
+        logger.debug(f"  Stage 5 calibrated table write failed: {_ce}")
 
     fig_counts, axes_counts = plt.subplots(1, 3, figsize=(15, 5), sharey=False)
     fig_counts.suptitle('Stage 5 — Mode Choice: Observed vs Predicted Raw Counts',
@@ -765,10 +799,10 @@ def validate_stage5(out: dict, s5_models: dict, save_dir: str) -> dict:
         # ── Priority 1: pre-computed full-zone predicted shares ─────────────
         # Stored during _run_segment after shadow-price calibration using
         # _dest_probs_numpy with all zones. This is the most reliable path
-        # because it uses the fitted model with the full 329-zone set.
+        # because it uses the fitted model with the full 371-zone set.
         # Both .probability() and the numpy Dataset fallback below fail when
         # the estimation Dataset has importance-sampled (60) alternatives while
-        # the prediction path expects 329 zones (shape mismatch → silent zeros).
+        # the prediction path expects 371 zones (shape mismatch → silent zeros).
         _pzs = seg_res.get('pred_zone_shares')
         if isinstance(_pzs, pd.Series) and not _pzs.empty:
             # Scale shares to expected counts (same total as observed)
@@ -810,7 +844,7 @@ def validate_stage5(out: dict, s5_models: dict, save_dir: str) -> dict:
 
         combined = (obs_counts.reindex(obs_counts.index.union(pred_counts.index)).fillna(0) +
                     pred_counts.reindex(obs_counts.index.union(pred_counts.index)).fillna(0))
-        # Sort zones numerically 1→330 so plots are geographically ordered
+        # Sort zones numerically (371-system ORDERs) so plots are geographically ordered
         zone_ids = sorted(combined.index.astype(int).tolist())
         if not zone_ids:
             continue
@@ -1202,6 +1236,298 @@ def validate_stage5(out: dict, s5_models: dict, save_dir: str) -> dict:
             logger.debug(f"  Stage 5 trip-level validation failed: {_t5e}")
 
     return {'stage': 5, 'plots': figs, 'metrics': metrics}
+
+
+# ---------------------------------------------------------------------------
+# STAGE 5 — HOLD-OUT validation (out-of-sample)
+# ---------------------------------------------------------------------------
+
+def validate_stage5_holdout(out: dict, s5_models: dict, save_dir: str,
+                            frac: float = 0.2, seed: int = 42) -> dict:
+    """Out-of-sample validation for Stage 5 on a person-level HHTS hold-out.
+
+    Splits HHTS persons 80/20 (seeded; HOLDOUT_FRAC/HOLDOUT_SEED env override),
+    rebuilds the mode/dest choice sets on the 20% holdout tours, applies the
+    FITTED coefficients (no refit), and compares predicted vs observed shares.
+    Person-level splitting avoids within-person leakage (a person's tours never
+    appear on both sides).
+
+    Design notes:
+      * The destination tree is built with sampled_alts=None (full 371-zone
+        set, log_correction=0), so hold-out shares need no Manski-Lerman
+        debiasing — unlike the importance-sampled estimation shares.
+      * Structural terms (ASC_*, Mu_*, c_size_term, log_correction) are added
+        by the builders automatically; custom_*_vars carries only the fitted
+        free behavioural variables recovered from the fitted pf.
+      * Fully non-fatal: any failure (missing skims/landuse, tree build,
+        prediction) degrades to observed-holdout aggregates with an explicit
+        note, and the function never raises.
+    Env:
+      HOLDOUT_ENABLE=0 disables (default 1); HOLDOUT_FRAC, HOLDOUT_SEED.
+    """
+    import os as _os
+    _enable = _os.environ.get('HOLDOUT_ENABLE', '1').strip() != '0'
+    figs, metrics = [], {}
+    _note = []
+    if not _enable:
+        return {'stage': '5-holdout',
+                'plots': figs,
+                'metrics': {'skipped': 'HOLDOUT_ENABLE=0'}}
+    try:
+        frac = float(_os.environ.get('HOLDOUT_FRAC', frac))
+    except Exception:
+        frac = 0.2
+    try:
+        seed = int(_os.environ.get('HOLDOUT_SEED', seed))
+    except Exception:
+        seed = 42
+    try:
+        from stage5_destination_choice import (
+            _prep_hhts_tours, _filter_seg, _mode_tree, _build_mode_model,
+            _dest_tree, _build_dest_model, _logsums, _attach_size_term,
+            _attach_acdc_terms, _skim_flat, _open_skims,
+        )
+        tours = _prep_hhts_tours(out["tours"], out["persons"])
+        persons = out["persons"]
+        if tours.empty or persons.empty:
+            return {'stage': '5-holdout', 'plots': figs,
+                    'metrics': {'skipped': 'empty tours/persons'}}
+        _rng = np.random.default_rng(seed)
+        _pids = pd.unique(persons['person_id'].dropna().astype(str))
+        _n_ho = max(1, int(round(len(_pids) * frac)))
+        _ho_pids = set(_rng.choice(_pids, size=_n_ho, replace=False).tolist())
+        _ho_mask_t = tours['person_id'].astype(str).isin(_ho_pids)
+        ho_tours = tours[_ho_mask_t].copy()
+        ho_persons = persons[persons['person_id'].astype(str).isin(_ho_pids)].copy()
+        metrics['holdout_persons'] = int(len(_ho_pids))
+        metrics['holdout_tours'] = int(len(ho_tours))
+        metrics['holdout_frac'] = float(frac)
+        metrics['holdout_seed'] = int(seed)
+        if ho_tours.empty:
+            metrics['note'] = 'holdout split empty'
+            return {'stage': '5-holdout', 'plots': figs, 'metrics': metrics}
+
+        # Resolve skims + landuse (same sources as estimation).
+        skims, _close_sk = None, False
+        landuse = None
+        try:
+            _sk_path = _os.environ.get('PIPELINE_SKIMS_PATH', '')
+            skims, _close_sk = _open_skims(_sk_path or None)
+        except Exception as _se:
+            _note.append(f'skims unavailable: {_se}')
+            skims = None
+        try:
+            from data_connect import Synth_Connect
+            landuse = Synth_Connect().get_land()
+        except Exception as _le:
+            _note.append(f'landuse unavailable: {_le}')
+            landuse = None
+
+        _SEG_LABEL = {'work': 'Work', 'edu': 'Education', 'nonmand': 'Non-Mandatory'}
+        _MODE_NAMES = {1: 'DA', 2: 'SR', 3: 'Walk', 4: 'Bike', 5: 'Transit'}
+        try:
+            from stage5_destination_choice import MODE_NAMES as _MN
+            _MODE_NAMES = dict(_MN)
+        except Exception:
+            pass
+
+        def _free_vars_and_coefs(mdl, _structural_prefixes=('ASC_', 'Mu_'),
+                                 _structural_exact=('c_size_term', 'log_correction')):
+            """(custom_vars, {name: fitted value}) for rebuilding on new data."""
+            try:
+                _pf = getattr(mdl, '_final_pf', None)
+                if _pf is None:
+                    _pf = mdl.pf
+                _hf = (_pf['holdfast'].fillna(False).astype(bool)
+                       if 'holdfast' in _pf.columns
+                       else pd.Series(False, index=_pf.index))
+                _free = [str(p) for p in _pf.index if not bool(_hf.get(p, False))]
+                _vars = [p for p in _free
+                         if not p.startswith(_structural_prefixes)
+                         and p not in _structural_exact]
+                _vals = {}
+                for p in _pf.index:
+                    try:
+                        _v = float(_pf.loc[p].get('value', float('nan')))
+                        if np.isfinite(_v):
+                            _vals[str(p)] = _v
+                    except Exception:
+                        continue
+                return _vars, _vals
+            except Exception:
+                return [], {}
+
+        def _apply_coefs(mdl, coefs: dict) -> int:
+            _n = 0
+            for _k, _v in (coefs or {}).items():
+                try:
+                    mdl.set_value(str(_k), float(_v))
+                    _n += 1
+                except Exception:
+                    continue
+            return _n
+
+        def _safe_js(a, b):
+            try:
+                from scipy.spatial.distance import jensenshannon as _js
+                _a = np.asarray(a, dtype=float); _b = np.asarray(b, dtype=float)
+                _a = _a / max(_a.sum(), 1e-12); _b = _b / max(_b.sum(), 1e-12)
+                return float(_js(_a, _b))
+            except Exception:
+                return float('nan')
+
+        _rows = []
+        _can_predict = skims is not None and landuse is not None
+        if not _can_predict:
+            _note.append('prediction skipped (no skims/landuse); observed-only')
+        _skim_df = None
+        if skims is not None:
+            try:
+                _skim_df = _skim_flat(skims)
+            except Exception as _sfe:
+                _note.append(f'skim flat table failed: {_sfe}')
+                _can_predict = False
+
+        for seg in ('work', 'edu', 'nonmand'):
+            try:
+                _seg_df = _filter_seg(ho_tours, seg)
+                if _seg_df.empty:
+                    continue
+                _seg_persons = ho_persons[
+                    ho_persons['person_id'].astype(str).isin(
+                        set(_seg_df['person_id'].astype(str)))]
+                # observed holdout shares
+                _obs_mode = _seg_df['tour_mode'].dropna()
+                _obs_ms = (_obs_mode.value_counts(normalize=True)
+                           .reindex(range(1, 6)).fillna(0) * 100)
+                _obs_dz = (_seg_df['DTAZ'].dropna().astype(int)
+                           .value_counts(normalize=True).sort_index())
+                _row = {'segment': seg, 'n_holdout_tours': int(len(_seg_df))}
+                for _m in range(1, 6):
+                    _row[f'obs_mode_{_MODE_NAMES.get(_m, _m)}'] = \
+                        float(_obs_ms.get(_m, 0.0))
+                _pred_ok = False
+                if _can_predict:
+                    try:
+                        _seg_res = s5_models.get(seg, {}) or {}
+                        _mode_fit = _seg_res.get('mode_model')
+                        _dest_fit = _seg_res.get('dest_model')
+                        if _mode_fit is None or _dest_fit is None:
+                            raise RuntimeError('fitted mode/dest model missing')
+                        # — mode on holdout —
+                        _dt_m = _mode_tree(_seg_df, _seg_persons, landuse, skims)
+                        _mv, _mc = _free_vars_and_coefs(_mode_fit)
+                        _mm = _build_mode_model(
+                            _dt_m, seg, custom_mode_vars=_mv,
+                            avail_vars_hint=list(_seg_df.columns))
+                        _apply_coefs(_mm, _mc)
+                        _mp = np.asarray(_mm.probability(), dtype=float)
+                        _mp = np.nan_to_num(_mp, nan=0.0, posinf=0.0, neginf=0.0)
+                        _rs = _mp.sum(axis=1, keepdims=True)
+                        _mp = _mp / np.where(_rs > 0, _rs, 1.0)
+                        _pm = {}
+                        for _mid in range(1, 6):
+                            _ci = _mid - 1
+                            _pm[_mid] = float(_mp[:, _ci].mean()) * 100 \
+                                if _ci < _mp.shape[1] else 0.0
+                        for _m in range(1, 6):
+                            _row[f'pred_mode_{_MODE_NAMES.get(_m, _m)}'] = _pm[_m]
+                        _row['mode_mae_pp'] = float(np.mean([
+                            abs(_pm.get(_m, 0.0) - float(_obs_ms.get(_m, 0.0)))
+                            for _m in range(1, 6)]))
+                        # — dest on holdout (full zone set, no sampling bias) —
+                        from stage5_destination_choice import _logsums as _lgs
+                        _ls = _lgs(_mm, _dt_m, skims=skims, verbose=False)
+                        _dt_d = _dest_tree(
+                            _seg_df, _seg_persons, landuse, skims, _ls,
+                            sampled_alts=None, skim_df=_skim_df)
+                        from stage5_destination_choice import _attach_size_term \
+                            as _ast
+                        _lu = _ast(landuse, seg)
+                        _dv, _dc = _free_vars_and_coefs(_dest_fit)
+                        _dm = _build_dest_model(_dt_d, seg, custom_dest_vars=_dv)
+                        _apply_coefs(_dm, _dc)
+                        _dp = np.asarray(_dm.probability(), dtype=float)
+                        _dp = np.nan_to_num(_dp, nan=0.0, posinf=0.0, neginf=0.0)
+                        _zid = None
+                        try:
+                            _zid = list(_dm.alternatives)
+                        except Exception:
+                            _zid = []
+                        if len(_zid) != _dp.shape[1]:
+                            _zid = list(range(int(_dp.shape[1])))
+                        _pred_dz = (pd.Series(_dp.sum(axis=0),
+                                              index=pd.Index(_zid, dtype=int))
+                                    .sort_index())
+                        _pred_dz = _pred_dz / max(_pred_dz.sum(), 1e-12)
+                        _zunion = sorted(set(_obs_dz.index.tolist())
+                                         | set(_pred_dz.index.tolist()))
+                        _ov = _obs_dz.reindex(_zunion).fillna(0.0).values
+                        _pv = _pred_dz.reindex(_zunion).fillna(0.0).values
+                        _row['dest_mae_share'] = float(np.mean(np.abs(_ov - _pv)))
+                        _row['dest_js_divergence'] = _safe_js(_ov, _pv)
+                        _to = _obs_dz.sort_values(ascending=False).head(25).index.tolist()
+                        _tp = _pred_dz.sort_values(ascending=False).head(25).index.tolist()
+                        _row['dest_top25_overlap'] = (
+                            float(len(set(_to) & set(_tp)) / 25.0) if _to else float('nan'))
+                        _pred_ok = True
+                    except Exception as _pe:
+                        _row['predict_note'] = f'{type(_pe).__name__}: {_pe}'[:200]
+                        logger.debug(f"  Stage 5 holdout predict [{seg}]: {_pe}")
+                _row['predicted'] = bool(_pred_ok)
+                _rows.append(_row)
+            except Exception as _se:
+                logger.debug(f"  Stage 5 holdout segment [{seg}]: {_se}")
+                continue
+        try:
+            if _close_sk:
+                skims.close()
+        except Exception:
+            pass
+
+        if _rows:
+            _hdf = pd.DataFrame(_rows)
+            _hp = os.path.join(save_dir, 'stage5_holdout_metrics.csv')
+            _hdf.to_csv(_hp, index=False)
+            metrics['holdout_metrics_csv'] = _hp
+            metrics['holdout_segments'] = int(len(_rows))
+            metrics['holdout_predicted_segments'] = int(
+                sum(1 for _r in _rows if _r.get('predicted')))
+            try:
+                fig, axes = plt.subplots(1, max(len(_rows), 1), figsize=(5 * max(len(_rows), 1), 5))
+                if max(len(_rows), 1) == 1:
+                    axes = [axes]
+                for ax, _r in zip(axes, _rows):
+                    _ml = [_MODE_NAMES.get(_m, str(_m)) for _m in range(1, 6)]
+                    _x = np.arange(len(_ml))
+                    _o = [_r.get(f'obs_mode_{_m}', 0.0) for _m in _ml]
+                    _p = [_r.get(f'pred_mode_{_m}', 0.0) for _m in _ml]
+                    ax.bar(_x - .2, _o, .4, color='#2E86AB', alpha=.85, label='Observed (holdout)')
+                    ax.bar(_x + .2, _p, .4, color='#E84855', alpha=.75, label='Predicted (holdout)')
+                    ax.set_xticks(_x)
+                    ax.set_xticklabels(_ml, rotation=25, ha='right', fontsize=9)
+                    ax.set_ylabel('Mode share (%)')
+                    ax.set_title(f"{_r['segment']} (n={_r['n_holdout_tours']})")
+                    ax.legend(fontsize=9)
+                    ax.grid(axis='y', alpha=.3)
+                fig.suptitle('Stage 5 HOLD-OUT — mode shares: observed vs predicted '
+                             '(fitted models, unseen persons)', fontweight='bold', fontsize=12)
+                fig.tight_layout(rect=[0, 0, 1, 0.96])
+                _pp = os.path.join(save_dir, 'val_stage5_holdout.png')
+                fig.savefig(_pp, dpi=130, bbox_inches='tight'); plt.close(fig)
+                figs.append(_pp)
+            except Exception as _fe:
+                logger.debug(f"  Stage 5 holdout plot failed: {_fe}")
+            for _r in _rows:
+                for _k, _v in _r.items():
+                    if isinstance(_v, float) and np.isfinite(_v):
+                        metrics[f"holdout_{_r['segment']}_{_k}"] = _v
+        if _note:
+            metrics['notes'] = '; '.join(_note)
+    except Exception as _e:
+        logger.warning(f"  Stage 5 holdout validation failed (non-fatal): {_e}")
+        metrics['error'] = f'{type(_e).__name__}: {_e}'[:200]
+    return {'stage': '5-holdout', 'plots': figs, 'metrics': metrics}
 
 
 # ---------------------------------------------------------------------------
@@ -1607,6 +1933,12 @@ def run_validation(out: dict,
         results.append(validate_stage5(out, s5_models, val_dir))
     except Exception as e:
         logger.warning(f"  Stage 5 validation failed: {e}")
+
+    # Stage 5 hold-out (out-of-sample on unseen persons; non-fatal)
+    try:
+        results.append(validate_stage5_holdout(out, s5_models, val_dir))
+    except Exception as e:
+        logger.warning(f"  Stage 5 holdout validation failed: {e}")
 
     # Stage 5b (optional — trip destination + mode)
     if s5b_dest_models is not None or s5b_mode_models is not None:

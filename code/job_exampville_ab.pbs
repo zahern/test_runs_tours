@@ -1,0 +1,167 @@
+#!/bin/bash -l
+# =====================================================================
+# job_exampville_ab.pbs — Exampville transfer test (3-arm Stage-5 comparison).
+#
+# Runs exampville_compare.py on Larch's built-in synthetic town:
+#   Stage 0 CDAP (E1 defaults + E2 searched),
+#   Stage 1 frequency work/nonmand (E1 defaults + E2 searched),
+#   Stage 5 (E0 docs-201 replication + E1 default + E2 searched),
+# using the FULL Exampville synthetic population (5,000 hh / 12,349 persons /
+# 20,739 tours, 40 zones). Stages 2-4, 5b, M3, safety untestable (no diary
+# times/durations/stops/crash in Exampville) — see exampville_connect.py.
+#
+# ARTIFACT SEPARATION: everything lands under runs/exampville_ab/
+# (models, metrics, mapped CSVs, skim copy, logs). NOTHING is written to
+# saved_data/ or any QLD run tree; the driver refuses non-exampville roots.
+#
+# Submit from the code dir:
+#   qsub job_exampville_ab.pbs
+# Override:
+#   qsub -v OUTDIR=runs/exampville_ab2,CONDA_ENV=zigenv job_exampville_ab.pbs
+# =====================================================================
+#PBS -N exampville_ab
+#PBS -l select=1:ncpus=8:mem=64gb
+# 24h default: the full E2 search budget (POP=60/GENS=150/S5_GENS=120) needs it —
+# job 25912109 was killed at 8h with the GA still at gen 73. Small-budget runs
+# finish in minutes; override down per-submit if needed, e.g. -l walltime=02:00:00.
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -m n
+
+set -euo pipefail
+
+# PBS starts jobs in $HOME; all relative paths below assume the code dir.
+cd "${PBS_O_WORKDIR:-$(pwd)}"
+
+# Source conda from the shared filesystem (works on compute nodes)
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+OUTDIR=${OUTDIR:-runs/exampville_ab_${PBS_JOBID:?}}
+
+# Use the shared miniconda env (zigenv has larch/searchlibrium/metacountregressor
+# verified; the standalone exampville env no longer exists and its create step
+# resolved the yml path against $HOME and failed on compute nodes).
+CONDA_BASE=${CONDA_BASE:-/mnt/hpccs01/home/ahernz/miniconda3}
+if ! "${CONDA_BASE}/bin/conda" env list | grep -q "^${CONDA_ENV} "; then
+    echo "FATAL: conda env ${CONDA_ENV} missing under ${CONDA_BASE}" >&2
+    exit 3
+fi
+conda activate "${CONDA_BASE}/envs/${CONDA_ENV}"
+
+# Ensure conda's bin is first in PATH
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+
+# Add compat directory to PYTHONPATH for NumPy 2.0 compatibility shim
+export PYTHONPATH="${PBS_O_WORKDIR}/compat:${PYTHONPATH:-}"
+
+# Verify core packages
+python -c "
+import numpy, pandas, scipy, statsmodels, openmatrix, larch, SearchLibrium, metacountregressor
+print('numpy:', numpy.__version__)
+print('pandas:', pandas.__version__)
+print('scipy:', scipy.__version__)
+print('statsmodels:', __import__('statsmodels').__version__)
+print('openmatrix:', openmatrix.__version__)
+print('larch:', larch.__version__)
+print('SearchLibrium:', __import__('SearchLibrium').__version__)
+print('metacountregressor:', __import__('metacountregressor').__version__)
+"
+python -m py_compile exampville_compare.py exampville_connect.py
+
+# ── Hardware/JAX configuration ──────────
+# Detect GPU and configure JAX accordingly
+if command -v nvidia-smi &> /dev/null && nvidia-smi -L &> /dev/null; then
+    echo "GPU detected, enabling JAX GPU backend"
+    export JAX_PLATFORMS=gpu
+    export JAX_PLATFORMS_ONLY=gpu
+    export PIPELINE_ACCELERATOR=gpu
+    export XLA_PYTHON_CLIENT_PREALLOCATE=false
+    export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+else
+    echo "No GPU detected, forcing JAX CPU backend"
+    export JAX_PLATFORMS=cpu
+    export JAX_PLATFORMS_ONLY=cpu
+fi
+
+# ── House numerical environment ──────────
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export TF_CPP_MIN_LOG_LEVEL=3
+export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+# Small GA budget for the E2 arm (40 zones / ~20k tours: fits are seconds).
+# Override for extensive benchmark searches, e.g.:
+#   qsub -v OUTDIR=runs/exampville_ab_x,EXV_E2_GENS=150,EXV_E2_S5_GENS=120,EXV_E2_RESTARTS=2 job_exampville_ab.pbs
+export EXV_E2_POP=${EXV_E2_POP:-12}
+export EXV_E2_GENS=${EXV_E2_GENS:-8}
+export EXV_E2_RESTARTS=${EXV_E2_RESTARTS:-1}
+export EXV_E2_S5_GENS=${EXV_E2_S5_GENS:-10}
+export GA_ENGINE=${GA_ENGINE:-agds}
+export GA_MAX_WORKERS=${GA_MAX_WORKERS:-1}
+export GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-2}
+# Estimate nest scales (docs example-201 estimates Mu:Car/Motor/NonMotor, so the
+# E-arms must be allowed to as well for a fair comparison). Validity-gated in
+# _run_segment: boundary/insignificant scales revert to fixed automatically.
+export STAGE5_ESTIMATE_MU=${STAGE5_ESTIMATE_MU:-1}
+# 40-zone transfer system: relax read_skims' 371-zone hard guard (its error
+# message names this variable) so _skim_flat's path route + derived columns
+# work on exampville_skims.omx. SEQ runs never set this (default 371).
+export ZONE_SYSTEM_N_ZONES=${ZONE_SYSTEM_N_ZONES:-40}
+export GA_MAX_WORKERS=${GA_MAX_WORKERS:-1}
+export GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-2}
+# Estimate nest scales (docs example-201 estimates Mu:Car/Motor/NonMotor, so the
+# E-arms must be allowed to as well for a fair comparison). Validity-gated in
+# _run_segment: boundary/insignificant scales revert to fixed automatically.
+export STAGE5_ESTIMATE_MU=${STAGE5_ESTIMATE_MU:-1}
+# 40-zone transfer system: relax read_skims' 371-zone hard guard (its error
+# message names this variable) so _skim_flat's path route + derived columns
+# work on exampville_skims.omx. SEQ runs never set this (default 371).
+export ZONE_SYSTEM_N_ZONES=${ZONE_SYSTEM_N_ZONES:-40}
+
+mkdir -p "$OUTDIR"
+
+# Verify Exampville OMX data exists
+if [ ! -f "$(python -c "import exampville_connect as evc; print(evc.exampville_root('${OUTDIR}'))")/exampville_skims.omx" ]; then
+    echo "Exampville OMX not found, will be downloaded by exampville_connect.py"
+fi
+
+echo "=========================================="
+echo "Exampville transfer test (E0/E1/E2)"
+echo "PBS job     : ${PBS_JOBID:-unknown}"
+echo "Code dir    : $(pwd)"
+echo "Out dir     : ${OUTDIR}"
+echo "Conda env   : ${CONDA_ENV}"
+echo "Search eng. : ${GA_ENGINE}"
+echo "Started     : $(date)"
+echo "=========================================="
+
+# Quick import test before full run
+python -c "
+import sys
+try:
+    import larch
+    print('larch version:', larch.__version__)
+except ImportError:
+    print('WARNING: larch not available, will use openmatrix fallback')
+try:
+    import openmatrix
+    print('openmatrix available')
+except ImportError:
+    print('WARNING: openmatrix not available')
+try:
+    import SearchLibrium
+    print('SearchLibrium available')
+except ImportError:
+    print('WARNING: searchlibrium not available (GA search will be limited)')
+"
+
+EXIT_CODE=0
+python -u exampville_compare.py --outdir "$OUTDIR" \
+  > "${OUTDIR}/exampville_compare.out" 2> "${OUTDIR}/exampville_compare.err" || EXIT_CODE=$?
+
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+echo "Metrics : ${OUTDIR}/exampville_metrics.json"
+exit "${EXIT_CODE}"

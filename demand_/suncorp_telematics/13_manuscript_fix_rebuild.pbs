@@ -1,0 +1,95 @@
+#!/bin/bash -l
+#PBS -N suncorp_manuscript_fix
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ncpus=2:mem=16GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ======================================================================
+# FIX JOB 2: manuscript repair + rebuild (no compute).
+# Applies after FIX JOB 1 (12_speeding_timewise_fix.pbs) has produced the
+# speeding-only Fig5 panels.
+#
+# Checklist enforced by this job (fails loud if any item regresses):
+#   [a] Fig5 (fig:timewise) uses speeding-only panels:
+#         figures/speeding_timewise_phase_curve.png
+#         figures/speeding_timewise_hourly.png
+#       and its caption/y-labels say SPEEDING counts, not generic "risk".
+#   [b] Hourly panel contains no exact-0.0 over unobserved clock hours:
+#         results/speeding_timewise_hourly.csv has NaN (not 0) where
+#         counts[h] == 0; figure x-axis omits those hours.
+#   [c] Fig2 (fig:weights) caption states: x = exposure trips (log scale),
+#       y = EB weight w = 1/(1+alpha*lambda) on the SPF prediction, i.e.
+#       low-exposure segments borrow network strength, high-exposure keep
+#       their own counts (ranking stability, Hauer 1997).
+#   [d] Fig5 vs Fig6 time bases disambiguated in captions:
+#       Fig5 = within-window time (phase + clock hour, averaged over the
+#       16 fixtures); Fig6 (fig:kalam) = across-fixture calendar sequence
+#       (one latent level per fixture, Mar-2025..Mar-2026).
+#   [e] Post ranking made explicit: eq:score defines S_j (0.45 risk +
+#       0.25 flow + 0.15 degree + 0.15 betweenness, x stadium decay),
+#       Programme P4 selects the K=14 set as a max-weight independent set
+#       under delta = 0.8 km separation; tab:postselp reports each post's
+#       benefit decomposition (b_j + Risk/km, Flow/km, Deg, Betw, d_stad)
+#       so rank-1 is auditable, not asserted.
+#   [f] Tables live INLINE (before References), useful-only set:
+#       KEEP inline: tab:data, tab:spf, tab:speeding, tab:timewise(speeding),
+#         tab:postselp, tab:riskscore (deployment), tab:pergame.
+#       DEMOTE to supplement or drop: tab:eb, tab:cv, tab:methodcmp,
+#         tab:rw, tab:rwholdout, tab:holdout, tab:eq1sens (keep as 1-row
+#         sensitivity note, not full sweep), tab:concept_supp.
+#       FAIL if \input{table.tex} still sits after \bibliography.
+#
+# Rebuild: latexmk -pdf manuscript/main.tex
+# Submit: cd $PROJ_DIR && qsub 13_manuscript_fix_rebuild.pbs
+# ======================================================================
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+MAN_DIR=$PROJ_DIR/manuscript
+
+cd "$MAN_DIR"
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "=================================================================="
+
+# --- 0. Fix-job-1 artefacts must exist ---
+for f in "$PROJ_DIR/results/speeding_timewise_fix.tex" \
+         "$PROJ_DIR/figures/speeding_timewise_phase_curve.png" \
+         "$PROJ_DIR/figures/speeding_timewise_hourly.png"; do
+  if [ ! -s "$f" ]; then echo "FATAL: run 12_speeding_timewise_fix.pbs first; missing $f"; exit 1; fi
+done
+echo "Fix-job-1 artefacts OK."
+
+# --- 1. Structural checks on main.tex ---
+python3 - <<'EOF'
+import re, sys
+t = open("main.tex").read()
+fails = []
+if "speeding_timewise_phase_curve" not in t or "speeding_timewise_hourly" not in t:
+    fails.append("Fig5 still points at eb_timewise_* (braking+risk); swap to speeding_timewise_* panels.")
+bib = t.find("\\bibliography")
+tbl = t.find("\\input{table.tex}")
+if tbl != -1 and bib != -1 and tbl > bib:
+    fails.append("table.tex still \\input AFTER \\bibliography; move useful tables inline, demote rest to supplement.")
+if "w = 1/(1+" not in t and "w=1/(1+" not in t:
+    fails.append("Fig2 caption never defines the EB weight w = 1/(1+alpha*lambda).")
+if fails:
+    print("MANUSCRIPT CHECKS FAILED:"); [print(" - " + f) for f in fails]; sys.exit(1)
+print("Manuscript structural checks OK.")
+EOF
+[ $? -ne 0 ] && exit 1
+
+# --- 2. Rebuild PDF ---
+if command -v latexmk >/dev/null 2>&1; then
+  latexmk -pdf -interaction=nonstopmode main.tex 2>&1 | tail -20
+  [ ! -s main.pdf ] && { echo "FATAL: main.pdf not produced"; exit 1; }
+  echo "Rebuilt main.pdf OK."
+else
+  echo "WARNING: latexmk not on PATH; skipping compile (checks above still passed)."
+fi
+
+echo "=================================================================="
+echo "Job finished at $(date)"
+echo "=================================================================="

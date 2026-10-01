@@ -1,0 +1,48 @@
+This is BibTeX, Version 0.99e (TeX Live 2026)
+Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
+The top-level auxiliary file: preprint_main.aux
+The style file: unsrtnat.bst
+Database file #1: trb_template.bib
+Warning--empty institution in Dingus2006TheExperiment
+You've used 37 entries,
+            2481 wiz_defined-function locations,
+            861 strings with 15820 characters,
+and the built_in function-call counts, 15149 in all, are:
+= -- 1314
+> -- 929
+< -- 10
++ -- 352
+- -- 276
+* -- 1364
+:= -- 2617
+add.period$ -- 184
+call.type$ -- 37
+change.case$ -- 76
+chr.to.int$ -- 35
+cite$ -- 38
+duplicate$ -- 676
+empty$ -- 1193
+format.name$ -- 323
+if$ -- 3101
+int.to.chr$ -- 3
+int.to.str$ -- 38
+missing$ -- 33
+newline$ -- 266
+num.names$ -- 111
+pop$ -- 189
+preamble$ -- 1
+purify$ -- 37
+quote$ -- 0
+skip$ -- 358
+stack$ -- 0
+substring$ -- 487
+swap$ -- 98
+text.length$ -- 0
+text.prefix$ -- 0
+top$ -- 0
+type$ -- 259
+warning$ -- 1
+while$ -- 109
+width$ -- 0
+write$ -- 634
+(There was 1 warning)

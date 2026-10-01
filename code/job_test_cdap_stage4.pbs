@@ -1,0 +1,163 @@
+#!/bin/bash -l
+#PBS -N test_cdap_s4
+#PBS -l select=1:ncpus=2:mem=16GB
+#PBS -l walltime=00:30:00
+#PBS -j oe
+#PBS -m n
+#PBS -r n
+#
+# CDAP-on-HHTS + joint/origin Stage-4 verification gate.
+# Exercises everything added for observed-CDAP + joint-travel + origin/job
+# timing conditionals and the gated CP-SAT repair, on synthetic frames plus
+# the real HHTS survey (read-only, save=False). Writes nothing outside the
+# job log. Expected runtime < 10 min.
+#
+#   qsub job_test_cdap_stage4.pbs
+#   qsub -v "SCHEDULE_OPTIMIZE=1" job_test_cdap_stage4.pbs   # also exercise repair path
+cd "$PBS_O_WORKDIR"
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORMS=cpu
+export PIPELINE_ACCELERATOR=cpu
+
+python -u -X utf8 - <<'PY'
+import os, sys
+fail = []
+def check(name, cond, detail=""):
+    print(f"  [{'PASS' if cond else 'FAIL'}] {name} {detail}", flush=True)
+    if not cond:
+        fail.append(name)
+
+import pandas as pd
+
+print("== 1. imports ==", flush=True)
+mods = {}
+for m in ["cdap_households_estimation", "cdap_households",
+          "stage4_schedule_placement", "schedule_optimizer",
+          "ga_hypothesis_testing", "data_connect"]:
+    try:
+        mods[m] = __import__(m)
+        print(f"  [PASS] import {m}", flush=True)
+    except Exception as e:
+        print(f"  [FAIL] import {m}: {type(e).__name__}: {e}", flush=True)
+        fail.append(f"import {m}")
+
+print("== 2. synthetic observed-CDAP attach ==", flush=True)
+try:
+    from cdap_households_estimation import attach_cdap_to_hhts
+    persons = pd.DataFrame({
+        'person_id': ['p1', 'p2', 'p3'], 'HHID': [7, 7, 8],
+        'ptype': ['FullTimeWorker', 'SchoolChild', 'NonWorker']})
+    tours = pd.DataFrame({
+        'HHID': [7, 7, 7, 8], 'OTAZ': [101, 101, 101, 202],
+        'DTAZ': [303, 303, 303, 404], 'STARTIME': [480, 480, 600, 600],
+        'person_id': ['p1', 'p2', 'p1', 'p3'],
+        'main_purpose': ['work', 'edu', 'shopping', 'shopping'],
+        'tour_id': [1, 1, 2, 3]})
+    out = attach_cdap_to_hhts(persons, tours)
+    check("cdap_M/N/H present",
+          {'cdap_M', 'cdap_N', 'cdap_H'} <= set(out.columns))
+    check("p1 observed M", out.loc[0, 'cdap_M'] == 1.0, f"({out.loc[0, 'cdap_M']})")
+    check("p3 observed N", out.loc[2, 'cdap_N'] == 1.0, f"({out.loc[2, 'cdap_N']})")
+    check("hh composition", out.loc[0, 'cdap_hh_n_children'] == 1.0)
+    check("joint traveller", out.loc[0, 'is_joint_traveller'] == 1.0
+          and out.loc[2, 'is_joint_traveller'] == 0.0)
+    check("idempotent", sorted(attach_cdap_to_hhts(out, tours).columns) == sorted(out.columns))
+except Exception as e:
+    print(f"  [FAIL] synthetic CDAP attach: {type(e).__name__}: {e}", flush=True)
+    fail.append("synthetic CDAP attach")
+
+print("== 3. joint + origin/job stage-4 features ==", flush=True)
+try:
+    from stage4_schedule_placement import (
+        _attach_joint_features, _attach_origin_job_features,
+        _timing_person_features)
+    df = pd.DataFrame({
+        'person_id': ['p1', 'p2'], 'purpose': ['escort', 'work'],
+        'OTAZ': [101, 202], 'WORK_TAZ': [101, 0], 'SCHOOL_TAZ': [0, 202],
+        'WORKSTAT': [1, 2], 'occp_group': ['Professional', 'Driver'],
+        'WFHWEEK': [0, 1], 'hh_child': [1, 0],
+        'is_joint': [1, 0], 'joint_participants': ['p1,p9', '']})
+    df = _attach_origin_job_features(_attach_joint_features(df))
+    for c in ('is_joint_act', 'joint_party_n', 'escort_duty', 'pickup_anchor',
+              'same_zone_work', 'job_fulltime', 'occp_prof', 'wfh'):
+        check(f"flag {c}", c in df.columns)
+    check("escort_duty fires", df.loc[0, 'escort_duty'] == 1.0)
+    check("pickup_anchor fires", df.loc[0, 'pickup_anchor'] == 1.0)
+    check("joint_party_n==2", df.loc[0, 'joint_party_n'] == 2.0)
+    check("escort feats selectable",
+          {'escort_duty', 'is_joint_act'} <= set(_timing_person_features(df, 'escort', None)))
+    check("work feats selectable",
+          {'same_zone_work', 'job_fulltime', 'cdap_M'} <= set(
+              _timing_person_features(
+                  df.assign(cdap_M=1.0, cdap_hh_n_children=1.0,
+                            is_joint_traveller=1.0), 'work', None)))
+except Exception as e:
+    print(f"  [FAIL] stage-4 features: {type(e).__name__}: {e}", flush=True)
+    fail.append("stage-4 features")
+
+print("== 4. GA candidates include new genes ==", flush=True)
+try:
+    from ga_hypothesis_testing import _stage4_candidates
+    cdf = pd.DataFrame({c: [0.0, 1.0] for c in (
+        'day_position', 'sexp', 'has_work_anchor', 'same_zone_work',
+        'job_fulltime', 'occp_prof', 'wfh', 'is_joint_act', 'joint_party_n',
+        'escort_duty', 'pickup_anchor', 'joint_worker', 'cdap_M', 'cdap_N',
+        'cdap_H', 'cdap_hh_n_children', 'n_joint_tours_hh', 'is_joint_traveller')})
+    cands = _stage4_candidates(cdf)
+    for g in ('has_work_anchor', 'is_joint_act', 'escort_duty',
+              'cdap_M', 'n_joint_tours_hh', 'is_joint_traveller'):
+        check(f"GA candidate {g}", g in cands)
+except Exception as e:
+    print(f"  [FAIL] GA candidates: {type(e).__name__}: {e}", flush=True)
+    fail.append("GA candidates")
+
+print("== 5. schedule repair gating ==", flush=True)
+try:
+    from schedule_optimizer import maybe_repair_schedules, ORTOOLS_OK
+    print(f"  [INFO] ORTOOLS_OK={ORTOOLS_OK}", flush=True)
+    d2 = pd.DataFrame({'person_id': [1], 'STARTIME': [500], 'ENDTIME': [560],
+                       'predicted_duration_min': [60],
+                       'start_of_day': [420], 'end_of_day': [1200]})
+    r = maybe_repair_schedules(d2)  # must never raise, may no-op
+    check("repair no-op safe", len(r) == 1)
+except Exception as e:
+    print(f"  [FAIL] repair gating: {type(e).__name__}: {e}", flush=True)
+    fail.append("repair gating")
+
+print("== 6. real HHTS (read-only) ==", flush=True)
+try:
+    from data_connect import Synth_Connect
+    sc = Synth_Connect()
+    out = sc.process_survey(save=False)
+    persons, tours = out["persons"], out["tours"]
+    cdap_cols = [c for c in ('cdap_M', 'cdap_N', 'cdap_H', 'n_joint_tours_hh',
+                             'is_joint_traveller') if c in persons.columns]
+    check("persons carry observed CDAP", len(cdap_cols) >= 3, f"({cdap_cols})")
+    check("tours carry CDAP", 'cdap_M' in tours.columns or 'is_joint_traveller' in tours.columns,
+          f"({[c for c in ('cdap_M', 'is_joint_traveller') if c in tours.columns]})")
+    from stage4_schedule_placement import prepare_timing_data
+    tdf = prepare_timing_data(out["trips"], out["tours"], out["persons"])
+    check("timing frame has joint/cdap cols",
+          {'is_joint_act', 'escort_duty'} <= set(tdf.columns)
+          and any(c in tdf.columns for c in ('cdap_M', 'n_joint_tours_hh')),
+          f"(n={len(tdf)})")
+except FileNotFoundError as e:
+    print(f"  [SKIP] HHTS files absent on this node: {e}", flush=True)
+except Exception as e:
+    print(f"  [FAIL] real HHTS: {type(e).__name__}: {e}", flush=True)
+    fail.append("real HHTS")
+
+print("=========================", flush=True)
+if fail:
+    print(f"RESULT: FAIL ({len(fail)}): {fail}", flush=True)
+    sys.exit(1)
+print("RESULT: PASS (SKIPs allowed)", flush=True)
+PY
+_ec=$?
+echo "=== test_cdap_s4 finished exit=$_ec ==="
+exit $_ec

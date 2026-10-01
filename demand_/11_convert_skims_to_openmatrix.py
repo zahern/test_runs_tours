@@ -25,7 +25,7 @@ Requirements: openmatrix, tables (PyTables), numpy, h5py
 Usage:
     python 11_convert_skims_to_openmatrix.py
     # or specify paths:
-    python 11_convert_skims_to_openmatrix.py --in sa2_skims_507.omx --crash crash_matrices_507.omx --out sa2_skims_507_omxspec.omx
+    python 11_convert_skims_to_openmatrix.py --in sa2_skims_507.omx --crash crash_matrices_507.omx --out skims_371.omx
 """
 import argparse
 import os
@@ -113,6 +113,6 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--in", dest="in_path", default="sa2_skims_507.omx")
     p.add_argument("--crash", dest="crash_path", default="crash_matrices_507.omx")
-    p.add_argument("--out", dest="out_path", default="sa2_skims_507_omxspec.omx")
+    p.add_argument("--out", dest="out_path", default="skims_371.omx")
     args = p.parse_args()
     convert(args.in_path, args.crash_path, args.out_path)

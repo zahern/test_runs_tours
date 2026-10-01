@@ -4,7 +4,8 @@
 #PBS -l select=1:ncpus=4:mem=64GB
 #PBS -j oe
 #PBS -m abe
-#PBS -r y
+#PBS -r n
+# No-restarts policy: single-run GA; do not auto-rerun.
 
 # ── Cluster paths ───────────────────────────────────────────────────────────
 SCRIPT_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template
@@ -48,6 +49,11 @@ python -u nearmiss_crash_analysis.py \
     --data    "$DATA_DIR/near_miss_ecf.csv" \
     --out-dir "$SCRIPT_DIR"
 EXIT_CODE=$?
+
+# Best-model gate: the paper's reported best models must always be produced.
+for f in "$SCRIPT_DIR/hb_de_best_nm.tex" "$SCRIPT_DIR/hb_de_best_crash.tex"; do
+  if [ ! -f "$f" ]; then echo "MISSING best-model output: $f"; EXIT_CODE=1; fi
+done
 
 # Keep a timestamped archival copy in RESULTS_DIR too, without disturbing
 # the paper's copy. Archived regardless of exit code so partial (Step-1-only)

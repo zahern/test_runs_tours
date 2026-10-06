@@ -22,6 +22,7 @@ import json
 import os
 import sys
 
+import numpy as np
 import pandas as pd
 
 FAIL = []
@@ -344,6 +345,229 @@ if FIG_ROOT:
                 "MISSING -- did not reach the figure block, or predates it")
 else:
     chk(False, "project root derivable for figure checks", str(FIG_ROOT))
+
+def spearman(a, b):
+    ra = pd.Series(a).rank().to_numpy()
+    rb = pd.Series(b).rank().to_numpy()
+    if ra.std() == 0 or rb.std() == 0:
+        return float("nan")
+    return float(np.corrcoef(ra, rb)[0, 1])
+
+
+def top_quartile_share(pred, obs):
+    """Share of realised target falling in the top quartile of a ranking."""
+    p = np.asarray(pred, float)
+    o = np.asarray(obs, float)
+    if p.sum() <= 0 or o.sum() <= 0:
+        return float("nan")
+    k = max(1, len(p) // 4)
+    return float(o[np.argsort(-p)[:k]].sum() / o.sum())
+
+
+def baseline_gate(arm, d, proj, window_h=(-3.0, 4.0)):
+    """THE GATE THAT MATTERS MOST: does the model beat plain traffic volume?
+
+    A count model that cannot outrank "sort segments by how many vehicles they
+    carry" is decoration. Sorting by volume is a fair, non-circular baseline
+    because it shares nothing with the speed threshold; mean speed would NOT
+    be a fair comparator, since the target is defined by a speed threshold and
+    would score near 1.0 for that reason alone.
+
+    This is not hypothetical. Measured with matched targets on job 26107921's
+    own output:
+
+        target trips_mean_gt_10   model r +0.111, Q1 0.753
+                                 volume r +0.131, Q1 0.832   <-- model LOSES
+        target speeding_trips     model r +0.117, Q1 0.581
+                                 volume r -0.071, Q1 0.311   <-- model WINS
+
+    Under the old congestion target the model was strictly worse than a
+    one-line sort, and nothing in the pipeline noticed, because every existing
+    check asked whether an artefact existed rather than whether the model was
+    any good at all.
+
+    Holdout truth is rebuilt from the panel over each fixture's own kickoff
+    window, so it is measured and never the model's own prediction.
+    """
+    import pyarrow.parquet as _pq
+
+    mj = os.path.join(d, "game_day_holdout_metrics.json")
+    pred = os.path.join(d, "game_day_pred_15min.parquet")
+    panel = os.path.join(proj, "results", "segment_15min_panel.parquet")
+
+    if not os.path.exists(mj):
+        chk(False, "arm %s metrics available for the baseline gate" % arm,
+            "missing: %s" % mj)
+        return
+    with open(mj) as fh:
+        j = json.load(fh)
+    target = (j.get("target") or (j.get("metrics") or {}).get("target")
+              or (j.get("audit") or {}).get("target"))
+    if not target:
+        chk(False, "arm %s records which target it predicted" % arm,
+            "no target key in the metrics json")
+        return
+    for p, what in ((pred, "predictions"), (panel, "panel")):
+        if not os.path.exists(p):
+            chk(False, "arm %s baseline gate can read the %s" % (arm, what),
+                "missing: %s" % p)
+            return
+    have = set(_pq.ParquetFile(panel).schema_arrow.names)
+    if target not in have:
+        chk(False, "arm %s baseline gate: panel carries %s" % (arm, target),
+            "panel has: %s" % ", ".join(sorted(have)[:6]))
+        return
+
+    pl = pd.read_parquet(panel, columns=["road_osmid", "bin", target,
+                                        "vehicle_count"])
+    pl["bin"] = pd.to_datetime(pl["bin"])
+    pr = pd.read_parquet(pred, columns=["fixture", "road_osmid",
+                                        "pred_speeding"])
+    pr["pred_speeding"] = pd.to_numeric(pr["pred_speeding"], errors="coerce")
+
+    mr, vr, mq, vq = [], [], [], []
+    skipped = 0
+    n_fx = int(pr["fixture"].nunique())
+    for fx in sorted(pr["fixture"].dropna().unique()):
+        lbl = str(fx)
+        if "@" not in lbl:
+            skipped += 1
+            continue
+        try:
+            ko = pd.to_datetime(lbl.split("@")[-1].strip())
+        except Exception:  # noqa: BLE001
+            skipped += 1
+            continue
+        if ko.tzinfo is None:
+            ko = ko.tz_localize(pl["bin"].dt.tz)
+        w = pl[(pl["bin"] >= ko + pd.Timedelta(hours=window_h[0]))
+               & (pl["bin"] < ko + pd.Timedelta(hours=window_h[1]))]
+        if not len(w):
+            skipped += 1
+            continue
+        truth = w.groupby("road_osmid", observed=True).agg(
+            obs=(target, "sum"), vol=("vehicle_count", "sum"))
+        psum = pr[pr["fixture"] == fx].groupby(
+            "road_osmid", observed=True)["pred_speeding"].sum()
+        j2 = truth.join(psum.rename("pred"), how="inner").dropna(subset=["pred"])
+        if len(j2) < 50:
+            skipped += 1
+            continue
+        o = j2["obs"].to_numpy(float)
+        mr.append(spearman(j2["pred"].to_numpy(float), o))
+        vr.append(spearman(j2["vol"].to_numpy(float), o))
+        mq.append(top_quartile_share(j2["pred"].to_numpy(float), o))
+        vq.append(top_quartile_share(j2["vol"].to_numpy(float), o))
+
+    if not mr:
+        chk(False, "arm %s baseline gate evaluated at least one fixture" % arm,
+            "0 usable of %d (%d unparseable or too small)" % (n_fx, skipped))
+        return
+    M, V = float(np.mean(mr)), float(np.mean(vr))
+    MQ, VQ = float(np.mean(mq)), float(np.mean(vq))
+    print("       %s: %d/%d fixtures, target=%s" % (arm, len(mr), n_fx, target))
+    print("         Spearman      model %+.3f    traffic volume %+.3f"
+          % (M, V))
+    print("         top-quartile  model  %.3f    traffic volume  %.3f"
+          % (MQ, VQ))
+    chk(M > V,
+        "arm %s: model outranks plain traffic volume" % arm,
+        "model %+.3f vs volume %+.3f%s"
+        % (M, V, "" if M > V else "   <-- model redundant with a one-line sort"))
+    chk(MQ > VQ,
+        "arm %s: model beats traffic volume on top-quartile capture" % arm,
+        "model %.3f vs volume %.3f" % (MQ, VQ))
+    chk(MQ > 0.25,
+        "arm %s: top predicted quartile beats chance" % arm,
+        "%.3f vs 0.25 chance" % MQ)
+
+
+def structure_gate(arm, d):
+    """Can the fitted surface produce a GAME-SPECIFIC deployment plan?
+
+    The operational claim is a game-day plan: officers go where THIS game needs
+    them. If every fixture ranks the same streets highest, the plan is a static
+    street list wearing a game-day label.
+
+    Job 26107921: top-10 and top-20 site sets 100% identical across all six
+    games, same argmax street every time, 3.2% of variance between fixtures.
+    The run exited 0 and every artefact existed, so nothing noticed. Stage 59
+    now records the measurement; this gate refuses to certify a plan that
+    cannot differ by game.
+
+    This is deliberately a hard gate. The alternative -- reporting it as a note
+    -- is how a static model shipped as a game-day model in the first place.
+    """
+    mj = os.path.join(d, "game_day_holdout_metrics.json")
+    if not os.path.exists(mj):
+        chk(False, "arm %s metrics for the structure gate" % arm, "missing")
+        return
+    with open(mj) as fh:
+        fv = ((json.load(fh).get("audit") or {}).get("fixture_variation")
+              or {})
+    if not fv:
+        chk(False, "arm %s records fixture_variation" % arm,
+            "absent -- the run predates the structural audit, or it failed")
+        return
+    if fv.get("error"):
+        chk(False, "arm %s fixture_variation computed" % arm, fv["error"])
+        return
+    jac = fv.get("site_overlap_jaccard") or {}
+    bf = fv.get("variance_between_fixtures_pct")
+    ua = fv.get("unique_argmax_sites")
+    print("       %s: %s fixtures, %s segments, between-fixture variance %s%%,"
+          " top20 Jaccard %s, unique argmax %s"
+          % (arm, fv.get("n_fixtures"), fv.get("n_segments"), bf,
+             jac.get("top20"), ua))
+    if jac.get("top20") == 1.0:
+        chk(False,
+            "arm %s: site ranking is game-specific (top-20 not identical)" % arm,
+            "top-20 Jaccard = 1.0: every game selects the SAME 20 streets, so"
+            " the plan is a static street list")
+    else:
+        chk(True,
+            "arm %s: site ranking is game-specific (top-20 not identical)" % arm,
+            "top-20 Jaccard %s" % jac.get("top20"))
+    chk(bool(fv.get("game_specific_ranking")),
+        "arm %s: flags a game-specific ranking" % arm,
+        str(fv.get("game_specific_ranking")))
+    if bf is not None:
+        chk(bf > 0.5,
+            "arm %s: between-fixture variance is non-trivial" % arm,
+            "%s%% (26107921 had 3.2%%)" % bf)
+
+
+# ---------------------------------------------------------------- baseline
+# Can the model beat sorting segments by traffic volume? Without this check a
+# model that is strictly WORSE than a one-line sort still certifies a
+# deployment, which is exactly what happened under the old congestion target.
+print()
+print("baseline gate -- can the model beat sorting by traffic volume?")
+if FIG_ROOT:
+    for _arm, _d in (("A", A_DIR), ("B", B_DIR)):
+        if os.path.isdir(_d):
+            try:
+                baseline_gate(_arm, _d, FIG_ROOT)
+            except Exception as _exc:  # noqa: BLE001
+                chk(False, "arm %s baseline gate ran" % _arm,
+                    "%s: %s" % (type(_exc).__name__, _exc))
+else:
+    chk(False, "project root derivable for the baseline gate", str(FIG_ROOT))
+
+
+# ---------------------------------------------------------------- structure
+# Harder question than "is the model any good": can it give a DIFFERENT answer
+# per game? A game-day plan that cannot vary by game is not a game-day plan.
+print()
+print("structure gate -- can the surface produce a game-specific plan?")
+for _arm, _d in (("A", A_DIR), ("B", B_DIR)):
+    if os.path.isdir(_d):
+        try:
+            structure_gate(_arm, _d)
+        except Exception as _exc:  # noqa: BLE001
+            chk(False, "arm %s structure gate ran" % _arm,
+                "%s: %s" % (type(_exc).__name__, _exc))
+
 
 # ---------------------------------------------------------------- verdict
 print()

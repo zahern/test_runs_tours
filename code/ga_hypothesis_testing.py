@@ -4529,6 +4529,93 @@ def _stage5_dest_only_fitness(
         return -1e9
 
 
+def _stage5_dest_lc_fitness(
+    dest_genes:      np.ndarray,
+    dest_candidates: List[str],
+    base_candidates: List[str],
+    segment:         str,
+    seg_tours:       pd.DataFrame,
+    persons:         pd.DataFrame,
+    lu_st:           pd.DataFrame,
+    skims,
+    ls_cached,
+    seg_acdc:        pd.DataFrame,
+) -> float:
+    """Latent-class destination fitness for the extended chromosome.
+
+    Only reached when STAGE5_LC_GENES=1 and the genome's lc_on bit is set;
+    pooled genomes delegate to the larch path so the current model stays a
+    competitor.  LC genomes are scored -BIC/n on the same long frame the
+    SearchLibrium estimators use (exact MNL likelihood, so BIC/n is comparable
+    with the larch pooled arm), with hard constraints: converged fit, no class
+    collapse, and crash_class_gap >= the genome's gap_min.  decode_lc_spec
+    repairs a crash component in when the raw genome omitted one.
+    """
+    from stage5_destination_choice import (_adaptive_dest_choice_frame_full,
+                                           quarantine_dest_cases)
+    from stage5_lc_genes import decode_lc_spec, fit_lc_genome
+    spec = decode_lc_spec(dest_genes, dest_candidates, base_candidates)
+    if not spec.get("lc_on"):
+        return _stage5_dest_only_fitness(
+            dest_genes, base_candidates, segment, seg_tours, persons, lu_st,
+            skims, ls_cached, seg_acdc)
+    try:
+        _n_pre = len(seg_acdc)
+        seg_acdc = quarantine_dest_cases(seg_acdc, label=f"{segment}/lc")
+        if len(seg_acdc) < _n_pre:
+            logger.info(f"Stage5 dest-LC [{segment}]: quarantined "
+                        f"{_n_pre - len(seg_acdc)} tour(s) before sampling")
+    except Exception as _qe:
+        logger.debug(f"Stage5 dest-LC [{segment}]: quarantine skipped ({_qe})")
+    seg_acdc = _cap_dest_cases(seg_acdc, label=f"{segment}/lc")
+    try:
+        _samp = _ga_sample_dest_alts(seg_acdc, lu_st, ls_cached)
+    except Exception as _e:
+        logger.warning(f"Stage5 dest-LC [{segment}]: alt sampling failed ({_e!r})")
+        return -1e9
+    try:
+        _dt = _dest_tree_cached(seg_acdc, persons, lu_st, skims, ls_cached,
+                                _samp, key_extra=f"{segment}/lc")
+    except Exception as _e:
+        logger.warning(f"Stage5 dest-LC [{segment}]: tree build failed ({_e!r})")
+        return -1e9
+    try:
+        frame, fmap = _adaptive_dest_choice_frame_full(
+            _dt, _samp, segment,
+            case_covariates=list(spec.get("membership_vars") or []))
+    except Exception as _e:
+        logger.warning(f"Stage5 dest-LC [{segment}]: frame build failed ({_e!r})")
+        return -1e9
+    coef_to_col = {str(v): str(k) for k, v in fmap.items()}
+    try:
+        from ga_external_estimators import _GA_COMPLEXITY_PENALTY as _cp
+    except Exception:
+        _cp = 1.0
+    import zlib
+    seed = (int(os.environ.get('STAGE5_LC_SEED', '7'))
+            + (zlib.crc32(np.asarray(dest_genes, dtype=np.uint8).tobytes())
+               % 100000))
+    score, info = fit_lc_genome(frame, coef_to_col, spec,
+                                complexity_penalty=float(_cp), seed=seed)
+    if score is None or score <= -1e8:
+        logger.warning(
+            f"Stage5 dest-LC [{segment}]: {info.get('reason', 'failed')} "
+            f"(features={spec['features']}, memb={spec['membership_vars']}, "
+            f"nc={spec['n_classes']}, gap_min={spec['gap_min']})")
+        return -1e9
+    _seen = getattr(_stage5_dest_lc_fitness, '_valid_logged', set())
+    if segment not in _seen:
+        print(f"    First valid Stage 5 dest-LC model [{segment}]: "
+              f"BIC/n={-score:.4f} ll={info['ll']:.1f} "
+              f"shares={[round(s, 3) for s in info['shares']]} "
+              f"crash_gap={info['crash_gap']:.2f} k={info['k']} "
+              f"memb={spec['membership_vars']}"
+              + (f" pruned={info.get('pruned')}" if info.get('pruned') else ""))
+        _seen.add(segment)
+        _stage5_dest_lc_fitness._valid_logged = _seen
+    return float(score)
+
+
 # ÔöÇÔöÇ Stage 5: Larch   mode_LL + dest_LL on HHTS only ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 # ESTIMATION ONLY   no prediction over synthetic population.
 # Calls _run_segment which uses only HHTS tours.
@@ -9358,6 +9445,26 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
             # terms → singular Hessian → SLSQP stalls at iteration 0).
             # Fit the minimal backbone ONCE (two_phase), gate on convergence,
             # then perturb from there with coefficient warm starts.
+            # ── Opt-in latent-class gene block (STAGE5_LC_GENES=1) ─────────
+            # Appends structure genes (lc_on / lc_nc3 / lc_gap_* / lc_memb:*)
+            # after the base destination terms; decode + repair happens inside
+            # _stage5_dest_lc_fitness so the GA operators are unchanged and
+            # pooled genomes still run the larch path.
+            _lc_genes_on = os.environ.get('STAGE5_LC_GENES', '0').strip() == '1'
+            _lc_base_cands = list(seg_dest_cands)
+            _lc_decode = None
+            if _lc_genes_on:
+                try:
+                    from stage5_lc_genes import (extend_candidates,
+                                                 decode_lc_spec as _lc_decode)
+                    seg_dest_cands = extend_candidates(seg_dest_cands)
+                    print(f"    [LC genes] dest chromosome extended: "
+                          f"{len(_lc_base_cands)} -> {len(seg_dest_cands)} genes")
+                except Exception as _lce:
+                    logger.warning(f"Stage 5 [{seg}] LC gene block unavailable "
+                                   f"({_lce!r}) — pooled larch search only")
+                    _lc_genes_on = False
+
             _starter_coefs: dict = {}
             _starter_genes = np.zeros(len(seg_dest_cands), dtype=int)
             _starter_ok = False
@@ -9386,6 +9493,13 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
                 print("    Dest starter: disabled (STAGE5_DEST_STARTER=0) — cold starts")
 
             def _dest_fit(genes, uec=None):
+                if _lc_genes_on and uec is None and _lc_decode is not None:
+                    _spec = _lc_decode(genes, seg_dest_cands, _lc_base_cands)
+                    if _spec.get("lc_on"):
+                        return _stage5_dest_lc_fitness(
+                            genes, seg_dest_cands, _lc_base_cands, seg,
+                            seg_tours, persons, lu_st_cached, skims, ls_cached,
+                            seg_acdc)
                 return _stage5_dest_only_fitness(
                     genes, seg_dest_cands, seg, seg_tours, persons, lu_st_cached, skims, ls_cached, seg_acdc,
                     warm_start=_starter_coefs or None, custom_uec=uec)
@@ -9527,6 +9641,11 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
             try:
                 _sc_dg = np.asarray(_sc_d.get('genes'), dtype=int).ravel()
                 _sc_df = float(_sc_d.get('fitness', -np.inf))
+                if (_lc_genes_on and _sc_dg.size == len(_lc_base_cands)
+                        and _sc_dg.size < len(seg_dest_cands)):
+                    _sc_dg = np.concatenate([
+                        _sc_dg,
+                        np.zeros(len(seg_dest_cands) - _sc_dg.size, dtype=int)])
                 if (_sc_dg.size == len(seg_dest_cands) and np.isfinite(_sc_df)
                         and _sc_df > -1e8
                         and _sc_df > _bl_dest_fitness):

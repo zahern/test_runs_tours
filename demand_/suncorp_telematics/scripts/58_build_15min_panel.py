@@ -27,8 +27,11 @@ Usage:
   python scripts/58_build_15min_panel.py --pass --limit-chunks 40   # pilot
   python scripts/58_build_15min_panel.py --all                      # full build
   python scripts/58_build_15min_panel.py --merge                    # merge + plots
+  python scripts/58_build_15min_panel.py --patch-target             # add
+      # speed_limit + speeding_trips to an existing panel in place
 """
 import argparse
+import gc
 import json
 import shutil
 from pathlib import Path
@@ -112,6 +115,93 @@ def add_speeding_target(summary, limits, min_limit=MIN_TRUSTED_LIMIT):
     summary["speeding_trips"] = pd.to_numeric(
         summary["speeding_trips"], errors="coerce").fillna(0).astype("int64")
     return summary
+
+
+def patch_target(path, limits, min_limit=MIN_TRUSTED_LIMIT,
+                 batch_size=1_000_000, force=False):
+    """Add speed_limit + speeding_trips to an existing panel parquet in place.
+
+    WHY THIS EXISTS. finalize_month() derives speeding_trips from quantities
+    the panel ALREADY carries: mean_vehicle_speed_kmh and vehicle_count, plus
+    the posted limit from road_meta.csv. A panel built before the target
+    existed therefore does not need the 20 h re-stream of the 7.3 GB traffic
+    extract -- the same derivation can be applied to the rows on disk. This
+    is the cheap, auditable path; the streaming rebuild remains the
+    authoritative one if the underlying pass ever changes.
+
+    Streamed row-group by row-group so a 64M-row merged panel never has to
+    be resident. Idempotent: a file that already carries both columns is
+    skipped unless force=True. Written to a sibling .patchtmp then swapped,
+    so a kill mid-write cannot truncate the original.
+
+    Returns an audit dict with the totals and the two invariants the rebuild
+    also asserts: target <= vehicle_count, and no target on a segment whose
+    posted limit is below the trusted floor.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(path)
+    names = list(pf.schema_arrow.names)
+    need = ("road_osmid", "mean_vehicle_speed_kmh", "vehicle_count")
+    missing = [c for c in need if c not in names]
+    if missing:
+        return {"path": str(path), "ok": False,
+                "reason": f"missing source columns {missing}"}
+    if "speeding_trips" in names and "speed_limit" in names and not force:
+        return {"path": str(path), "ok": True, "skipped": "columns present"}
+    tmp = path.with_suffix(path.suffix + ".patchtmp")
+    writer = None
+    rows = total = over = untrusted_hit = 0
+    try:
+        for batch in pf.iter_batches(batch_size=int(batch_size)):
+            tbl = pa.Table.from_batches([batch])
+            oid = pd.to_numeric(tbl.column("road_osmid").to_pandas(),
+                                errors="coerce")
+            sp = pd.to_numeric(
+                tbl.column("mean_vehicle_speed_kmh").to_pandas(),
+                errors="coerce")
+            vc = pd.to_numeric(tbl.column("vehicle_count").to_pandas(),
+                               errors="coerce")
+            lim = pd.to_numeric(oid.map(limits), errors="coerce")
+            trusted = lim >= float(min_limit)
+            st = (vc.where(trusted & (sp > lim), 0)
+                  .fillna(0).astype("int64"))
+            arrays = [tbl.column(c) for c in names]
+            arrays.append(pa.array(lim.to_numpy(dtype=float)))
+            arrays.append(pa.array(st.to_numpy()))
+            out = pa.Table.from_arrays(
+                arrays, names=names + ["speed_limit", "speeding_trips"])
+            if writer is None:
+                writer = pq.ParquetWriter(tmp, out.schema,
+                                          compression="snappy")
+            writer.write_table(out)
+            rows += len(st)
+            total += int(st.sum())
+            over += int((st > vc.fillna(0)).sum())
+            untrusted_hit += int(((~trusted) & (st > 0)).sum())
+        if writer is not None:
+            writer.close()
+            writer = None
+        # Windows: an open ParquetFile handle blocks os.replace with
+        # PermissionError (WinError 5). Drop the reader (and collect) before
+        # swapping, or the patch can never land on the destination.
+        del pf
+        gc.collect()
+        tmp.replace(path)
+    except Exception:
+        if writer is not None:
+            writer.close()
+        try:
+            del pf
+        except UnboundLocalError:
+            pass
+        tmp.unlink(missing_ok=True)
+        raise
+    return {"path": str(path), "ok": True, "rows": int(rows),
+            "speeding_trips": int(total), "over_vehicle_count": int(over),
+            "untrusted_limit_hits": int(untrusted_hit),
+            "min_trusted_limit": float(min_limit)}
 
 
 def _load_roads():
@@ -299,6 +389,13 @@ def main():
     ap.add_argument("--finalize", action="store_true")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--merge", action="store_true")
+    ap.add_argument("--patch-target", action="store_true",
+                    help="add speed_limit + speeding_trips to the existing"
+                         " monthly and merged panels in place, derived from"
+                         " mean_vehicle_speed_kmh and road_meta.csv limits"
+                         " exactly as finalize does. No re-stream; idempotent")
+    ap.add_argument("--patch-force", action="store_true",
+                    help="rewrite the two target columns even if present")
     ap.add_argument("--months", default=None, help="comma-separated YYYY-MM")
     ap.add_argument("--snap-m", type=float, default=30.0)
     ap.add_argument("--default-limit", type=float, default=50.0)
@@ -318,6 +415,50 @@ def main():
     marker = tmp_root / "_pass_done.json"
     out_dir.mkdir(parents=True, exist_ok=True)
     fig_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.patch_target:
+        limits = load_speed_limits()
+        if len(limits) == 0:
+            raise SystemExit(
+                f"cannot derive speed_limit: {ROAD_META} missing or empty")
+        print(f"[58] patch-target: {len(limits):,} posted limits "
+              f"(trusted >= {MIN_TRUSTED_LIMIT:g} km/h)")
+        parts = sorted(out_dir.glob("segment_15min_panel_????-??.parquet"))
+        merged = out_dir / "segment_15min_panel.parquet"
+        targets = parts + ([merged] if merged.exists() else [])
+        if not targets:
+            raise SystemExit("no panel parquet files to patch")
+        audits = []
+        for p in targets:
+            a = patch_target(p, limits, force=args.patch_force)
+            print(f"[58] {p.name}: {json.dumps(a, default=str)}")
+            audits.append(a)
+        patched = [a for a in audits
+                   if a.get("ok") and not a.get("skipped")]
+        problems = [a for a in patched
+                    if a["over_vehicle_count"] or a["untrusted_limit_hits"]]
+        if problems:
+            raise SystemExit(
+                "FATAL: patched target violates its invariants: "
+                + json.dumps(problems, default=str))
+        if patched and sum(a["speeding_trips"] for a in patched) <= 0:
+            raise SystemExit("FATAL: the patched target is empty")
+        ma = next((a for a in patched
+                   if Path(a["path"]) == merged), None)
+        if ma is not None:
+            apath = out_dir / "segment_15min_panel.audit.json"
+            try:
+                audit = (json.loads(apath.read_text())
+                         if apath.exists() else {})
+                audit["speeding_trips"] = int(ma["speeding_trips"])
+                audit["speed_limit_segments"] = int(len(limits))
+                audit["target_patched"] = True
+                apath.write_text(json.dumps(audit, indent=2, default=str))
+            except Exception as exc:  # noqa: BLE001 - audit is advisory
+                print(f"[58] WARN: could not update audit json ({exc})")
+        print(f"[58] patch-target done: {len(patched)} file(s) patched, "
+              f"{len(audits) - len(patched)} skipped")
+        return
 
     if args.merge:
         parts = sorted(out_dir.glob("segment_15min_panel_????-??.parquet"))

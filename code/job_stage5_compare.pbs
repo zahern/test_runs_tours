@@ -34,7 +34,9 @@ if [[ "${INSTALL_ESTIMATORS}" == "1" ]]; then
     if [[ "${ESTIMATOR_SOURCE}" == "editable" && -d "/mnt/hpccs01/home/ahernz/source/SearchLibrium" ]]; then
         pip install -e /mnt/hpccs01/home/ahernz/source/SearchLibrium --upgrade -q
     else
-        pip install --upgrade -q SearchLibrium
+        # Always constrain the PyPI upgrade so SearchLibrium's wide bounds
+        # cannot pull numpy/scipy/numba out of the zigenv window.
+        pip install --upgrade -q -c "${PBS_O_WORKDIR}/constraints.txt" SearchLibrium
     fi
     _pip_rc=$?
     set -e
@@ -71,6 +73,17 @@ export STAGE5_CLEAR_SHARROW_CACHE="${STAGE5_CLEAR_SHARROW_CACHE:-1}"
 export STAGE5_ENABLE_MXL="${STAGE5_ENABLE_MXL:-0}"
 export STAGE5_ENABLE_GSE="${STAGE5_ENABLE_GSE:-0}"
 
+# ── SearchLibrium source ─────────────────────────────────────────────────────
+# The installed wheel (latest PyPI, pinned by requirements.txt) is always the
+# first import path.  The destination additions made locally
+# (identify_weak_features, PreconditionedRandomWalkProposal, interactions, LC)
+# are not in every release yet, so _estimate_adaptive_dest_choice() falls back
+# to $SEARCHLIBRIUM_SRC/SearchLibrium/mh_choice_estimator.py when the import
+# is missing names.  Point it at the checked-in _patches tree by default.
+if [[ -z "${SEARCHLIBRIUM_SRC:-}" && -f "${PBS_O_WORKDIR}/_patches/SearchLibrium/mh_choice_estimator.py" ]]; then
+    export SEARCHLIBRIUM_SRC="${PBS_O_WORKDIR}/_patches"
+fi
+
 mkdir -p "${STAGE5_COMPARE_DIR}/plots"
 LOG_OUT="${STAGE5_COMPARE_DIR}/job.out"
 LOG_ERR="${STAGE5_COMPARE_DIR}/job.err"
@@ -83,6 +96,52 @@ LOG_ERR="${STAGE5_COMPARE_DIR}/job.err"
     echo "Skims         : ${PIPELINE_SKIMS_PATH:-default}"
     echo "Started       : $(date)"
 } | tee -a "${LOG_OUT}"
+
+# ── Preflight: zigenv window + SearchLibrium destination features ────────────
+python - <<'PYEOF' 2>&1 | tee -a "${LOG_OUT}" || exit 2
+import os, sys
+import numpy, scipy, numba, pandas
+def _mm(v):
+    return tuple(int(x) for x in v.split(".")[:2])
+_bad = []
+if not ((2, 1) <= _mm(numpy.__version__) < (2, 4)):
+    _bad.append(f"numpy {numpy.__version__} not in [2.1,2.4)")
+if not ((1, 15) <= _mm(scipy.__version__) < (1, 16)):
+    _bad.append(f"scipy {scipy.__version__} not in [1.15,1.16)")
+if not ((0, 60) <= _mm(numba.__version__) < (0, 63)):
+    _bad.append(f"numba {numba.__version__} not in [0.60,0.63)")
+if int(pandas.__version__.split(".")[0]) >= 3:
+    _bad.append(f"pandas {pandas.__version__} >= 3")
+if _bad:
+    print("FATAL: outside zigenv window: " + ", ".join(_bad), file=sys.stderr)
+    raise SystemExit(2)
+print(f"  numpy {numpy.__version__} / scipy {scipy.__version__} / "
+      f"numba {numba.__version__} / pandas {pandas.__version__}")
+try:
+    import SearchLibrium
+    print(f"  SearchLibrium {getattr(SearchLibrium, '__version__', '?')}")
+    import SearchLibrium.mh_choice_estimator as M
+    need = ("identify_weak_features", "PreconditionedRandomWalkProposal",
+            "estimate_dest_choice_interactions", "estimate_dest_choice_lc")
+    miss = [n for n in need if not hasattr(M, n)]
+except Exception as e:
+    miss = [f"import failed: {e!r}"]
+src = os.environ.get("SEARCHLIBRIUM_SRC", "")
+patch = os.path.join(src, "SearchLibrium", "mh_choice_estimator.py") if src else ""
+if miss:
+    print(f"  installed wheel lacks: {miss}")
+    if patch and os.path.isfile(patch):
+        print(f"  fallback patch present -> {patch}")
+    else:
+        print("FATAL: missing destination features and no SEARCHLIBRIUM_SRC "
+              "fallback. Run `pip install -U -c constraints.txt SearchLibrium` "
+              "on the login node, or set SEARCHLIBRIUM_SRC to _patches.",
+              file=sys.stderr)
+        raise SystemExit(2)
+else:
+    print("  SearchLibrium destination features: OK (installed wheel)")
+print("  preflight OK")
+PYEOF
 
 set +e
 python -u stage5_compare_runner.py \

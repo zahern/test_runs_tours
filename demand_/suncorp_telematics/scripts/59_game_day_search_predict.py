@@ -134,9 +134,60 @@ CONT_VARS = ["lanes_z", "maxspeed_z", "curvature_z", "dist_inter_z",
              "node_degree_z", "log_length", "lanes_known"]
 CAL_VARS = ["tod_sin", "tod_cos", "dow_sin", "dow_cos", "weekend"]
 GAME_VARS = ["in_event", "rel_hour", "log_att", "dist_stad", "event_x_dist"]
-# Game-day dynamics that must ALWAYS survive the search (user requirement:
-# a game-day plan needs game-day structure even when BIC would drop it).
-GAME_FORCE = ["in_event", "rel_hour", "log_att", "event_x_dist"]
+# Terms that MUST survive selection, because the operational requirement is a
+# GAME-SPECIFIC, SEGMENT-LEVEL, TIME-RESOLVED deployment and the model cannot
+# express one without them.
+#
+# WHY THE PREVIOUS LIST WAS NOT ENOUGH. It was
+#     [in_event, rel_hour, log_att, event_x_dist]
+# and not one of those can reorder segments DIFFERENTLY for different games:
+#
+#   in_event      is 1 for every game inside its own window, so it is the
+#                 same constant for all six fixtures
+#   rel_hour      varies by 15-minute bin, not by segment
+#   log_att       varies by game but is IDENTICAL across segments -- it shifts
+#                 the level of a game, it does not reorder streets
+#   event_x_dist  = in_event * dist_stad, and with in_event == 1 in every
+#                 window this collapses to dist_stad, i.e. a STATIC segment
+#                 effect
+#
+# Measured consequence on job 26107921, whose fitted spec contained exactly
+# those four and none of the interactions below:
+#   * 87.8% of the variance of log1p(predicted) was between segments, 3.2%
+#     between fixtures
+#   * the top-10 and top-20 site sets were 100% IDENTICAL across all six games
+#   * the same street was the argmax for every game
+# so the "game-day" surface could not produce a game-specific plan, and the
+# MIP dutifully returned the same four streets six times.
+#
+# WHY THESE TWO, AND WHY FORCED RATHER THAN "LET BIC DECIDE". Both were
+# offered to the search and both were culled, which is expected: each explains
+# only a few per cent of POOLED variance, while BIC on a multi-million-row
+# panel charges k*log(n) for every parameter and rewards the static segment
+# effects that carry the bulk. Pooled in-sample BIC is structurally blind to a
+# term whose entire value is reordering segments WITHIN a game. Since the
+# requirement is the reordering, it has to be required by construction:
+#
+#   att_x_dist = log_att * dist_stad   the stadium footprint GROWS with the
+#                                      crowd, so a 45k game puts relatively
+#                                      more weight on near-stadium segments
+#                                      than a 39k game -> different streets
+#                                      for different games
+#   rel_x_dist = rel_hour * dist_stad  the temporal shape depends on distance,
+#                                      so near-stadium and far segments peak
+#                                      at different times -> time-dependence
+#                                      that is specific to the segment, not
+#                                      just to the game as a whole
+#
+# The search still chooses the FORMS around them (fixed vs grouped, which
+# basis functions, everything else in the library); what it no longer decides
+# is whether the model is allowed to have any game- or segment-specific
+# time structure at all.
+GAME_FORCE = ["in_event", "rel_hour", "log_att", "event_x_dist",
+              # REQUIRED for game-specific reordering and segment-specific
+              # timing. See the block comment above; do not remove without
+              # replacing them with something that does the same job.
+              "att_x_dist", "rel_x_dist"]
 # Within-window temporal shape (serial persistence is carried by these
 # engineered features plus segment-level grouping; metacountregressor
 # >=1.0.165 adds a real AR(1)/AR(2) NB2 estimator used in stage 2b below).
@@ -149,8 +200,36 @@ TEMPORAL_VARS = ["rel_hour_sq", "rel_sin", "rel_cos", "pre_game", "post_game"]
 # ev_x_lanes (game traffic uses different road types).
 GAME_ATTR_VARS = ["fxt_NRL", "fxt_ALeague", "big_game", "ko_tod_sin",
                   "ko_tod_cos"]
-INTERACT_VARS = ["rel_x_dist", "att_x_dist", "ev_x_lanes"]
+# evu_x_att = seg_event_uplift_z * log_att: the stadium footprint of a
+# segment that demonstrably responds to games grows with the crowd, so a
+# 45k game weights responsive segments differently from a 39k game -> the
+# segment ranking becomes game-specific.
+INTERACT_VARS = ["rel_x_dist", "att_x_dist", "ev_x_lanes", "evu_x_att"]
 GAME_WIDE_VARS = GAME_ATTR_VARS + INTERACT_VARS
+EVENT_X_VARS = ["evu_x_att"]
+
+
+def force_terms(work, args=None):
+    """GAME_FORCE, plus evu_x_att when it varies and forcing is enabled.
+
+    The event-uplift interaction is the direct mechanism for game-specific
+    reordering, and pooled BIC culls exactly this kind of within-game term
+    (see the GAME_FORCE comment). It is therefore forced by construction
+    unless --force-event-uplift off. A column that is constant (no
+    background sums, or no uplift variance) is not forced: the package's
+    identifiability screen would reject it and collapse the spec.
+    """
+    terms = [c for c in GAME_FORCE if c in work.columns]
+    if str(getattr(args, "force_event_uplift", "on") or "on").lower() == "on":
+        for c in EVENT_X_VARS:
+            if c not in work.columns or c in terms:
+                continue
+            try:
+                if pd.to_numeric(work[c], errors="coerce").nunique() > 1:
+                    terms.append(c)
+            except Exception:  # noqa: BLE001 - forcing is best-effort
+                pass
+    return terms
 SLIM_CONT = ["lanes_z", "maxspeed_z", "dist_inter_z", "lanes_known"]
 SLIM_CAL = ["tod_sin", "tod_cos", "weekend"]
 SLIM_GAME = ["in_event", "rel_hour", "log_att", "dist_stad", "event_x_dist"]
@@ -198,7 +277,11 @@ PROFILE_ROWS = 500000
 # segment" could only ever mean "let lanes_z vary by segment" -- the segment
 # identity itself was never a candidate. Candidate set grows by 1, so the
 # decision dimension changes and old checkpoints must not warm-start.
-SEARCH_GEN = 7
+# GEN 9: seg_event_uplift_z (per-segment game uplift) and its attendance
+# interaction evu_x_att join the candidate set; evu_x_att is force-included
+# by default. Two new columns change the decision dimension, so pre-GEN-9
+# checkpoints must not warm-start.
+SEARCH_GEN = 9
 # Transferable temporal structure (all train-anchored, all known for future
 # fixtures — unlike autoregression, which needs unobserved future lags):
 #   seg_risk_z: EB-shrunk per-segment speeding propensity from train history
@@ -208,7 +291,13 @@ SPLIT_CODES = ["NRL", "ALeague", "SuperRugby"]
 RISK_VARS = ["seg_risk_z"]
 LAG_VARS = ["exp_lag1"]
 CLOCK_VARS = ["clock_prof"]
-TIME_X_VARS = RISK_VARS + LAG_VARS + CLOCK_VARS
+# Per-segment GAME uplift: does this segment's own rate rise on game days
+# relative to its own background? Estimated EB-shrunk from train event vs
+# background sums, standardised, and transferable to future fixtures (no
+# future lags). This is the direct "which streets respond to games" signal;
+# seg_risk_z only carries the overall level.
+EVENT_UPLIFT_VARS = ["seg_event_uplift_z"]
+TIME_X_VARS = RISK_VARS + LAG_VARS + CLOCK_VARS + EVENT_UPLIFT_VARS
 # Segment-identity term for the grouped (role 4) effect.
 #
 # This started as a CONSTANT 1.0 column, on the reasoning that a
@@ -850,6 +939,11 @@ def add_game_wide(frame, crowd_med=None):
     frame["rel_x_dist"] = rh * ds
     frame["att_x_dist"] = la * ds
     frame["ev_x_lanes"] = ie * lz
+    # NOTE: evu_x_att is NOT computed here. seg_event_uplift_z is attached by
+    # apply_temporal_x, which runs AFTER this function in every frame path
+    # (build_game_frame -> ... -> apply_temporal_x), so computing it here
+    # silently produced an all-zero column and the search could never use it.
+    # apply_temporal_x owns the interaction.
     return frame
 
 
@@ -866,6 +960,46 @@ def estimate_seg_risk(train_events, target, pseudo_exp=20.0):
     risk = (g["Y"] + pseudo_exp * r0) / (g["E"] + pseudo_exp)
     mu, sd = float(risk.mean()), float(risk.std())
     return (((risk - mu) / (sd if sd > 0 else 1.0)).to_dict(), r0)
+
+
+def estimate_seg_event_uplift(train_events, bg_sums, target, denom_col,
+                              pseudo_exp=20.0):
+    """EB-shrunk per-segment GAME uplift: event rate vs its own background.
+
+        u_s = log((Y_ev+k*p0)/(E_ev+k)) - log((Y_bg+k*p0)/(E_bg+k))
+
+    where Y/E are target and measured-denominator sums over train event
+    windows and over all background (non-fixture) bins, p0 is the pooled
+    rate, and k shrinks thin segments toward "no uplift". Standardised
+    across segments; unseen segments map to 0.
+
+    WHY THIS AND NOT seg_risk_z. seg_risk_z is the segment's overall level
+    (busy streets are busy in and out of games). This contrast is the part
+    that is SPECIFIC to game days, which is the only thing that can reorder
+    segments for a deployment plan. It is train-anchored, so it transfers
+    to future fixtures (unlike an autoregressive term).
+    """
+    if (train_events is None or len(train_events) == 0
+            or bg_sums is None or len(bg_sums) == 0):
+        return {}
+    if target not in train_events.columns or denom_col not in train_events.columns:
+        return {}
+    ev = (train_events.groupby("road_osmid")[[target, denom_col]]
+          .sum().rename(columns={target: "Y_ev", denom_col: "E_ev"}))
+    bg = bg_sums.rename(columns={target: "Y_bg", denom_col: "E_bg"})
+    j = ev.join(bg, how="inner")
+    if j.empty:
+        return {}
+    p0 = float(j["Y_ev"].sum() + j["Y_bg"].sum()) / max(
+        float(j["E_ev"].sum() + j["E_bg"].sum()), 1e-9)
+    k = float(pseudo_exp)
+    r_ev = (j["Y_ev"] + k * p0) / (j["E_ev"] + k)
+    r_bg = (j["Y_bg"] + k * p0) / (j["E_bg"] + k)
+    u = np.log(np.maximum(r_ev, 1e-12)) - np.log(np.maximum(r_bg, 1e-12))
+    mu, sd = float(u.mean()), float(u.std())
+    if not np.isfinite(mu) or not np.isfinite(sd) or sd <= 0:
+        return {}
+    return ((u - mu) / sd).to_dict()
 
 
 def estimate_clock_prof(train_events, target):
@@ -889,14 +1023,30 @@ def estimate_clock_prof(train_events, target):
     return prof
 
 
-def apply_temporal_x(frame, seg_risk_map=None, clock_prof=None):
-    """Attach seg_risk_z / clock_prof / exp_lag1 to an enriched frame."""
+def apply_temporal_x(frame, seg_risk_map=None, clock_prof=None,
+                     seg_event_uplift_map=None):
+    """Attach seg_risk_z / clock_prof / exp_lag1 / seg_event_uplift_z."""
     n = len(frame)
     if seg_risk_map and "road_osmid" in frame.columns:
         frame["seg_risk_z"] = (frame["road_osmid"].map(seg_risk_map)
                                .fillna(0.0).astype(float))
     elif "seg_risk_z" not in frame.columns:
         frame["seg_risk_z"] = 0.0
+    if seg_event_uplift_map and "road_osmid" in frame.columns:
+        frame["seg_event_uplift_z"] = (
+            frame["road_osmid"].map(seg_event_uplift_map)
+            .fillna(0.0).astype(float))
+    elif "seg_event_uplift_z" not in frame.columns:
+        frame["seg_event_uplift_z"] = 0.0
+    # Game-uplift x attendance, computed HERE because the uplift column only
+    # exists after the block above. Responsive segments weigh more for bigger
+    # crowds, so the ranking can differ between a 45k and a 39k game.
+    _la = (pd.to_numeric(frame["log_att"], errors="coerce").fillna(0.0)
+           .to_numpy(float) if "log_att" in frame.columns
+           else np.zeros(len(frame)))
+    frame["evu_x_att"] = (pd.to_numeric(frame["seg_event_uplift_z"],
+                                        errors="coerce").fillna(0.0)
+                          .to_numpy(float) * _la)
     if (clock_prof and "rel_bin" in frame.columns
             and "fixture_type" in frame.columns):
         rb = pd.to_numeric(frame["rel_bin"], errors="coerce").fillna(0).to_numpy(int).clip(0, REL_BINS - 1)
@@ -1372,8 +1522,7 @@ def run_search(work, args, audit, out_dir, resume_state=None):
     # Random parameters are restricted to continuous geometry/flow terms —
     # the old code re-allowed cal/game into allow_random, letting the search
     # waste draws on binary game dummies.
-    force_game = [c for c in GAME_FORCE if c in work.columns] \
-        if not args.no_force_game else []
+    force_game = force_terms(work, args) if not args.no_force_game else []
     # Segment length is exposure scale (like logexp): counts must scale
     # with metres, otherwise 4 m driveways get the same baseline as
     # 400 m arterials (o25908597: 45 m osmid hogged 72% of predictions).
@@ -1398,6 +1547,27 @@ def run_search(work, args, audit, out_dir, resume_state=None):
     allow = [c for c in cand_cont if c not in hw]
     if allow:
         constraints = constraints.allow_random(*allow, distributions=["normal"])
+    # --- per-segment temporal response (opt-in) -------------------------
+    # With --group-temporal on, the temporal basis may take role 4 (grouped)
+    # as well as fixed, so the WITHIN-WINDOW SHAPE can differ by segment
+    # instead of being one curve for the whole network scaled by static
+    # coefficients. Roles 2/3 (random independent/correlated) stay banned:
+    # those draw huge numbers of free parameters on a panel this size and are
+    # not what is wanted here; role 4 shrinks each segment's slope toward the
+    # group mean. set_roles OVERWRITES the allowed set (it does not intersect),
+    # so {1, 4} here also removes role 0 -- the term must appear.
+    gt_vars = ([c for c in ("rel_sin", "rel_cos") if c in work.columns]
+               if str(getattr(args, "group_temporal", "off")).lower() == "on"
+               else [])
+    for _v in gt_vars:
+        constraints = (constraints.set_roles(_v, [1, 4])
+                       .set_distributions(_v, ["normal"]))
+    if gt_vars:
+        print(f"   [temporal] grouped temporal slope enabled on: {gt_vars} "
+              f"(group = {getattr(args, 'group_by', 'highway')})")
+    audit["group_temporal"] = {
+        "enabled": bool(gt_vars), "vars": list(gt_vars),
+        "group_col": str(getattr(args, "group_by", "highway"))}
     audit["forced_game_terms"] = list(force_game)
     # Grouped panel structure. --group-by event splits by fixture: each
     # event gets its own grouped coefficients (the per-event split), shrunk
@@ -1580,8 +1750,13 @@ def run_search(work, args, audit, out_dir, resume_state=None):
                 "algo": args.search_algo, "iters": total_iters,
                 "iters_completed": int(done), "chunk_size": int(chunk),
                 "R": int(args.search_R), "seed": int(args.seed),
-                "target": args.target, "search_gen": SEARCH_GEN,
-                "engine": engine_used, "variables": variables,
+                  "target": args.target, "search_gen": SEARCH_GEN,
+                  # Recorded so a resume can tell whether the temporal terms
+                  # were allowed the grouped role: that changes the search
+                  # space, so a checkpoint from the other setting must not be
+                  # reused (see the resume validation in main).
+                  "group_temporal": bool(gt_vars),
+                  "engine": engine_used, "variables": variables,
                 "search_error": search_error,
                 "updated_iso": _utcnow_iso()})
             _append_progress({
@@ -1645,7 +1820,8 @@ DEFAULT_FIXED = ["logexp", "in_event", "rel_hour", "log_att", "dist_stad",
                  "tod_sin", "tod_cos", "weekend", "lanes_z", "maxspeed_z"]
 
 
-def ensure_spec(spec, work, audit, force_game=True, keep_temporal=True):
+def ensure_spec(spec, work, audit, force_game=True, keep_temporal=True,
+                args=None):
     """Guarantee a usable spec: exposure + game-day block always in.
 
     The SA search on sparse 15-min counts can select an all-excluded solution
@@ -1666,8 +1842,8 @@ def ensure_spec(spec, work, audit, force_game=True, keep_temporal=True):
         fixed = ["logexp"] + fixed
     missing_game = []
     if force_game:
-        for c in GAME_FORCE:
-            if c in work.columns and c not in fixed:
+        for c in force_terms(work, args):
+            if c not in fixed:
                 fixed.append(c)
                 missing_game.append(c)
     audit["game_terms_patched"] = list(missing_game)
@@ -1826,7 +2002,380 @@ def refit_only(work, spec, args, audit):
     return info
 
 
-def refit_binomial(work, args, audit, spec=None, label="binomial refit"):
+def refit_denominator(work, denom, spec, args, audit):
+    """Stage A of the two-stage model: predict the MEASURED denominator.
+
+    The count refit needs an exposure to scale a count with, and the only
+    one it has is a TMR flow projection -- the channel the exposure LRT
+    rejects at chi2(1)=364. The two-stage decomposition removes the
+    projection from the shipped surface entirely:
+
+        pred_speeding = pred_denominator  x  P(speeding | denominator)
+
+    where the denominator is a panel MEASURED column (vehicle_count for
+    speeding_trips, trips_with_judged_speed for the trips_* targets) and the
+    probability is the binomial propensity from refit_binomial. Stage A is
+    therefore an ordinary NB2 count model for the denominator with the same
+    searched structure; it is the "future demand" surface.
+
+    Returns the fit info dict (same contract as refit_only) or None.
+    """
+    out = {"denominator": denom, "available": False}
+    audit.setdefault("two_stage", {})
+    if denom not in work.columns:
+        out["reason"] = f"denominator {denom!r} not in the search frame"
+        audit["two_stage"]["flow_refit"] = out
+        print(f"   [two-stage] flow unavailable: {out['reason']}")
+        return None
+    work_a = work.copy()
+    work_a["Y"] = pd.to_numeric(work_a[denom], errors="coerce") \
+        .replace([np.inf, -np.inf], 0.0).fillna(0.0).astype(float)
+    fields = _spec_fields(spec, work_a)
+    R = max(20, int(getattr(args, "two_stage_flow_R", 60)))
+    try:
+        info = fit_metacount_nb(
+            work_a, y_col="Y", id_col="row_id", model="nb", R=R,
+            de_maxiter=int(args.de_maxiter),
+            de_popsize=int(args.de_popsize), verbose=True,
+            continuous_de_warm_start=(not args.no_de_warm),
+            use_slsqp=(not args.no_slsqp), seed=int(args.seed), **fields)
+    except Exception as exc:  # noqa: BLE001
+        out["reason"] = f"{type(exc).__name__}: {exc}"
+        audit["two_stage"]["flow_refit"] = out
+        print(f"   [two-stage] flow refit failed: {out['reason']}")
+        return None
+    out.update({"available": True, "spec_label": info.get("spec_label"),
+                "bic": info.get("bic"), "aic": info.get("aic"),
+                "model": info.get("model", "nb"), "R": R,
+                "fixed_terms": list(info.get("fixed_terms", []))})
+    audit["two_stage"]["flow_refit"] = out
+    print(f"   [two-stage] flow NB2 on {denom}: {info.get('spec_label')} "
+          f"BIC={info.get('bic'):.1f} R={R}")
+    del work_a
+    _clear_jax_caches()
+    return info
+
+
+def _fixture_variation(out, top_n=(10, 20)):
+    """How much of the predicted surface actually differs between games?
+
+    Pure measurement -- nothing here changes the fit. Returns the same kind of
+    structure stage 60 reports, computed here so a run records whether its OWN
+    surface could support a game-specific plan before the MIP is ever pointed
+    at it.
+
+    Reported:
+      variance_between_segments_pct / variance_between_fixtures_pct
+          split of var(log1p(pred)) per segment x fixture
+      site_overlap_jaccard
+          mean pairwise Jaccard of the top-N site sets across fixtures;
+          1.0 means every game ranks the same streets highest
+      unique_argmax_sites
+          how many distinct streets are the single best site across fixtures
+      game_specific_ranking
+          True when the top-20 sets are not all identical
+    """
+    need = {"fixture", "road_osmid", "pred_speeding"}
+    if out is None or not need.issubset(out.columns):
+        return {"error": "predictions lack %s" % sorted(need - set(out.columns))}
+    d = out[["fixture", "road_osmid", "pred_speeding"]].dropna(
+        subset=["fixture", "road_osmid"])
+    if not len(d):
+        return {"error": "no prediction rows"}
+    wide = d.pivot_table(index="road_osmid", columns="fixture",
+                         values="pred_speeding", aggfunc="sum").fillna(0.0)
+    if wide.shape[1] < 2:
+        return {"error": "need >= 2 fixtures, got %d" % wide.shape[1]}
+    L = np.log1p(wide.to_numpy(float))
+    grand = L.mean()
+    seg = L.mean(axis=1)
+    fxm = L.mean(axis=0)
+    total = float(((L - grand) ** 2).sum())
+    out_d = {"n_fixtures": int(wide.shape[1]),
+             "n_segments": int(wide.shape[0])}
+    if total > 0:
+        out_d["variance_between_segments_pct"] = round(
+            100 * float(((seg - grand) ** 2).sum()) * L.shape[1] / total, 1)
+        out_d["variance_between_fixtures_pct"] = round(
+            100 * float(((fxm - grand) ** 2).sum()) * L.shape[0] / total, 1)
+    cols = list(wide.columns)
+    jac = {}
+    for n in top_n:
+        tops = [set(wide[c].nlargest(n).index) for c in cols]
+        vals = []
+        for i in range(len(tops)):
+            for j in range(i + 1, len(tops)):
+                vals.append(len(tops[i] & tops[j]) / max(len(tops[i] | tops[j]), 1))
+        jac["top%d" % n] = round(float(np.mean(vals)), 3) if vals else None
+    out_d["site_overlap_jaccard"] = jac
+    out_d["unique_argmax_sites"] = int(len({wide[c].idxmax() for c in cols}))
+    out_d["game_specific_ranking"] = bool(jac.get("top20") != 1.0)
+    return out_d
+
+
+def _pearson(a, b):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    mask = np.isfinite(a) & np.isfinite(b)
+    a, b = a[mask], b[mask]
+    if len(a) < 8 or np.var(a) <= 0 or np.var(b) <= 0:
+        return float("nan")
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def compute_handoff(merged, out, metrics, top_n=20):
+    """Can this surface be handed to the MIP? Three checks, all measured.
+
+    The MIP solves a maximal-covering problem on pred_speeding, so what
+    matters is not pooled RMSE but whether the ranking is right WITHIN each
+    fixture and whether the ranking DIFFERS between fixtures. Job 26107921
+    passed every existing metric and still produced one site set for all six
+    games, because nothing here was checked.
+
+    Reported per fixture:
+      pearson_r        predicted vs observed segment totals on OBSERVED
+                       segments only (5% penetration means many predicted
+                       segments have no observation; pooling those in makes
+                       r negative by construction -- see diag_proof.py)
+      top20_coverage   share of the observed top-20 mass that falls inside
+                       the predicted top-20, against the 20/n random floor
+    and across fixtures: the top-20 site-set Jaccard from _fixture_variation.
+
+    pass = ranking is positive on every fixture, the plan is game-specific,
+    and the surface is calibrated. A surface that fails can still be run with
+    ALLOW_WEAK_SURFACE=1 in the chain, but it is never silently shipped.
+    """
+    res = {"n_fixtures": 0, "per_fixture": {}}
+    need = {"fixture", "road_osmid", "observed", "pred_speeding"}
+    if merged is None or not need.issubset(merged.columns):
+        res["error"] = "merged frame lacks %s" % sorted(need - set(
+            merged.columns if merged is not None else []))
+        return res
+    rs, covs = [], []
+    for fx, g in merged.groupby("fixture"):
+        seg = g.groupby("road_osmid").agg(
+            obs=("observed", "sum"), pred=("pred_speeding", "sum"))
+        if len(seg) < top_n + 1:
+            continue
+        r = _pearson(seg["obs"], seg["pred"])
+        obs_top = seg["obs"].nlargest(top_n).index
+        pred_top = set(seg["pred"].nlargest(top_n).index)
+        obs_mass = float(seg.loc[obs_top, "obs"].sum())
+        captured = float(seg.loc[seg.index.isin(pred_top)
+                                & seg.index.isin(obs_top), "obs"].sum())
+        coverage = captured / max(obs_mass, 1e-9)
+        floor = top_n / max(len(seg), 1)
+        res["per_fixture"][str(fx)] = {
+            "n_observed_segments": int(len(seg)),
+            "pearson_r": round(float(r), 4) if np.isfinite(r) else None,
+            "top20_coverage": round(float(coverage), 4),
+            "random_floor": round(float(floor), 4)}
+        if np.isfinite(r):
+            rs.append(float(r))
+        covs.append(float(coverage))
+    res["n_fixtures"] = len(res["per_fixture"])
+    res["pearson_min"] = round(min(rs), 4) if rs else None
+    res["pearson_mean"] = round(float(np.mean(rs)), 4) if rs else None
+    res["top20_coverage_mean"] = (round(float(np.mean(covs)), 4)
+                                  if covs else None)
+    try:
+        fv = _fixture_variation(out)
+        res["top20_jaccard"] = (fv.get("site_overlap_jaccard") or {}).get("top20")
+    except Exception:  # noqa: BLE001
+        res["top20_jaccard"] = None
+    slope = metrics.get("calibration_slope")
+    res["calibration_slope"] = slope
+    res["positive_ranking"] = bool(rs and res["pearson_min"] > 0.0)
+    res["game_specific"] = bool(res["top20_jaccard"] is not None
+                                and res["top20_jaccard"] < 1.0)
+    res["calibrated"] = bool(slope is not None and np.isfinite(slope)
+                             and 0.2 <= float(slope) <= 5.0)
+    res["pass"] = bool(res["positive_ranking"] and res["game_specific"]
+                       and res["calibrated"] and res["n_fixtures"] >= 1)
+    return res
+
+
+def predict_propensity(frame, prop_model):
+    """sigmoid(X b) from a fitted binomial model on a future frame.
+
+    prop_model is the dict stashed from refit_binomial: names (intercept
+    first) and coef. Columns dropped as degenerate at fit time are absent
+    from names and therefore contribute nothing -- the same restriction the
+    fit used.
+    """
+    names = list(prop_model.get("names") or [])
+    coef = np.asarray(prop_model.get("coef"), dtype=float)
+    if not names or coef.size != len(names):
+        raise ValueError("propensity model has no usable coefficients")
+    eta = np.full(len(frame), float(coef[0]))
+    for j, c in enumerate(names[1:], start=1):
+        if c in frame.columns:
+            eta = eta + pd.to_numeric(frame[c], errors="coerce") \
+                .fillna(0.0).to_numpy(float) * float(coef[j])
+    return 1.0 / (1.0 + np.exp(-np.clip(eta, -35.0, 35.0)))
+
+
+# Game-context terms that get their own prior scale in the approximate-Bayes
+# propensity. These are the coefficients that are only identified from the
+# handful of fixture windows (35 train games), so they are the ones at risk
+# of overfitting the holdout; geometry/exposure terms are pooled over
+# millions of rows and can stay weakly regularised.
+GAME_PRIOR_TERMS = frozenset(GAME_VARS + GAME_WIDE_VARS)
+
+
+def bayes_prior_dict(design_cols, game_sd=None, base_sd=10.0):
+    """Independent Gaussian prior sds keyed by final design column name.
+
+    base_sd is deliberately weak (10): it makes every fit a PROPER prior so
+    Laplace evidences are comparable, while leaving pooled terms essentially
+    unregularised. game_sd (when not None) replaces it on GAME_PRIOR_TERMS.
+    """
+    prior = {"(intercept)": float(base_sd)}
+    for c in design_cols:
+        prior[c] = (float(game_sd)
+                    if (game_sd is not None and c in GAME_PRIOR_TERMS)
+                    else float(base_sd))
+    return prior
+
+
+def select_propensity_prior(work, args, audit, spec, design_cols):
+    """Choose the game-interaction prior sd by Laplace evidence on TRAIN.
+
+    Evidence-based selection is the Bayesian alternative to tuning on the
+    holdout: it never touches future rows. Grid includes None (the same weak
+    base prior as everything else, i.e. "no game shrinkage"), then a ladder
+    of increasingly tight scales. Returns (best_sd, best_r, table).
+    """
+    grid = [None, 2.0, 1.0, 0.5, 0.25]
+    table, best = [], None
+    for sd in grid:
+        prior = bayes_prior_dict(design_cols, game_sd=sd,
+                                 base_sd=float(getattr(args,
+                                                       "bayes_base_sd", 10.0)))
+        r, out = refit_binomial(work, args, audit, spec=spec,
+                                design_cols=design_cols, prior_sd=prior,
+                                audit_key=None, quiet=True)
+        ev = None if r is None else r.get("laplace_evidence")
+        row = {"game_sd": sd,
+               "evidence": (round(float(ev), 3)
+                            if ev is not None and np.isfinite(ev) else None),
+               "available": bool(out.get("available")),
+               "separated": bool(out.get("separated")),
+               "loglik": (round(float(out.get("loglik")), 2)
+                          if out.get("available") else None)}
+        table.append(row)
+        if (ev is not None and np.isfinite(ev)
+                and (best is None or float(ev) > best[1])):
+            best = (sd, float(ev), r)
+    return best, table
+
+
+def laplace_coef_draws(r, S, seed=0):
+    """S draws of beta from the Laplace posterior N(coef, cov)."""
+    beta = np.asarray(r["coef"], dtype=float)
+    cov = np.asarray(r["cov"], dtype=float)
+    cov = 0.5 * (cov + cov.T)
+    try:
+        L = np.linalg.cholesky(cov + 1e-12 * np.eye(len(beta)))
+    except np.linalg.LinAlgError:
+        w, V = np.linalg.eigh(cov)
+        w = np.clip(w, 1e-12, None)
+        L = V * np.sqrt(w)
+    rng = np.random.default_rng(int(seed))
+    z = rng.standard_normal((int(S), len(beta)))
+    return beta[None, :] + z @ L.T
+
+
+def predict_propensity_draws(frame, r, draws):
+    """S x n matrix of sigmoid(X beta_s) for a fitted binomial."""
+    names = list(r["names"])
+    S = np.asarray(draws).shape[0]
+    eta = np.tile(np.asarray(draws)[:, 0:1], (1, len(frame)))
+    for j, c in enumerate(names[1:], start=1):
+        if c in frame.columns:
+            x = pd.to_numeric(frame[c], errors="coerce").fillna(0.0) \
+                .to_numpy(float)
+            eta = eta + np.asarray(draws)[:, j:j + 1] * x[None, :]
+    return 1.0 / (1.0 + np.exp(-np.clip(eta, -35.0, 35.0)))
+
+
+def laplace_fixed_factors(frame, info, S, seed=0):
+    """S x n multiplicative factors exp(X_fixed (beta_s - beta_hat)).
+
+    Stage A's random parameters are already integrated by
+    predict_metacount_sim, so the remaining parameter uncertainty is the
+    FIXED effects. Their sds come from the package's coefficient table
+    (std_err). Sampling the fixed part and multiplying the random-effect
+    mean is exact under the Laplace approximation for the fixed block:
+    exp(eta_fixed) factors out of E_b[exp(eta)]. Coefficients without a
+    finite se contribute zero uncertainty (recorded as coverage).
+    """
+    beta = info.get("beta") or {}
+    coef = info.get("coef")
+    se_map = {}
+    try:
+        if coef is not None and "std_err" in getattr(coef, "columns", []):
+            se_map = {str(v): float(s) for v, s in
+                      zip(coef["variable"], coef["std_err"])
+                      if np.isfinite(s)}
+    except Exception:  # noqa: BLE001
+        se_map = {}
+    terms, sds = [], []
+    b_int = float(beta.get("__INTERCEPT__", 0.0))
+    terms.append(None)
+    sds.append(float(se_map.get("__INTERCEPT__", 0.0)))
+    for c in info.get("fixed_terms", []):
+        base = str(c).split(":")[0]
+        if base in frame.columns and base in beta:
+            terms.append(base)
+            sds.append(float(se_map.get(base, 0.0)))
+    for r_ in info.get("rdm_terms", []):
+        base = str(r_).split(":")[0]
+        key = f"__mean__{base}"
+        if base in frame.columns and key in beta:
+            terms.append(base)
+            sds.append(float(se_map.get(f"mean({base})", 0.0)))
+    sds = np.asarray(sds, dtype=float)
+    X = np.ones((len(frame), len(terms)))
+    for j, c in enumerate(terms[1:], start=1):
+        X[:, j] = pd.to_numeric(frame[c], errors="coerce") \
+            .fillna(0.0).to_numpy(float)
+    rng = np.random.default_rng(int(seed))
+    z = rng.standard_normal((int(S), len(sds)))
+    delta = (z * sds[None, :]) @ X.T
+    coverage = {"n_terms": int(len(sds)),
+                "n_with_se": int(np.sum(sds > 0)),
+                "mean_se": float(sds.mean()) if len(sds) else 0.0}
+    return np.exp(np.clip(delta, -30.0, 30.0)), coverage
+
+
+def bayes_predictive_draws(denom_draws, p_draws, alpha=None, seed=0):
+    """S x n posterior-predictive counts for the two-stage surface.
+
+    n_s ~ NB2(mean=denom_s, dispersion=alpha)  (or Poisson when alpha is
+    None), then k_s ~ Binomial(n_s, p_s). Quantiles of this matrix are
+    OBSERVATION bounds; quantiles of denom_s x p_s are parameter bounds and
+    had ~0% holdout coverage (pilot, job pilot_bayes).
+    """
+    S = int(np.asarray(denom_draws).shape[0])
+    rng = np.random.default_rng(int(seed))
+    out = np.empty_like(np.asarray(denom_draws, dtype=float))
+    for s in range(S):
+        mu = np.maximum(np.asarray(denom_draws[s], dtype=float), 0.0)
+        if alpha is not None and np.isfinite(alpha) and float(alpha) > 0:
+            n_s = rng.negative_binomial(
+                1.0 / float(alpha), 1.0 / (1.0 + float(alpha) * mu))
+        else:
+            n_s = rng.poisson(mu)
+        out[s] = rng.binomial(
+            np.maximum(n_s, 0).astype(np.int64),
+            np.clip(np.asarray(p_draws[s], dtype=float), 0.0, 1.0))
+    return out
+
+
+def refit_binomial(work, args, audit, spec=None, label="binomial refit",
+                   design_cols=None, audit_key="binomial", prior_sd=None,
+                   quiet=False):
     """Fit the speeding propensity as a BINOMIAL and report it beside the
     count refit.
 
@@ -1874,7 +2423,8 @@ def refit_binomial(work, args, audit, spec=None, label="binomial refit"):
     if denom is None:
         out["reason"] = ("no usable denominator in the frame; wanted one of "
                          + ", ".join(_ordered))
-        audit["binomial"] = out
+        if audit_key:
+            audit[audit_key] = out
         print(f"   [binom] unavailable: {out['reason']}")
         return None, out
     out["denominator"] = denom
@@ -1887,23 +2437,36 @@ def refit_binomial(work, args, audit, spec=None, label="binomial refit"):
     k, n = k[ok], n[ok]
     if len(k) < 100:
         out["reason"] = f"only {len(k)} rows with a positive denominator"
-        audit["binomial"] = out
+        if audit_key:
+            audit[audit_key] = out
         print(f"   [binom] unavailable: {out['reason']}")
         return None, out
 
-    # Design: prefer the searched fixed terms, fall back to the forced
-    # exposure block. Kept small and fixed -- the point is a like-for-like
-    # refit of the chosen structure, not a second search.
-    cands = []
-    for c in ["logexp", "in_event", "rel_hour", "log_att", "dist_stad",
-              SEG_GROUP_VAR]:
-        if c in work.columns:
-            cands.append(c)
-    cands += [c for c in ("lanes", "lanes_known", "aadt_z", "log_flow_z")
-              if c in work.columns and c not in cands]
+    # Design: an explicit design_cols (the two-stage path passes the SEARCHED
+    # fixed terms, so the propensity inherits the same game/segment structure
+    # the structural search selected) wins; otherwise fall back to the fixed
+    # comparison list used by --binomial-refit.
+    if design_cols:
+        cands = [c for c in design_cols if c in work.columns]
+    else:
+        cands = []
+        for c in ["logexp", "in_event", "rel_hour", "log_att", "dist_stad",
+                  SEG_GROUP_VAR]:
+            if c in work.columns:
+                cands.append(c)
+        cands += [c for c in ("lanes", "lanes_known", "aadt_z", "log_flow_z")
+                  if c in work.columns and c not in cands]
+    # Duplicate names break the coef/name zip; de-dup preserving order.
+    _seen, _dedup = set(), []
+    for c in cands:
+        if c not in _seen:
+            _seen.add(c)
+            _dedup.append(c)
+    cands = _dedup
     if not cands:
         out["reason"] = "no candidate design columns present"
-        audit["binomial"] = out
+        if audit_key:
+            audit[audit_key] = out
         print(f"   [binom] unavailable: {out['reason']}")
         return None, out
 
@@ -1924,11 +2487,14 @@ def refit_binomial(work, args, audit, spec=None, label="binomial refit"):
     from binomial_mle import fit_binomial_logit
     try:
         r = fit_binomial_logit(
-            k.to_numpy(float), n.to_numpy(float), Xs, names=cands)
+            k.to_numpy(float), n.to_numpy(float), Xs, names=cands,
+            prior_sd=prior_sd)
     except Exception as exc:  # noqa: BLE001
         out["reason"] = f"{type(exc).__name__}: {exc}"
-        audit["binomial"] = out
-        print(f"   [binom] fit failed: {out['reason']}")
+        if audit_key:
+            audit[audit_key] = out
+        if not quiet:
+            print(f"   [binom] fit failed: {out['reason']}")
         return None, out
 
     out.update({
@@ -1941,30 +2507,46 @@ def refit_binomial(work, args, audit, spec=None, label="binomial refit"):
         "dropped": r["dropped"], "n_params": r["design_columns"],
         "terms": {c: [float(b), float(s)] for c, b, s
                   in zip(r["names"], r["coef"], r["se"])},
+        # Ship-ready coefficients (intercept first). Kept in the audit so a
+        # run's propensity is reconstructible from its JSON alone; the
+        # in-memory fit is returned to the caller for prediction.
+        "model": {"names": list(r["names"]),
+                  "coef": [float(x) for x in r["coef"]]},
+        # Laplace/Bayes diagnostics. Evidence is only comparable between
+        # fits that both use proper priors on the same design/data.
+        "laplace_evidence": r.get("laplace_evidence"),
+        "loglik_pen": r.get("loglik_pen"),
+        "prior_sd_used": ({k: float(v) for k, v in prior_sd.items()}
+                          if prior_sd else None),
     })
-    audit["binomial"] = out
+    if audit_key:
+        if audit_key:
+            audit[audit_key] = out
     out["n_trials_total"] = int(r["n_trials"])
-    print(f"   [binom] k~Binomial(n={out['mean_rate']*r['n_trials']:.0f} "
-          f"successes / {r['n_trials']:.0f} {denom}, "
-          f"rate={out['mean_rate']:.4f})")
-    print(f"   [binom] loglik={r['loglik']:.2f}  AIC={r['aic']:.2f}  "
-          f"BIC={r['bic']:.2f}  params={r['design_columns']}")
-    if r["separated"]:
-        print("   [binom] *** SEPARATED: the MLE does not exist (a coefficient"
-              " runs to infinity). Coefficients below are NOT interpretable.")
-    if r["dropped"]:
-        print(f"   [binom] dropped degenerate columns: {r['dropped']}")
-    for c, b, s in zip(r["names"], r["coef"], r["se"]):
-        print(f"           {c:<18} {b:+9.4f}  (se {s:.4f})")
+    if not quiet:
+        print(f"   [binom] k~Binomial(n={out['mean_rate']*r['n_trials']:.0f} "
+              f"successes / {r['n_trials']:.0f} {denom}, "
+              f"rate={out['mean_rate']:.4f})")
+        print(f"   [binom] loglik={r['loglik']:.2f}  AIC={r['aic']:.2f}  "
+              f"BIC={r['bic']:.2f}  params={r['design_columns']}")
+        if r["separated"]:
+            print("   [binom] *** SEPARATED: the MLE does not exist (a "
+                  "coefficient runs to infinity). Coefficients below are NOT "
+                  "interpretable.")
+        if r["dropped"]:
+            print(f"   [binom] dropped degenerate columns: {r['dropped']}")
+        for c, b, s in zip(r["names"], r["coef"], r["se"]):
+            print(f"           {c:<18} {b:+9.4f}  (se {s:.4f})")
     # The headline comparison: in the count model the exposure elasticity is
     # pinned at 1 by the offset and the LRT fights it. Here it is free.
     if "logexp" in r["names"]:
         i = r["names"].index("logexp")
         out["logexp_coef"] = float(r["coef"][i])
         out["logexp_se"] = float(r["se"][i])
-        print(f"   [binom] flow elasticity (logexp) = {r['coef'][i]:.4f} "
-              f"+/- {r['se'][i]:.4f}   (count model pins this at 1.0 by"
-              " construction)")
+        if not quiet:
+            print(f"   [binom] flow elasticity (logexp) = {r['coef'][i]:.4f} "
+                  f"+/- {r['se'][i]:.4f}   (count model pins this at 1.0 by"
+                  " construction)")
     return r, out
 
 
@@ -2271,7 +2853,9 @@ def predict_future_chunked(info, future_cal, segs, ctx, seg_flow, profile,
                            work, args, flow_uplift=None, crowd_med=None,
                            temporal_fit=None, seg_risk_map=None,
                            clock_prof=None, flow_uplift_by_hw=None,
-                           exp_cal=None):
+                           exp_cal=None, flow_info=None, prop_fit=None,
+                           prop_bayes=None, stage_a_bayes=None,
+                           seg_event_uplift_map=None):
     """Per-fixture future prediction (numpy only, no JAX).
 
     Joint flow->speeding stage 2: future exposure uses PREDICTED flow
@@ -2353,7 +2937,8 @@ def predict_future_chunked(info, future_cal, segs, ctx, seg_flow, profile,
             grid = calibrate_exposure(grid, exp_cal)
         # Temporal-x AFTER exposure is final: exp_lag1 rides predicted flow
         # (free lags for the whole window); risk/clock map by segment/code.
-        grid = apply_temporal_x(grid, seg_risk_map, clock_prof)
+        grid = apply_temporal_x(grid, seg_risk_map, clock_prof,
+                                seg_event_uplift_map)
         fw = search_frame(grid.assign(Y=0.0), args.target)
         fw, _ = prepare_metacount_frame(fw, exposure_col="exp",
                                         highway_col="highway")
@@ -2376,10 +2961,87 @@ def predict_future_chunked(info, future_cal, segs, ctx, seg_flow, profile,
             R=max(1000, int(args.refit_R)), chunk=25000), 1e-9)
         keys = grid[["fixture", "code", "road_osmid", "bin", "rel_bin",
                        "pred_flow", "flow_uplift"]].copy()
-        keys["pred_speeding"] = np.asarray(pred, dtype=float)
+        # The count surface is always computed and kept, so a two-stage
+        # shipment can be compared against it on the same rows.
+        keys["pred_speeding_count"] = np.asarray(pred, dtype=float)
+        keys["pred_speeding"] = keys["pred_speeding_count"]
         keys["pred_speeding_network"] = (
             keys["pred_speeding"] / max(args.penetration, 1e-9))
         keys["exp"] = fw["logexp"].to_numpy()
+        # ------------------------------------------------------- two-stage
+        # pred_speeding = E[denominator | game] x P(speeding | game).
+        # The denominator model (stage A) is a measured-quantity NB2; the
+        # propensity (stage B) is the binomial on the searched design. This
+        # replaces the TMR flow projection in the shipped surface, which is
+        # the channel the exposure LRT rejects. Any failure falls back to the
+        # count surface loudly -- never silently.
+        if flow_info is not None and prop_fit is not None:
+            try:
+                denom_pred = np.maximum(predict_metacount_sim(
+                    fw, flow_info, id_col="row_id", y_col="Y",
+                    R=max(200, int(getattr(args, "two_stage_flow_R", 60))),
+                    chunk=25000), 1e-9)
+                p_hat = predict_propensity(fw, prop_fit)
+                two_plugin = np.maximum(denom_pred * p_hat, 1e-12)
+                keys["pred_denom"] = denom_pred
+                keys["pred_propensity"] = p_hat
+                keys["pred_speeding_plugin"] = two_plugin
+                keys["pred_speeding"] = two_plugin
+                keys["pred_speeding_network"] = (
+                    two_plugin / max(args.penetration, 1e-9))
+                # Approximate-Bayes surface: posterior mean of
+                # denom_s x p_s with independent Laplace draws for the
+                # stage-A fixed effects and the stage-B propensity.
+                if prop_bayes is not None:
+                    S = max(4, int(prop_bayes.get("draws", 50)))
+                    bdraws = laplace_coef_draws(
+                        prop_bayes["model"], S,
+                        seed=int(prop_bayes.get("seed", 0)))
+                    p_draws = predict_propensity_draws(
+                        fw, prop_bayes["model"], bdraws)
+                    if stage_a_bayes is not None:
+                        fac, cov = laplace_fixed_factors(
+                            fw, stage_a_bayes["info"], S,
+                            seed=int(stage_a_bayes.get("seed", 1)))
+                    else:
+                        fac = np.ones((S, len(fw)))
+                        cov = {"n_terms": 0, "n_with_se": 0, "mean_se": 0.0}
+                    denom_draws = denom_pred[None, :] * fac
+                    samples = denom_draws * p_draws
+                    post = samples.mean(axis=0)
+                    keys["pred_speeding"] = np.maximum(post, 1e-12)
+                    # POSTERIOR PREDICTIVE bounds, not parameter-only ones.
+                    # Quantiles of the conditional mean had ~0% holdout
+                    # coverage on the pilot (they describe where the mean
+                    # is, not where an observation falls). An observation
+                    # bound needs the two-stage sampling noise:
+                    #   n_s ~ NB2/Poisson(denom_s)   (stage-A predictive)
+                    #   k_s ~ Binomial(n_s, p_s)     (propensity noise)
+                    _alpha_a = None
+                    if stage_a_bayes is not None:
+                        _alpha_a = (stage_a_bayes.get("info") or {}).get(
+                            "alpha")
+                    _pred = bayes_predictive_draws(
+                        denom_draws, p_draws, alpha=_alpha_a,
+                        seed=(int(stage_a_bayes.get("seed", 1)) + 977
+                              if stage_a_bayes is not None else 977))
+                    keys["pred_speeding_lo"] = np.maximum(
+                        np.quantile(_pred, 0.05, axis=0), 0.0)
+                    keys["pred_speeding_hi"] = np.maximum(
+                        np.quantile(_pred, 0.95, axis=0), 0.0)
+                    del _pred
+                    keys["pred_propensity_sd"] = p_draws.std(axis=0)
+                    keys["pred_speeding_network"] = (
+                        keys["pred_speeding"] / max(args.penetration, 1e-9))
+                    if not getattr(args, "_bayes_logged", False):
+                        args._bayes_logged = True
+                        args._bayes_stage_a_cov = cov
+                        print(f"   [bayes] posterior surface: S={S} draws, "
+                              f"stage-A fixed terms with se "
+                              f"{cov['n_with_se']}/{cov['n_terms']}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"   WARN: two-stage predict failed ({exc}); "
+                      "shipping the count surface")
         if temporal_fit is not None:
             try:
                 tpred = np.maximum(
@@ -2587,6 +3249,42 @@ def main():
                          "to get wrong and the flow elasticity becomes a "
                          "coefficient instead of a pinned offset. Reported "
                          "alongside, not instead of, the count path")
+    ap.add_argument("--two-stage", default="on", choices=["on", "off"],
+                    help="ship pred_speeding = E[measured denominator | game] "
+                         "x P(speeding | game) instead of the count model on "
+                         "the TMR flow projection. Stage A is an NB2 model "
+                         "for the panel's measured denominator (vehicle_count "
+                         "for speeding_trips, trips_with_judged_speed for the "
+                         "trips_* targets); stage B is the binomial propensity "
+                         "on the SEARCHED fixed design, so game x segment "
+                         "interactions act on the rate. Both must fit; any "
+                         "failure falls back to the count surface and the "
+                         "handoff gate records it. On by default")
+    ap.add_argument("--two-stage-flow-R", type=int, default=60,
+                    help="Monte-Carlo draws for the stage-A denominator "
+                         "surface (only used when the searched structure has "
+                         "random terms; 60 is enough for a mean surface)")
+    ap.add_argument("--bayes", default="off", choices=["on", "off"],
+                    help="approximate-Bayes two-stage: Laplace posterior for "
+                         "the propensity (optional evidence-selected Gaussian "
+                         "prior on game interactions) and diagonal Laplace "
+                         "for the stage-A fixed effects; ships the posterior "
+                         "mean and writes 5/95%% predictive bounds. The "
+                         "holdout metrics report the plug-in surface side by "
+                         "side, so the gain is measurable on the same rows. "
+                         "Off by default")
+    ap.add_argument("--bayes-draws", type=int, default=50,
+                    help="posterior draws for the Bayes surface (50 keeps "
+                         "the S x n sample matrix at ~100 MB per fixture)")
+    ap.add_argument("--bayes-base-sd", type=float, default=10.0,
+                    help="weak Gaussian prior sd for pooled coefficients; "
+                         "makes every evidence fit a proper prior so the "
+                         "Laplace evidences are comparable")
+    ap.add_argument("--bayes-game-prior", default="on", choices=["on", "off"],
+                    help="select the game-interaction prior sd (None/2/1/"
+                         "0.5/0.25) by Laplace evidence on TRAIN; the "
+                         "Bayesian alternative to tuning shrinkage on the "
+                         "holdout. Off = weak prior everywhere")
     ap.add_argument("--exposure-basis", default="none",
                     choices=["none", "hinge", "hinge+hw", "linear+hw", "hw"],
                     help="shape of the flow->speeding exposure curve. "
@@ -2672,9 +3370,27 @@ def main():
                          "road_osmid segment propensity, or fixture event "
                          "split (per-event coefficients with "
                          "attribute-driven means for future games)")
+    ap.add_argument("--group-temporal", default="off", choices=["on", "off"],
+                    help="allow the temporal basis (rel_sin/rel_cos) to take "
+                         "the GROUPED role (4), so each segment gets its own "
+                         "within-window time curve instead of one shape shared "
+                         "by the whole network. Off by default: it enlarges the "
+                         "search space, and the existing --group-by setting "
+                         "decides what a 'group' is (segment/fixture/...). "
+                         "With the flag off, temporal terms stay fixed-only, "
+                         "so --group-temporal on|off is a genuine A/B of "
+                         "per-segment time dependence")
     ap.add_argument("--no-force-game", action="store_true",
                     help="allow the search to drop game-day terms (default: "
                          "in_event/rel_hour/log_att/event_x_dist are forced)")
+    ap.add_argument("--force-event-uplift", default="on",
+                    choices=["on", "off"],
+                    help="force evu_x_att = seg_event_uplift_z * log_att into "
+                         "every spec when the column varies. This is the "
+                         "direct game-specific reordering term (responsive "
+                         "segments weigh more for bigger crowds); pooled BIC "
+                         "culls such within-game terms, so it is forced by "
+                         "construction, like the GAME_FORCE block")
     ap.add_argument("--no-flow-uplift", action="store_true",
                     help="predict future exposure from the static background "
                          "profile only (default: joint flow->speeding with "
@@ -2795,7 +3511,31 @@ def main():
                          "global_rate": round(float(_seg_r0), 6)}
     audit["clock_prof"] = {k: [round(float(v), 3) for v in arr]
                            for k, arr in clock_prof.items()}
-    train_events = apply_temporal_x(train_events, seg_risk_map, clock_prof)
+    # Per-segment GAME uplift: event-window rate vs the segment's own
+    # background rate, from TRAIN events and the full background panel.
+    # This is the transferable "which streets respond to games" signal.
+    seg_event_uplift_map = {}
+    _denom_ev = binomial_denominator(args.target)
+    try:
+        if (_denom_ev in panel.columns and args.target in panel.columns):
+            _bg_sums = (panel.loc[~covered, ["road_osmid", args.target,
+                                             _denom_ev]]
+                        .groupby("road_osmid").sum())
+            seg_event_uplift_map = estimate_seg_event_uplift(
+                train_events, _bg_sums, args.target, _denom_ev)
+            del _bg_sums
+    except Exception as exc:  # noqa: BLE001 - candidate degrades to zero
+        print(f"   WARN: event-uplift estimate failed ({exc})")
+    _evu = np.asarray(list(seg_event_uplift_map.values()), dtype=float)
+    audit["seg_event_uplift"] = {
+        "n_segments": int(len(seg_event_uplift_map)),
+        "sd": round(float(_evu.std()), 4) if len(_evu) else 0.0,
+        "min": round(float(_evu.min()), 3) if len(_evu) else None,
+        "max": round(float(_evu.max()), 3) if len(_evu) else None}
+    print(f"   event uplift: {len(seg_event_uplift_map)} segments, "
+          f"sd={audit['seg_event_uplift']['sd']}")
+    train_events = apply_temporal_x(train_events, seg_risk_map, clock_prof,
+                                    seg_event_uplift_map)
     print(f"   temporal-x: {len(seg_risk_map)} segment risks, "
           f"clock codes={sorted(clock_prof)})")
     # Stage 2b snapshot: whole-window sample BEFORE row caps break the
@@ -2820,7 +3560,8 @@ def main():
                                   min(len(train_events) * 2, bg_cap))
     background = enrich_background(bg_sample, ctx, seg_flow, profile)
     del bg_sample
-    background = apply_temporal_x(background, seg_risk_map, clock_prof)
+    background = apply_temporal_x(background, seg_risk_map, clock_prof,
+                                  seg_event_uplift_map)
     # Stage 1 (joint model): game-day flow uplift per rel_bin, estimated
     # while both frames are alive. Disabled with --no-flow-uplift.
     flow_uplift_by_hw = {}
@@ -2955,10 +3696,22 @@ def main():
                 # lack the game block: re-search rather than re-freeze them.
                 _rs_fixed = ((resume_state.get("best_spec") or {})
                              .get("fixed_terms", []))
-                if not set(GAME_FORCE) <= set(_rs_fixed):
+                if not set(force_terms(work, args)) <= set(_rs_fixed):
                     print("   WARN: checkpoint predates forced game dynamics "
                           f"(fixed={_rs_fixed}); discarding resume so the "
                           "search re-runs with the game block forced")
+                    resume_state = None
+                # --group-temporal changes the ROLE SET a temporal term may
+                # take, so a checkpoint made under the other setting is a
+                # different search space. Reusing it would silently compare
+                # incomparable BICs.
+                _rs_gt = bool(resume_state.get("group_temporal"))
+                _want_gt = (str(getattr(args, "group_temporal", "off"))
+                            .lower() == "on")
+                if _rs_gt != _want_gt:
+                    print("   WARN: checkpoint was searched with "
+                          f"group_temporal={_rs_gt}, now {_want_gt}; "
+                          "starting fresh")
                     resume_state = None
         except Exception as exc:  # noqa: BLE001
             print(f"   WARN: could not parse {BEST_JSON.name} ({exc}); "
@@ -2995,7 +3748,9 @@ def main():
 
     spec = ensure_spec(spec, work, audit,
                        force_game=not args.no_force_game,
-                       keep_temporal=not getattr(args, "no_temporal_vars", False))
+                       keep_temporal=not getattr(args, "no_temporal_vars",
+                                                 False),
+                       args=args)
     print(f"   spec: fixed={len(spec.get('fixed_terms', []))} "
           f"rdm={len(spec.get('rdm_terms', []))} "
           f"fallback={audit.get('spec_fallback')}")
@@ -3056,6 +3811,75 @@ def main():
         except Exception as exc:  # noqa: BLE001
             print(f"   WARN: binomial refit failed ({exc})")
             _bo = {"available": False, "reason": str(exc)}
+    # ------------------------------------------------------------ two-stage
+    # Ship pred_speeding = E[denominator] x P(speeding) instead of the count
+    # model on the TMR-projected exposure. Both stages must fit; any failure
+    # falls back to the count surface and the handoff gate below reports the
+    # consequence rather than the run silently degrading.
+    two_stage_on = str(getattr(args, "two_stage", "on") or "on").lower() == "on"
+    bayes_on = str(getattr(args, "bayes", "off") or "off").lower() == "on"
+    flow_info, prop_fit = None, None
+    prop_bayes, stage_a_bayes = None, None
+    audit.setdefault("two_stage", {})["requested"] = bool(two_stage_on)
+    audit["bayes"] = {"requested": bool(bayes_on),
+                      "base_sd": float(getattr(args, "bayes_base_sd", 10.0)),
+                      "draws": int(getattr(args, "bayes_draws", 50))}
+    if two_stage_on:
+        denom_col = binomial_denominator(args.target)
+        flow_info = refit_denominator(work, denom_col, spec, args, audit)
+        _design = [c for c in spec.get("fixed_terms", [])
+                   if c in work.columns]
+        prior = None
+        if bayes_on:
+            selected_sd = None
+            if str(getattr(args, "bayes_game_prior", "on")).lower() == "on":
+                best, table = select_propensity_prior(
+                    work, args, audit, spec, _design)
+                audit["bayes"]["prior_selection"] = table
+                if best is not None:
+                    selected_sd = best[0]
+            prior = bayes_prior_dict(
+                _design, game_sd=selected_sd,
+                base_sd=float(getattr(args, "bayes_base_sd", 10.0)))
+            audit["bayes"]["selected_game_sd"] = selected_sd
+            print(f"   [bayes] game-interaction prior sd by Laplace "
+                  f"evidence: {selected_sd}")
+        try:
+            prop_fit, _po = refit_binomial(
+                work, args, audit, spec=spec,
+                label="two-stage propensity", design_cols=_design,
+                audit_key="propensity", prior_sd=prior)
+        except Exception as exc:  # noqa: BLE001
+            print(f"   WARN: propensity fit failed ({exc})")
+            prop_fit = None
+        if bayes_on and prop_fit is not None:
+            _S = max(4, int(getattr(args, "bayes_draws", 50)))
+            prop_bayes = {"model": prop_fit, "draws": _S,
+                          "seed": int(args.seed)}
+            if flow_info is not None:
+                stage_a_bayes = {"info": flow_info, "draws": _S,
+                                 "seed": int(args.seed) + 1}
+            audit["bayes"]["shipped"] = True
+            audit["bayes"]["propensity_posterior_sd"] = {
+                c: round(float(sd), 5) for c, sd
+                in zip(prop_fit["names"], prop_fit["se"])
+                if c in ("(intercept)", "logexp", "in_event", "rel_hour",
+                         "log_att", "event_x_dist", "att_x_dist",
+                         "rel_x_dist", "ev_x_lanes")}
+            print(f"   [bayes] posterior draws: S={_S}, shipped surface is "
+                  "the posterior mean; lo/hi at 5/95%")
+        audit["two_stage"].update({
+            "shipped": bool(flow_info is not None and prop_fit is not None),
+            "denominator": denom_col,
+            "propensity_design": _design,
+            "bayes": bool(bayes_on and prop_fit is not None),
+        })
+        if flow_info is None or prop_fit is None:
+            print("   [two-stage] *** FALLBACK: shipping the count surface; "
+                  "the handoff gate records the consequence ***")
+        else:
+            print(f"   [two-stage] shipping pred = {denom_col} x propensity "
+                  f"({len(_design)} design terms)")
     # Nested LRT on the exposure parameterisation. Runs AFTER the shipped
     # refit so the panel is already freed and the work frame is the only
     # thing alive. Doubles the refit cost, hence opt-in.
@@ -3077,7 +3901,14 @@ def main():
                                  temporal_fit=temporal_fit,
                                  seg_risk_map=seg_risk_map,
                                  clock_prof=clock_prof,
-                                 exp_cal=exp_cal)
+                                 exp_cal=exp_cal,
+                                 flow_info=flow_info,
+                                 prop_fit=prop_fit,
+                                 prop_bayes=prop_bayes,
+                                 stage_a_bayes=stage_a_bayes,
+                                 seg_event_uplift_map=seg_event_uplift_map)
+    if getattr(args, "_bayes_stage_a_cov", None) is not None:
+        audit["bayes"]["stage_a_fixed_se_coverage"] = args._bayes_stage_a_cov
     del segs, future_cal
     gc.collect()
     out.to_parquet(out_dir / "game_day_pred_15min.parquet", index=False)
@@ -3112,6 +3943,47 @@ def main():
         metrics["segment_spearman"] = _spearman(seg["obs"], seg["pred"])
         metrics["segment_top20"] = _jaccard_topk(seg["obs"], seg["pred"], 20)
         metrics["segment_top50"] = _jaccard_topk(seg["obs"], seg["pred"], 50)
+        # Head-to-head against the count surface when the two-stage shipped,
+        # so the replacement is judged on the same rows it replaced.
+        if "pred_speeding_count" in merged.columns:
+            try:
+                _cp = merged.groupby(["fixture", "road_osmid"])[
+                    "pred_speeding_count"].sum()
+                _co = merged.groupby(["fixture", "road_osmid"])["observed"].sum()
+                metrics["count_bin_spearman"] = _spearman(
+                    merged["observed"], merged["pred_speeding_count"])
+                metrics["count_segment_spearman"] = _spearman(_co, _cp)
+                metrics["count_segment_top20"] = _jaccard_topk(
+                    _co, _cp, 20)
+            except Exception as exc:  # noqa: BLE001
+                print(f"   WARN: count-surface comparison failed ({exc})")
+        # Plug-in vs approximate-Bayes posterior, on the same holdout rows.
+        if "pred_speeding_plugin" in merged.columns:
+            try:
+                _pp = merged.groupby(["fixture", "road_osmid"])[
+                    "pred_speeding_plugin"].sum()
+                _po2 = merged.groupby(["fixture", "road_osmid"])[
+                    "observed"].sum()
+                metrics["plugin_bin_spearman"] = _spearman(
+                    merged["observed"], merged["pred_speeding_plugin"])
+                metrics["plugin_segment_spearman"] = _spearman(_po2, _pp)
+                metrics["plugin_segment_top20"] = _jaccard_topk(
+                    _po2, _pp, 20)
+                _s_p, _i_p = _calibration(
+                    merged["observed"], merged["pred_speeding_plugin"])
+                metrics["plugin_calibration_slope"] = _s_p
+            except Exception as exc:  # noqa: BLE001
+                print(f"   WARN: plugin comparison failed ({exc})")
+        if "pred_propensity_sd" in merged.columns:
+            metrics["bayes_propensity_sd_mean"] = float(pd.to_numeric(
+                merged["pred_propensity_sd"], errors="coerce").mean())
+        if ("pred_speeding_lo" in merged.columns
+                and "pred_speeding_hi" in merged.columns):
+            _lo = pd.to_numeric(merged["pred_speeding_lo"], errors="coerce")
+            _hi = pd.to_numeric(merged["pred_speeding_hi"], errors="coerce")
+            _ob = pd.to_numeric(merged["observed"], errors="coerce")
+            metrics["bayes_interval_90_coverage"] = float(
+                ((_ob >= _lo) & (_ob <= _hi)).mean())
         # Joint-model diagnostics: flow stage + residual serial correlation.
         # The NB panel has no AR(1) term; |resid_lag1| >> 0 means temporal
         # persistence is left on the table (segment grouping only gives
@@ -3181,6 +4053,62 @@ def main():
         except Exception as exc:  # noqa: BLE001
             print(f"   WARN: temporal metrics failed ({exc})")
     audit["metrics"] = metrics
+
+    # ---------------------------------------------------------------- structure
+    # Can this fitted surface produce a GAME-SPECIFIC plan, or is its site
+    # ranking identical for every fixture?
+    #
+    # WHY THIS IS MEASURED EVERY RUN. Job 26107921 produced a surface whose
+    # top-10 and top-20 site sets were 100% identical across all six games,
+    # with 87.8% of the variance between segments and only 3.2% between
+    # fixtures, so the MIP could only ever return the same streets. Nothing in
+    # the pipeline reported that: the run exited 0 and every artefact existed.
+    # A "game-day" deployment that does not vary by game is not game-day, so
+    # the property is now recorded and gated rather than assumed.
+    try:
+        audit["fixture_variation"] = _fixture_variation(out)
+        fv = audit["fixture_variation"]
+        print("   surface structure: %s" % json.dumps(
+            {k: fv.get(k) for k in ("n_fixtures", "variance_between_fixtures_pct",
+                                    "site_overlap_jaccard",
+                                    "unique_argmax_sites",
+                                    "game_specific_ranking")},
+            default=str))
+        if fv.get("site_overlap_jaccard", {}).get("top20") == 1.0:
+            print("   WARN: the top-20 site set is IDENTICAL for every fixture;"
+                  " the deployment would be a static street list. The model"
+                  " cannot reorder segments by game (see GAME_FORCE).")
+    except Exception as exc:  # noqa: BLE001
+        print(f"   WARN: fixture-variation audit failed ({exc})")
+        audit["fixture_variation"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    # ------------------------------------------------------------ handoff
+    # The MIP is a maximal-covering solve on pred_speeding, so the surface is
+    # only usable if (a) it ranks observed segments positively WITHIN each
+    # fixture, (b) the ranking differs BETWEEN fixtures, and (c) it is
+    # calibrated. Every prior metric could pass while all three failed
+    # (26107921: identical site sets, per-fixture r < 0). Stage 61 refuses a
+    # surface that fails this gate unless ALLOW_WEAK_SURFACE=1.
+    try:
+        audit["handoff"] = compute_handoff(merged, out, metrics)
+        _h = audit["handoff"]
+        print("   handoff: %s" % json.dumps(
+            {k: _h.get(k) for k in (
+                "n_fixtures", "pearson_min", "pearson_mean",
+                "top20_coverage_mean", "top20_jaccard",
+                "positive_ranking", "game_specific", "calibrated", "pass")},
+            default=str))
+        if not _h.get("pass"):
+            print("   WARN: HANDOFF GATE FAILED (positive_ranking="
+                  f"{_h.get('positive_ranking')}, game_specific="
+                  f"{_h.get('game_specific')}, calibrated="
+                  f"{_h.get('calibrated')}); stage 60 refuses this surface "
+                  "unless ALLOW_WEAK_SURFACE=1")
+    except Exception as exc:  # noqa: BLE001
+        print(f"   WARN: handoff audit failed ({exc})")
+        audit["handoff"] = {"error": f"{type(exc).__name__}: {exc}",
+                            "pass": False}
+
     (out_dir / "game_day_holdout_metrics.json").write_text(
         json.dumps({"metrics": metrics, "audit": audit}, indent=2, default=str))
 
@@ -3290,7 +4218,12 @@ def main():
             _tot = (_fo.groupby("road_osmid")["pred_speeding"].sum()
                     .sort_values(ascending=False))
             _top = _tot.head(20)
-            _flow_tot = _fo.groupby("road_osmid")["pred_flow"].sum()
+            # Report the stage-A denominator when the two-stage shipped: it
+            # is the demand surface the speeding prediction was multiplied
+            # by, so pred_vehicles and pred_speeding are consistent.
+            _flow_col = ("pred_denom" if "pred_denom" in _fo.columns
+                         else "pred_flow")
+            _flow_tot = _fo.groupby("road_osmid")[_flow_col].sum()
             try:
                 _mo = merged[merged["fixture"] == fx]
                 _obs_spd = _mo.groupby("road_osmid")["observed"].sum()

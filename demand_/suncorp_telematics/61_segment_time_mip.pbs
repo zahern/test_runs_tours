@@ -52,7 +52,12 @@ SEARCH_ARGS=(
   --wall-budget 20000 --n-starts 1
   --search-R 25 --refit-R 100 --search-vars slim
   --target trips_mean_gt_10 --group-by event
+  --two-stage on --temporal-refit ar1
 )
+# BAYES=on ships the approximate-Bayes posterior mean (Laplace) instead of
+# the plug-in two-stage, and records both surfaces' holdout metrics. Off by
+# default so the A/B is explicit: qsub -v BAYES=on 61_segment_time_mip.pbs
+[ "${BAYES:-off}" = "on" ] && SEARCH_ARGS+=(--bayes on)
 # --group-by event: per-event split — each fixture gets its own grouped
 # coefficients, shrunk toward game-attribute-driven means (fxt_*/ko_* already
 # eligible as heterogeneity drivers), so unseen future events predict from
@@ -88,17 +93,35 @@ import json, os, sys
 d = json.load(open(sys.argv[1]))
 done, total = int(d.get("iters_completed", 0)), int(d.get("iters", 0))
 converged = total > 0 and done >= total
+allow_weak = os.environ.get("ALLOW_WEAK_SURFACE") == "1"
 ok_quality = False
+handoff_ok = False
 try:
-    m = json.load(open(sys.argv[2]))["metrics"]
+    full = json.load(open(sys.argv[2]))
+    m = full.get("metrics") or {}
+    a = full.get("audit") or {}
     slope = float(m.get("calibration_slope", float("nan")))
     top20 = float(m.get("segment_top20", 0.0) or 0.0)
     rmse = float(m.get("rmse", float("inf")))
     ok_quality = (0.2 <= slope <= 5.0) and (top20 >= 0.05) and (rmse < 10.0)
+    h = a.get("handoff") or {}
+    handoff_ok = bool(h.get("pass"))
+    ts = a.get("two_stage") or {}
     print(f"holdout quality: slope={slope:.3f} top20={top20:.3f} rmse={rmse:.3f}")
+    print("handoff: pass=%s pearson_min=%s jaccard_top20=%s "
+          "coverage_top20=%s" % (h.get("pass"), h.get("pearson_min"),
+                                 h.get("top20_jaccard"),
+                                 h.get("top20_coverage_mean")))
+    print(f"two-stage: shipped={ts.get('shipped')} "
+          f"denominator={ts.get('denominator')}")
 except Exception as exc:
     print(f"WARN: no readable holdout metrics ({exc})")
 print(f"search: {done}/{total} converged={converged}")
+if not handoff_ok and not allow_weak:
+    print("FATAL: handoff gate failed (positive per-fixture ranking / "
+          "game-specific plan / calibration); refusing MIP. "
+          "Set ALLOW_WEAK_SURFACE=1 to override.")
+    sys.exit(1)
 if converged or ok_quality:
     print("GATE PASS: solving MIP" + (" (on partial search, quality-verified)" if not converged else ""))
 elif os.environ.get("REQUIRE_CONVERGED") == "1":

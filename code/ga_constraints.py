@@ -499,6 +499,26 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             'c_visit_edu':      'c_size_term',
             'c_visit_shop':     'c_size_term',
             'c_visit_social':   'c_size_term',
+            # ── Doctor-driven pairs (larch troubleshooting.overspecification
+            # on the real QLD work fit: 120 near-null Hessian directions) ────
+            # Direction 0 loads c_cbd_dest .53 / c_comp .51 /
+            # c_est_workers_resid -.40 / c_logsum -.38 / c_occp_dist -.38 /
+            # c_dist_decay_slow .13; direction 1 is a clean c_logsum ±.707 vs
+            # c_occp_dist ∓.707; the distance recodes load on further
+            # directions.  Residualise the interaction/weak member of each
+            # group on the structural control so those near-null directions
+            # collapse without dropping the behavioural term.  c_logsum's
+            # distance component is already residualised within-case by
+            # STAGE5_LOGSUM_ORTHOG, so it is deliberately not listed here.
+            'c_cbd_dest':          'c_size_term',
+            'c_comp':              'c_aggl',
+            'c_est_workers_resid': 'c_size_term',
+            'c_occp_dist':         'c_log_dist',
+            'c_dist_decay_slow':   'c_log_dist',
+            'c_dist_sq':           'c_log_dist',
+            'c_dist_0_2':          'c_log_dist',
+            'c_dist_2_5':          'c_log_dist',
+            'c_dist_5_10':         'c_log_dist',
         },
     },
 }

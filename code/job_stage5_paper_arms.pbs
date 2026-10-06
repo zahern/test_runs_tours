@@ -1,0 +1,67 @@
+#!/bin/bash -l
+#PBS -N stage5_paper_arms
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -m n
+#PBS -r y
+
+# ─────────────────────────────────────────────────────────────────────────────
+# job_stage5_paper_arms.pbs
+# Four-arm Stage-5 destination comparison for the paper.  All arms fit the
+# SAME sampled cases/alternatives and the SAME utility spec (PAPER_UTILITY
+# coef names); the latent arms share the SAME membership spec over
+# BEHAVIORAL person types (PAPER_MEMB):
+#   A  larch MNL (pooled) ......... _build_dest_model + _estimate
+#   B  SearchLibrium MNL (pooled) .. ChoiceSetFrame + _fit_frame_mnl (exact)
+#   C  larch latent class .......... lx.LatentClass + larch_lc_compat
+#      (n_cases metadata patch; from_idca fill_missing=0 to kill NaN
+#      gradients; 0-coded alternatives unsupported — root_id collision;
+#      jittered SLSQP restarts break the symmetric pooled optimum)
+#   D  SearchLibrium latent class .. estimate_dest_choice_lc (EM + restarts)
+#
+# USAGE
+#   qsub job_stage5_paper_arms.pbs                                     # 300-case smoke
+#   qsub -v PAPER_N_CASES=0,PAPER_N_PERT=3 job_stage5_paper_arms.pbs   # full paper run
+#
+# KNOBS (qsub -v or environment)
+#   PAPER_SEGMENT=work  PAPER_N_CASES=300 (0 = all tours in the cache)
+#   PAPER_UTILITY=c_log_dist,c_crash,c_logsum,c_visit_work,c_crash_safety_dest
+#   PAPER_MEMB=STUDYING,age5p,sexp,safety_sensitivity
+#   PAPER_N_PERT=2  PAPER_LC_MAXITER=150  PAPER_MSTEP_MAXITER=200
+#   PAPER_LC_PERTURB_SIGMA=0.5  PAPER_SEED=42
+#   CONDA_ENV=zigenv  SEARCHLIBRIUM_SRC (defaults to _patches fallback)
+#
+# OUTPUT  runs/stage5_paper_arms/<PBS_JOBID or PAPER_OUT>: arms.json + arms.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV:-zigenv}"
+module unload Anaconda3
+
+export NEW_POP=1 NEW_POP_MAPPED=0
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+
+if [[ -z "${SEARCHLIBRIUM_SRC:-}" && -f "${PBS_O_WORKDIR}/_patches/SearchLibrium/mh_choice_estimator.py" ]]; then
+  export SEARCHLIBRIUM_SRC="${PBS_O_WORKDIR}/_patches"
+fi
+
+export PAPER_SEGMENT="${PAPER_SEGMENT:-work}"
+export PAPER_N_CASES="${PAPER_N_CASES:-300}"
+export PAPER_N_PERT="${PAPER_N_PERT:-2}"
+export PAPER_LC_MAXITER="${PAPER_LC_MAXITER:-150}"
+export PAPER_MSTEP_MAXITER="${PAPER_MSTEP_MAXITER:-200}"
+export JAX_PLATFORMS=cpu
+export CUDA_VISIBLE_DEVICES=""
+
+STAMP="$(date -u +%Y%m%d_%H%M%S)_${PBS_JOBID:-local}"
+export PAPER_OUT="${PAPER_OUT:-runs/stage5_paper_arms/${STAMP}}"
+mkdir -p "${PAPER_OUT}"
+
+echo "paper arms -> ${PAPER_OUT} (segment=${PAPER_SEGMENT} n_cases=${PAPER_N_CASES})"
+python _paper_stage5_arms.py 2>&1 | tee "${PAPER_OUT}/job.out"
+echo "Finished: $(date) exit_code=${PIPESTATUS[0]}" | tee -a "${PAPER_OUT}/job.out"

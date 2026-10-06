@@ -13,6 +13,7 @@ Stage 5 converts this into a proper TRIP CHAIN:
     home ──trip1──> activity1 ──trip2──> activity2 ──trip3──> home
 """
 
+import json
 import logging
 import os
 import pickle
@@ -696,20 +697,99 @@ def _skim_lookup(skim_df: pd.DataFrame) -> dict:
     return lookup
 
 
-def _read_crash_od_table(crash_source, zone_ids: list = None) -> pd.DataFrame:
+def _crash_table_from_open_omx(cf, label: str, zone_ids: list = None,
+                               matrix_name: str = None) -> pd.DataFrame:
+    """Build the OTAZ/DTAZ/CRASH frame from an OPEN OMX file handle.
+
+    Shared by the .omx-path branch and the open-handle branch of
+    _read_crash_od_table: _run_segment passes its live ``crash_skims`` OMX
+    handle straight through, and treating that handle as a path
+    (str(handle) -> h5py repr, os.path.isfile False) used to raise
+    FileNotFoundError and silently zero c_crash for every larch destination
+    fit.
+
+    Matrix name is selectable so alternative crash measures can be tested
+    (e.g. crash_matrices_371.omx carries crash_total, crash_rate_total,
+    crash_length_km, crash_headon, ...). A RATE is far less confounded with
+    distance than a raw count: measured over all off-diagonal pairs of the
+    371-zone matrices,
+      corr(log DIST, log CRASH)            = +0.180  (R^2 0.032)
+      corr(log DIST, log crash_rate_total) = -0.126  (R^2 0.016)
+      corr(log DIST, log crash_runoff)     = +0.377  (R^2 0.142)
+    so crash_rate_total keeps the crash effect separately identifiable from
+    distance. Selected via STAGE5_CRASH_MATRIX (default 'CRASH').
+    """
+    _mat_name = (matrix_name
+                 or os.environ.get('STAGE5_CRASH_MATRIX', '').strip()
+                 or 'CRASH')
+    _avail = list(cf.listMatrices())
+    if _mat_name not in _avail:
+        raise RuntimeError(
+            f"Crash OMX {label!r} has no matrix "
+            f"{_mat_name!r}; available: {_avail[:20]}")
+    mat = np.asarray(cf[_mat_name], dtype=float)
+    logger.info(f"_read_crash_od_table: using matrix {_mat_name!r} from {label}")
+    # Use the OMX's own zone mapping when available so a shape mismatch
+    # (e.g. fringe zone 999 in zone_ids, or a differently ordered mapping)
+    # cannot blow up the DataFrame constructor with "All arrays must be of
+    # the same length".
+    try:
+        _mp = dict(cf.mapping(cf.listMappings()[0]))
+        _omx_z = [int(z) for z in sorted(_mp.keys(), key=lambda k: _mp[k])]
+    except Exception:
+        _omx_z = None
+    if zone_ids is None:
+        if _omx_z is None:
+            _n = mat.shape[0]
+            _omx_z = list(range(1, _n + 1))
+        zone_ids = _omx_z
+    z = np.asarray(zone_ids, dtype=int)
+    if mat.shape != (len(z), len(z)) and _omx_z is not None \
+            and mat.ndim == 2 and mat.shape[0] == mat.shape[1] \
+            and len(_omx_z) == mat.shape[0]:
+        # Build on the OMX's native zone set, then filter to the requested
+        # zones downstream (groupby/sum keeps it safe).
+        _zo = np.asarray(_omx_z, dtype=int)
+        return pd.DataFrame({
+            'OTAZ': np.repeat(_zo, len(_zo)),
+            'DTAZ': np.tile(_zo, len(_zo)),
+            'CRASH': np.asarray(mat).ravel(),
+        })
+    if mat.size != len(z) * len(z):
+        raise RuntimeError(
+            f"Crash OMX matrix shape {mat.shape} does not match "
+            f"{len(z)} zones ({len(z) * len(z)} expected)")
+    return pd.DataFrame({
+        'OTAZ': np.repeat(z, len(z)),
+        'DTAZ': np.tile(z, len(z)),
+        'CRASH': np.asarray(mat).ravel(),
+    })
+
+
+def _read_crash_od_table(crash_source, zone_ids: list = None,
+                         matrix_name: str = None) -> pd.DataFrame:
     """
     Load an OD crash table with columns OTAZ, DTAZ, CRASH.
 
     Supports:
       - DataFrame already containing OD crash values
+      - an OPEN OMX handle (e.g. the live crash_skims passed by _run_segment)
       - CSV/XLSX path
       - OMX path containing matrix 'CRASH'
+
+    ``matrix_name`` (or env ``STAGE5_CRASH_MATRIX``) selects a different OMX
+    matrix, e.g. 'crash_rate_total' from crash_matrices_371.omx, so a
+    distance-orthogonal crash measure can be tested in place of the raw count.
     """
     if crash_source is None:
         return pd.DataFrame(columns=['OTAZ', 'DTAZ', 'CRASH'])
 
     if isinstance(crash_source, pd.DataFrame):
         raw = crash_source.copy()
+    elif (hasattr(crash_source, 'listMatrices')
+          and not isinstance(crash_source, (str, bytes, os.PathLike))):
+        raw = _crash_table_from_open_omx(
+            crash_source, '<open OMX handle>', zone_ids, matrix_name)
     else:
         path = str(crash_source)
         if not os.path.isfile(path):
@@ -722,47 +802,8 @@ def _read_crash_od_table(crash_source, zone_ids: list = None) -> pd.DataFrame:
         elif ext == '.omx':
             cf, owned = _open_skims(path)
             try:
-                if 'CRASH' not in cf.listMatrices():
-                    raise RuntimeError("Crash OMX missing matrix 'CRASH'")
-                mat = np.asarray(cf['CRASH'], dtype=float)
-                # Use the OMX's own zone mapping when available so a shape
-                # mismatch (e.g. fringe zone 999 in zone_ids, or a differently
-                # ordered mapping) cannot blow up the DataFrame constructor
-                # with "All arrays must be of the same length".
-                try:
-                    _mp = dict(cf.mapping(cf.listMappings()[0]))
-                    _omx_z = [int(z) for z in sorted(_mp.keys(),
-                                                     key=lambda k: _mp[k])]
-                except Exception:
-                    _omx_z = None
-                if zone_ids is None:
-                    if _omx_z is None:
-                        _n = mat.shape[0]
-                        _omx_z = list(range(1, _n + 1))
-                    zone_ids = _omx_z
-                z = np.asarray(zone_ids, dtype=int)
-                if mat.shape != (len(z), len(z)) and _omx_z is not None \
-                        and np.asarray(mat.shape) .size == 2 \
-                        and mat.shape[0] == mat.shape[1] \
-                        and len(_omx_z) == mat.shape[0]:
-                    # Build on the OMX's native zone set, then filter to the
-                    # requested zones downstream (groupby/sum keeps it safe).
-                    _zo = np.asarray(_omx_z, dtype=int)
-                    raw = pd.DataFrame({
-                        'OTAZ': np.repeat(_zo, len(_zo)),
-                        'DTAZ': np.tile(_zo, len(_zo)),
-                        'CRASH': np.asarray(mat).ravel(),
-                    })
-                else:
-                    if mat.size != len(z) * len(z):
-                        raise RuntimeError(
-                            f"Crash OMX matrix shape {mat.shape} does not match "
-                            f"{len(z)} zones ({len(z) * len(z)} expected)")
-                    raw = pd.DataFrame({
-                        'OTAZ': np.repeat(z, len(z)),
-                        'DTAZ': np.tile(z, len(z)),
-                        'CRASH': np.asarray(mat).ravel(),
-                    })
+                raw = _crash_table_from_open_omx(
+                    cf, os.path.basename(path), zone_ids, matrix_name)
             finally:
                 if owned:
                     cf.close()
@@ -1907,6 +1948,92 @@ def quarantine_da_zero_vehicle(tours: pd.DataFrame, label: str = "mode") -> pd.D
     except Exception as _qe:
         logger.debug(f"quarantine_da_zero_vehicle [{label}] skipped ({_qe})")
         return tours
+
+
+def _ensure_person_attrs(persons: pd.DataFrame,
+                         tours: pd.DataFrame = None) -> pd.DataFrame:
+    """Derive the person attributes the mode/destination UECs expect but the
+    raw HHTS persons table does not carry.
+
+    The HHTS persons frame has AGEGROUP, EBIKES, WORKSTAT, STUDYING, ... but
+    NOT age5p / ebikes / car_prop / transit_prop / bike_prop, so every mode or
+    destination term referencing them was silently zero-filled and then
+    holdfasted (larch doctor `low_variance_data_co`: person.age5p, ebikes,
+    car_prop, transit_prop, bike_prop all variance 0).  Derived here, once,
+    for both trees:
+
+      age5p      <- AGEGROUP clipped to the 1..18 five-year bands
+      ebikes     <- EBIKES (case-insensitive source)
+      car_prop / transit_prop / bike_prop
+                 <- per-person HHTS tour mode shares (DA+SR / Transit / Bike)
+
+    Columns that cannot be derived from HHTS (occp_group, escooter,
+    joint_travel, workstat_notworking) are left absent; their terms are
+    genuinely unidentified on HHTS and should be dropped/holdfasted.
+    """
+    if persons is None or not isinstance(persons, pd.DataFrame) or not len(persons):
+        return persons
+    p = persons
+    changed = []
+    cols = {str(c).lower(): c for c in p.columns}
+
+    if 'age5p' not in p.columns:
+        _src = cols.get('agegroup') or cols.get('agep')
+        if _src is not None:
+            try:
+                p = p.copy()
+                p['age5p'] = pd.to_numeric(p[_src], errors='coerce').clip(1, 18)
+                changed.append(f"age5p<-{_src}")
+            except Exception:
+                pass
+
+    for _dst, _src in (('ebikes', 'ebikes'), ('bikes', 'bikes')):
+        if _dst not in p.columns and _src in cols and cols[_src] != _dst:
+            try:
+                p = p.copy() if p is persons else p
+                p[_dst] = pd.to_numeric(p[cols[_src]], errors='coerce').fillna(0.0)
+                changed.append(f"{_dst}<-{cols[_src]}")
+            except Exception:
+                pass
+
+    if tours is not None and isinstance(tours, pd.DataFrame) and len(tours):
+        try:
+            _pid_col = next((c for c in ('person_id', 'PERSID', 'persid')
+                             if c in tours.columns), None)
+            _mode_col = next((c for c in ('tour_mode',) if c in tours.columns), None)
+            if _pid_col and _mode_col:
+                _t = tours[[_pid_col, _mode_col]].copy()
+                _raw_mode = _t[_mode_col]
+                # Map string labels FIRST: pd.to_numeric would turn them into
+                # all-NaN floats and every *_prop came out 0.0.  is_numeric_dtype
+                # rather than `dtype == object` because pandas 3 labels string
+                # columns with the new `str` dtype (not object).
+                if not pd.api.types.is_numeric_dtype(_raw_mode):
+                    _m = _raw_mode.map(MODE_MAP)
+                    if _m.isna().all():
+                        _m = pd.to_numeric(_raw_mode, errors='coerce')
+                else:
+                    _m = pd.to_numeric(_raw_mode, errors='coerce')
+                _t['_mode'] = _m
+                _t['_car'] = _t['_mode'].isin([MODE_MAP.get('DA'), MODE_MAP.get('SR')])
+                _t['_tr'] = (_t['_mode'] == MODE_MAP.get('Transit'))
+                _t['_bk'] = (_t['_mode'] == MODE_MAP.get('Bike'))
+                _g = _t.groupby(_pid_col)[['_car', '_tr', '_bk']].mean()
+                p = p.copy() if p is persons else p
+                _pid = p[_pid_col] if _pid_col in p.columns else None
+                if _pid is not None:
+                    for _dst, _col in (('car_prop', '_car'),
+                                       ('transit_prop', '_tr'),
+                                       ('bike_prop', '_bk')):
+                        if _dst not in p.columns:
+                            p[_dst] = _pid.map(_g[_col]).fillna(0.0)
+                            changed.append(f"{_dst}<-tour {_col}")
+        except Exception as _mp_e:
+            logger.debug(f"_ensure_person_attrs: mode-share props skipped ({_mp_e})")
+
+    if changed:
+        logger.info(f"_ensure_person_attrs: derived {', '.join(changed)}")
+    return p
 
 
 def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame:
@@ -3559,15 +3686,72 @@ def _safety_sensitivity_score(pp: pd.DataFrame) -> pd.Series:
                              errors='coerce').fillna(default).values
 
     s = np.full(n, 0.50, dtype=np.float64)   # population-average baseline
-    age5p = _col('age5p', 5.0)
-    s += np.where(age5p <= 2, 0.20,           # young children
-         np.where(age5p >= 9, 0.18, 0.0))     # seniors 65+
+
+    # ── Age channels ────────────────────────────────────────────────────────
+    # Resolve the age source exactly as the rest of the pipeline does
+    # (ga_hypothesis_testing.py:7527-7548): AGEGROUP preferred, age5p as
+    # fallback, and the SENIOR cutoff differs between the two -- >=10 for
+    # AGEGROUP, >=9 for age5p. Using one hardcoded threshold for both sources
+    # silently mis-classifies seniors by one band.
+    #
+    # Previously this read only 'age5p', which is NOT present in the HHTS
+    # persons frame, so `_col('age5p', 5.0)` fell back to the default 5.0 for
+    # everyone: neither branch fired and the +0.20 (children) / +0.18 (seniors)
+    # contributions were DEAD. With AGEGROUP (21 bands) sitting unused in the
+    # same frame, that compressed safety_sensitivity into [0.50, 0.93] with a
+    # large mass exactly at the 0.50 default -- making
+    # `c_crash_safety_dest = safety_sensitivity * log(CRASH+1)` near-collinear
+    # with the base `c_crash = log_CRASH_1`, so the interaction could not be
+    # identified.
+    _age_src = None
+    _is5p = False
+    if 'AGEGROUP' in pp.columns:
+        _age_src = pd.to_numeric(pp['AGEGROUP'], errors='coerce').values
+        _is5p = False
+    elif 'age5p' in pp.columns:
+        _age_src = pd.to_numeric(pp['age5p'], errors='coerce').values
+        _is5p = True
+    _age_ok = _age_src is not None and np.isfinite(_age_src).any()
+    if _age_ok:
+        _age_src = np.where(np.isfinite(_age_src), _age_src, 5.0)
+        s += np.where(_age_src <= 2, 0.20, 0.0)                  # young children
+        s += np.where(_age_src >= (9 if _is5p else 10), 0.18, 0.0)  # seniors 65+
+
     s += np.where(_col('sexp', 1.0) == 2, 0.10, 0.0)     # female
     s += np.where(_col('vehrd', 1.0) <= 0, 0.15, 0.0)    # car-free (exposed)
     s += np.where(_col('CARLICENCE', 1.0) <= 0, 0.06, 0.0)  # unlicensed
     incp = _col('incp', 7.0)
     s += np.clip((7.0 - incp) / 14.0, 0.0, 0.12)          # lower income → more sensitive
-    s += np.where(_col('hh_child', 0.0) > 0, 0.08, 0.0)   # children in household
+
+    # ── Children in household ───────────────────────────────────────────────
+    # 'hh_child' is not a column anywhere in the pipeline; the CDAP-derived
+    # alternatives (cdap_is_child, cdap_hh_n_children) are all-zero stubs
+    # because household CDAP estimation falls back to heuristic priors. Derive
+    # it from household composition using the same age source as above:
+    # a household is a "child household" if any member is a child.
+    _hh_child_src = None
+    try:
+        if 'hh_child' in pp.columns:
+            _hh_child_src = pd.to_numeric(pp['hh_child'], errors='coerce').values
+            _hh_child_src = (_hh_child_src > 0).astype(float)
+        elif _age_ok:
+            _hhkey = None
+            for _c in ('HHID', 'household_id', 'abshid', 'absfid'):
+                if _c in pp.columns:
+                    _hhkey = pp[_c].astype(str)
+                    break
+            if _hhkey is None and 'person_id' in pp.columns:
+                # HHTS person_id is '<household>/<person>' e.g. '100582/1000'
+                _hhkey = pp['person_id'].astype(str).str.split('/').str[0]
+            if _hhkey is not None:
+                _is_child = pd.Series((_age_src <= 2).astype(float), index=pp.index)
+                _hh_child_src = _is_child.groupby(
+                    _hhkey.values).transform('max').values
+    except Exception as _hce:
+        logger.debug(f"_safety_sensitivity_score: hh_child derivation skipped "
+                     f"({_hce!r})")
+    if _hh_child_src is not None:
+        s += np.where(_hh_child_src > 0, 0.08, 0.0)       # children in household
 
     return pd.Series(np.clip(s, 0.0, 1.0), index=pp.index, name='safety_sensitivity')
 
@@ -3793,6 +3977,10 @@ def _mode_tree(tours, persons, landuse, skims, skim_df: pd.DataFrame = None):
     as sub-datasets.
     """
     import xarray as xr
+
+    # HHTS persons lack age5p / ebikes / *_prop; derive them once so the mode
+    # UEC terms are identified instead of zero-filled (doctor low_variance).
+    persons = _ensure_person_attrs(persons, tours=tours)
 
     # ── Mode-side quarantine (job 25254924) ──────────────────────────────
     # Dest has quarantine_dest_cases; mode had NONE — 14 tours with NaN
@@ -4051,6 +4239,10 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     """
     import xarray as xr
 
+    # Same person-attribute derivation as _mode_tree: the destination UEC's
+    # age5p_x_log_dist / *_prop / ebikes terms are dead without it.
+    persons = _ensure_person_attrs(persons, tours=tours)
+
     # get zone IDs from the logsum array (these are the destination alternatives)
     if hasattr(logsums, 'coords') and 'zones' in logsums.coords:
         zone_ids = [int(z) for z in logsums.coords['zones'].values]
@@ -4147,6 +4339,18 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
 
             if crash_skims is not None:
                 _crash_df = _read_crash_od_table(crash_skims, zone_ids=_zones)
+            elif (os.environ.get('STAGE5_CRASH_MATRIX', '').strip() not in ('', 'CRASH')
+                  and os.environ.get('STAGE5_CRASH_SKIMS', '').strip()):
+                # Alternative crash measure from a separate OMX, e.g.
+                #   STAGE5_CRASH_SKIMS=../demand_/crash_matrices_371.omx
+                #   STAGE5_CRASH_MATRIX=crash_rate_total
+                # crash_rate_total is a per-km RATE, so it is far less confounded
+                # with distance than the raw count (R^2 0.016 vs 0.032 against
+                # log DIST), letting the crash effect be identified separately.
+                _crash_df = _read_crash_od_table(
+                    os.environ['STAGE5_CRASH_SKIMS'].strip(),
+                    zone_ids=_zones,
+                    matrix_name=os.environ['STAGE5_CRASH_MATRIX'].strip())
             else:
                 # Normalize first: duplicate labels / junk dtypes / NaN keys in
                 # skim_df otherwise surface downstream as "All arrays must be
@@ -4372,12 +4576,41 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
             f"= {len(ca_df)} rows"
         )
     else:
-        ptour_rep = np.repeat(case_ids, n_zones)
-        altid_rep = np.tile(zone_ids, n_cases)
+        # ALL-ZONES path. The three arrays MUST share one length, but they were
+        # built from independently-derived sizes:
+        #   ptour_rep = np.repeat(case_ids, n_zones)   -> n_cases * n_zones
+        #   altid_rep = np.tile(zone_ids, n_cases)     -> n_cases * len(zone_ids)
+        #   ls_vals.ravel()                            -> shape of the logsum matrix
+        # Any disagreement raised pandas' opaque "All arrays must be of the same
+        # length" from inside the DataFrame constructor (stage5_destination_
+        # choice.py:4413), which told you nothing about which one was wrong.
+        # Derive every length from zone_ids (the authority for the alternative
+        # axis) and validate the logsum matrix explicitly.
+        _zid = np.asarray(zone_ids)
+        n_zones_eff = int(_zid.size)
+        ptour_rep = np.repeat(np.asarray(case_ids), n_zones_eff)
+        altid_rep = np.tile(_zid, n_cases)
+        _ls = np.asarray(ls_vals)
+        if _ls.shape == (n_cases, n_zones_eff):
+            ls_flat = _ls.ravel()
+        elif _ls.size == ptour_rep.size:
+            # already the right number of entries, just oddly shaped
+            ls_flat = _ls.reshape(-1)
+        else:
+            raise ValueError(
+                f"_dest_tree: ALL-ZONES logsum matrix has {_ls.shape} "
+                f"({_ls.size} entries) but the CA table needs "
+                f"({n_cases}, {n_zones_eff}) = {ptour_rep.size} entries "
+                f"(n_cases={n_cases} from case_ids={len(case_ids)}, "
+                f"n_zones={n_zones_eff} from len(zone_ids)={len(zone_ids)}, "
+                f"n_zones_variable={n_zones}). Mismatch between the logsum "
+                f"coordinate and the zone universe -- fix the logsum source "
+                f"rather than letting pandas raise an opaque length error."
+            )
         ca_df = pd.DataFrame({
             'ptour_id':       ptour_rep,
             '_altid_':        altid_rep,
-            'logsum':         ls_vals.ravel(),
+            'logsum':         ls_flat,
             'log_correction': 0.0,
         })
         print(f"  _dest_tree: ALL-ZONES CA table {n_cases} cases × {n_zones} zones = {len(ca_df)} rows")
@@ -4670,6 +4903,20 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
         # Joined like any other landuse column; absent in older landuse files
         # → zero-filled by the loop below (neutral, term auto-holdfasts).
         'est_workers_resid', 'est_students_resid',
+        # ── Extended accessibility (accessibility_371_extended.csv) ────────
+        # These are merged into lu_emp above (_EXT_COLS) and their log/visit
+        # recodes are built further below, but they were never mapped onto
+        # the alternative axis: the log_* loop silently fell back to
+        # log(0+1)=0, and the visit_* loop (which only touches EXISTING
+        # columns) produced nothing — so the flat estimation dataset had no
+        # 'visit_work'/'visit_edu'/'visit_shop'/'visit_social' at all.
+        # Larch then aborted every destination fit with
+        #   ValueError: Setup failed for variable 'visit_work'
+        # (seen in both the 20260928 larch arm and the 20260930 MH arm), which
+        # is why the larch destination model never produced an LL.
+        'crime_violent_per100k', 'crash_smooth', 'transit_intensity',
+        'attract_shop', 'attract_food', 'attract_health', 'attract_edu',
+        'attract_rec', 'visit_work', 'visit_edu', 'visit_shop', 'visit_social',
     ]
     if _power_acc_enabled():
         # E1 grid-feedback pilot: power columns were merged into lu_emp above.
@@ -5952,16 +6199,176 @@ def _adaptive_dest_choice_frame(seg_tours: pd.DataFrame,
                   'log_DIST_1', 'DIST', 'size_term', 'logsum', 'log_CRASH_1']]
 
 
+def _adaptive_dest_choice_frame_full(dt_dest, sampled_alts: pd.DataFrame,
+                                     segment: str,
+                                     case_covariates: list = None
+                                     ) -> tuple[pd.DataFrame, dict]:
+    """Build the long estimation frame for the FULL flat destination spec.
+
+    MH-as-a-full-larch-replacement path: instead of the compact 5-feature
+    frame, read every utility column in DEST_UEC_FLAT (filtered to this
+    segment, minus collinear/dead columns) straight off the flat estimation
+    Dataset built by _dest_tree, keyed by the same sampled (case,
+    alternative) pairs larch fits on.
+
+    The two terms larch holds at 1.0 are folded into the McFadden offset so
+    the MH posterior mirrors the larch specification:
+
+        offset = log_correction + size_term
+
+    (c_size_term / log_correction therefore do not appear as free features).
+    Returns (frame, {column: coefficient_name}).
+    """
+    if sampled_alts is None or sampled_alts.empty:
+        raise ValueError("sampled destination alternatives are empty")
+    if dt_dest is None:
+        raise ValueError("full-spec adaptive frame requires the flat Dataset")
+    if not hasattr(dt_dest, 'coords') or 'ptour_id' not in dt_dest.coords \
+            or '_altid_' not in dt_dest.coords:
+        raise ValueError("flat Dataset is missing ptour_id/_altid_ coords")
+
+    _collinear = set(getattr(dt_dest, 'attrs', {}).get('_collinear_cols', []) or [])
+    feature_map = {}
+    for _coef, (_col, _segs) in DEST_UEC_FLAT.items():
+        if _col in ('log_correction', 'size_term'):
+            continue
+        if _segs is not None and segment and segment not in _segs:
+            continue
+        if _col in _collinear:
+            continue
+        if _col not in dt_dest.data_vars:
+            continue
+        if _col in feature_map:
+            continue
+        feature_map[_col] = _coef
+
+    case_vals = [str(c) for c in
+                 np.asarray(dt_dest.coords['ptour_id'].values).ravel()]
+    alt_vals = np.asarray(dt_dest.coords['_altid_'].values).ravel().astype(np.int64)
+    case_to_row = {c: i for i, c in enumerate(case_vals)}
+    alt_to_col = {int(a): j for j, a in enumerate(alt_vals)}
+
+    sa = sampled_alts.copy()
+    sa['case_id'] = sa['ptour_id'].astype(str)
+    sa['alt_id'] = pd.to_numeric(sa['alt_zone'], errors='coerce')
+    sa = sa.dropna(subset=['case_id', 'alt_id'])
+    _row = sa['case_id'].map(case_to_row)
+    _col = sa['alt_id'].astype(np.int64).map(alt_to_col)
+    _ok = _row.notna() & _col.notna()
+    if not _ok.all():
+        logger.warning(f"adaptive(full) [{segment}]: dropped "
+                       f"{int((~_ok).sum())} sampled row(s) not present in the "
+                       "flat Dataset")
+    sa = sa[_ok].reset_index(drop=True)
+    row_idx = _row[_ok].astype(int).to_numpy()
+    col_idx = _col[_ok].astype(int).to_numpy()
+
+    def _grab(name):
+        arr = np.asarray(dt_dest[name].values, dtype=float)
+        if arr.ndim == 1:
+            # from_idca collapses case-constant columns (e.g. DTAZ) to the
+            # case axis; index those by row only.
+            return arr[row_idx]
+        return arr[row_idx, col_idx]
+
+    frame = pd.DataFrame({
+        'case_id': sa['case_id'].to_numpy(),
+        'alt_id': sa['alt_id'].astype(np.int64).to_numpy(),
+    })
+    offset = np.zeros(len(sa), dtype=float)
+    if 'log_correction' in dt_dest.data_vars:
+        offset = offset + _grab('log_correction')
+    if 'size_term' in dt_dest.data_vars:
+        offset = offset + _grab('size_term')
+    frame['log_correction'] = offset
+    if 'DTAZ' in dt_dest.data_vars:
+        frame['chosen'] = (frame['alt_id'].to_numpy() == _grab('DTAZ'))
+    else:
+        raise ValueError("full-spec adaptive frame requires a DTAZ ca column")
+
+    keep = {}
+    for col, coef in feature_map.items():
+        vals = np.where(np.isfinite(_grab(col)), _grab(col), 0.0)
+        if float(np.nanstd(vals)) <= 1e-12:
+            logger.debug(f"adaptive(full) [{segment}]: dropping zero-variance "
+                         f"feature {col!r} ({coef})")
+            continue
+        frame[col] = vals
+        keep[col] = coef
+
+    # ── Case-level behavioural covariates (for interaction terms) ──────────
+    # Person attributes are materialised in the flat Dataset as case-constant
+    # columns (2-D with identical rows, or collapsed to the case axis).
+    # ``case_covariates`` copies them onto the long frame so
+    # SearchLibrium's actor expressions (STUDYING > 0, occp_group == 4, ...)
+    # and component x actor interactions can be built downstream.
+    if case_covariates:
+        for _name in case_covariates:
+            if _name in frame.columns:
+                continue
+            if _name not in dt_dest.data_vars:
+                logger.warning(f"adaptive(full) [{segment}]: case covariate "
+                               f"{_name!r} not in the flat Dataset - skipped")
+                continue
+            try:
+                _arr = np.asarray(dt_dest[_name].values)
+                if _arr.ndim == 1:
+                    _per_case = _arr.astype(float)
+                else:
+                    _per_case = _arr[:, 0].astype(float)
+                _by_case = {str(_c): float(_v)
+                            for _c, _v in zip(case_vals, _per_case)}
+                frame[_name] = (pd.to_numeric(frame['case_id'], errors='coerce')
+                                .map(_by_case).fillna(0.0).astype(float))
+            except Exception as _cc_e:
+                logger.warning(f"adaptive(full) [{segment}]: case covariate "
+                               f"{_name!r} failed ({_cc_e})")
+        _cov_ok = [c for c in case_covariates if c in frame.columns]
+        logger.info(f"adaptive(full) [{segment}]: attached {len(_cov_ok)} "
+                    f"case covariate(s): {_cov_ok}")
+
+    # Every case needs exactly one chosen alternative and >= 2 rows; the
+    # Manski-Lerman sample always includes the chosen zone, but stay drop-safe.
+    _cnt = frame.groupby('case_id', sort=False)['chosen'].transform('sum')
+    _size = frame.groupby('case_id', sort=False)['alt_id'].transform('size')
+    _bad = (_cnt != 1) | (_size < 2)
+    if _bad.any():
+        logger.warning(f"adaptive(full) [{segment}]: dropping "
+                       f"{int(_bad.sum())} row(s) in cases without exactly one "
+                       "chosen alternative")
+        frame = frame[~_bad].reset_index(drop=True)
+
+    frame.attrs['universal_denominator'] = False
+    logger.info(
+        f"adaptive(full) [{segment}]: frame {len(frame)} rows x "
+        f"{len(keep)} features ({len(case_vals)} cases in Dataset)")
+    return frame, keep
+
+
 def _estimate_adaptive_dest_choice(seg_tours: pd.DataFrame,
                                    sampled_alts: pd.DataFrame,
                                    landuse: pd.DataFrame,
                                    logsums,
                                    skim_df: pd.DataFrame,
                                    method: str,
-                                   seed: int = 42) -> tuple[dict, dict]:
-    """Estimate compact sampled destination utilities through SearchLibrium."""
+                                   seed: int = 42,
+                                   dt_dest=None,
+                                   segment: str = '',
+                                   full_spec: bool = None,
+                                   initial_coefs: dict = None) -> tuple[dict, dict]:
+    """Estimate sampled destination utilities through SearchLibrium.
+
+    ``full_spec`` (env ``STAGE5_DEST_FULL_SPEC=1``) fits EVERY flat
+    destination utility term off the larch estimation Dataset, i.e. MH as a
+    full larch replacement; otherwise the compact 5-feature model is used.
+
+    ``initial_coefs`` are the full-model coefficient values already estimated
+    by larch; they warm-start the sampler at a good point (matching larch's
+    local-optimizer design) instead of the prior means.
+    """
     try:
-        from SearchLibrium.mh_choice_estimator import estimate_dest_choice
+        from SearchLibrium.mh_choice_estimator import (
+            estimate_dest_choice, estimate_dest_choice_interactions)
     except (ImportError, ModuleNotFoundError):
         # Some pipeline environments pin an older SearchLibrium wheel.  Load
         # the matching checkout explicitly when it is available, while keeping
@@ -5981,9 +6388,58 @@ def _estimate_adaptive_dest_choice(seg_tours: pd.DataFrame,
         sys.modules[_spec.name] = _module
         _spec.loader.exec_module(_module)
         estimate_dest_choice = _module.estimate_dest_choice
+        estimate_dest_choice_interactions = getattr(
+            _module, 'estimate_dest_choice_interactions', None)
 
-    frame = _adaptive_dest_choice_frame(seg_tours, sampled_alts, landuse, logsums, skim_df)
-    feature_cols = ['log_DIST_1', 'DIST', 'size_term', 'logsum', 'log_CRASH_1']
+    # ── Behavioural interaction spec (STAGE5_DEST_INTERACTIONS) ──────────────
+    # JSON string or file path:
+    #   {"case_covariates": ["STUDYING", "age5p", "occp_group", "vehrd"],
+    #    "actor_defs": {"student": "STUDYING > 0", "senior": "age5p >= 9",
+    #                   "occp_trades": "occp_group == 4", "noveh": "vehrd == 0"},
+    #    "interactions": {"log_DIST_1": ["student", "senior"],
+    #                     "log_CRASH_1": ["occp_trades"],
+    #                     "logsum": ["noveh"]}}
+    # Each entry is a component x people-type term: a distance effect only for
+    # those people, a crash effect only for those workers, etc.  The base
+    # component stays in the model, so the new coefficient is the group's
+    # deviation from the pooled effect.
+    _ix_spec = None
+    _ix_env = os.environ.get('STAGE5_DEST_INTERACTIONS', '').strip()
+    if _ix_env:
+        try:
+            if os.path.isfile(_ix_env):
+                with open(_ix_env, encoding='utf-8') as _ixf:
+                    _ix_spec = json.load(_ixf)
+            else:
+                _ix_spec = json.loads(_ix_env)
+        except Exception as _ix_e:
+            logger.warning(f"adaptive dest: could not parse "
+                           f"STAGE5_DEST_INTERACTIONS ({_ix_e})")
+
+    _full = full_spec
+    if _full is None:
+        _full = os.environ.get('STAGE5_DEST_FULL_SPEC', '0').strip() == '1'
+    if _full and dt_dest is not None:
+        frame, source_to_model = _adaptive_dest_choice_frame_full(
+            dt_dest, sampled_alts, segment or '',
+            case_covariates=(_ix_spec or {}).get('case_covariates'))
+        feature_cols = list(source_to_model.keys())
+        if not feature_cols:
+            raise RuntimeError("adaptive destination full-spec frame has no features")
+    else:
+        if _full and dt_dest is None:
+            logger.warning("adaptive dest: full spec requested but no flat "
+                           "Dataset was supplied - using the compact frame")
+        frame = _adaptive_dest_choice_frame(seg_tours, sampled_alts, landuse,
+                                            logsums, skim_df)
+        feature_cols = ['log_DIST_1', 'DIST', 'size_term', 'logsum', 'log_CRASH_1']
+        source_to_model = {
+            'log_DIST_1': 'c_log_dist',
+            'DIST': 'c_dist',
+            'size_term': 'c_size_term',
+            'logsum': 'c_logsum',
+            'log_CRASH_1': 'c_crash',
+        }
     options = {
         'mh': {'draws': int(os.environ.get('STAGE5_DEST_MH_DRAWS', '1000')),
                'burn_in': int(os.environ.get('STAGE5_DEST_MH_BURN_IN', '500'))},
@@ -5997,29 +6453,144 @@ def _estimate_adaptive_dest_choice(seg_tours: pd.DataFrame,
                 'k_max': int(os.environ.get('STAGE5_DEST_SGD_K_MAX', '64')),
                 'learning_rate': float(os.environ.get('STAGE5_DEST_SGD_LR', '0.01'))},
     }
-    result = estimate_dest_choice(frame, method=method, feature_cols=feature_cols,
-                                  seed=seed, **options[method])
-    source_to_model = {
-        'log_DIST_1': 'c_log_dist',
-        'DIST': 'c_dist',
-        'size_term': 'c_size_term',
-        'logsum': 'c_logsum',
-        'log_CRASH_1': 'c_crash',
-    }
-    coefficients = {source_to_model[name]: float(value)
-                    for name, value in result.coef_dict.items()
-                    if name in source_to_model and np.isfinite(value)}
+
+    # ── Warm start + identification + preconditioning ────────────────────────
+    # 1. Warm start: the estimator's own start is the prior mean (zeros), and
+    #    a 30+-dimension RWMH chain starting there never reaches the optimum
+    #    (measured: LL -22740 vs larch -13570).  Passing larch's coefficients
+    #    as a {feature: value} dict fixes the start AND survives feature drops.
+    # 2. Identification: eigendecompose the scaled information matrix and drop
+    #    one feature per near-null direction (SearchLibrium
+    #    identify_weak_features, adapted from larch's overspecification
+    #    check) so the likelihood is not a flat ridge.
+    # 3. Preconditioning: fixed Laplace covariance inv(info + prior precision)
+    #    with Robbins-Monro step adaptation to 0.234 acceptance - the direct
+    #    analogue of larch's inverse-Hessian/BHHH curvature at the optimum.
+    _initial_map = None
+    if initial_coefs:
+        _initial_map = {}
+        for _col, _coef in source_to_model.items():
+            try:
+                _v = float(initial_coefs.get(_coef, 0.0))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(_v):
+                _initial_map[_col] = _v
+        if not _initial_map:
+            _initial_map = None
+
+    _identify = os.environ.get(
+        'STAGE5_DEST_IDENTIFY', '1' if _full else '0').strip() == '1'
+    _precond = os.environ.get(
+        'STAGE5_DEST_PRECOND', '1' if _full else '0').strip() == '1'
+    _target_accept = float(os.environ.get('STAGE5_DEST_TARGET_ACCEPT', '0.234'))
+    _ident_tol = float(os.environ.get('STAGE5_DEST_IDENTIFY_TOL', '1e-8'))
+    if _initial_map is not None:
+        logger.info(f"adaptive dest [{method}]: warm start from "
+                    f"{len(_initial_map)} larch coefficients; "
+                    f"identify={_identify} precondition={_precond} "
+                    f"target_accept={_target_accept}")
+
+    _ix_map = (_ix_spec or {}).get('interactions') if _full else None
+    if _ix_map and estimate_dest_choice_interactions is not None:
+        result = estimate_dest_choice_interactions(
+            frame, base_features=feature_cols, interactions=_ix_map,
+            actor_defs=(_ix_spec or {}).get('actor_defs'),
+            method=method, initial=_initial_map, identify=_identify,
+            identify_tol=_ident_tol,
+            identify_loading=float(os.environ.get('STAGE5_DEST_IDENTIFY_LOADING', '0.5')),
+            precondition=_precond, target_accept=_target_accept, seed=seed,
+            **options[method])
+        logger.info(
+            f"adaptive dest [{method}]: interaction spec active - "
+            f"{len(_ix_map)} component(s), "
+            f"{len(result.metadata.get('interaction_features', []))} "
+            f"interaction feature(s)")
+    else:
+        result = estimate_dest_choice(
+            frame, method=method, feature_cols=feature_cols, seed=seed,
+            initial=_initial_map,
+            identify=_identify,
+            identify_tol=_ident_tol,
+            identify_loading=float(os.environ.get('STAGE5_DEST_IDENTIFY_LOADING', '0.5')),
+            precondition=_precond,
+            target_accept=_target_accept,
+            **options[method])
+    # Base component coefficients map back to their c_* names; interaction
+    # columns keep their own ix_<actor>_x_<component> name so the behavioural
+    # deviation is addressable separately.
+    coefficients = {}
+    for name, value in result.coef_dict.items():
+        if not np.isfinite(value):
+            continue
+        coefficients[source_to_model.get(name, name)] = float(value)
     if not coefficients:
         raise RuntimeError("adaptive destination estimator returned no finite coefficients")
+
+    # ── Propagate posterior inference ────────────────────────────────────────
+    # ChoiceEstimate carries posterior std errors (std_err_dict).  They used to
+    # be dropped here, so every MH/Gibbs/SGD row in the coefficient report had
+    # t-stat=NaN even though the posterior SE/t/p had been computed.  Map the
+    # 5 compact-feature names back to model coefficient names and derive
+    # t/p from value/se.
+    _se_map = {}
+    try:
+        _se_src = getattr(result, 'std_err_dict', None)
+        if not _se_src:
+            _se_arr = getattr(result, 'std_err', None)
+            _feat = getattr(result, 'feature_names', feature_cols)
+            if _se_arr is not None:
+                _se_src = {str(n): float(v) for n, v in zip(_feat, np.asarray(_se_arr).ravel())}
+        for name, se in dict(_se_src or {}).items():
+            if np.isfinite(float(se)) and float(se) > 0:
+                _se_map[source_to_model.get(name, name)] = float(se)
+    except Exception as _se_e:
+        logger.debug(f"adaptive dest [{method}]: std_err propagation skipped ({_se_e})")
+
+    from scipy.stats import norm as _norm_se
+    inference = {}
+    for name, val in coefficients.items():
+        se = _se_map.get(name)
+        t = (val / se) if (se and se > 0) else None
+        p = float(2.0 * _norm_se.sf(abs(t))) if t is not None else None
+        inference[name] = {
+            'value': float(val),
+            'std_err': float(se) if se else None,
+            'tstat': float(t) if t is not None else None,
+            'pval': p,
+            'source': f'{method}_posterior_mean',
+        }
+    logger.info(
+        f"adaptive dest [{method}]: {len(inference)} posterior-mean coefficients, "
+        f"{len(_se_map)} with posterior SE "
+        f"(ess_min={(result.diagnostics or {}).get('ess_min')})"
+    )
+
     metadata = {
         'method': method,
+        'full_spec': bool(_full),
+        'n_features': int(len(getattr(result, 'feature_names', feature_cols))),
         'n_cases': int(result.metadata.get('n_cases', frame['case_id'].nunique())),
         'n_rows': int(len(frame)),
-        'feature_names': list(feature_cols),
+        'feature_names': list(getattr(result, 'feature_names', feature_cols)),
         'coefficient_map': source_to_model,
         'acceptance_rate': float(result.acceptance_rate),
         'diagnostics': result.diagnostics,
         'loglike': float(result.loglike),
+        'inference': inference,
+        'identification': result.metadata.get('identification'),
+        'dropped_features': list(result.metadata.get('dropped_features', []) or []),
+        'interactions': result.metadata.get('interactions'),
+        'interaction_inference': {
+            col: {
+                'component': pair.get('component'),
+                'actor': pair.get('actor'),
+                'value': inference.get(col, {}).get('value'),
+                'std_err': inference.get(col, {}).get('std_err'),
+                'tstat': inference.get(col, {}).get('tstat'),
+            }
+            for col, pair in (result.metadata.get('interactions') or {}).items()
+        },
         'metadata': result.metadata,
     }
     return coefficients, metadata
@@ -10250,6 +10821,36 @@ def _slsqp_options(base: dict) -> dict:
     return out
 
 
+# Per-method scipy option keys.  SLSQP-valid keys (ftol) are NOT valid for
+# trust-constr, which crashes with "_minimize_trustregion_constr() got an
+# unexpected keyword argument 'ftol'" and silently leaves every parameter at
+# its prior — the STAGE5_LARCH_METHOD=trust-constr run looked like it "kept
+# prior values".  Filter per chosen method.
+_SCIPY_METHOD_OPTIONS = {
+    'slsqp': _SLSQP_VALID_OPTIONS,
+    'l-bfgs-b': {'maxiter', 'ftol', 'gtol', 'eps', 'maxfun', 'maxcor',
+                 'iprint', 'disp', 'finite_diff_rel_step'},
+    'tnc': {'maxiter', 'ftol', 'xtol', 'gtol', 'eps', 'scale', 'offset',
+            'disp', 'finite_diff_rel_step'},
+    'trust-constr': {'maxiter', 'gtol', 'xtol', 'barrier_tol',
+                     'initial_tr_radius', 'initial_constr_penalty',
+                     'initial_barrier_parameter', 'initial_barrier_tolerance',
+                     'factorization_method', 'sparse_jacobian', 'verbose',
+                     'disp'},
+    'bfgs': {'maxiter', 'ftol', 'gtol', 'eps', 'disp', 'finite_diff_rel_step'},
+    'cg': {'maxiter', 'gtol', 'eps', 'disp', 'finite_diff_rel_step'},
+}
+
+
+def _options_for_method(method, base: dict) -> dict:
+    """Filter ``base`` to the keys the chosen scipy/Larch method accepts."""
+    key = str(method or 'slsqp').strip().lower()
+    valid = _SCIPY_METHOD_OPTIONS.get(key)
+    if valid is None:
+        return dict(base or {})
+    return {k: v for k, v in dict(base or {}).items() if k in valid}
+
+
 def _estimate(model, two_phase: bool = False, search_mode: bool = False):
     """
     Estimate a Larch model.
@@ -10276,7 +10877,11 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
     except Exception:
         _saved_max = _saved_min = None
 
-    model.set_cap(8)
+    # Coefficient cap: larch bounds every free parameter to +/-cap.  The 8
+    # default censored models whose optimum wanted larger coefficients (the
+    # full-spec MH found a ~6k better LL beyond it); make it configurable so
+    # a run can widen the box without touching code (STAGE5_LARCH_CAP).
+    model.set_cap(float(os.environ.get('STAGE5_LARCH_CAP', '8')))
 
     try:
         if _saved_max is not None:
@@ -10518,7 +11123,22 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
     # Tight ftol → optimizer walks further toward the optimum so the Hessian
     # at convergence is better conditioned and std errors less likely to be
     # NaN. (SLSQP has no gtol — filtered by _slsqp_options; it was ignored.)
-    est_options = _slsqp_options({'maxiter': 2000, 'ftol': 1e-9})
+    # Solver knobs (rec 4): trust-constr / more iterations / tighter tol can
+    # be selected per run without touching call sites.
+    est_options = _slsqp_options({
+        'maxiter': int(os.environ.get('STAGE5_LARCH_MAXITER', '2000')),
+        'ftol': float(os.environ.get('STAGE5_LARCH_FTOL', '1e-9')),
+    })
+    _est_method = os.environ.get('STAGE5_LARCH_METHOD', '').strip() or None
+
+    def _maximize_loglike(_m):
+        """maximize_loglike with optional solver override (rec 4)."""
+        _opts = (est_options if not _est_method
+                 else _options_for_method(_est_method, est_options))
+        _kw = {'options': _opts, 'quiet': True}
+        if _est_method:
+            _kw['method'] = _est_method
+        return _m.maximize_loglike(**_kw)
     _n_free_now = sum(1 for p in model.pf.index
                       if not model.pf.loc[p].get('holdfast', False))
     print(f"    _estimate phase-1: {_n_free_now} free params, maxiter={est_options['maxiter']} ...")
@@ -10604,7 +11224,7 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
             f"_estimate: non-finite initial log-likelihood ({_pre_ll})")
     logger.debug(f"_estimate pre-flight LL={_pre_ll:.4f}")
     try:
-        result = model.maximize_loglike(options=est_options, quiet=True)
+        result = _maximize_loglike(model)
         #todo : why candidate pool mode=5 and dest = 2
         print(f"    _estimate phase-1 done: LL={getattr(result, 'loglike', '?')}")
     except Exception as _mll_e:
@@ -10776,7 +11396,7 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
                                           reference=_re_ref, weights=_re_w)
         _ennet_ctx.__enter__()
         try:
-            result = model.maximize_loglike(options=est_options, quiet=True)
+            result = _maximize_loglike(model)
             print(f"    _estimate {_retry_engine} retry done: LL={getattr(result, 'loglike', '?')}")
             if _all_free_params_stuck():
                 logger.error(
@@ -10846,7 +11466,7 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
             logger.info(f"_estimate phase-2: released {released} - re-estimating")
             print(f"    _estimate phase-2: released {released}, re-estimating ...")
             try:
-                result = model.maximize_loglike(options=est_options, quiet=True)
+                result = _maximize_loglike(model)
                 print(f"    _estimate phase-2 done: LL={getattr(result, 'loglike', '?')}")
             except Exception as _ph2_e:
                 logger.warning(
@@ -11014,7 +11634,7 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
                 logger.warning(f"Destination inference unstable for {to_fix} - refitting with those terms fixed at 0")
                 for name in to_fix:
                     model.lock_value(name, 0.0)
-                result = model.maximize_loglike(options=est_options, quiet=True)
+                result = _maximize_loglike(model)
                 _compute_inference()
     except Exception as _e:
         logger.debug(f"Destination stabilization refit skipped: {_e}")
@@ -11030,6 +11650,8 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
     # bandit search penalises them via update_feature_weakness and stops
     # re-proposing them on the next iteration. Disable with STAGE5_DROP_STUCK=0.
     _dropped_stuck: list = []
+    _reverted_predrop = False
+    _predrop_pf = None
     try:
         # In SEARCH mode this whole drop-stuck + overspecification + refit-and-
         # revert cleanup is SKIPPED: it ran a full re-optimisation on every GA
@@ -11041,6 +11663,36 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
         if (search_mode and os.environ.get('STAGE5_DROP_STUCK_SEARCH', '0') != '1'):
             _start_vals = None
         if _start_vals is not None and os.environ.get('STAGE5_DROP_STUCK', '1') != '0':
+            # ── JAX-clobber guard ─────────────────────────────────────────────
+            # After JAX compiles the objective, model.pf can read back zeros
+            # for parameters that were just estimated (the same side-effect
+            # that motivates the _coef_cache snapshot above).  Running the
+            # stuck/overspec diagnostics on a clobbered frame misclassified
+            # 30+ live coefficients as "stuck near-zero", dropped them, and
+            # then the refit worsened LL -7807 -> -11904 and reverted, leaving
+            # _final_pf/CVS showing the failed fit.  Re-assert the post-fit
+            # snapshot on the model before diagnosing.
+            try:
+                _cc_sync = dict(getattr(model, '_coef_cache', {}) or {})
+                if _cc_sync:
+                    _pf_now = model.pf
+                    _clobbered = [
+                        _p for _p, _v in _cc_sync.items()
+                        if _p in _pf_now.index
+                        and abs(float(_v)) > 0.05
+                        and abs(float(_pf_now.loc[_p, 'value'])) < 1e-6
+                    ]
+                    if len(_clobbered) >= 3:
+                        model.pvals = {str(_p): float(_v)
+                                       for _p, _v in _cc_sync.items()
+                                       if np.isfinite(float(_v))}
+                        logger.warning(
+                            f"_estimate: model.pf was JAX-clobbered "
+                            f"({len(_clobbered)} snapshot-nonzero params read ~0); "
+                            "restored values from the post-fit coefficient snapshot")
+            except Exception as _ccs_e:
+                logger.debug(f"_estimate: clobber guard skipped ({_ccs_e})")
+
             # Structural terms are never dropped even if they appear unmoved:
             # ASCs anchor the mode constants, the Mu nest scales are kept free
             # per the nest policy, and the destination backbone (size term,
@@ -11062,6 +11714,16 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
             }
             if os.environ.get('STAGE5_DEST_FORCE_ACC', '0') == '1':
                 _NEVER_DROP.add('c_logsum')
+            # ── Pre-drop snapshot (BEFORE overspecification mutates state) ────
+            # _dest_overspecified_params() locks/zeroes the params it flags, so
+            # the snapshot MUST be taken before it: a post-lock snapshot holds
+            # the already-zeroed state, so a degrading refit "reverted" to zeros
+            # and _final_pf reported -16362 instead of the true -7807.
+            _predrop_result = result
+            _predrop_ll = float(getattr(result, 'loglike', float('nan')))
+            _predrop_pf = model.pf.copy()
+            _predrop_vals = _predrop_pf['value'].astype(float).copy()
+            _predrop_coef_cache = dict(getattr(model, '_coef_cache', {}) or {})
             # Larch overspecification: lock linearly-dependent params FIRST (the
             # singular-Hessian directions behind the zero-gradient fits + flat
             # zeros). This removes the redundancy so the refit below is identified
@@ -11090,9 +11752,6 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
             ]
             if _dropped_stuck or _overspec_locked:
                 _dropped_stuck = list(dict.fromkeys(_dropped_stuck + _overspec_locked))
-                # Snapshot the pre-drop optimum so a degrading refit can be reverted.
-                _predrop_ll = float(getattr(result, 'loglike', float('nan')))
-                _predrop_vals = _cur_d.copy()
                 logger.warning(
                     f"_estimate: dropping {len(_dropped_stuck)} stuck near-zero "
                     f"component(s) and refitting without them: {_dropped_stuck}"
@@ -11107,7 +11766,23 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
                             pass
                         _pf_set(model, _p, 'holdfast', True)
                 try:
-                    result = model.maximize_loglike(options=est_options, quiet=True)
+                    result = _maximize_loglike(model)
+                    # Refresh the authoritative snapshot immediately after the
+                    # refit: pf can be JAX-clobbered by the time anything else
+                    # reads it, and a successful refit changes the values.
+                    try:
+                        _cc_new = {}
+                        for _p in model.pf.index:
+                            try:
+                                _v = float(model.pf.loc[_p, 'value'])
+                            except Exception:
+                                continue
+                            if np.isfinite(_v):
+                                _cc_new[str(_p)] = _v
+                        if _cc_new:
+                            model._coef_cache = _cc_new
+                    except Exception:
+                        pass
                     _new_ll = float(getattr(result, 'loglike', float('nan')))
                     # Revert if the refit is non-finite, the blown-LL sentinel, or
                     # materially worse than the pre-drop fit. Dropping a genuinely
@@ -11119,16 +11794,36 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
                             f"_estimate: stuck-drop refit worsened LL "
                             f"({_predrop_ll:.2f} → {_new_ll:.2e}) — reverting to "
                             "the pre-drop fit (terms left free)")
+                        # Unlock the dropped params: holdfast flag AND the
+                        # point bounds lock_value wrote (min==max==0). Restoring
+                        # bounds from the pre-drop pf is what actually frees
+                        # them again on larch 6.0.44.
                         for _p in _dropped_stuck:
                             try:
-                                _pf_set(model, _p, 'holdfast', False)
+                                model.pholdfast = {_p: 0}
                             except Exception:
                                 pass
+                            if _p in _predrop_pf.index:
+                                for _bnd in ('minimum', 'maximum'):
+                                    try:
+                                        _bv = float(_predrop_pf.loc[_p, _bnd])
+                                        if np.isfinite(_bv):
+                                            _pf_set(model, _p, _bnd, _bv)
+                                    except Exception:
+                                        pass
                         for _p in _predrop_vals.index:
                             try:
                                 model.set_value(_p, float(_predrop_vals[_p]))
                             except Exception:
                                 pass
+                        # Restore the result object too: _compute_inference()
+                        # reads result.loglike, and `result` currently points at
+                        # the failed refit whose LL (e.g. -11921) is NOT the
+                        # reverted model's LL (-7807).
+                        result = _predrop_result
+                        _reverted_predrop = True
+                        if _predrop_coef_cache:
+                            model._coef_cache = dict(_predrop_coef_cache)
                         _compute_inference()
                     else:
                         _compute_inference()
@@ -11241,6 +11936,39 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
     try:
         _pf = model.pf.copy()   # snapshot - safe to modify in-place
 
+        # ── Reverted stuck-drop refit: force the definitive frame back to the
+        # pre-drop optimum.  lock_value() writes point bounds (min==max) that
+        # can survive the unlock sequence on larch 6.0.44, so the dropped
+        # terms could still read 0 in pf even after _coef_cache/_cached_ll
+        # were restored to the pre-drop fit.  The report must describe the
+        # model that actually achieved _predrop_ll.
+        if _reverted_predrop and isinstance(_predrop_pf, pd.DataFrame):
+            _n_overlay = 0
+            try:
+                for _p in _predrop_pf.index:
+                    if _p not in _pf.index:
+                        continue
+                    for _fld in ('value', 'holdfast', 'minimum', 'maximum'):
+                        if _fld not in _pf.columns or _fld not in _predrop_pf.columns:
+                            continue
+                        # Per-field try: pandas 2 rejects a float into an int8
+                        # 'holdfast' column (LossySetitemError), and one failing
+                        # field must not abort the whole overlay.
+                        try:
+                            _pf.loc[_p, _fld] = _predrop_pf.loc[_p, _fld]
+                            _n_overlay += 1
+                        except Exception:
+                            try:
+                                _pf[_fld] = _pf[_fld].astype(float)
+                                _pf.loc[_p, _fld] = float(_predrop_pf.loc[_p, _fld])
+                                _n_overlay += 1
+                            except Exception:
+                                pass
+            except Exception as _rev_pf_e:
+                logger.debug(f"_estimate: pre-drop frame overlay failed ({_rev_pf_e})")
+            logger.info(f"_estimate: reverted pre-drop overlay applied to "
+                        f"{_n_overlay} field(s)")
+
         # Ensure required columns exist
         for _col in ('std_err', 't_stat', 'pval'):
             if _col not in _pf.columns:
@@ -11307,6 +12035,10 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
                 "These SEs are NOT from the Hessian - model may be unidentified."
             )
 
+        if _reverted_predrop:
+            logger.info(
+                f"_estimate: final pf nonzero after overlay = "
+                f"{int((pd.to_numeric(_pf['value'], errors='coerce').abs() > 1e-9).sum())}")
         # Cache definitive frame on the model object so it survives pickle/reload
         model._final_pf = _pf
 
@@ -11380,9 +12112,66 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
     except Exception:
         _fit_n_params = 0
         _fit_n_free = 0
+
+    # ── Gradient-norm convergence gate (rec 2) ──────────────────────────────
+    # The optimizer's `success` flag is not enough: the destination fits
+    # "converged" at nit=10 while the exact log-likelihood gradient was 2.3e7
+    # (finite-difference verified), i.e. nowhere near a stationary point.
+    # Larch records the last gradient on the jax path (_latest_gradient); fall
+    # back to a fresh d_logloss evaluation restored to the true objective.
+    _grad_norm = float('nan')
+    if os.environ.get('STAGE5_GRAD_NORM_GATE', '1') != '0':
+        # Fresh evaluation at the final (restored) values: _latest_gradient may
+        # belong to the failed stuck-drop refit after a revert.
+        # NOTE: on the jax engine model.d_logloss() is the NumbaModel wrapper
+        # (x, start_case=0, stop_case=-1, step_case=1) which forwards non-None
+        # start/stop/step into JaxModel.d_loglike -> NotImplementedError, so
+        # that call silently fell back to _latest_gradient.  Prefer the
+        # jax-native gradient; zero the holdfast components so the gate
+        # measures the free-parameter subspace (matching Larch's own
+        # d_logloss convention).
+        _grad_vec = None
+        try:
+            if hasattr(model, 'jax_d_loglike'):
+                _grad_vec = np.asarray(
+                    model.jax_d_loglike(np.asarray(model.pvals, dtype=float)),
+                    dtype=float)
+                try:
+                    _grad_vec = _grad_vec * (1.0 - np.asarray(model.pholdfast, dtype=float))
+                except Exception:
+                    pass
+            else:
+                _grad_vec = np.asarray(model.d_logloss(model.pvals), dtype=float)
+        except Exception:
+            _grad_vec = None
+        if _grad_vec is None:
+            try:
+                _grad_vec = np.asarray(model._latest_gradient, dtype=float)
+            except Exception:
+                _grad_vec = None
+        if _grad_vec is not None:
+            try:
+                _grad_norm = float(np.linalg.norm(np.nan_to_num(_grad_vec)))
+            except Exception:
+                _grad_norm = float('nan')
+    _grad_max = float(os.environ.get('STAGE5_GRAD_NORM_MAX', '1e5'))
+    _grad_ok = (not np.isfinite(_grad_norm)) or (_grad_norm <= _grad_max)
+    if not _grad_ok:
+        logger.warning(
+            f"_estimate: gradient norm {_grad_norm:.3g} exceeds "
+            f"STAGE5_GRAD_NORM_MAX={_grad_max:.3g} — optimizer reported "
+            f"success={bool(_fit_success)} but the fit is NOT at a stationary "
+            "point (unidentified/ill-conditioned utility columns). Treat the "
+            "coefficients and t-stats with caution."
+        )
+
     model._fit_diagnostics = {
         'backend': 'larch',
-        'converged': bool(_fit_success) and bool(np.isfinite(_fit_ll)),
+        'converged': (bool(_fit_success) and bool(np.isfinite(_fit_ll))
+                      and bool(_grad_ok)),
+        'stationary': bool(_grad_ok) and bool(np.isfinite(_grad_norm)),
+        'grad_norm': _grad_norm if np.isfinite(_grad_norm) else None,
+        'grad_norm_max': _grad_max,
         'success': bool(_fit_success),
         'status': (int(_fit_status) if isinstance(_fit_status, (int, np.integer)) else None),
         'message': str(getattr(result, 'message', '')),
@@ -11796,13 +12585,36 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
         if len(zone_ids) < 10:
             zone_ids = None   # override was degenerate - fall through to normal derivation
     if zone_ids is None:
+        # FULL-UNIVERSE fallback, taken BEFORE the observed-DTAZ shortcut below.
+        #
+        # `dt_mode['od']` is a DataTree node, not a Dataset, so the
+        # od_ds.coords lookup above raises AttributeError and is swallowed --
+        # which sent control to the observed-DTAZ branch, giving a zone list of
+        # only the destinations actually present in the tours (325 here).
+        # The destination choice set, however, is built by _dest_tree from
+        # _build_od_dataset(skims, skim_df), which carries the full 372-zone
+        # universe (999 fringe + 371 SA2). The logsum is a `ca` variable inside
+        # the destination utility, so the 46 zones absent from the logsum made
+        # any tour choosing one evaluate to LL=nan -- observed as
+        #   'Computing logsums: 6720 cases x 325 zones'
+        #   'ALL-ZONES CA table 6720 cases x 371 zones'
+        # Both keyspaces are SA2 codes (999, 112011236, ...), so the OMX-derived
+        # universe is directly usable as the zone list here.
         try:
-            od_ds = dt_mode['od']
-            coord = od_ds.coords.get('dtaz', od_ds.coords.get('otaz', None))
-            if coord is not None:
-                zone_ids = sorted([int(z) for z in coord.values if int(z) > 0])
-        except Exception:
-            pass
+            _od_full = _build_od_dataset(skims, None)
+            _zset = set()
+            for _cn in ('otaz', 'dtaz'):
+                _c = _od_full.coords.get(_cn, None)
+                if _c is not None:
+                    _zset.update(int(z) for z in _c.values if int(z) > 0)
+            if len(_zset) >= 10:
+                zone_ids = sorted(_zset)
+                logger.info(
+                    f"_logsums: using FULL OMX zone universe ({len(zone_ids)} "
+                    f"zones) so the logsum covers every destination alternative "
+                    f"(was: observed-DTAZ subset)")
+        except Exception as _ze:
+            logger.debug(f"_logsums: full-universe lookup failed ({_ze})")
 
     if zone_ids is None:
         try:
@@ -12091,6 +12903,49 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
                            f"c_ivt_auto={_cd.get('c_ivt_auto','MISSING')}")
         except Exception as _de:
             logger.warning(f"    Diagnostic failed: {_de}")
+
+    # ── Within-case variation gate ──────────────────────────────────────────
+    # c_logsum identifies ONLY from cross-zone variation WITHIN a case; a
+    # case-constant logsum cancels out of the destination softmax entirely.
+    # Observed locally on the QLD work frame: global std looked healthy (1.0)
+    # but the per-case across-zone std was exactly 0.00000 for every case,
+    # because the mode utilities had lost their destination-varying terms
+    # (broken mode fit under a version-mismatched JAX+numpy stack).  The old
+    # ">90% zero" check above cannot see this failure mode.
+    try:
+        _lsf = np.asarray(ls_array, dtype=float)
+        if _lsf.ndim == 2 and _lsf.shape[1] > 1:
+            _within = np.nanstd(_lsf, axis=1)
+            _med = float(np.nanmedian(_within))
+            _p95 = float(np.nanpercentile(_within, 95))
+            _flat = float(np.nanmean(_within < 1e-9))
+            logger.info(f"_logsums: within-case across-zone std: "
+                        f"median={_med:.5g} p95={_p95:.5g} "
+                        f"flat_cases={_flat:.1%}")
+            if _flat > 0.5:
+                _msg = (
+                    f"_logsums: DEGENERATE LOGSUM SURFACE - {_flat:.0%} of "
+                    "cases have ZERO cross-zone variation, so c_logsum is "
+                    "structurally unidentified and any logsum interaction is "
+                    "meaningless. Likely causes: mode utilities lost their "
+                    "destination-varying terms (broken/degenerate mode fit, "
+                    "e.g. version-mismatched JAX+numpy), or the skim join "
+                    "failed. Set STAGE5_REQUIRE_LOGSUM_VARIANCE=1 to fail "
+                    "fast instead of silently fitting a dead accessibility "
+                    "term.")
+                try:
+                    # GA/search calls _logsums thousands of times; warn once.
+                    _warn_once("logsum_degenerate", _msg)
+                except NameError:
+                    logger.error(_msg)
+                if os.environ.get('STAGE5_REQUIRE_LOGSUM_VARIANCE', '0') == '1':
+                    raise RuntimeError(
+                        "degenerate logsum surface: no within-case variation "
+                        f"({_flat:.0%} flat cases) - c_logsum cannot identify")
+    except RuntimeError:
+        raise
+    except Exception as _lsg_e:
+        logger.debug(f"_logsums: within-case variance check skipped ({_lsg_e})")
 
     return ls
 
@@ -12726,11 +13581,34 @@ def _ensure_cbd_and_transit_cols(landuse: pd.DataFrame) -> pd.DataFrame:
     lu = landuse.copy()
     zone_col = 'ORDER' if 'ORDER' in lu.columns else lu.columns[0]
 
+    # CBD_ZONES are LEGACY ORDER ids (1-15, 40-45).  In SA2-native landuse the
+    # zone key is the SA2 code (>= 1e6), so a direct isin() was all-False and
+    # is_cbd came out zero-variance (larch doctor: emp.is_cbd variance 0.0),
+    # killing c_cbd_dest / c_cbd_transit / c_cbd_da / c_cbd_sr and the logsum
+    # CBD term.  Bridge the legacy ids to SA2 through the extended
+    # accessibility file's order_legacy column so both key spaces match.
+    _cbd_ids = set(int(z) for z in CBD_ZONES)
+    try:
+        _ext_p = os.path.join('saved_data', 'accessibility_371_extended.csv')
+        if not os.path.exists(_ext_p):
+            _ext_p = os.path.join(os.path.dirname(__file__), 'saved_data',
+                                  'accessibility_371_extended.csv')
+        if os.path.exists(_ext_p):
+            _ext = pd.read_csv(_ext_p, usecols=['zone_id', 'order_legacy']).dropna()
+            _bridge = dict(zip(_ext['order_legacy'].astype(int),
+                               _ext['zone_id'].astype(int)))
+            _cbd_ids |= {_bridge[z] for z in CBD_ZONES if z in _bridge}
+    except Exception as _cbd_e:
+        logger.debug(f"_ensure_cbd_and_transit_cols: CBD bridge skipped ({_cbd_e})")
+
     if 'is_cbd' not in lu.columns:
         if lu.index.name == zone_col:
-            lu['is_cbd'] = lu.index.astype(int).isin(CBD_ZONES).astype(np.float32)
+            lu['is_cbd'] = lu.index.astype(int).isin(_cbd_ids).astype(np.float32)
         else:
-            lu['is_cbd'] = lu[zone_col].astype(int).isin(CBD_ZONES).astype(np.float32)
+            lu['is_cbd'] = lu[zone_col].astype(int).isin(_cbd_ids).astype(np.float32)
+        logger.info(f"_ensure_cbd_and_transit_cols: is_cbd flagged "
+                    f"{int(lu['is_cbd'].sum())} zone(s) "
+                    f"(key={zone_col}, {len(_cbd_ids)} bridged ids)")
 
     if 'transit_walk_acc' not in lu.columns:
         if 'transit_acc' in lu.columns:
@@ -12754,6 +13632,51 @@ def _ensure_cbd_and_transit_cols(landuse: pd.DataFrame) -> pd.DataFrame:
             _lu_num('sa2_area', np.nan))
         _dens = (_emp / _area.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         lu['log_emp_density'] = np.log1p(_dens.clip(lower=0.0)).astype(np.float32)
+
+    # ── Overture occupancy residuals ────────────────────────────────────────
+    # est_workers_resid / est_students_resid live in the Overture landuse
+    # superset (saved_data/zone_landuse_overture.csv) but the default landuse
+    # file lacks them, so _dest_tree zero-filled the columns and
+    # c_est_workers_resid / c_est_students_resid were dead terms (doctor:
+    # residual beta 0).  Merge the two columns by ORDER/zone key when absent;
+    # a no-op when the run already loads the Overture file directly
+    # (USE_OVERTURE_LANDUSE=1 or LANDUSE_CSV).
+    _missing_resid = [c for c in ('est_workers_resid', 'est_students_resid')
+                      if c not in lu.columns]
+    if _missing_resid:
+        try:
+            _ov_p = os.path.join('saved_data', 'zone_landuse_overture.csv')
+            if not os.path.exists(_ov_p):
+                _ov_p = os.path.join(os.path.dirname(__file__), 'saved_data',
+                                     'zone_landuse_overture.csv')
+            if os.path.exists(_ov_p):
+                _ov = pd.read_csv(_ov_p)
+                # The Overture file carries the zone id in SA2_MAIN16 (or an
+                # ORDER/zone_id column); the baseline landuse has SA2_MAIN16
+                # too, so prefer a key present in BOTH frames.
+                _ov_key = _lu_key = None
+                for _cand in ('ORDER', 'zone_id', 'zone', 'SA2_MAIN16'):
+                    if _cand in _ov.columns and _cand in lu.columns:
+                        _ov_key = _lu_key = _cand
+                        break
+                if _ov_key is None:
+                    _ov_key = next((c for c in ('ORDER', 'zone_id', 'zone',
+                                                'SA2_MAIN16')
+                                    if c in _ov.columns), None)
+                    _lu_key = zone_col if zone_col in lu.columns else None
+                if _ov_key and _lu_key:
+                    _ov = _ov.dropna(subset=[_ov_key]).drop_duplicates(_ov_key).set_index(_ov_key)
+                    _target = lu[_lu_key]
+                    for _c in _missing_resid:
+                        if _c in _ov.columns:
+                            lu[_c] = pd.to_numeric(
+                                _target.map(_ov[_c]), errors='coerce').fillna(0.0).values
+                    logger.info(
+                        f"_ensure_cbd_and_transit_cols: merged "
+                        f"{[c for c in _missing_resid if c in lu.columns]} "
+                        f"from zone_landuse_overture.csv")
+        except Exception as _ov_e:
+            logger.debug(f"overture residual merge skipped ({_ov_e})")
 
     return lu
 
@@ -14624,6 +15547,16 @@ def _estimate_mode_model_mixed_logit(mode_model, segment: str,
                            if distribution == 'neglognormal'
                            else lx.mixtures.Normal(param, sd_name))
                 mxl.mixtures.append(mixture)
+                # The sd_* parameter only enters model.pf after the mixture
+                # list is scanned; _pf_set silently no-ops on names not yet in
+                # pf.index.  Without this mangle/unmangle the sd value/bounds
+                # below were discarded and every mixture ran on Larch's
+                # internal defaults.
+                try:
+                    mxl.mangle()
+                    mxl.unmangle()
+                except Exception:
+                    pass
                 try:
                     base_value = float(mode_model.pf.loc[param, 'value'])
                 except Exception:
@@ -18048,12 +18981,32 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                     skim_df=_dest_skim_df,
                     method=_adaptive_dest_method,
                     seed=seed,
+                    dt_dest=dt_d,
+                    segment=segment,
+                    initial_coefs=dict(dest_coef) if dest_coef else None,
                 )
                 dest_coef = dict(dest_coef)
                 dest_coef.update(_adaptive_coef)
                 dest_mdl._coef_cache = dict(dest_coef)
-                dest_mdl._cached_ll = float(_adaptive_dest_metadata['loglike'])
+                # The adaptive estimator fits a COMPACT 5-feature utility, so
+                # its LL is not the full destination model's LL.  Record it
+                # separately (reported as dest_estimator_ll) instead of
+                # overwriting the full Larch/ZIG LL: the coefficient report
+                # used to print the compact-model LL as if every destination
+                # term had been fitted to it.  Only fall back to it when the
+                # full-model fit produced no finite LL at all.
+                _adaptive_ll = float(_adaptive_dest_metadata['loglike'])
+                _full_ll = getattr(dest_mdl, '_cached_ll', float('nan'))
+                try:
+                    _full_ll = float(_full_ll)
+                except (TypeError, ValueError):
+                    _full_ll = float('nan')
+                if not np.isfinite(_full_ll):
+                    dest_mdl._cached_ll = _adaptive_ll
+                dest_mdl._adaptive_dest_ll = _adaptive_ll
                 dest_mdl._adaptive_dest_metadata = dict(_adaptive_dest_metadata)
+                dest_mdl._adaptive_dest_inference = dict(
+                    _adaptive_dest_metadata.get('inference', {}) or {})
                 logger.info(
                     f"_run_segment [{segment}]: SearchLibrium destination estimator "
                     f"{_adaptive_dest_method} accepted ({len(_adaptive_coef)} coefficients, "
@@ -23680,6 +24633,35 @@ def _save_coefficients(models: dict, path: str):
                         if np.isnan(pval) and not np.isnan(tstat):
                             from scipy.stats import norm as _norm
                             pval = float(2.0 * _norm.sf(abs(tstat)))
+                    # ── Adaptive-estimator (MH/Gibbs/SGD) inference overlay ────
+                    # The compact posterior estimator refines a subset of terms
+                    # and caches posterior mean/SE/t/p on the model.  Without
+                    # this overlay those rows kept the estimator's values in
+                    # _coef_cache but showed NaN std_err/t_stat, and could pair
+                    # a posterior value with a stale pf SE.  Overlay all four
+                    # fields together so value = tstat * std_err holds.
+                    _ainf = getattr(mdl, '_adaptive_dest_inference', None) or {}
+                    _arow = _ainf.get(str(param_name))
+                    if isinstance(_arow, dict):
+                        try:
+                            if _arow.get('value') is not None:
+                                val = float(_arow['value'])
+                        except (TypeError, ValueError):
+                            pass
+                        _ase = _arow.get('std_err')
+                        if _ase is not None and np.isfinite(float(_ase)) and float(_ase) > 0:
+                            se = float(_ase)
+                        _at = _arow.get('tstat')
+                        if _at is not None and np.isfinite(float(_at)):
+                            tstat = float(_at)
+                        elif np.isfinite(se) and se > 0:
+                            tstat = float(val) / se
+                        _ap = _arow.get('pval')
+                        pval = float(_ap) if (_ap is not None and np.isfinite(float(_ap))) else float('nan')
+                        if np.isnan(pval) and np.isfinite(tstat):
+                            from scipy.stats import norm as _norm2
+                            pval = float(2.0 * _norm2.sf(abs(tstat)))
+                        holdfast = False
                     # ── Internal-consistency guard ────────────────────────────
                     # t_stat is defined as value/std_err.  A row that violates that
                     # means value and std_err came from different sources (the
@@ -23710,6 +24692,38 @@ def _save_coefficients(models: dict, path: str):
                     }
                     rows.append(r)
                     seg_rows.append(r)
+
+                # ── Behavioural interaction rows (component x people-type) ──
+                # These coefficients live outside the flat UEC pf (they are
+                # generated per run by the interaction spec), so append them
+                # explicitly from the result metadata; otherwise the report
+                # would omit exactly the behavioural deviations the run added.
+                _ixinf = res.get('interaction_inference') if isinstance(res, dict) else None
+                if _ixinf:
+                    from scipy.stats import norm as _norm_ix
+                    for _ixname, _ixin in _ixinf.items():
+                        _ixval = _ixin.get('value')
+                        if _ixval is None:
+                            continue
+                        _ixse = _ixin.get('std_err')
+                        _ixt = _ixin.get('tstat')
+                        if _ixt is None and _ixse:
+                            _ixt = float(_ixval) / float(_ixse)
+                        _ixp = (float(2.0 * _norm_ix.sf(abs(_ixt)))
+                                if _ixt is not None else float('nan'))
+                        _r = {
+                            'segment': seg, 'model_type': mtype,
+                            'parameter': str(_ixname),
+                            'value': float(_ixval),
+                            'std_err': (float(_ixse) if _ixse is not None else float('nan')),
+                            'tstat': (float(_ixt) if _ixt is not None else float('nan')),
+                            'pval': _ixp, 'loglike': ll, 'rho2': rho2,
+                            'holdfast': False,
+                        }
+                        rows.append(_r)
+                        seg_rows.append(_r)
+                    logger.info(f"[{seg}/{mtype}] coefficient report: appended "
+                                f"{len(_ixinf)} behavioural interaction row(s)")
 
                 section = _html_model_table(seg, mtype, seg_rows, ll, rho2,
                                              res.get('n_tours', '?'))

@@ -202,9 +202,16 @@ def fixture_variation(surfaces, top_n=(5, 10, 20)):
     mats = {k: np.asarray(surfaces[k], dtype=float) for k in keys}
     # Per (fixture, site) totals on the original scale for ranking...
     tot = {k: m.sum(axis=1) for k, m in mats.items()}
-    # ...and on a log scale for the variance split, because the raw spread is
-    # dominated by the few biggest arterials.
-    lg = {k: np.log1p(m).mean(axis=1) for k, m in mats.items()}
+    # Per (fixture, site) TOTALS, then log1p. Both stages must use this same
+    # definition or they report different numbers for the same surface: an
+    # earlier version of this function averaged log1p over bins instead
+    # (log1p then mean) while stage 59's _fixture_variation sums bins first
+    # (mean then log1p), and the two disagreed on job 26107921's surface --
+    # 3.2% between-fixture variance here against 5.4% there. A measurement two
+    # components report differently is worse than one, because neither can be
+    # used to gate anything.
+    lg = {k: np.log1p(np.asarray(m, dtype=float).sum(axis=1)) for k, m in
+          mats.items()}
     common = sorted(set.intersection(*[set(np.nonzero(t)[0].tolist())
                                        for t in tot.values()]))
     if len(common) < 2:

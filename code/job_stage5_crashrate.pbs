@@ -1,0 +1,162 @@
+#!/bin/bash -l
+#PBS -N qld_crashrate
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=4:mem=128GB
+#PBS -m n
+#PBS -r y
+
+# ─────────────────────────────────────────────────────────────────────────────
+# job_stage5_crashrate.pbs
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage-5 destination with a DISTANCE-ORTHOGONAL crash measure, estimated by
+# SearchLibrium MH, and compared against the raw-CRASH baseline.
+#
+# WHY. The destination crash coefficient is currently frozen out by
+# collinearity in the 30/09 run:
+#     c_crash_safety_dest  0.0000  (holdfasted)
+#     c_crash_safety       0.0000  (holdfasted: collinear)
+# and the raw CRASH count is partly a distance proxy (longer OD pairs simply
+# accumulate more crashes). Measured over all off-diagonal pairs of the
+# 371-zone matrices:
+#     corr(log DIST, log CRASH)              = +0.180   (R^2 0.032)
+#     corr(log DIST, log crash_rate_total)   = -0.126   (R^2 0.016)
+#     corr(log DIST, log crash_runoff)       = +0.377   (R^2 0.142)
+# so crash_rate_total (a per-km RATE) keeps crash identifiable separately from
+# distance. `c_crash: c_log_dist` orthogonalisation is ALREADY configured in
+# ga_constraints stage5_dest.orthogonalize_on, and stays on (STAGE5_DEST_ORTHOG=1).
+#
+# The alternative sample stays CLOSED FORM: observed DTAZ force-included
+# (Manski-Lerman 1977) + (N-1) importance draws from size_term, with the
+# correction log_correction = -log(q) LOCKED at 1.0
+# (stage5_destination_choice.py:8980). Same estimator family as TRANSP-OR
+# (Frejinger-Bierlaire-Ben-Akiva 2009). No change to that machinery here.
+#
+# USAGE
+#   # crash-rate arm
+#   qsub -v ARM=crash_rate job_stage5_crashrate.pbs
+#   # raw-CRASH control arm
+#   qsub -v ARM=crash_raw  job_stage5_crashrate.pbs
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV:-zigenv}"
+module unload Anaconda3
+
+ARM="${ARM:-crash_rate}"
+STAGE5_DEST_ESTIMATOR="${STAGE5_DEST_ESTIMATOR:-mh}"
+STAGE5_CONVERGENCE_MIN_ESS="${STAGE5_CONVERGENCE_MIN_ESS:-20}"
+STAGE5_DEST_SAMPLE_SIZE="${STAGE5_DEST_SAMPLE_SIZE:-20}"
+STAGE5_DEST_MH_DRAWS="${STAGE5_DEST_MH_DRAWS:-32000}"
+PIPELINE_SEED="${PIPELINE_SEED:-42}"
+
+# 371-zone universe
+export NEW_POP=1 NEW_POP_MAPPED=0
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+export PIPELINE_SEED PIPELINE_ACCELERATOR=cpu LARCH_FORCE_JAX=1
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+export PYTHONPATH="${PBS_O_WORKDIR}:${PYTHONPATH:-}"
+export JAX_PLATFORMS=cpu JAX_PLATFORM_NAME=cpu CUDA_VISIBLE_DEVICES=""
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+
+case "${ARM}" in
+  crash_rate)
+    # per-km crash rate: least confounded with distance (R^2 0.016)
+    export STAGE5_CRASH_SKIMS="${STAGE5_CRASH_SKIMS:-../demand_/crash_matrices_371.omx}"
+    export STAGE5_CRASH_MATRIX="${STAGE5_CRASH_MATRIX:-crash_rate_total}"
+    ;;
+  crash_raw)
+    # control: CRASH from the main skims (current behaviour)
+    unset STAGE5_CRASH_SKIMS STAGE5_CRASH_MATRIX || true
+    ;;
+  crash_length)
+    export STAGE5_CRASH_SKIMS="${STAGE5_CRASH_SKIMS:-../demand_/crash_matrices_371.omx}"
+    export STAGE5_CRASH_MATRIX="${STAGE5_CRASH_MATRIX:-crash_length_km}"
+    ;;
+  *) echo "FATAL: ARM must be crash_rate|crash_raw|crash_length (got '${ARM}')" >&2; exit 2 ;;
+esac
+
+export STAGE5_DEST_ESTIMATOR STAGE5_CONVERGENCE_MIN_ESS STAGE5_DEST_SAMPLE_SIZE
+export STAGE5_DEST_MH_DRAWS
+export STAGE5_DEST_ORTHOG="${STAGE5_DEST_ORTHOG:-1}"   # keeps c_crash ⊥ c_log_dist
+export STAGE5_STRICT_ESTIMATION=1
+export STAGE5_REQUIRE_DEST_ESTIMATION=1
+export STAGE5_MIN_TOURS="${STAGE5_MIN_TOURS:-30}"
+
+OUT="runs/stage5_compare/crash_${ARM}_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "${OUT}/plots"
+
+{
+  echo "=========================================================="
+  echo "Stage-5 crash-measure arm : ${ARM}"
+  echo "PBS job                   : ${PBS_JOBID:-local}"
+  echo "Node                      : $(hostname)"
+  echo "Estimator                 : ${STAGE5_DEST_ESTIMATOR}"
+  echo "Crash matrix              : ${STAGE5_CRASH_MATRIX:-CRASH (from skims)}"
+  echo "Crash skims               : ${STAGE5_CRASH_SKIMS:-<main skims>}"
+  echo "Sample of alternatives    : ${STAGE5_DEST_SAMPLE_SIZE} (Manski-Lerman, locked -log q)"
+  echo "MH draws                  : ${STAGE5_DEST_MH_DRAWS}"
+  echo "min ESS                   : ${STAGE5_CONVERGENCE_MIN_ESS}"
+  echo "Output                    : ${OUT}"
+  echo "Started                   : $(date)"
+  echo "=========================================================="
+} | tee "${OUT}/job.out"
+
+# Preflight: confirm the requested matrix actually exists before spending hours.
+python - <<'PYEOF' 2>&1 | tee -a "${OUT}/job.out" || exit 2
+import os, sys
+try:
+    import h5py
+except Exception as exc:
+    print(f"FATAL: h5py unavailable: {exc}", file=sys.stderr); raise SystemExit(2)
+p = os.environ.get("STAGE5_CRASH_SKIMS", os.environ["PIPELINE_SKIMS_PATH"])
+want = os.environ.get("STAGE5_CRASH_MATRIX", "CRASH")
+if not os.path.isfile(p):
+    print(f"FATAL: crash skims not found: {p}", file=sys.stderr); raise SystemExit(2)
+with h5py.File(p, "r") as f:
+    names = []
+    def visit(n, o):
+        if hasattr(o, "shape") and getattr(o, "shape", None) and len(o.shape) == 2:
+            names.append(n.replace("data/", ""))
+    f.visititems(visit)
+    print(f"  crash source : {p}")
+    print(f"  matrix wanted: {want}")
+    print(f"  available    : {sorted(set(names))[:12]}")
+    if f"data/{want}" not in f and want not in f:
+        print(f"FATAL: matrix {want!r} not present", file=sys.stderr); raise SystemExit(2)
+print("  preflight OK")
+PYEOF
+
+set +e
+python -u stage5_compare_runner.py \
+    --out-dir "${OUT}" \
+    --min-ess "${STAGE5_CONVERGENCE_MIN_ESS}" \
+    --required-segments work,edu,nonmand \
+    > "${OUT}/runner.stdout" 2> "${OUT}/runner.stderr"
+RC=$?
+set -e
+
+cat "${OUT}/runner.stdout" >> "${OUT}/job.out"
+cat "${OUT}/runner.stderr" >> "${OUT}/job.err" 2>/dev/null || true
+
+# Report the crash coefficient so the arm is interpretable at a glance.
+python - "${OUT}" <<'PYEOF' 2>&1 | tee -a "${OUT}/job.out"
+import csv, glob, os, sys
+out = sys.argv[1]
+for p in glob.glob(os.path.join(out, "**", "*coefficients*.csv"), recursive=True):
+    rows = list(csv.DictReader(open(p, encoding="utf-8")))
+    crash = [r for r in rows if "crash" in r.get("parameter", "").lower()
+             and r.get("model_type") == "destination"]
+    print(f"  --- {os.path.relpath(p, out)} ---")
+    for r in crash:
+        hf = r.get("holdfast")
+        print(f"    {r['segment']:8s} {r['parameter']:24s} value={r['value']:>10s} "
+              f"t={r.get('tstat',''):>8s} {'[HOLDFAST - not identified]' if hf=='True' else ''}")
+PYEOF
+
+echo "Finished: $(date) exit_code=${RC}" | tee -a "${OUT}/job.out"
+exit "${RC}"

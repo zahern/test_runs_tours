@@ -64,10 +64,23 @@ def _loglik(eta, k, n):
     return float(np.sum(k * eta - n * ls))
 
 
-def _fit_one(eta0, k, n, X, ridge, maxiter, tol):
-    """Newton/IRLS with a ridge. Returns (beta, loglik, iters, diverged)."""
+def _fit_one(eta0, k, n, X, ridge, maxiter, tol, prior_prec=None):
+    """Newton/IRLS for the (penalized) likelihood.
+
+    prior_prec, when given, is a per-column Gaussian prior PRECISION vector:
+    the objective becomes loglik - 0.5 * sum(prior_prec * beta^2), i.e. a MAP
+    fit under independent N(0, 1/prior_prec) priors. The Newton system and
+    the damping test both use the penalized objective, so the step can never
+    decrease it. Returns (beta, loglik_penalized, iters, diverged).
+    """
+    def _obj(b):
+        ll = _loglik(X @ b, k, n)
+        if prior_prec is not None:
+            ll = ll - 0.5 * float(np.sum(prior_prec * b * b))
+        return ll
+
     beta = np.array(eta0, dtype=float)
-    ll = _loglik(X @ beta, k, n)
+    ll = _obj(beta)
     diverged = False
     it = 0
     for it in range(1, maxiter + 1):
@@ -80,22 +93,25 @@ def _fit_one(eta0, k, n, X, ridge, maxiter, tol):
         grad = X.T @ (k - n * p)
         XtW = X.T * w
         H = XtW @ X
+        if prior_prec is not None:
+            grad = grad - prior_prec * beta
+            H = H + np.diag(prior_prec)
         if ridge:
             H = H + ridge * np.eye(H.shape[0])
         try:
             step = np.linalg.solve(H, grad)
         except np.linalg.LinAlgError:
             step = np.linalg.lstsq(H, grad, rcond=None)[0]
-        # damped step: never let the loglik get worse
+        # damped step: never let the (penalized) objective get worse
         scale = 1.0
         cand = beta + step
-        cand_ll = _loglik(X @ cand, k, n)
+        cand_ll = _obj(cand)
         for _ in range(40):
             if np.isfinite(cand_ll) and cand_ll >= ll - 1e-12:
                 break
             scale *= 0.5
             cand = beta + scale * step
-            cand_ll = _loglik(X @ cand, k, n)
+            cand_ll = _obj(cand)
         if not np.isfinite(cand_ll):
             diverged = True
             break
@@ -119,8 +135,9 @@ def fit_binomial_logit(
     tol=1e-10,
     sep_tol=1e4,
     drop_degenerate=True,
+    prior_sd=None,
 ):
-    """Fit k ~ Binomial(n, sigmoid(X beta)).
+    """Fit k ~ Binomial(n, sigmoid(X beta)), optionally as a MAP fit.
 
     Parameters
     ----------
@@ -132,12 +149,19 @@ def fit_binomial_logit(
     ridge : L2 ridge added to the Hessian only (0 = pure MLE)
     sep_tol : |beta| above which the fit is declared separated
     drop_degenerate : silently drop constant / all-zero columns
+    prior_sd : optional dict {column name -> prior sd}, evaluated on the
+        FINAL column names ("(intercept)" included). Independent Gaussian
+        priors, MAP-fitted; the returned cov is then the Laplace posterior
+        covariance (inverse posterior precision), and `laplace_evidence`
+        is log p(y) up to a prior-independent constant, so different
+        prior_sd dicts on the same design/data are directly comparable.
 
     Returns
     -------
     dict with keys
       coef, se, loglik, aic, bic, n_obs, n_trials, n_successes,
-      converged, separated, dropped, names, fitted_p
+      converged, separated, dropped, names, fitted_p,
+      loglik_pen, logdet_H, laplace_evidence, prior_prec
     """
     k = np.asarray(k, dtype=float).ravel()
     n = np.asarray(n, dtype=float).ravel()
@@ -192,6 +216,27 @@ def fit_binomial_logit(
     if X.shape[1] == 0:
         raise BinomialFitError("no usable columns after dropping degenerate")
 
+    # Gaussian prior precision aligned to the FINAL columns. A prior_sd entry
+    # of None/0/NaN leaves that coefficient flat. Aliases: callers may use
+    # "__INTERCEPT__" for the intercept.
+    prior_prec = None
+    if prior_sd:
+        _p = np.zeros(X.shape[1])
+        for j, c in enumerate(cols):
+            sd = prior_sd.get(c)
+            if sd is None and c == "(intercept)":
+                sd = prior_sd.get("__INTERCEPT__")
+            if sd is not None and np.isfinite(sd) and float(sd) > 0:
+                _p[j] = 1.0 / float(sd) ** 2
+        if np.any(_p > 0):
+            prior_prec = _p
+
+    def _obj(b):
+        v = _loglik(X @ b, k, n)
+        if prior_prec is not None:
+            v = v - 0.5 * float(np.sum(prior_prec * b * b))
+        return v
+
     # start from the null fit (intercept only) or zeros
     if intercept:
         rate = float(np.clip(k.sum() / max(n.sum(), 1e-12), 1e-6, 1 - 1e-6))
@@ -200,15 +245,21 @@ def fit_binomial_logit(
     else:
         start = np.zeros(X.shape[1])
 
-    beta, ll, iters, diverged = _fit_one(start, k, n, X, ridge, maxiter, tol)
+    beta, ll_pen, iters, diverged = _fit_one(
+        start, k, n, X, ridge, maxiter, tol, prior_prec=prior_prec)
+    ll = _loglik(X @ beta, k, n)
 
-    # standard errors from the inverse observed information
+    # Posterior precision at the MAP. With a prior this is the Laplace
+    # posterior covariance (inverse posterior precision); with a flat prior
+    # it is the ordinary observed-information covariance.
     eta = X @ beta
     p = np.where(eta >= 0, 1.0 / (1.0 + np.exp(-np.abs(eta))),
                  np.exp(-np.abs(eta)) / (1.0 + np.exp(-np.abs(eta))))
     w = np.maximum(n * p * (1.0 - p), 1e-10)
     XtW = X.T * w
     H = XtW @ X
+    if prior_prec is not None:
+        H = H + np.diag(prior_prec)
     if ridge:
         H = H + ridge * np.eye(H.shape[0])
     try:
@@ -217,6 +268,27 @@ def fit_binomial_logit(
     except np.linalg.LinAlgError:
         cov = np.linalg.pinv(H)
         se = np.sqrt(np.clip(np.diag(cov), 0.0, np.inf))
+    try:
+        sign, logdet_H = np.linalg.slogdet(H)
+        logdet_H = float(logdet_H) if sign > 0 else float("nan")
+    except np.linalg.LinAlgError:
+        logdet_H = float("nan")
+    # Laplace log evidence log p(y), up to a constant independent of the
+    # prior (same design and data):
+    #     loglik_pen - 0.5 logdet(H) + 0.5 sum(log prior_prec)
+    # The last term is the prior normaliser. WITHOUT it the comparison
+    # silently prefers the widest prior (the missing term is exactly the
+    # Occam penalty on prior volume), which is the opposite of the intended
+    # behaviour. Only defined for proper priors: comparing a truly flat fit
+    # against a proper-prior fit is invalid, so every evidence grid must use
+    # proper (possibly very weak) priors throughout.
+    log_prior_norm = (float(np.sum(np.log(prior_prec[prior_prec > 0])))
+                      if prior_prec is not None
+                      and np.any(prior_prec > 0) else float("nan"))
+    laplace_evidence = (
+        float(ll_pen - 0.5 * logdet_H + 0.5 * log_prior_norm)
+        if (np.isfinite(logdet_H) and np.isfinite(log_prior_norm))
+        else float("nan"))
 
     # expected information (alternative convention), for transparency
     try:
@@ -254,8 +326,8 @@ def fit_binomial_logit(
         for t in (1.0, 10.0, 50.0):
             cand = beta.copy()
             cand[j] += t * np.sign(beta[j])
-            lls.append(_loglik(X @ cand, k, n))
-        if lls[1] > ll + 1e-9 and lls[2] > ll + 1e-9:
+            lls.append(_obj(cand))
+        if lls[1] > ll_pen + 1e-9 and lls[2] > ll_pen + 1e-9:
             runaway = True
     separated = bool(diverged or perfect or runaway
                      or not np.all(np.isfinite(beta))
@@ -280,4 +352,13 @@ def fit_binomial_logit(
         "names": cols,
         "fitted_p": p,
         "design_columns": int(X.shape[1]),
+        # Laplace-approximation extras. loglik_pen is the MAP objective;
+        # logdet_H the log-determinant of the posterior precision; evidence
+        # is comparable across priors on the same design/data.
+        "loglik_pen": float(ll_pen),
+        "logdet_H": logdet_H,
+        "log_prior_norm": log_prior_norm,
+        "laplace_evidence": laplace_evidence,
+        "prior_prec": (None if prior_prec is None
+                       else [float(x) for x in prior_prec]),
     }

@@ -234,9 +234,27 @@ def _coef_table(sdir, sid, seg):
             nm = _esc(x['name']) + (' \\textsuperscript{(held)}' if x['held'] else '')
             slot = _esc(str(r.get(modelc, r.get(segc, '')))) if modelc \
                 else _esc(str(r.get(segc, '')))
+            # Inference-consistency guard on read: some stage 1-3 CSVs carry a
+            # t_stat/p_value misaligned with value/SE (e.g. t=957 for -13.43/0.52).
+            # The Wald t is value/SE by definition, so recompute t and p whenever
+            # SE is valid and the stored t disagrees. Keeps reused (not re-run)
+            # stages correct in the paper without re-estimation.
+            t_disp, p_disp = r.get(tc, ''), r.get(pc, '')
+            try:
+                _v = float(r.get('value', '')); _se = float(r.get(sec, ''))
+                _t = float(t_disp)
+                if math.isfinite(_v) and math.isfinite(_se) and _se > 0:
+                    _impl = _v / _se
+                    if (not math.isfinite(_t)
+                            or abs(_impl - _t) > max(0.05, 0.01 * abs(_impl))):
+                        from scipy.stats import norm as _n
+                        t_disp = _impl
+                        p_disp = float(2.0 * _n.sf(abs(_impl)))
+            except (TypeError, ValueError):
+                pass
             lines.append('%s & %s & %s & %s & %s & %s \\\\' % (
                 nm, slot, _fmt_num(r.get('value', '')), _fmt_num(r.get(sec, '')),
-                _fmt_num(r.get(tc, ''), 2), _fmt_num(r.get(pc, ''))))
+                _fmt_num(t_disp, 2), _fmt_num(p_disp)))
             n_shown += 1
     lines.append('\\bottomrule\\end{tabular}}\\end{center}')
     # Convergence line from the per-model metadata when present.

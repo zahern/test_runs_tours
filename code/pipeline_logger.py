@@ -1602,6 +1602,68 @@ def _save_stage_coef_csv(models: dict, stage_name: str, save_dir: str):
             return ("<p>This report shows the estimated parameters for this stage. "
                     "Check the parameter signs, standard errors, and t-statistics for the most defensible interpretation.</p>")
 
+    # ── Inference-consistency guard + convergence columns ──────────────────
+    # The estimators' t_stat_/p_value_ arrays are sometimes misaligned with the
+    # coefficient order (observed: Stage 2 n_work_out value=-13.43, SE=0.52 but
+    # a reported t_stat of 957 / 1640 — clearly value/SE, i.e. ~26, mispaired
+    # with a threshold's t). The Wald t is DEFINED by value/SE, so recompute it
+    # (and the p-value) whenever SE is valid and the stored t disagrees. This is
+    # the same guarantee the Stage-5 saver already enforces. Also stamp per-model
+    # convergence metadata (loglike / loglike_null / rho2 / iterations /
+    # converged) so the report and paper appendix can show real final-fit
+    # convergence, mirroring Stage 5. Best-effort; never raises.
+    try:
+        from scipy.stats import norm as _norm
+        # Per-model convergence lookup keyed by segment, read from the model obj.
+        _conv = {}
+        for _k, _obj in (models.items() if hasattr(models, 'items') else []):
+            _inner = _obj.get('model') if isinstance(_obj, dict) else _obj
+            def _g(*names):
+                for _src in (_obj if isinstance(_obj, dict) else {}, _inner):
+                    for _n in names:
+                        _v = (_src.get(_n) if isinstance(_src, dict)
+                              else getattr(_src, _n, None))
+                        if _v is not None:
+                            try:
+                                return float(_v)
+                            except Exception:
+                                return _v
+                return None
+            _conv[_k] = {
+                'loglike':      _g('loglike', 'll', 'log_likelihood', 'llf', '_cached_ll'),
+                'loglike_null': _g('loglike_null', 'll_null', 'llnull', '_cached_ll_null'),
+                'n_iter':       _g('n_iter', 'nit', 'iterations', 'n_iterations', '_cached_nit'),
+                'converged':    _g('converged', 'success', '_cached_converged'),
+            }
+        for r in rows:
+            try:
+                v = float(r.get('value')); se = float(r.get('std_err'))
+            except (TypeError, ValueError):
+                v, se = float('nan'), float('nan')
+            t = r.get('t_stat')
+            try:
+                t = float(t)
+            except (TypeError, ValueError):
+                t = float('nan')
+            if np.isfinite(se) and se > 0 and np.isfinite(v):
+                implied = v / se
+                if (not np.isfinite(t)) or abs(implied - t) > max(0.05, 0.01 * abs(implied)):
+                    r['t_stat'] = implied
+                    r['p_value'] = float(2.0 * _norm.sf(abs(implied)))
+            c = _conv.get(r.get('segment'), {})
+            _lln = c.get('loglike_null'); _ll = c.get('loglike')
+            r.setdefault('loglike', _ll if _ll is not None else float('nan'))
+            r['loglike_null'] = _lln if _lln is not None else float('nan')
+            if (_ll is not None and _lln not in (None, 0) and np.isfinite(float(_ll))
+                    and np.isfinite(float(_lln)) and float(_lln) != 0):
+                r['rho2'] = 1.0 - float(_ll) / float(_lln)
+            else:
+                r.setdefault('rho2', float('nan'))
+            r['n_iter'] = c.get('n_iter')
+            r['converged'] = c.get('converged')
+    except Exception as _cge:
+        logger.debug(f"_save_stage_coef_csv consistency/convergence pass skipped: {_cge}")
+
     coef_path = os.path.join(save_dir, f'{stage_name}_coefficients.csv')
     coef_df = pd.DataFrame(rows)
     coef_df.to_csv(coef_path, index=False)

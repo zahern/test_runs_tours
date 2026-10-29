@@ -670,7 +670,14 @@ def load_synth(filepath: str = DEFAULT_SYNTH,
     synth = pd.read_csv(filepath)
 
     zone_id = _parse_zone_id(filepath)
-    if zone_id is not None:
+    # ZONE MIGRATION (371): order_N.csv carries a legacy ORDER label; the active
+    # system is SA2-keyed. Use the SA2 code as OTAZ so the synth population aligns
+    # with the 371-SA2 landuse and skims (the legacy ORDER is a retired ordering
+    # whose SA2 mapping disagrees with seq_zone_ids_371.csv).
+    if 'SA2_MAIN16' in synth.columns:
+        synth['OTAZ'] = pd.to_numeric(
+            synth['SA2_MAIN16'], errors='coerce').fillna(0).astype(int)
+    elif zone_id is not None:
         synth['OTAZ'] = zone_id
     elif 'ORDER' in synth.columns:
         synth['OTAZ'] = synth['ORDER'].astype(int)
@@ -773,7 +780,13 @@ def load_synth_all_zones(synth_dir: str = SYNTH_DIR,
             continue
         try:
             df = pd.read_csv(filepath)
-            df['OTAZ'] = otaz       # override/set from filename — always correct
+            # ZONE MIGRATION (371): use the SA2 code as OTAZ so the synth
+            # population aligns with the 371-SA2 landuse and skims.
+            if 'SA2_MAIN16' in df.columns:
+                df['OTAZ'] = pd.to_numeric(
+                    df['SA2_MAIN16'], errors='coerce').fillna(0).astype(int)
+            else:
+                df['OTAZ'] = otaz
             frames.append(df)
         except Exception as e:
             logger.warning(f"  Failed to load {filepath}: {e}")
@@ -1113,7 +1126,11 @@ def cdap(out, synth, landuse=None, feature_override=None):
                         from cdap_households_estimation import estimate_household_cdap as _est_hh
                         from cdap import build_person_profiles as _bpp
                         _hp = out.get('persons') if isinstance(out, dict) else None
-                        _ht = (out.get('tours') or out.get('trips')) if isinstance(out, dict) else None
+                        _ht = None
+                        if isinstance(out, dict):
+                            _ht = out.get('tours')
+                            if _ht is None:
+                                _ht = out.get('trips')
                         if _hp is not None and _ht is not None and len(_hp):
                             _hp2 = _hp if 'ptype' in _hp.columns else _bpp(_hp)
                             _cfg = _est_hh(_hp2, _ht, base=_cfg, out_dir=OUT_DIR)
@@ -3260,7 +3277,7 @@ def _trips_to_seg_table(trips: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFr
                 if c != pid_col and c not in t.columns
                 and c in ['ptype', 'WORKSTAT', 'STUDYING', 'income_hi', 'income_lo',
                            'vehrd', 'has_vehicle', 'has_licence', 'indp', 'indp_group',
-                           'income_band', 'age_group', 'veh_bin', 'age']
+                           'income_band', 'age_group', 'veh_bin', 'age', 'bikes']
             ]
             t = t.merge(persons[_person_cols], left_on=t_pid,
                         right_on=pid_col, how='left', suffixes=('', '_person'))
@@ -3863,7 +3880,28 @@ def predict_stage3(synth_s2, models=None):
         models = load_models(os.path.join(OUT_DIR, 'stage3_models.pkl'))
     _use_mdcev = os.environ.get('STAGE3_USE_MDCEV', '0') == '1'
     logger.info(f"  Predicting activity durations for {len(synth_s2):,} persons...")
-    result = predict_activity_durations(synth_s2, models, use_mdcev=_use_mdcev)
+    # Chunked by person to bound peak memory: the full-population call expands
+    # 3.65M persons to ~4.5M activities and builds per-person Python objects
+    # (person-offset dicts, per-purpose feature matrices), which pushed the
+    # 194 GB nodes over their limit and got the 16/10 safety/predict jobs
+    # OOM-killed mid-stage-3 (198-203 GB RSS).  STAGE3_PREDICT_CHUNK=0
+    # restores the old single-shot behaviour.
+    try:
+        _chunk = int(os.environ.get('STAGE3_PREDICT_CHUNK', '500000') or '500000')
+    except ValueError:
+        _chunk = 500000
+    if _chunk > 0 and len(synth_s2) > _chunk:
+        _parts = []
+        for _i, _start in enumerate(range(0, len(synth_s2), _chunk)):
+            _sub = synth_s2.iloc[_start:_start + _chunk]
+            logger.info(f"  Stage 3 chunk {_i + 1}: persons "
+                        f"{_start:,}-{_start + len(_sub) - 1:,} ({len(_sub):,})")
+            _parts.append(predict_activity_durations(_sub, models,
+                                                     use_mdcev=_use_mdcev))
+        result = pd.concat(_parts, ignore_index=True)
+        del _parts
+    else:
+        result = predict_activity_durations(synth_s2, models, use_mdcev=_use_mdcev)
     # ── Tag joint-activity rows (structural household-CDP → purpose bridge) ──
     # When the household joint-tour path produced a joint map (stage1_joint_map.csv),
     # mark the shared activity rows so joint destination/mode/scheduling can be
@@ -5044,11 +5082,16 @@ def _format_ga_checkpoint_summary(res) -> dict:
     return summary
 
 
-def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -> None:
+def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None,
+                                       segments=None) -> None:
     """
     Re-estimate stage `sid` using the GA's best-selected features and write
     coefficient HTML + models pkl to OUT_DIR (mirrors the main pipeline layout)
     and also to the ga_reports/ subdir.
+
+    segments : optional list of stage-5 segment keys to refit. Defaults to all
+        three (work, edu, nonmand). Shard promotion passes a single segment so
+        a shard's features only refit that shard's segment (3x cheaper).
     """
     from ga_hypothesis_testing import _ga_save_stage_coef_csv
     if res is None:
@@ -5295,13 +5338,25 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
         elif sid == 23:
             # Joint Stage 2+3 Weibull AFT model — already fitted by ga_stage23_joint.
             # Re-persist from the metadata dict so coefficients land in OUT_DIR.
-            _j23_models = (res.metadata or {}).get('stage23_joint_models') if res else None
+            _j23_meta = (res.metadata or {}) if res else {}
+            _j23_models = _j23_meta.get('stage23_joint_models')
+            _j23_pkl = os.path.join(OUT_DIR, 'stage23_joint_models.pkl')
             if _j23_models and _j23_models.get('success'):
-                _j23_pkl = os.path.join(OUT_DIR, 'stage23_joint_models.pkl')
                 with open(_j23_pkl, 'wb') as _f:
                     pickle.dump(_j23_models, _f)
                 logger.info(f"GA stage23_joint models → {_j23_pkl}")
-                # Also copy to saved_data/ for downstream consumption
+            elif _j23_meta.get('stage23_joint_models_pkl') or os.path.exists(_j23_pkl):
+                # Models were offloaded to disk (GA_OFFLOAD_STAGE23_MODELS); the
+                # pkl is already written — just make sure OUT_DIR has it.
+                _src = _j23_meta.get('stage23_joint_models_pkl') or _j23_pkl
+                if _src != _j23_pkl and os.path.exists(_src):
+                    import shutil as _sh0
+                    _sh0.copy2(_src, _j23_pkl)
+                logger.info(f"GA stage23_joint models (offloaded) → {_j23_pkl}")
+            else:
+                logger.warning("_ga_save_stage_coef_html_from_best sid=23: no joint model in metadata")
+            # Copy to saved_data/ for downstream consumption (live or offloaded).
+            if os.path.exists(_j23_pkl):
                 import shutil as _sh
                 _sd_pkl = os.path.join('saved_data', 'stage23_joint_models.pkl')
                 try:
@@ -5309,8 +5364,6 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                     logger.info(f"GA stage23_joint models → {_sd_pkl}")
                 except Exception as _ce:
                     logger.warning(f"stage23_joint copy to saved_data failed: {_ce}")
-            else:
-                logger.warning("_ga_save_stage_coef_html_from_best sid=23: no joint model in metadata")
         elif sid == 2:
             from stage2_day_duration import aggregate_person_day, estimate_day_models
             pd_df = aggregate_person_day(out['tours'], out['persons'])
@@ -5378,7 +5431,7 @@ def _ga_save_stage_coef_html_from_best(sid: int, res, out: dict, landuse=None) -
                     _skim_df = _pd.DataFrame()
                     logger.warning(f"GA stage 5 coef HTML: skim_flat failed: {_se}")
                 _lu = landuse if landuse is not None else getattr(res, 'metadata', {}).get('landuse')
-                for _seg in ['work', 'edu', 'nonmand']:
+                for _seg in (list(segments) if segments else ['work', 'edu', 'nonmand']):
                     try:
                         _st = _filter_seg(_hhts_input, _seg)
                         if not isinstance(_st, (pd.DataFrame, type(None))):
@@ -6000,6 +6053,7 @@ def ga_stage23_joint(out):
 
     # Persist the final JAX joint model
     final_models = (res.metadata or {}).get('stage23_joint_models')
+    pkl_path = None
     if final_models:
         pkl_path = os.path.join(OUT_DIR, 'stage23_joint_models.pkl')
         with open(pkl_path, 'wb') as fh:
@@ -6011,7 +6065,29 @@ def ga_stage23_joint(out):
         with open(summary_path, 'w') as fh:
             fh.write(joint_model_summary(final_models))
 
-    out['stage23_joint_models'] = final_models
+    # Memory: the fitted Stage 2+3 JAX models (datasets + compiled flows) are
+    # otherwise pinned in RAM for the whole run — through the Stage 4/5/6
+    # searches — yet nothing reads them again until the final prediction, which
+    # loads them back from the pkl just written. Offload them to disk and drop
+    # the live references so they can be collected before Stage 5 (the heaviest
+    # search). The downstream consumer falls back to stage23_joint_models_pkl.
+    # Disable with GA_OFFLOAD_STAGE23_MODELS=0.
+    _offload = os.environ.get('GA_OFFLOAD_STAGE23_MODELS', '1') == '1'
+    if _offload and pkl_path:
+        try:
+            res.metadata['stage23_joint_models_pkl'] = pkl_path
+            res.metadata['stage23_joint_models'] = None
+            out['stage23_joint_models'] = pkl_path
+            del final_models
+            import gc as _gc
+            _gc.collect()
+            logger.info("Stage 2+3 models offloaded to disk; freed from RAM "
+                        "for the remaining stage searches")
+        except Exception:
+            out['stage23_joint_models'] = (res.metadata or {}).get(
+                'stage23_joint_models')
+    else:
+        out['stage23_joint_models'] = final_models
     return res
 
 
@@ -7315,20 +7391,23 @@ def main(filepath: str = None):
             _s5_pl = __import__('stage5_destination_choice',
                                 fromlist=['load_models']).load_models(
                                     os.path.join(OUT_DIR, 'stage5_models.pkl'))
-            # skim_df for logsum computation — use the skims path directly
+            # Pass the OPEN OMX handle (not a flattened DataFrame): the
+            # _logsums numpy fallback (default path) reads matrices by name
+            # from the handle; a DataFrame degrades every time/impedance
+            # term to a constant and flattens the accessibility surface.
             import openmatrix as omx
-            from stage5_destination_choice import _skim_flat
             _sk_pl = omx.open_file(PIPELINE_SKIMS_PATH, 'r')
-            _skdf = _skim_flat(_sk_pl)
-            _acc_df2 = compute_logsum_accessibility(
-                _s5_pl, landuse, _skdf, persons=out.get('persons'))
+            try:
+                _acc_df2 = compute_logsum_accessibility(
+                    _s5_pl, landuse, _sk_pl, persons=out.get('persons'))
+            finally:
+                _sk_pl.close()
             landuse = attach_logsum_to_landuse(landuse, _acc_df2)
-            _sk_pl.close()
             _n2 = sum(1 for c in _acc_df2.columns
                       if c.startswith('logsum_'))
             logger.info(
                 f"  Phase 2: {_n2} logsum_acc columns attached to landuse")
-            del _s5_pl, _acc_df2, _sk_pl, _skdf
+            del _s5_pl, _acc_df2, _sk_pl
             gc.collect()
         except Exception as _p2e:
             logger.warning(
@@ -9969,6 +10048,7 @@ if __name__ == "__main__":
             "mcr_search",
             "safety_baseline",
             "safety_nosafety",
+            "safety_counterfactual",
             "safety_compare",
             "hhts_core",
             "hhts_search",
@@ -10029,11 +10109,14 @@ if __name__ == "__main__":
         )
     elif mode == 'list_searches':
         _print_model_zoo_searches()
-    elif mode in ('safety_baseline', 'safety_nosafety'):
+    elif mode in ('safety_baseline', 'safety_nosafety', 'safety_counterfactual'):
         # Safety-skim experiment modes.
-        # safety_baseline  → run normally (safety skims INCLUDED in stage 5)
-        # safety_nosafety  → exclude CRASH + CRASHPT from stage 5 estimation
-        os.environ['SAFETY_EXPERIMENT_MODE'] = mode.replace('safety_', '')
+        # safety_baseline        → run normally (safety skims INCLUDED in stage 5)
+        # safety_nosafety        → exclude CRASH + CRASHPT from stage 5 estimation
+        # safety_counterfactual  → skims INCLUDED, destination crash exposure
+        #                          scaled to (1-delta) via STAGE5_CRASH_SCALE
+        os.environ['SAFETY_EXPERIMENT_MODE'] = (
+            'nosafety' if mode == 'safety_nosafety' else 'baseline')
         logger.info(f"Safety experiment mode: {os.environ['SAFETY_EXPERIMENT_MODE']}")
         main(arg)
     elif mode == 'safety_compare':

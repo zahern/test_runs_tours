@@ -114,8 +114,26 @@ MODE_MAP     = {'DA': 1, 'SR': 2, 'Walk': 3, 'Bike': 4, 'Transit': 5}
 MODE_NAMES   = {1: 'DA', 2: 'SR', 3: 'Walk', 4: 'Bike', 5: 'Transit'}
 TRANSIT_SUBMODE_MAP = {'Bus': 1, 'Train': 2}
 TRANSIT_SUBMODE_NAMES = {1: 'Bus', 2: 'Train'}
-TRANSIT_ACCESS_MAP = {'Walk': 1, 'Drive': 2}
-TRANSIT_ACCESS_NAMES = {1: 'Walk', 2: 'Drive'}
+TRANSIT_ACCESS_MAP = {'Walk': 1, 'Drive': 2, 'Bike': 3}
+TRANSIT_ACCESS_NAMES = {1: 'Walk', 2: 'Drive', 3: 'Bike'}
+
+# ── 8-mode estimation extension (PT access split, gated) ─────────────────────
+# STAGE5_PT_MODES=1 adds PT_Walk=6 / PT_Drive=7 / PT_Bike=8 as estimable
+# transit-access alternatives. Observed Transit tours are split by the
+# tour_transit_access column (created by data_connect when
+# STAGE5B_TRANSIT_ACCESS=1): access Walk→6, Drive→7, Bike→8; 'Ride'
+# (kiss-ride), school bus / charter and unlabeled access stay on 5=Transit
+# (generic bucket). Default 0 = exact 5-mode behaviour; every PT code path
+# below is inert unless the flag is set AND MODE_MAP carries the names, so
+# the flag must be exported before this module is imported (PBS -v / export).
+STAGE5_PT_MODES = os.environ.get('STAGE5_PT_MODES', '0').strip() == '1'
+PT_MODE_MAP = {'PT_Walk': 6, 'PT_Drive': 7, 'PT_Bike': 8}
+PT_MODE_NAMES = {6: 'PT_Walk', 7: 'PT_Drive', 8: 'PT_Bike'}
+if STAGE5_PT_MODES:
+    MODE_MAP.update(PT_MODE_MAP)
+    MODE_NAMES.update(PT_MODE_NAMES)
+MODE_CODES = sorted(MODE_MAP.values())   # [1..5] or [1..8] — positional order
+                                         # of every per-alternative vector
 DEST_CHOICE_SAMPLE_SIZE = 0    # 0 = use ALL zones during prediction (no sampling)
 # Polaris-style runtime destination choice.  The model remains a zone-level
 # MNL; these settings only control the simulation choice set and feasibility.
@@ -188,6 +206,14 @@ _DIST_WALK_CORR_WARNED: set = set()
 # thousands of repeats of the same ~10 pairs. First occurrence still logs at
 # WARNING (so it's visible), repeats are demoted to DEBUG.
 _WARNED_COLLINEAR_CA_PAIRS: set = set()
+# Per-zone Larch logsum short-circuit (2026-10-08: qld_full40 work/nonmand jobs
+# 26520867/26520869 spent ~24h + 60-120GB repeating a 371-zone Larch loop that
+# always returned byte-identical columns — DTAZ substitution silently ignored —
+# then fell back to numpy anyway). STAGE5_LARCH_LOGSUM=0 forces the numpy path
+# immediately; after the first duplicate-column failure in this process the loop
+# is auto-skipped so later GA evals don't pay the 371×mangle cost again.
+_LARCH_PERZONE_DEAD = False
+_LARCH_PERZONE_DEAD_LOGGED = False
 
 # ── ZONE MIGRATION (371): default zone universe ──────────────────────────────
 # Fallback zone list when a data-derived one isn't available. In SA2-native mode
@@ -281,12 +307,66 @@ MODE_TT_COL  = {
     3: 'DISTWALK',                # Walk - km, converted at 5 km/h in _get_tt
     4: 'DISTBIKE',                # Bike - km, converted at 15 km/h in _get_tt
     5: 'WLK_LOC_WLK_TOTIVT__AM', # Transit - walk-to-transit IVT (minutes)
+    6: 'WLK_LOC_WLK_TOTIVT__AM', # PT_Walk - walk access + ride
+    7: 'WLK_LOC_DRV_TOTIVT__AM', # PT_Drive - park-and-ride access + ride
+    8: 'WLK_LOC_WLK_TOTIVT__AM', # PT_Bike - derived proxy (x2.4 in _get_tt)
 }
 
 WALK_KMH = 5.0    # walk speed for distance→time conversion
 BIKE_KMH = 15.0   # bike speed for distance→time conversion
 WALK_MAX_KM = 10.0
 BIKE_MAX_KM = 25.0
+
+# ── Coupled PT access modes (tour coupling, gated OFF by default) ───────────
+# A transit tour is not one leg: you ACCESS the PT network on foot / bike /
+# car, ride, then EGRESS. The access leg and the PT leg are chosen TOGETHER,
+# so each PT alternative's impedance is a composite of the access skim and the
+# in-vehicle leg. Three access modes, modelled as a composite nest under the
+# PT node so the coupling is explicit rather than baked into one skim:
+#
+#   PT_Walk  = WLK_LOC_WLK_TOTIVT__AM   (walk access + ride)
+#   PT_Drive = WLK_LOC_DRV_TOTIVT__AM   (park-and-ride access + ride)
+#   PT_Bike  = derived: walk-access skim × (12/5)   (no bike-access skim
+#              exists in skims_371.omx; the ×12/5 scales walk minutes at
+#              12 min/km to bike minutes at ~5 min/km, a documented proxy)
+#
+# Drive-access is the only COMPLETE skim (0% NaN vs walk-access 49%), so it is
+# the workhorse alternative. NOTE: the access split is applied UNCONDITIONALLY
+# in prediction — both _predict_transit_access call sites run regardless of
+# STAGE5_PT_ACCESS, and _pt_access_enabled()/_pt_access_modes() are currently
+# dead code (never called). So the env var does NOT switch this off; it only
+# documents intent. Prediction-time only: the 5-mode estimation model is
+# untouched (Transit stays a single alternative, since MAINMODE in
+# initial_trips_hhts.csv has no access/submode field to identify).
+PT_ACCESS_MODES = ('PT_Walk', 'PT_Drive', 'PT_Bike')
+PT_ACCESS_DEFAULT = 'PT_Walk'   # preserves today's Transit alternative
+
+# Skim backing each access mode. None = derive from the walk-access skim.
+PT_ACCESS_SKIM = {
+    'PT_Walk':  'WLK_LOC_WLK_TOTIVT__AM',
+    # Walk TO a park-and-ride stop, then ride. This is the access skim
+    # _transit_submode_features already reads for drive access, and the one
+    # _get_tt uses for mode 5 — NOT DRV_LOC_WLK_TOTIVT__AM (drive to a
+    # transit-connected stop), which is a different access pattern.
+    'PT_Drive': 'WLK_LOC_DRV_TOTIVT__AM',
+    'PT_Bike':  None,   # derived
+}
+# Bike-access proxy scale: walk is 12 min/km, bike ~5 min/km => ×2.4.
+PT_BIKE_FROM_WALK = 12.0 / 5.0
+
+
+def _pt_access_enabled() -> bool:
+    """Coupled PT access modes on? Opt-in via STAGE5_PT_ACCESS=1."""
+    return os.environ.get('STAGE5_PT_ACCESS', '0').strip() == '1'
+
+
+def _pt_access_modes() -> list:
+    """Active coupled-PT access alternatives (walk, plus optional drive/bike)."""
+    if not _pt_access_enabled():
+        return []
+    sel = os.environ.get('STAGE5_PT_ACCESS_MODES', 'Walk,Drive,Bike')
+    want = [s.strip().capitalize() for s in sel.split(',') if s.strip()]
+    return [f'PT_{w}' for w in want if f'PT_{w}' in PT_ACCESS_SKIM]
 
 try:
     import larch as lx
@@ -1423,16 +1503,15 @@ def _dest_uec_flat_from_feature_list(custom_vars: list) -> dict:
     # Force-include ONLY terms that are structurally guaranteed to identify:
     # the fixed backbone (size_term, log_correction via UEC), distance (always
     # varies), crash (varies), and the reliably-alive industry attractors. The
-    # ACCESSIBILITY terms (c_logsum, c_transit_acc, c_walk_acc, c_noveh_*_acc,
-    # c_auto_shop_acc) and c_occp_dist were force-included but are frequently
-    # UNIDENTIFIED (near-constant accessibility surfaces / logsum≈distance when
-    # transit is floored) → they sat at exactly 0 in the report. They're now
-    # GA-SELECTABLE instead: included only when the search picks them, and
-    # STAGE5_DROP_STUCK removes them if they don't move — so the coefficient
-    # table shows identified, non-zero estimates, not forced zeros. Set
-    # STAGE5_DEST_FORCE_ACC=1 to restore the old always-on accessibility backbone.
+    # c_logsum is structural: destination choice must receive the mode
+    # inclusive value in every destination specification. Other accessibility
+    # terms (c_transit_acc, c_walk_acc, c_noveh_*_acc, c_auto_shop_acc) and
+    # c_occp_dist remain GA-selectable because they can be unidentified when
+    # their surfaces are near-constant. Set STAGE5_DEST_FORCE_ACC=1 to restore
+    # the old always-on accessibility backbone for those additional terms.
     always_include = {
         "c_log_dist", "c_dist", "c_size_term",
+        "c_logsum",
         "c_crash",
         "c_incp_dist", "c_veh_dist",
         "c_indp_finance", "c_indp_health", "c_indp_retail",
@@ -1558,8 +1637,12 @@ MODE_TT_CAP = {
     3: 120.0,   # Walk     - 120 min max = 10 km at 5 km/h
     4: 100.0,   # Bike     - 100 min max = 25 km at 15 km/h
     5: 150.0,   # Transit  - 2.5 hrs max
+    6: 150.0,   # PT_Walk  - walk access + ride (walk-access skim)
+    7: 150.0,   # PT_Drive - park-and-ride access + ride (drive-access skim)
+    8: 150.0,   # PT_Bike  - derived bike-access proxy
 }
-MODE_TT_DEFAULT = {1: 15.0, 2: 15.0, 3: 20.0, 4: 15.0, 5: 25.0}
+MODE_TT_DEFAULT = {1: 15.0, 2: 15.0, 3: 20.0, 4: 15.0, 5: 25.0,
+                   6: 25.0, 7: 25.0, 8: 25.0}
 
 
 def _transit_access_code(value) -> int:
@@ -1646,13 +1729,22 @@ def _get_tt(lookup: dict, otaz: int, dtaz: int, mode: int,
         km = min(km, BIKE_MAX_KM)
         return float(np.clip(km * 60.0 / BIKE_KMH, 0.5, MODE_TT_CAP[4]))
 
-    # ── Transit: try WLK_LOC_WLK_TOTIVT__AM, fall back to auto × 1.5 ─────
-    if mode == 5:
-        transit_col = (
-            'WLK_LOC_DRV_TOTIVT__AM'
-            if _transit_access_code(transit_access) == TRANSIT_ACCESS_MAP['Drive']
-            else 'WLK_LOC_WLK_TOTIVT__AM'
-        )
+    # ── Transit variants: modes 5-8 all read the transit skims ───────────
+    # PT codes 6/7/8 carry their access mode implicitly (6=Walk, 7=Drive,
+    # 8=Bike); mode 5 keeps the explicit transit_access argument.
+    if mode in (6, 7, 8):
+        _pt_default = {6: 'Walk', 7: 'Drive', 8: 'Bike'}.get(mode)
+        if _pt_default is not None:
+            transit_access = _pt_default
+    if mode in (5, 6, 7, 8):
+        # Coupled PT access: drive-access uses the park-and-ride skim
+        # (WLK_LOC_DRV_TOTIVT__AM); walk AND bike access share the walk-access
+        # skim (bike is the derived x12/5 proxy — no bike-access column exists
+        # in the OMX, so it is applied to the resulting value below).
+        _acc = _transit_access_code(transit_access)
+        transit_col = ('WLK_LOC_DRV_TOTIVT__AM'
+                       if _acc == TRANSIT_ACCESS_MAP['Drive']
+                       else 'WLK_LOC_WLK_TOTIVT__AM')
         transit_val = sk.get(transit_col, None)
         if transit_val is None or transit_val <= 0:
             transit_val = sk.get('WLK_LOC_WLK_TOTIVT__AM', None)
@@ -1661,14 +1753,24 @@ def _get_tt(lookup: dict, otaz: int, dtaz: int, mode: int,
             transit_val = (float(auto_val) * 1.5) if auto_val and auto_val > 0 else None
         if transit_val and transit_val > 0:
             val = float(_skim_minutes(transit_col, float(transit_val)))
-            return float(np.clip(val, 0.5, MODE_TT_CAP[5]))
+            if _acc == TRANSIT_ACCESS_MAP['Bike']:
+                val *= PT_BIKE_FROM_WALK   # derived bike-access proxy
+            return float(np.clip(val, 0.5, MODE_TT_CAP.get(mode, MODE_TT_CAP[5])))
 
     # ── Auto modes: use SOVTOLL_TIME__AM with period fallbacks ────────────
+    # Reached by Walk/Bike too when DISTWALK/DISTBIKE is 0 or missing for the
+    # OD pair (MODE_TT_COL[3]/[4] hold km, not minutes). Track WHICH column the
+    # surviving value came from: `col` still names the distance matrix at this
+    # point, and handing a minutes-valued auto skim to _skim_minutes under the
+    # name 'DISTWALK' both missed the sidecar (spurious "NOT in sidecar"
+    # warning) and fed the legacy value-guesser an already-minutes number, so a
+    # genuine 223-min auto time was read as 22.3 min.
     if val is None or val <= 0:
         for fallback_col in ['SOVTOLL_TIME__AM', 'SOVTOLL_TIME__PM',
                               'SOVTOLL_TIME__MD', 'SOVTOLL_TIME__EV']:
             val = sk.get(fallback_col, None)
             if val and val > 0:
+                col = fallback_col
                 break
         if not val or val <= 0:
             return float(MODE_TT_DEFAULT.get(mode, 15.0))
@@ -1896,6 +1998,103 @@ def _da_avail_series(df: pd.DataFrame) -> pd.Series:
     return pd.Series(np.ones(n, dtype=np.int8), index=df.index)
 
 
+def _da_avail_for_tours(tour_rows: pd.DataFrame,
+                        persons: pd.DataFrame) -> np.ndarray:
+    """Person-level DA availability aligned, row-for-row, to ``tour_rows``.
+
+    Same rule as ``_mode_probs_numpy`` / ``_prep_hhts_tours``:
+    ``CARLICENCE > 0 AND vehrd > 0``, with the age gate that under-15s
+    (age5p <= 3) can never hold a licence.  Missing columns default to
+    available, matching ``_ensure_person_behavioural_cols``.
+
+    Used at prediction time to mask DA out of the choice set.  The frozen
+    cell-probability path ignores availability entirely and the mode-share
+    stabiliser rescales every row, so without this mask DA gets assigned to
+    carless/licence-less people and the old quarantine then deleted those
+    tours (job 27177740: 29.9% of predicted DA tours).
+    """
+    n = len(tour_rows)
+    pid_col = next((c for c in ('person_id', 'PERSID', 'persid')
+                    if c in tour_rows.columns), None)
+    ids = (tour_rows[pid_col].astype(str).to_numpy()
+           if pid_col is not None else None)
+
+    def _from_persons(col, default):
+        if ids is None or persons is None or not isinstance(persons, pd.DataFrame):
+            return None
+        pp = persons
+        if 'person_id' not in pp.columns and 'PERSID' in pp.columns:
+            pp = pp.rename(columns={'PERSID': 'person_id'})
+        if 'person_id' not in pp.columns or col not in pp.columns:
+            return None
+        pp = pp[['person_id', col]].copy()
+        pp['person_id'] = pp['person_id'].astype(str)
+        pp = pp.drop_duplicates(subset=['person_id'], keep='first')
+        lookup = (pd.to_numeric(pp[col], errors='coerce')
+                  .set_axis(pp['person_id']).to_dict())
+        return np.fromiter((float(lookup.get(pid, default)) for pid in ids),
+                           dtype=np.float64, count=n)
+
+    def _from_tours(col, default):
+        if col in tour_rows.columns:
+            return pd.to_numeric(tour_rows[col], errors='coerce') \
+                .fillna(default).to_numpy(dtype=np.float64)
+        return np.full(n, default, dtype=np.float64)
+
+    vehrd = _from_persons('vehrd', 1.0)
+    if vehrd is None:
+        vehrd = _from_tours('vehrd', 1.0)
+    licence = _from_persons('CARLICENCE', 1.0)
+    if licence is None:
+        licence = _from_tours('CARLICENCE', 1.0)
+    age5p = _from_persons('age5p', 4.0)
+    if age5p is None:
+        age5p = _from_tours('age5p', 4.0)
+
+    licence = np.where(np.asarray(age5p) <= 3, 0.0, np.asarray(licence))
+    return (np.asarray(licence) > 0) & (np.asarray(vehrd) > 0)
+
+
+def _mask_da_availability(probs, da_ok: np.ndarray, alt_ids=None,
+                          label: str = '') -> 'np.ndarray | None':
+    """Zero the DA column where DA is unavailable and renormalise the row.
+
+    Applied after every prediction probability path (numpy, frozen cells,
+    Larch) and before sampling, because frozen cells and the share
+    stabiliser can hand DA probability to people with no licence/vehicle.
+    Rows that would become all-zero keep their original probabilities.
+    """
+    if probs is None:
+        return None
+    try:
+        arr = np.asarray(probs, dtype=float).copy()
+        _alts = list(alt_ids) if alt_ids is not None else list(MODE_CODES)
+        if MODE_MAP['DA'] not in _alts or arr.ndim != 2:
+            return probs
+        da_col = _alts.index(MODE_MAP['DA'])
+        if da_col >= arr.shape[1]:
+            return probs
+        blocked = ~np.asarray(da_ok, dtype=bool)
+        if blocked.size != arr.shape[0] or not blocked.any():
+            return probs
+        _mean_before = float(np.nanmean(arr[blocked, da_col])) if blocked.any() else 0.0
+        arr[blocked, da_col] = 0.0
+        row_sums = arr.sum(axis=1, keepdims=True)
+        empty = (row_sums[:, 0] <= 0)
+        if empty.any():
+            arr[empty] = np.asarray(probs, dtype=float)[empty]
+            row_sums = np.where(row_sums > 0, row_sums, 1.0)
+        arr = arr / row_sums
+        logger.info(
+            f"_mask_da_availability [{label}]: DA removed for "
+            f"{int(blocked.sum())}/{len(blocked)} tours "
+            f"(mean P(DA) before mask {_mean_before:.1%})")
+        return arr
+    except Exception as _me:
+        logger.debug(f"_mask_da_availability [{label}] skipped ({_me})")
+        return probs
+
+
 def quarantine_da_zero_vehicle(tours: pd.DataFrame, label: str = "mode") -> pd.DataFrame:
     """Drop DA-chosen tours that cannot satisfy DA availability (safety net).
 
@@ -2111,6 +2310,39 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
                 f"over {WALK_MAX_KM:.0f} km to SR"
             )
 
+    # ── PT access split (STAGE5_PT_MODES=1) ──────────────────────────────
+    # Observed Transit tours are re-coded to their access-specific
+    # alternative from tour_transit_access (main-trip access label carried by
+    # data_connect when STAGE5B_TRANSIT_ACCESS=1): Walk→PT_Walk, Drive→
+    # PT_Drive, Bike→PT_Bike. 'Ride' (kiss-ride), school bus / charter /
+    # unlabeled access and missing labels stay on 5=Transit (generic bucket,
+    # per the agreed design). Inert when the flag is off.
+    if STAGE5_PT_MODES:
+        _acc_col = next((c for c in ('tour_transit_access', 'transit_access')
+                         if c in t.columns), None)
+        if _acc_col is None:
+            logger.warning(
+                "STAGE5_PT_MODES=1 but the tours frame carries no "
+                "tour_transit_access/transit_access column - PT_Walk/Drive/"
+                "Bike have no observed choices and every Transit tour stays "
+                "on the generic 5=Transit alternative. Regenerate the "
+                "estimation data with STAGE5B_TRANSIT_ACCESS=1.")
+        else:
+            _acc_lab = (t[_acc_col].astype(str).str.strip().str.title()
+                        .replace({'Nan': ''}))
+            _is_transit = t['tour_mode'] == MODE_MAP['Transit']
+            for _lab, _mname in (('Walk', 'PT_Walk'),
+                                 ('Drive', 'PT_Drive'),
+                                 ('Bike', 'PT_Bike')):
+                _m = _is_transit & (_acc_lab == _lab)
+                t.loc[_m, 'tour_mode'] = MODE_MAP[_mname]
+            _counts = t['tour_mode'].value_counts().to_dict()
+            logger.info(
+                "_prep_hhts_tours: PT access split -> "
+                f"PT_Walk={_counts.get(6, 0)}, PT_Drive={_counts.get(7, 0)}, "
+                f"PT_Bike={_counts.get(8, 0)}, "
+                f"generic Transit={_counts.get(5, 0)}")
+
     # ── numeric zone columns ──────────────────────────────────────────────
     for col in ['OTAZ', 'DTAZ']:
         t[col] = pd.to_numeric(t[col], errors='coerce').fillna(0).astype(int)
@@ -2291,6 +2523,10 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
             MODE_MAP['Transit']: 'transit_avail',
             MODE_MAP['SR']:      'sr_avail',
         }
+        # PT alternatives (6-8, STAGE5_PT_MODES=1) are repaired where their
+        # availability columns are materialized later in this function — those
+        # columns do not exist yet at this point, so adding them here would be
+        # silently skipped (see the pt_drive_avail / pt_bike_avail block below).
         for mode_id, avail_col in _avail_cols.items():
             if avail_col in t.columns:
                 t.loc[t['tour_mode'] == mode_id, avail_col] = 1
@@ -2326,6 +2562,44 @@ def _prep_hhts_tours(tours: pd.DataFrame, persons: pd.DataFrame) -> pd.DataFrame
                         f"DA-choosers unavailable={(int(((t['tour_mode'] == MODE_MAP['DA']) & (t['da_avail'] <= 0)).sum())) if 'tour_mode' in t.columns else '?'}")
         except Exception as _dae:
             logger.debug(f"_prep_hhts_tours: da_avail skipped ({_dae})")
+
+    # ── PT access availability flags (STAGE5_PT_MODES=1, materialized) ──────
+    # Same rationale as da_avail above: plain 0/1 columns survive sharrow
+    # compilation and doctor(repair_ch_av), while the inline expressions used
+    # in _build_mode_model ("(bikes > 0)") neither repair reliably nor guard
+    # NaN bike counts — a NaN availability makes chosen-PT_Bike rows ~0
+    # probability and aborts the whole segment fit with "log likelihood is Inf".
+    # PT_Walk needs no column (always available, like generic Transit).
+    # PT_Drive mirrors DA (licence AND household vehicle) and is computed AFTER
+    # the CARLICENCE repair above so it reflects repaired values; PT_Bike
+    # mirrors the (bikes > 0) rule with a missing-count default of 0 (no
+    # bikes), matching _PERSON_BEHAVIOURAL_DEFAULTS['bikes'].
+    if STAGE5_PT_MODES:
+        try:
+            if 'da_avail' in t.columns:
+                t['pt_drive_avail'] = pd.to_numeric(
+                    t['da_avail'], errors='coerce').fillna(0).astype(np.int8)
+            else:
+                t['pt_drive_avail'] = _da_avail_series(t)
+            _bk = (pd.to_numeric(t['bikes'], errors='coerce').fillna(0) > 0) \
+                if 'bikes' in t.columns else pd.Series(False, index=t.index)
+            t['pt_bike_avail'] = _bk.astype(np.int8)
+            # Chosen-mode repair (the 5-mode _avail_cols loop above runs before
+            # these columns exist). PT_Bike always — same as the Bike repair.
+            # PT_Drive only when PLC is off, mirroring the DA policy: with PLC
+            # on, carless PT_Drive choosers are identifying variation for the
+            # PT_Drive ASC (borrowed car, coding error), exactly as unlicenced
+            # DA choosers are for u_DA; overwriting would destroy that margin.
+            if 'tour_mode' in t.columns:
+                if not STAGE5_ENABLE_PLC:
+                    t.loc[t['tour_mode'] == MODE_MAP['PT_Drive'],
+                          'pt_drive_avail'] = 1
+                t.loc[t['tour_mode'] == MODE_MAP['PT_Bike'], 'pt_bike_avail'] = 1
+            logger.info(
+                f"_prep_hhts_tours: pt_drive_avail={int(t['pt_drive_avail'].sum())}/{len(t)}, "
+                f"pt_bike_avail={int(t['pt_bike_avail'].sum())}/{len(t)}")
+        except Exception as _pte:
+            logger.debug(f"_prep_hhts_tours: PT availability skipped ({_pte})")
 
     # ── survey expansion weights ──────────────────────────────────────
     # QTS uses PERSWGT23 (person-level expansion weight). Merging onto tours
@@ -2555,26 +2829,177 @@ def _transit_submode_features(rows: pd.DataFrame, skim_lookup: dict = None,
 
 
 def _predict_transit_access(rows: pd.DataFrame, skim_lookup: dict,
-                            rng: np.random.Generator) -> np.ndarray:
-    """Choose walk or drive access using LOS and household vehicle eligibility."""
+                            rng: np.random.Generator,
+                            observed_access: dict = None) -> np.ndarray:
+    """Coupled PT access choice: walk / bike / drive to the PT network.
+
+    A transit TOUR is not one leg — you access the PT network, ride, then
+    egress. The HHTS observes only MAINMODE='Transit' (5 distinct codes, no
+    access or submode field in initial_trips_hhts.csv), so the access leg is
+    NOT identified by the survey and cannot be estimated as a mode-logit
+    alternative. It is therefore SAMPLED here at assignment time, which is the
+    correct place for it: the estimation model keeps Transit as a single
+    alternative (what the data supports) and the coupling happens in
+    simulation.
+
+    Three access modes, each scored on its composite impedance so the access
+    leg and the PT leg are coupled rather than added blindly:
+      walk  : WLK_LOC_WLK_TOTIVT__AM  (walk access + ride, gap-filled)
+      bike  : walk-access skim x 12/5 (derived proxy; no bike-access skim)
+      drive : WLK_LOC_DRV_TOTIVT__AM  (park-and-ride access + ride, complete)
+
+    The old binary walk/drive version used a hand-tuned 2-term logit
+    (-0.8 + 1.5*delta - 0.7*access_time) that ignored bike access entirely and
+    could not represent a genuine 3-way choice. This uses a softmax over the
+    three composite utilities with the same sign conventions (access + PT time
+    is a deterrent), plus explicit availability gates.
+
+    OBSERVED ACCESS: if `observed_access` maps tour_id -> {1,2,3}, that exact
+    access mode is used instead of sampling. This covers ~35% of transit tours
+    where the HHTS outbound legs reveal the access leg (Walk/DA/Bike). The
+    remaining ~65% fall back to the calibrated 3-way simulation above.
+
+    GATE: the 3-way softmax + observed override only apply when
+    STAGE5_PT_MODES=1 (they exist to feed the PT_Walk/PT_Drive/PT_Bike
+    alternatives). With the default STAGE5_PT_MODES=0 the legacy binary
+    walk/drive logit runs instead, so default 5-mode runs stay behaviourally
+    unchanged by the PT redesign.
+
+    Returns codes in TRANSIT_ACCESS_MAP (Walk=1, Drive=2, Bike=3).
+    """
+    n = len(rows)
+    if n == 0:
+        return np.zeros(0, dtype=int)
+
+    if not STAGE5_PT_MODES:
+        # Legacy binary walk/drive path — kept byte-identical to the pre-PT
+        # implementation so default runs (PT modes off) are unaffected by the
+        # 3-way access redesign; observed_access is intentionally ignored here
+        # (it only exists to route the PT access alternatives).
+        features = _transit_submode_features(rows, skim_lookup=skim_lookup)
+        walk_ivt = features['transit_ivt_hr'].to_numpy(dtype=float)
+        drive_ivt = features['drive_transit_ivt_hr'].to_numpy(dtype=float)
+        drive_time = features['drive_access_hr'].to_numpy(dtype=float)
+        eligible = features['drive_eligible'].to_numpy(dtype=float) > 0
+        walk_ok = np.isfinite(walk_ivt) & (walk_ivt > 0) & (walk_ivt < 2.5)
+        drive_ok = (eligible & np.isfinite(drive_ivt) & (drive_ivt > 0) &
+                    (drive_ivt < 2.5))
+        delta = np.nan_to_num(walk_ivt - drive_ivt, nan=0.0, posinf=0.0, neginf=0.0)
+        access_time = np.nan_to_num(drive_time, nan=0.0, posinf=2.5, neginf=0.0)
+        utility = -0.8 + 1.5 * delta - 0.7 * np.maximum(access_time, 0.0)
+        probability = 1.0 / (1.0 + np.exp(-np.clip(utility, -40.0, 40.0)))
+        probability = np.where(drive_ok & walk_ok, probability, 0.0)
+        probability = np.where(~walk_ok & drive_ok, 1.0, probability)
+        probability = np.where(~drive_ok, 0.0, probability)
+        return np.where(rng.uniform(size=len(rows)) < probability,
+                        TRANSIT_ACCESS_MAP['Drive'],
+                        TRANSIT_ACCESS_MAP['Walk']).astype(int)
+
+    # Observed access override: if the caller supplied a tour_id -> access map,
+    # and the rows have a 'tour_id' column, use it directly instead of sampling.
+    # The returned array MUST stay aligned 1:1 with `rows` (the caller writes it
+    # back per activity), so simulated codes are scattered back into a full-length
+    # output rather than returned as the shorter simulated subset.
+    _out = None
+    _need_sim = None
+    if observed_access is not None and 'tour_id' in rows.columns:
+        tour_ids = rows['tour_id'].astype(str)
+        obs = tour_ids.map(observed_access)
+        # 0 (and any non-positive) means "not observed" — never a valid access
+        # code, since TRANSIT_ACCESS_MAP only holds {1,2,3}.
+        has_obs = obs.notna() & (pd.to_numeric(obs, errors='coerce') > 0)
+        has_obs = has_obs.fillna(False).astype(bool)
+        _need_sim = (~has_obs).to_numpy()
+        if has_obs.any():
+            _out = np.zeros(n, dtype=int)
+            _out[has_obs.to_numpy()] = obs[has_obs].astype(int).to_numpy()
+            if not _need_sim.any():
+                return _out
+            # Simulate only the rows without observed access, keeping the
+            # positional mask so the result can be scattered back.
+            rows = rows.loc[_need_sim]
+            n = len(rows)
+        else:
+            _out = None
+            _need_sim = None
+
     features = _transit_submode_features(rows, skim_lookup=skim_lookup)
-    walk_ivt = features['transit_ivt_hr'].to_numpy(dtype=float)
-    drive_ivt = features['drive_transit_ivt_hr'].to_numpy(dtype=float)
-    drive_time = features['drive_access_hr'].to_numpy(dtype=float)
-    eligible = features['drive_eligible'].to_numpy(dtype=float) > 0
-    walk_ok = np.isfinite(walk_ivt) & (walk_ivt > 0) & (walk_ivt < 2.5)
-    drive_ok = (eligible & np.isfinite(drive_ivt) & (drive_ivt > 0) &
-                (drive_ivt < 2.5))
-    delta = np.nan_to_num(walk_ivt - drive_ivt, nan=0.0, posinf=0.0, neginf=0.0)
-    access_time = np.nan_to_num(drive_time, nan=0.0, posinf=2.5, neginf=0.0)
-    utility = -0.8 + 1.5 * delta - 0.7 * np.maximum(access_time, 0.0)
-    probability = 1.0 / (1.0 + np.exp(-np.clip(utility, -40.0, 40.0)))
-    probability = np.where(drive_ok & walk_ok, probability, 0.0)
-    probability = np.where(~walk_ok & drive_ok, 1.0, probability)
-    probability = np.where(~drive_ok, 0.0, probability)
-    return np.where(rng.uniform(size=len(rows)) < probability,
-                    TRANSIT_ACCESS_MAP['Drive'],
-                    TRANSIT_ACCESS_MAP['Walk']).astype(int)
+    # Composite PT impedance in HOURS for each access mode.
+    walk_h = features['transit_ivt_hr'].to_numpy(dtype=float)
+    drive_h = features['drive_transit_ivt_hr'].to_numpy(dtype=float)
+    bike_h = walk_h * PT_BIKE_FROM_WALK          # derived proxy (12/5)
+    drive_access_h = features['drive_access_hr'].to_numpy(dtype=float)
+
+    licensed = (pd.to_numeric(
+        rows['CARLICENCE'] if 'CARLICENCE' in rows.columns
+        else pd.Series(0, index=rows.index), errors='coerce').fillna(0).to_numpy() > 0)
+    vehicles = (pd.to_numeric(
+        rows['vehrd'] if 'vehrd' in rows.columns
+        else pd.Series(0, index=rows.index), errors='coerce').fillna(0).to_numpy() > 0)
+    owns_bike = (pd.to_numeric(
+        rows['bikes'] if 'bikes' in rows.columns
+        else pd.Series(0, index=rows.index), errors='coerce').fillna(0).to_numpy() > 0)
+
+    # Walk access only if walk-to-stop+ride is a plausible commute; the +2.5h
+    # cap mirrors the previous binary rule and keeps wild skims out.
+    CAP_H = 2.5
+    walk_ok = np.isfinite(walk_h) & (walk_h > 0) & (walk_h < CAP_H)
+    drive_ok = (licensed & vehicles & np.isfinite(drive_h) &
+                (drive_h > 0) & (drive_h < CAP_H))
+    bike_ok = (owns_bike & np.isfinite(bike_h) & (bike_h > 0) & (bike_h < CAP_H))
+
+    # Utilities. Time is a deterrent, but on this system park-and-ride is
+    # FASTER than walk-access on 88.9% of OD pairs (median 0.98h vs 2.22h),
+    # so a pure time penalty selects P&R almost everywhere. Real P&R uptake is
+    # suppressed by costs a time-only term ignores: parking search/availability
+    # and catchment loss (you must still walk from the stop). Those are the
+    # terms below; they are what keeps the walk-access share sensible.
+    # Signs: negative ASCs penalise the access modes; positive detriments.
+    asc = {'walk': 0.0, 'bike': -0.5, 'drive': -0.35}
+    beta_time = 0.6        # damped: time alone over-selects the faster access
+    parking_pen = 1.10     # parking cost + search at the P&R lot
+    catchment_pen = 0.45   # extra walk from the stop to the destination
+
+    u_walk = asc['walk'] - beta_time * np.nan_to_num(walk_h, nan=CAP_H, posinf=CAP_H)
+    u_bike = asc['bike'] - beta_time * np.nan_to_num(bike_h, nan=CAP_H, posinf=CAP_H)
+    u_drive = (asc['drive']
+               - beta_time * np.nan_to_num(drive_h, nan=CAP_H, posinf=CAP_H)
+               - parking_pen
+               - catchment_pen * np.nan_to_num(drive_access_h, nan=0.0, posinf=CAP_H))
+
+    u = np.vstack([u_walk, u_drive, u_bike])           # order: Walk, Drive, Bike
+    u = np.where(np.vstack([walk_ok, drive_ok, bike_ok]), u, -np.inf)
+    # If no access mode is feasible, default to walk (matches prior behaviour).
+    all_bad = ~np.any(np.isfinite(u), axis=0)
+    u[0, all_bad] = 0.0
+    mx = np.max(u, axis=0)
+    mx = np.where(np.isfinite(mx), mx, 0.0)
+    p = np.exp(np.clip(u - mx, -500, 0))
+    p[~np.isfinite(p)] = 0.0
+    tot = p.sum(axis=0)
+    # Rows with no feasible mode carry all-zero mass; give them pure walk.
+    p[:, all_bad] = 0.0
+    p[0, all_bad] = 1.0
+    safe_tot = np.where(tot > 0, tot, 1.0)
+    p = np.divide(p, safe_tot, out=np.zeros_like(p), where=(tot > 0))
+    # Renormalise defensively (guards against float drift in the fallback col).
+    rtot = p.sum(axis=0)
+    p = np.divide(p, rtot, out=np.zeros_like(p), where=(rtot > 0))
+    p[0, rtot <= 0] = 1.0
+
+    # Cumulative thresholds in Walk<Drive<Bike order, then ONE draw.
+    cum = np.cumsum(p, axis=0)
+    draw = rng.uniform(size=n)
+    codes = np.where(draw < cum[0], TRANSIT_ACCESS_MAP['Walk'],
+                     np.where(draw < cum[1], TRANSIT_ACCESS_MAP['Drive'],
+                              TRANSIT_ACCESS_MAP['Bike'])).astype(int)
+
+    # Scatter simulated codes back into the full-length output so observed and
+    # simulated rows stay positionally aligned with the input frame.
+    if _out is not None and _need_sim is not None:
+        _out[_need_sim] = codes
+        return _out
+    return codes
 
 def _fit_transit_submode(rows: pd.DataFrame, landuse: pd.DataFrame = None) -> dict:
     """Fit a regularized conditional Bus/Train logit from transit tours."""
@@ -3446,6 +3871,125 @@ def _power_acc_enabled() -> bool:
     return os.environ.get('STAGE5_POWER_ACC', '0').strip() == '1'
 
 
+_sa2_to_order_cache: dict = {}
+
+
+def _sa2_to_order_bridge() -> dict:
+    """Cached SA2 zone_id → ORDER map (seq_zone_ids_371.csv). Empty on failure."""
+    global _sa2_to_order_cache
+    if '_loaded' not in _sa2_to_order_cache:
+        try:
+            _xq = pd.read_csv(os.path.join('saved_data', 'seq_zone_ids_371.csv'),
+                              usecols=['ORDER', 'SA2_MAIN16'])
+            _sa2_to_order_cache.update(zip(
+                pd.to_numeric(_xq['SA2_MAIN16'], errors='coerce')
+                .fillna(0).astype(int).tolist(),
+                pd.to_numeric(_xq['ORDER'], errors='coerce')
+                .fillna(0).astype(int).tolist()))
+        except Exception:
+            pass
+        _sa2_to_order_cache['_loaded'] = -1
+    return {k: v for k, v in _sa2_to_order_cache.items() if k != '_loaded'}
+
+
+_ZONE_XWALK: dict = {}
+
+
+def _load_zone_xwalk() -> dict:
+    """Cached ORDER → SA2_MAIN16 map (seq_zone_ids_371.csv). Empty on failure."""
+    global _ZONE_XWALK
+    if _ZONE_XWALK:
+        return _ZONE_XWALK
+    try:
+        _xq = pd.read_csv(os.path.join('saved_data', 'seq_zone_ids_371.csv'),
+                          usecols=['ORDER', 'SA2_MAIN16'])
+        _rows = zip(
+            pd.to_numeric(_xq['ORDER'], errors='coerce').fillna(0).astype(int).tolist(),
+            pd.to_numeric(_xq['SA2_MAIN16'], errors='coerce').fillna(0).astype(int).tolist())
+        _ZONE_XWALK.update({int(o): int(s) for o, s in _rows if o and s})
+    except Exception as _xe:
+        logger.warning(f"zone bridge: seq_zone_ids_371.csv unreadable ({_xe})")
+    return _ZONE_XWALK
+
+
+def _bridge_tours_zones(tours, ref_otaz, ref_dtaz, label: str):
+    """Guarded ORDER↔SA2 remap of tour OTAZ/DTAZ at the skim boundary.
+
+    HHTS tours are ORDER-coded (1..371; data_connect.process_survey maps
+    ORIGSA2/DESTSA2 → ORDER via seq_zone_ids_371.csv) while the 371-zone skims
+    and landuse are SA2-keyed (9-digit). Without this bridge every OD lookup
+    misses and _check_zone_keyspace aborts estimation (jobs 26820017 /
+    26820018 / 26838820: empty stage5_models.pkl, 0 trips). Fires only on a
+    detected keyspace mismatch, so SA2-native (new_pop) runs are untouched.
+    Unmapped endpoints (fringe 999, 0, NaN) pass through unchanged.
+    Disable with STAGE5_ZONE_BRIDGE=0.
+    """
+    if os.environ.get('STAGE5_ZONE_BRIDGE', '1').strip() == '0':
+        return tours
+    try:
+        if tours is None or len(tours) == 0:
+            return tours
+        if 'OTAZ' not in tours.columns or 'DTAZ' not in tours.columns:
+            return tours
+        _t_ids = pd.concat([
+            pd.to_numeric(tours['OTAZ'], errors='coerce'),
+            pd.to_numeric(tours['DTAZ'], errors='coerce')]).dropna()
+        _r_ids = pd.concat([
+            pd.to_numeric(pd.Series(list(ref_otaz)), errors='coerce'),
+            pd.to_numeric(pd.Series(list(ref_dtaz)), errors='coerce')]).dropna()
+        if _t_ids.empty or _r_ids.empty:
+            return tours
+        _tk = _skim_keyspace(set(_t_ids.astype(int).tolist()))
+        _rk = _skim_keyspace(set(_r_ids.astype(int).tolist()))
+        if _tk == _rk or _tk == 'unknown' or _rk == 'unknown':
+            return tours
+        _xw = _load_zone_xwalk()
+        if _tk == 'ORDER' and _rk == 'SA2':
+            _mp = _xw
+        elif _tk == 'SA2' and _rk == 'ORDER':
+            _mp = {v: k for k, v in _xw.items()}
+        else:
+            return tours
+        if not _mp:
+            logger.warning(
+                f"zone bridge [{label}]: keyspace mismatch detected "
+                f"(tours={_tk}, ref={_rk}) but the crosswalk is empty — "
+                "OD lookups will miss (STAGE5_ZONE_BRIDGE=0 to silence)")
+            return tours
+        _t = tours.copy()
+        for _c in ('OTAZ', 'DTAZ'):
+            _num = pd.to_numeric(_t[_c], errors='coerce')
+            _t[_c] = _num.map(
+                lambda v: _mp.get(int(v), int(v)) if pd.notna(v) else 0
+            ).astype('int64')
+        logger.info(
+            f"zone bridge [{label}]: {len(_t):,} tours remapped {_tk}→{_rk} "
+            f"via seq_zone_ids_371.csv")
+        return _t
+    except Exception as _be:
+        logger.debug(f"zone bridge [{label}] skipped ({_be!r})")
+        return tours
+
+
+def _bridge_tours_zones_auto(tours, skims, skim_df, label: str):
+    """Resolve the reference zone-id space (skim_df else the OMX mapping) and
+    bridge tour OTAZ/DTAZ into it. Never raises."""
+    try:
+        _ref_o = _ref_d = None
+        if skim_df is not None and not skim_df.empty \
+                and {'OTAZ', 'DTAZ'} <= set(skim_df.columns):
+            _ref_o, _ref_d = skim_df['OTAZ'], skim_df['DTAZ']
+        elif skims is not None:
+            _mp = skims.mapping(skims.listMappings()[0])
+            _ref_o = _ref_d = list(_mp.keys())
+        if _ref_o is None:
+            return tours
+        return _bridge_tours_zones(tours, _ref_o, _ref_d, label)
+    except Exception as _zbe:
+        logger.debug(f"zone bridge [{label}] skipped ({_zbe!r})")
+        return tours
+
+
 def _merge_power_accessibility(lu: pd.DataFrame) -> pd.DataFrame:
     """Join the 4 power-accessibility columns onto a zone-indexed landuse frame.
 
@@ -3841,6 +4385,12 @@ def _ensure_person_behavioural_cols(persons: pd.DataFrame) -> pd.DataFrame:
 _MODE_TIME_TRANSFORMS = {
     'c_ivt_auto':    ('SOVTOLL_TIME__AM',      lambda v: v / 60.0),
     'c_ivt_transit': ('WLK_LOC_WLK_TOTIVT__AM', lambda v: v / 60.0),
+    # PT access IVTs (STAGE5_PT_MODES=1): same residualize-on-DIST treatment as
+    # the 5-mode time terms; the coeffs are absent from the spec on 5-mode runs,
+    # so the downstream remap/swap silently skips them (missing-name-safe).
+    'c_ivt_pt_drive': ('WLK_LOC_DRV_TOTIVT__AM', lambda v: v / 60.0),
+    'c_ivt_pt_bike':  ('WLK_LOC_WLK_TOTIVT__AM',
+                       lambda v: np.log(np.maximum(v, 1.0) * 2.4 + 1.0)),
     'c_walk_time':   ('DISTWALK',  lambda v: np.log(np.maximum(v, 0.3) * 12.0 + 1.0)),
     'c_bike_time':   ('DISTBIKE',  lambda v: np.log(np.maximum(v, 0.5) * 4.0 + 1.0)),
     # Crash exposure residualized on OD distance (mirrors UEC log(od.CRASH+1)).
@@ -3967,7 +4517,8 @@ def _apply_mode_orthogonalization(tours, pp, od, orthogonalize_on: dict) -> dict
     return betas
 
 
-def _mode_tree(tours, persons, landuse, skims, skim_df: pd.DataFrame = None):
+def _mode_tree(tours, persons, landuse, skims, skim_df: pd.DataFrame = None,
+               quarantine_da: bool = True):
     """
     Build DataTree for mode choice.
 
@@ -3975,8 +4526,21 @@ def _mode_tree(tours, persons, landuse, skims, skim_df: pd.DataFrame = None):
     find the '_altid_' index. We build a minimal idca root from the mode
     alternatives, then attach tours (idco), persons, landuse, and od skims
     as sub-datasets.
+
+    ``quarantine_da`` drops DA-chosen zero-vehicle tours.  That is an
+    ESTIMATION-data safety net (observed anomalies that make the chosen
+    probability 0 and abort a fit).  Prediction must pass
+    ``quarantine_da=False``: synthetic tours carry a placeholder/observed
+    mode before prediction, so dropping them silently deletes a third of the
+    tours (job 27177740: 37,670/126,133) and misaligns the chooser tables.
     """
     import xarray as xr
+
+    # ── Zone key-space bridge (ORDER↔SA2) — must precede quarantine/joins ──
+    # HHTS tours are ORDER-coded; the 371-zone skims/landuse od + emp nodes
+    # are SA2-keyed. Bridging here (before quarantine) keeps every OD lookup
+    # and the emp.ORDER relationship aligned. Inert for SA2-native runs.
+    tours = _bridge_tours_zones_auto(tours, skims, skim_df, "_mode_tree")
 
     # HHTS persons lack age5p / ebikes / *_prop; derive them once so the mode
     # UEC terms are identified instead of zero-filled (doctor low_variance).
@@ -4009,14 +4573,17 @@ def _mode_tree(tours, persons, landuse, skims, skim_df: pd.DataFrame = None):
     # through _mode_tree. Consequence: quarantined tours get no mode-logsum
     # row, so dest estimation sees logsum 0.0 for them (existing fallback) —
     # acceptable for measurement anomalies. Gate: STAGE5_DA_QUARANTINE=0.
-    try:
-        _n0 = len(tours)
-        tours = quarantine_da_zero_vehicle(tours, label="mode")
-        if len(tours) != _n0:
-            logger.warning(f"_mode_tree: quarantined {_n0 - len(tours)}/{_n0} "
-                           f"DA-chosen zero-vehicle tours (kept {len(tours)})")
-    except Exception as _qe:
-        logger.debug(f"_mode_tree: DA quarantine skipped ({_qe})")
+    # Prediction (quarantine_da=False) never drops rows: the mode in a
+    # synthetic tour is a placeholder/observed label, not a choice.
+    if quarantine_da:
+        try:
+            _n0 = len(tours)
+            tours = quarantine_da_zero_vehicle(tours, label="mode")
+            if len(tours) != _n0:
+                logger.warning(f"_mode_tree: quarantined {_n0 - len(tours)}/{_n0} "
+                               f"DA-chosen zero-vehicle tours (kept {len(tours)})")
+        except Exception as _qe:
+            logger.debug(f"_mode_tree: DA quarantine skipped ({_qe})")
 
     # Ensure ptour_id is unique before building the DataTree.
     # Larch's from_idca raises "cannot convert a DataFrame with a non-unique
@@ -4195,7 +4762,7 @@ def _mode_tree(tours, persons, landuse, skims, skim_df: pd.DataFrame = None):
     # sharrow DataTree: ALL datasets must be keyword arguments.
     # The first dataset passed becomes the root node.
     # We name it 'root' explicitly; relationships then use 'root.' to reference it.
-    return lx.DataTree(
+    _tree = lx.DataTree(
         base   = root_ds,
         tour   = tour_ds,
         person = pp.set_index('person_id'),
@@ -4209,6 +4776,15 @@ def _mode_tree(tours, persons, landuse, skims, skim_df: pd.DataFrame = None):
             "tour.DTAZ @ od.dtaz",
         ),
     )
+    # Attach the emp frame for _logsums_numpy_fallback: dt['emp'] is a
+    # DataTreeBranch whose item access resolves the tree relationships and
+    # raises "'ptour_id' is not a valid dimension or coordinate", so the
+    # logsum emp lookup must read the frame directly instead of via the tree.
+    try:
+        _tree._emp_frame = lu_emp
+    except Exception:
+        pass
+    return _tree
 
 
 def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
@@ -4238,6 +4814,9 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
         If None, all zones are used as alternatives and log_correction = 0.
     """
     import xarray as xr
+
+    # ── Zone key-space bridge (ORDER↔SA2) — same rationale as _mode_tree ──
+    tours = _bridge_tours_zones_auto(tours, skims, skim_df, "_dest_tree")
 
     # Same person-attribute derivation as _mode_tree: the destination UEC's
     # age5p_x_log_dist / *_prop / ebikes terms are dead without it.
@@ -4750,6 +5329,22 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                                "or no positive crash exposure) — using log_CRASH_1 as-is")
         except Exception as _cse:
             logger.warning(f"_dest_tree: crash smoothing failed ({_cse}) — using log_CRASH_1 as-is")
+
+    # ── Counterfactual crash scale (safety-value experiment S5) ──────────────
+    # Multiplies destination crash exposure so the SAME fitted model can be
+    # re-applied under a hypothetical safety-technology scenario. With
+    # STAGE5_CRASH_SCALE = 1 - delta, e.g. 0.8 ⇒ a 20% reduction in destination
+    # crash exposure. Applied after smoothing so the raw and log forms move
+    # together; the log form is rebuilt so c_crash uses the scaled field.
+    # Default 1.0 ⇒ no change (bit-identical to a baseline run).
+    _cs_scale = float(os.environ.get('STAGE5_CRASH_SCALE', '1.0') or '1.0')
+    if abs(_cs_scale - 1.0) > 1e-9 and 'CRASH' in ca_df.columns:
+        ca_df['CRASH'] = (np.asarray(ca_df['CRASH'], dtype=float) * _cs_scale)
+        ca_df['log_CRASH_1'] = np.log(
+            np.clip(np.asarray(ca_df['CRASH'], dtype=float), 0.0, None)
+            + 1.0).astype(np.float32)
+        logger.info(f"_dest_tree: crash exposure scaled x{_cs_scale:g} "
+                    f"(counterfactual delta={1.0 - _cs_scale:.2f})")
 
     # ── Piecewise-linear distance spline (ActivitySim distance-band pattern) ─
     # A continuous linear spline in km with knots at 2 and 5 km, so the GA can
@@ -5604,6 +6199,38 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     logger.info(f"_dest_tree: d_ca built - {len(d_ca.data_vars)} vars, "
                 f"dims={dict(d_ca.dims)}")
 
+    # ── Zone-system size (never conflate the 999 SENTINEL with a size) ────────
+    # EXTERNAL_TAZ = FRINGE_ZONE = 999 is a zone ID, never a count. The active
+    # universe is the 371 real ORDER zones plus the composite fringe zone = 372,
+    # and the destination choice set drawn here is at most that. Log/export the
+    # three numbers explicitly so nothing downstream can read "999" as the size.
+    _zone_size_meta = {}
+    try:
+        _n_real = int(_default_n_zones())                 # 371 real SA2/ORDER zones
+        _n_universe = _n_real + 1                         # + composite fringe = 372
+        _n_set = int(d_ca.sizes['_altid_']) if '_altid_' in d_ca.dims else 0
+        _has_fringe = False
+        try:
+            _has_fringe = bool((np.asarray(
+                d_ca.coords['_altid_'].values).ravel().astype(int)
+                == int(FRINGE_ZONE)).any())
+        except Exception:
+            pass
+        logger.info(
+            f"_dest_tree: zone-system size = {_n_universe} "
+            f"({_n_real} real ORDER zones + {int(FRINGE_ZONE)} fringe) — "
+            f"destination choice set drawn = {_n_set} alternatives "
+            f"(fringe present: {_has_fringe})")
+        _zone_size_meta = {
+            '_zone_universe_size': int(_n_universe),
+            '_zone_system_real': int(_n_real),
+            '_alt_set_size': int(_n_set),
+            '_fringe_zone': int(FRINGE_ZONE),
+            '_fringe_in_set': bool(_has_fringe),
+        }
+    except Exception as _zse:
+        logger.debug(f"_dest_tree: zone-system size log skipped ({_zse})")
+
     # ── Force every CA variable to be 2-D (ptour_id × _altid_) ───────────────
     # from_idca() COLLAPSES any column that is constant across alternatives to a
     # 1-D (ptour_id,) variable (a memory optimisation). But the model's numba CA
@@ -5749,9 +6376,41 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                 d_co = _tmp.assign_coords({_cc: _ca_ids})
             elif len(_ca_ids) != len(_co_ids) or not np.array_equal(
                     np.sort(_ca_ids.astype(str)), np.sort(_co_ids.astype(str))):
+                # Same dtype but different case sets (e.g. one side had
+                # quarantined tours dropped). An unaligned merge UNIONS the case
+                # axes, inflating the dataset and padding CA utilities with NaN
+                # for the CO-only cases. Restrict CO to the CA case set (the
+                # CA table is the authoritative destination-estimation universe)
+                # so the merge is an exact no-op on the case axis.
+                _ca_key = np.asarray([str(v) for v in _ca_ids])
+                _co_key = np.asarray([str(v) for v in _co_ids])
+                _missing = sorted(set(_ca_key) - set(_co_key))
+                _extra = sorted(set(_co_key) - set(_ca_key))
                 logger.warning(
                     f"_dest_tree: CASEID VALUE MISMATCH on '{_cc}': "
-                    f"ca={len(_ca_ids)} co={len(_co_ids)} (dtypes agree)")
+                    f"ca={len(_ca_ids)} co={len(_co_ids)} (dtypes agree) "
+                    f"missing_in_co={len(_missing)} extra_in_co={len(_extra)} "
+                    f"examples missing={_missing[:5]} extra={_extra[:5]}")
+                if _missing and os.environ.get('STAGE5_DEST_CASEID_ALIGN', 'strict') != 'loose':
+                    raise ValueError(
+                        f"_dest_tree: {len(_missing)} case(s) in CA have no tour "
+                        f"(CO) record -- refusing to merge (would silently produce "
+                        f"NaN weights and LL=nan). Examples: {_missing[:10]}. "
+                        f"Set STAGE5_DEST_CASEID_ALIGN=loose to override.")
+                try:
+                    _tmp = d_co.assign_coords({_cc: (d_co[_cc].dims, _co_key)})
+                    for _junk in ('_index',):
+                        if _junk in _tmp.coords:
+                            _tmp = _tmp.drop_vars(_junk)
+                    _tmp = _tmp.reindex({_cc: _ca_key})
+                    d_co = _tmp.assign_coords({_cc: _ca_ids})
+                    logger.info(
+                        f"_dest_tree: aligned CO to CA case axis on '{_cc}' "
+                        f"(co {len(_co_ids)} -> {len(_ca_ids)}, dropped "
+                        f"{len(_extra)} CO-only case(s))")
+                except Exception as _ce:
+                    logger.warning(f"_dest_tree: CO->CA case-axis alignment "
+                                   f"failed ({_ce!r}) - merge may union cases")
     except ValueError:
         raise
     except Exception as _al_e:
@@ -5827,6 +6486,11 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     d.attrs['_od_vars_cached'] = list(_cached_od_vars) if _cached_od_vars else []
     d.attrs['_flat_mode'] = True  # flag for _build_dest_model to use flat expressions
     d.attrs['_collinear_cols'] = list(_collinear_ca_cols)  # columns to holdfast at 0
+    # Zone-system size metadata (999 is the fringe SENTINEL, never a size).
+    try:
+        d.attrs.update(_zone_size_meta or {})
+    except Exception:
+        pass
     if _ortho_betas:
         d.attrs['_ortho_betas'] = {k: {'col': c, 'beta': b}
                                    for k, (c, b) in _ortho_betas.items()}
@@ -6318,8 +6982,8 @@ def _adaptive_dest_choice_frame_full(dt_dest, sampled_alts: pd.DataFrame,
                     _per_case = _arr[:, 0].astype(float)
                 _by_case = {str(_c): float(_v)
                             for _c, _v in zip(case_vals, _per_case)}
-                frame[_name] = (pd.to_numeric(frame['case_id'], errors='coerce')
-                                .map(_by_case).fillna(0.0).astype(float))
+                frame[_name] = (frame['case_id'].astype(str)
+                                 .map(_by_case).fillna(0.0).astype(float))
             except Exception as _cc_e:
                 logger.warning(f"adaptive(full) [{segment}]: case covariate "
                                f"{_name!r} failed ({_cc_e})")
@@ -6967,7 +7631,17 @@ MODE_UEC = {
     #
     # Auto/Transit: SOVTOLL_TIME__AM median=58.8 min → divide by 60 → hours
     "c_ivt_auto":       ("od.SOVTOLL_TIME__AM / 60.0",         {"DA": None, "SR": None}),
-    "c_ivt_transit":    ("od.WLK_LOC_WLK_TOTIVT__AM / 60.0",  {"Transit": None}),
+    "c_ivt_transit":    ("od.WLK_LOC_WLK_TOTIVT__AM / 60.0",  {"Transit": None,
+                                                               "PT_Walk": None}),
+    # PT access alternatives (STAGE5_PT_MODES=1; silently skipped when the
+    # names are absent from MODE_MAP). PT_Walk shares c_ivt_transit (same
+    # walk-access skim as generic Transit — the two are separated by their
+    # ASCs only, which keeps the shared IVT coefficient identification-safe).
+    "c_ivt_pt_drive":   ("od.WLK_LOC_DRV_TOTIVT__AM / 60.0",  {"PT_Drive": None}),
+    # Bike access proxy: walk transit minutes × 12/5 (PT_BIKE_FROM_WALK),
+    # log-compressed to the same 0-7 scale as the other time terms.
+    "c_ivt_pt_bike":    ("log(max(od.WLK_LOC_WLK_TOTIVT__AM, 1.0) * 2.4 + 1)",
+                                                              {"PT_Bike": None}),
     "c_walk_time":      ("log(max(od.DISTWALK, 0.3) * 12 + 1)", {"Walk": None}),
     "c_bike_time":      ("log(max(od.DISTBIKE, 0.5) * 4 + 1)",   {"Bike": None}),
 
@@ -7139,6 +7813,14 @@ MODE_UEC = {
     "ASC_Walk":         ("1",                             {"Walk": None}),
     "ASC_Bike":         ("1",                             {"Bike": None}),
     "ASC_Transit":      ("1",                             {"Transit": None}),
+    # PT access alternative constants (STAGE5_PT_MODES=1; inert otherwise).
+    # Each is relative to the DA base like every other ASC; PT_Walk also
+    # carries the walk-access level of generic Transit, so its start value
+    # mirrors ASC_Transit while PT_Drive / PT_Bike start further negative
+    # (smaller observed shares).
+    "ASC_PT_Walk":      ("1",                             {"PT_Walk": None}),
+    "ASC_PT_Drive":     ("1",                             {"PT_Drive": None}),
+    "ASC_PT_Bike":      ("1",                             {"PT_Bike": None}),
 }
 
 
@@ -7787,6 +8469,11 @@ def _mode_ortho_remap(uec: dict, orthogonalize_on: dict, node_vars: dict) -> dic
                     remap[coeff] = f"tour.{coeff}_resid"
                     logger.info(f"_mode_ortho: {coeff} uses orthogonalized "
                                 f"'tour.{coeff}_resid'")
+                else:
+                    logger.warning(
+                        f"_mode_ortho: {coeff} residual "
+                        f"'tour.{coeff}_resid' MISSING from DataTree; "
+                        "raw expression will be used (collinear with distance)")
                 continue
             yp = _ortho_plain_column(uec[coeff][0])
             if base in MODE_UEC:
@@ -8125,7 +8812,8 @@ def _build_dest_utility(mm, segment: str,
                           uec: dict = None,
                           cond: dict = None,
                           orthogonalize_on: dict = None,
-                          ca_df=None) -> object:
+                          ca_df=None,
+                          resid_ok=None) -> object:
     """
     Build destination utility from UEC dict.
     Mirrors ActivitySim's non_mandatory_destination / work_location pattern.
@@ -8148,6 +8836,15 @@ def _build_dest_utility(mm, segment: str,
     if cond is None: cond = DEST_COND
     if orthogonalize_on is None:
         orthogonalize_on = {}
+
+    # Authoritative set of residual columns actually materialised by
+    # _apply_orthogonalization_to_ca (carried on the dataset attrs as
+    # '_ortho_resid_cols').  A flat Larch model's mm.datatree does NOT expose
+    # the flat CA columns through _dataset_var_names, so the _ds_vars probe
+    # below comes back empty and would reject EVERY residual.  resid_ok is the
+    # ground truth: if the materialiser created the column it is guaranteed to
+    # be a dataset var (it was added to the frame that became the dataset).
+    _resid_ok = set(resid_ok) if resid_ok else set()
 
     # Dataset variable universe for the verified swap (works for flat Dataset
     # and multi-node DataTree alike; empty set on any failure → keep originals).
@@ -8172,7 +8869,7 @@ def _build_dest_utility(mm, segment: str,
                                  "residualize at tree-build time or skip")
                     continue
                 rcol = _ortho_resid_col(y_parsed[0], x_parsed[0])
-                if rcol in _ds_vars:
+                if rcol in _ds_vars or rcol in _resid_ok:
                     resid_cols[coeff] = rcol
                     logger.info(f"_build_dest_utility [{segment}]: {coeff} uses "
                                 f"orthogonalized '{rcol}'")
@@ -8264,6 +8961,12 @@ SEGMENT_COEFFICIENTS: dict = {
         "c_ivt_auto":        -1.20,
         "c_ivt_transit":     -0.90,
         "c_crash_veh":        0.0,
+        # ── Mode: PT access alternatives (STAGE5_PT_MODES=1; skipped if absent) ──
+        "c_ivt_pt_drive":    -0.90,
+        "c_ivt_pt_bike":     -0.50,
+        "ASC_PT_Walk":       -2.8,
+        "ASC_PT_Drive":      -4.2,
+        "ASC_PT_Bike":       -5.5,
         # ── Mode: vehicle ownership ───────────────────────────────────────
         "c_veh_da":           0.30,
         "c_veh_sr":           0.10,
@@ -8355,6 +9058,12 @@ SEGMENT_COEFFICIENTS: dict = {
         "c_ivt_auto":        -1.10,
         "c_ivt_transit":     -0.80,
         "c_crash_veh":        0.0,
+        # ── Mode: PT access alternatives (STAGE5_PT_MODES=1; skipped if absent) ──
+        "c_ivt_pt_drive":    -0.80,
+        "c_ivt_pt_bike":     -0.50,
+        "ASC_PT_Walk":       -2.8,
+        "ASC_PT_Drive":      -4.2,
+        "ASC_PT_Bike":       -5.5,
         "c_veh_da":           0.20,
         "c_veh_sr":           0.20,
         "c_noveh_transit":    2.0,
@@ -8419,6 +9128,12 @@ SEGMENT_COEFFICIENTS: dict = {
         "c_ivt_auto":        -1.00,
         "c_ivt_transit":     -0.70,
         "c_crash_veh":        0.0,
+        # ── Mode: PT access alternatives (STAGE5_PT_MODES=1; skipped if absent) ──
+        "c_ivt_pt_drive":    -0.70,
+        "c_ivt_pt_bike":     -0.50,
+        "ASC_PT_Walk":       -2.8,
+        "ASC_PT_Drive":      -4.2,
+        "ASC_PT_Bike":       -5.5,
         "c_veh_da":           0.25,
         "c_veh_sr":           0.15,
         "c_noveh_transit":    2.0,
@@ -8584,6 +9299,12 @@ def _mode_spec_custom(m, Mode, custom_vars: list, segment: str = 'all'):
         #                       stay GA-selectable (gated on 'emp_density').
         'c_transit_access', 'c_empden_transit',
     }
+    if STAGE5_PT_MODES:
+        # PT access alternatives keep their ASCs and IVTs always-on (same
+        # status as the core mode impedance terms) so a GA-selected genome
+        # can never produce a PT alternative with no utility at all.
+        _ALWAYS_INCLUDE |= {'ASC_PT_Walk', 'ASC_PT_Drive', 'ASC_PT_Bike',
+                            'c_ivt_pt_drive', 'c_ivt_pt_bike'}
 
     # ── 2. Person/tour term → candidate gate mapping ─────────────────────────
     # A MODE_UEC person/tour term is included when ANY of its mapped candidates
@@ -8842,29 +9563,18 @@ def _apply_param_ordering(model, kind: str = 'mode') -> None:
     versions without the attribute.
     """
     try:
-        if kind == 'mode':
+        # Grouping categories live in ga_constraints (single source of truth,
+        # shared with the paper appendix generator) so a constraint overlay can
+        # re-group variables without touching estimation code.
+        try:
+            from ga_constraints import stage5_variable_groups
+            model.ordering = stage5_variable_groups(kind)
+        except Exception:
+            # Fallback to a minimal inline grouping if the constraints module
+            # is unavailable (keeps the Safety group so crash terms stay visible).
             model.ordering = (
                 ("Structural: ASCs & nesting", "ASC_.*", "Mu_.*"),
-                ("Level of service", "c_ivt.*", ".*_time$", "c_wait.*", "c_peak.*"),
-                ("Safety", ".*crash.*", ".*CRASH.*"),
-                ("Person & household", "c_incp.*", "c_veh.*", "c_noveh.*",
-                 "c_age.*", "c_young.*", "c_female.*", "c_ftwork.*",
-                 "c_ptwork.*", "c_notwork.*", "c_hhsize.*", "c_joint.*",
-                 "c_bikes.*"),
-                ("Other", ".*"),
-            )
-        else:
-            model.ordering = (
-                ("Structural: size & sampling", "c_size_term", "log_correction"),
-                ("Impedance & accessibility", "c_log_dist", "c_dist",
-                 ".*intrazonal.*", "c_logsum", ".*_acc$"),
-                ("Safety", ".*crash.*"),
-                ("Spatial structure (ACDC)", "c_aggl", "c_comp"),
-                ("Land-use attractors", "c_indp_.*", "c_edu_.*",
-                 "c_log_commercial.*", "c_nonmand_.*"),
-                ("Person interactions", "c_incp_.*", "c_age_.*", "c_veh_.*",
-                 "c_occp_.*", "c_female_.*", "c_nprd_.*", "c_propensity.*",
-                 "c_person.*"),
+                ("Safety", ".*crash.*", ".*CRASH.*", ".*safety.*"),
                 ("Other", ".*"),
             )
     except Exception as _oe:
@@ -8882,6 +9592,8 @@ def _resolve_mode_structure(structure=None) -> str:
     with every nest scale = 1, i.e. Larch's default when no nest nodes are added.
     """
     s = str(structure or os.environ.get('STAGE5_MODE_STRUCTURE', 'nested')).strip().lower()
+    if s in ('lccm', 'lc', 'latent', 'latent_class'):
+        return 'lccm'   # latent-class mode model (per-class MNL/NL); opt-in
     if s in ('flat', 'mnl', 'mxl', 'mixed'):
         return 'flat'
     return 'nested'   # 'auto'/'search' build nested first; decided by BIC later
@@ -8897,12 +9609,15 @@ def _mu_scales_valid(mode_mdl, segment: str):
     both scales at the house fixed value and refits once.
     """
     try:
-        _names = ('Mu_Motor', 'Mu_NonMotor')
         try:
             _idx = set(mode_mdl.pf.index.tolist())
         except Exception:
             return False, 'pf unreadable'
-        if not all(n in _idx for n in _names):
+        # Validate every present nest scale, including the transit sub-nest
+        # (STAGE5_PT_MODES) when it exists.
+        _names = tuple(n for n in ('Mu_Motor', 'Mu_NonMotor', 'Mu_Transit')
+                       if n in _idx)
+        if not all(n in _idx for n in ('Mu_Motor', 'Mu_NonMotor')):
             return True, 'no nest scales (flat structure)'
         _floor = float(os.environ.get('STAGE5_MU_LOWER_BOUND', '0.10'))
         try:
@@ -8937,9 +9652,16 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
     per-segment coefficient starting values via _apply_segment_coefficients.
 
     `structure` (or STAGE5_MODE_STRUCTURE) makes the NEST a decision: 'nested'
-    (default NL) vs 'flat'/'mnl'/'mxl' (no nests → standard MNL/MXL). See
+    (default NL) vs 'flat'/'mnl'/'mxl' (no nests → standard MNL/MXL) vs 'lccm'
+    (latent-class model whose per-class within-models are MNL/NL). See
     _resolve_mode_structure.
     """
+    # Latent-class opt-in: delegate to the LCCM builder (which recursively calls
+    # this function per class with an explicit 'nested'/'flat' structure, so it
+    # never re-enters this branch). Default behaviour is unchanged.
+    if _resolve_mode_structure(structure) == 'lccm':
+        return _build_mode_lccm(dt, segment, custom_mode_vars=custom_mode_vars)
+
     Mode = Dict(**{k: v for k, v in MODE_MAP.items()}).freeze()
     # Prefer JAX when available; _lx_model automatically falls back to numba
     # if JAX is unavailable or fails to initialize.
@@ -8975,7 +9697,23 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
         # Motorised nest.  Parameter names use _ not : to avoid sharrow
         # expression-compiler issues.
         NonMotor = m.graph.new_node(parameter="Mu_NonMotor", children=[Mode.Walk, Mode.Bike])
-        Motor    = m.graph.new_node(parameter="Mu_Motor",    children=[Mode.DA, Mode.SR, Mode.Transit])
+        # PT access alternatives (STAGE5_PT_MODES=1) are transit variants. Rather
+        # than sit flat inside Motor alongside DA/SR, they share a dedicated
+        # Transit sub-nest (Mu_Transit) with the base Transit alternative, so the
+        # walk/drive/bike-access transit options carry correlated error relative
+        # to the private-vehicle modes (the "nest transit properly" structure).
+        # Mu_Transit is fixed (holdfast) by default like the other scales; a free
+        # scale was not identified on HHTS. With STAGE5_PT_MODES off there is
+        # only the base Transit alternative, so the sub-nest is skipped and
+        # Transit sits directly in Motor (the original two-level tree).
+        if STAGE5_PT_MODES:
+            Transit_nest = m.graph.new_node(
+                parameter="Mu_Transit",
+                children=[Mode.Transit, Mode.PT_Walk, Mode.PT_Drive, Mode.PT_Bike])
+            _motor_children = [Mode.DA, Mode.SR, Transit_nest]
+        else:
+            _motor_children = [Mode.DA, Mode.SR, Mode.Transit]
+        Motor    = m.graph.new_node(parameter="Mu_Motor", children=_motor_children)
         m.graph.new_node(parameter="Mu_Root", children=[Motor, NonMotor])
 
         # Mu_Root = 1 is the normalisation constraint for the nested logit.
@@ -8995,17 +9733,26 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
         # Override the fixed value via STAGE5_MU_FIXED_VALUE (default 0.8).
         _mu_fixed = float(os.environ.get('STAGE5_MU_FIXED_VALUE', '0.8'))
         _mu_free = (os.environ.get('STAGE5_ESTIMATE_MU', '0') == '1')
+        # The transit sub-nest scale (STAGE5_PT_MODES) is handled on the same
+        # footing as Mu_Motor / Mu_NonMotor: fixed+locked by default, freed only
+        # under STAGE5_ESTIMATE_MU.
+        _has_transit_nest = STAGE5_PT_MODES and ("Mu_Transit" in m.pf.index)
         m.set_value("Mu_Root",     1.0)
         m.set_value("Mu_Motor",    _mu_fixed)
         m.set_value("Mu_NonMotor", _mu_fixed)
+        if _has_transit_nest:
+            m.set_value("Mu_Transit", _mu_fixed)
         try:
             m.lock_value("Mu_Root",     1.0)      # holdfast — always
             if _mu_free:
                 logger.info(f"[{segment}] STAGE5_ESTIMATE_MU=1: Mu_Motor / "
-                            "Mu_NonMotor FREE (validity-gated post-fit)")
+                            "Mu_NonMotor" + (" / Mu_Transit" if _has_transit_nest
+                            else "") + " FREE (validity-gated post-fit)")
             else:
                 m.lock_value("Mu_Motor",    _mu_fixed)  # holdfast
                 m.lock_value("Mu_NonMotor", _mu_fixed)  # holdfast
+                if _has_transit_nest:
+                    m.lock_value("Mu_Transit", _mu_fixed)  # holdfast
             # Keep bounds on the fixed Mu params for self-documentation and as a
             # guard if anyone flips holdfast off later.  Floor raised 0.001 → 0.10:
             # run06/23300124 models collapsed Mu_Car to the 0.001 bound, scaling
@@ -9023,6 +9770,9 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
             _pf_set(m, "Mu_Motor",    "maximum", 1.0)
             _pf_set(m, "Mu_NonMotor", "minimum", _mu_floor)
             _pf_set(m, "Mu_NonMotor", "maximum", 1.0)
+            if _has_transit_nest:
+                _pf_set(m, "Mu_Transit", "minimum", _mu_floor)
+                _pf_set(m, "Mu_Transit", "maximum", 1.0)
         except Exception as e:
             logger.debug(f"Could not set nesting bounds: {e}")
 
@@ -9078,13 +9828,39 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
             "falling back to always-available for those alternatives"
         )
 
-    m.availability_co_vars = {
+    _avail_map = {
         Mode.DA:      _da_avail,   # licence AND household vehicle required
         Mode.SR:      1,           # SR - passenger, no licence required
         Mode.Walk:    _walk_avail,
         Mode.Bike:    _bike_avail,
         Mode.Transit: 1,
     }
+    if STAGE5_PT_MODES:
+        # PT_Walk: everyone can walk to transit (transit skim treated as the
+        # constraining input, as for generic Transit).
+        # PT_Drive: park-and-ride needs the same car access as DA (licence AND
+        # household vehicle) — a carless person cannot drive to a station.
+        # PT_Bike: needs bike ownership when the column exists.
+        # Prefer the materialized columns (see _prep_hhts_tours): plain columns
+        # survive sharrow compilation and doctor(repair_ch_av); the inline
+        # "(bikes > 0)" fallback neither repairs reliably nor guards NaN bike
+        # counts (chosen-PT_Bike rows then abort the whole segment fit).
+        if 'pt_drive_avail' in _avail_vars:
+            _ptdrive_avail = "pt_drive_avail"
+        else:
+            _ptdrive_avail = _da_avail
+        if 'pt_bike_avail' in _avail_vars:
+            _ptbike_avail = "pt_bike_avail"
+        elif 'bikes' in _avail_vars:
+            _ptbike_avail = "(bikes > 0)"
+        else:
+            _ptbike_avail = 1
+        _avail_map.update({
+            Mode.PT_Walk:  1,
+            Mode.PT_Drive: _ptdrive_avail,
+            Mode.PT_Bike:  _ptbike_avail,
+        })
+    m.availability_co_vars = _avail_map
 
     # apply per-segment coefficient starting values (ActivitySim: get_segment_coefficients)
     m = _apply_segment_coefficients(m, segment)
@@ -9139,6 +9915,412 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
     m = _apply_sign_constraints(m, 'stage5_mode')
 
     return m
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Latent-class mode choice (LCCM) — K classes, each a (optionally NESTED) mode
+# model with class-specific tastes, plus a class-membership logit.  Built from
+# larch's lx.LatentClass (feasibility confirmed: nested-logit-within-class
+# estimates cleanly on larch 6.0.46).  Opt-in and standalone — nothing in the
+# default pipeline constructs an LCCM unless a caller explicitly asks, so this
+# is inert until wired into the GA mode search (STAGE5_MODE_STRUCTURE=lccm).
+#
+# Each class reuses _build_mode_model (so NL-within-class is free) but with the
+# selected MODE_UEC coefficient names SUFFIXED '__c{k}'.  larch shares
+# same-named parameters across class models, so the suffix is what makes the
+# classes behaviourally distinct (own ASCs + own tastes).  Nest-scale params
+# (Mu_Motor/Mu_NonMotor) remain shared across classes in this v1 — acceptable
+# for identification; per-class nest scales are a later refinement.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_mode_lccm(dt, segment: str, n_classes: int = None,
+                     membership_vars=None, class_structures=None,
+                     custom_mode_vars=None):
+    """Return an lx.LatentClass mode model (K classes) for one segment.
+
+    n_classes          : K (default STAGE5_MODE_N_CLASSES or 2; capped by
+                         STAGE5_MODE_MAX_CLASSES).
+    membership_vars    : datatree exprs driving class membership (default
+                         STAGE5_LCCM_MEMBERSHIP_VARS or vehrd/incp/age5p);
+                         class 0 is the reference.
+    class_structures   : list of 'nested'/'flat' per class (default
+                         STAGE5_LCCM_CLASS_STRUCTURES, else all 'nested').
+    custom_mode_vars   : GA-selected MODE_UEC subset (dict) or None (full UEC).
+    """
+    import os as _os
+    _LC = getattr(lx, 'LatentClass', None)
+    if _LC is None:
+        raise RuntimeError("larch has no LatentClass (needs larch>=6 with "
+                           "larch.model.latent_class)")
+    K = int(n_classes or _os.environ.get('STAGE5_MODE_N_CLASSES', '2'))
+    K = max(2, min(K, int(_os.environ.get('STAGE5_MODE_MAX_CLASSES', '4'))))
+
+    if class_structures is None:
+        _cs = _os.environ.get('STAGE5_LCCM_CLASS_STRUCTURES', '').strip()
+        class_structures = ([s.strip() for s in _cs.split(',') if s.strip()]
+                            if _cs else ['nested'] * K)
+    class_structures = (list(class_structures) + ['nested'] * K)[:K]
+
+    # Base utility spec: a GA-passed dict subset, else the full MODE_UEC (which
+    # already carries ASCs + impedance + behavioural backbone).
+    base_uec = (dict(custom_mode_vars) if isinstance(custom_mode_vars, dict)
+                else dict(MODE_UEC))
+
+    # Per-class choice models with class-suffixed parameter names.
+    choicemodels = {}
+    _class_param_names = {}   # k -> class-specific coefficient names (symmetry break)
+    for k in range(K):
+        uec_k = {f"{coeff}__c{k}": val for coeff, val in base_uec.items()}
+        _class_param_names[k] = list(uec_k.keys())
+        choicemodels[k] = _build_mode_model(
+            dt, segment, custom_mode_vars=uec_k, structure=class_structures[k])
+
+    # Class-membership logit (class 0 reference; classes 1..K-1 get utility).
+    if membership_vars is None:
+        _mv = _os.environ.get('STAGE5_LCCM_MEMBERSHIP_VARS', '').strip()
+        membership_vars = ([v.strip() for v in _mv.split(',') if v.strip()]
+                           if _mv else ['person.vehrd', 'person.incp',
+                                        'person.age5p'])
+    # The membership model MUST NOT carry the MODE datatree (altids =
+    # DA/SR/Transit/Walk/Bike), which trips LatentClass's
+    # `assert membership.altids == choicemodels.keys()` with an AssertionError
+    # (observed on real data, job 26463014: "mode model build failed
+    # (AssertionError())"). See larch examples/_107_swissmetro_latent_class.
+    # It DOES need its own minimal datatree whose alternatives ARE the class
+    # ids: Larch 6.0.x LatentClass.reflow assigns classmodel.dataset and the
+    # JAX engine then evaluates classmodel.dataset.dc.altids() through
+    # unmangle(), which needs self.graph — None on a datatreeless model, so
+    # every LCCM refit died with AttributeError 'NoneType' has no
+    # 'node_slot_arrays' (ga_s5*_lccm3*: "family refit failed (sentinel)").
+    # The class datatree gives it a graph, correct altids, and the person
+    # covariates the membership utilities reference; reflow overwrites its
+    # dataset with derived class data afterwards. Falls back to datatreeless
+    # mk (original behavior) on any failure. Never raises.
+    _dt_class = None
+    try:
+        import pandas as _pd_lc
+        _pp = dt['person'].to_dataframe()
+        _pid = _pp.index.to_numpy()
+        _ca = _pd_lc.DataFrame({
+            'person_id': np.repeat(_pid, K),
+            '_altid_': np.tile(np.arange(K), len(_pid)),
+            'chosen': 0,
+        }).set_index(['person_id', '_altid_'])
+        _ds_ca = lx.Dataset.construct.from_idca(_ca)
+        _pp_idx_col = _pp.index.name or 'person_id'
+        _pp_reset = _pp.reset_index(drop=True)
+        _pp_reset[_pp_idx_col] = np.asarray(_pid)
+        _ds_co = lx.Dataset.construct.from_idco(
+            _pp_reset.set_index(_pp_idx_col))
+        _dt_class = lx.DataTree(
+            base=_ds_ca, person=_ds_co,
+            relationships=('base.person_id @ person.person_id',))
+    except Exception as _e_dt:
+        logger.warning(f"[{segment}] LCCM class datatree skipped ({_e_dt!r}); "
+                       f"membership stays datatreeless")
+        _dt_class = None
+    mk = lx.Model(_dt_class) if _dt_class is not None else lx.Model()
+    for k in range(1, K):
+        _u = P(f"gamma_c{k}_const")
+        for v in membership_vars:
+            _safe = v.replace('.', '_').replace(' ', '')
+            _u = _u + P(f"gamma_c{k}_{_safe}") * X(v)
+        mk.utility_co[k] = _u
+
+    # Assemble through SearchLibrium's shared builder: single source of truth
+    # for latent-class wiring + the class-collapse symmetry break (the pipeline
+    # previously assembled lx.LatentClass directly with no symmetry break, so
+    # identical per-class specs could collapse to one class). Falls back to the
+    # direct constructor if an older SearchLibrium without the builder is
+    # installed, so the pipeline never hard-depends on the new entry point.
+    _sb = _os.environ.get('STAGE5_LCCM_SYMMETRY_BREAK', '1') == '1'
+    try:
+        from SearchLibrium.larch_models import build_latent_class as _build_lc
+        lc = _build_lc(
+            choicemodels, mk, dt,
+            num_classes=K,
+            symmetry_break=_sb,
+            class_param_names=_class_param_names,
+            membership_intercepts={k: f"gamma_c{k}_const" for k in range(K)},
+        )
+    except Exception as _e_blc:
+        logger.debug(f"[{segment}] build_latent_class unavailable "
+                     f"({_e_blc!r}); using direct lx.LatentClass")
+        lc = _LC(mk, choicemodels, datatree=dt)
+    try:
+        lc.set_cap(float(_os.environ.get('STAGE5_LCCM_CAP', '25')))
+    except Exception:
+        pass
+    logger.info(f"[{segment}] LCCM built: {K} classes, structures="
+                f"{class_structures}, membership={membership_vars}, "
+                f"symmetry_break={_sb}")
+    return lc
+
+
+def _lccm_rail_scan(lc, cap=None):
+    """Rail scan for a fitted lx.LatentClass (best effort, never raises).
+
+    Flags parameters pinned at a bound/cap, degenerate standard errors,
+    identical class-specific coefficients and collapsed membership gammas.
+    """
+    import os as _os
+    import re as _re
+
+    reasons, warnings, info = [], [], {}
+    try:
+        cap = float(cap if cap is not None else
+                    _os.environ.get('STAGE5_LCCM_CAP', '25'))
+    except Exception:
+        cap = 25.0
+    try:
+        pf = lc.pf
+    except Exception as exc:
+        info['error'] = f"pf unreadable: {type(exc).__name__}: {exc}"
+        return reasons, warnings, info
+
+    def _col(name):
+        try:
+            if name in pf.columns:
+                return pf[name].to_numpy()
+        except Exception:
+            pass
+        return None
+
+    val = _col('value')
+    if val is None:
+        info['error'] = 'pf has no value column'
+        return reasons, warnings, info
+    hf = _col('holdfast')
+    lo = _col('minimum')
+    hi = _col('maximum')
+    se = _col('std_err')
+
+    vals, ses, bounds = {}, {}, {}
+    try:
+        names = [str(p) for p in pf.index]
+    except Exception:
+        names = []
+    for i, p in enumerate(names):
+        try:
+            if hf is not None and bool(hf[i]):
+                continue
+            v = float(val[i])
+            if not np.isfinite(v):
+                continue
+            vals[p] = v
+            if se is not None:
+                s = float(se[i])
+                if np.isfinite(s):
+                    ses[p] = s
+            b_lo = (float(lo[i]) if lo is not None
+                    and np.isfinite(float(lo[i])) else None)
+            b_hi = (float(hi[i]) if hi is not None
+                    and np.isfinite(float(hi[i])) else None)
+            if (b_lo is not None and b_hi is not None
+                    and abs(b_hi - b_lo) < 1e-12):
+                continue
+            if b_lo is None and b_hi is None:
+                b_lo, b_hi = -cap, cap
+            elif b_lo is not None and b_lo < -cap:
+                b_lo = -cap
+            elif b_hi is not None and b_hi > cap:
+                b_hi = cap
+            bounds[p] = (b_lo, b_hi)
+        except Exception:
+            continue
+    info['n_params'] = len(vals)
+    info['n_se'] = len(ses)
+
+    try:
+        from lc_rail_guard import rail_flags
+        rf = rail_flags(vals, ses, bounds)
+        reasons.extend(rf['rail'])
+        warnings.extend(rf['warnings'])
+    except Exception as exc:
+        warnings.append(
+            f"rail helper unavailable: {type(exc).__name__}: {exc}")
+
+    try:
+        bases = {}
+        for p, v in vals.items():
+            m = _re.search(r'__c(\d+)$', p)
+            if m:
+                bases.setdefault(p[:m.start()], {})[int(m.group(1))] = v
+        complete = []
+        K = 0
+        if bases:
+            K = max(max(d) for d in bases.values()) + 1
+            complete = [d for d in bases.values()
+                        if all(k in d for k in range(K))]
+        if len(complete) >= 2 and K > 1:
+            maxdiff = 0.0
+            for d in complete:
+                for k in range(1, K):
+                    maxdiff = max(maxdiff, abs(d[k] - d[0]))
+            if np.isfinite(maxdiff) and maxdiff < 1e-6:
+                reasons.append(
+                    f"classes identical on {len(complete)} class-specific "
+                    f"terms (max |diff|={maxdiff:.1e})")
+    except Exception:
+        pass
+
+    try:
+        gam = {p: v for p, v in vals.items() if p.startswith('gamma_c')}
+        if gam and cap > 0:
+            gmax = max(abs(v) for v in gam.values())
+            if gmax >= cap - 1e-3:
+                reasons.append(f"membership gamma at cap {cap:g} "
+                               f"(max |gamma|={gmax:.4g})")
+    except Exception:
+        pass
+
+    try:
+        probs = None
+        for attr in ('class_probs', '_class_probs', 'class_share',
+                     'class_shares'):
+            probs = getattr(lc, attr, None)
+            if probs is not None:
+                break
+        if probs is not None:
+            sh = np.asarray(probs, dtype=float).ravel()
+            if sh.size and np.min(sh) < 0.01:
+                reasons.append(
+                    f"class collapsed (min share={np.min(sh):.4g})")
+    except Exception:
+        pass
+
+    return reasons, warnings, info
+
+
+def _estimate_lccm(lc, search_mode: bool = False):
+    """Lightweight estimator for an lx.LatentClass (kept out of _estimate, whose
+    overspec/holdfast/drop-stuck logic assumes a single choice model's pf).
+
+    Finishing/identification bookkeeping added 2026-10-13. Previously the
+    return value of ``maximize_loglike`` was discarded and ONLY a TypeError was
+    caught, so: a fit that returned without raising but never moved a parameter
+    (zero gradient) was returned as a valid model, and any other exception --
+    e.g. the ``'NoneType' object has no attribute 'node_slot_arrays'`` raised
+    inside ``LatentClass.reflow_data_arrays`` -- escaped and surfaced upstream
+    only as the anonymous -1e9 GA sentinel with no reason attached. The model
+    now carries ``_lccm_ok`` / ``_lccm_reason`` / ``_lccm_moved`` so a caller can
+    reject an unidentified or crashed latent-class fit instead of publishing it.
+    """
+    import os as _os
+
+    def _param_snapshot():
+        """Current free-parameter values as a 1-D array (empty if unreadable).
+
+        ``lc.pf`` is tried first, then larch's starting-value store. Note that
+        on this stack reading ``pf`` goes through ``LatentClass.reflow_data_
+        arrays`` -- the very call that raises ``node_slot_arrays`` -- so the
+        pre-fit snapshot can legitimately come back empty. That is reported as
+        "unknown" (moved=None) rather than as a pass.
+        """
+        try:
+            return np.asarray(lc.pf['value'], dtype=float).ravel()
+        except Exception:
+            pass
+        for _attr in ('starting_values', '_starting_values'):
+            try:
+                v = getattr(lc, _attr, None)
+                if v is None:
+                    continue
+                if hasattr(v, 'values'):
+                    v = v.values
+                arr = np.asarray(v, dtype=float).ravel()
+                if arr.size:
+                    return arr
+            except Exception:
+                continue
+        return np.array([], dtype=float)
+
+    def _flag(ok, reason, moved=None):
+        try:
+            lc._lccm_ok = bool(ok)
+            lc._lccm_reason = str(reason)
+            lc._lccm_moved = moved
+        except Exception:
+            pass
+        return lc
+
+    try:
+        lc.set_cap(float(_os.environ.get('STAGE5_LCCM_CAP', '25')))
+    except Exception:
+        pass
+    _maxiter = int(_os.environ.get('STAGE5_LCCM_MAXITER',
+                                   '100' if search_mode else '250'))
+    _method = _os.environ.get('STAGE5_LCCM_METHOD', 'slsqp')
+    _before = _param_snapshot()
+    _res = None
+    try:
+        _res = lc.maximize_loglike(method=_method, options={'maxiter': _maxiter},
+                                   quiet=True)
+    except TypeError:
+        # older/newer signature without quiet/options
+        try:
+            _res = lc.maximize_loglike(method=_method)
+        except Exception as _e:
+            logger.warning(f"LCCM maximize_loglike failed: {_e!r}")
+            return _flag(False, f"maximize_loglike raised {type(_e).__name__}: {_e}")
+    except Exception as _e:
+        # Was NOT caught here: the latent-class arm died on
+        # AttributeError("'NoneType' object has no attribute 'node_slot_arrays'")
+        # out of larch LatentClass.reflow_data_arrays and the only surviving
+        # trace was "[stage5-refit] FAILED ... reason=sentinel".
+        logger.warning(f"LCCM maximize_loglike raised: {_e!r}")
+        return _flag(False, f"maximize_loglike raised {type(_e).__name__}: {_e}")
+
+    # Did anything actually move? A latent-class model whose free parameters
+    # are all still at their starting values has a zero gradient and is not
+    # identified -- the same condition _estimate reports as NEVER MOVED for the
+    # single-model path.
+    _after = _param_snapshot()
+    _moved = None
+    if _before.size and _before.size == _after.size:
+        try:
+            _moved = bool(np.any(np.abs(_after - _before) > 1e-10))
+        except Exception:
+            _moved = None
+        if _moved is False:
+            logger.warning(
+                "LCCM: no free parameter moved from its starting value — zero "
+                "gradient, latent classes are not identified on this data")
+            return _flag(False, "no free parameter moved (zero gradient)", False)
+
+    # Optimizer's own verdict, when larch reports one.
+    _ok = True
+    _reason = "ok"
+    _succ = getattr(_res, 'success', None)
+    if _succ is False:
+        _ok = False
+        _reason = f"optimizer reported success=False ({_res})"
+        logger.warning(f"LCCM: {_reason}")
+    if not search_mode:
+        try:
+            lc.calculate_parameter_covariance()
+        except Exception as _e:
+            logger.debug(f"LCCM covariance skipped: {_e!r}")
+
+    try:
+        _rail_reasons, _rail_warns, _rail_info = _lccm_rail_scan(lc)
+    except Exception as _e_rail:
+        _rail_reasons = [f"rail scan failed: {_e_rail!r}"]
+        _rail_warns = []
+        _rail_info = {}
+    try:
+        lc._lccm_rail = bool(_rail_reasons)
+        lc._lccm_rail_reasons = list(_rail_reasons)
+        lc._lccm_rail_warnings = list(_rail_warns)
+        lc._lccm_rail_info = _rail_info
+    except Exception:
+        pass
+    if _rail_reasons:
+        _ok = False
+        _reason = "railed: " + "; ".join(_rail_reasons[:4])
+        logger.warning(f"LCCM: {_reason}")
+
+    return _flag(_ok, _reason, _moved)
 
 
 # ── Flat UEC for pre-joined datasets (ActivitySim pattern) ───────────────
@@ -9391,6 +10573,44 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
     except Exception:
         pass
 
+    # Residual columns actually materialised by _dest_tree (authoritative).
+    # Forwarded to _build_dest_utility so the orthogonalization swap succeeds
+    # for a flat model whose mm.datatree hides the CA columns (the _ds_vars
+    # probe inside _build_dest_utility comes back empty for a flat Model, which
+    # previously rejected EVERY residual and kept the original expression).
+    # _dest_tree exports them on the dataset attrs as
+    # '_ortho_betas' = {coeff: {'col': resid_col, 'beta': beta}}; we
+    # intersect with dt's own variable names so we only ever reference columns
+    # that genuinely exist in the flat flow.
+    _ortho_resid_ok = set()
+    try:
+        _ob = getattr(dt, 'attrs', {}).get('_ortho_betas', {}) or {}
+        _beta_cols = set()
+        if isinstance(_ob, dict):
+            for _v in _ob.values():
+                _c = _v.get('col') if isinstance(_v, dict) else None
+                if _c:
+                    _beta_cols.add(str(_c))
+        if _beta_cols:
+            _dt_vars = _dataset_var_names(dt)
+            if _dt_vars:
+                _ortho_resid_ok = _beta_cols & _dt_vars
+                _missing = _beta_cols - _dt_vars
+                if _missing:
+                    _warn_once(
+                        f'ortho_resid_missing:{segment}',
+                        f"_build_dest_model [{segment}]: {len(_missing)} "
+                        f"materialised residual col(s) absent from the flat "
+                        f"dataset: {sorted(_missing)[:6]}")
+                logger.info(
+                    f"_build_dest_model [{segment}]: {len(_ortho_resid_ok)}/"
+                    f"{len(_beta_cols)} orthogonalization residual col(s) "
+                    f"available for the verified swap")
+            else:
+                _ortho_resid_ok = _beta_cols
+    except Exception:
+        _ortho_resid_ok = set()
+
     # Choice definition: DataTree path uses tour.DTAZ, flat path uses DTAZ
     if _use_datatree_path:
         mm.choice_co_code = "tour.DTAZ"
@@ -9442,7 +10662,8 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
                     )
             # Include log_correction in initial utility (not via += which is broken in Larch 6.x)
             _safe_uec['log_correction'] = ('base.log_correction', None)
-            mm = _build_dest_utility(mm, segment, uec=_safe_uec, orthogonalize_on=_orthogonalize_on)
+            mm = _build_dest_utility(mm, segment, uec=_safe_uec, orthogonalize_on=_orthogonalize_on,
+                                     resid_ok=_ortho_resid_ok)
     else:
         # Flat path: numba engine with utility_ca (faster, avoids DataTree param discovery issues)
         _uec = DEST_UEC_FLAT
@@ -9481,7 +10702,8 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
 
         _built_uec_keys = list(_seg_uec.keys())
         _seg_uec['log_correction'] = ('log_correction', None)
-        mm = _build_dest_utility(mm, segment, uec=_seg_uec, cond={}, orthogonalize_on=_orthogonalize_on)
+        mm = _build_dest_utility(mm, segment, uec=_seg_uec, cond={}, orthogonalize_on=_orthogonalize_on,
+                                 resid_ok=_ortho_resid_ok)
         if _use_quantity:
             _seg_size = _DEST_SIZE_VARS.get(segment, _DEST_SIZE_VARS['nonmand'])
             _sel_size = None
@@ -10565,7 +11787,14 @@ def _prefit_mode_model(mode_mdl, seg_df, persons_df, skims, segment):
         logger.debug(f"[{segment}] Pre-fit Mu interior reset failed: {_mu_e}")
 
     # ── Step 2: ASC log-share pre-calibration ─────────────────────────────
+    # Same damping/bounds as the post-estimation calibration.  Without the
+    # clip, an infeasible target (observed share > available share) starts
+    # the optimiser at an extreme ASC, and 27177740 showed the fit then
+    # settles there (edu ASC_Transit=+6.1, nonmand ASC_Transit=-8.0).
     try:
+        _pre_asc_lo = float(os.environ.get('STAGE5_ASC_CAL_MIN', '-5.0'))
+        _pre_asc_hi = float(os.environ.get('STAGE5_ASC_CAL_MAX', '3.0'))
+        _pre_asc_damp = float(os.environ.get('STAGE5_ASC_CAL_DAMP', '0.5'))
         _mode_col = 'tour_mode' if 'tour_mode' in seg_df.columns else None
         if _mode_col is not None and len(seg_df) > 0:
             _obs_total = float(len(seg_df))
@@ -10578,43 +11807,62 @@ def _prefit_mode_model(mode_mdl, seg_df, persons_df, skims, segment):
                 'ASC_Bike':    MODE_MAP['Bike'],
                 'ASC_Transit': MODE_MAP['Transit'],
             }
-            _col_to_code = {
-                0: MODE_MAP['DA'], 1: MODE_MAP['SR'],
-                2: MODE_MAP['Walk'], 3: MODE_MAP['Bike'], 4: MODE_MAP['Transit'],
-            }
+            if STAGE5_PT_MODES:
+                _asc_map.update({
+                    'ASC_PT_Walk':  MODE_MAP['PT_Walk'],
+                    'ASC_PT_Drive': MODE_MAP['PT_Drive'],
+                    'ASC_PT_Bike':  MODE_MAP['PT_Bike'],
+                })
+            # _mode_probs_numpy returns per-alternative columns in MODE_CODES
+            # order (1..5, or 1..8 with STAGE5_PT_MODES).
+            _code_to_col = {c: i for i, c in enumerate(MODE_CODES)}
 
-            for _it in range(6):
-                mode_mdl._coef_cache = {}
-                _probs = _mode_probs_numpy(mode_mdl, seg_df, persons_df, skims,
-                                           coef_override=None)
-                if _probs is None or _probs.shape[0] == 0:
-                    break
-                _pred_arr = np.asarray(_probs).mean(axis=0)
-                _pred_dict = {_col_to_code[ci]: float(_pred_arr[ci])
-                              for ci in range(len(_pred_arr))}
-
-                _any_adj = False
-                for _asc_p, _mc in _asc_map.items():
-                    if _asc_p not in mode_mdl.pf.index:
+            _pre_coef = _coef_dict_from_model(mode_mdl, None)
+            if _pre_coef:
+                for _asc_p in _asc_map:
+                    if _asc_p in _pre_coef:
+                        _pre_coef[_asc_p] = float(np.clip(
+                            float(_pre_coef[_asc_p]), _pre_asc_lo, _pre_asc_hi))
+                for _it in range(12):
+                    _probs = _mode_probs_numpy(mode_mdl, seg_df, persons_df, skims,
+                                               coef_override=_pre_coef)
+                    if _probs is None or _probs.shape[0] == 0:
+                        break
+                    _pred_arr = np.asarray(_probs).mean(axis=0)
+                    _any_adj = False
+                    for _asc_p, _mc in _asc_map.items():
+                        if _asc_p not in _pre_coef:
+                            continue
+                        _mi = _code_to_col.get(_mc)
+                        if _mi is None or _mi >= len(_pred_arr):
+                            continue
+                        _obs_s  = _obs_shares.get(_mc, 0.0)
+                        _pred_s = float(_pred_arr[_mi])
+                        if _obs_s > 1e-4:
+                            _delta = float(np.log((_obs_s + 1e-8) /
+                                                  (max(_pred_s, 0.0) + 1e-8)))
+                            if abs(_delta) > 0.005:
+                                _cur = float(_pre_coef[_asc_p])
+                                _step = float(np.clip(_pre_asc_damp * _delta,
+                                                      -0.50, 0.50))
+                                _pre_coef[_asc_p] = float(np.clip(
+                                    _cur + _step, _pre_asc_lo, _pre_asc_hi))
+                                _any_adj = True
+                    if not _any_adj:
+                        logger.debug(f"[{segment}] Pre-fit ASC converged in {_it + 1} iter")
+                        break
+                # Write bounded starting values back to the model.
+                for _asc_p in _asc_map:
+                    if _asc_p not in _pre_coef:
                         continue
-                    _is_hf = bool(mode_mdl.pf.loc[_asc_p].get('holdfast', False))
-                    if _is_hf:
-                        continue
-                    _obs_s  = _obs_shares.get(_mc, 0.0)
-                    _pred_s = _pred_dict.get(_mc, 0.0)
-                    if _obs_s > 0.001 and _pred_s > 0.001:
-                        _delta = float(np.log((_obs_s + 1e-8) / (_pred_s + 1e-8)))
-                        if abs(_delta) > 0.005:
-                            _cur = float(mode_mdl.pf.loc[_asc_p, 'value'])
-                            try:
-                                mode_mdl.set_value(_asc_p, _cur + _delta)
-                            except Exception:
-                                mode_mdl.pf.loc[_asc_p, 'value'] = _cur + _delta
-                            _any_adj = True
+                    try:
+                        mode_mdl.set_value(_asc_p, float(_pre_coef[_asc_p]))
+                    except Exception:
+                        try:
+                            mode_mdl.pf.loc[_asc_p, 'value'] = float(_pre_coef[_asc_p])
+                        except Exception:
+                            pass
                 mode_mdl._coef_cache = {}
-                if not _any_adj:
-                    logger.debug(f"[{segment}] Pre-fit ASC converged in {_it + 1} iter")
-                    break
     except Exception as _asc_e:
         logger.debug(f"[{segment}] Pre-fit ASC log-share correction failed: {_asc_e}")
 
@@ -10641,6 +11889,12 @@ def _prefit_mode_model(mode_mdl, seg_df, persons_df, skims, segment):
                 'Mu_Motor':    (0.10, 0.95),
                 'Mu_NonMotor': (0.10, 0.95),
             }
+            if STAGE5_PT_MODES:
+                _de_candidates.update({
+                    'ASC_PT_Walk':  (-6.0, 3.0),
+                    'ASC_PT_Drive': (-8.0, 2.0),
+                    'ASC_PT_Bike':  (-9.0, 1.0),
+                })
             _de_params = []
             _de_bounds = []
             for _p, (_lo, _hi) in _de_candidates.items():
@@ -10864,6 +12118,13 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
                 This dramatically improves Hessian conditioning and eliminates
                 NaN std errors that arise from near-collinear sparse columns.
     """
+    # Latent-class models have a composite parameter frame (membership + K
+    # choice models) that the single-model overspec/holdfast/drop-stuck logic
+    # below would mishandle. Route them to the dedicated LCCM estimator.
+    if type(model).__name__ == 'LatentClass' or isinstance(
+            model, getattr(lx, 'LatentClass', ())):
+        return _estimate_lccm(model, search_mode=search_mode)
+
     # Save per-parameter bounds before set_cap overrides them.
     # set_cap(8) sets maximum=8 / minimum=-8 for ALL parameters, which
     # overwrites any stricter bounds already in pf (e.g. maximum=0.0 on
@@ -11548,6 +12809,23 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
             except Exception:
                 model._cached_ll = float('nan')
 
+        # Persist convergence metadata alongside the LL so reports/appendix can
+        # show the ACTUAL final-fit convergence (iterations, success, null LL
+        # for rho²) instead of only the GA BIC trajectory. Best-effort; never
+        # raises into the fit.
+        try:
+            model._cached_nit = int(getattr(result, 'nit', 0) or 0)
+        except Exception:
+            model._cached_nit = None
+        try:
+            model._cached_converged = bool(getattr(result, 'success', True))
+        except Exception:
+            model._cached_converged = None
+        try:
+            model._cached_ll_null = float(model.loglike_null())
+        except Exception:
+            model._cached_ll_null = float('nan')
+
         try:
             model.calculate_parameter_covariance()
         except Exception as e:
@@ -11714,6 +12992,23 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
             }
             if os.environ.get('STAGE5_DEST_FORCE_ACC', '0') == '1':
                 _NEVER_DROP.add('c_logsum')
+            # Safety experiment contract: crash terms are FORCE-INCLUDED in the
+            # baseline arm.  They must never be treated as disposable
+            # "stuck near-zero" candidates, otherwise the M_S vs M_0 contrast is
+            # silently destroyed (work mode/destination became exactly 0 in
+            # runs 26958837/27016405).  The nosafety arm removes them upstream.
+            if os.environ.get('SAFETY_EXPERIMENT_MODE', 'baseline').strip().lower() != 'nosafety':
+                _safety_keep = {
+                    'c_crash', 'c_crash_veh', 'c_crash_safety',
+                    'c_crash_safety_dest', 'c_crash_smooth',
+                }
+                _protected_safety = _safety_keep & set(model.pf.index)
+                if _protected_safety:
+                    _NEVER_DROP |= _protected_safety
+                    logger.info(
+                        "_estimate: crash terms protected from drop/overspec "
+                        f"(baseline arm): {sorted(_protected_safety)}"
+                    )
             # ── Pre-drop snapshot (BEFORE overspecification mutates state) ────
             # _dest_overspecified_params() locks/zeroes the params it flags, so
             # the snapshot MUST be taken before it: a post-lock snapshot holds
@@ -12391,6 +13686,11 @@ def _prune_and_refit(model, estimate_fn, stage: str, *,
         protected = set(_pb(stage))
     except Exception:
         protected = set()
+    # Safety experiment contract: crash terms are never pruned in the baseline
+    # arm (otherwise M_S collapses to M_0 and the contrast is lost).
+    if _os.environ.get('SAFETY_EXPERIMENT_MODE', 'baseline').strip().lower() != 'nosafety':
+        protected |= {'c_crash', 'c_crash_veh', 'c_crash_safety',
+                      'c_crash_safety_dest'}
 
     _tag = f"[prune {label or stage}]"
     try:
@@ -12543,6 +13843,82 @@ def _collapse_generic_groups(model, stage: str, rebuild_and_fit, *,
     return model
 
 
+def _lccm_membership_shares(lc, n_cases: int):
+    """Best-effort per-case class-membership shares π_q(n) for a fitted LC.
+
+    Returns an array of shape (n_cases, K) that sums to 1 across classes, or
+    ``None`` if the shares cannot be recovered (caller then uses equal weights).
+    Guarded: never raises.
+    """
+    try:
+        import numpy as _np
+        mem = getattr(lc, 'class_membership_model', None)
+        if mem is not None:
+            for _attr in ('jax_probability', 'probability'):
+                _fn = getattr(mem, _attr, None)
+                if _fn is None:
+                    continue
+                try:
+                    pr = _np.asarray(_fn(), dtype=float)
+                except Exception:
+                    try:
+                        pr = _np.asarray(_fn(mem.pvals), dtype=float)
+                    except Exception:
+                        continue
+                if pr.ndim == 2 and pr.shape[0] == n_cases and pr.shape[1] >= 2:
+                    _rs = pr.sum(axis=1, keepdims=True)
+                    _rs[_rs <= 0] = 1.0
+                    return pr / _rs
+    except Exception:
+        pass
+    return None
+
+
+def _logsums_lccm(lc, dt_mode, skims=None, verbose: bool = False,
+                  zone_ids_override: list = None):
+    """Class-averaged inclusive value for a latent-class mode model.
+
+    LS^LC(n,j) = ln Σ_q π_q(n)·exp(LS_q(n,j)), with LS_q the normal per-class
+    logsum (paper eq. m5m-ls-lc). Per-class within-models are the integer-keyed
+    submodels of the larch LatentClass; membership shares π_q(n) come from
+    :func:`_lccm_membership_shares` (equal weights 1/K if unrecoverable, logged).
+    """
+    import numpy as _np
+    from scipy.special import logsumexp as _logsumexp
+    models = getattr(lc, '_models', None) or {}
+    class_models = {k: m for k, m in models.items()
+                    if isinstance(k, int)}
+    if len(class_models) < 2:
+        raise RuntimeError(f"LatentClass exposed {len(class_models)} class "
+                           "within-models; need ≥2")
+    order = sorted(class_models)
+    # Per-class logsum matrices (cases × zones), each via the normal path.
+    per_class = []
+    for k in order:
+        ls_k = _logsums(class_models[k], dt_mode, skims=skims, verbose=False,
+                        zone_ids_override=zone_ids_override)
+        per_class.append(ls_k)
+    _ref = per_class[0]
+    stack = _np.stack([_np.asarray(x.values, dtype=float) for x in per_class],
+                      axis=0)                      # (K, cases, zones)
+    K, n_cases, n_zones = stack.shape
+    shares = _lccm_membership_shares(lc, n_cases)
+    if shares is None or shares.shape[1] != K:
+        logger.warning("_logsums_lccm: could not recover membership shares; "
+                       "using equal 1/K weights (validate before publishing)")
+        shares = _np.full((n_cases, K), 1.0 / K, dtype=float)
+    logw = _np.log(_np.clip(shares.T, 1e-12, None))   # (K, cases)
+    # LS^LC = logsumexp_q (log π_q + LS_q); broadcast weights across zones.
+    ls_lc = _logsumexp(stack + logw[:, :, None], axis=0)   # (cases, zones)
+    if verbose:
+        logger.info(f"_logsums_lccm: combined {K} classes over "
+                    f"{n_cases}×{n_zones} (shares "
+                    f"{'recovered' if shares is not None else 'equal'})")
+    import xarray as _xr
+    return _xr.DataArray(ls_lc.astype(_np.float32), coords=_ref.coords,
+                         dims=_ref.dims)
+
+
 def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
                coef_override: dict = None, zone_ids_override: list = None,
                force_numpy: bool = False):
@@ -12574,7 +13950,58 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
         the full landuse zone list here when computing logsums specifically
         for that calibration step.
     """
+    global _LARCH_PERZONE_DEAD, _LARCH_PERZONE_DEAD_LOGGED
     import xarray as xr
+
+    # ── Latent-class arm: class-averaged inclusive value ────────────────────
+    # For an lx.LatentClass mode model the single-coefficient numpy path below
+    # would read ambiguous (mixed-class) coefficients and produce a wrong
+    # logsum. The paper's destination linkage (eq. m5m-ls-lc) instead feeds the
+    # class-averaged inclusive value  LS^LC(n,j) = ln Σ_q π_q(n)·exp(LS_q(n,j)),
+    # i.e. a per-case π-weighted log-sum-exp over the per-class logsums LS_q.
+    # We compute each LS_q with the normal path on that class's within-model and
+    # combine with the fitted membership shares. Fully guarded: any failure
+    # falls through to the legacy single-model path (unchanged behaviour).
+    if type(mode_model).__name__ == 'LatentClass' and not force_numpy:
+        try:
+            return _logsums_lccm(
+                mode_model, dt_mode, skims=skims, verbose=verbose,
+                zone_ids_override=zone_ids_override)
+        except Exception as _lce:
+            logger.warning(f"_logsums: latent-class class-averaged logsum "
+                           f"failed ({_lce!r}); falling back to single-model "
+                           f"path — treat LC logsums with caution")
+
+# Fast path (2026-10-08 walltime/OOM fix): STAGE5_LARCH_LOGSUM=0 forces the
+    # numpy path immediately; after the first duplicate-column failure in this
+    # process the loop is auto-skipped so later GA evals don't repay the
+    # 371x mangle/unmangle cost (jobs 26520867/26520869 hit walltime/OOM).
+    #
+    # Default flipped to OFF 2026-10-13. The per-zone Larch loop has never once
+    # succeeded against larch 6.0.x on this data: it returns 371 byte-identical
+    # columns (DTAZ substitution ignored) and is then discarded in favour of the
+    # numpy path anyway -- so it was pure cost. Left ON it still burns one full
+    # 371-zone mangle sweep per worker process before self-disabling, which is
+    # the bulk of the walltime/OOM pressure seen on the qld_conv1 tour shards
+    # (26665306/07/09 = SIGTERM at 12h, 26668491/92/93 = OOM at 96GB).
+    # The numpy fallback is NOT an approximation here: it is the path the
+    # duplicate-column check already selects, and it sets DTAZ explicitly per
+    # zone, which is precisely what the Larch loop failed to do.
+    # Set STAGE5_LARCH_LOGSUM=1 to re-attempt the Larch loop (e.g. after a
+    # larch upgrade that fixes the substitution).
+    try:
+        _larch_env_off = os.environ.get('STAGE5_LARCH_LOGSUM', '0').strip().lower() not in ('1', 'true', 'yes', 'on')
+    except Exception:
+        _larch_env_off = True
+    if _LARCH_PERZONE_DEAD or _larch_env_off:
+        if _LARCH_PERZONE_DEAD and not _LARCH_PERZONE_DEAD_LOGGED:
+            logger.info("_logsums: skipping Larch per-zone loop (previously failed with duplicate columns) — using numpy fallback directly.")
+            _LARCH_PERZONE_DEAD_LOGGED = True
+        elif _larch_env_off:
+            logger.info("_logsums: STAGE5_LARCH_LOGSUM=0 — using numpy logsum "
+                        "path directly (Larch per-zone DTAZ substitution is "
+                        "broken on larch 6.0.x).")
+        force_numpy = True
 
     case_ids = list(dt_mode.caseids())
 
@@ -12682,12 +14109,44 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
         except Exception as _e:
             _e_str = str(_e)
             if 'availability_any' in _e_str or 'availability_co' in _e_str:
-                # Larch removed internal _availability_any attribute in a recent version.
-                # This is a known API change - the numpy logsum path is functionally
-                # equivalent and is the correct fallback.  Log at DEBUG only.
-                logger.debug(
-                    f"_logsums: Larch API changed ({_e}) - using numpy logsum path (normal)."
-                )
+                # Larch 6.0.4x rebuilds fixed arrays through the availability
+                # spec, which the mode model here does not carry (every zone is
+                # available), so logsums() raises on it.  Neutralise the
+                # availability spec with object.__setattr__ (BaseModel.
+                # __setattr__ rejects unknown names) and retry: on success the
+                # per-zone Larch loop below runs and logsums come from the model
+                # itself instead of the numpy reconstruction (which can only
+                # approximate the destination-varying terms, and returns a
+                # flat surface when any origin is missing from the OMX map).
+                _retried = False
+                for _avail_any in (True, False):
+                    try:
+                        object.__setattr__(m_test, '_availability_any',
+                                           _avail_any)
+                        object.__setattr__(m_test, '_availability_co_vars', None)
+                        object.__setattr__(m_test, '_availability_ca_var', None)
+                        m_test.mangle()
+                        m_test.unmangle()
+                        np.asarray(m_test.logsums(), dtype=np.float32)
+                        logger.info(
+                            "_logsums: Larch logsums() recovered after "
+                            "neutralising the availability spec "
+                            f"(availability_any={_avail_any}) - using the "
+                            "per-zone Larch loop.")
+                        larch_api_ok = True
+                        _retried = True
+                        break
+                    except Exception as _e2:
+                        logger.debug(
+                            f"_logsums: availability-neutralising retry "
+                            f"(any={_avail_any}) failed ({_e2})")
+                if not _retried:
+                    logger.warning(
+                        f"_logsums: Larch API unavailable ({_e}) and the "
+                        "availability shim did not recover it - using the "
+                        "numpy logsum path (mode coefficients from cache). "
+                        "If this persists the destination c_logsum may be "
+                        "unidentified.")
             else:
                 logger.info(
                     f"_logsums: Larch logsums() unavailable ({_e}) - "
@@ -12710,69 +14169,185 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
         except Exception:
             m_copy = mode_model
 
-        # ── Engine promotion: evaluate the per-zone loop on the JAX engine ──
+        # Same availability shim as the smoke test: this per-zone copy must
+        # survive larch's fixed-array rebuild, which reads the availability
+        # spec the mode model does not carry (see the smoke-test retry).
+        for _avail_any in (True, False):
+            try:
+                object.__setattr__(m_copy, '_availability_any', _avail_any)
+                object.__setattr__(m_copy, '_availability_co_vars', None)
+                object.__setattr__(m_copy, '_availability_ca_var', None)
+                m_copy.mangle()
+                m_copy.unmangle()
+                break
+            except Exception as _av_e:
+                logger.debug(f"_logsums: per-zone availability shim "
+                             f"(any={_avail_any}) failed ({_av_e})")
+
+        # ── Engine promotion: DEFAULT OFF since 2026-10-09 ───────────────
         # XLA caches compiled executables keyed on array SHAPE, so per-zone
         # data changes retrace nothing after the first compile — unlike the
         # numba+sharrow path, whose flow is re-derived whenever the attached
-        # tree changes. Estimation may have auto-switched the model to numba
-        # (the jax-gradient retry); logsums EVALUATION has no such gradient
-        # problem. Promotion is best-effort: on any failure we silently keep
-        # the model's own engine (the per-zone TypeError fallback below then
-        # behaves exactly as before).
+        # tree changes.  Promotion to jax was originally added for speed, but
+        # it is the prime suspect for the 371/371 byte-identical-column
+        # failure (jobs 26441576/26520867/26520869): a JAX-traced utility
+        # flow bakes the FIRST zone's data in as constants, and every later
+        # zone reuses the shape-keyed executable — i.e. every zone evaluates
+        # zone #1's tree while _set_dtaz verification passes.  The numba path
+        # re-derives from the attached tree per zone (slower, reads current
+        # data).  Re-enable only for experiments via
+        # STAGE5_LARCH_LOOP_ENGINE=jax.  Best-effort: on any failure we
+        # silently keep the model's own engine.
         try:
-            if str(getattr(m_copy, 'compute_engine', '')).lower() != 'jax':
+            _loop_engine = os.environ.get('STAGE5_LARCH_LOOP_ENGINE', '').strip().lower()
+            if (_loop_engine == 'jax'
+                    and str(getattr(m_copy, 'compute_engine', '')).lower() != 'jax'):
                 m_copy.compute_engine = 'jax'
                 m_copy.mangle()
                 m_copy.unmangle()
-                logger.info("_logsums: per-zone loop promoted to compute_engine='jax'")
+                logger.info("_logsums: per-zone loop promoted to compute_engine='jax' "
+                            "(STAGE5_LARCH_LOOP_ENGINE=jax)")
+            else:
+                logger.debug("_logsums: per-zone loop keeps model engine "
+                             f"({getattr(m_copy, 'compute_engine', '?')}); jax promotion off by default")
         except Exception as _eng_e:
             logger.debug(f"_logsums: jax engine promotion skipped ({_eng_e})")
 
         # Helper: replace the 'tour' dataset inside a DataTree with one that has
         # DTAZ fixed at `dtaz`.  Tries three API variants across larch/xarray versions.
         def _set_dtaz(dt, dtaz_val):
+            """Return a DataTree whose 'tour' node has DTAZ == dtaz_val.
+
+            Sets ``_set_dtaz.variant`` to the strategy that worked, else leaves
+            it 'unchanged'.  Every candidate result is VERIFIED by reading the
+            tour DTAZ back: the larch/sharrow ``logsums(datatree=...)`` shim
+            accepts any tree (it just attaches it), so a silent no-op used to
+            evaluate the observed-zone tree for every zone and produce a
+            100%-flat logsum surface (seen 2026-10-06, jobs 26441576/26457887).
+            """
             _set_dtaz.variant = 'unchanged'
+            _want = int(dtaz_val)
+
+            def _verify(_tree):
+                for _get in (
+                    lambda t: np.asarray(t['tour']['DTAZ']).ravel(),
+                    lambda t: np.asarray(t.get_subspace('tour')['DTAZ']).ravel(),
+                ):
+                    try:
+                        _v = _get(_tree)
+                        if _v.size and int(_v.ravel()[0]) == _want:
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            # Variant 0: sharrow DataTree.get_subspace -> xr.Dataset (the
+            # node-dataset accessor present on the cluster sharrow build).
+            try:
+                _sub = dt.get_subspace('tour')
+                if _sub is not None and 'DTAZ' in _sub:
+                    _new = _sub.assign(DTAZ=xr.full_like(_sub['DTAZ'], _want))
+                    _out = dt.replace_datasets(tour=_new)
+                    if _verify(_out):
+                        _set_dtaz.variant = 'get_subspace_replace'
+                        return _out
+            except Exception as _e0:
+                logger.debug(f"_logsums: _set_dtaz get_subspace failed ({_e0})")
+
             # Variant 1: larch replace_datasets (larch <5.8 / older xarray DataTree)
             if template is not None:
                 try:
-                    new_tour = dt['tour'].assign(DTAZ=xr.full_like(template, int(dtaz_val)))
-                    _set_dtaz.variant = 'replace_datasets_node'
-                    return dt.replace_datasets(tour=new_tour)
-                except (AttributeError, TypeError, Exception):
+                    new_tour = dt['tour'].assign(DTAZ=xr.full_like(template, _want))
+                    _out = dt.replace_datasets(tour=new_tour)
+                    if _verify(_out):
+                        _set_dtaz.variant = 'replace_datasets_node'
+                        return _out
+                except Exception:
                     pass
                 # Variant 2: access underlying .ds Dataset, then rebuild child node
                 try:
                     _ds = (getattr(dt['tour'], 'ds', None)
                            or getattr(dt['tour'], 'dataset', None))
                     if _ds is not None:
-                        new_ds = _ds.assign(DTAZ=xr.full_like(_ds['DTAZ'], int(dtaz_val)))
-                        _set_dtaz.variant = 'replace_datasets_dataset'
-                        return dt.replace_datasets(tour=new_ds)
+                        new_ds = _ds.assign(DTAZ=xr.full_like(_ds['DTAZ'], _want))
+                        _out = dt.replace_datasets(tour=new_ds)
+                        if _verify(_out):
+                            _set_dtaz.variant = 'replace_datasets_dataset'
+                            return _out
                 except Exception:
                     pass
-                # Variant 3: in-place mutation on the model copy's datatree
-                # (safe because m_copy is already a copy for each outer iteration)
+                # Variant 3: in-place mutation on the model copy's datatree.
+                # Only when the copy owns its tree - mutating a tree shared
+                # with the caller's dt_mode would poison every later use.
                 try:
-                    _ds = (getattr(m_copy.datatree['tour'], 'ds', None)
-                           or getattr(m_copy.datatree['tour'], 'dataset', None))
+                    _tree = m_copy.datatree
+                    if _tree is dt_mode:
+                        raise RuntimeError(
+                            "m_copy shares dt_mode; in-place mutation would "
+                            "pollute the caller's tree")
+                    _ds = None
+                    for _get in (lambda t: t['tour'].ds,
+                                 lambda t: t['tour'].dataset,
+                                 lambda t: t.get_subspace('tour')):
+                        try:
+                            _cand = _get(_tree)
+                            if _cand is not None and 'DTAZ' in _cand:
+                                _ds = _cand
+                                break
+                        except Exception:
+                            _ds = None
                     if _ds is not None and 'DTAZ' in _ds:
-                        import xarray as _xr
-                        _ds['DTAZ'].values[:] = int(dtaz_val)
-                        _set_dtaz.variant = 'in_place_model_copy'
-                        return m_copy.datatree
+                        _ds['DTAZ'].values[:] = _want
+                        if _verify(_tree):
+                            _set_dtaz.variant = 'in_place_model_copy'
+                            return _tree
                 except Exception:
                     pass
             return dt
 
         ls_array_larch = np.zeros((len(case_ids), len(zone_ids)), dtype=np.float32)
         n_failed = 0
+        _dup_zones = []
         _datatree_kwarg_unsupported = False
         for j, dtaz in enumerate(zone_ids):
             try:
                 tmp = _set_dtaz(dt_mode, dtaz)
+                # The sharrow/larch logsums(datatree=...) shim accepts ANY
+                # tree (it merely attaches it), so an 'unchanged' result must
+                # be rejected HERE - otherwise every zone evaluates the same
+                # observed-zone tree and the surface is silently 100% flat.
+                if _set_dtaz.variant == 'unchanged':
+                    raise RuntimeError(
+                        f"could not set DTAZ={dtaz}: all _set_dtaz variants "
+                        "failed (tree returned unchanged; the logsums shim "
+                        "would accept it and fake a flat surface)")
                 ls_col = None
                 try:
-                    ls_col = np.asarray(m_copy.logsums(datatree=tmp), dtype=np.float32)
+                    # Force a FULL detach -> attach -> rebuild so the compiled
+                    # flow is rebuilt from THIS zone's tree.  The datatree
+                    # shim alone is not sufficient: when the tree is already
+                    # attached (in-place variant) the setter short-circuits and
+                    # logsums() silently evaluates the PREVIOUS DTAZ for every
+                    # zone - the 100% flat surface seen on 2026-10-07 (jobs
+                    # 26478124/26478134/26478140).  A failure here counts as a
+                    # zone failure and routes to the numpy fallback.
+                    try:
+                        m_copy.datatree = None
+                    except Exception:
+                        pass
+                    for _ov in ('_dataset', '_data_arrays'):
+                        try:
+                            setattr(m_copy, _ov, None)
+                        except Exception:
+                            pass
+                    try:
+                        m_copy.work_arrays = None
+                    except Exception:
+                        pass
+                    m_copy.datatree = tmp
+                    m_copy.mangle()
+                    m_copy.unmangle()
+                    ls_col = np.asarray(m_copy.logsums(), dtype=np.float32)
                 except TypeError as e:
                     # Larch ≥6 removed the logsums(datatree=...) kwarg — the
                     # signature is logsums(x=None) evaluated against the
@@ -12796,23 +14371,125 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
                         m_copy.unmangle()
                     ls_col = np.asarray(m_copy.logsums(), dtype=np.float32)
                 if ls_col is not None and not np.all(np.isnan(ls_col)):
-                    ls_array_larch[:, j] = np.nan_to_num(ls_col, nan=0.0)
+                    _col = np.nan_to_num(ls_col, nan=0.0)
+                    if j > 0 and np.array_equal(_col, ls_array_larch[:, j - 1]):
+                        # A per-zone loop whose substitution works can never
+                        # return byte-identical columns for two different
+                        # zones.  Identical columns mean DTAZ was not actually
+                        # moved (stale attached tree / cached flow), which
+                        # silently produces the 100%-flat surface.
+                        _dup_zones.append(int(dtaz))
+                        # Demoted to debug (2026-10-08): logging 371 ERROR lines
+                        # per GA eval produced 500KB+ .e files and hid real
+                        # failures. The summary below still logs once.
+                        logger.debug(
+                            "_logsums: zone %s produced an IDENTICAL logsum "
+                            "column to zone %s (variant=%s) - DTAZ "
+                            "substitution is not taking effect",
+                            int(dtaz), int(zone_ids[j - 1]),
+                            _set_dtaz.variant)
+                    ls_array_larch[:, j] = _col
                 else:
                     n_failed += 1
             except Exception as e:
                 logger.debug(f"Logsum failed for zone {dtaz}: {e}")
                 n_failed += 1
 
+        if _dup_zones:
+            logger.error(
+                "_logsums: per-zone Larch loop produced %d duplicate zone "
+                "column(s) - the DTAZ substitution is not taking effect; "
+                "treating the whole loop as failed and using the numpy "
+                "logsum path (future evals in this process skip the Larch "
+                "loop; set STAGE5_LARCH_LOGSUM=0 to skip immediately)",
+                len(_dup_zones))
+            n_failed = len(zone_ids)
+            # Auto-skip the loop for the rest of this GA worker process.
+            try:
+                _LARCH_PERZONE_DEAD = True
+            except Exception:
+                pass
+
         if _datatree_kwarg_unsupported:
             pass   # ls_array stays None -> falls through to numpy fallback below
         elif n_failed < len(zone_ids):
-            ls_array = ls_array_larch
+            # Never accept a flat surface from the loop: if every zone column
+            # is identical the DTAZ substitution was silently ignored (or the
+            # model has no destination-varying terms), and handing this to the
+            # destination estimator fits a dead c_logsum.  Route to the numpy
+            # fallback instead (the mean-row fill above makes it non-flat) so
+            # the caller's variance gate sees a real surface.
+            _lw = (np.nanstd(ls_array_larch, axis=1)
+                   if ls_array_larch.ndim == 2 and ls_array_larch.shape[1] > 1
+                   else np.zeros(0))
+            _lflat = float(np.mean(_lw < 1e-9)) if _lw.size else 1.0
+            if _lflat > 0.5:
+                logger.error(
+                    "_logsums: per-zone Larch loop returned a FLAT surface "
+                    f"({_lflat:.0%} of cases have zero cross-zone variation) "
+                    "- DTAZ substitution was ignored; using the numpy logsum "
+                    "path for this segment.")
+                ls_array = None
+            else:
+                ls_array = ls_array_larch
+                logger.info(
+                    "_logsums: per-zone Larch logsums accepted "
+                    f"(flat={_lflat:.1%}, median within-case std="
+                    f"{float(np.nanmedian(_lw)):.4g})")
         else:
             logger.error(
                 "_logsums: Larch per-zone loop FAILED for every zone despite API smoke-test passing.\n"
                 "  ► Falling back to numpy - mode impedance may be less accurate.\n"
                 "  ► Check Larch model state and skim data consistency."
             )
+
+    # ── Attempt 2.5: JAX-vmap engine ─────────────────────────────────────
+    # Opt-in via STAGE5_VMAP_LOGSUM=1 (default 0: no behaviour change).
+    # Evaluates the same full-spec utility assembly under jit+vmap and (with
+    # STAGE5_VMAP_VERIFY=1) self-verifies against the numpy fallback,
+    # failing closed on breach. Any failure here falls through to the numpy
+    # fallback below — except in verify mode, where the breach propagates so
+    # verify jobs fail loudly instead of passing vacuously.
+    _vmap_req = os.environ.get('STAGE5_VMAP_LOGSUM', '0').strip() == '1'
+    if _vmap_req and STAGE5_PT_MODES:
+        _vmap_req = False
+        logger.warning(
+            "_logsums: STAGE5_VMAP_LOGSUM=1 ignored — the vmap core is "
+            "5-mode and not PT-aware; using the numpy fallback (which "
+            "includes PT_Walk/PT_Drive/PT_Bike) so STAGE5_PT_MODES=1 "
+            "logsums stay consistent.")
+    if ls_array is None and _vmap_req:
+        try:
+            _verify_on = os.environ.get(
+                'STAGE5_VMAP_VERIFY', '0').strip() == '1'
+            ls_array = _logsums_vmap(
+                mode_model, dt_mode, case_ids, zone_ids, skims=skims,
+                coef_override=coef_override)
+            _VMAP_LAST["used"] = True
+            logger.info("_logsums: vmap path taken "
+                        f"(verify={'on' if _verify_on else 'off'})")
+            if _verify_on:
+                _vinfo = _logsums_vmap_verify(
+                    ls_array, mode_model, dt_mode, case_ids, zone_ids,
+                    skims=skims, coef_override=coef_override)
+                _VMAP_LAST["maxdiff"] = _vinfo["maxdiff"]
+                _VMAP_LAST["note"] = (
+                    f"self-verify passed (maxdiff={_vinfo['maxdiff']:.3g})")
+                logger.info("_logsums: vmap self-verify passed "
+                            f"(maxdiff={_vinfo['maxdiff']:.3g})")
+        except _VmapBreach:
+            raise
+        except Exception as _ve:
+            # Fail-closed in verify mode: a vmap crash with silent fallback
+            # would let a verify job pass vacuously (observed 2026-10-11:
+            # unpack bug fell back, job nearly passed on numpy alone).
+            if os.environ.get(
+                    'STAGE5_VMAP_VERIFY', '0').strip() == '1':
+                _VMAP_LAST["note"] = f"vmap crashed: {_ve}"
+                raise
+            logger.error(f"_logsums: vmap path failed ({_ve}) — "
+                         "falling back to numpy")
+            ls_array = None
 
     # ── Attempt 3: numpy fallback - always works regardless of Larch API ────
     # ls_array is None here when both Larch attempts failed/were skipped.
@@ -12822,6 +14499,42 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
         ls_array = _logsums_numpy_fallback(
             mode_model, dt_mode, case_ids, zone_ids, skims=skims, verbose=verbose,
             coef_override=coef_override)
+
+    # ── Flat-surface gate on the numpy path ────────────────────────────────
+    # The Larch per-zone loop had a flatness check ("_lflat > 0.5" -> discard
+    # the loop). The numpy fallback had none, so a degenerate reconstruction
+    # flowed straight into _dest_tree. Since STAGE5_LARCH_LOGSUM now defaults
+    # to 0, numpy IS the path for every run, and this gate is the only thing
+    # standing between a flat logsum and c_logsum.
+    # A flat L_iz across destinations makes base.logsum constant, so
+    # c_logsum has zero gradient and is reported NEVER MOVED / AT A BOUND —
+    # i.e. an unidentified coefficient that still reaches the coefficient CSV.
+    # Causes seen in practice: the mode model carrying no destination-varying
+    # term, or an origin missing from the OMX map (the fallback returns the
+    # case-mean row in that case).
+    try:
+        _lsf0 = np.asarray(ls_array, dtype=float)
+        if _lsf0.ndim == 2 and _lsf0.shape[1] > 1:
+            _withinz = np.nanstd(_lsf0, axis=1)
+            _flatfrac = float(np.mean(_withinz < 1e-9)) if _withinz.size else 1.0
+            _nonzero_frac = float((_lsf0 != 0).mean())
+            if _flatfrac > 0.5 or _nonzero_frac < 0.1:
+                logger.error(
+                    "_logsums: mode logsum is DEGENERATE "
+                    f"(flat across zones for {_flatfrac:.0%} of cases, "
+                    f"non-zero {_nonzero_frac:.0%} of cells). c_logsum will be "
+                    "unidentified (zero gradient) in the destination model. "
+                    "Check the mode model carries destination-varying "
+                    "impedance and that every OTAZ resolves in the OMX.")
+                if os.environ.get('STAGE5_LOGSUM_REQUIRE_VARIANCE', '0').strip() \
+                        in ('1', 'true', 'yes', 'on'):
+                    raise ValueError(
+                        "STAGE5_LOGSUM_REQUIRE_VARIANCE=1 and the mode logsum is "
+                        "flat — refusing to estimate c_logsum on a constant.")
+    except ValueError:
+        raise
+    except Exception:
+        pass
 
     # wrap as xarray DataArray with named dims for use in _dest_tree
     ls = xr.DataArray(
@@ -12938,7 +14651,7 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
                     _warn_once("logsum_degenerate", _msg)
                 except NameError:
                     logger.error(_msg)
-                if os.environ.get('STAGE5_REQUIRE_LOGSUM_VARIANCE', '0') == '1':
+                if os.environ.get('STAGE5_REQUIRE_LOGSUM_VARIANCE', '1') == '1':
                     raise RuntimeError(
                         "degenerate logsum surface: no within-case variation "
                         f"({_flat:.0%} flat cases) - c_logsum cannot identify")
@@ -12948,6 +14661,1041 @@ def _logsums(mode_model, dt_mode, skims=None, verbose: bool = False,
         logger.debug(f"_logsums: within-case variance check skipped ({_lsg_e})")
 
     return ls
+
+
+# ── JAX-vmap logsum engine ─────────────────────────────────────────────
+# Replaces the slow per-zone Larch loop with a jitted, vmapped evaluation of
+# the SAME full-spec utility assembly the numpy fallback uses (6a + 6a-extra
+# + availability masks + nested-logsum reduce). Gated by STAGE5_VMAP_LOGSUM=1
+# (default 0: current behaviour). STAGE5_VMAP_VERIFY=1 additionally runs the
+# numpy fallback and FAILS CLOSED on any breach (the verify-job contract).
+# Memory discipline (2026-10-09 lesson: XLA buffers ratcheted a job to ~100GB):
+# float32 throughout, case-chunked evaluation, block_until_ready per chunk,
+# jax.clear_caches() + gc.collect() after. Never import jax at module level.
+_VMAP_LAST = {"attempted": False, "used": False, "maxdiff": None, "note": ""}
+_JNP = None                    # set on first vmap use (lazy jax import)
+_VMAP_COMPILED = {}            # (chunk, zones, ncoefs) -> jitted vmapped core
+
+# Fixed-order coefficient vector (host-built per call; gates folded in, so the
+# jitted core has no data-dependent branches and compiles exactly once).
+_VMAP_PNAMES = [
+    'c_ivt_auto', 'c_ivt_transit', 'c_walk_time', 'c_bike_time',
+    'ASC_SR', 'ASC_Walk', 'ASC_Bike', 'ASC_Transit',
+    'c_transit_access', 'c_empden_transit', 'c_cbd_transit', 'c_toll_auto',
+    'c_power_rel_da', 'c_power_rel_sr', 'c_power_rel_transit',
+    'c_power_ev_da', 'c_power_ev_transit',
+    'c_veh_da', 'c_incp_da', 'c_ftwork_da', 'c_car_use_da',
+    'c_mgr_da', 'c_trades_da',
+    'c_veh_sr', 'c_incp_sr', 'c_hhsize_sr', 'c_ptwork_sr',
+    'c_noveh_transit', 'c_incp_transit', 'c_female_transit',
+    'c_student_transit', 'c_notwork_transit', 'c_transit_use_transit',
+    'c_prof_transit', 'c_autodef_transit',
+    'c_noveh_walk', 'c_incp_active', 'c_age_walk', 'c_female_walk',
+    'c_student_walk', 'c_retired_walk', 'c_autodef_walk',
+    'c_age_bike', 'c_young_bike', 'c_bikes_bike', 'c_bike_use_bike',
+    'c_ebike_bike', 'c_escooter_bike', 'c_bike_veh',
+    'c_crash_veh', 'c_crash_safety', 'c_cost_auto',
+    'c_joint_sr', 'c_walk_stops', 'c_bike_stops', 'c_bike_shop', 'c_peak_da',
+    'c_work_sr', 'c_work_walk', 'c_work_bike', 'c_work_transit',
+    'c_edu_walk', 'c_edu_bike', 'c_edu_transit',
+    'c_short_walk', 'c_short_bike',
+    'c_cbd_da', 'c_cbd_sr',
+    'c_empden_sr', 'c_empden_walk', 'c_empden_bike',
+    'Mu_Motor', 'Mu_NonMotor',
+]
+_VMAP_PIDX = {n: i for i, n in enumerate(_VMAP_PNAMES)}
+
+# Person/tour case-vector columns pre-materialised for the vmap path (same
+# names/defaults as the numpy fallback's _case_vec calls).
+_VMAP_CASEVEC_COLS = [
+    ('vehrd', 1.0), ('incp', 8.0), ('age5p', 5.0), ('sexp', 1.0),
+    ('nprd', 2.0), ('car_prop', 0.0), ('transit_prop', 0.0), ('bike_prop', 0.0),
+    ('occp_mgr', 0.0), ('occp_trades', 0.0), ('occp_group', 0.0),
+    ('workstat_fulltime', 0.0), ('workstat_parttime', 0.0),
+    ('workstat_notworking', 0.0), ('STUDYING', 0.0), ('safety_sensitivity', 0.0),
+    ('bikes', 0.0), ('ebikes', 0.0), ('escooter', 0.0),
+    ('joint_travel', 0.0), ('outbound_stops', 0.0), ('n_shopping_out', 0.0),
+    ('_time_period', 0.0), ('CARLICENCE', 1.0),
+]
+
+# Coefs whose application the numpy path gates on data presence. The vmap
+# host folds the identical gate into the coef vector (0.0 when gated off),
+# so the jitted core is branch-free. Conditions mirror the numpy fallback.
+_VMAP_NEED_PERSON = (
+    'c_veh_da', 'c_veh_sr', 'c_noveh_transit', 'c_noveh_walk',
+    'c_incp_da', 'c_incp_sr', 'c_incp_transit', 'c_incp_active',
+    'c_age_walk', 'c_age_bike', 'c_young_bike', 'c_hhsize_sr',
+    'c_bikes_bike', 'c_transit_use_transit', 'c_car_use_da',
+    'c_bike_use_bike', 'c_female_transit', 'c_female_walk',
+    'c_ftwork_da', 'c_ptwork_sr', 'c_notwork_transit',
+    'c_bike_veh', 'c_ebike_bike', 'c_escooter_bike',
+    'c_student_transit', 'c_student_walk', 'c_retired_walk',
+    'c_mgr_da', 'c_trades_da', 'c_prof_transit',
+    'c_autodef_transit', 'c_autodef_walk', 'c_crash_safety',
+    'c_cost_auto',
+)
+
+
+_TRANSIT_FILL_CACHE = {}
+
+
+def _fill_transit_gaps(mat_transit, mat_walk, max_walk_km=6.0,
+                       max_col_nan=0.90, n_bands=10):
+    """Network-aware fill of transit-time gaps (WLK_LOC_WLK_TOTIVT__AM).
+
+    The GTFS skim is NaN on ~49% of OD pairs and the rate rises monotonically
+    with walk distance (28% NaN under 6km rising to 80% beyond 75km), i.e. the
+    router only returns paths inside its service envelope. NaN therefore means
+    "no transit path" for most pairs, NOT "unknown", and left alone those cells
+    reach the logsum nest as the contained floor (~-552.6), which deletes
+    transit from the choice set for half the matrix and leaves c_ivt_transit /
+    c_logsum weakly identified.
+
+    Fill only the genuinely walkable-but-unserved gap:
+      * DISTWALK < max_walk_km            (you could actually walk to a stop),
+      * destination is served from >= (1-max_col_nan) of origins, so we are
+        filling a network gap rather than asserting service to an unserved
+        destination,
+    Everything else keeps its NaN and still resolves through the nest floor.
+
+    Fill value is the conditional median of OBSERVED transit times for the same
+    destination within the same DISTWALK band (walk-coupled, and preserves the
+    across-zone variation that c_logsum identifies on). Falls back to the
+    destination's overall median, then the global median.
+
+    Returns (filled_matrix, stats). Never mutates the input. Applied to
+    mat_transit in BOTH the vmap and numpy paths so the two stay bit-identical
+    (a one-sided fill breached self-verify by maxdiff=553, jobs 26620300/26624077).
+    """
+    if mat_transit is None:
+        return None, None
+    mt = np.asarray(mat_transit, dtype=np.float64)
+    if mt.ndim != 2 or mt.shape[0] != mt.shape[1]:
+        return mat_transit, None
+    if mat_walk is None:
+        return mat_transit, None
+    mw = np.asarray(mat_walk, dtype=np.float64)
+    if mw.shape != mt.shape:
+        return mat_transit, None
+
+    nan = np.isnan(mt) | np.isinf(mt)
+    n = mt.shape[0]
+    col_nan = nan.sum(axis=0) / float(n)
+    served = col_nan < max_col_nan
+    walk_ok = np.isfinite(mw) & (mw < float(max_walk_km))
+    eligible = nan & walk_ok & served[None, :]
+    n_elig = int(eligible.sum())
+    if not n_elig:
+        return mt.astype(np.float32), {'eligible': 0, 'filled': 0,
+                                       'served_dest': int(served.sum())}
+    observed = ~nan
+
+    # Distance bands from OBSERVED cells so the fill tracks the distance decay.
+    d_obs = mw[observed]
+    if d_obs.size == 0:
+        return mt.astype(np.float32), {'eligible': n_elig, 'filled': 0,
+                                       'served_dest': int(served.sum())}
+    edges = np.nanpercentile(d_obs, np.linspace(0, 100, n_bands + 1)[1:-1])
+    band = np.digitize(np.where(np.isfinite(mw), mw, 1e9), edges)
+
+    filled = mt.copy()
+    done = np.zeros_like(eligible)
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("ignore")
+        for b in range(n_bands + 1):
+            sel = eligible & (band == b) & ~done
+            if not sel.any():
+                continue
+            # median observed transit per destination within this band
+            cond = np.where(sel & observed, mt, np.nan)
+            med = np.nanmedian(cond, axis=0)
+            hit = sel & np.isfinite(med)[None, :]
+            if hit.any():
+                filled[hit] = med[None, :].repeat(mt.shape[0], 0)[hit]
+                done |= hit
+        # destination-level fallback (any band)
+        if not done.all():
+            cond = np.where(eligible & observed, mt, np.nan)
+            med = np.nanmedian(cond, axis=0)
+            hit = (~done) & eligible & np.isfinite(med)[None, :]
+            if hit.any():
+                filled[hit] = med[None, :].repeat(mt.shape[0], 0)[hit]
+                done |= hit
+    # global fallback for anything still unfilled
+    if not done.all():
+        gm = float(np.nanmedian(mt[observed])) if observed.any() else 45.0
+        left = eligible & ~done
+        filled[left] = gm
+        done |= left
+
+    n_filled = int(done.sum())
+    stats = {
+        'eligible': n_elig,
+        'filled': n_filled,
+        'served_dest': int(served.sum()),
+        'median_fill': float(np.median(filled[done])) if n_filled else None,
+    }
+    logger.info(
+        "_fill_transit_gaps: served destinations=%d/%d, eligible NaN cells=%d, "
+        "filled=%d (median %.1f min); %d NaN cells intentionally left for the "
+        "nest floor",
+        stats['served_dest'], n, n_elig, n_filled,
+        stats['median_fill'] or float('nan'), int(nan.sum() - n_filled))
+    return filled.astype(np.float32), stats
+
+
+_PT_ACCESS_CACHE = {}
+
+
+def _pt_composite_skim(skims, access_mode, base_transit=None, base_walk=None):
+    """Composite PT impedance (minutes) for one access mode, or None.
+
+    Returns the OMX-scale matrix a coupled PT alternative should be evaluated
+    on:
+      * PT_Walk  -> the walk-access skim as-is,
+      * PT_Drive -> the drive-access skim as-is (complete, 0% NaN),
+      * PT_Bike  -> walk-access skim × PT_BIKE_FROM_WALK (derived proxy).
+
+    For PT_Bike the walk skim is filled with _fill_transit_gaps first when a
+    walk matrix is available, so the proxy inherits the same network-aware gap
+    treatment instead of scaling raw NaNs. Cached per (access, matrix
+    fingerprint) because the GA fitness re-reads skims thousands of times.
+    """
+    if not access_mode or access_mode not in PT_ACCESS_SKIM:
+        return None
+    col = PT_ACCESS_SKIM[access_mode]
+    mat = None
+    if col is not None and skims is not None:
+        try:
+            if col in skims.listMatrices():
+                mat = np.asarray(_skim_minutes(col, np.array(skims[col],
+                                                             dtype=np.float32)),
+                                 dtype=np.float64)
+        except Exception as _e:
+            logger.debug("_pt_composite_skim: read %s failed (%s)", col, _e)
+            mat = None
+    if mat is None and access_mode == 'PT_Bike' and base_transit is not None:
+        mat = np.asarray(base_transit, dtype=np.float64)
+    if mat is None:
+        return None
+    if access_mode == 'PT_Bike':
+        if base_walk is not None:
+            try:
+                _fk = ('bike', mat.shape, float(np.nansum(mat)))
+                if _PT_ACCESS_CACHE.get(_fk) is None:
+                    _filled, _ = _fill_transit_gaps(mat, base_walk)
+                    if _filled is not None:
+                        _PT_ACCESS_CACHE[_fk] = np.asarray(_filled,
+                                                           dtype=np.float64)
+                mat = _PT_ACCESS_CACHE.get(_fk, mat)
+            except Exception as _e:
+                logger.debug("_pt_composite_skim: bike fill skipped (%s)", _e)
+        mat = mat * PT_BIKE_FROM_WALK
+    nan = float(np.isnan(mat).mean()) if mat.size else 1.0
+    obs = mat[~np.isnan(mat)]
+    logger.info(
+        "_pt_composite_skim[%s]: NaN=%.1f%%  median=%.1f min  n=%d  "
+        "(source=%s)", access_mode, 100.0 * nan,
+        float(np.median(obs)) if obs.size else float('nan'), mat.size,
+        col or 'derived-from-walk')
+    return mat.astype(np.float32)
+
+
+def _logsum_case_core(P, c, Z):
+    """Per-case nested logsum; array-module-agnostic (jnp under vmap/jit).
+
+    P: (Np,) coef vector in _VMAP_PNAMES order (traced). c: dict of per-case
+    inputs (scalars or (Z,) OD rows). Z: dict of (Z,) zone arrays (static).
+    Returns (1 + 5*n_zones,) concat [logsum, V_DA, V_SR, V_Transit, V_Walk,
+    V_Bike] so the host can run the shared PLC correction on full surfaces.
+    Mirrors the numpy fallback sections 6a/6a-extra term by term; any
+    divergence is caught by the self-verify gate (STAGE5_VMAP_VERIFY=1).
+    """
+    jnp = _JNP
+    g = lambda n: P[_VMAP_PIDX[n]]  # noqa: E731  (static int index: no retrace)
+    # 6a base time/ASC/access
+    v_da = (g('c_ivt_auto') * c['auto_h'] + g('c_toll_auto') * c['toll'] / 10.0
+            + g('c_power_rel_da') * Z['pow_rel'] + g('c_power_ev_da') * Z['ev_host'])
+    v_sr = (g('ASC_SR') + g('c_ivt_auto') * c['auto_h']
+            + g('c_toll_auto') * c['toll'] / 10.0
+            + g('c_power_rel_sr') * Z['pow_rel'])
+    v_transit = (g('c_ivt_transit') * c['trans_h'] + g('ASC_Transit')
+                 + g('c_transit_access') * Z['acc'] + g('c_empden_transit') * Z['empden']
+                 + g('c_cbd_transit') * Z['cbd']
+                 + g('c_power_rel_transit') * Z['pow_rel']
+                 + g('c_power_ev_transit') * Z['ev_host'])
+    v_walk = g('c_walk_time') * c['walk_logmin'] + g('ASC_Walk')
+    v_bike = g('c_bike_time') * c['bike_logmin'] + g('ASC_Bike')
+    # 6a-extra person/tour heterogeneity (fitted-only via zero-default coefs)
+    _female = (c['sexp'] == 2).astype(jnp.float32)
+    _noveh = (c['vehrd'] == 0).astype(jnp.float32)
+    _young = (c['age5p'] <= 5).astype(jnp.float32)
+    _study = (c['studying'] > 0).astype(jnp.float32)
+    _autodef = (c['vehrd'] < c['nprd']).astype(jnp.float32)
+    v_da = v_da + (g('c_veh_da') * c['vehrd'] + g('c_incp_da') * c['incp']
+                   + g('c_ftwork_da') * c['workstat_ft']
+                   + g('c_car_use_da') * c['car_prop']
+                   + g('c_mgr_da') * c['occp_mgr'] + g('c_trades_da') * c['occp_trades'])
+    v_sr = v_sr + (g('c_veh_sr') * c['vehrd'] + g('c_incp_sr') * c['incp']
+                   + g('c_hhsize_sr') * c['nprd'] + g('c_ptwork_sr') * c['workstat_pt'])
+    v_transit = v_transit + (g('c_noveh_transit') * _noveh + g('c_incp_transit') * c['incp']
+                             + g('c_female_transit') * _female + g('c_student_transit') * _study
+                             + g('c_notwork_transit') * c['workstat_nw']
+                             + g('c_transit_use_transit') * c['transit_prop']
+                             + g('c_prof_transit') * (c['occp_group'] == 1).astype(jnp.float32)
+                             + g('c_autodef_transit') * _autodef)
+    v_walk = v_walk + (g('c_noveh_walk') * _noveh + g('c_incp_active') * c['incp']
+                       + g('c_age_walk') * c['age5p'] + g('c_female_walk') * _female
+                       + g('c_student_walk') * _study + g('c_retired_walk') * c['workstat_nw']
+                       + g('c_autodef_walk') * _autodef)
+    v_bike = v_bike + (g('c_incp_active') * c['incp'] + g('c_age_bike') * c['age5p']
+                       + g('c_young_bike') * _young + g('c_bikes_bike') * c['bikes']
+                       + g('c_bike_use_bike') * c['bike_prop']
+                       + g('c_ebike_bike') * c['ebikes'] + g('c_escooter_bike') * c['escooter']
+                       + g('c_bike_veh') * (c['vehrd'] >= 1).astype(jnp.float32)
+                       + g('c_retired_walk') * c['workstat_nw'])
+    v_da = v_da + g('c_crash_veh') * c['crash_lcr'] + g('c_cost_auto') * c['cost']
+    v_sr = v_sr + g('c_crash_veh') * c['crash_lcr'] + g('c_cost_auto') * c['cost']
+    v_transit = v_transit + g('c_crash_veh') * c['crash_lcr']
+    v_walk = v_walk + g('c_crash_safety') * c['sens'] * c['crash_lcr']
+    v_bike = v_bike + g('c_crash_safety') * c['sens'] * c['crash_lcr']
+    v_walk = v_walk + g('c_short_walk') * (c['walk_dist'] < 2.0).astype(jnp.float32)
+    v_bike = v_bike + g('c_short_bike') * (c['bike_dist'] < 5.0).astype(jnp.float32)
+    v_da = v_da + g('c_cbd_da') * Z['cbd']
+    v_sr = v_sr + g('c_cbd_sr') * Z['cbd']
+    v_sr = v_sr + g('c_empden_sr') * Z['empden']
+    v_walk = v_walk + g('c_empden_walk') * Z['empden']
+    v_bike = v_bike + g('c_empden_bike') * Z['empden']
+    v_sr = v_sr + g('c_joint_sr') * c['joint_travel']
+    v_walk = v_walk + g('c_walk_stops') * c['outbound_stops']
+    v_bike = (v_bike + g('c_bike_stops') * c['outbound_stops']
+              + g('c_bike_shop') * (c['n_shopping_out'] > 0).astype(jnp.float32))
+    v_da = v_da + g('c_peak_da') * (c['time_period'] == 1).astype(jnp.float32)
+    v_sr = v_sr + g('c_work_sr') * c['is_work']
+    v_walk = v_walk + g('c_work_walk') * c['is_work'] + g('c_edu_walk') * c['is_edu']
+    v_bike = v_bike + g('c_work_bike') * c['is_work'] + g('c_edu_bike') * c['is_edu']
+    v_transit = (v_transit + g('c_work_transit') * c['is_work']
+                 + g('c_edu_transit') * c['is_edu'])
+    # availability masks (ActivitySim respects availability in logsums)
+    v_da = jnp.where((c['licence'] > 0) & (c['vehrd'] > 0), v_da, -1e20)
+    v_walk = jnp.where(c['walk_dist'] < 6.0, v_walk, -1e20)
+    v_bike = jnp.where(c['bike_dist'] < 25.0, v_bike, -1e20)
+
+    # float32-safe log floor (2026-10-11): the numpy fallback floors empty
+    # sums at 1e-300, but 1e-300 flushes to 0.0 in float32 (min subnormal
+    # ~1.4e-45), so log(1e-300) == log(0) == -inf under jit — observed as
+    # ~1M -inf cells (job 26618151/26619251). Split form below is bit-exact
+    # for normal cells (log(t) + 0.0) and reproduces float64 log(1e-300) =
+    # -690.7755... for empty cells (diff ~3e-5, inside verify tolerance).
+    _LOG_FLOOR = jnp.float32(-690.7755)
+
+    def _nlog(t):
+        _pos = t > 0
+        return jnp.log(jnp.where(_pos, t, 1.0)) + jnp.where(_pos, 0.0, _LOG_FLOOR)
+
+    def _nl(V, mu):
+        # NaN-semantics independence (2026-10-11): the numpy fallback relies
+        # on NaN PROPAGATION (any-NaN nest -> t=NaN -> log(1e-300) floor), but
+        # XLA minimum/maximum-number semantics can turn NaN into a finite
+        # bound inside clip/max (observed: NaN transit zones silently produced
+        # NORMAL logsums instead of the contained floor). Detect NaN
+        # explicitly with isnan (exact under both semantics) and force the
+        # identical contained result: mu * (log(1e-300) + 0.0). No reliance on
+        # max/clip NaN behaviour anywhere on this path.
+        _bad = jnp.isnan(V).any(axis=-1, keepdims=True)
+        Vs = jnp.where(_bad, 0.0, V)
+        Vm = Vs / mu
+        m = jnp.max(Vm, axis=-1, keepdims=True)
+        m = jnp.where(jnp.isfinite(m), m, 0.0)
+        e = jnp.exp(jnp.clip(Vm - m, -500, 0))
+        t = e.sum(axis=-1, keepdims=True)
+        iv = mu * (_nlog(t) + m)
+        return jnp.where(_bad[..., 0], mu * (_LOG_FLOOR + 0.0), iv[..., 0])
+
+    mu_m = g('Mu_Motor')
+    mu_nm = g('Mu_NonMotor')
+    iv_m = _nl(jnp.stack([v_da, v_sr, v_transit], axis=-1), mu_m)
+    iv_nm = _nl(jnp.stack([v_walk, v_bike], axis=-1), mu_nm)
+    root = jnp.stack([iv_m, iv_nm], axis=-1)
+    rm = jnp.max(root, axis=-1, keepdims=True)
+    rm = jnp.where(jnp.isfinite(rm), rm, 0.0)
+    re_ = jnp.exp(jnp.clip(root - rm, -500, 0))
+    rs = re_.sum(axis=-1, keepdims=True)
+    ls = (rm[..., 0] + _nlog(rs)[..., 0])
+    # Per-case output is zone-vector shaped: ls is (Z,). Stack everything as
+    # (6, Z) rows [logsum, V_DA, V_SR, V_Transit, V_Walk, V_Bike] so the
+    # vmapped call returns (C, 6, Z) and the host splits logsum vs surfaces.
+    return jnp.concatenate([ls[None, :], v_da[None, :], v_sr[None, :],
+                            v_transit[None, :], v_walk[None, :], v_bike[None, :]])
+
+
+def _logsums_vmap(mode_model, dt_mode, case_ids, zone_ids, skims=None,
+                  coef_override: dict = None):
+    """JAX-vmap logsum engine. Same signature/semantics as the numpy fallback.
+
+    Gathers inputs once on host (pure numpy/pandas/OMX I/O), evaluates the
+    per-case core under jit+vmap in float32 case-chunks, then runs the shared
+    host-side PLC correction. Raises on any failure (the caller falls back to
+    numpy, or — with STAGE5_VMAP_VERIFY=1 — lets it propagate fail-closed).
+    """
+    global _JNP
+    if STAGE5_PT_MODES:
+        raise RuntimeError(
+            "_logsums_vmap: the JAX-vmap logsum core is 5-mode and not "
+            "PT-aware; refusing to run with STAGE5_PT_MODES=1 (it would "
+            "silently drop PT_Walk/PT_Drive/PT_Bike from the inclusive "
+            "value). Use the numpy fallback instead.")
+    _VMAP_LAST["attempted"] = True
+    try:
+        import jax
+        import jax.numpy as jnp
+    except Exception as _je:
+        raise RuntimeError(f"vmap logsum needs jax: {_je}")
+    _JNP = jnp
+    import gc as _gc
+
+    n_cases = len(case_ids)
+    n_zones = len(zone_ids)
+    try:
+        _chunk = int(os.environ.get("STAGE5_VMAP_CHUNK", "2000"))
+    except ValueError:
+        _chunk = 2000
+    _chunk = max(64, _chunk)
+
+    # ── host-side inputs (mirrors numpy fallback sections 1–5b) ──────────
+    _cache = _coef_dict_from_model(mode_model, coef_override)
+    if not _cache:
+        raise RuntimeError("vmap logsum: no coefficient source")
+
+    def _pv(name, default=0.0):
+        v = _cache.get(name)
+        if v is None:
+            return default
+        try:
+            fv = float(v)
+            return fv if not np.isnan(fv) else default
+        except Exception:
+            return default
+
+    def _chain(*names):
+        v = None
+        for _n in names:
+            if _n in _cache:
+                v = _cache[_n]
+                break
+        if v is None:
+            return None
+        try:
+            fv = float(v)
+            return fv if np.isfinite(fv) else None
+        except Exception:
+            return None
+
+    # base time/ASC coefs with the fallback's chains (6a header comments)
+    _c_ivt_auto = _chain('c_ivt_auto', 'c_ivt')
+    if _c_ivt_auto is None:
+        _c_ivt_auto = -1.20
+    _c_ivt_transit = _chain('c_ivt_transit', 'c_ivt_auto')
+    if _c_ivt_transit is None:
+        _c_ivt_transit = _pv('c_ivt_auto', -0.90)
+    _c_walk_time = _chain('c_walk_time', 'c_walk_dist')
+    if _c_walk_time is None:
+        _c_walk_time = -1.50
+    _c_bike_time = _chain('c_bike_time', 'c_bike_dist')
+    if _c_bike_time is None:
+        _c_bike_time = -1.00
+    _mu_m = float(max(_pv('Mu_Motor', 0.8), 0.01))
+    _mu_nm = float(max(_pv('Mu_NonMotor', 0.8), 0.01))
+
+    # gates mirror the numpy fallback's conditional application exactly
+    _has = lambda n: _cache.get(n) is not None  # noqa: E731
+    _person_active = any(_has(n) for n in _VMAP_NEED_PERSON)
+    _crash_ok = bool(_has('c_crash_veh') or _has('c_crash_safety'))
+    _cost_ok = bool(_has('c_cost_auto') and _person_active)
+    _sens_ok = bool(_has('c_crash_safety') and _person_active)
+
+    # OMX zone mapping + matrices (same reads as the numpy fallback §2–3)
+    zone_to_idx: dict = {}
+    if skims is not None:
+        try:
+            mapping = dict(skims.mapping(skims.listMappings()[0]))
+            zone_to_idx = {int(k): int(v) for k, v in mapping.items()}
+        except Exception as e:
+            logger.warning(f"_logsums_vmap: OMX mapping unreadable ({e})")
+
+    def _read_mat(name):
+        if skims is None:
+            return None
+        try:
+            if name in skims.listMatrices():
+                arr = np.array(skims[name], dtype=np.float32)
+                return np.asarray(_skim_minutes(name, arr), dtype=np.float32)
+        except Exception:
+            pass
+        return None
+
+    mat_auto = _read_mat('SOVTOLL_TIME__AM')
+    _mat_trans = _read_mat('WLK_LOC_WLK_TOTIVT__AM')
+    if _mat_trans is None:
+        mat_transit = (mat_auto * 1.5 if mat_auto is not None else None)
+    else:
+        mat_transit = _mat_trans
+    mat_walk = _read_mat('DISTWALK')
+    mat_bike = _read_mat('DISTBIKE')
+
+    # Network-aware transit gap fill — SAME helper and SAME cache entry as the
+    # numpy path (see _fill_transit_gaps). Must stay bit-identical: filling one
+    # engine but not the other breached self-verify by maxdiff=553.
+    if mat_transit is not None and os.environ.get(
+            'STAGE5_FILL_TRANSIT_GAPS', '1').strip() == '1':
+        try:
+            _fp = (mat_transit.shape, float(np.nansum(mat_transit)),
+                   float(np.nansum(mat_walk)) if mat_walk is not None else 0.0)
+            if _TRANSIT_FILL_CACHE.get('key') != _fp:
+                _ft, _fst = _fill_transit_gaps(mat_transit, mat_walk)
+                if _ft is not None:
+                    _TRANSIT_FILL_CACHE['key'] = _fp
+                    _TRANSIT_FILL_CACHE['mat'] = _ft
+                    _TRANSIT_FILL_CACHE['stats'] = _fst
+            if _TRANSIT_FILL_CACHE.get('mat') is not None:
+                mat_transit = _TRANSIT_FILL_CACHE['mat']
+        except Exception as _tfe:
+            logger.warning(
+                "_logsums_vmap: transit gap fill skipped (%r) - unserved "
+                "pairs keep the nest floor", _tfe)
+    mat_crash = None
+    try:
+        if skims is not None and 'CRASH' in skims.listMatrices():
+            mat_crash = np.array(skims['CRASH'], dtype=np.float32)
+    except Exception:
+        mat_crash = None
+    mat_dist = None
+    try:
+        if skims is not None:
+            for _dn in ('DIST', 'SOVTOLL_DIST__AM'):
+                if _dn in skims.listMatrices():
+                    mat_dist = np.array(skims[_dn], dtype=np.float32)
+                    break
+    except Exception:
+        mat_dist = None
+    mat_toll = None
+    try:
+        if skims is not None and 'SOVTOLL_TOLL__AM' in skims.listMatrices():
+            mat_toll = np.array(skims['SOVTOLL_TOLL__AM'], dtype=np.float32)
+    except Exception:
+        mat_toll = None
+    _toll = mat_toll
+
+    # origins per case (same tour-node resolution as the numpy fallback §4)
+    case_otaz = np.ones(n_cases, dtype=np.int32)
+    for _get in (
+        lambda: np.asarray(dt_mode['tour']['OTAZ']).ravel(),
+        lambda: np.asarray(dt_mode.get_subspace('tour')['OTAZ']).ravel(),
+        lambda: np.asarray(dt_mode['tour']['otaz']).ravel(),
+    ):
+        try:
+            _v = _get()
+            if _v is not None and _v.size == n_cases:
+                case_otaz = np.nan_to_num(np.asarray(_v, dtype=float), nan=1.0).astype(np.int32)
+                break
+        except Exception:
+            continue
+
+    _MISSING_IDX = -1
+    dest_idx = np.array(
+        [zone_to_idx.get(int(z), _MISSING_IDX) for z in zone_ids], dtype=np.int32)
+    dest_valid = (dest_idx >= 0)
+    _orig_idx = np.array(
+        [zone_to_idx.get(int(z), _MISSING_IDX) for z in case_otaz], dtype=np.int32)
+    _orig_valid = _orig_idx >= 0
+
+    def _gather(mat, fallback_min):
+        if mat is None or not zone_to_idx or not dest_valid.any():
+            return np.full((n_cases, n_zones), fallback_min, dtype=np.float32)
+        valid_dest = dest_idx[dest_valid]
+        mat = np.asarray(mat, dtype=np.float32)
+        rows = np.repeat(mat.mean(axis=0)[None, :], n_cases, axis=0)
+        if _orig_valid.any():
+            rows[_orig_valid, :] = mat[_orig_idx[_orig_valid], :]
+        out = np.full((n_cases, n_zones), fallback_min, dtype=np.float32)
+        out[:, dest_valid] = rows[:, valid_dest]
+        out = np.where(out <= 0, fallback_min, out)
+        return out
+
+    auto_ivt = _gather(mat_auto, 30.0)
+    transit_ivt = _gather(mat_transit, 45.0)
+    walk_dist = _gather(mat_walk, 20.0)
+    bike_dist = _gather(mat_bike, 20.0)
+    # NOTE: no NaN filling here. The numpy fallback lets skim-gap NaNs flow
+    # into the nest, where they take the contained floor (-552.6); the vmap
+    # core reproduces that exactly via its explicit NaN guard + split _nlog
+    # floor. Filling NaNs with fallbacks (tried 2026-10-11) silently produced
+    # NORMAL values where numpy contains, breaching self-verify by ~553.
+    auto_h = np.clip(auto_ivt / 60.0, 0.01, 5.0).astype(np.float32)
+    trans_h = np.clip(transit_ivt / 60.0, 0.01, 6.0).astype(np.float32)
+    walk_logmin = np.log(np.clip(walk_dist * 12.0, 0.0, 1500.0) + 1.0).astype(np.float32)
+    bike_logmin = np.log(np.clip(bike_dist * 4.0, 0.0, 1500.0) + 1.0).astype(np.float32)
+
+    def _gather_full_local(mat, fill):
+        """Exact port of the numpy fallback's _gather_full (NOT _gather):
+        invalid origins keep `fill` (no mean-row), invalid destinations keep
+        `fill`, no <=0 replacement. Used for crash/dist so the vmap path
+        matches the fallback cell-for-cell."""
+        out = np.full((n_cases, n_zones), float(fill), dtype=np.float32)
+        if mat is None or np.ndim(mat) != 2 or not zone_to_idx:
+            return out
+        try:
+            _vd = dest_idx[dest_valid]
+            for i in range(n_cases):
+                o_idx = zone_to_idx.get(int(case_otaz[i]), _MISSING_IDX)
+                if o_idx < 0:
+                    continue
+                _row = np.asarray(mat[o_idx, _vd], dtype=np.float32)
+                out[i, dest_valid] = np.where(np.isfinite(_row), _row, fill)
+        except Exception:
+            pass
+        return out
+
+    # crash / dist use _gather_full semantics (see above), NOT _gather
+    crash_base = (_gather_full_local(mat_crash, 0.0)
+                  if _crash_ok and mat_crash is not None
+                  else np.zeros((n_cases, n_zones), dtype=np.float32))
+    crash_lcr = np.log(np.maximum(crash_base, 0.0) + 1.0).astype(np.float32)
+    dist_full = (_gather_full_local(mat_dist, 0.0)
+                 if _cost_ok and mat_dist is not None
+                 else np.zeros((n_cases, n_zones), dtype=np.float32))
+    if _toll is not None and zone_to_idx and _pv('c_toll_auto', 0.0) != 0.0 and dest_valid.any():
+        _toll_od = np.zeros((n_cases, n_zones), dtype=np.float32)
+        _toll_rows = np.repeat(
+            np.maximum(np.asarray(_toll, dtype=np.float32).mean(axis=0), 0.0)[None, :],
+            n_cases, axis=0)
+        if _orig_valid.any():
+            _toll_rows[_orig_valid, :] = _toll[_orig_idx[_orig_valid], :]
+        _toll_od[:, dest_valid] = np.maximum(
+            _toll_rows[:, dest_idx[dest_valid]], 0.0)
+    else:
+        _toll_od = np.zeros((n_cases, n_zones), dtype=np.float32)
+
+    # zone attribute vectors (same emp-node LUT as the numpy fallback §5b)
+    def _zone_vec(col):
+        out = np.zeros(n_zones, dtype=np.float32)
+        try:
+            _emp_df = dt_mode['emp'].to_dataframe()
+            _emp_idx = pd.Index(pd.to_numeric(_emp_df.index, errors='coerce')).astype(int)
+            if col in _emp_df.columns:
+                _vals = pd.to_numeric(_emp_df[col], errors='coerce').fillna(0.0).values
+                _lut = dict(zip(_emp_idx.tolist(), _vals.tolist()))
+                for _j, _z in enumerate(zone_ids):
+                    _v = _lut.get(int(_z))
+                    if _v is not None and np.isfinite(_v):
+                        out[_j] = float(_v)
+        except Exception:
+            pass
+        return out
+
+    Z = {k: _zone_vec(c) for k, c in (
+        ('acc', 'transit_walk_acc'), ('empden', 'log_emp_density'),
+        ('cbd', 'is_cbd'), ('pow_rel', 'power_reliability_acc'),
+        ('ev_host', 'ev_hosting_acc'))}
+
+    # person/tour case vectors (same _case_vec semantics/defaults as fallback)
+    _tdf = None
+    try:
+        _tdf = dt_mode['tour'].to_dataframe()
+        _tdf.index = _tdf.index.map(str)
+    except Exception:
+        _tdf = None
+    _plut = {}
+    try:
+        _pdf = dt_mode['person'].to_dataframe()
+        if 'person_id' in _pdf.columns:
+            _pkey = _pdf['person_id'].astype(str).values
+        else:
+            _pkey = pd.Index(_pdf.index).astype(str).values
+        for _c in _pdf.columns:
+            try:
+                _plut[str(_c)] = pd.to_numeric(
+                    _pdf[_c], errors='coerce').fillna(0.0).values.astype(float)
+            except Exception:
+                pass
+        _plut['_pid'] = np.asarray(list(_pkey), dtype=str)
+    except Exception:
+        _plut = {}
+
+    def _mcase(col, default=0.0):
+        out = np.full(n_cases, float(default), dtype=np.float32)
+        if _tdf is None:
+            return out
+        try:
+            _cids = [str(c) for c in case_ids]
+            if col in _tdf.columns:
+                for i, _cid in enumerate(_cids):
+                    if _cid in _tdf.index:
+                        try:
+                            _f = float(_tdf.at[_cid, col])
+                            out[i] = _f if np.isfinite(_f) else default
+                        except Exception:
+                            pass
+                return out
+            if _plut and 'person_id' in _tdf.columns:
+                _pids = _tdf.loc[
+                    [c for c in _cids if c in _tdf.index], 'person_id'].astype(str)
+                _pos = {p: k for k, p in enumerate(_plut.get('_pid', []))}
+                _pvals = _plut.get(col)
+                if _pvals is not None:
+                    for i, _cid in enumerate(_cids):
+                        if _cid in _pids.index:
+                            _k = _pos.get(str(_pids.at[_cid]))
+                            if _k is not None:
+                                out[i] = float(_pvals[_k])
+        except Exception:
+            pass
+        return out
+
+    Cfull = {}
+    for _nm, _dflt in _VMAP_CASEVEC_COLS:
+        Cfull[_nm] = _mcase(_nm, _dflt)
+    # short aliases used by the per-case core (must match _logsum_case_core).
+    # Missing-alias KeyErrors inside jit surface as opaque JAX errors, so keep
+    # this map next to the core and covered by the vmap_check harness.
+    for _short, _long in (
+            ('workstat_ft', 'workstat_fulltime'),
+            ('workstat_pt', 'workstat_parttime'),
+            ('workstat_nw', 'workstat_notworking'),
+            ('studying', 'STUDYING'),
+            ('sens', 'safety_sensitivity'),
+            ('time_period', '_time_period'),
+            ('licence', 'CARLICENCE')):
+        Cfull[_short] = Cfull[_long]
+    try:
+        _pm = None
+        if _tdf is not None and 'main_purpose' in _tdf.columns:
+            _cids2 = [str(c) for c in case_ids]
+            _pm = _tdf['main_purpose'].astype(str).reindex(_cids2).fillna('').values.astype(str)
+            Cfull['is_work'] = (_pm == 'work').astype(np.float32)
+            Cfull['is_edu'] = (_pm == 'edu').astype(np.float32)
+        else:
+            Cfull['is_work'] = np.zeros(n_cases, dtype=np.float32)
+            Cfull['is_edu'] = np.zeros(n_cases, dtype=np.float32)
+    except Exception:
+        Cfull['is_work'] = np.zeros(n_cases, dtype=np.float32)
+        Cfull['is_edu'] = np.zeros(n_cases, dtype=np.float32)
+    # NOTE: no age-gate on licence here — the numpy fallback applies none
+    # (the CARLICENCE<=15 gate lives only in the tour-mode predictor).
+    # Mirroring it here would deviate from numpy and trip the self-verify.
+    _rate = 0.0
+    try:
+        _rate = float(_auto_cost_rate())
+    except Exception:
+        _rate = 0.0
+    _cost = ((_rate * dist_full / np.maximum(Cfull['incp'][:, None] + 1.0, 1.0))
+             if _cost_ok else np.zeros((n_cases, n_zones), dtype=np.float32)).astype(np.float32)
+    if not _sens_ok:
+        _sens_arr = np.zeros(n_cases, dtype=np.float32)
+    else:
+        _sens_arr = np.asarray(Cfull['sens'], dtype=np.float32)
+    Cfull['sens'] = _sens_arr
+
+    # coef vector with fallback chains + data gates folded in
+    def _pc(name, default=0.0):
+        return _pv(name, default)
+
+    _P = {
+        'c_ivt_auto': _c_ivt_auto, 'c_ivt_transit': _c_ivt_transit,
+        'c_walk_time': _c_walk_time, 'c_bike_time': _c_bike_time,
+        'ASC_SR': _pc('ASC_SR', -0.50), 'ASC_Walk': _pc('ASC_Walk', -1.00),
+        'ASC_Bike': _pc('ASC_Bike', -1.50), 'ASC_Transit': _pc('ASC_Transit', -0.50),
+        'c_transit_access': _pc('c_transit_access', 0.0),
+        'c_empden_transit': _pc('c_empden_transit', 0.0),
+        'c_cbd_transit': _pc('c_cbd_transit', 0.0),
+        'c_toll_auto': _pc('c_toll_auto', 0.0),
+        'c_power_rel_da': _pc('c_power_rel_da', 0.0),
+        'c_power_rel_sr': _pc('c_power_rel_sr', 0.0),
+        'c_power_rel_transit': _pc('c_power_rel_transit', 0.0),
+        'c_power_ev_da': _pc('c_power_ev_da', 0.0),
+        'c_power_ev_transit': _pc('c_power_ev_transit', 0.0),
+    }
+    for _n in _VMAP_PNAMES:
+        if _n not in _P:
+            _P[_n] = _pc(_n, 0.0)
+    # data gates (mirror the numpy fallback's conditional application)
+    if not (_crash_ok and mat_crash is not None):
+        _P['c_crash_veh'] = 0.0
+        _P['c_crash_safety'] = 0.0
+    if not _cost_ok or mat_dist is None:
+        _P['c_cost_auto'] = 0.0
+    _P['Mu_Motor'] = _mu_m
+    _P['Mu_NonMotor'] = _mu_nm
+    P = np.array([float(_P[n]) for n in _VMAP_PNAMES], dtype=np.float32)
+    try:
+        _bad_p = [n for n in _VMAP_PNAMES if not np.isfinite(float(_P[n]))]
+        if _bad_p:
+            logger.warning(f"_logsums_vmap: non-finite coefs in P vector: {_bad_p}")
+    except Exception:
+        pass
+
+    # per-case chunk dicts (host float32) + static zone dict
+    _Z = {k: np.asarray(v, dtype=np.float32) for k, v in Z.items()}
+    _OD = {'auto_h': auto_h, 'trans_h': trans_h, 'walk_logmin': walk_logmin,
+           'bike_logmin': bike_logmin, 'toll': _toll_od,
+           'crash_lcr': crash_lcr, 'dist': dist_full,
+           'walk_dist': walk_dist, 'bike_dist': bike_dist, 'cost': _cost}
+
+    _key = (_chunk, n_zones, len(_VMAP_PNAMES))
+    _jit = _VMAP_COMPILED.get(_key)
+    if _jit is None:
+        _core = jax.jit(jax.vmap(
+            _logsum_case_core,
+            in_axes=(None,
+                     {k: 0 for k in list(_OD) + list(Cfull)},
+                     None)))
+        _VMAP_COMPILED[_key] = _core
+        _jit = _core
+        logger.info(f"_logsums_vmap: compiled core (chunk={_chunk}, zones={n_zones})")
+
+    _ls_parts, _vparts = [], []
+    _n_chunks = 0
+    try:
+        for _s in range(0, n_cases, _chunk):
+            _n_chunks += 1
+            _e = min(_s + _chunk, n_cases)
+            _c = {}
+            for _k, _v in list(_OD.items()) + [(k, Cfull[k]) for k in Cfull]:
+                _a = np.asarray(_v[_s:_e], dtype=np.float32)
+                if _a.ndim == 2 and _a.shape[0] == (_e - _s) and _k in Cfull:
+                    pass  # (Cc,1) case scalars stay 2-D; core broadcasts vs (Z,)
+                _c[_k] = _a
+            _out = _jit(P, _c, _Z)
+            jax.block_until_ready(_out)
+            _out = np.asarray(_out, dtype=np.float32)
+            # assembly-shape guard (fail-closed, not silent): a contract drift
+            # between the core's (6,Z) rows and this split corrupts every
+            # surface (observed 2026-10-11: silent garbage without it).
+            if _out.ndim != 3 or _out.shape[0] != (_e - _s) \
+                    or _out.shape[1] != 6 or _out.shape[2] != n_zones:
+                raise RuntimeError(
+                    f"vmap core shape breach: got {_out.shape}, want "
+                    f"({(_e - _s)}, 6, {n_zones})")
+            _ls_parts.append(_out[:, 0, :])
+            _vparts.append(_out[:, 1:, :])
+        ls_array = np.concatenate(_ls_parts, axis=0).astype(np.float32)
+        _V = np.concatenate(_vparts, axis=0)  # (C,5,Z): DA,SR,Transit,Walk,Bike
+        # breach-debug bundle (verify mode only): per-case NaN flags for every
+        # vmap input surface + active coefs, so a self-verify breach can be
+        # attributed to inputs vs core math without another full run.
+        if os.environ.get('STAGE5_VMAP_VERIFY', '0').strip() == '1':
+            try:
+                def _anymask(a):
+                    try:
+                        return np.isnan(np.asarray(a, dtype=float)).any(axis=-1)
+                    except Exception:
+                        return None
+                _pflags = {}
+                try:
+                    for _k, _v in list(Cfull.items()):
+                        _a = np.asarray(_v, dtype=float)
+                        if bool(np.isnan(_a).any()):
+                            _pflags[_k] = int(np.isnan(_a).sum())
+                except Exception:
+                    pass
+                _dbg = {"trans_h_nan": _anymask(trans_h),
+                        "auto_h_nan": _anymask(auto_h),
+                        "crash_nan": _anymask(crash_lcr),
+                        "cost_nan": _anymask(_cost),
+                        "toll_nan": _anymask(_toll_od),
+                        "person_nan_cols": _pflags,
+                        "zone_nan": {k: bool(np.isnan(
+                            np.asarray(v, dtype=float)).any())
+                            for k, v in Z.items()},
+                        "active_coefs": sorted(
+                            str(n) for n in _VMAP_PNAMES
+                            if abs(float(_P[n])) > 0),
+                        "n_cases": n_cases, "n_zones": n_zones,
+                        # raw gather provenance for post-mortem
+                        "case_otaz": np.asarray(
+                            case_otaz, dtype=int).tolist(),
+                        "zone_ids": [int(z) for z in zone_ids],
+                        "mat_transit_is_none": mat_transit is None,
+                        "trans_raw_6257_184": None}
+                _VMAP_LAST["debug"] = _dbg
+            except Exception:
+                pass
+    finally:
+        # memory discipline: drop chunk temporaries, clear XLA caches
+        try:
+            del _ls_parts, _vparts, _c, _out
+        except NameError:
+            pass
+        try:
+            jax.clear_caches()
+        except Exception:
+            pass
+        try:
+            import gc as _gc2
+            _gc2.collect()
+        except Exception:
+            pass
+
+    # shared host-side PLC correction (same call as the numpy fallback)
+    try:
+        def _census2(x, tag):
+            try:
+                _xa = np.asarray(x, dtype=float)
+                logger.warning(f"_logsums_vmap surface {tag}: "
+                               f"nan={int(np.isnan(_xa).sum())} "
+                               f"+inf={int(np.isposinf(_xa).sum())} "
+                               f"-inf={int(np.isneginf(_xa).sum())} "
+                               f"min={float(np.nanmin(_xa)):.3g} "
+                               f"max={float(np.nanmax(_xa)):.3g}")
+            except Exception:
+                pass
+        _census2(ls_array, "ls-raw")
+        for _ii, _mm in enumerate(("DA", "SR", "Transit", "Walk", "Bike")):
+            _census2(np.asarray(_V[:, _ii, :]), f"V-{_mm}")
+        _plc_ls = _plc_correct_logsum(
+            ls_array,
+            {'DA': np.asarray(_V[:, 0, :]), 'SR': np.asarray(_V[:, 1, :]),
+             'Transit': np.asarray(_V[:, 2, :])},
+            case_ids, dt_mode, _cache)
+        if _plc_ls is not None:
+            ls_array = np.asarray(_plc_ls, dtype=np.float32)
+    except Exception as _plc_e:
+        logger.debug(f"_logsums_vmap: PLC correction skipped ({_plc_e})")
+    try:
+        del _V
+    except NameError:
+        pass
+
+    # Post-condition (2026-10-11): the vmap surface must be FINITE, but it is
+    # EXPECTED to mirror numpy's contained-floor value (~-552.6) wherever a
+    # skim-gap NaN reaches the transit nest — so NaN must NOT appear, while a
+    # legitimate large-magnitude floor value is fine. A raw NaN here would
+    # annihilate the destination softmax (job 26619725, maxdiff=inf).
+    _lsf = np.asarray(ls_array, dtype=float)
+    _nan_cells = int(np.isnan(_lsf).sum())
+    if _nan_cells:
+        # RuntimeError, not _VmapBreach: _VmapBreach is re-raised unconditionally
+        # in _logsums, which would kill a production segment instead of letting
+        # it fall back. RuntimeError is re-raised only under
+        # STAGE5_VMAP_VERIFY=1 (so verify jobs still fail loudly) and otherwise
+        # routes to the numpy fallback.
+        raise RuntimeError(
+            f"vmap produced a NaN logsum surface: {_nan_cells}/{_lsf.size} "
+            "cells; routing to the numpy fallback")
+
+    try:
+        _med_within = float(np.nanmedian(np.nanstd(ls_array.astype(float), axis=1)))
+    except Exception:
+        _med_within = float('nan')
+    logger.info(f"_logsums_vmap: vmap path taken ({n_cases}x{n_zones}, "
+                f"chunks={_n_chunks}; "
+                f"within-case std median={_med_within:.4g})")
+    return ls_array
+
+
+class _VmapBreach(RuntimeError):
+    """Self-verify breach: vmap disagrees with numpy beyond tolerance."""
+
+
+def _logsums_vmap_verify(ls_vmap: np.ndarray, mode_model, dt_mode, case_ids,
+                         zone_ids, skims=None, coef_override: dict = None) -> dict:
+    """Run the numpy fallback as reference and compare (fail-closed on breach).
+
+    Returns {'maxdiff': float, 'meandiff': float}. Raises _VmapBreach when the
+    disagreement exceeds tolerance — the verify-job contract.
+    """
+    try:
+        _tol_abs = float(os.environ.get('STAGE5_VMAP_TOL_ABS', '5e-3'))
+    except ValueError:
+        _tol_abs = 5e-3
+    try:
+        _tol_rel = float(os.environ.get('STAGE5_VMAP_TOL_REL', '1e-4'))
+    except ValueError:
+        _tol_rel = 1e-4
+    ref = _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
+                                  skims=skims, coef_override=coef_override)
+    a = np.asarray(ls_vmap, dtype=float)
+    b = np.asarray(ref, dtype=float)
+    if a.shape != b.shape:
+        raise _VmapBreach(f"shape mismatch vmap={a.shape} numpy={b.shape}")
+    # inf/nan census (which side, where) — pinpoints the divergent term
+    def _census(x, tag):
+        try:
+            _nn = int(np.isnan(x).sum())
+            _ni = int(np.isposinf(x).sum())
+            _ng = int(np.isneginf(x).sum())
+            _loc = ""
+            if _nn + _ni + _ng:
+                _idx = np.argwhere(~np.isfinite(x))
+                _loc = f" e.g. {(_idx[:5]).tolist()}"
+                try:
+                    _rows = sorted(set(int(r[0]) for r in _idx[:50].tolist()))
+                    _loc += f" rows={_rows[:8]}"
+                except Exception:
+                    pass
+            logger.warning(f"_logsums_vmap_verify census {tag}: "
+                             f"nan={_nn} +inf={_ni} -inf={_ng}{_loc}")
+        except Exception:
+            pass
+    _census(a, "vmap")
+    _census(b, "numpy")
+    _d = np.abs(a - b)
+    _den = 1.0 + np.abs(b)
+    maxdiff = float(np.nanmax(_d))
+    meandiff = float(np.nanmean(_d))
+    maxrel = float(np.nanmax(_d / _den))
+    info = {"maxdiff": maxdiff, "meandiff": meandiff, "maxrel": maxrel}
+    logger.info(f"_logsums_vmap_verify: maxdiff={maxdiff:.3g} "
+                f"meandiff={meandiff:.3g} maxrel={maxrel:.3g} "
+                f"(tol abs={_tol_abs:.0e} rel={_tol_rel:.0e})")
+    # attribute the breach: top divergent cells + whether they sit on
+    # NaN-input rows (skim gaps) vs clean rows (core math bug). Also saves a
+    # small breach artifact (inputs for the top cells) for offline analysis.
+    try:
+        _flat = np.argpartition(_d.ravel(), -10)[-10:]
+        _rows, _cols = np.unravel_index(_flat, _d.shape)
+        _dbg = dict(_VMAP_LAST.get("debug") or {})
+
+        def _rowflag(_k, _r):
+            _v = _dbg.get(_k)
+            if _v is None:
+                return "?"
+            try:
+                return bool(np.asarray(_v).ravel()[_r])
+            except Exception:
+                return "?"
+
+        def _cnt(_k):
+            _v = _dbg.get(_k)
+            if _v is None:
+                return "?"
+            try:
+                return int(np.asarray(_v).sum())
+            except Exception:
+                return "?"
+
+        _desc = []
+        for _r, _zz in zip(_rows.tolist(), _cols.tolist()):
+            _desc.append(f"(row={_r},zone={_zz},a={a[_r,_zz]:.3g},"
+                         f"b={b[_r,_zz]:.3g},"
+                         f"trans_nan={_rowflag('trans_h_nan', _r)},"
+                         f"auto_nan={_rowflag('auto_h_nan', _r)})")
+        logger.warning("_logsums_vmap_verify top divergent cells: "
+                       + "; ".join(_desc)
+                       + f" | active_coefs={(_dbg.get('active_coefs') or [])[:24]}"
+                       + f" | crash_rows_nan={_cnt('crash_nan')}"
+                       + f" cost_rows_nan={_cnt('cost_nan')}"
+                       + f" toll_rows_nan={_cnt('toll_nan')}"
+                       + f" person_nan_cols={_dbg.get('person_nan_cols')}"
+                       + f" zone_nan={_dbg.get('zone_nan')}")
+    except Exception as _de:
+        logger.debug(f"_logsums_vmap_verify attribution skipped ({_de})")
+    if not (np.isfinite(maxdiff) and maxdiff <= _tol_abs) and not (
+            np.isfinite(maxrel) and maxrel <= _tol_rel):
+        raise _VmapBreach(
+            f"vmap/numpy breach: maxdiff={maxdiff:.3g} maxrel={maxrel:.3g}")
+    return info
 
 
 def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
@@ -12965,10 +15713,21 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
         Transit     : WLK_LOC_WLK_TOTIVT__AM (walk-to-transit IVT, minutes)
         Walk        : DISTWALK × 12 min/km   (5 km/h)
         Bike        : DISTBIKE × 4  min/km   (15 km/h)
+        PT_Walk     : WLK_LOC_WLK_TOTIVT__AM / 60  (STAGE5_PT_MODES=1; same
+                      walk-access IVT as Transit, separated by ASC only)
+        PT_Drive    : WLK_LOC_DRV_TOTIVT__AM / 60  (drive-access IVT; walk
+                      proxy when the OMX lacks the matrix)
+        PT_Bike     : log(max(walk-access IVT minutes, 1) × 2.4 + 1)
 
     Returns np.ndarray shape (n_cases, n_zones).
     """
-    xp = jnp if JAX_AVAILABLE else np
+    # NOTE (2026-10-09 memory fix): this is the NUMPY fallback — it must use
+    # plain numpy, never JAX.  xp=jnp here allocated one XLA buffer per op per
+    # GA fitness eval (65+ ops × multi-GB arrays), and those buffers only
+    # clear on jax.clear_caches(), ratcheting RSS to the cgroup limit
+    # (othdiscr 26552419 hit ~100GB).  All ops below are elementwise and
+    # float32-identical under numpy.
+    xp = np
     n_cases = len(case_ids)
     n_zones = len(zone_ids)
     ls_array = np.zeros((n_cases, n_zones), dtype=np.float32)
@@ -12978,8 +15737,13 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
     # the '_mangled' AttributeError that caused all logsums to be zero.
     _cache = _coef_dict_from_model(mode_model, coef_override)
     if not _cache:
-        logger.warning("_logsums_numpy_fallback: no coefficient source - "
-                       "pass coef_override or use save_models() to inject cache")
+        _no_coef_msg = (
+            "_logsums_numpy_fallback: no coefficient source (coef_override "
+            "empty and the mode model exposes no pf) - refusing to return an "
+            "all-zero logsum surface")
+        logger.error(_no_coef_msg)
+        if os.environ.get('STAGE5_REQUIRE_LOGSUM_VARIANCE', '1') == '1':
+            raise RuntimeError(_no_coef_msg)
         return ls_array
 
     def _pv(name, default=0.0):
@@ -13013,7 +15777,17 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
             # mapping is {zone_id: 0-based_index}
             zone_to_idx = {int(k): int(v) for k, v in mapping.items()}
         except Exception as e:
-            logger.debug(f"_logsums_numpy_fallback: could not read OMX mapping: {e}")
+            # WARNING, not DEBUG: an empty zone_to_idx makes _gather return a
+            # constant for every case, which silently flattens the whole logsum
+            # surface and leaves the destination c_logsum unidentified.
+            logger.warning(
+                "_logsums_numpy_fallback: could not read OMX mapping (%s) - "
+                "zone lookups will miss and logsums may be degenerate", e)
+    if not zone_to_idx:
+        logger.error(
+            "_logsums_numpy_fallback: OMX zone mapping is EMPTY "
+            "(skims.listMappings() unusable) - every zone-varying term becomes "
+            "a constant; check the skims file carries an SA2_CODE mapping")
 
     # ── 3. Read OMX matrices as numpy arrays once (fast path) ────────────
     def _read_mat(name: str, default_min: float = 30.0):
@@ -13045,18 +15819,86 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
     mat_walk    = _read_mat('DISTWALK')    # km → × 12 = minutes at 5 km/h
     mat_bike    = _read_mat('DISTBIKE')    # km → × 4  = minutes at 15 km/h
 
+    # Network-aware transit gap fill (walk-coupled, destination-served only).
+    # Identical call in the vmap path so both engines stay bit-identical.
+    if mat_transit is not None and os.environ.get(
+            'STAGE5_FILL_TRANSIT_GAPS', '1').strip() == '1':
+        try:
+            _fp = (mat_transit.shape, float(np.nansum(mat_transit)),
+                   float(np.nansum(mat_walk)) if mat_walk is not None else 0.0)
+            if _TRANSIT_FILL_CACHE.get('key') != _fp:
+                _ft, _fst = _fill_transit_gaps(mat_transit, mat_walk)
+                if _ft is not None:
+                    _TRANSIT_FILL_CACHE['key'] = _fp
+                    _TRANSIT_FILL_CACHE['mat'] = _ft
+                    _TRANSIT_FILL_CACHE['stats'] = _fst
+            if _TRANSIT_FILL_CACHE.get('mat') is not None:
+                mat_transit = _TRANSIT_FILL_CACHE['mat']
+        except Exception as _tfe:
+            logger.warning(
+                "_logsums_numpy_fallback: transit gap fill skipped (%r) - "
+                "unserved pairs keep the nest floor", _tfe)
+
     # ── 4. Get OTAZ per case from the tour sub-dataset ────────────────────
+    _missing_mats = [n for n, m in (('SOVTOLL_TIME__AM', mat_auto),
+                                    ('WLK_LOC_WLK_TOTIVT__AM', _mat_trans),
+                                    ('DISTWALK', mat_walk),
+                                    ('DISTBIKE', mat_bike)) if m is None]
+    if _missing_mats:
+        logger.warning(
+            "_logsums_numpy_fallback: skim matrices unreadable: %s - those "
+            "mode terms stay constant across zones and can flatten the "
+            "logsum surface", _missing_mats)
+
+    # Origin (OTAZ) per case.  Prefer the DataTree tour node directly: its
+    # case order IS dt_mode.caseids() (the case_ids argument), so no id-string
+    # matching is needed.  The old dataframe/id-matching path silently fell
+    # back to OTAZ=1 for every case whenever the index format did not match,
+    # which made 100% of origins "unmapped" and forced the mean-row profile for
+    # every case (2026-10-07, job 26496901).
     case_otaz = np.ones(n_cases, dtype=np.int32)
-    try:
-        tour_df = dt_mode['tour'].to_dataframe()   # small: only tour-level cols
-        tour_df.index = tour_df.index.map(str)
-        case_ids_str  = [str(c) for c in case_ids]
-        if 'OTAZ' in tour_df.columns:
-            for i, cid in enumerate(case_ids_str):
-                if cid in tour_df.index:
-                    case_otaz[i] = int(tour_df.at[cid, 'OTAZ'])
-    except Exception as e:
-        logger.debug(f"_logsums_numpy_fallback: tour read failed: {e} - using OTAZ=1")
+    _otaz_vec = None
+    for _get in (
+        lambda: np.asarray(dt_mode['tour']['OTAZ']).ravel(),
+        lambda: np.asarray(dt_mode.get_subspace('tour')['OTAZ']).ravel(),
+        lambda: np.asarray(dt_mode['tour']['otaz']).ravel(),
+    ):
+        try:
+            _v = _get()
+            if _v is not None and _v.size == n_cases:
+                _otaz_vec = np.asarray(_v, dtype=float)
+                break
+        except Exception:
+            continue
+    if _otaz_vec is not None:
+        case_otaz = np.nan_to_num(_otaz_vec, nan=1.0).astype(np.int32)
+    else:
+        try:
+            tour_df = dt_mode['tour'].to_dataframe()   # small: only tour-level cols
+            tour_df.index = tour_df.index.map(str)
+            _otaz_col = ('OTAZ' if 'OTAZ' in tour_df.columns
+                         else 'otaz' if 'otaz' in tour_df.columns else None)
+            if _otaz_col is None:
+                logger.warning(
+                    "_logsums_numpy_fallback: no OTAZ column on the tour node "
+                    "(columns=%s) - origins default to 1 (mean-row profile)",
+                    list(tour_df.columns)[:24])
+            else:
+                case_ids_str = [str(c) for c in case_ids]
+                _hits = 0
+                for i, cid in enumerate(case_ids_str):
+                    if cid in tour_df.index:
+                        case_otaz[i] = int(tour_df.at[cid, _otaz_col])
+                        _hits += 1
+                if _hits == 0:
+                    logger.warning(
+                        "_logsums_numpy_fallback: OTAZ lookup matched 0/%d "
+                        "cases (index sample=%s, case sample=%s, "
+                        "otaz sample=%s)",
+                        n_cases, list(tour_df.index[:4]), case_ids_str[:4],
+                        list(np.asarray(tour_df[_otaz_col].values[:4])))
+        except Exception as e:
+            logger.debug(f"_logsums_numpy_fallback: tour read failed: {e}")
 
     # ── 5. Vectorised logsum computation ─────────────────────────────────
     # For each case, look up its origin row index once, then gather the
@@ -13071,20 +15913,55 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
         [zone_to_idx.get(int(z), _MISSING_IDX) for z in zone_ids], dtype=np.int32)
     dest_valid = (dest_idx >= 0)   # boolean mask: True where zone is in OMX
 
+    # Origin row per case.  Unresolved origins (out-of-universe endpoints routed
+    # to FRINGE_ZONE 999, or codes absent from the OMX mapping) resolve to -1
+    # and are filled from the matrix MEAN ROW below.  Previously they were left
+    # at a single constant fallback_min, which made that case's logsum
+    # identical across every destination zone; when most cases were affected the
+    # whole logsum surface was flat (std 0.0 within 100% of cases) and the
+    # destination model's c_logsum was structurally unidentified.
+    _orig_idx = np.array(
+        [zone_to_idx.get(int(z), _MISSING_IDX) for z in case_otaz], dtype=np.int32)
+    _orig_valid = _orig_idx >= 0
+    _n_unresolved_origins = int((~_orig_valid).sum())
+    logger.info(
+        "_logsums_numpy_fallback: origins resolved %d/%d (sample=%s)",
+        n_cases - _n_unresolved_origins, n_cases,
+        [int(z) for z in case_otaz[:6]])
+    if _n_unresolved_origins:
+        logger.warning(
+            "_logsums_numpy_fallback: %d/%d case origins are not in the OMX "
+            "zone mapping (fringe 999 or unmapped code); using the mean origin "
+            "profile for those so the logsum still varies across zones",
+            _n_unresolved_origins, n_cases)
+
     def _gather(mat, fallback_min: float):
-        """Return (n_cases, n_zones) array; uses fallback_min where mat is None."""
-        if mat is None or not zone_to_idx:
+        """Return (n_cases, n_zones) array; fallback_min only where mat is None.
+
+        Each case reads its own OMX origin row.  Origins that are unmapped
+        (fringe 999 / codes absent from the mapping) read the matrix MEAN row
+        instead of a constant, so the gathered values keep varying across
+        destination zones - a constant here makes that case's logsum flat and,
+        when most cases are affected, kills c_logsum identification entirely.
+        """
+        if mat is None or not zone_to_idx or not dest_valid.any():
             return np.full((n_cases, n_zones), fallback_min, dtype=np.float32)
+        valid_dest = dest_idx[dest_valid]  # column positions in the OMX matrix
+        mat = np.asarray(mat, dtype=np.float32)
+        rows = np.repeat(mat.mean(axis=0)[None, :], n_cases, axis=0)
+        if _orig_valid.any():
+            rows[_orig_valid, :] = mat[_orig_idx[_orig_valid], :]
         out = np.full((n_cases, n_zones), fallback_min, dtype=np.float32)
-        valid_dest = dest_idx[dest_valid]  # column indices for zones in OMX
-        for i in range(n_cases):
-            o_idx = zone_to_idx.get(int(case_otaz[i]), _MISSING_IDX)
-            if o_idx < 0:
-                # Origin zone not in OMX - leave entire row at fallback_min
-                continue
-            out[i, dest_valid] = mat[o_idx, valid_dest]
+        out[:, dest_valid] = rows[:, valid_dest]
         # fill zeros (missing OD) with fallback
         out = np.where(out <= 0, fallback_min, out)
+        # NOTE: skim-gap NaNs are deliberately NOT filled here (`NaN <= 0` is
+        # False, so they survive into auto_h/trans_h). They propagate into the
+        # nest, where the log floor contains them at ~-552.6, and the vmap core
+        # reproduces that value exactly via its NaN guard + split _nlog floor.
+        # Substituting the fallback here instead (tried 2026-10-11, job
+        # 26620300/26624077) produced NORMAL utilities where numpy contains,
+        # breaching self-verify by maxdiff=553. Keep both paths identical.
         return out
 
     auto_ivt    = _gather(mat_auto,    30.0)           # minutes
@@ -13126,16 +16003,45 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
     _ev_host = np.zeros(n_zones, dtype=np.float32)
     _n_emp_hit = 0
     _emp_hits: dict = {}
+    # larch's DataTree['emp'] is a DataTreeBranch — it has no .to_dataframe().
+    # The old call raised AttributeError, which the except swallowed as a
+    # DEBUG line, so the emp lookup below never ran (emp zones hit=0/N in
+    # every run, e.g. 26948576 and 26958837). Read the columns as DataArrays.
+    _emp_df = None
     try:
-        _emp_df = dt_mode['emp'].to_dataframe()
-        _emp_idx = pd.Index(pd.to_numeric(_emp_df.index, errors='coerce')).astype(int)
-        for _col, _arr in (('transit_walk_acc', _acc), ('log_emp_density', _empden),
-                           ('is_cbd', _cbd),
-                           ('power_reliability_acc', _pow_rel),
-                           ('ev_hosting_acc', _ev_host)):
-            if _col in _emp_df.columns:
-                _vals = pd.to_numeric(_emp_df[_col], errors='coerce').fillna(0.0).values
-                _lut = dict(zip(_emp_idx.tolist(), _vals.tolist()))
+        _emp_df = getattr(dt_mode, '_emp_frame', None)
+    except Exception:
+        _emp_df = None
+    if _emp_df is None:
+        try:
+            _emp_branch = dt_mode['emp']
+            _emp_cols = {}
+            for _c in ('transit_walk_acc', 'log_emp_density', 'is_cbd',
+                       'power_reliability_acc', 'ev_hosting_acc'):
+                try:
+                    _s = _emp_branch[_c].to_series()
+                except Exception:
+                    continue
+                if _s is not None and len(_s):
+                    _emp_cols[_c] = _s
+            if _emp_cols:
+                _emp_df = pd.DataFrame(_emp_cols)
+        except Exception as _emp_e:
+            logger.debug(f"_logsums_numpy_fallback: emp attrs unavailable ({_emp_e})")
+    if _emp_df is not None and len(_emp_df):
+        try:
+            _emp_num = pd.to_numeric(pd.Series(_emp_df.index), errors='coerce')
+            _emp_ok = _emp_num.notna().values
+            _emp_keys = _emp_num[_emp_ok].astype(int).tolist()
+            for _col, _arr in (('transit_walk_acc', _acc), ('log_emp_density', _empden),
+                               ('is_cbd', _cbd),
+                               ('power_reliability_acc', _pow_rel),
+                               ('ev_hosting_acc', _ev_host)):
+                if _col not in _emp_df.columns:
+                    continue
+                _vals = pd.to_numeric(
+                    _emp_df[_col], errors='coerce').fillna(0.0).values[_emp_ok]
+                _lut = dict(zip(_emp_keys, _vals.tolist()))
                 _hit = 0
                 for _j, _z in enumerate(zone_ids):
                     _v = _lut.get(int(_z))
@@ -13144,8 +16050,8 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
                         _hit += 1
                 _emp_hits[_col] = _hit
                 _n_emp_hit = max(_n_emp_hit, _hit)
-    except Exception as _emp_e:
-        logger.debug(f"_logsums_numpy_fallback: emp attrs unavailable ({_emp_e})")
+        except Exception as _emp_e:
+            logger.debug(f"_logsums_numpy_fallback: emp lookup failed ({_emp_e})")
     c_acc_tr   = _pv('c_transit_access', 0.0)
     c_empden_t = _pv('c_empden_transit', 0.0)
     c_cbd_tr   = _pv('c_cbd_transit', 0.0)
@@ -13163,13 +16069,19 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
     except Exception as _t_e:
         logger.debug(f"_logsums_numpy_fallback: toll matrix unreadable ({_t_e})")
     c_toll = _pv('c_toll_auto', 0.0)
-    if _toll is not None and zone_to_idx and c_toll != 0.0:
-        _toll_od = np.full((n_cases, n_zones), 0.0, dtype=np.float32)
+    if _toll is not None and zone_to_idx and c_toll != 0.0 \
+            and dest_valid.any():
         _valid_dest = dest_idx[dest_valid]
-        for i in range(n_cases):
-            o_idx = zone_to_idx.get(int(case_otaz[i]), _MISSING_IDX)
-            if o_idx >= 0:
-                _toll_od[i, dest_valid] = np.maximum(_toll[o_idx, _valid_dest], 0.0)
+        _toll_od = np.zeros((n_cases, n_zones), dtype=np.float32)
+        # Same mean-row treatment as _gather: unmapped origins must not read as
+        # "no toll anywhere", which would flatten their logsum profile.
+        _toll_rows = np.repeat(
+            np.maximum(np.asarray(_toll, dtype=np.float32).mean(axis=0),
+                       0.0)[None, :], n_cases, axis=0)
+        if _orig_valid.any():
+            _toll_rows[_orig_valid, :] = _toll[_orig_idx[_orig_valid], :]
+        _toll_od[:, dest_valid] = np.maximum(
+            _toll_rows[:, _valid_dest], 0.0)
     else:
         _toll_od = np.zeros((n_cases, n_zones), dtype=np.float32)
     _n_acc_terms = int(c_acc_tr != 0.0) + int(c_empden_t != 0.0) \
@@ -13279,7 +16191,12 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
                     _plut = {}
 
             def _case_vec(col, default=0.0):
-                out = np.full(n_cases, float(default), dtype=np.float64)
+                # Column vector (n_cases, 1): person-level terms are added to
+                # the (n_cases, n_zones) mode utilities, and returning
+                # (n_cases,) raised "Incompatible shapes for broadcasting:
+                # [(n_cases, n_zones), (n_cases,)]" which silently disabled the
+                # whole full-spec emulation (2026-10-07, job 26496901).
+                out = np.full((n_cases, 1), float(default), dtype=np.float64)
                 if _tdf is None:
                     return out
                 try:
@@ -13289,7 +16206,7 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
                             if _cid in _tdf.index:
                                 try:
                                     _f = float(_tdf.at[_cid, col])
-                                    out[i] = _f if np.isfinite(_f) else default
+                                    out[i, 0] = _f if np.isfinite(_f) else default
                                 except Exception:
                                     pass
                         return out
@@ -13303,7 +16220,7 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
                                 if _cid in _pids.index:
                                     _k = _pos.get(str(_pids.at[_cid]))
                                     if _k is not None:
-                                        out[i] = float(_pvals[_k])
+                                        out[i, 0] = float(_pvals[_k])
                 except Exception:
                     pass
                 return out
@@ -13452,7 +16369,7 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
                     v_transit = v_transit + _pv0('c_crash_veh') * _lcr
                     if _has('c_crash_safety') and _sens is not None:
                         try:
-                            _sb = np.asarray(_sens, dtype=float)[:, None]
+                            _sb = np.asarray(_sens, dtype=float)
                         except Exception:
                             _sb = 0.0
                         v_walk = v_walk + _pv0('c_crash_safety') * _sb * _lcr
@@ -13463,7 +16380,7 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
                         # Same shadow price as tour.cost_auto (DIST × $/km ÷
                         # (incp+1); see _auto_cost_rate derivation).
                         _ct = (_auto_cost_rate() * _gather_full(_dist_mat, 0.0)
-                               / np.maximum(_incp[:, None] + 1.0, 1.0))
+                               / np.maximum(_incp + 1.0, 1.0))
                         v_da = v_da + _pv0('c_cost_auto') * _ct
                         v_sr = v_sr + _pv0('c_cost_auto') * _ct
                         _n_extra_terms += 1
@@ -13489,7 +16406,7 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
             try:
                 _lic = _case_vec('CARLICENCE', 1.0)
                 _vv = _case_vec('vehrd', 1.0)
-                _da_ok = ((_lic > 0) & (_vv > 0))[:, None]
+                _da_ok = (_lic > 0) & (_vv > 0)   # (n_cases, 1) column vector
                 v_da = xp.where(_da_ok, v_da, -1e20)
                 v_walk = xp.where(np.asarray(walk_dist) < 6.0, v_walk, -1e20)
                 v_bike = xp.where(np.asarray(bike_dist) < 25.0, v_bike, -1e20)
@@ -13500,6 +16417,60 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
         except Exception as _fe:
             logger.warning(f"_logsums_numpy_fallback: full-spec emulation skipped ({_fe!r}) — "
                            "time+access logsum only")
+
+    # ── 6a-PT. PT access alternatives (STAGE5_PT_MODES=1) ──────────────────
+    # Mirror _mode_probs_numpy / MODE_UEC exactly: PT_Walk shares the
+    # transit walk-access IVT (and c_ivt_transit — separated from Transit by
+    # ASC only); PT_Drive uses the drive-access IVT matrix (hours, same
+    # 0.05-6.0 clip as the probs path, walk-IVT proxy when the OMX lacks it);
+    # PT_Bike uses log(walk minutes x 2.4 + 1). Availability follows the
+    # estimation graph: PT_Drive masked by licence & household vehicle
+    # (reuses the full-spec _da_ok mask when that block ran); PT_Walk rides
+    # on Transit (no separate mask here — same treatment as v_transit);
+    # the person-level bikes>0 mask is not applied host-side.
+    v_pt_walk = v_pt_drive = v_pt_bike = None
+    if STAGE5_PT_MODES:
+        try:
+            asc_pt_walk  = _pv('ASC_PT_Walk',  -2.8)
+            asc_pt_drive = _pv('ASC_PT_Drive', -4.2)
+            asc_pt_bike  = _pv('ASC_PT_Bike',  -5.5)
+            c_ivt_pt_drive = _pv('c_ivt_pt_drive', -0.9)
+            c_ivt_pt_bike  = _pv('c_ivt_pt_bike',  -0.5)
+            _mat_pt_drv = _read_mat('WLK_LOC_DRV_TOTIVT__AM')
+            if _mat_pt_drv is None:
+                drv_ivt = transit_ivt      # walk-access proxy (cf. _get_tt)
+            else:
+                drv_ivt = _gather(_mat_pt_drv, 45.0)
+            _pt_drv_h  = xp.clip(xp.asarray(drv_ivt) / 60.0, 0.05, 6.0)
+            _pt_bike_t = xp.log(
+                xp.maximum(xp.asarray(transit_ivt), 1.0) * 2.4 + 1.0)
+            v_pt_walk  = asc_pt_walk  + c_ivt_transit * trans_h
+            v_pt_drive = asc_pt_drive + c_ivt_pt_drive * _pt_drv_h
+            v_pt_bike  = asc_pt_bike  + c_ivt_pt_bike * _pt_bike_t
+            if '_da_ok' in locals():
+                v_pt_drive = xp.where(_da_ok, v_pt_drive, -1e20)
+            else:
+                logger.info(
+                    "_logsums_numpy_fallback: PT_Drive licence/vehicle mask "
+                    "unavailable (full-spec masks off/failed) - PT_Drive "
+                    "enters the logsum unmasked")
+            logger.info(
+                "_logsums_numpy_fallback: PT access modes in logsum "
+                "(asc walk/drive/bike=%.2f/%.2f/%.2f, c_ivt_pt_drive=%.3g, "
+                "c_ivt_pt_bike=%.3g, drive IVT=%s)",
+                asc_pt_walk, asc_pt_drive, asc_pt_bike, c_ivt_pt_drive,
+                c_ivt_pt_bike,
+                'OMX' if _mat_pt_drv is not None else 'walk-proxy')
+        except Exception as _pt_e:
+            v_pt_walk = v_pt_drive = v_pt_bike = None
+            _pt_msg = (
+                "_logsums_numpy_fallback: PT utilities failed "
+                f"({_pt_e!r}) while STAGE5_PT_MODES=1 - the logsum surface "
+                "would silently drop PT_Walk/PT_Drive/PT_Bike")
+            if os.environ.get('STAGE5_REQUIRE_LOGSUM_VARIANCE',
+                              '1') == '1':
+                raise RuntimeError(_pt_msg)
+            logger.error(_pt_msg)
 
     def _nest_logsum(v_list, mu):
         """Inclusive value for one nest: mu * log( Σ exp(V_i / mu) )."""
@@ -13512,8 +16483,31 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
         totals_safe = xp.where(totals > 0, totals, 1e-300)
         return float(mu) * (xp.log(totals_safe) + row_max[..., 0])
 
-    # Motor nest: DA, SR, Transit
-    iv_motor    = _nest_logsum([v_da, v_sr, v_transit], mu_motor)
+    # Motor nest: DA, SR, Transit [, PT_Walk, PT_Drive, PT_Bike when
+    # STAGE5_PT_MODES=1]
+    # Verify-mode NaN census (additive logging only — never changes numerics):
+    # records which utility surface carries NaN into the nest so a vmap
+    # self-verify breach can be attributed without another full run.
+    if os.environ.get('STAGE5_VMAP_VERIFY', '0').strip() == '1':
+        try:
+            _census = [('DA', v_da), ('SR', v_sr), ('Transit', v_transit),
+                       ('Walk', v_walk), ('Bike', v_bike)]
+            if STAGE5_PT_MODES and v_pt_walk is not None:
+                _census += [('PT_Walk', v_pt_walk), ('PT_Drive', v_pt_drive),
+                            ('PT_Bike', v_pt_bike)]
+            for _nm, _vv in _census:
+                _na = np.asarray(_vv, dtype=float)
+                _nn = int(np.isnan(_na).sum())
+                if _nn:
+                    logger.warning(
+                        f"_logsums_numpy_fallback NaN census V-{_nm}: "
+                        f"{_nn} NaN cells of {_na.size}")
+        except Exception:
+            pass
+    _motor_utils = [v_da, v_sr, v_transit]
+    if STAGE5_PT_MODES and v_pt_walk is not None:
+        _motor_utils += [v_pt_walk, v_pt_drive, v_pt_bike]
+    iv_motor    = _nest_logsum(_motor_utils, mu_motor)
     # NonMotor nest: Walk, Bike
     iv_nonmotor = _nest_logsum([v_walk, v_bike],     mu_nonmotor)
     # Root nest (Mu=1): simple log-sum-exp of the two nest inclusive values
@@ -13559,9 +16553,91 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
     except Exception:
         _corr, _indep = float('nan'), float('nan')
     logger.info(f"_logsums_numpy_fallback: {n_cases}×{n_zones} logsums computed "
-                f"({pct_nonzero:.1f}% non-zero) via direct OMX reads; "
+                f"({pct_nonzero:.1f}% non-zero, PT modes "
+                f"{'IN' if (STAGE5_PT_MODES and v_pt_walk is not None) else 'off'}"
+                f") via direct OMX reads; "
                 f"corr(logsum, auto_time)={_corr:.3f}, "
                 f"independent-signal share={_indep:.3f}")
+
+    # ── Defensive flatness self-check (fix 2) ─────────────────────────────
+    # Check here too so a degenerate surface is never handed back silently.
+    # Warn always; strict failure is the default, with an explicit environment
+    # override available for diagnostic runs.
+    try:
+        _Lf = np.asarray(ls_array, dtype=float)
+        if _Lf.ndim == 2 and _Lf.shape[0] > 0 and _Lf.shape[1] > 1:
+            _within = np.nanstd(_Lf, axis=1)
+            _flat_frac = float(np.mean(_within < 1e-9))
+            logger.info(
+                "_logsums_numpy_fallback: within-case across-zone std "
+                "median=%.6g p95=%.6g flat_cases=%.1f%%",
+                float(np.nanmedian(_within)),
+                float(np.nanpercentile(_within, 95)),
+                _flat_frac * 100.0)
+            if _flat_frac > 0.5:
+                _msg = (
+                    "_logsums_numpy_fallback produced a DEGENERATE logsum "
+                    f"surface: { _flat_frac:.0%} of cases have no cross-zone "
+                    "variation (origins unresolved in the OMX mapping, skim "
+                    "matrices unreadable, or the mode fit lost its "
+                    "destination-varying terms). The destination c_logsum is "
+                    "structurally unidentified on this surface.")
+                logger.error(_msg)
+                if os.environ.get('STAGE5_REQUIRE_LOGSUM_VARIANCE', '1') == '1':
+                    raise RuntimeError(_msg)
+    except RuntimeError:
+        raise
+    except Exception as _flat_e:
+        logger.debug(f"_logsums_numpy_fallback: flatness self-check skipped ({_flat_e})")
+
+    # ── Peak-memory hygiene (2026-10-09) ──────────────────────────────
+    # Each name below can hold a full (n_cases × n_zones) surface (~1.8GB at
+    # 1.2M cases × 371 zones).  They are all consumed by this point, so drop
+    # them explicitly: CPython refcounting frees ndarray memory immediately,
+    # cutting peak RSS before return instead of at function teardown.
+    # Each group is guarded so a missing name never breaks the return.
+    try:
+        del auto_ivt, transit_ivt, walk_dist, bike_dist, _toll_od
+    except NameError:
+        pass
+    try:
+        del _toll_rows
+    except NameError:
+        pass
+    try:
+        del auto_h, trans_h, walk_logmin, bike_logmin
+    except NameError:
+        pass
+    try:
+        del v_da, v_sr, v_walk, v_bike, v_transit
+    except NameError:
+        pass
+    try:
+        del v_pt_walk, v_pt_drive, v_pt_bike
+    except NameError:
+        pass
+    try:
+        del drv_ivt, _pt_drv_h, _pt_bike_t, _mat_pt_drv, _motor_utils
+    except NameError:
+        pass
+    try:
+        del iv_motor, iv_nonmotor, iv_stack
+    except NameError:
+        pass
+    try:
+        del root_max, root_exp, root_sum, root_sum_safe
+    except NameError:
+        pass
+    try:
+        del _L, _T, _Lm, _Tm, _Lw, _Tw, _Lf
+    except NameError:
+        pass
+    try:
+        import gc as _gc_ls
+        _gc_ls.collect()
+    except Exception:
+        pass
+
     return ls_array
 
 
@@ -16805,6 +19881,7 @@ def _stabilize_mode_probs_stage5(
 
         # Build target vector in alt_ids order.
         tv = np.zeros(len(alt_ids), dtype=float)
+        _tv_missing = []
         if not hasattr(target_shares, 'get'):
             return mode_probs
         for j, aid in enumerate(alt_ids):
@@ -16812,19 +19889,29 @@ def _stabilize_mode_probs_stage5(
             if v is None:
                 v = target_shares.get(str(aid), None)
             if v is None:
-                _name_map = {1: 'DA', 2: 'SR', 3: 'Walk', 4: 'Bike', 5: 'Transit'}
-                v = target_shares.get(_name_map.get(int(aid), ''), None)
-            try:
-                tv[j] = float(v) if v is not None else 0.0
-            except Exception:
+                v = target_shares.get(MODE_NAMES.get(int(aid), ''), None)
+            if v is None:
+                # No target for this alternative (e.g. 5-mode frozen tables
+                # with STAGE5_PT_MODES=1): stay neutral by using the model's
+                # own predicted share below instead of pulling it to zero.
+                _tv_missing.append(j)
                 tv[j] = 0.0
+            else:
+                try:
+                    tv[j] = float(v)
+                except Exception:
+                    _tv_missing.append(j)
+                    tv[j] = 0.0
+
+        pred = np.clip(arr.mean(axis=0), 1e-12, None)
+        pred = pred / pred.sum()
+        for j in _tv_missing:
+            if 0 <= j < len(tv):
+                tv[j] = float(pred[j])
 
         if not np.isfinite(tv).all() or tv.sum() <= 0:
             return mode_probs
         tv = tv / tv.sum()
-
-        pred = np.clip(arr.mean(axis=0), 1e-12, None)
-        pred = pred / pred.sum()
 
         # Severe collapse trigger - ANY mode dominating far beyond its target,
         # not just DA. Job 23880279 predicted SR=96% (target 43%) for nonmand
@@ -16959,8 +20046,8 @@ def _frozen_person_dist_offsets(person_ids, s_log_dist: float) -> pd.Series:
 
 
 # Safety-skim exclusion: set SAFETY_EXPERIMENT_MODE=nosafety to drop crash params
-_SAFETY_MODE_PARAMS = {'c_crash_veh'}   # mode model crash params
-_SAFETY_DEST_PARAMS = {'c_crash'}       # dest model crash params
+_SAFETY_MODE_PARAMS = {'c_crash_veh', 'c_crash_safety'}   # mode model crash params
+_SAFETY_DEST_PARAMS = {'c_crash', 'c_crash_safety_dest', 'c_crash_smooth'}  # dest model crash params
 
 # ── SA2 destination with optional SA1 refinement ───────────────────────────
 STAGE5_DEST_SA1_REFINEMENT = os.environ.get(
@@ -17550,6 +20637,15 @@ def _run_segment(segment: str, tours: pd.DataFrame,
       4. Compute logsums once (ActivitySim: compute_logsums in trip_destination)
       5. Estimate destination model (logsum as ca variable)
     """
+    # ── Zone key-space bridge (ORDER↔SA2) — before filter/merge/quarantine ──
+    # HHTS tours are ORDER-coded; skims/landuse are SA2-keyed. Bridging here
+    # keeps the segment filter, the MXL skim merge (seg.merge(sk_sub,
+    # on=['OTAZ','DTAZ'])) and the [segment]/final dest quarantine aligned.
+    # Without it the dest path quarantines 6895/6909 tours as unrepresentable
+    # (job 26926729: dest model fit on 14 observations) and the skim merge
+    # misses (defaults filled). Inert for SA2-native (new_pop) runs.
+    tours = _bridge_tours_zones_auto(tours, skims, skim_df, "_run_segment")
+
     print(f"\n  ── Segment: {segment} ──────────────────────────────")
     print(f"  [{segment}] INPUT: {len(tours)} tours, {len(persons)} persons, {len(landuse)} landuse zones")
     if 'OTAZ' in tours.columns and 'DTAZ' in tours.columns:
@@ -17587,14 +20683,18 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                 k: v for k, v in _dest_feature_override.items() if k not in _SAFETY_DEST_PARAMS
             }
 
-    # In nosafety mode do not pass crash skims or CRASH skim column to _dest_tree.
+    # In nosafety mode do not pass crash skims into utility construction, but
+    # retain the observed CRASH column in the destination frame.  The ablation
+    # must be evaluated against the same true exposure, not against an
+    # artificially zeroed or removed exposure measure.
     _dest_crash_skims = None if _nosafety else crash_skims
     _dest_skim_df = skim_df
-    if _nosafety and _dest_skim_df is not None and 'CRASH' in _dest_skim_df.columns:
-        _dest_skim_df = _dest_skim_df.drop(columns=['CRASH'])
 
     if _nosafety:
-        logger.info(f"  [{segment}] nosafety mode - excluded crash params")
+        logger.info(
+            f"  [{segment}] nosafety mode - excluded crash utility params; "
+            "retaining CRASH for exposure evaluation"
+        )
 
     seg = _filter_seg(tours, segment)
 
@@ -17706,6 +20806,25 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             seg['da_avail'] = _da_avail_series(seg)
         except Exception:
             pass
+    # Same guarantee for the PT availability flags (STAGE5_PT_MODES=1; see
+    # _prep_hhts_tours): _run_segment also serves frames that never pass
+    # through _prep_hhts_tours (trip-like tables, GA/vv frames), and the
+    # _build_mode_model fallbacks ("(bikes > 0)" / expression DA) are exactly
+    # what the materialized columns exist to avoid.
+    if STAGE5_PT_MODES:
+        try:
+            if 'pt_drive_avail' not in seg.columns:
+                if 'da_avail' in seg.columns:
+                    seg['pt_drive_avail'] = pd.to_numeric(
+                        seg['da_avail'], errors='coerce').fillna(0).astype(np.int8)
+                else:
+                    seg['pt_drive_avail'] = _da_avail_series(seg)
+            if 'pt_bike_avail' not in seg.columns:
+                _bk = (pd.to_numeric(seg['bikes'], errors='coerce').fillna(0) > 0) \
+                    if 'bikes' in seg.columns else pd.Series(False, index=seg.index)
+                seg['pt_bike_avail'] = _bk.astype(np.int8)
+        except Exception as _pte:
+            logger.debug(f"_run_segment [{segment}]: PT availability skipped ({_pte})")
 
     transit_submode_model = _fit_transit_submode(seg, landuse=landuse)
     logger.info(
@@ -17732,6 +20851,17 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                 except Exception:
                     pass
                 seg.loc[seg['tour_mode'] == MODE_MAP['DA'], 'CARLICENCE'] = 1
+            # PT alternatives (6-8, STAGE5_PT_MODES=1): same policy as above —
+            # PT_Bike always repaired (mirrors Bike), PT_Drive only when PLC is
+            # off (mirrors the DA identifying-variation policy; see
+            # _prep_hhts_tours).
+            if STAGE5_PT_MODES:
+                if 'pt_drive_avail' in seg.columns and not STAGE5_ENABLE_PLC:
+                    seg.loc[seg['tour_mode'] == MODE_MAP['PT_Drive'],
+                            'pt_drive_avail'] = 1
+                if 'pt_bike_avail' in seg.columns:
+                    seg.loc[seg['tour_mode'] == MODE_MAP['PT_Bike'],
+                            'pt_bike_avail'] = 1
         except Exception:
             pass
 
@@ -17771,10 +20901,15 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             if _pct_30 > 70:
                 logger.warning(
                     f"_run_segment [{segment}]: {_pct_30:.0f}% of DISTWALK values are ≥30 km "
-                    "(fallback fill). Walk-distance term c_log_distwalk will be near-constant "
-                    "for most OD pairs → coefficient degenerate. Walk accessibility is "
-                    "captured via mode logsum; c_log_distwalk only meaningful for walkable "
-                    "zone pairs (DISTWALK < 6 km, walk_feasible_ij=1)."
+                    "(fallback fill). Root cause: the OMX DISTWALK/DISTBIKE matrices are the "
+                    "placeholder 0.9×road DIST (corr with DIST ≈ 1.0), i.e. the OSM-routed "
+                    "walk/bike overlay has NOT been built for this skim. Fix: run the OSM "
+                    "walk/bike skim builder so read_skims._overlay_real_walk_bike replaces "
+                    "them (see demand_/21_build_osm_walk_bike_skims.py). Until then the "
+                    "walk-distance term c_log_distwalk is near-constant → coefficient "
+                    "degenerate; walk accessibility is carried by the mode logsum and "
+                    "c_log_distwalk is only meaningful for walkable pairs (DISTWALK < 6 km, "
+                    "walk_feasible_ij=1)."
                 )
         elif not _dwalk_ok:
             logger.warning(
@@ -18027,14 +21162,27 @@ def _run_segment(segment: str, tours: pd.DataFrame,
         print(f"  [{segment}] Re-estimating mode model after fixing degenerate parameters...")
         mode_mdl = _estimate(mode_mdl)
 
-    # ── Post-estimation: ASC calibration for SR and Walk ─────────────────────
-    # Iteratively adjust mode ASCs so that predicted shares match observed shares
-    # in the estimation data. Uses the log-share correction:
-    #   ASC_mode += log(obs_share / pred_share)
-    # This does NOT change the model's fit (LL stays the same) but ensures that
-    # the aggregate predicted shares exactly reproduce the observed proportions.
-    # Up to 8 iterations; convergence when all |delta| < 0.002.
-    # We calibrate SR, Walk, Bike, and Transit (DA is reference / always implied).
+    # ── Post-estimation: ASC calibration for SR/Walk/Bike/Transit ───────────
+    # Iteratively adjust the non-DA mode ASCs so aggregate predicted shares
+    # match the estimation sample.  DA is the reference alternative, so its
+    # share is matched implicitly through the share-sum constraint.
+    #
+    # Run 27177740 exposed two failure modes in the previous implementation:
+    #   1. It read coefficients through _coef_cache, which still held the
+    #      pre-calibration snapshot.  Every iteration therefore saw the same
+    #      predicted shares and re-applied the same log-share delta.
+    #   2. It had no bounds.  When an observed share is infeasible given the
+    #      availability mask (edu transit: obs 10.6% vs 7.0% available),
+    #      ASC_Transit ran away to +6.4 and squeezed DA to 0.3%; nonmand
+    #      ASC_Transit ended at -8.0 and transit was predicted at 0%.
+    #
+    # The calibration below works on a plain coefficient dict (passed as
+    # coef_override, so no stale cache), damps each step, clips every ASC to
+    # a plausible range, and finally writes the calibrated vector back into
+    # _final_pf/_coef_cache so save_models() and prediction cannot revert it.
+    _asc_cal_lo = float(os.environ.get('STAGE5_ASC_CAL_MIN', '-5.0'))
+    _asc_cal_hi = float(os.environ.get('STAGE5_ASC_CAL_MAX', '3.0'))
+    _asc_cal_damp = float(os.environ.get('STAGE5_ASC_CAL_DAMP', '0.5'))
     try:
         _asc_mode_map = {
             'ASC_SR':      MODE_MAP['SR'],
@@ -18042,76 +21190,165 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             'ASC_Bike':    MODE_MAP['Bike'],
             'ASC_Transit': MODE_MAP['Transit'],
         }
+        if STAGE5_PT_MODES:
+            _asc_mode_map.update({
+                'ASC_PT_Walk':  MODE_MAP['PT_Walk'],
+                'ASC_PT_Drive': MODE_MAP['PT_Drive'],
+                'ASC_PT_Bike':  MODE_MAP['PT_Bike'],
+            })
         _mode_col = 'tour_mode' if 'tour_mode' in seg.columns else None
         if _mode_col is not None and len(seg) > 0:
             _obs_total = float(len(seg))
             _obs_counts = seg[_mode_col].value_counts()
             _obs_shares = {int(k): float(v) / _obs_total for k, v in _obs_counts.items()}
 
-            _col_to_code = {0: MODE_MAP['DA'], 1: MODE_MAP['SR'],
-                            2: MODE_MAP['Walk'], 3: MODE_MAP['Bike'],
-                            4: MODE_MAP['Transit']}
+            # _mode_probs_numpy returns per-alternative columns in MODE_CODES
+            # order (1..5, or 1..8 with STAGE5_PT_MODES).
+            _code_to_col = {c: i for i, c in enumerate(MODE_CODES)}
 
-            for _calib_iter in range(8):
-                try:
-                    # Use _mode_probs_numpy with coef_override=None so it
-                    # reads fresh values from _final_pf / pf after set_value().
+            _calib_coef = _coef_dict_from_model(mode_mdl, None)
+            if not _calib_coef:
+                logger.warning(
+                    f"[{segment}] ASC calibration skipped: no coefficient source"
+                )
+            else:
+                # Clamp any pre-existing degenerate ASC before iterating.
+                for _asc_p in _asc_mode_map:
+                    if _asc_p not in _calib_coef:
+                        continue
+                    _v = float(_calib_coef[_asc_p])
+                    if not np.isfinite(_v):
+                        _v = 0.0
+                    _v_c = float(np.clip(_v, _asc_cal_lo, _asc_cal_hi))
+                    if abs(_v_c - _v) > 1e-9:
+                        logger.warning(
+                            f"[{segment}] ASC calibration: {_asc_p}={_v:+.4f} outside "
+                            f"[{_asc_cal_lo:+.1f}, {_asc_cal_hi:+.1f}] "
+                            f"→ clipped to {_v_c:+.4f}"
+                        )
+                        _calib_coef[_asc_p] = _v_c
+
+                _cal_probs = None
+                _converged = False
+                _calib_iter = 0
+                _max_delta = float('inf')
+                for _calib_iter in range(25):
                     _probs = _mode_probs_numpy(mode_mdl, seg, persons, skims,
-                                               coef_override=None)
+                                               coef_override=_calib_coef)
                     if _probs is None or _probs.shape[0] == 0:
                         break
-                    _pred_shares_arr = np.asarray(_probs).mean(axis=0)  # (5,)
-                    _pred_dict = {_col_to_code[ci]: float(_pred_shares_arr[ci])
-                                  for ci in range(len(_pred_shares_arr))}
-
+                    _cal_probs = np.asarray(_probs)
+                    _pred_shares_arr = _cal_probs.mean(axis=0)
+                    _max_delta = 0.0
                     _any_delta = False
                     for _asc_p, _mc in _asc_mode_map.items():
-                        if _asc_p not in mode_mdl.pf.index:
+                        if _asc_p not in _calib_coef:
                             continue
-                        _is_hf = bool(mode_mdl.pf.loc[_asc_p].get('holdfast', False))
-                        if _is_hf:
+                        _mi = _code_to_col.get(_mc)
+                        if _mi is None or _mi >= len(_pred_shares_arr):
                             continue
-                        _obs_s  = _obs_shares.get(_mc, 0.0)
-                        _pred_s = _pred_dict.get(_mc, 0.0)
-                        if _obs_s > 0.001 and _pred_s > 0.001:
-                            _delta = float(np.log((_obs_s + 1e-8) / (_pred_s + 1e-8)))
-                            if abs(_delta) > 0.002:
-                                _cur = float(mode_mdl.pf.loc[_asc_p, 'value'])
-                                _new_val = _cur + _delta
-                                try:
-                                    mode_mdl.set_value(_asc_p, _new_val)
-                                except Exception:
-                                    mode_mdl.pf.loc[_asc_p, 'value'] = _new_val
-                                # Sync _final_pf so coef cache stays consistent
-                                if (hasattr(mode_mdl, '_final_pf') and
-                                        isinstance(mode_mdl._final_pf, pd.DataFrame) and
-                                        _asc_p in mode_mdl._final_pf.index):
-                                    mode_mdl._final_pf.loc[_asc_p, 'value'] = _new_val
-                                _any_delta = True
-                    # Invalidate coef cache so next iteration reads fresh values
-                    mode_mdl._coef_cache = {}
+                        _obs_s = _obs_shares.get(_mc, 0.0)
+                        _pred_s = float(_pred_shares_arr[_mi])
+                        if _obs_s <= 1e-4:
+                            continue
+                        # Epsilon-based guard so a mode predicted at ~0
+                        # (nonmand transit in 27177740) can still be lifted.
+                        _delta = float(np.log((_obs_s + 1e-8) /
+                                              (max(_pred_s, 0.0) + 1e-8)))
+                        _max_delta = max(_max_delta, abs(_delta))
+                        if abs(_delta) <= 0.01:
+                            continue
+                        _cur = float(_calib_coef[_asc_p])
+                        _step = float(np.clip(_asc_cal_damp * _delta, -0.50, 0.50))
+                        _new = float(np.clip(_cur + _step, _asc_cal_lo, _asc_cal_hi))
+                        if abs(_new - _cur) > 1e-9:
+                            _calib_coef[_asc_p] = _new
+                            _any_delta = True
                     if not _any_delta:
+                        # No parameter could move.  This is only true
+                        # convergence when every target delta is already
+                        # inside tolerance; a mode pinned at a bound with a
+                        # large residual must be reported as stopped, not
+                        # converged.
+                        _converged = bool(_max_delta <= 0.01)
                         break
-                except Exception as _ci_e:
-                    logger.debug(f"[{segment}] ASC calibration iter {_calib_iter}: {_ci_e}")
-                    break
 
-            # Log final calibrated shares
-            try:
-                _cal_probs = _mode_probs_numpy(mode_mdl, seg, persons, skims,
-                                               coef_override=None)
+                # Final predicted shares and a full-mode diagnostic.
+                if _cal_probs is None:
+                    _cal_probs = _mode_probs_numpy(mode_mdl, seg, persons, skims,
+                                                   coef_override=_calib_coef)
                 if _cal_probs is not None:
                     _cal_arr = np.asarray(_cal_probs).mean(axis=0)
-                    _cal_pred = {_col_to_code[ci]: _cal_arr[ci] for ci in range(len(_cal_arr))}
-                    _sr_obs = _obs_shares.get(MODE_MAP['SR'], 0.0)
-                    _wk_obs = _obs_shares.get(MODE_MAP['Walk'], 0.0)
+                    _mode_names = (
+                        (MODE_MAP['DA'], 'DA'), (MODE_MAP['SR'], 'SR'),
+                        (MODE_MAP['Walk'], 'Walk'), (MODE_MAP['Bike'], 'Bike'),
+                        (MODE_MAP['Transit'], 'Transit'),
+                    )
+                    _diag = []
+                    _bad_diff = []
+                    for _mc, _nm in _mode_names:
+                        _mi = _code_to_col.get(_mc)
+                        if _mi is None or _mi >= len(_cal_arr):
+                            continue
+                        _obs_s = _obs_shares.get(_mc, 0.0)
+                        _pred_s = float(_cal_arr[_mi])
+                        _diag.append(f"{_nm} obs={_obs_s:.3f} pred={_pred_s:.3f}")
+                        if abs(_pred_s - _obs_s) > 0.02:
+                            _bad_diff.append(f"{_nm} {_pred_s - _obs_s:+.3f}")
                     logger.info(
                         f"[{segment}] Mode ASC calibration complete: "
-                        f"SR obs={_sr_obs:.3f} pred={_cal_pred.get(MODE_MAP['SR'],0):.3f} | "
-                        f"Walk obs={_wk_obs:.3f} pred={_cal_pred.get(MODE_MAP['Walk'],0):.3f}"
+                        + " | ".join(_diag)
                     )
-            except Exception:
-                pass
+                    logger.info(
+                        f"[{segment}] ASC calibration "
+                        f"{'converged' if _converged else 'stopped'} after "
+                        f"{_calib_iter + 1} iter (max|delta|={_max_delta:.4f}); "
+                        f"bounds [{_asc_cal_lo:+.1f}, {_asc_cal_hi:+.1f}]"
+                    )
+                    if _bad_diff:
+                        logger.warning(
+                            f"[{segment}] ASC calibration residuals >2pp "
+                            f"(target may be infeasible given availability): "
+                            + ", ".join(_bad_diff)
+                        )
+                logger.info(
+                    f"[{segment}] Calibrated ASCs: "
+                    + ", ".join(f"{_p}={_calib_coef[_p]:+.3f}"
+                                for _p in _asc_mode_map if _p in _calib_coef)
+                )
+
+                # Persist the calibrated vector so later pf/mangle reads and
+                # save_models() cannot fall back to the raw fit.
+                for _asc_p in _asc_mode_map:
+                    if _asc_p not in _calib_coef:
+                        continue
+                    try:
+                        mode_mdl.set_value(_asc_p, float(_calib_coef[_asc_p]))
+                    except Exception:
+                        pass
+                try:
+                    if not (hasattr(mode_mdl, '_final_pf') and
+                            isinstance(mode_mdl._final_pf, pd.DataFrame)):
+                        # _final_pf is Larch-whitelisted away on pickle, but
+                        # keeping it live here makes CSV/report extraction use
+                        # the calibrated values.
+                        try:
+                            mode_mdl._final_pf = mode_mdl.pf.copy()
+                        except Exception:
+                            # Live pf may be unusable after JAX JIT.  A minimal
+                            # value frame is enough for _extract_coef() and
+                            # _save_coefficients(); SE columns are optional.
+                            mode_mdl._final_pf = pd.DataFrame(
+                                {'value': pd.Series(_calib_coef, dtype=float)})
+                    for _p, _v in _calib_coef.items():
+                        if _p in mode_mdl._final_pf.index:
+                            mode_mdl._final_pf.loc[_p, 'value'] = float(_v)
+                except Exception as _pf_e:
+                    logger.debug(
+                        f"[{segment}] could not refresh _final_pf after ASC "
+                        f"calibration: {_pf_e}"
+                    )
+                mode_mdl._coef_cache = dict(_calib_coef)
     except Exception as _asc_cal_e:
         logger.debug(f"[{segment}] ASC calibration failed: {_asc_cal_e}")
 
@@ -20381,14 +23618,20 @@ def _sanitize_mu(mu, name=''):
 
 
 def _nested_mode_probs(V_DA, V_SR, V_WK, V_BK, V_TR,
-                       mu_motor=1.0, mu_nonmotor=1.0, xp=np):
+                       mu_motor=1.0, mu_nonmotor=1.0, xp=np,
+                       extra_motor=None):
     """
-    GEV nested-logit choice probabilities for the 5-mode tree estimated by
+    GEV nested-logit choice probabilities for the tree estimated by
     _build_mode_model:
 
         Root (mu_root=1, fixed)
-          Motor (mu_motor): DA, SR, Transit
+          Motor (mu_motor): DA, SR, Transit [, PT_Walk, PT_Drive, PT_Bike]
           NonMotor (mu_nonmotor): Walk, Bike
+
+    extra_motor (STAGE5_PT_MODES=1): additional Motor-nest utility vectors in
+    MODE_CODES order after Transit (PT_Walk, PT_Drive, PT_Bike). They are
+    appended as extra columns after Transit so the output column layout stays
+    code-ascending (col i ↔ MODE_CODES[i]).
 
     Two-level tree only: the intermediate Car{DA,SR} nest (Mu_Car) was removed
     because it was not identified by the data (Mu_Car collapsed to its 0.10
@@ -20441,7 +23684,8 @@ def _nested_mode_probs(V_DA, V_SR, V_WK, V_BK, V_TR,
         iv = mu * (xp.log(totals_safe) + row_max[:, 0])     # inclusive value (utils)
         return cond_probs, iv
 
-    motor_cond,    iv_motor    = _logsum([V_DA, V_SR, V_TR], mu_motor)
+    _extras = list(extra_motor) if extra_motor else []
+    motor_cond,    iv_motor    = _logsum([V_DA, V_SR, V_TR] + _extras, mu_motor)
     nonmotor_cond, iv_nonmotor = _logsum([V_WK, V_BK], mu_nonmotor)
     root_cond,     _iv_root    = _logsum([iv_motor, iv_nonmotor], 1.0)
 
@@ -20455,19 +23699,24 @@ def _nested_mode_probs(V_DA, V_SR, V_WK, V_BK, V_TR,
     p_WK = p_nonmotor * p_wk_nm
     p_BK = p_nonmotor * p_bk_nm
 
-    return xp.stack([p_DA, p_SR, p_WK, p_BK, p_TR], axis=1)
+    _cols = [p_DA, p_SR, p_WK, p_BK, p_TR]
+    for _j in range(len(_extras)):
+        _cols.append(p_motor * motor_cond[:, 3 + _j])
+    return xp.stack(_cols, axis=1)
 
 
 def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
-                      coef_override: dict = None):
+                      coef_override: dict = None, landuse=None):
     """
     Compute mode choice probabilities directly from fitted coefficients.
 
     Uses coef_override (plain Python dict from models[seg]['coef']) first,
     then tries _coef_cache, then model.pf - never crashes on loaded models.
 
-    Modes: DA=1, Other=2, Walk=3, Bike=4, Transit=5
-    Returns np.ndarray shape (n_cases, 5) or None on failure.
+    Modes: DA=1, Other=2, Walk=3, Bike=4, Transit=5 [, PT_Walk=6,
+    PT_Drive=7, PT_Bike=8 with STAGE5_PT_MODES=1]. Column order follows
+    MODE_CODES (code-ascending), so col i ↔ MODE_CODES[i].
+    Returns np.ndarray shape (n_cases, len(MODE_CODES)) or None on failure.
 
     ActivitySim alignment
     ---------------------
@@ -20541,6 +23790,13 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         c_student_tr   = _pv('c_student_tr',       0.40)  # student → more transit
         c_inc_high_da  = _pv('c_inc_high_da',      0.015) # high income → DA
         c_inc_low_tr   = _pv('c_inc_low_tr',      -0.020) # low income → transit
+        # ── E1 grid-feedback pilot: destination power attributes ─────────
+        # Defaults 0.0 → zero contribution when unestimated/flag off.
+        c_pow_rel_da = _pv('c_power_rel_da',      0.0)
+        c_pow_rel_sr = _pv('c_power_rel_sr',      0.0)
+        c_pow_rel_tr = _pv('c_power_rel_transit', 0.0)
+        c_pow_ev_da  = _pv('c_power_ev_da',       0.0)
+        c_pow_ev_tr  = _pv('c_power_ev_transit',  0.0)
         # ── ASC values - relative to DA (ASC_DA = 0) ─────────────────────
         # Raised significantly from -4.0/-4.5 which produced effectively 0%
         # walk/bike.  New values allow the distance utility to govern mode
@@ -20561,6 +23817,49 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         otaz = _col(tour_rows, 'OTAZ', default=1).astype(np.int32)
         dtaz = _col(tour_rows, 'DTAZ', default=1).astype(np.int32)
 
+        # ── E1 grid-feedback pilot: destination power attributes ─────────
+        # Join power_reliability_acc / ev_hosting_acc from landuse on DTAZ
+        # (9-digit values are SA2 codes, small values are ORDER indices —
+        # same magnitude rule as the walk-skim lookup below). All-zero when
+        # the flag is off, landuse is absent, or columns are missing, so
+        # default prediction is unchanged.
+        pow_rel = np.zeros(n, dtype=np.float32)
+        pow_ev = np.zeros(n, dtype=np.float32)
+        if (_power_acc_enabled() and landuse is not None
+                and isinstance(landuse, pd.DataFrame) and len(landuse)):
+            try:
+                _lu = landuse
+                _key = next((c for c in ('SA2_MAIN16', 'zone_id', 'ORDER')
+                             if c in _lu.columns), None)
+                if _key is not None:
+                    _lut = {}
+                    for _pc in ('power_reliability_acc', 'ev_hosting_acc'):
+                        if _pc in _lu.columns:
+                            _s = pd.to_numeric(_lu[_pc], errors='coerce').fillna(0.0)
+                            _lut[_pc] = dict(zip(
+                                pd.to_numeric(_lu[_key], errors='coerce')
+                                .fillna(0).astype(int).tolist(),
+                                _s.tolist()))
+                    _d = np.asarray(dtaz, dtype=float)
+                    for i in range(n):
+                        _z = int(_d[i]) if np.isfinite(_d[i]) else 0
+                        _hit = _lut.get('power_reliability_acc', {}).get(_z)
+                        if _hit is None and _z >= 100_000_000:
+                            # ORDER-keyed landuse with SA2 DTAZ: bridge via
+                            # seq_zone_ids_371.csv (ORDER ↔ SA2_MAIN16).
+                            _hit = _lut.get('power_reliability_acc', {}).get(
+                                _sa2_to_order_bridge().get(_z, -1))
+                        if _hit is not None:
+                            pow_rel[i] = float(_hit)
+                        _hit2 = _lut.get('ev_hosting_acc', {}).get(_z)
+                        if _hit2 is None and _z >= 100_000_000:
+                            _hit2 = _lut.get('ev_hosting_acc', {}).get(
+                                _sa2_to_order_bridge().get(_z, -1))
+                        if _hit2 is not None:
+                            pow_ev[i] = float(_hit2)
+            except Exception as _pow_e:
+                logger.debug(f"_mode_probs_numpy power join skipped ({_pow_e})")
+
         # ── 3. Read skim values per OD pair ──────────────────────────────
         # Multi-resolution: walk/bike use SA1-origin × SA2-destination skims
         # (finer spatial resolution within each SA2 home zone) when available.
@@ -20568,6 +23867,10 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         # Falls back gracefully when SA1 skims aren't built yet.
         ivt_auto    = np.full(n, 30.0, dtype=np.float32)
         ivt_transit = np.full(n, 45.0, dtype=np.float32)
+        # PT_Drive access IVT (WLK_LOC_DRV_TOTIVT__* = park-and-ride access +
+        # ride). -1 sentinel = unknown; falls back to the walk-access value
+        # before the PT utilities are built. Only used with STAGE5_PT_MODES=1.
+        ivt_transit_drv = np.full(n, -1.0, dtype=np.float32)
         dist_walk   = np.full(n, 5.0,  dtype=np.float32)
         dist_bike   = np.full(n, 5.0,  dtype=np.float32)
 
@@ -20637,6 +23940,13 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                 suf = period_suffix[i]
                 ivt_auto[i]    = float(sk.get(f'SOVTOLL_TIME__{suf}', sk.get('SOVTOLL_TIME__AM', 30.0)) or 30.0)
                 ivt_transit[i] = float(sk.get(f'WLK_LOC_WLK_TOTIVT__{suf}', sk.get('WLK_LOC_WLK_TOTIVT__AM', 45.0)) or 45.0)
+                if STAGE5_PT_MODES:
+                    _drv_v = sk.get(f'WLK_LOC_DRV_TOTIVT__{suf}',
+                                    sk.get('WLK_LOC_DRV_TOTIVT__AM', -1.0))
+                    try:
+                        ivt_transit_drv[i] = float(_drv_v)
+                    except (TypeError, ValueError):
+                        pass
                 crash[i]       = float(sk.get('CRASH', 0.0)                    or 0.0)
                 # Walk/bike: use SA1/Lvl4-origin × SA2-destination skim when available.
                 # DTAZ is either a 9-digit SA2 code (new_pop/507-zone) or an ORDER
@@ -20658,15 +23968,29 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                 dist_bike[i] = float(sk.get('DISTBIKE', 5.0) or 5.0)
         elif skims is not None:
             # Read matrices once and index per row
-            def _mat(name, fallback):
+            def _mat(name, fill=0.0):
                 # minutes via unit sidecar for known time matrices (genuine
                 # 200+ min trips survive); anything else keeps legacy
                 # median-guessing inside to_minutes.
+                # Non-finite cells are filled with `fill` HERE, once at load,
+                # rather than on every per-row join: a single NaN cell in an
+                # OMX matrix previously produced a per-call warning
+                # ("falling back to 45.0") that re-fired on every fit/refit/GA
+                # evaluation (job 26958837: 149/6909 work lines etc.).
                 try:
                     if name in skims.listMatrices():
-                        arr = np.array(skims[name], dtype=np.float32)
-                        return np.asarray(_skim_minutes(name, arr),
-                                          dtype=np.float32)
+                        arr = np.asarray(_skim_minutes(name, np.array(
+                            skims[name], dtype=np.float32)), dtype=np.float32)
+                        _bad = ~np.isfinite(arr)
+                        _n_bad = int(_bad.sum())
+                        if _n_bad:
+                            arr = np.where(_bad, np.float32(fill), arr).astype(np.float32)
+                            _warn_once(
+                                f'skim_nonfinite:{name}',
+                                f"_mode_probs_numpy: skim matrix '{name}' had "
+                                f"{_n_bad}/{arr.size} non-finite cell(s) — filled "
+                                f"with {fill} once at load (was re-warned per join)")
+                        return arr
                 except Exception:
                     pass
                 return None
@@ -20678,11 +24002,15 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                 pass
             # Load per-period matrices (falls back to AM-only matrices for
             # legacy OMX files that don't have the full 5-period set).
-            mat_ivt_auto_by_period    = {p: _mat(f'SOVTOLL_TIME__{p}', None) for p in ('AM', 'MD', 'PM', 'EA', 'EV')}
-            mat_ivt_transit_by_period = {p: _mat(f'WLK_LOC_WLK_TOTIVT__{p}', None) for p in ('AM', 'MD', 'PM', 'EA', 'EV')}
-            mat_walk        = _mat('DISTWALK', None)
-            mat_bike        = _mat('DISTBIKE', None)
-            mat_crash       = _mat('CRASH', None)
+            mat_ivt_auto_by_period    = {p: _mat(f'SOVTOLL_TIME__{p}', 30.0) for p in ('AM', 'MD', 'PM', 'EA', 'EV')}
+            mat_ivt_transit_by_period = {p: _mat(f'WLK_LOC_WLK_TOTIVT__{p}', 45.0) for p in ('AM', 'MD', 'PM', 'EA', 'EV')}
+            mat_ivt_drv_by_period     = (
+                {p: _mat(f'WLK_LOC_DRV_TOTIVT__{p}', -1.0)
+                 for p in ('AM', 'MD', 'PM', 'EA', 'EV')}
+                if STAGE5_PT_MODES else {})
+            mat_walk        = _mat('DISTWALK', 5.0)
+            mat_bike        = _mat('DISTBIKE', 5.0)
+            mat_crash       = _mat('CRASH', 0.0)
             for i in range(n):
                 oi = mapping.get(int(otaz[i]), 0)
                 di = mapping.get(int(dtaz[i]), 0)
@@ -20695,6 +24023,12 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                     mat_ivt_transit = mat_ivt_transit_by_period.get('AM')
                 if mat_ivt_auto    is not None: ivt_auto[i]    = mat_ivt_auto[oi, di]
                 if mat_ivt_transit is not None: ivt_transit[i] = mat_ivt_transit[oi, di]
+                if STAGE5_PT_MODES and mat_ivt_drv_by_period:
+                    _mdrv = mat_ivt_drv_by_period.get(suf)
+                    if _mdrv is None:
+                        _mdrv = mat_ivt_drv_by_period.get('AM')
+                    if _mdrv is not None:
+                        ivt_transit_drv[i] = _mdrv[oi, di]
                 if mat_walk        is not None: dist_walk[i]   = mat_walk[oi, di]
                 if mat_bike        is not None: dist_bike[i]   = mat_bike[oi, di]
                 if mat_crash       is not None: crash[i]       = mat_crash[oi, di]
@@ -20703,8 +24037,11 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         # `float(x) or default` passes NaN through (NaN is truthy), so one
         # NaN skim cell poisons V_WK/V_BK for that row and surfaces as
         # Walk=nan% Bike=nan% while DA/SR/Transit stay finite. Force finite
-        # here — fallbacks equal the initial defaults above. The warning
-        # names the poisoned input so the skim source can be fixed.
+        # here — fallbacks equal the initial defaults above. The warning names
+        # the poisoned input ONCE per process (the counts are deterministic for
+        # a given run, so a bare logger.warning re-fired on every fit/refit/GA
+        # evaluation — job 26958837). Matrices read via _mat are already
+        # sanitized at load, so this now only catches the legacy dict path.
         for _nm, _arr, _fb in (('ivt_auto', ivt_auto, 30.0),
                                ('ivt_transit', ivt_transit, 45.0),
                                ('dist_walk', dist_walk, 5.0),
@@ -20712,7 +24049,8 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                                ('crash', crash, 0.0)):
             _bad = ~np.isfinite(np.asarray(_arr, dtype=float))
             if _bad.any():
-                logger.warning(
+                _warn_once(
+                    f'mode_probs_nonfinite:{_nm}',
                     f"_mode_probs_numpy: {int(_bad.sum())}/{n} non-finite "
                     f"{_nm} from skim join — falling back to {_fb}")
                 _arr[_bad] = _fb
@@ -20733,6 +24071,54 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
             f"{int(transit_avail.sum())}/{len(transit_avail)} persons "
             f"(IVT threshold={TRANSIT_IVT_UNAVAIL_MIN} min)"
         )
+
+        # ---- PT access alternatives (STAGE5_PT_MODES=1) -------------------
+        # Availability mirrors _build_mode_model: PT_Walk rides on the
+        # walk-access transit service check; PT_Drive additionally needs car
+        # access (licence AND household vehicle) AND a usable drive-access
+        # IVT; PT_Bike needs bike ownership when the column exists, plus the
+        # transit service check.
+        _pt_drive_avail = None
+        _pt_bike_avail = None
+        if STAGE5_PT_MODES:
+            try:
+                _pt_drive_avail = np.asarray(transit_avail, dtype=np.float32).copy()
+            except Exception:
+                _pt_drive_avail = None
+            _drv_raw = np.asarray(ivt_transit_drv, dtype=np.float32)
+            _drv_bad = (~np.isfinite(_drv_raw)) | (_drv_raw <= 0)
+            if _drv_bad.all():
+                # OMX carries no drive-access matrix: fall back to walk IVT so
+                # PT_Drive utilities stay finite (matches _get_tt fallback).
+                try:
+                    ivt_transit_drv = np.asarray(ivt_transit, dtype=np.float32).copy()
+                except Exception:
+                    ivt_transit_drv = np.full(n, 45.0, dtype=np.float32)
+            else:
+                _walk_ivt = np.asarray(ivt_transit, dtype=np.float32)
+                _arr = np.asarray(ivt_transit_drv, dtype=np.float32).copy()
+                _arr[_drv_bad] = _walk_ivt[_drv_bad]
+                ivt_transit_drv = _arr
+            if _pt_drive_avail is not None:
+                _drv_h = np.asarray(ivt_transit_drv, dtype=np.float32)
+                _pt_drive_avail = (
+                    (_pt_drive_avail > 0)
+                    & (_drv_h > 0) & (_drv_h < TRANSIT_IVT_UNAVAIL_MIN)
+                ).astype(np.float32)
+            try:
+                _bikes_col = None
+                for _src in (tour_rows, persons if isinstance(persons, pd.DataFrame) else None):
+                    if _src is not None and 'bikes' in _src.columns:
+                        _bikes_col = pd.to_numeric(
+                            _src['bikes'], errors='coerce')
+                        break
+                if _bikes_col is not None:
+                    _pt_bike_avail = (np.asarray(_bikes_col, dtype=np.float32) > 0
+                                      ).astype(np.float32) * np.asarray(transit_avail, dtype=np.float32)
+                else:
+                    _pt_bike_avail = np.asarray(transit_avail, dtype=np.float32)
+            except Exception:
+                _pt_bike_avail = np.asarray(transit_avail, dtype=np.float32)
 
         ivt_auto = xp.clip(xp.asarray(ivt_auto) / 60.0, 0.05, 5.0)   # minutes → hours
         ivt_transit = xp.clip(xp.asarray(ivt_transit) / 60.0, 0.05, 6.0)
@@ -20902,7 +24288,9 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
               + c_inc_high_da * xp.clip(xp.asarray(inc_cent), 0, None)  # high inc only
               + c_ind_da  * xp.asarray(ind_industrial)   # industrial/agri captive
               + c_mgr_da  * xp.asarray(occ_mgr_prof)     # managers → DA
-              + c_lab_da  * xp.asarray(occ_labourer))    # labourers → DA
+              + c_lab_da  * xp.asarray(occ_labourer)    # labourers → DA
+              + c_pow_rel_da * xp.asarray(pow_rel)       # E1: dest power reliability
+              + c_pow_ev_da  * xp.asarray(pow_ev))       # E1: dest EV hosting
         # Apply licence AND household vehicle as hard availability:
         # unlicensed OR zero-vehicle household → V_DA = -inf (cannot drive alone)
         V_DA = xp.where((xp.asarray(licence) > 0) & (xp.asarray(vehrd) > 0),
@@ -20915,7 +24303,8 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
               + c_veh_sr     * vehrd
               + c_incp_sr    * incp
               + c_joint_sr   * joint
-              + c_ret_sr  * xp.asarray(ind_retail))      # retail/hospitality → SR
+              + c_ret_sr  * xp.asarray(ind_retail)      # retail/hospitality → SR
+              + c_pow_rel_sr * xp.asarray(pow_rel))      # E1: dest power reliability
 
         # Transit - hard availability: block when IVT >= TRANSIT_IVT_UNAVAIL_MIN
         # (no service, or only the sentinel fill value present in skim).
@@ -20932,7 +24321,9 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
               + c_pub_tr * xp.asarray(ind_public)        # public sector → transit
               + c_hlt_tr * xp.asarray(ind_health)        # health workers → transit
               + c_clr_tr * xp.asarray(occ_clerical)      # clerical → transit
-              + c_inc_low_tr    * xp.clip(xp.asarray(-inc_cent), 0, None))  # low inc only
+              + c_inc_low_tr    * xp.clip(xp.asarray(-inc_cent), 0, None)  # low inc only
+              + c_pow_rel_tr * xp.asarray(pow_rel)   # E1: dest power reliability
+              + c_pow_ev_tr  * xp.asarray(pow_ev))   # E1: dest EV hosting
         V_TR = xp.where(xp.asarray(transit_avail) > 0, xp.asarray(V_TR), -1e9)
 
         # Walk - person-type heterogeneity from ActivitySim:
@@ -20969,15 +24360,44 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
             errors='coerce').fillna(1).values.astype(float)
         V_BK = xp.where(bike_avail > 0, xp.asarray(V_BK), -1e9)
 
-        # ── 6. Nested logit (Root{Motor{DA,SR,Transit}, NonMotor{Walk,Bike}}) ──
+        # ---- PT access utilities (STAGE5_PT_MODES=1) ----------------------
+        # Mirror MODE_UEC exactly: PT_Walk = ASC + c_ivt_transit (shared
+        # walk-access IVT); PT_Drive = ASC + c_ivt_pt_drive × drive-access
+        # hours; PT_Bike = ASC + c_ivt_pt_bike × log(walk minutes × 2.4 + 1).
+        _V_PTW = _V_PTD = _V_PTB = None
+        if STAGE5_PT_MODES:
+            asc_pt_walk    = _pv('ASC_PT_Walk',    -2.8)
+            asc_pt_drive   = _pv('ASC_PT_Drive',   -4.2)
+            asc_pt_bike    = _pv('ASC_PT_Bike',    -5.5)
+            c_ivt_pt_drive = _pv('c_ivt_pt_drive', -0.9)
+            c_ivt_pt_bike  = _pv('c_ivt_pt_bike',  -0.5)
+            _pt_drv_h  = xp.clip(xp.asarray(ivt_transit_drv) / 60.0, 0.05, 6.0)
+            _pt_bike_t = xp.log(xp.maximum(ivt_transit * 60.0, 1.0) * 2.4 + 1.0)
+            _V_PTW = xp.asarray(asc_pt_walk) + c_ivt_transit * ivt_transit
+            _V_PTD = xp.asarray(asc_pt_drive) + c_ivt_pt_drive * _pt_drv_h
+            _V_PTB = xp.asarray(asc_pt_bike) + c_ivt_pt_bike * _pt_bike_t
+            _V_PTW = xp.where(xp.asarray(transit_avail) > 0,
+                              xp.asarray(_V_PTW), -1e9)
+            if _pt_drive_avail is not None:
+                _V_PTD = xp.where(xp.asarray(_pt_drive_avail) > 0,
+                                  xp.asarray(_V_PTD), -1e9)
+            if _pt_bike_avail is not None:
+                _V_PTB = xp.where(xp.asarray(_pt_bike_avail) > 0,
+                                  xp.asarray(_V_PTB), -1e9)
+
+        # ── 6. Nested logit (Root{Motor{DA,SR,Transit[,PT_*]}, NonMotor{Walk,Bike}}) ──
         # Two-level tree: the intermediate Car{DA,SR} nest was removed (Mu_Car
         # was not identified).  See _nested_mode_probs for the structure.
         mu_motor    = _sanitize_mu(_pv('Mu_Motor',    1.0), 'Mu_Motor')
         mu_nonmotor = _sanitize_mu(_pv('Mu_NonMotor', 1.0), 'Mu_NonMotor')
+        _extra_motor = ([xp.asarray(_V_PTW), xp.asarray(_V_PTD),
+                         xp.asarray(_V_PTB)]
+                        if STAGE5_PT_MODES else None)
         probs_raw = _nested_mode_probs(
             xp.asarray(V_DA), xp.asarray(V_SR), xp.asarray(V_WK),
             xp.asarray(V_BK), xp.asarray(V_TR),
             mu_motor=mu_motor, mu_nonmotor=mu_nonmotor, xp=xp,
+            extra_motor=_extra_motor,
         )
         exp_V = np.asarray(probs_raw)   # already-normalised probs (sums to ~1 per row)
 
@@ -20989,7 +24409,10 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         # floating-point artifact in this all-blocked case, not a real
         # signal), so a post-hoc "totals below threshold" check on exp_V no
         # longer detects this case the way it did under the old flat softmax.
-        V_stack = np.asarray(xp.stack([V_DA, V_SR, V_WK, V_BK, V_TR], axis=1))
+        _stack_list = [V_DA, V_SR, V_WK, V_BK, V_TR]
+        if STAGE5_PT_MODES:
+            _stack_list += [_V_PTW, _V_PTD, _V_PTB]
+        V_stack = np.asarray(xp.stack(_stack_list, axis=1))
         all_blocked = (V_stack <= -1e8).all(axis=1)
         if all_blocked.any():
             n_blocked = int(all_blocked.sum())
@@ -20999,7 +24422,7 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                 "for those rows. Check CARLICENCE and skim availability."
             )
             # fallback: DA (col 0) = 0.6, Transit (col 4) = 0.4
-            fallback = np.zeros((n_blocked, 5), dtype=np.float64)
+            fallback = np.zeros((n_blocked, len(MODE_CODES)), dtype=np.float64)
             fallback[:, 0] = 0.6   # DA
             fallback[:, 4] = 0.4   # Transit
             exp_V[all_blocked] = fallback
@@ -21011,9 +24434,12 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         # NOTE: isfinite (not isnan): the 25.16% poison proved to be
         # non-finite WITHOUT tripping an isnan audit — audit inf too.
         try:
-            _cols = ['DA', 'SR', 'Walk', 'Bike', 'Transit']
+            _cols = [MODE_NAMES[c] for c in MODE_CODES]
             _vn = {'V_DA': V_DA, 'V_SR': V_SR, 'V_WK': V_WK,
                    'V_BK': V_BK, 'V_TR': V_TR}
+            if STAGE5_PT_MODES:
+                _vn.update({'V_PTW': _V_PTW, 'V_PTD': _V_PTD,
+                            'V_PTB': _V_PTB})
             _bits = []
             for _k, _v in _vn.items():
                 _a = np.asarray(_v, dtype=float)
@@ -21047,7 +24473,7 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
             logger.debug(f"_mode_probs_numpy: PLC blend skipped ({_plc_e})")
 
         # ── 7. INFO: log realised mode split and availability counts ─────────
-        mode_names = ['DA', 'SR', 'Walk', 'Bike', 'Transit']
+        mode_names = [MODE_NAMES[c] for c in MODE_CODES]
         mean_probs = probs.mean(axis=0)
         logger.info(
             f"_mode_probs_numpy predicted split (n={n}): "
@@ -21114,16 +24540,38 @@ def _predict_batch(
     df['pred_mode'] = 1                         # default: DA
     df['transit_submode'] = 0                    # 1=Bus, 2=Train
     df['transit_submode_name'] = ''
-    df['transit_access'] = 0                     # 1=Walk, 2=Drive
+    df['transit_access'] = 0                     # 1=Walk, 2=Drive, 3=Bike
     df['transit_access_name'] = ''
+
+    # ── Hybrid transit access: observed from outbound legs where available,
+    #    simulated fallback otherwise. Build a lookup from transit tour -> access
+    #    before the segment loop so it's available to all segments.
+    _transit_access_observed = {}
+    if {'tour_leg', 'MAINMODE', 'tour_id'}.issubset(df.columns):
+        main = df[df['tour_leg'] == 'main'][['tour_id', 'MAINMODE']].copy()
+        outb = df[df['tour_leg'] != 'main'][['tour_id', 'MAINMODE']].copy()
+        # Keep only the FIRST outbound leg per tour (arbitrary but deterministic)
+        outb_first = outb.drop_duplicates(subset='tour_id', keep='first')
+        merged = main[main['MAINMODE'] == 'Transit'][['tour_id']].merge(
+            outb_first[outb_first['MAINMODE'].isin(['Walk', 'Bike', 'DA'])][['tour_id', 'MAINMODE']],
+            on='tour_id', how='left')
+        if not merged.empty:
+            # OMIT unmatched tours rather than mapping them to 0. A left-merge
+            # leaves NaN MAINMODE for transit tours with no Walk/Bike/DA outbound
+            # leg; fillna(0) turned "unknown" into a value that the lookup read
+            # as an OBSERVED access mode, so those tours were never simulated.
+            _pair = merged.dropna(subset=['MAINMODE'])
+            _transit_access_observed = dict(zip(
+                _pair['tour_id'].astype(str),
+                _pair['MAINMODE'].map(TRANSIT_ACCESS_MAP).astype(int)))
 
     # ── diagnostics ────────────────────────────────────────────────────
     _n_rows = len(df)
     _otaz_u = df['OTAZ'].nunique() if 'OTAZ' in df.columns else 0
     _seg_u  = df['segment'].value_counts().to_dict() if 'segment' in df.columns else {}
     _models_segs = list(models.keys()) if models else []
-    print(f"    _predict_batch: {_n_rows} activities, {_otaz_u} unique OTAZ, "
-          f"segments={_seg_u}, models={_models_segs}")
+    print(f"    _predict_batch: {_n_rows} activities, {df['OTAZ'].nunique() if 'OTAZ' in df.columns else 0} unique OTAZ, "
+          f"segments={df['segment'].value_counts().to_dict() if 'segment' in df.columns else {}}, models={list(models.keys()) if models else []}")
     if not models:
         logger.warning("_predict_batch called with empty models dict - "
                        "all DTAZ will default to OTAZ, pred_mode=1 (DA)")
@@ -21414,6 +24862,12 @@ def _predict_batch(
         seg_rows = seg_rows.copy()
         seg_rows['ptour_id'] = tour_rows.index.values
 
+        # Person-level DA availability for this batch.  Applied to every
+        # probability path before sampling; the DA quarantine is estimation-
+        # only, so prediction must respect availability here instead of
+        # deleting unrealisable DA choices afterwards.
+        _da_ok = _da_avail_for_tours(tour_rows, pp)
+
         # Nonmandatory tours need a mode before their destination can be
         # resolved. Draw it in the origin context, then condition the child
         # destination choice set on that realized mode below.
@@ -21430,10 +24884,13 @@ def _predict_batch(
                                    or seg_models.get('coef') or {}),
                 )
                 if _origin_mode_probs is not None:
+                    _origin_mode_probs = _mask_da_availability(
+                        _origin_mode_probs, _da_ok, list(MODE_CODES),
+                        label=f"{seg}/origin")
                     _origin_targets = seg_models.get('pred_mode_shares')
                     _origin_mode_probs = _stabilize_mode_probs_stage5(
                         _origin_mode_probs,
-                        [1, 2, 3, 4, 5],
+                        list(MODE_CODES),
                         _origin_targets,
                         seg=seg,
                     )
@@ -21443,8 +24900,8 @@ def _predict_batch(
                     _origin_cdf = np.cumsum(_origin_probs_norm, axis=1)
                     _origin_u = rng.uniform(size=len(seg_rows))
                     _origin_picks = ((_origin_cdf < _origin_u[:, np.newaxis]) * 1).sum(axis=1)
-                    _origin_picks = np.clip(_origin_picks, 0, 4)
-                    df.loc[seg_rows.index, 'pred_mode'] = np.asarray([1, 2, 3, 4, 5])[_origin_picks]
+                    _origin_picks = np.clip(_origin_picks, 0, len(MODE_CODES) - 1)
+                    df.loc[seg_rows.index, 'pred_mode'] = np.asarray(MODE_CODES)[_origin_picks]
                     tour_rows['tour_mode'] = df.loc[seg_rows.index, 'pred_mode'].to_numpy()
                     _modes_drawn_before_dest = True
                     logger.info(
@@ -21490,7 +24947,8 @@ def _predict_batch(
             print(f"      [{seg}] dest prediction: {len(pred_seg_rows)} choosers, "
                   f"dest_mdl={dest_mdl is not None}")
             try:
-                dt_m_batch = _mode_tree(pred_tour_rows.reset_index(), pp, landuse, skims)
+                dt_m_batch = _mode_tree(pred_tour_rows.reset_index(), pp, landuse, skims,
+                                        quarantine_da=False)
                 _m_coef = seg_models.get('mode_coef') or seg_models.get('coef') or {}
                 ls_batch   = _logsums(mode_mdl, dt_m_batch, skims=skims, verbose=False,
                                       coef_override=_m_coef)
@@ -21883,16 +25341,26 @@ def _predict_batch(
                 f"Mode prediction already resolved before destination [{seg}]"
             )
             _transit_model = seg_models.get('transit_submode_model')
-            if _transit_model is not None:
+            _transit_mask = df.loc[seg_rows.index, 'pred_mode'].to_numpy() == MODE_MAP['Transit']
+            if _transit_model is None:
+                # Missing-key bundles used to skip this block silently, leaving
+                # transit tours with no Bus/Train submode and no access label.
+                if _transit_mask.any():
+                    logger.warning(
+                        f"[{seg}] {int(_transit_mask.sum())} predicted transit tour(s) "
+                        "but the loaded model bundle has no transit_submode_model — "
+                        "transit_submode/transit_access left unset. Re-estimate stage 5: "
+                        "the bundle predates the Bus/Train submode fit or dropped it."
+                    )
+            else:
                 _transit_rows = tour_rows.reindex(seg_rows.index.astype(str)).copy()
                 _transit_rows['DTAZ'] = df.loc[seg_rows.index, 'DTAZ'].to_numpy()
-                _transit_mask = df.loc[seg_rows.index, 'pred_mode'].to_numpy() == MODE_MAP['Transit']
                 if _transit_mask.any():
                     _transit_choice_rows = _transit_rows.loc[_transit_mask].reset_index(drop=True)
                     _transit_submodes = _predict_transit_submode(
                         _transit_choice_rows, _transit_model, skim_lookup, landuse, rng)
                     _transit_access = _predict_transit_access(
-                        _transit_choice_rows, skim_lookup, rng)
+                        _transit_choice_rows, skim_lookup, rng, observed_access=_transit_access_observed)
                     _transit_indices = seg_rows.index[_transit_mask]
                     df.loc[_transit_indices, 'transit_submode'] = _transit_submodes
                     df.loc[_transit_indices, 'transit_submode_name'] = [
@@ -21909,7 +25377,8 @@ def _predict_batch(
             # update DTAZ in tour_rows from df predictions
             tour_rows['DTAZ'] = df.loc[seg_rows.index, 'DTAZ'].values
 
-            dt_m_mode = _mode_tree(tour_rows.reset_index(), pp, landuse, skims)
+            dt_m_mode = _mode_tree(tour_rows.reset_index(), pp, landuse, skims,
+                                   quarantine_da=False)
             try:
                 template  = dt_m_mode['tour']['DTAZ']
                 new_dtaz  = xr.DataArray(
@@ -21921,7 +25390,7 @@ def _predict_batch(
                 pass
 
             mode_probs = None
-            alt_ids    = [1, 2, 3, 4, 5]   # DA, SR, Walk, Bike, Transit
+            alt_ids    = list(MODE_CODES)  # DA..Transit [, PT_Walk, PT_Drive, PT_Bike]
             _frozen = seg_models.get('frozen_probs')
 
             # ── Attempt -1: distance-aware numpy path with fine skims ─────
@@ -21969,7 +25438,8 @@ def _predict_batch(
             # ── Attempt 0: frozen cell probabilities (most stable) ────────
             # HHTS-estimated cell probabilities applied directly to synth pop.
             # No MC noise, fully reproducible, industry/occupation-aware.
-            if mode_probs is None and _frozen is not None and len(_frozen) > 0:
+            if (mode_probs is None and _frozen is not None and len(_frozen) > 0
+                    and not STAGE5_PT_MODES):
                 try:
                     mode_probs = _mode_probs_frozen(_frozen, tour_rows, pp)
                     if mode_probs is not None:
@@ -22015,12 +25485,16 @@ def _predict_batch(
 
             if mode_probs is not None:
                 alt_arr   = np.array(alt_ids)
+                # Enforce DA availability for the sampled choice set.  The
+                # frozen-cell path and the share stabiliser both ignore it.
+                mode_probs = _mask_da_availability(
+                    mode_probs, _da_ok, alt_ids, label=seg)
 
                 # Segment-level share stabilization to avoid DA-collapse in
                 # fallback prediction paths (especially when coefficient caches
                 # are incomplete after reloads).
                 _target_shares = seg_models.get('pred_mode_shares')
-                if _target_shares is None:
+                if _target_shares is None and not STAGE5_PT_MODES:
                     _fp = seg_models.get('frozen_probs')
                     if isinstance(_fp, pd.DataFrame) and len(_fp) > 0:
                         try:
@@ -22051,16 +25525,24 @@ def _predict_batch(
             logger.warning(f"Batch mode prediction failed for {seg}: {e} - using DA")
 
         _transit_model = seg_models.get('transit_submode_model')
-        if _transit_model is not None:
+        _transit_mask = df.loc[seg_rows.index, 'pred_mode'].to_numpy() == MODE_MAP['Transit']
+        if _transit_model is None:
+            if _transit_mask.any():
+                logger.warning(
+                    f"[{seg}] {int(_transit_mask.sum())} predicted transit tour(s) "
+                    "but the loaded model bundle has no transit_submode_model — "
+                    "transit_submode/transit_access left unset. Re-estimate stage 5: "
+                    "the bundle predates the Bus/Train submode fit or dropped it."
+                )
+        else:
             _transit_rows = tour_rows.reindex(seg_rows.index.astype(str)).copy()
             _transit_rows['DTAZ'] = df.loc[seg_rows.index, 'DTAZ'].to_numpy()
-            _transit_mask = df.loc[seg_rows.index, 'pred_mode'].to_numpy() == MODE_MAP['Transit']
             if _transit_mask.any():
                 _transit_choice_rows = _transit_rows.loc[_transit_mask].reset_index(drop=True)
                 _transit_submodes = _predict_transit_submode(
                     _transit_choice_rows, _transit_model, skim_lookup, landuse, rng)
                 _transit_access = _predict_transit_access(
-                    _transit_choice_rows, skim_lookup, rng)
+                    _transit_choice_rows, skim_lookup, rng, observed_access=_transit_access_observed)
                 _transit_indices = seg_rows.index[_transit_mask]
                 df.loc[_transit_indices, 'transit_submode'] = _transit_submodes
                 df.loc[_transit_indices, 'transit_submode_name'] = [
@@ -22451,6 +25933,7 @@ def _build_trip_chain(
 
             out_trip = {
                 'person_id':              pid,
+                'tour_id':                f"{pid}_t{tour_idx}",
                 'row_type':               'trip',
                 'seq':                    global_seq,
                 'purpose':                str(first_act.get('purpose', 'travel')),
@@ -22497,6 +25980,7 @@ def _build_trip_chain(
                     leg_start = max(prev_act_end, act_start - leg_tt)
                     intra_trip = {
                         'person_id':              pid,
+                        'tour_id':                f"{pid}_t{tour_idx}",
                         'row_type':               'trip',
                         'seq':                    global_seq,
                         'purpose':                str(act_row.get('purpose', 'travel')),
@@ -22522,6 +26006,7 @@ def _build_trip_chain(
                 # activity dwell
                 act_out = {
                     'person_id':              pid,
+                    'tour_id':                f"{pid}_t{tour_idx}",
                     'row_type':               'activity',
                     'seq':                    global_seq,
                     'purpose':                str(act_row.get('purpose', '')),
@@ -22555,6 +26040,7 @@ def _build_trip_chain(
 
             home_trip = {
                 'person_id':              pid,
+                'tour_id':                f"{pid}_t{tour_idx}",
                 'row_type':               'trip',
                 'seq':                    global_seq,
                 'purpose':                'home',
@@ -22600,6 +26086,7 @@ def _build_trip_chain(
                 if next_depart > home_arrive:
                     home_dwell = {
                         'person_id':              pid,
+                        'tour_id':                f"{pid}_t{tour_idx}",
                         'row_type':               'activity',
                         'seq':                    global_seq,
                         'purpose':                'home',
@@ -22711,10 +26198,29 @@ def enhance_plan_with_trip_destinations(
         logger.warning("stage5b_trip_destination not available - skipping trip-level destination enhancement")
         return plan
 
+    # plan's index can be non-unique after upstream concatenation/merges. The
+    # label-based write-back at the end (`plan.loc[_plan_rows,'DTAZ']=_pred`)
+    # then broadcasts N predictions onto the 2N rows a duplicated label matches
+    # ("Length of values (108) does not match length of index (216)", exact 1:2
+    # — job 27255593). Give plan a unique RangeIndex so _plan_row labels map 1:1
+    # at write-back; downstream consumes plan columns, not its index, so this is
+    # safe and complements the _plan_row carry below (which handles the separate
+    # merge-doubling of the trip frame).
+    if not plan.index.is_unique:
+        plan = plan.reset_index(drop=True)
+
     # Identify trip rows in the plan
     trip_rows = plan[plan['row_type'] == 'trip'].copy()
     if trip_rows.empty:
         return plan
+
+    # Carry the plan row index through every merge below.  pandas resets the
+    # index on merge (and build_trip_records merges twice more), so without
+    # this the write-back at the end matched arbitrary plan rows: job
+    # 27177740 raised "Length of values (902) does not match length of index
+    # (1804)" on 14 segments (persons had duplicate person_ids, duplicating
+    # the merged frame) and skipped the whole enhancement.
+    trip_rows['_plan_row'] = trip_rows.index
 
     # Need tour_id to group trips into tours
     if 'tour_id' not in trip_rows.columns:
@@ -22726,12 +26232,43 @@ def enhance_plan_with_trip_destinations(
             trip_rows['tour_id'] = trip_rows['person_id'].astype(str) + '_tour_' + \
                                    (trip_rows.groupby('person_id').cumcount() // 2 + 1).astype(str)
 
+    # The prediction plan uses OTAZ/DTAZ/STARTIME/ENDTIME and previously had no
+    # tour_id/is_outbound/trip_num_in_tour — build_trip_records expects the
+    # ActivitySim trip-table names, so the enhancement raised KeyError
+    # ('is_outbound') and was skipped for every zone (job 27009334). Map the
+    # plan columns and derive the tour structure here.
+    if 'origin_taz' not in trip_rows.columns:
+        trip_rows['origin_taz'] = trip_rows['OTAZ']
+    if 'dest_taz' not in trip_rows.columns:
+        trip_rows['dest_taz'] = trip_rows['DTAZ']
+    if 'depart_time_min' not in trip_rows.columns:
+        trip_rows['depart_time_min'] = trip_rows['STARTIME']
+    if 'arrive_time_min' not in trip_rows.columns:
+        trip_rows['arrive_time_min'] = trip_rows['ENDTIME']
+    if 'trip_num_in_tour' not in trip_rows.columns:
+        trip_rows['trip_num_in_tour'] = (
+            trip_rows.groupby('tour_id').cumcount() + 1)
+    if 'is_outbound' not in trip_rows.columns:
+        # Every leg except the final return-home leg is outbound; the last
+        # outbound leg is the tour's primary destination.
+        _last_leg = trip_rows.groupby('tour_id')['trip_num_in_tour'].transform('max')
+        trip_rows['is_outbound'] = (
+            trip_rows['trip_num_in_tour'] < _last_leg).astype(int)
+
     # Build trip records with is_tour_dest_leg and anchor_down_taz
     # We need home_taz from persons
     pp = persons.copy()
     if 'person_id' not in pp.columns and 'PERSID' in pp.columns:
         pp = pp.rename(columns={'PERSID': 'person_id'})
     pp['person_id'] = pp['person_id'].astype(str)
+    # One row per person: a duplicated person_id in persons multiplies every
+    # trip row in the merge below (the 902 -> 1804 blow-up in job 27177740).
+    pp = pp.drop_duplicates(subset=['person_id'], keep='first')
+    # Align the merge key: the plan's person_id is int64 while pp was just
+    # cast to str, so the merge below raised "int64 and object columns for key
+    # 'person_id'" and the whole enhancement was skipped (133 warnings in job
+    # 26958837). trip_rows is a local copy, so casting it is safe.
+    trip_rows['person_id'] = trip_rows['person_id'].astype(str)
     home_taz_col = next((c for c in ['OTAZ', 'HOME_TAZ', 'home_taz', 'home_zone']
                          if c in pp.columns), None)
     if home_taz_col:
@@ -22748,9 +26285,14 @@ def enhance_plan_with_trip_destinations(
     # Load skims for detour computation
     if isinstance(skims, str):
         skims_dict = _load_skims(skims)
-    else:
-        # Assume skims is already a dict of matrices
+    elif isinstance(skims, dict):
         skims_dict = skims
+    else:
+        # Open OMX File handle (no .get): materialise the aliased matrices.
+        from stage5b_trip_destination import SKIM_ALIAS as _SK_ALIAS
+        _avail = set(skims.list_matrices())
+        skims_dict = {a: np.array(skims[o]) for a, o in _SK_ALIAS.items()
+                      if o in _avail}
 
     # Build taz_index for detour computation
     if 'zone_id' in landuse.columns:
@@ -22817,9 +26359,21 @@ def enhance_plan_with_trip_destinations(
                 taz_index=taz_index,
                 rng=rng,
             )
-            # Update the plan with predicted destinations
-            stop_indices = seg.index
-            plan.loc[plan.index.isin(stop_indices), 'DTAZ'] = pred.values
+            # Update the plan with predicted destinations.  Build the locator
+            # from the original plan row ids carried through the merges, not
+            # from seg.index (which pandas reset to 0..N).
+            if '_plan_row' in seg.columns:
+                _plan_rows = seg['_plan_row'].to_numpy()
+            else:  # pragma: no cover - defensive fallback
+                _plan_rows = seg.index.to_numpy()
+            _pred = np.asarray(pred)
+            if len(_pred) != len(_plan_rows):
+                logger.warning(
+                    f"Trip-level destination enhancement [{purpose}]: "
+                    f"prediction length {len(_pred)} != chooser length "
+                    f"{len(_plan_rows)} - skipping this purpose")
+                continue
+            plan.loc[_plan_rows, 'DTAZ'] = _pred
 
     logger.info("Trip-level destination enhancement complete")
     return plan
@@ -24542,6 +28096,7 @@ def _save_coefficients(models: dict, path: str):
     combined_sections = []
     mode_sections = []
     dest_sections = []
+    submode_sections = []
 
     for seg, res in models.items():
         for mtype, mdl_key in [('mode', 'mode_model'), ('dest', 'dest_model')]:
@@ -24575,6 +28130,38 @@ def _save_coefficients(models: dict, path: str):
                     ll = res.get(mtype + '_ll', np.nan)
                 ll = float(ll) if ll is not None else float('nan')
                 rho2 = _rho_sq_null(mdl, ll)
+
+                # Per-model convergence metadata (persisted so the report /
+                # paper appendix can show real final-fit convergence, not just
+                # the GA BIC trajectory).
+                def _mget(attr, default=None):
+                    _v = getattr(mdl, attr, default)
+                    try:
+                        return (float(_v) if isinstance(_v, (int, float))
+                                and not isinstance(_v, bool) else _v)
+                    except Exception:
+                        return default
+                ll_null = _mget('_cached_ll_null', float('nan'))
+                n_iter = _mget('_cached_nit', None)
+                converged = _mget('_cached_converged', None)
+                # Reporting group resolver (shared categories from ga_constraints).
+                try:
+                    import re as _re_grp
+                    from ga_constraints import stage5_variable_groups as _svg
+                    _groups = _svg('mode' if mtype == 'mode' else 'dest')
+                except Exception:
+                    _groups = (("Other", ".*"),)
+
+                def _group_of(pname):
+                    _s = str(pname)
+                    for _cat in _groups:
+                        for _pat in _cat[1:]:
+                            try:
+                                if _re_grp.fullmatch(_pat, _s) or _re_grp.search(_pat, _s):
+                                    return _cat[0]
+                            except Exception:
+                                continue
+                    return "Other"
 
                 seg_rows = []
                 param_names = list(pf.index) if (pf is not None and len(pf) > 0) else list(coef_dict.keys())
@@ -24642,7 +28229,9 @@ def _save_coefficients(models: dict, path: str):
                     # fields together so value = tstat * std_err holds.
                     _ainf = getattr(mdl, '_adaptive_dest_inference', None) or {}
                     _arow = _ainf.get(str(param_name))
+                    _p_from_adaptive = False
                     if isinstance(_arow, dict):
+                        _p_from_adaptive = True
                         try:
                             if _arow.get('value') is not None:
                                 val = float(_arow['value'])
@@ -24678,16 +28267,47 @@ def _save_coefficients(models: dict, path: str):
                                 f"t={_implied:.2f}, but t_stat={tstat:.2f}. "
                                 "Coefficient value and SE are from different sources."
                             )
+                    # ── pval/tstat consistency guard (2026-10-09) ─────────
+                    # se/tstat/pval above are each first-non-NaN across pf
+                    # columns that can come from different fit stages
+                    # (Hessian vs OPG vs pre-penalty snapshot), which shipped
+                    # tables pairing e.g. |t|=11 with p=0.16.  The Wald
+                    # p-value is DEFINED by the reported t-statistic, so
+                    # recompute it whenever the stored pval disagrees and
+                    # keep the stored value only when it agrees.  Rows from
+                    # the adaptive-posterior overlay are set consistently as
+                    # a block, so they are exempt.
+                    if holdfast:
+                        pval = 1.0
+                    elif _p_from_adaptive:
+                        pass
+                    elif np.isfinite(tstat):
+                        from scipy.stats import norm as _norm_p
+                        _p_from_t = float(2.0 * _norm_p.sf(abs(tstat)))
+                        if np.isnan(pval):
+                            pval = _p_from_t
+                        elif ((pval < 0.05) != (_p_from_t < 0.05)
+                                or abs(pval - _p_from_t) > max(0.02, 0.5 * _p_from_t)):
+                            logger.debug(
+                                f"[{seg}/{mtype}] {param_name}: stored pval={pval:.4g} "
+                                f"inconsistent with tstat={tstat:.3f} "
+                                f"(Wald p={_p_from_t:.4g}) — using Wald p."
+                            )
+                            pval = _p_from_t
                     r = {
                         'segment':    seg,
                         'model_type': mtype,
                         'parameter':  str(param_name),
+                        'group':      _group_of(param_name),
                         'value':      val,
                         'std_err':    se,
                         'tstat':      tstat,
                         'pval':       pval,
                         'loglike':    ll,
+                        'loglike_null': ll_null,
                         'rho2':       rho2,
+                        'n_iter':     n_iter,
+                        'converged':  converged,
                         'holdfast':   holdfast,
                     }
                     rows.append(r)
@@ -24813,6 +28433,47 @@ def _save_coefficients(models: dict, path: str):
             except Exception as mxl_e:
                 logger.debug(f"MXL HTML failed for {seg}: {mxl_e}")
 
+        # ── transit Bus/Train submode section ─────────────────────────
+        # transit_submode_model is a plain dict (regularized conditional logit
+        # over z-scored LOS features), NOT a Larch model, so the
+        # ('mode','dest') loop above never sees it. Without this block the
+        # fitted Bus/Train coefficients exist in the .pkl but are missing from
+        # every report (the 2026-10 table had 0 submode rows).
+        _sub = res.get('transit_submode_model') if isinstance(res, dict) else None
+        if isinstance(_sub, dict):
+            _sub_names = list(_sub.get('feature_names', []) or [])
+            _sub_coef = [float(_c) for _c in (_sub.get('coef', []) or [])]
+            _sub_rows = []
+            if _sub_coef:
+                _sub_rows.append({
+                    'segment': seg, 'model_type': 'transit_submode',
+                    'parameter': 'ASC_Train', 'value': _sub_coef[0],
+                    'std_err': float('nan'), 'tstat': float('nan'),
+                    'pval': float('nan'), 'loglike': float('nan'),
+                    'rho2': float('nan'), 'holdfast': False,
+                })
+                for _i, _nm in enumerate(_sub_names):
+                    if _i + 1 >= len(_sub_coef):
+                        break
+                    _sub_rows.append({
+                        'segment': seg, 'model_type': 'transit_submode',
+                        'parameter': f'{_nm} (z-scored)',
+                        'value': _sub_coef[_i + 1],
+                        'std_err': float('nan'), 'tstat': float('nan'),
+                        'pval': float('nan'), 'loglike': float('nan'),
+                        'rho2': float('nan'), 'holdfast': False,
+                    })
+            rows.extend(_sub_rows)
+            logger.info(
+                f"[{seg}/transit_submode] coefficient report: appended "
+                f"{len(_sub_rows)} row(s) (n_obs={_sub.get('n_obs', 0)}, "
+                f"train_share={float(_sub.get('train_share', float('nan'))):.3f})")
+            _sub_section = _html_model_table(
+                seg, 'transit_submode', _sub_rows, float('nan'), float('nan'),
+                _sub.get('n_obs', '?'))
+            combined_sections.append(_sub_section)
+            submode_sections.append(_sub_section)
+
     if rows:
         df = pd.DataFrame(rows)
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
@@ -24824,11 +28485,14 @@ def _save_coefficients(models: dict, path: str):
         _write_html_report(combined_sections, html_path)
         mode_html_path = path.replace('.csv', '_mode.html')
         dest_html_path = path.replace('.csv', '_dest.html')
+        submode_html_path = path.replace('.csv', '_transit_submode.html')
         _write_html_report(mode_sections, mode_html_path)
         _write_html_report(dest_sections, dest_html_path)
+        _write_html_report(submode_sections, submode_html_path)
         print(f"  Combined HTML report saved  → {html_path}")
         print(f"  Mode-only HTML report saved  → {mode_html_path}")
         print(f"  Destination-only HTML report saved  → {dest_html_path}")
+        print(f"  Transit-submode HTML report saved  → {submode_html_path}")
 
         # console summary
         print("\n  ── Model Summary ──────────────────────────────────────────")
@@ -25691,7 +29355,9 @@ def compute_multilevel_validation(
 
     # Extract trips from pred_plan
     if _has_rowtype:
-        pred_trips = pred_plan[pred_plan['row_type'] == 'trip'].copy()
+        # Boolean-mask indexing already returns a new frame; the extra .copy()
+        # doubled the trips subset for no reason (memory peak diagnosis).
+        pred_trips = pred_plan[pred_plan['row_type'] == 'trip']
     else:
         pred_trips = pred_plan.copy()
 
@@ -25722,13 +29388,18 @@ def compute_multilevel_validation(
     # longest-leg trip per (person_id, purpose) to approximate the primary OD.
     _pred_trips_primary = pred_trips
     if _pred_dist_col and 'person_id' in pred_trips.columns and 'purpose' in pred_trips.columns:
+        # Deduplicate on a 3-column view (person/purpose/distance) and index
+        # back into pred_trips.  Sorting the full plan here created two
+        # full-size copies — the validation stage was the peak-memory point
+        # (job 26958837 peaked at 182 GB).
         _d_vals = pd.to_numeric(pred_trips[_pred_dist_col], errors='coerce')
-        _pred_trips_primary = (
-            pred_trips.assign(_d_tmp=_d_vals)
-            .sort_values('_d_tmp', ascending=False)
-            .drop_duplicates(subset=['person_id', 'purpose'], keep='first')
-            .drop(columns=['_d_tmp'])
-        )
+        _trip_key = pred_trips[['person_id', 'purpose']].copy()
+        _trip_key['_d_tmp'] = _d_vals.values
+        _keep_idx = (_trip_key.sort_values('_d_tmp', ascending=False)
+                     .drop_duplicates(subset=['person_id', 'purpose'], keep='first')
+                     .index)
+        _pred_trips_primary = pred_trips.loc[_keep_idx]
+        del _trip_key, _d_vals
 
     # Trip length frequency distribution (TLFD) by segment
     trip_tlfd = {}
@@ -25838,7 +29509,7 @@ def compute_multilevel_validation(
         pred_od = pd.Series(dtype=int)
         if 'purpose' in pred_trips.columns and 'OTAZ' in pred_trips.columns and 'DTAZ' in pred_trips.columns:
             _m = pred_trips['purpose'].isin(purposes)
-            _sub = pred_trips.loc[_m].copy()
+            _sub = pred_trips.loc[_m]
             _sub['od_pair'] = (_sub['OTAZ'].astype(str) + '_' +
                                _sub['DTAZ'].astype(str))
             pred_od = _sub['od_pair'].value_counts()
@@ -25868,25 +29539,29 @@ def compute_multilevel_validation(
     # nearby zones.  Primary = activity with the highest skim distance from
     # the person's origin, or failing that, the first activity record.
     if _has_rowtype:
-        _all_acts = pred_plan[pred_plan['row_type'] == 'activity'].copy()
+        _all_acts = pred_plan[pred_plan['row_type'] == 'activity']
     else:
         _all_acts = pred_plan.copy()
 
     if ('person_id' in _all_acts.columns and 'purpose' in _all_acts.columns
             and 'DTAZ' in _all_acts.columns):
         if _od_dist_lookup and 'OTAZ' in _all_acts.columns:
-            _all_acts['_pri_dist'] = [
+            _pri_dist = [
                 _od_dist_lookup.get((int(o), int(d)), 0.0)
                 for o, d in zip(
                     pd.to_numeric(_all_acts['OTAZ'], errors='coerce').fillna(0).astype(int),
                     pd.to_numeric(_all_acts['DTAZ'],  errors='coerce').fillna(0).astype(int),
                 )
             ]
-            pred_acts = (
-                _all_acts.sort_values('_pri_dist', ascending=False)
-                .drop_duplicates(subset=['person_id', 'purpose'], keep='first')
-                .drop(columns=['_pri_dist'])
-            )
+            # Rank on a 3-column view instead of sorting the full activities
+            # frame (two extra full-size copies at the memory peak).
+            _act_key = _all_acts[['person_id', 'purpose']].copy()
+            _act_key['_pri_dist'] = _pri_dist
+            _keep_idx = (_act_key.sort_values('_pri_dist', ascending=False)
+                         .drop_duplicates(subset=['person_id', 'purpose'], keep='first')
+                         .index)
+            pred_acts = _all_acts.loc[_keep_idx]
+            del _act_key, _pri_dist
         else:
             # No distance lookup - keep first activity per person×purpose
             pred_acts = _all_acts.drop_duplicates(subset=['person_id', 'purpose'], keep='first')
@@ -26544,6 +30219,14 @@ def _check_behavioural_signs(models: dict) -> list:
                 val = float(coef[pname])
                 if np.isnan(val):
                     ok = None
+                elif abs(val) < 1e-6:
+                    # Held-at-zero (collinear/holdfasted) or not identified on
+                    # this sample: a ~0 coefficient has no sign to check, so it
+                    # is inconclusive, not a wrong-sign failure. This is what
+                    # produced the spurious "7 fail" once PT submodes holdfast
+                    # the collinear transit interactions (c_noveh_transit, etc.).
+                    ok = None
+                    note = note + ' (~0: held/unidentified)'
                 elif op == '<':
                     ok = val < threshold
                 else:
@@ -27744,6 +31427,7 @@ def run_stage5(
           f"(batch size={BATCH_SIZE}), {len(s4):,} activities total")
 
     zone_plans   = []
+    zone_paths   = []
     total_persons = 0
     total_trips   = 0
 
@@ -27776,13 +31460,15 @@ def run_stage5(
         if _ckpt_fp and os.path.exists(_ckpt_fp):
             try:
                 batch_plan = pd.read_pickle(_ckpt_fp)
-                zone_plans.append(batch_plan)
+                zone_paths.append(_ckpt_fp)
                 total_persons += (batch_plan['person_id'].nunique()
                                   if 'person_id' in batch_plan.columns else 0)
                 total_trips   += (batch_plan['row_type'] == 'trip').sum()
+                _n_rows = len(batch_plan)
+                del batch_plan
                 print(f"  Batch {b_idx+1:3d}/{n_batches} "
                       f"(zones {batch_zones[0]}-{batch_zones[-1]}) - "
-                      f"resumed from checkpoint ({len(batch_plan):,} rows)")
+                      f"resumed from checkpoint ({_n_rows:,} rows)")
                 continue
             except Exception as _ck_e:
                 logger.warning(f"  Batch checkpoint unreadable, recomputing: {_ck_e}")
@@ -27798,12 +31484,15 @@ def run_stage5(
             )
             # attach skims immediately, then release DataTree memory
             batch_plan = _attach_skims(batch_plan, skim_df)
-            zone_plans.append(batch_plan)
             if _ckpt_fp:
                 try:
                     batch_plan.to_pickle(_ckpt_fp)
+                    zone_paths.append(_ckpt_fp)
                 except Exception as _cw_e:
                     logger.warning(f"  Batch checkpoint write failed (non-fatal): {_cw_e}")
+                    zone_plans.append(batch_plan)
+            else:
+                zone_plans.append(batch_plan)
 
             total_persons += (batch_plan['person_id'].nunique()
                               if 'person_id' in batch_plan.columns else 0)
@@ -27825,18 +31514,40 @@ def run_stage5(
                 raise
             continue
 
-    if not zone_plans:
+    # Prediction is done with s4 / _pp_s4 — release them before the concat
+    # spike below (they otherwise ride along at full population size and add
+    # several GB to the peak).
+    try:
+        del s4, _pp_s4
+    except UnboundLocalError:
+        pass
+    import gc as _gc_pre
+    _gc_pre.collect()
+
+    if not zone_plans and not zone_paths:
         raise RuntimeError("All batches failed during prediction - check model fit.")
 
-    print(f"\n  Concatenating {len(zone_plans)} zone plans...")
-    plan = pd.concat(zone_plans, ignore_index=True)
-    # zone_plans held every batch (≈ the full population) at once, and the
-    # concat above briefly needs a SECOND same-size buffer on top of that -
-    # a ~2x transient spike right here. Drop the now-redundant list before
-    # doing anything else so that peak isn't compounded by what follows.
+    # ── Concatenation ────────────────────────────────────────────────────
+    # When checkpoints are on, stream the batches back from disk: hold only
+    # the running plan plus ONE batch, instead of every batch in memory AND
+    # a second full-size buffer for pd.concat (a ~2x transient spike).
     # (Job 23972282, first-ever 371-zone NEW_POP run: OOM-killed exactly at
     # this point, 259GB used vs a 250GB cgroup limit.)
-    del zone_plans
+    if zone_paths:
+        print(f"\n  Concatenating {len(zone_paths) + len(zone_plans)} zone plans "
+              f"(streaming from checkpoints)...")
+        plan = None
+        for _p in zone_paths:
+            _b = pd.read_pickle(_p)
+            plan = _b if plan is None else pd.concat([plan, _b], ignore_index=True)
+            del _b
+        if zone_plans:
+            plan = (pd.concat([plan] + zone_plans, ignore_index=True)
+                    if plan is not None else pd.concat(zone_plans, ignore_index=True))
+    else:
+        print(f"\n  Concatenating {len(zone_plans)} zone plans...")
+        plan = pd.concat(zone_plans, ignore_index=True)
+    del zone_plans, zone_paths
     import gc as _gc
     _gc.collect()
 
@@ -27861,6 +31572,11 @@ def run_stage5(
 
     if close_skims:
         skims.close()
+
+    # Skim tables are only needed during prediction; free them before the
+    # validation block makes its plan-sized working copies.
+    del skim_df, skim_df_est, sk_lookup
+    _gc_pre.collect()
 
     # ── summary ───────────────────────────────────────────────────────
     n_trips = (plan['row_type'] == 'trip').sum()
@@ -27927,11 +31643,16 @@ def run_stage5(
             os.path.dirname(save_path) if save_path else 'saved_data',
             'location_choice'
         )
-        _trips_plan = plan[plan['row_type'] == 'trip'] if 'row_type' in plan.columns else plan
+        # The HTML reports only need the destination-distribution columns;
+        # slicing the full plan duplicated all ~50 columns at the memory peak.
+        _html_cols = [c for c in ['person_id', 'tour_id', 'purpose', 'DTAZ']
+                      if c in plan.columns]
+        _trips_plan = (plan.loc[plan['row_type'] == 'trip', _html_cols]
+                       if 'row_type' in plan.columns else plan[_html_cols])
         _tours_plan = (_trips_plan.groupby(
             [c for c in ['person_id', 'tour_id', 'purpose'] if c in _trips_plan.columns],
             as_index=False
-        ).first() if any(c in _trips_plan.columns for c in ['tour_id']) else _trips_plan)
+        ).first() if 'tour_id' in _trips_plan.columns else _trips_plan)
         write_destination_validation_html(
             tours_df=_tours_plan,
             trips_df=_trips_plan,
@@ -28246,4 +31967,3 @@ if __name__ == '__main__':
     log.info(f"Stage 5 models saved → {_OUT}/stage5_models.pkl")
     log.info(f"  {len(scheduled_dest):,} rows (trips + activities interleaved)")
     log.info(f"Pass {_OUT}/stage5_output.csv to stage6_plan_finalisation.py")
-

@@ -23,8 +23,39 @@ import csv
 import json
 import math
 import os
+import re
 import shutil
 import sys
+
+# Shared reporting categories + always-show patterns (single source of truth in
+# ga_constraints, also used to set larch's model.ordering at build time).
+try:
+    from ga_constraints import (stage5_variable_groups as _s5_groups,
+                                 STAGE5_REPORT_ALWAYS_SHOW as _ALWAYS_SHOW)
+except Exception:
+    def _s5_groups(kind='mode'):
+        return (("Safety", r".*crash.*", r".*CRASH.*", r".*safety.*"),
+                ("Other", r".*"))
+    _ALWAYS_SHOW = (r".*crash.*", r".*CRASH.*", r".*safety.*", r".*logsum.*",
+                    r"c_size_term", r"log_correction")
+
+
+def _matches_any(name, patterns):
+    s = str(name)
+    for p in patterns:
+        try:
+            if re.fullmatch(p, s) or re.search(p, s):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _group_of(name, groups):
+    for cat in groups:
+        if _matches_any(name, cat[1:]):
+            return cat[0]
+    return "Other"
 
 STAGE_NAMES = {
     0: 'CDAP (coordinated daily activity pattern)',
@@ -102,15 +133,24 @@ def _coef_table(sdir, sid, seg):
     Stages 1-3 schema: stage,segment,param,value,std_err,t_stat,p_value,source
     (segment looks like 'work/PartTimeWorker' -- match the seg prefix).
     Stage 5 schema: segment,model_type,parameter,value,std_err,tstat,pval,...
-    Top COEF_MAX rows by |t|, non-holdfast, finite values.
+
+    Rows are grouped into reporting categories (Structural / LOS / Safety /
+    Land-use / ...) exactly as larch's ``model.ordering`` would. Force-included
+    structural + safety terms (crash / safety / logsum / size) are ALWAYS shown
+    -- even when held at a bound or below the top-|t| cap -- so the CRASH terms
+    never silently vanish; held rows are flagged. Everything else is the top
+    rows by |t|.
     """
-    COEF_MAX = 25
+    COEF_MAX = int(os.environ.get('APPENDIX_COEF_MAX', '40'))
     cands = []
     if sid in (1, 2, 3):
         cands = [os.path.join(sdir, 'stage%d_coefficients.csv' % sid),
                  os.path.join(sdir, 'ga_reports', 'stage%d_coefficients.csv' % sid)]
     elif sid == 5:
-        cands = [os.path.join(sdir, 'stage5_models_coefficients.csv')]
+        # Prefer the full fitted table; fall back to the prefit table (some
+        # runs carry only a Stage-5 prefit) so the crash terms still surface.
+        cands = [os.path.join(sdir, 'stage5_models_coefficients.csv'),
+                 os.path.join(sdir, 'stage5_models_prefit_coefficients.csv')]
     rows = []
     for c in cands:
         rows = _read_csv_rows(c)
@@ -121,15 +161,19 @@ def _coef_table(sdir, sid, seg):
     cols = set(rows[0].keys())
     if {'param', 'value'}.issubset(cols):
         segc, paramc, tc, sec, pc = 'segment', 'param', 't_stat', 'std_err', 'p_value'
-        holdc = None
+        holdc = 'holdfast' if 'holdfast' in cols else None
     elif {'parameter', 'value'}.issubset(cols):
         segc, paramc, tc, sec, pc = 'segment', 'parameter', 'tstat', 'std_err', 'pval'
         holdc = 'holdfast' if 'holdfast' in cols else None
     else:
         return []
-    keep = []
+    modelc = 'model_type' if 'model_type' in cols else None
+    groupc = 'group' if 'group' in cols else None
+    kind = 'dest'  # grouping; mode/dest decided per-row below when model_type present
     NONMAND = {'eat', 'escort', 'shopping', 'othmaint', 'othdiscr', 'social',
                '_nonmand'}
+    # Collect this segment's rows (value finite; keep held rows).
+    seg_rows = []
     for r in rows:
         s = str(r.get(segc, ''))
         if sid in (1, 2, 3):
@@ -140,43 +184,160 @@ def _coef_table(sdir, sid, seg):
         else:
             if s != seg:
                 continue
-        if holdc and str(r.get(holdc, '')).strip().lower() in ('true', '1'):
-            continue
-        try:
-            t = abs(float(r.get(tc, '')))
-        except Exception:
-            continue
-        if not math.isfinite(t):
-            continue
         try:
             v = float(r.get('value', ''))
         except Exception:
             continue
         if not math.isfinite(v):
             continue
-        keep.append((t, r))
-    if not keep:
+        try:
+            t = abs(float(r.get(tc, '')))
+        except Exception:
+            t = float('nan')
+        held = bool(holdc and str(r.get(holdc, '')).strip().lower()
+                    in ('true', '1'))
+        seg_rows.append({'r': r, 't': t, 'held': held,
+                         'name': str(r.get(paramc, ''))})
+    if not seg_rows:
         return []
-    keep.sort(key=lambda x: -x[0])
-    keep = keep[:COEF_MAX]
-    modelc = 'model_type' if 'model_type' in cols else None
+    # Select rows: always-show (crash/safety/logsum/size) + top-|t| of the rest.
+    pinned = [x for x in seg_rows if _matches_any(x['name'], _ALWAYS_SHOW)]
+    rest = [x for x in seg_rows
+            if x not in pinned and not x['held'] and math.isfinite(x['t'])]
+    rest.sort(key=lambda x: -x['t'])
+    budget = max(0, COEF_MAX - len(pinned))
+    chosen = pinned + rest[:budget]
+    # Group chosen rows by reporting category.
+    mt0 = str(chosen[0]['r'].get(modelc, '')) if (chosen and modelc) else ''
+    groups = _s5_groups('mode' if mt0 == 'mode' else 'dest') if sid == 5 \
+        else (("All", r".*"),)
+    by_group = {}
+    for x in chosen:
+        g = (str(x['r'].get(groupc, '')) if groupc and x['r'].get(groupc)
+             else _group_of(x['name'], groups))
+        by_group.setdefault(g, []).append(x)
+    # Preserve the category order from the group spec; unknowns last.
+    order = [c[0] for c in groups] + [g for g in by_group if g not in
+                                      {c[0] for c in groups}]
     lines = ['\\begin{center}{\\small\\begin{tabular}{l l r r r r}\\toprule']
     lines.append('Param & Slot & Value & SE & $t$ & $p$ \\\\ \\midrule')
-    for _, r in keep:
-        slot = _esc(r.get(modelc, r.get(segc, ''))) if modelc else _esc(str(r.get(segc, '')))
-        lines.append('%s & %s & %s & %s & %s & %s \\\\' % (
-            _esc(str(r.get(paramc, ''))), slot,
-            _fmt_num(r.get('value', '')), _fmt_num(r.get(sec, '')),
-            _fmt_num(r.get(tc, ''), 2), _fmt_num(r.get(pc, ''))))
+    n_shown = 0
+    for g in order:
+        xs = by_group.get(g)
+        if not xs:
+            continue
+        xs.sort(key=lambda x: (not _matches_any(x['name'], _ALWAYS_SHOW),
+                               -(x['t'] if math.isfinite(x['t']) else -1)))
+        lines.append('\\multicolumn{6}{l}{\\itshape %s} \\\\' % _esc(g))
+        for x in xs:
+            r = x['r']
+            nm = _esc(x['name']) + (' \\textsuperscript{(held)}' if x['held'] else '')
+            slot = _esc(str(r.get(modelc, r.get(segc, '')))) if modelc \
+                else _esc(str(r.get(segc, '')))
+            lines.append('%s & %s & %s & %s & %s & %s \\\\' % (
+                nm, slot, _fmt_num(r.get('value', '')), _fmt_num(r.get(sec, '')),
+                _fmt_num(r.get(tc, ''), 2), _fmt_num(r.get(pc, ''))))
+            n_shown += 1
     lines.append('\\bottomrule\\end{tabular}}\\end{center}')
-    lines.append('Top %d of %d estimated coefficients by $|t|$ (non-holdfast); '
-                 'full table in the run artifacts.' % (len(keep), len(rows)))
+    # Convergence line from the per-model metadata when present.
+    conv = ''
+    _r0 = chosen[0]['r']
+    _ll = _r0.get('loglike'); _ll0 = _r0.get('loglike_null')
+    _rho = _r0.get('rho2'); _nit = _r0.get('n_iter'); _cv = _r0.get('converged')
+    conv_bits = []
+    if _ll not in (None, ''):
+        conv_bits.append('LL $=%s$' % _fmt_num(_ll, 1))
+    if _rho not in (None, ''):
+        conv_bits.append(r'$\rho^2=%s$' % _fmt_num(_rho, 3))
+    if _nit not in (None, ''):
+        conv_bits.append('%s iterations' % _esc(str(_nit)))
+    if _cv not in (None, ''):
+        conv_bits.append('converged' if str(_cv).lower() in ('true', '1')
+                         else 'NOT converged')
+    if conv_bits:
+        conv = ' Final fit: ' + ', '.join(conv_bits) + '.'
+    lines.append('%d coefficients shown (force-included safety/structural terms '
+                 'always listed, held rows flagged); full table in the run '
+                 'artifacts.%s' % (n_shown, conv))
     return lines
 
 
+def _safety_benefit_figure(tags, based, figdir):
+    """Forest plot of the Stage-5 crash/safety coefficients across segments.
+
+    Replaces the "plots don't show the benefit" gap: reads the force-included
+    crash / safety terms (value +/- 1.96*SE) from each segment's Stage-5 coef
+    CSV (full table, else prefit) and draws a coefficient forest so the safety
+    effect and its sign are visible at a glance. Returns the saved path or None.
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    pat = (r".*crash.*", r".*CRASH.*", r".*safety.*")
+    items = []  # (label, value, lo, hi, model_type)
+    for seg in EXPECTED[5]:
+        rows = []
+        for t in tags:
+            for sub in (os.path.join('stage5', 'promoted', 'refit', seg),
+                        os.path.join('stage5', 'shards', seg)):
+                cand = os.path.join(based[t], sub)
+                for fn in ('stage5_models_coefficients.csv',
+                           'stage5_models_prefit_coefficients.csv'):
+                    rows = _read_csv_rows(os.path.join(cand, fn))
+                    if rows:
+                        break
+                if rows:
+                    break
+            if rows:
+                break
+        for r in rows:
+            nm = str(r.get('parameter', r.get('param', '')))
+            if not _matches_any(nm, pat):
+                continue
+            try:
+                v = float(r.get('value', ''))
+                se = float(r.get('std_err', ''))
+            except Exception:
+                continue
+            if not (math.isfinite(v) and math.isfinite(se)):
+                continue
+            mt = str(r.get('model_type', ''))
+            items.append(('%s/%s: %s' % (seg, mt or '?', nm), v,
+                          v - 1.96 * se, v + 1.96 * se, mt))
+    if not items:
+        return None
+    items = items[::-1]
+    fig, ax = plt.subplots(figsize=(8, max(3, 0.34 * len(items))))
+    ys = range(len(items))
+    colors = {'mode': '#1f77b4', 'dest': '#d62728'}
+    for y, (lab, v, lo, hi, mt) in zip(ys, items):
+        c = colors.get(mt, '#555555')
+        ax.plot([lo, hi], [y, y], '-', color=c, lw=1.6, alpha=0.8)
+        ax.plot([v], [y], 'o', color=c, ms=5)
+    ax.axvline(0.0, color='k', lw=0.8, ls='--', alpha=0.6)
+    ax.set_yticks(list(ys))
+    ax.set_yticklabels([lab for lab, *_ in items], fontsize=7)
+    ax.set_xlabel('Coefficient (95% CI); negative = safety/crash deters the choice')
+    ax.set_title('Stage 5 safety / crash coefficients by segment')
+    import matplotlib.lines as _ml
+    ax.legend(handles=[_ml.Line2D([], [], color=colors['mode'], marker='o',
+                                  ls='-', label='mode'),
+                       _ml.Line2D([], [], color=colors['dest'], marker='o',
+                                  ls='-', label='destination')],
+              fontsize=8, loc='best')
+    fig.tight_layout()
+    dst = os.path.join(figdir, 'safety_benefit_forest.png')
+    fig.savefig(dst, dpi=130, bbox_inches='tight')
+    plt.close(fig)
+    return dst
+
+
 def main():
-    tag = 'qld_shard4_retry_20260924'
-    fallbacks = ['qld_shard2', 'qld_shard1']
+    tag = 'qld_conv1'
+    fallbacks = ['qld_shard4_retry_20260924', 'qld_shard2', 'qld_shard1']
     for a in sys.argv[1:]:
         if a.startswith('--tag='):
             tag = a.split('=', 1)[1]
@@ -204,7 +365,13 @@ def main():
                '(higher is better) with the completed search-generation count. '
                'Each convergence panel is that segment\'s own BIC trajectory '
                '--- there is no pooled convergence plot. '
-               'Estimated-coefficient tables (top rows by $|t|$) are included '
+               'Estimated-coefficient tables are grouped by model component '
+               '(structural / level-of-service / safety / land-use / person '
+               'interactions); the force-included safety and structural terms '
+               '(crash, safety, logsum, size) are always listed --- even when '
+               'held at a bound or below the top-$|t|$ cap --- and held rows '
+               'are flagged, with the final-fit log-likelihood, $\\rho^2$, and '
+               'iteration count reported beneath each table. Tables appear '
                'where the run artifacts carry them (stages 1--3 and 5); '
                'stages 0 and 4 report best-feature sets only. '
                'Segments absent from the primary run are taken from the fallback '
@@ -242,6 +409,38 @@ def main():
                 break
             # usable = artifact exists AND (search finished with features)
             title = 'Stage~%d / %s' % (sid, _esc(seg))
+            if sdir is None and sid == 5:
+                # Stage-5 search pkls are frequently absent/FAILED even when the
+                # fitted coefficient tables were written (promoted refit, else
+                # the shard). Emit the coefficient table from those so the
+                # estimated model -- including the force-included CRASH terms --
+                # is reported instead of a "pending rerun" stub.
+                for t in tags:
+                    for sub in (os.path.join('stage5', 'promoted', 'refit', seg),
+                                os.path.join('stage5', 'shards', seg)):
+                        cdir = os.path.join(based[t], sub)
+                        if (os.path.isfile(os.path.join(
+                                cdir, 'stage5_models_coefficients.csv'))
+                            or os.path.isfile(os.path.join(
+                                cdir, 'stage5_models_prefit_coefficients.csv'))):
+                            sdir, used = cdir, t
+                            break
+                    if sdir is not None:
+                        break
+                if sdir is not None:
+                    _cl = _coef_table(sdir, sid, seg)
+                    if _cl:
+                        out.append('')
+                        out.append('\\paragraph{%s.}' % title)
+                        out.append('Estimated coefficients from the promoted '
+                                   'Stage-5 fit (source run %s%s); the GA search '
+                                   'trace was not retained for this segment.'
+                                   % (_esc(used),
+                                      ' (fallback)' if used != tag else ''))
+                        for _l in _cl:
+                            out.append(_l)
+                        continue
+                sdir = None
             if sdir is None:
                 out.append('')
                 out.append('\\paragraph{%s (pending rerun).}' % title)
@@ -306,12 +505,36 @@ def main():
                 out.append('\\label{fig:conv-s%d-%s}' % (sid, seg))
                 out.append('\\end{figure}')
                 n_fig += 1
+    # ── Safety-benefit forest (crash/safety coefficients across segments) ──
+    out.append('')
+    out.append('\\clearpage')
+    out.append('\\subsection{Stage~5 safety effects at a glance}')
+    out.append('\\label{app:safety-forest}')
+    bfig = _safety_benefit_figure(tags, based, figdir)
+    if bfig:
+        out.append('The force-included crash and safety terms from the Stage~5 '
+                   'mode and destination models, as coefficient estimates with '
+                   '95\\% confidence intervals. Points left of the dashed zero '
+                   'line indicate that higher crash exposure / lower safety '
+                   'reduces the utility of the mode or destination.')
+        out.append('\\begin{figure}[h!]\\centering')
+        out.append('\\includegraphics[width=0.9\\linewidth]'
+                   '{figures/appendix/safety_benefit_forest.png}')
+        out.append('\\caption{Stage~5 crash/safety coefficients (95\\% CI) by '
+                   'segment and sub-model.}')
+        out.append('\\label{fig:safety-forest}')
+        out.append('\\end{figure}')
+        n_fig += 1
+    else:
+        out.append('No Stage~5 crash/safety coefficients were found in the '
+                   'available run artifacts.')
+
     tex = os.path.join(pre, 'appendix_models.tex')
     with open(tex, 'w', encoding='utf-8') as fh:
         fh.write('\n'.join(out) + '\n')
-    n_coef = sum(1 for ln in out if ln.startswith('Top ') and 'coefficients by' in ln)
-    print('wrote %s (%d convergence figures, %d coefficient tables; tags: %s)'
-          % (tex, n_fig, n_coef, ', '.join(tags)))
+    n_coef = sum(1 for ln in out if 'coefficients shown' in ln)
+    print('wrote %s (%d figures, %d coefficient tables; primary=%s; tags: %s)'
+          % (tex, n_fig, n_coef, tag, ', '.join(tags)))
 
 
 if __name__ == '__main__':

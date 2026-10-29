@@ -130,6 +130,17 @@ _CONTINUOUS_RANDOM = {
     'n_total': 'n', 'n_tours': 'n',
 }
 
+# Stage-4 timing variables are continuous and have a direct behavioural
+# interpretation as heterogeneous timing pressure. Keep them separate from the
+# shared count/activity pool so they are not offered as random coefficients in
+# unrelated stages.
+_TIMING_RANDOM = {
+    'day_position': 'n',
+    'time_consumed': 'n',
+    'duration_min': 'n',
+    'time_remaining': 'n',
+}
+
 # Structural / weakly-identified terms that must NEVER be random (stages 1-4):
 # model structure plus the 0/1 person-type & band dummies.
 _NEVER_RANDOM_14 = [
@@ -173,7 +184,7 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         # for. Keep interaction dummies fixed — a random coefficient on a
         # 0/1 segment dummy is weakly identified at 50 draws.
         'mutually_exclusive': [list(g) for g in _ENCODING_MUTEX],
-        'force_random': dict(_CONTINUOUS_RANDOM),
+        'force_random': dict(_CONTINUOUS_RANDOM, **_TIMING_RANDOM),
         'never_random': list(_NEVER_RANDOM_14) + ['is_weekend', 'is_school_term'],
     },
     # Stage 5 — tour mode choice (Larch NL/MXL)
@@ -238,7 +249,11 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         # _estimate_mixed_logit).
         'force_random': {'c_ivt': 'n', 'c_walk': 'n',
                          'c_bike': 'n', 'c_da_aff': 'n'},
+        # PT ASCs (STAGE5_PT_MODES=1) exist only when the flag is on; listing
+        # them here is missing-name-safe on 5-mode runs and keeps the GA/bandit
+        # rand-param genes from promoting them when it is.
         'never_random': ['ASC_SR', 'ASC_Walk', 'ASC_Bike', 'ASC_Transit',
+                         'ASC_PT_Walk', 'ASC_PT_Drive', 'ASC_PT_Bike',
                          'Mu_Motor', 'Mu_Root'],
         # ── Generic-vs-alternative-specific collapse (refit substitution) ────
         # Each entry: generic_gene -> the mode-generic replacement + the ASV
@@ -278,6 +293,10 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         # _build_mode_model with one declarative list.
         'sign_constraints': {
             'c_ivt_auto': 'neg', 'c_ivt_transit': 'neg',
+            # PT access IVTs (STAGE5_PT_MODES=1; missing-name-safe otherwise).
+            # Design defaults are negative; a fitted positive IVT would be
+            # behaviourally perverse, so constrain like the other time terms.
+            'c_ivt_pt_drive': 'neg', 'c_ivt_pt_bike': 'neg',
             'c_ivt_auto_pm': 'neg', 'c_ivt_auto_md': 'neg', 'c_ivt_auto_ev': 'neg',
             'c_ivt_hov2_am': 'neg',
             'c_walk_time': 'neg', 'c_bike_time': 'neg',
@@ -299,6 +318,12 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         # ── Protected backbone (never removed by _prune_and_refit) ───────────
         'protected_backbone': [
             'ASC_SR', 'ASC_Walk', 'ASC_Bike', 'ASC_Transit',
+            # PT ASCs + access IVTs (STAGE5_PT_MODES=1; missing-name-safe on
+            # 5-mode runs). _prune_and_refit must never drop them: the PT
+            # coefficients are structurally always-included in the spec, so a
+            # prune would leave spec and parameter set inconsistent.
+            'ASC_PT_Walk', 'ASC_PT_Drive', 'ASC_PT_Bike',
+            'c_ivt_pt_drive', 'c_ivt_pt_bike',
             'Mu_Motor', 'Mu_NonMotor', 'Mu_Root',
             'c_ivt_auto', 'c_ivt_transit', 'c_walk_time', 'c_bike_time',
             # Zone-varying accessibility: breaks logsum-distance collinearity
@@ -317,6 +342,11 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             'c_bike_time':   'od.DIST',
             'c_ivt_auto':    'od.DIST',
             'c_ivt_transit': 'od.DIST',
+            # PT access IVTs (STAGE5_PT_MODES=1): same treatment as the 5-mode
+            # time terms; missing-name-safe on 5-mode runs (both the materialiser
+            # and the swap skip coeffs absent from the spec/uec).
+            'c_ivt_pt_drive': 'od.DIST',
+            'c_ivt_pt_bike':  'od.DIST',
             # Crash exposure residualized on OD distance (tour-level): crash
             # accumulates with trip length, so the raw term confounds safety
             # sensitivity with distance deterrence. The residual identifies
@@ -838,15 +868,16 @@ def random_var_policy(
     stage: Optional[str],
     selected_vars: Sequence[str],
     default_dist: str = 'n',
-    default_random: bool = True,
+    default_random: bool = False,
 ) -> Dict[str, str]:
     """
     Decide which of the selected variables get random coefficients.
 
     force_random entries always win (with their declared distribution);
     never_random entries are always excluded; the rest follow
-    ``default_random`` (True = current pipeline behaviour of randomising
-    every selected variable).
+    ``default_random``. The default is fixed unless a variable is explicitly
+    listed in ``force_random``; this keeps binary indicators and structural
+    controls out of the mixture unless a stage declares them eligible.
     """
     c = get_constraints(stage) if stage else {}
     force = dict(c.get('force_random', {}))
@@ -905,6 +936,63 @@ def stage5_extra_random_params() -> List[str]:
     """Extra Larch param names to randomise in the stage-5 mode MXL."""
     raw = os.environ.get('GA_STAGE5_RAND', '').strip()
     return [p.strip() for p in raw.split(',') if p.strip()] if raw else []
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Variable grouping for reports (larch `model.ordering` and the paper appendix)
+# ──────────────────────────────────────────────────────────────────────────
+# Single source of truth for how Stage-5 coefficients are grouped into
+# reporting categories (Level-of-service, Safety, Land-use, …), mirroring the
+# larch MTC example's ``m.ordering`` idiom
+# (https://larch.driftless.xyz/v6.0/examples/mtc/013_cbd.html). Each category is
+# (group_name, *regex_patterns); a parameter joins the first category whose
+# pattern matches. Consumed by stage5_destination_choice._apply_param_ordering
+# (sets model.ordering before reports) and by build_appendix_models.py (groups
+# the paper's coefficient tables and pins the Safety rows). Keeping it here lets
+# a constraint overlay re-group variables without touching estimation code.
+STAGE5_VARIABLE_GROUPS: Dict[str, tuple] = {
+    'mode': (
+        ("Structural: ASCs & nesting", "ASC_.*", "Mu_.*"),
+        ("Level of service", "c_ivt.*", ".*_time$", "c_wait.*", "c_peak.*",
+         "c_cost.*", "c_tt.*", "c_ovt.*", "c_fare.*"),
+        ("Safety", ".*crash.*", ".*CRASH.*", ".*safety.*"),
+        ("Person & household", "c_incp.*", "c_veh.*", "c_noveh.*",
+         "c_age.*", "c_young.*", "c_female.*", "c_ftwork.*",
+         "c_ptwork.*", "c_notwork.*", "c_hhsize.*", "c_joint.*",
+         "c_bikes.*"),
+        ("Other", ".*"),
+    ),
+    'dest': (
+        ("Structural: size & sampling", "c_size_term", "log_correction"),
+        ("Impedance & accessibility", "c_log_dist", "c_dist",
+         ".*intrazonal.*", "c_logsum", ".*_acc$"),
+        ("Safety", ".*crash.*", ".*CRASH.*", ".*safety.*"),
+        ("Spatial structure (ACDC)", "c_aggl", "c_comp"),
+        ("Land-use attractors", "c_indp_.*", "c_edu_.*",
+         "c_log_commercial.*", "c_nonmand_.*"),
+        ("Person interactions", "c_incp_.*", "c_age_.*", "c_veh_.*",
+         "c_occp_.*", "c_female_.*", "c_nprd_.*", "c_propensity.*",
+         "c_person.*"),
+        ("Other", ".*"),
+    ),
+}
+
+# Patterns whose coefficients are always shown in a report even when they fall
+# below a top-|t| truncation or are held at a bound — the force-included
+# structural/safety terms (so CRASH never silently vanishes from a table).
+STAGE5_REPORT_ALWAYS_SHOW = (
+    r".*crash.*", r".*CRASH.*", r".*safety.*",
+    r".*logsum.*", r"c_size_term", r"log_correction",
+)
+
+
+def stage5_variable_groups(kind: str = 'mode') -> tuple:
+    """Return the (group, *regex) ordering tuples for a Stage-5 model kind.
+
+    ``kind`` is 'mode' or 'dest' (anything non-'mode' maps to 'dest').
+    """
+    return STAGE5_VARIABLE_GROUPS['mode' if kind == 'mode'
+                                  else 'dest']
 
 
 def stage5_mxl_distribution_features() -> List[str]:

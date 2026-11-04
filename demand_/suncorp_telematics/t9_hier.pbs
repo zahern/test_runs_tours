@@ -1,0 +1,167 @@
+#!/bin/bash -l
+#PBS -N t9hier
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=4:mem=192GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# T9 - HIERARCHICAL GAME-DAY SURFACE.
+# Refits the t8 searched spec with game-day random coefficients estimated per
+# road-class x distance-band CELL (--grouped-game-grain cell): 12 groups, each
+# carrying a coefficient on every game-day attribute, so the fixture-specific
+# response is identified from the ~3.8k observed events instead of asking for
+# 39 fixtures x k segment-level slopes. --grouped-game-grain fixture restores
+# the previous per-fixture parameterisation for comparison. Ships
+# the COUNT surface (--two-stage off) because the propensity stage is a
+# fixed-effects GLM and cannot carry the hierarchy. Output records the
+# fixture_variation block (between-fixture variance share, pairwise surface
+# Spearman, top-10 sites per fixture, top-k Jaccard).
+#
+# It also reports refit FIDELITY. The staged ladder inside fit_metacount_nb
+# degrades quietly (nb-full -> ... -> poisson-fixed); job 27247312 landed on
+# poisson-fixed, shipped a fixed-effects surface with none of the six
+# searched fixture-grouped slopes, and still exited 0. A degraded refit now
+# raises SystemExit inside 59 and fails the post-check below (exit 3), so a
+# surface that is not the searched model cannot be handed to the MIP.
+# To ship a Poisson family on purpose, pass --refit-model poisson (that stage
+# IS the requested model, so it is not degraded); to inspect a degraded
+# fallback knowingly, export ALLOW_DEGRADED_FIT=1 for the post-check AND add
+# --allow-degraded-fit to the python call.
+set -u
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+OUT_DIR=$PROJ_DIR/results_tests/t9_hier
+FIG_DIR=$PROJ_DIR/figures_tests/t9_hier
+SRC_DIR=$PROJ_DIR/results_tests/t8_ar_fix
+
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+
+[ -s "$SRC_DIR/game_day_search_best.json" ] || {
+  echo "FATAL: missing $SRC_DIR/game_day_search_best.json (t8 must finish first)" >&2
+  exit 1
+}
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+# Pick up the just-published package (bounded-cache/leak fixes +
+# system_dynamics/functional_forms modules). Unlike the other .pbs scripts this
+# one did not upgrade before, so a rerun would silently use the old install.
+python -m pip install --upgrade --retries 2 --timeout 20 metacountregressor \
+  || python -m pip install --upgrade --no-index \
+       --find-links /home/ahernz/suncorp_wheels metacountregressor \
+  || { echo "FATAL: metacountregressor install failed (PyPI and staged wheel)"; exit 1; }
+python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,188), v; assert v==getattr(m,'__version__','?'), 'torn install: dist '+v+' != module '+str(getattr(m,'__version__','?'))" \
+  || { echo "FATAL: metacountregressor older than 1.0.188 or import failed"; exit 1; }
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export JAX_PLATFORMS=cpu
+export PYTHONIOENCODING=utf-8
+
+cd "$SCRIPT_DIR"
+rm -rf "$OUT_DIR" "$FIG_DIR"
+mkdir -p "$OUT_DIR" "$FIG_DIR"
+cp "$SRC_DIR/game_day_search_best.json" "$OUT_DIR/game_day_search_best.json"
+
+echo "=================================================================="
+echo "T9 hierarchical game-day surface started on $(hostname) at $(date)"
+echo "=================================================================="
+echo "package: $(python -c 'from importlib.metadata import version; print(version("metacountregressor"))')"
+echo
+
+python -u 59_game_day_search_predict.py \
+  --out-dir "$OUT_DIR" --fig-dir "$FIG_DIR" \
+  --search-iters 1 --search-chunk 1 \
+  --n-starts 1 --search-R 5 --refit-R 10 \
+  --search-vars slim --target trips_mean_gt_10 \
+  --group-by event \
+  --force-grouped-game on \
+  --grouped-game-grain cell \
+  --grouped-game-terms log_att,in_event,rel_sin,rel_cos,ko_tod_sin,ko_tod_cos,big_game \
+  --two-stage off \
+  --exposure offset \
+  --exposure-calibration on \
+  --temporal-mode ar1 --temporal-refit ar2 \
+  --n-future 2 \
+  --resume \
+  2>&1
+
+RC=$?
+echo
+echo "=================================================================="
+echo "T9 python exit code: $RC"
+echo
+
+python - "$OUT_DIR" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+p = os.path.join(d, "game_day_holdout_metrics.json")
+if not os.path.exists(p):
+    print("FAIL: no holdout metrics json written")
+    sys.exit(1)
+j = json.load(open(p))
+m = j.get("metrics") or {}
+a = j.get("audit") or {}
+fv = a.get("fixture_variation") or {}
+print("--- fit ---")
+print("spec:", (a.get("refit") or {}).get("spec_label"))
+print("bic:", (a.get("refit") or {}).get("bic"),
+      "exposure_coef:", (a.get("refit") or {}).get("exposure_coef"))
+print("--- skill ---")
+print({k: m.get(k) for k in (
+    "segment_spearman", "bin_spearman", "segment_top20",
+    "count_segment_spearman", "count_segment_top20",
+    "calibration_slope")})
+print("--- hierarchy ---")
+print("grouped_terms:", (a.get("refit") or {}).get("fitted", {}).get("grouped_terms"))
+print("group_id_col:", (a.get("refit") or {}).get("fitted", {}).get("group_id_col"))
+print("force_grouped_game:", a.get("force_grouped_game"))
+print("variance_between_segments_pct:", fv.get("variance_between_segments_pct"))
+print("variance_between_fixtures_pct:", fv.get("variance_between_fixtures_pct"))
+print("pairwise_surface_spearman_mean:", fv.get("pairwise_surface_spearman_mean"))
+print("site_overlap_jaccard:", fv.get("site_overlap_jaccard"))
+print("unique_argmax_sites:", fv.get("unique_argmax_sites"))
+print("game_specific_ranking:", fv.get("game_specific_ranking"))
+print("top_segments_per_fixture:")
+for k, v in (fv.get("top_segments_per_fixture") or {}).items():
+    print("  ", k, v[:8])
+print("--- refit fidelity ---")
+r = a.get("refit") or {}
+req = r.get("requested") or {}
+fit = r.get("fitted") or {}
+print("degraded:", r.get("degraded"), "| shipped:", r.get("spec_label"))
+print("grouped requested/fitted:", len(req.get("grouped") or []), "/",
+      len(fit.get("grouped_terms") or []))
+print("random  requested/fitted:", len(req.get("rdm") or []), "/",
+      len(fit.get("rdm_terms") or []))
+print("design_drops:", r.get("design_drops"))
+print("drift_retries:", r.get("drift_retries"))
+print("rejected_stages:", r.get("rejected_stages"))
+if r.get("degraded") and os.environ.get("ALLOW_DEGRADED_FIT") != "1":
+    print("FAIL: degraded refit -- the shipped model is not the searched "
+          "one, so its surface must not be handed to the MIP")
+    sys.exit(3)
+PY
+PCHECK=$?
+if [ "$RC" -ne 0 ]; then
+  echo "FAILED (python exit $RC)"
+  exit "$RC"
+fi
+if [ "$PCHECK" -ne 0 ]; then
+  echo "FAILED (post-check exit $PCHECK)"
+  exit "$PCHECK"
+fi
+echo
+echo "=================================================================="
+echo "T9 finished at $(date)"
+echo "=================================================================="

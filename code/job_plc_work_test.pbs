@@ -1,0 +1,77 @@
+#!/bin/bash -l
+# =====================================================================
+# job_plc_work_test.pbs — PLC captivity A/B on the Stage-5 work segment.
+#
+# Runs plc_work_test.py: run_stage5(segments=['work']) twice on HHTS
+# (fixed default spec, NO GA search) — once with PLC off (control),
+# once with STAGE5_ENABLE_PLC toggled on in-process — then compares
+# predicted vs observed work mode shares and reports captivity masses.
+#
+# Submit from the code dir:
+#   qsub job_plc_work_test.pbs
+# Override outputs / env:
+#   qsub -v OUTDIR=runs/plc_work_test2,CONDA_ENV=zigenv job_plc_work_test.pbs
+#
+# Expect in runs/plc_work_test/:
+#   plc_work_ab.json, stage5_models_plc_{off,on}.pkl,
+#   plc_work_test.out / .err
+# Success = arm "on" accepted (ΔBIC < -2 in the log) with DA recovering
+# toward ~76% and SR falling from the ~25% over-prediction.
+# =====================================================================
+#PBS -N plc_work_test
+#PBS -l select=1:ncpus=8:mem=128gb
+#PBS -l walltime=06:00:00
+#PBS -j oe
+#PBS -m n
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+OUTDIR=${OUTDIR:-runs/plc_work_test}
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# ── House numerical environment (mirrors job_ga_stage_single.pbs) ──────────
+# Stable CPU defaults; JAX must NOT preallocate (it grabs ~75% of host RAM).
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-false}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export TF_CPP_MIN_LOG_LEVEL=${TF_CPP_MIN_LOG_LEVEL:-3}
+export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
+
+# NOTE: STAGE5_ENABLE_PLC is toggled *inside* plc_work_test.py (off then on),
+# so no -v flag is needed for it. The PLC compute engine resolves at runtime:
+# JAX-jit value+grad first, numba-njit fallback. The log line
+#   "[work] PLC captivity accepted [jax|numba]: ..."
+# tells you which backend actually fired.
+export STAGE5_PLC_NSTARTS=${STAGE5_PLC_NSTARTS:-5}
+
+mkdir -p "$OUTDIR"
+
+echo "=========================================="
+echo "PLC work-segment A/B test"
+echo "PBS job     : ${PBS_JOBID:-unknown}"
+echo "Code dir    : $(pwd)"
+echo "Out dir     : ${OUTDIR}"
+echo "Conda env   : ${CONDA_ENV}"
+echo "PLC nstarts : ${STAGE5_PLC_NSTARTS}"
+echo "Started     : $(date)"
+echo "=========================================="
+
+python -u plc_work_test.py --outdir "$OUTDIR" \
+  > "${OUTDIR}/plc_work_test.out" 2> "${OUTDIR}/plc_work_test.err"
+EXIT_CODE=$?
+
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+echo "Results : ${OUTDIR}/plc_work_ab.json"
+exit "${EXIT_CODE}"

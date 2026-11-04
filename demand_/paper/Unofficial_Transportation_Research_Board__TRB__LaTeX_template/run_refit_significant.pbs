@@ -1,0 +1,49 @@
+#!/bin/bash -l
+#PBS -N refit_significant
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -j oe
+#PBS -r n
+# Significance-constrained refits: fixed-effect backward elimination
+# (final HB / Crash condensed specs, Extreme + Critical tiers) plus a
+# constrained random-parameter verdict. Single-run GA only; no SA restarts.
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+# ALWAYS ensure the pinned estimator: flock-serialized so concurrent paper jobs
+# don't race pip into the shared env. Hardened after jobs 25258209/25271015
+# (stale 1.0.143, short timeout, no --upgrade). A failed install must NOT pass
+# silently — re-check the version right after (script also gates >=1.0.151).
+mkdir -p /mnt/hpccs01/home/ahernz/test_runs_tours/code
+(
+    flock -w 900 9 2>/dev/null || echo "(flock unavailable, proceeding without lock)"
+    pip install --quiet --upgrade --retries 5 --timeout 60 metacountregressor 2>&1 | tail -5
+) 9>/mnt/hpccs01/home/ahernz/test_runs_tours/code/.pkg_upgrade.lock
+# Hard gate (this file has NO `set -e`, so a bare failing assert would NOT stop
+# the job — job 25277158 proved it: assert fired, run continued on stale 1.0.143).
+# Reads distribution metadata, NOT m.__version__: the 1.0.151 wheel ships a
+# stale in-code string ("1.0.143") while dist-info correctly says 1.0.151.
+python -c "from importlib.metadata import version as _v; v=tuple(map(int, _v('metacountregressor').split('.')[:3])); assert v>=(1,0,151), f\"stale mcr {_v('metacountregressor')} — aborting\"; print('mcr', _v('metacountregressor'), 'OK')" || exit 1
+python -c "from importlib.metadata import version as _v; print('mcr', _v('metacountregressor'))"
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
+export JAX_PLATFORMS=cpu
+cd "$PROJ_DIR"
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+python -u refit_significant.py --data "$PROJ_DIR/near_miss_hb_ecf.csv" --out-dir "$PROJ_DIR" 2>&1
+EXIT_CODE=$?
+# Gate: every refit table must exist and contain no insignificant marker.
+for f in "$PROJ_DIR/hb_final_spec_fixed_nm.tex" "$PROJ_DIR/hb_final_spec_fixed_crash.tex" \
+         "$PROJ_DIR/hb_category_hb_extreme_refit.tex" "$PROJ_DIR/hb_category_hb_critical_refit.tex" \
+         "$PROJ_DIR/rp_constrained_verdict.csv"; do
+  if [ ! -f "$f" ]; then echo "MISSING refit output: $f"; EXIT_CODE=1; fi
+done
+echo "Job finished at $(date) exit=$EXIT_CODE"
+exit $EXIT_CODE
+
+

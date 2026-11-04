@@ -1,0 +1,65 @@
+#!/bin/bash -l
+# =============================================================================
+# LUTI co-simulation (paper: arXiv:2608.24817) for the 371 SA2 SEQ system.
+# Chain: build_building_energy_371.py (CityBES role, 3 scenarios) ->
+#        run_luti_scenarios_371.py (UrbanSim/POLARIS roles: land use + travel) ->
+#        plot_luti_figures_371.py (Fig 2/3/4/6/7 analogues).
+# Outputs: saved_data/energy/, saved_data/luti/{scenario_travel.csv,
+#          table1_analogue.csv, landuse_371_*_2045.csv, scenario_energy.csv,
+#          figures/}
+#
+# Offline, pandas/numpy/matplotlib only (no geopandas needed).
+# Submit:  qsub job_luti_energy_371.pbs
+# =============================================================================
+#PBS -N luti_energy_371
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -l walltime=04:00:00
+
+set -euo pipefail
+CONDA_ENV=${CONDA_ENV:-geotfenv}
+cd "$PBS_O_WORKDIR"
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+
+echo "=== 1. CityBES-role building energy (BASE/TELE/MBUF) ==="
+python -u build_building_energy_371.py --scenario BASE
+python -u build_building_energy_371.py --scenario TELE
+python -u build_building_energy_371.py --scenario MBUF
+
+echo "=== 2. LUTI scenarios (land use + travel + energy rollup) ==="
+# SD hybrid feedback on (Nguyen et al. SD<->ABM layer): MSA-delayed congestion
+# speeds scale VHT and Bass EV diffusion scales operating cost along the
+# horizon. SD_HYBRID=0 restores the uncoupled trajectories.
+export SD_HYBRID=${SD_HYBRID:-1}
+python -u run_luti_scenarios_371.py --energy
+
+echo "=== 3. Paper-figure analogues ==="
+python -u plot_luti_figures_371.py
+
+echo "=== Verify ==="
+python - <<'PY'
+import pandas as pd, os, json, glob
+for p in ['saved_data/luti/scenario_travel.csv',
+          'saved_data/luti/table1_analogue.csv',
+          'saved_data/luti/scenario_energy.csv',
+          'saved_data/energy/energy_totals_TELE.json',
+          'saved_data/energy/energy_totals_MBUF.json']:
+    assert os.path.exists(p), f'MISSING: {p}'
+    print(f'{p}: OK ({os.path.getsize(p)} bytes)')
+t = pd.read_csv('saved_data/luti/scenario_travel.csv')
+b45 = t[(t.scenario == 'BASE') & (t.year == 2045)].iloc[0]
+for s in ('TELE', 'MBUF'):
+    r = t[(t.scenario == s) & (t.year == 2045)].iloc[0]
+    print(f"{s} 2045 vs BASE: VMT {(r.vmt / b45.vmt - 1) * 100:+.1f}%  "
+          f"VHT {(r.vht / b45.vht - 1) * 100:+.1f}%  trips {(r.trips / b45.trips - 1) * 100:+.1f}%")
+e = pd.read_csv('saved_data/luti/scenario_energy.csv')
+print(e.to_string(index=False))
+print('figures:', sorted(os.path.basename(p) for p in glob.glob('saved_data/luti/figures/*.png')))
+print('OK')
+PY
+echo "Done."

@@ -1,0 +1,77 @@
+#!/bin/bash -l
+# Build saved_data/logsum_acc_371.csv from fitted Stage-5 mode models
+# (build_fitted_logsum_371.py -> compute_logsum_accessibility).
+#
+# The build resolves EVERY fitted model (purpose/segment) to the full 371-zone
+# SA2 system and RAISES if the landuse, the output row count, or any *_acc
+# column is not exactly 371 zones (EXPECTED_ZONES_371). Flat surfaces warn by
+# default; set STRICT_LOGSUM_371=1 to make them fatal.
+#
+# MODELS_371 MUST be a pickle that contains fitted model objects (save_models
+# output), e.g. saved_data/stage5_models.pkl. A merge_ga_shards.py ga_results.pkl
+# holds feature names only and fails the model scan.
+#
+# Submit from the code dir:
+#   qsub -v MODELS_371=saved_data/stage5_models.pkl job_build_logsum_371.pbs
+# Optional -v: LANDUSE_371, SKIMS_371/PIPELINE_SKIMS_PATH, LOGSUM_OUT,
+#              EXPECTED_ZONES_371, STRICT_LOGSUM_371, STAGE5_PT_MODES
+
+#PBS -N build_logsum_acc
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -l walltime=02:00:00
+
+set -euo pipefail
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+MODELS_371=${MODELS_371:-}
+LANDUSE_371=${LANDUSE_371:-saved_data/zone_landuse_overture.csv}
+PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+LOGSUM_OUT=${LOGSUM_OUT:-saved_data/logsum_acc_371.csv}
+EXPECTED_ZONES_371=${EXPECTED_ZONES_371:-371}
+STAGE5_PT_MODES=${STAGE5_PT_MODES:-1}
+
+if [[ -z "${MODELS_371}" ]]; then
+    echo "FATAL: MODELS_371 (fitted stage-5 pickle) required via -v" >&2
+    exit 2
+fi
+if [[ ! -f "${MODELS_371}" ]]; then
+    echo "FATAL: MODELS_371 not found: ${MODELS_371}" >&2
+    exit 2
+fi
+
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# Force UTF-8 I/O so box-drawing/arrows in logs never mojibake.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+
+# The PT/8-mode flag is read at stage5 import time; default ON so PT_Walk=6,
+# PT_Drive=7 (drive-to-transit) and PT_Bike=8 enter the mode logsum.
+export STAGE5_PT_MODES
+export EXPECTED_ZONES_371
+
+echo "Building fitted logsum accessibility (371)"
+echo "  models : ${MODELS_371}"
+echo "  landuse: ${LANDUSE_371}"
+echo "  skims  : ${PIPELINE_SKIMS_PATH}"
+echo "  out    : ${LOGSUM_OUT}"
+
+python build_fitted_logsum_371.py \
+    --models "${MODELS_371}" \
+    --landuse "${LANDUSE_371}" \
+    --skims "${PIPELINE_SKIMS_PATH}" \
+    --out "${LOGSUM_OUT}"
+
+echo "Done. Output: ${LOGSUM_OUT}"

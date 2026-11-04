@@ -1,0 +1,159 @@
+#!/bin/bash -l
+#PBS -m n
+#PBS -r y
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=4:mem=128GB
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+
+CONDA_ENV="${CONDA_ENV:-zigenv}"
+STAGE5_ARM="${STAGE5_ARM:?STAGE5_ARM is required}"
+STAGE5_DEST_ESTIMATOR="${STAGE5_DEST_ESTIMATOR:?STAGE5_DEST_ESTIMATOR is required}"
+STAGE5_COMPARE_DIR="${STAGE5_COMPARE_DIR:-runs/stage5_compare/${STAGE5_ARM}_${PBS_JOBID:-local}}"
+STAGE5_DEST_SAMPLE_SIZE="${STAGE5_DEST_SAMPLE_SIZE:-20}"
+STAGE5_CONVERGENCE_MIN_ESS="${STAGE5_CONVERGENCE_MIN_ESS:-20}"
+STAGE5_REQUIRED_SEGMENTS="${STAGE5_REQUIRED_SEGMENTS:-work,edu,nonmand}"
+THREADS="${THREADS:-1}"
+PIPELINE_ACCELERATOR="${PIPELINE_ACCELERATOR:-cpu}"
+ESTIMATOR_SOURCE="${ESTIMATOR_SOURCE:-pypi}"
+# Default 0: compute nodes cannot reach PyPI (pypi.ngc.nvidia.com does not
+# resolve there) and both larch + SearchLibrium are already in zigenv, so a
+# forced `pip install --upgrade` only adds a fatal network dependency.
+# Pass -v INSTALL_ESTIMATORS=1 to force a refresh; failures warn, not abort.
+INSTALL_ESTIMATORS="${INSTALL_ESTIMATORS:-0}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV}"
+module unload Anaconda3
+
+if [[ "${INSTALL_ESTIMATORS}" == "1" ]]; then
+    set +e
+    if [[ "${ESTIMATOR_SOURCE}" == "editable" && -d "/mnt/hpccs01/home/ahernz/source/SearchLibrium" ]]; then
+        pip install -e /mnt/hpccs01/home/ahernz/source/SearchLibrium --upgrade -q
+    else
+        # Always constrain the PyPI upgrade so SearchLibrium's wide bounds
+        # cannot pull numpy/scipy/numba out of the zigenv window.
+        pip install --upgrade -q -c "${PBS_O_WORKDIR}/constraints.txt" SearchLibrium
+    fi
+    _pip_rc=$?
+    set -e
+    if [[ ${_pip_rc} -ne 0 ]]; then
+        echo "WARNING: estimator refresh failed (rc=${_pip_rc}); continuing with env packages" >&2
+    fi
+fi
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export PYTHONPATH="${PBS_O_WORKDIR}:${PYTHONPATH:-}"
+export PIPELINE_ACCELERATOR
+export JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
+export LARCH_FORCE_JAX="${LARCH_FORCE_JAX:-1}"
+export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+export OMP_NUM_THREADS="${THREADS}"
+export OPENBLAS_NUM_THREADS="${THREADS}"
+export MKL_NUM_THREADS="${THREADS}"
+export NUMEXPR_NUM_THREADS="${THREADS}"
+
+export NEW_POP="${NEW_POP:-1}"
+export NEW_POP_MAPPED="${NEW_POP_MAPPED:-0}"
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+if [[ -z "${PIPELINE_SKIMS_PATH:-}" && "${NEW_POP}" == "1" && "${NEW_POP_MAPPED}" != "1" ]]; then
+    export PIPELINE_SKIMS_PATH="../demand_/skims_371.omx"
+fi
+
+export STAGE5_ARM STAGE5_DEST_ESTIMATOR STAGE5_DEST_SAMPLE_SIZE
+export STAGE5_CONVERGENCE_MIN_ESS STAGE5_REQUIRED_SEGMENTS
+export STAGE5_REQUIRE_DEST_ESTIMATION="${STAGE5_REQUIRE_DEST_ESTIMATION:-1}"
+export STAGE5_STRICT_ESTIMATION="${STAGE5_STRICT_ESTIMATION:-1}"
+export STAGE5_MIN_TOURS="${STAGE5_MIN_TOURS:-30}"
+export STAGE5_CLEAR_SHARROW_CACHE="${STAGE5_CLEAR_SHARROW_CACHE:-1}"
+export STAGE5_ENABLE_MXL="${STAGE5_ENABLE_MXL:-0}"
+export STAGE5_ENABLE_GSE="${STAGE5_ENABLE_GSE:-0}"
+
+# ── SearchLibrium source ─────────────────────────────────────────────────────
+# The installed wheel (latest PyPI, pinned by requirements.txt) is always the
+# first import path.  The destination additions made locally
+# (identify_weak_features, PreconditionedRandomWalkProposal, interactions, LC)
+# are not in every release yet, so _estimate_adaptive_dest_choice() falls back
+# to $SEARCHLIBRIUM_SRC/SearchLibrium/mh_choice_estimator.py when the import
+# is missing names.  Point it at the checked-in _patches tree by default.
+if [[ -z "${SEARCHLIBRIUM_SRC:-}" && -f "${PBS_O_WORKDIR}/_patches/SearchLibrium/mh_choice_estimator.py" ]]; then
+    export SEARCHLIBRIUM_SRC="${PBS_O_WORKDIR}/_patches"
+fi
+
+mkdir -p "${STAGE5_COMPARE_DIR}/plots"
+LOG_OUT="${STAGE5_COMPARE_DIR}/job.out"
+LOG_ERR="${STAGE5_COMPARE_DIR}/job.err"
+{
+    echo "Stage 5 estimator comparison arm"
+    echo "PBS job       : ${PBS_JOBID:-local}"
+    echo "Arm           : ${STAGE5_ARM}"
+    echo "Estimator     : ${STAGE5_DEST_ESTIMATOR}"
+    echo "Output        : ${STAGE5_COMPARE_DIR}"
+    echo "Skims         : ${PIPELINE_SKIMS_PATH:-default}"
+    echo "Started       : $(date)"
+} | tee -a "${LOG_OUT}"
+
+# ── Preflight: zigenv window + SearchLibrium destination features ────────────
+python - <<'PYEOF' 2>&1 | tee -a "${LOG_OUT}" || exit 2
+import os, sys
+import numpy, scipy, numba, pandas
+def _mm(v):
+    return tuple(int(x) for x in v.split(".")[:2])
+_bad = []
+if not ((2, 1) <= _mm(numpy.__version__) < (2, 4)):
+    _bad.append(f"numpy {numpy.__version__} not in [2.1,2.4)")
+if not ((1, 15) <= _mm(scipy.__version__) < (1, 16)):
+    _bad.append(f"scipy {scipy.__version__} not in [1.15,1.16)")
+if not ((0, 60) <= _mm(numba.__version__) < (0, 63)):
+    _bad.append(f"numba {numba.__version__} not in [0.60,0.63)")
+if int(pandas.__version__.split(".")[0]) >= 3:
+    _bad.append(f"pandas {pandas.__version__} >= 3")
+if _bad:
+    print("FATAL: outside zigenv window: " + ", ".join(_bad), file=sys.stderr)
+    raise SystemExit(2)
+print(f"  numpy {numpy.__version__} / scipy {scipy.__version__} / "
+      f"numba {numba.__version__} / pandas {pandas.__version__}")
+try:
+    import SearchLibrium
+    print(f"  SearchLibrium {getattr(SearchLibrium, '__version__', '?')}")
+    import SearchLibrium.mh_choice_estimator as M
+    need = ("identify_weak_features", "PreconditionedRandomWalkProposal",
+            "estimate_dest_choice_interactions", "estimate_dest_choice_lc")
+    miss = [n for n in need if not hasattr(M, n)]
+except Exception as e:
+    miss = [f"import failed: {e!r}"]
+src = os.environ.get("SEARCHLIBRIUM_SRC", "")
+patch = os.path.join(src, "SearchLibrium", "mh_choice_estimator.py") if src else ""
+if miss:
+    print(f"  installed wheel lacks: {miss}")
+    if patch and os.path.isfile(patch):
+        print(f"  fallback patch present -> {patch}")
+    else:
+        print("FATAL: missing destination features and no SEARCHLIBRIUM_SRC "
+              "fallback. Run `pip install -U -c constraints.txt SearchLibrium` "
+              "on the login node, or set SEARCHLIBRIUM_SRC to _patches.",
+              file=sys.stderr)
+        raise SystemExit(2)
+else:
+    print("  SearchLibrium destination features: OK (installed wheel)")
+print("  preflight OK")
+PYEOF
+
+set +e
+python -u stage5_compare_runner.py \
+    --out-dir "${STAGE5_COMPARE_DIR}" \
+    --min-ess "${STAGE5_CONVERGENCE_MIN_ESS}" \
+    --required-segments "${STAGE5_REQUIRED_SEGMENTS}" \
+    > "${STAGE5_COMPARE_DIR}/runner.stdout" \
+    2> "${STAGE5_COMPARE_DIR}/runner.stderr"
+EXIT_CODE=$?
+set -e
+
+cat "${STAGE5_COMPARE_DIR}/runner.stdout" >> "${LOG_OUT}"
+cat "${STAGE5_COMPARE_DIR}/runner.stderr" >> "${LOG_ERR}"
+echo "Finished: $(date) exit_code=${EXIT_CODE}" | tee -a "${LOG_OUT}"
+exit "${EXIT_CODE}"

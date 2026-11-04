@@ -1,0 +1,77 @@
+#!/bin/bash -l
+# Build transit (GTFS) travel-time skims and embed them into the OMX.
+#
+# All data (GTFS, OSM, zone centroids) is already pre-downloaded in
+# saved_data/osm_cache/ — no internet access needed on compute nodes.
+#
+# Submit from the code dir:
+#   qsub job_transit_gtfs_skims.pbs
+
+#PBS -N transit_gtfs_371
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -l walltime=12:00:00
+
+set -euo pipefail
+
+# geotfenv: fresh conda-forge env with a working r5py/geopandas/openmatrix
+# (zigenv has a broken pip/conda-mixed geopandas install — do not use it here)
+CONDA_ENV=${CONDA_ENV:-geotfenv}
+
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# Defensive PATH: activation can lose the PATH-order fight against the
+# Anaconda3 module (bare `python` then resolves to the module interpreter
+# instead of the env's, so imports fail despite being installed). Pin the
+# env first and clear bash's cached command paths.
+export PATH="$CONDA_PREFIX/bin:$PATH"
+hash -r
+echo "[env] python=$(which python) prefix=$CONDA_PREFIX"
+
+# Force UTF-8 I/O
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+# r5py uses Java heavily
+export OMP_NUM_THREADS=2
+export OPENBLAS_NUM_THREADS=2
+export MKL_NUM_THREADS=2
+
+# Set Java heap for r5py
+export JAVA_TOOL_OPTIONS="-Xmx12G"
+
+echo "=== Verify r5py/geopandas imports ==="
+python -c "
+import r5py; print('r5py:', r5py.__version__)
+import openmatrix as omx; print('openmatrix OK')
+import geopandas; print('geopandas OK')
+"
+
+echo "=== Build transit skims ==="
+# OD_CHUNK/OD_N_JOBS no longer needed: builder uses the fast TravelTimeMatrix
+# (~18 s for the full 371x371 grid). Removing them avoids the n_jobs=None path.
+export ORIGIN_STEP=${ORIGIN_STEP:-1}
+python build_transit_gtfs_skims.py 2>&1
+
+echo "=== Verify OMX ==="
+python -c "
+import openmatrix as omx
+f = omx.open_file('../demand_/skims_371.omx', 'r')
+for name in ['WLK_LOC_WLK_TOTIVT__AM', 'WLK_LOC_WLK_WAIT__AM', 'WLK_LOC_WLK_BOARDS__AM']:
+    if name in f:
+        mat = f[name]
+        valid = int((mat.read().flatten() > 0).sum())
+        total = mat.shape[0] * mat.shape[1]
+        print(f'{name}: shape={mat.shape} valid={valid}/{total} ({100*valid/total:.1f}%)')
+    else:
+        print(f'{name}: MISSING')
+f.close()
+"
+
+echo "=== Done ==="

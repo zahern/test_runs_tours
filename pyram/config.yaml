@@ -1,0 +1,106 @@
+# PYRAM Configuration
+# Copy this file to config.yaml and edit paths for your data
+
+# ─── Data Paths ──────────────────────────────────────────────────────────────
+data:
+  hhts_trips: "data/hhts_trips.csv"
+  hhts_persons: "data/hhts_persons.csv"
+  hhts_households: "data/hhts_households.csv"
+  skims_omx: "data/skims.omx"
+  landuse_csv: "data/landuse.csv"
+  zone_crosswalk: "data/zone_crosswalk.csv"
+  location_table: "data/location_table.csv"
+  output_dir: "output"
+
+# ─── Zone System ─────────────────────────────────────────────────────────────
+zones:
+  zone_id_col: "ORDER"        # SA2 code column in landuse
+  n_zones: 371                # Number of zones
+  crs: "EPSG:28356"           # GDA94/MGA Zone 56
+
+# ─── Synthetic Population ────────────────────────────────────────────────────
+population:
+  use_overture: true          # Use Overture Maps for control totals
+  overture_year: 2020
+  overture_themes: ["buildings", "places"]
+  target_region: "QLD"        # Australian state for Overture filtering
+  sample_fraction: 1.0        # Fraction of HHTS to expand (1.0 = full expansion)
+  seed: 42
+
+# ─── Stage 1: CDAP (Household Coordination) ──────────────────────────────────
+cdap:
+  enable: true
+  estimate_from_hhts: true    # Estimate CDAP coefficients from HHTS
+  joint_tours: true           # Generate joint tours
+  coordination_type: "full"   # "full" or "individual_only"
+
+# ─── Stage 2: Timing / Duration ──────────────────────────────────────────────
+timing:
+  model_type: "rrm"           # "rrm", "tdd", "rum"
+  mandatory_periods: true     # Period-varying LOS for mandatory tours
+  period_skims: false         # Use period-specific skims
+
+# ─── Stage 3: Destination Choice ─────────────────────────────────────────────
+destination:
+  model_type: "mnl"           # "mnl", "nl_distance", "nl_sa3"
+  distance_bands: [0, 2, 5, 10, 100]  # Distance band edges (km) for NL
+  sample_size: 0              # 0 = all zones; >0 = Manski-Lerman sampling
+  logsum_smoothing: true      # GP smoothing of mode logsum
+  logsum_orthogonalize: true  # Orthogonalize logsum vs distance
+  crash_imputation: true      # 0→max, intrazonal→min for crash matrix
+  quantity_term: false        # Larch estimated size term (Exampville)
+  sign_constraints: true      # Enforce theoretical sign expectations
+  cbd_zones: [1, 2, 3, 4, 5]  # Inner CBD zones for parking/cost effects
+
+# ─── Stage 4: Mode Choice ────────────────────────────────────────────────────
+mode:
+  model_type: "nl"            # "nl", "mxl", "mxl_gse"
+  nest_structure:
+    motorized: ["DA", "SR", "Transit"]
+    non_motorized: ["Walk", "Bike"]
+  transit_submodes: true      # Separate Bus/Train utilities
+  access_modes: true          # Walk/Drive access to transit
+  mixed_logit: false          # Enable Mixed Logit (MXL)
+  panel_mxl: true             # Panel MXL (same draws across choices)
+
+# ─── Stage 5: Trip Chain ─────────────────────────────────────────────────────
+trip_chain:
+  max_acts_per_person: 6
+  tour_mode_consistency: true # Consistent mode within tour
+  micro_locations: false      # Sub-zonal location placement
+
+# ─── Stage 6: Parking Choice ─────────────────────────────────────────────────
+parking:
+  enable: true
+  model_type: "mnl"           # "mnl" or "heuristic"
+  onstreet_search_time: 5.0   # Minutes
+  walk_speed_kmh: 5.0
+  cbd_zones: [1, 2, 3, 4, 5]
+
+# ─── Stage 7: DTA Feedback Loop ──────────────────────────────────────────────
+dta:
+  enable: false
+  engine: "matsim"            # "matsim", "sumo", "dynust"
+  iterations: 3
+  convergence_threshold: 0.02 # Relative RMSE threshold
+  walltime_hours: 48
+  matsim_jar: "/opt/matsim/matsim.jar"
+  sumo_bin: "sumo"
+  dynust_exe: "dynust"
+
+# ─── HPC / PBS Resources ─────────────────────────────────────────────────────
+hpc:
+  conda_env: "zigenv"
+  stage_ncpus: 8
+  stage_mem: "320GB"
+  stage_walltime: "24:00:00"
+  pred_ncpus: 8
+  pred_mem: "250GB"
+  pred_walltime: "24:00:00"
+  gpu: false
+  partition: "normal"
+
+# ─── Runtime ─────────────────────────────────────────────────────────────────
+run_tag: ""
+seed: 42
+verbose: true

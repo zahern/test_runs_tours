@@ -1,0 +1,140 @@
+#!/bin/bash -l
+#PBS -N stage3_model_suite
+#PBS -m abe
+#PBS -r y
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=4:mem=194GB
+
+# Estimate every requested Stage 3 duration variant, predict the synthetic
+# Stage 2 population, and optionally continue through Stage 4 scheduling.
+#
+# Basic submission:
+#   qsub job_stage3_model_suite.pbs
+#
+# Full suite plus timing placement:
+#   qsub -v RUN_STAGE4=1 job_stage3_model_suite.pbs
+#
+# Full Stage 1 -> 6 run for every duration variant:
+#   qsub -l select=1:ncpus=4:mem=194GB -l walltime=48:00:00 \
+#        -v FRESH=1,RUN_STAGE5_6=1,SKIMS_PATH=downcasted_matrices_base.omx \
+#        job_stage3_model_suite.pbs
+#
+# Selected variants:
+#   qsub -v STAGE3_MODEL_SUITE=lognormal,copula_hazard job_stage3_model_suite.pbs
+#
+# Useful overrides:
+#   STAGE3_INPUT=saved_data/stage2_output.csv
+#   STAGE3_SUITE_OUT=runs/stage3_suite/<tag>
+#   CONDA_ENV=zigenv
+#   STAGE3_MIN_SAMPLE=50
+#   STAGE3_SEED=42
+#   RUN_STAGE4=0|1
+#   RUN_STAGE5_6=0|1
+#   SKIMS_PATH=downcasted_matrices_base.omx
+#   FRESH=0|1,ZONE=40
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+
+CONDA_ENV="${CONDA_ENV:-zigenv}"
+STAGE3_MODEL_SUITE="${STAGE3_MODEL_SUITE:-all}"
+STAGE3_INPUT="${STAGE3_INPUT:-saved_data/stage2_output.csv}"
+STAGE3_SUITE_OUT="${STAGE3_SUITE_OUT:-runs/stage3_model_suite/${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}"
+RUN_STAGE4="${RUN_STAGE4:-0}"
+RUN_STAGE5_6="${RUN_STAGE5_6:-0}"
+SKIMS_PATH="${SKIMS_PATH:-downcasted_matrices_base.omx}"
+STAGE3_MIN_SAMPLE="${STAGE3_MIN_SAMPLE:-50}"
+STAGE4_MIN_SAMPLE="${STAGE4_MIN_SAMPLE:-30}"
+STAGE3_SEED="${STAGE3_SEED:-42}"
+FRESH="${FRESH:-0}"
+ZONE="${ZONE:-}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV}"
+module unload Anaconda3
+
+# Keep imports and scientific kernels stable on CPU PBS nodes. SearchLibrium
+# is still used by the planning-order and timing RRM paths.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORM_NAME="${JAX_PLATFORM_NAME:-cpu}"
+export JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
+export PIPELINE_ACCELERATOR="${PIPELINE_ACCELERATOR:-cpu}"
+export GA_METACOUNT_FORCE_CPU="${GA_METACOUNT_FORCE_CPU:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
+export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-3}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+export STAGE4_TIMING_MODEL="${STAGE4_TIMING_MODEL:-rrm}"
+# Search engine for every GA stage in this end-to-end job: default to
+# SparseEA-AGDS (override with -v GA_ENGINE=ga|sa|bandit|portfolio).
+export GA_ENGINE="${GA_ENGINE:-agds}"
+
+# Optional local source trees. On the cluster these are normally empty and the
+# conda/PyPI installations are used; set them only when the paths exist there.
+export SEARCHLIBRIUM_SOURCE="${SEARCHLIBRIUM_SOURCE:-}"
+
+mkdir -p "${STAGE3_SUITE_OUT}"
+LOG_OUT="${STAGE3_SUITE_OUT}/job.out"
+LOG_ERR="${STAGE3_SUITE_OUT}/job.err"
+
+{
+    echo "=========================================================="
+    echo "Stage 3 duration model suite"
+    echo "PBS job       : ${PBS_JOBID:-local}"
+    echo "Node          : $(hostname)"
+    echo "Workdir       : ${PBS_O_WORKDIR}"
+    echo "Models        : ${STAGE3_MODEL_SUITE}"
+    echo "Stage 2 input : ${STAGE3_INPUT}"
+    echo "Output        : ${STAGE3_SUITE_OUT}"
+    echo "Run Stage 4   : ${RUN_STAGE4}"
+    echo "Run Stage 5/6 : ${RUN_STAGE5_6}"
+    echo "Skims         : ${SKIMS_PATH}"
+    echo "Started       : $(date)"
+    echo "=========================================================="
+} | tee -a "${LOG_OUT}"
+
+ARGS=(
+    -u -X utf8 run_stage3_model_suite.py
+    --models "${STAGE3_MODEL_SUITE}"
+    --input "${STAGE3_INPUT}"
+    --out-dir "${STAGE3_SUITE_OUT}"
+    --min-sample "${STAGE3_MIN_SAMPLE}"
+    --timing-min-sample "${STAGE4_MIN_SAMPLE}"
+    --seed "${STAGE3_SEED}"
+    --skims "${SKIMS_PATH}"
+)
+if [[ "${FRESH}" == "1" ]]; then
+    ARGS+=(--fresh)
+    if [[ -n "${ZONE}" ]]; then
+        ARGS+=(--zone "${ZONE}")
+    fi
+fi
+if [[ "${RUN_STAGE4}" == "1" ]]; then
+    ARGS+=(--run-stage4)
+fi
+if [[ "${RUN_STAGE5_6}" == "1" ]]; then
+    ARGS+=(--run-stage5-6)
+fi
+
+python "${ARGS[@]}" >> "${LOG_OUT}" 2>> "${LOG_ERR}"
+
+# ── MATSim export per variant (PIPELINE_MATSIM=1, default on) ────────────────
+# When Stage 5/6 ran, each variant directory holds a stage6_output.csv. Convert
+# each into a MATSim scenario under <variant>/matsim. Non-blocking.
+if [[ "${RUN_STAGE5_6}" == "1" && "${PIPELINE_MATSIM:-1}" != "0" ]]; then
+    while IFS= read -r _s6; do
+        _vdir="$(dirname "${_s6}")"
+        echo "MATSim export: ${_vdir}" | tee -a "${LOG_OUT}"
+        python -u -X utf8 matsim_export.py --run-dir "${_vdir}" \
+            --crs "${MATSIM_CRS:-EPSG:28356}" >> "${LOG_OUT}" 2>> "${LOG_ERR}" \
+            || echo "  MATSim export failed for ${_vdir} (non-fatal)" | tee -a "${LOG_OUT}"
+    done < <(find "${STAGE3_SUITE_OUT}" -maxdepth 3 -name stage6_output.csv 2>/dev/null)
+fi
+
+printf 'Finished: %s\n' "$(date)" | tee -a "${LOG_OUT}"
+printf 'Manifest: %s/manifest.json\n' "${STAGE3_SUITE_OUT}" | tee -a "${LOG_OUT}"

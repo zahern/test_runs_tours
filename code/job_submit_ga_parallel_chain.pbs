@@ -23,20 +23,127 @@ RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
 RUN_TAG=${RUN_TAG:-ga_parallel_${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}
 CONDA_ENV=${CONDA_ENV:-zigenv}
 
+# On each submit, prune AUTO-named job-run dirs older than RUN_RETENTION_DAYS
+# days from RUN_ROOT (see the prune block below). Only auto-name patterns are
+# touched; hand-named experiment dirs (mv*, s5diag, …) are never removed.
+# RUN_PRUNE=0 disables; RUN_RETENTION_DAYS changes the age cutoff.
+RUN_PRUNE=${RUN_PRUNE:-0}
+RUN_RETENTION_DAYS=${RUN_RETENTION_DAYS:-2}
+
 # Estimation settings propagated to stage jobs.
-GA_BUDGET=${GA_BUDGET:-fast}
-GA_ESTIMATOR=${GA_ESTIMATOR:-sa_bandit}
-GA_USE_SA=${GA_USE_SA:-1}
-GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-1}
+# Defaults are the aligned 371 + search-quality config (a bare
+#   qsub -v "RUN_TAG=xxx" job_submit_ga_parallel_chain.pbs
+# now runs the intended metacount_mv / GA-engine 371 pipeline). Override any of
+# these via -v as needed.
+GA_BUDGET=${GA_BUDGET:-standard}
+GA_ESTIMATOR=${GA_ESTIMATOR:-metacount_mv}
+# Stage-1 multivariate activity-count copula (only used when GA_ESTIMATOR=metacount_mv).
+# Family: gaussian | vine-frank | vine-joe | vine-gumbel | vine-clayton.
+# joe/gumbel capture upper-tail activity co-occurrence; gaussian is symmetric.
+GA_MV_COPULA=${GA_MV_COPULA:-gaussian}
+GA_MV_MARGINAL=${GA_MV_MARGINAL:-nb}
+GA_MV_PREDICT=${GA_MV_PREDICT:-1}
+# Search engine: default to SparseEA-AGDS (adaptive genetic operator + dynamic
+# scoring, Wang et al. 2025) for every stage in the chain. GA_ENGINE overrides
+# the legacy GA_USE_SA/GA_USE_BANDIT_SA flags below and is threaded to every
+# fan-out job. Set GA_ENGINE=portfolio to restore landscape-based routing
+# (Bandit-SA for noisy stages, GA for fast-proxy stages), or ga|sa|bandit to
+# force one engine everywhere.
+GA_ENGINE=${GA_ENGINE:-agds}
+GA_USE_SA=${GA_USE_SA:-0}                  # legacy fallback (GA_ENGINE wins)
+GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA:-0}    # legacy fallback (GA_ENGINE wins)
 GA_N_RESTARTS=${GA_N_RESTARTS:-0}
 GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-4}
+# Stage-5 spawn-mode workers each re-load the FULL data payload, so 3-4 of them
+# (plus the parent) can blow past the job's cgroup. Two mitigations are wired in:
+#   * STAGE_PLACE below defaults to free (node-exclusive placement removed per
+#     HPC admin directive). NOTE a free placement can split 256GB into e.g.
+#     163GB+99GB and a worker on the 99GB slice gets cgroup/OOM-killed (what
+#     killed agds_full_003), so keep GA_MEM_PER_WORKER_GB / stage-5 workers low.
+#   * STAGE5_PARALLEL_SEGMENTS lets you trim just stage 5's worker count for
+#     headroom (default 1). GA_MEM_PER_WORKER_GB
+#     still caps the worker count from the other direction if set.
+STAGE5_PARALLEL_SEGMENTS=${STAGE5_PARALLEL_SEGMENTS:-1}
+STAGE_PLACE=${STAGE_PLACE:-free}
 # GA_PROFILE=1 runs every stage job (and the predict job) under cProfile,
 # writing profile_estimation_stage<N>_<tag>.pstats. Default off = no change.
 GA_PROFILE=${GA_PROFILE:-0}
 # GA_COMPLEXITY_PENALTY scales the BIC complexity penalty in the Stage 2/3 fast
 # GA oracle. 1.0 = standard BIC (sparse); lower (e.g. 0.3-0.5) keeps more
 # predictors — use it to "open up" flat Stage 2/3 searches.
-GA_COMPLEXITY_PENALTY=${GA_COMPLEXITY_PENALTY:-1.0}
+GA_COMPLEXITY_PENALTY=${GA_COMPLEXITY_PENALTY:-0.4}
+# GA_REHEAT_FRACTION: fraction of the population replaced by fresh random
+# individuals on each plateau generation (partial reheat) so the search keeps
+# perturbing/improving instead of flatlining. 0 disables; 0.3 is the default.
+GA_REHEAT_FRACTION=${GA_REHEAT_FRACTION:-0.3}
+# More generations for the cheap stages 1-3 (multiplier on the budget's gens),
+# and a hard mutation floor so the population never freezes/collapses.
+GA_STAGE123_GENS_MULT=${GA_STAGE123_GENS_MULT:-2.0}
+GA_MUTATION_MIN=${GA_MUTATION_MIN:-0.05}
+# Stage-specific exploration controls. Blank generation/restart overrides keep
+# the estimator-aware Python defaults; S4 gets a longer stop floor by default.
+GA_STAGE4_GENS=${GA_STAGE4_GENS:-}
+GA_STAGE4_RESTARTS=${GA_STAGE4_RESTARTS:-}
+GA_STAGE4_EARLY_STOP=${GA_STAGE4_EARLY_STOP:-1}
+GA_STAGE4_EARLY_STOP_PATIENCE=${GA_STAGE4_EARLY_STOP_PATIENCE:-120}
+GA_STAGE4_EARLY_STOP_MIN_GENS=${GA_STAGE4_EARLY_STOP_MIN_GENS:-120}
+GA_SA2_GENS=${GA_SA2_GENS:-}
+GA_SA2_RESTARTS=${GA_SA2_RESTARTS:-}
+GA_STAGE4_MXL_SEARCH=${GA_STAGE4_MXL_SEARCH:-0}
+STAGE2_MH=${STAGE2_MH:-0}
+STAGE2_MH_BURN=${STAGE2_MH_BURN:-1000}
+STAGE2_MH_DRAWS=${STAGE2_MH_DRAWS:-2000}
+STAGE2_MH_THIN=${STAGE2_MH_THIN:-2}
+STAGE2_MH_SEED=${STAGE2_MH_SEED:-42}
+STAGE2_MH_PROPOSAL_SCALE=${STAGE2_MH_PROPOSAL_SCALE:-1.0}
+# GA_MEM_PER_WORKER_GB caps parallel segment workers to what the job's memory
+# can hold (mem_limit // this). Prevents the Stage-1 OOM (BrokenProcessPool).
+# Empty = no cap (rely on STAGE_MEM being large enough).
+GA_MEM_PER_WORKER_GB=${GA_MEM_PER_WORKER_GB:-}
+# JAX memory trims so stage 5 fits a ~125GB node: disable JAX's ~75%-of-RAM
+# upfront preallocation, and keep the in-code cache guard
+# (ga_external_estimators._maybe_clear_jax_caches) on a tight leash (limit in
+# GB, check every N fits). Forwarded to stage jobs via -v below.
+XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-false}
+GA_JAX_CACHE_MEM_LIMIT_GB=${GA_JAX_CACHE_MEM_LIMIT_GB:-40}
+GA_JAX_CACHE_CHECK_EVERY=${GA_JAX_CACHE_CHECK_EVERY:-25}
+# UTF-8 console for all child jobs (~350 unicode print sites; a C-locale or
+# cp1252 stdout turns one fancy print into UnicodeEncodeError, sometimes
+# inside an except handler masking the real error). Python-level
+# _ensure_utf8_console() is the primary guard; these exports are backup.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+# Dest-estimation sampling + mode-degeneracy tuning. These are forwarded to
+# the stage and predict jobs explicitly (they are NOT always inherited by
+# nested qsubs). DEST_EST_SAMPLE_SIZE is the legacy name; STAGE5_DEST_SAMPLE_SIZE
+# is what stage5_destination_choice.py actually reads (preferred).
+# Default 20 (matches stage5_destination_choice.py's own default): the dest
+# design matrices scale with this, so 20 vs 30 cuts ~1/3 of dest-side memory.
+#
+# FALLBACK if stage 5 still OOMs on a ~125GB node (watch the stage-5 .o
+# "Mem usage" line; if it climbs past ~110GB, use this):
+#   qsub -v "...,STAGE5_DEST_SAMPLE_SIZE=12,..." job_submit_ga_parallel_chain.pbs
+# This cuts another ~40% off the dest-side matrices (12 vs 20 sampled zones).
+# Trade-off: noisier per-eval fitness (fewer sampled alternatives per case),
+# though the Manski-Lerman correction still applies so fitness stays valid.
+# Prefer this over raising STAGE_MEM when the node itself caps at ~125GB.
+DEST_EST_SAMPLE_SIZE=${DEST_EST_SAMPLE_SIZE:-20}
+STAGE5_DEST_SAMPLE_SIZE=${STAGE5_DEST_SAMPLE_SIZE:-${DEST_EST_SAMPLE_SIZE}}
+GA_MODE_DEGEN_PENALTY=${GA_MODE_DEGEN_PENALTY:-20}
+# Estimators: a ONE-TIME prep barrier enforces the version floors
+# (METACOUNT_MIN, SEARCHLIBRIUM_MIN — kept equal to the latest verified PyPI
+# releases in requirements.txt) BEFORE the fan-out, then smoke-tests the
+# public imports so a broken/incompatible wheel FAILS the barrier (afterok)
+# instead of silently poisoning every stage. Satisfied compute nodes stay
+# offline (no egress there anyway); only below-floor envs attempt a PyPI
+# fetch, and a failed fetch is FATAL. pbs_pipeline_mode.pbs jobs additionally
+# force-upgrade both estimators from PyPI on start (flock-serialized).
+# Set ESTIMATOR_PREP=0 to skip the barrier (e.g. offline / air-gapped), or
+# ESTIMATOR_SOURCE=editable to use local dev trees instead of PyPI.
+ESTIMATOR_PREP=${ESTIMATOR_PREP:-1}
+METACOUNT_MIN=${METACOUNT_MIN:-1.0.153}
+SEARCHLIBRIUM_MIN=${SEARCHLIBRIUM_MIN:-0.0.239}
+ESTIMATORS_SKIP_UPGRADE=${ESTIMATORS_SKIP_UPGRADE:-1}
 STAGE23_JOINT=${STAGE23_JOINT:-0}
 GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT:-1.50}
 GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH:-0.05}
@@ -48,45 +155,250 @@ GA_RESOLVE_CONFLICTS=${GA_RESOLVE_CONFLICTS:-1}
 # Stage-5 mixed logit (random coefficients). OFF by default — needs a stable
 # converged MNL base first; enable with STAGE5_ENABLE_MXL=1 for an MXL run.
 STAGE5_ENABLE_MXL=${STAGE5_ENABLE_MXL:-0}
+# GSE (Gradient Score Enhanced) mixed logit: systematic γ·g_origin loadings on
+# the random taste params. Implies MXL. Enable with STAGE5_ENABLE_GSE=1.
+STAGE5_ENABLE_GSE=${STAGE5_ENABLE_GSE:-1}
+# GA_SEARCH_GSE: let the SEARCH (not the global switch above) decide GSE per
+# segment — after mode search converges, the winner is refit ±GSE and BIC/n
+# picks (≤2 extra fits/segment; recorded in metadata + feeds dest logsums).
+# Default 1 (guarded: any failure keeps the searched spec).
+GA_SEARCH_GSE=${GA_SEARCH_GSE:-1}
+# Destination-model identification treatments (make dead terms identifiable so
+# the search gets a real gradient instead of a flat landscape):
+#  • crash 0->max densification + intrazonal->min (removes sparse-zero crash);
+#  • GP-over-space smoothing of the mode logsum (was near-constant across zones,
+#    which left c_logsum unidentified -> dropped to 0).
+STAGE5_CRASH_ZERO_TO_MAX=${STAGE5_CRASH_ZERO_TO_MAX:-1}
+STAGE5_LOGSUM_SMOOTH=${STAGE5_LOGSUM_SMOOTH:-1}
+#  • Orthogonalize the mode logsum against distance WITHIN each case: this network
+#    floors ASC_Transit, so the logsum is ~pure f(DIST) and collinear with the
+#    dest c_dist/c_log_dist terms -> c_logsum absorbed to 0. Residualizing lets
+#    c_logsum identify on accessibility INDEPENDENT of raw distance. Off with =0.
+STAGE5_LOGSUM_ORTHOG=${STAGE5_LOGSUM_ORTHOG:-1}
+#  • Larch estimated size/quantity term (Exampville-style): the per-attractor
+#    size weights are estimated jointly instead of using the fixed size_term.
+#    OFF by default — verify on HPC first (needs Larch quantity_ca). =1 to enable.
+#  • Larch-style modeled-vs-observed choice-distribution histograms (dest_hist_*).
+STAGE5_DEST_QUANTITY=${STAGE5_DEST_QUANTITY:-0}
+STAGE5_DEST_HIST=${STAGE5_DEST_HIST:-1}
+#  • PT access split (tour mode model). STAGE5_PT_MODES=1 adds PT_Walk=6 /
+#    PT_Drive=7 / PT_Bike=8 alongside the generic Transit=5 bucket (DA/SR/Walk/
+#    Bike stay 1-4). STAGE5B_TRANSIT_ACCESS=1 makes data_connect derive the
+#    trip-level transit_access label from HHTS MODE1 and carry it to tours
+#    (tour_transit_access); with STAGE5_PT_MODES=1 but no such column Stage 5
+#    hard-errors (stage5_destination_choice.py:2224), so the two must be enabled
+#    together. Both OFF by default — turning them on changes the mode-model
+#    alternative set, so the Stage-5 GA pool, fitted coefficients and every
+#    merge/predict artifact shift. Bus/Train remains a post-hoc conditional
+#    submode model (_fit_transit_submode) and needs neither flag.
+STAGE5_PT_MODES=${STAGE5_PT_MODES:-0}
+STAGE5B_TRANSIT_ACCESS=${STAGE5B_TRANSIT_ACCESS:-0}
+# GA feature-search for the pre-day numpy models (mobility_models, wfh_telecommute)
+# — searches their covariate subset by BIC like the stages. Off with =0.
+GA_SEARCH_PREDAY=${GA_SEARCH_PREDAY:-1}
+# Constrain each tour's trip legs to one consistent tour mode (ActivitySim-style
+# vehicle continuity). 'relaxed'/1 (default) keeps genuine walk access/egress legs
+# inside Transit/SR/Walk tours; 'strict' forces every leg to the tour mode; 0=off.
+STAGE6_TOUR_MODE_CONSISTENCY=${STAGE6_TOUR_MODE_CONSISTENCY:-1}
+# ActivitySim mandatory-tour-scheduling keystone: feed period-varying home→usual-
+# location auto commute LOS (AM/MD/PM/EV + PM/MD peak ratio) into the work/school
+# departure-time model as GA-searchable covariates, so scheduling responds to peak
+# congestion. OFF by default — verify on HPC (needs the period skims + usual
+# locations in the Stage-4 frame); safe no-op (columns stay 0) when disabled. =1 on.
+STAGE4_MANDATORY_LOS=${STAGE4_MANDATORY_LOS:-0}
+# Stage-4 timing estimator: 'rrm' (default, departure-period RRM), 'hybrid'/'rum'/
+# 'auto', OR 'tdd' = the FULL joint (start,end,duration) time-of-day-departure
+# choice (ActivitySim mandatory_tour_scheduling): 21 (start,end) period-pair
+# alternatives, duration becomes a scheduling OUTPUT. GA still selects the person
+# interactions (feature_override). Falls back to RRM per purpose if a TDD fit fails.
+STAGE4_TIMING_MODEL=${STAGE4_TIMING_MODEL:-rrm}
+# POLARIS-style sub-zonal micro-location placement in the final plan: keep the
+# SA2 destination models but place every activity at a specific micro-location
+# inside its SA2 by land use (home/work/school anchored per person; discretionary
+# ∝ lu_area). Adds location_id/loc_x/loc_y to stage6_output.csv for microsim.
+# OFF by default; needs saved_data/location_table.csv (qsub job_location_table.pbs).
+MICRO_LOCATIONS=${MICRO_LOCATIONS:-0}
+# A/B the comprehensive Overture-derived land use (build_zone_landuse_overture.py
+# → saved_data/zone_landuse_overture.csv, a strict superset of the baseline —
+# verified by health S10: 0 baseline cols missing, identical 371 keys).
+# ON by default (=1): loads it as the active land use (extra n_*/area_*
+# feature cols available to size-terms/GA/accessibility). Override to 0 at
+# submit time (qsub -v USE_OVERTURE_LANDUSE=0 ...) for the baseline arm.
+# Keep OVERTURE_REFRESH_SIZE=0 (default): =1 would OVERWRITE 9 baseline
+# size-term inputs with *_ovm counts (aggressive arm — validate the
+# conservative arm first). S10 guards both defaults.
+USE_OVERTURE_LANDUSE=${USE_OVERTURE_LANDUSE:-1}
+OVERTURE_REFRESH_SIZE=${OVERTURE_REFRESH_SIZE:-0}
+# E1 grid-feedback pilot: power-accessibility (grid → choice utilities).
+# OFF by default (=0): estimates are byte-identical to current runs. =1 wires
+# the 4 power_reliability/headroom/cost/ev_hosting measures into the stage-5
+# mode/dest utilities + GA pools (see stage5_destination_choice STAGE5_POWER_ACC).
+STAGE5_POWER_ACC=${STAGE5_POWER_ACC:-0}
+# ActivitySim-style household CDAP coordination (joint 2-way logit).
+# ON by default (=1): coordinates M/N/H at household level AND estimates+saves the
+# household/joint-tour coefficients from HHTS — DAP utilities, 2/3/4/5-way
+# INTERACTION_COEFFICIENTS, and joint-tour frequency/participation/purpose — to
+# {OUT_DIR}/household_cdap_coefficients.{csv,html,pkl} (the ActivitySim-style joint
+# coefficient report). Falls back to heuristic priors on any failure. =0 disables
+# (individual-only CDAP, no joint coefficients). CDAP_HH_ESTIMATE=0 keeps the
+# coordination but skips re-estimation (uses the baked-in priors).
+CDAP_HOUSEHOLD_COORD=${CDAP_HOUSEHOLD_COORD:-1}
+CDAP_HH_ESTIMATE=${CDAP_HH_ESTIMATE:-1}
+# JOINT_TOURS=1 runs the FULL structural joint-tour path (joint_tour_frequency
+# + participation + purpose), so the "number of joint travel" is predicted per
+# household and folded into the Stage-1 purpose counts (n_joint_<purpose>_out)
+# in predict_stage1 and tagged onto Stage-3 activity rows — i.e. the PREDICTIONS
+# are made from the joint outcomes, not just the coordinated CDAP. ON by default
+# now (pairs with CDAP_HOUSEHOLD_COORD=1); the Stage-1 reconcile is fully guarded
+# (non-fatal, skips cleanly if no joint tours were generated). =0 disables.
+# Only affects the PREDICT job (generation happens in cdap()); forwarded to stage
+# jobs too so mode=ga_staged reuse sees the same setting.
+JOINT_TOURS=${JOINT_TOURS:-1}
+# Shared per-person latent ("travel style") threaded through stages 1-5 so the
+# same individual is consistently mobile/immobile across stages. Off by default.
+PIPELINE_PERSON_LATENT=${PIPELINE_PERSON_LATENT:-0}
+# lr4 WFH/telecommute pre-day module: estimate P(WFH) on HHTS workers and assign
+# wfh/WFHWEEK onto the synth population before CDAP. Off by default.
+PIPELINE_WFH=${PIPELINE_WFH:-0}
+# Zero-inflated mobility models (transit/car/bike weekly trips + household
+# vehicles/bikes), assigned before CDAP with a validation report per model.
+PIPELINE_MOBILITY=${PIPELINE_MOBILITY:-0}
+# CDAP tour-level operation: ordered tour-purpose sequence per active person.
+PIPELINE_TOUR_SEQ=${PIPELINE_TOUR_SEQ:-0}
+# Unified logsum accessibility: =1 estimates Stage 5 first so fitted
+# logsum_*_acc measures thread through the whole chain (prediction flow).
+# GA estimation instead uses the always-available skim-based asim_* logsums
+# (joined automatically) plus build_fitted_logsum_371.py output when present.
+# Default 0 = current behaviour; pass -v UNIFIED_LOGSUM_ACC=1 for the full
+# fitted cascade.
+UNIFIED_LOGSUM_ACC=${UNIFIED_LOGSUM_ACC:-0}
+
+# Stage 7: POLARIS-style parking choice for auto trips (DA, SR).
+# Adds precise parking location + walk leg for every auto trip.
+# Requires saved_data/location_table.csv (build_location_table.py).
+# ON by default (=1). =0 disables.
+STAGE7_PARKING=${STAGE7_PARKING:-1}
+
+# DTA Feedback Loop: iterate demand model ↔ DTA to equilibrate skims.
+# DTA_FEEDBACK_ITERS > 0 enables the loop (e.g., 3 iterations).
+# DTA_ENGINE: 'matsim' (default), 'sumo', or 'dynust'.
+# Requires MATSim/SUMO/DynusT installed and configured.
+# Convergence threshold: relative skim RMSE (default 0.02 = 2%).
+DTA_FEEDBACK_ITERS=${DTA_FEEDBACK_ITERS:-0}
+DTA_ENGINE=${DTA_ENGINE:-matsim}
+DTA_CONVERGENCE_THRESHOLD=${DTA_CONVERGENCE_THRESHOLD:-0.02}
+
+# Distance-band Nested Logit destination benchmark (STAGE5_DEST_NL_DISTANCE=1)
+# Runs MNL + NL distance-band variants for comparison in model suite.
+STAGE5_DEST_NL_DISTANCE=${STAGE5_DEST_NL_DISTANCE:-0}
+
+# Trip-level destination enhancement for intermediate stops (STAGE5_TRIP_DEST_ENHANCE=1)
+# Integrated into Stage 5 trip chain building (POLARIS/ActivitySim pattern).
+STAGE5_TRIP_DEST_ENHANCE=${STAGE5_TRIP_DEST_ENHANCE:-1}
 
 # ── Resource shapes ───────────────────────────────────────────────────────────
 # Pass STAGE_NCPUS / STAGE_MEM / PRED_NCPUS / PRED_MEM individually via -v
 # to avoid colon-collision with the PBS variable-list delimiter.
 # The select strings are assembled here from those atomic variables.
+# Reduced defaults for typical HPC nodes (128-256GB per node)
 STAGE_NCPUS=${STAGE_NCPUS:-4}
-STAGE_MEM=${STAGE_MEM:-96GB}
-STAGE_WALLTIME=${STAGE_WALLTIME:-24:00:00}
+STAGE_MEM=${STAGE_MEM:-128GB}
+# Default kept strictly UNDER 24h: schedulers backfill sub-24h jobs far more
+# aggressively, so the stages queue sooner. Safe because the GA is walltime-aware
+# (GA_WALLTIME_SECONDS below) — it checkpoints before the wall and the
+# ga_s5resume driver resubmits stage 5 to continue. Raise only if a single stage
+# genuinely needs one uninterrupted >20h run.
+STAGE_WALLTIME=${STAGE_WALLTIME:-20:00:00}
+
+# Walltime-awareness: pass the stage walltime (seconds) to the GA so it can stop
+# gracefully before PBS SIGKILLs it (writes checkpoint + PARTIAL, chain proceeds).
+_hms_to_sec() { local IFS=:; set -- $1; local h=$1 m=$2 s=${3:-0}; echo $((10#$h*3600 + 10#$m*60 + 10#$s)); }
+GA_WALLTIME_SECONDS=${GA_WALLTIME_SECONDS:-$(_hms_to_sec "${STAGE_WALLTIME}")}
+# Buffer inside the job so the checkpoint write + teardown finishes before the
+# limit. Must exceed ~2x the slowest generation: stage-4 RRM generations run
+# 15-20 min, so the old hardcoded 600 s buffer let PBS SIGKILL a job mid-search
+# (observed: ga_s4 walltime-killed at 20:02 with 7/8 purposes done, no artifact).
+# Override per submit, e.g. -v WALLTIME_BUFFER_SECONDS=1800 for stage-4 reruns.
+WALLTIME_BUFFER_SECONDS=${WALLTIME_BUFFER_SECONDS:-600}
+GA_WALLTIME_SECONDS=$(( GA_WALLTIME_SECONDS > WALLTIME_BUFFER_SECONDS ? GA_WALLTIME_SECONDS - WALLTIME_BUFFER_SECONDS : GA_WALLTIME_SECONDS ))
 
 MERGE_NCPUS=${MERGE_NCPUS:-1}
 MERGE_MEM=${MERGE_MEM:-8GB}
 MERGE_WALLTIME=${MERGE_WALLTIME:-01:00:00}
 
 PRED_NCPUS=${PRED_NCPUS:-8}
-PRED_MEM=${PRED_MEM:-250GB}
+PRED_MEM=${PRED_MEM:-128GB}
 PRED_WALLTIME=${PRED_WALLTIME:-24:00:00}
+
+# ── Stage-5 checkpoint + auto-resume ────────────────────────────────────────
+# GA_CHECKPOINT_DIR lets a walltime-killed stage 5 RESUME the segments it
+# didn't finish (per-segment checkpoint in ga_stage5_segments.pkl) instead of
+# restarting from scratch. The resume driver (below) re-submits stage 5 until
+# no PARTIAL marker remains (or retries exhausted), so the pipeline completes
+# even when one walltime slot can't fit all 3 segments.
+GA_CHECKPOINT_DIR=${GA_CHECKPOINT_DIR:-${RUN_ROOT}/${RUN_TAG}/stage5}
+STAGE5_MAX_RESUMES=${STAGE5_MAX_RESUMES:-4}
+STAGE5_RESUME_MODE=${STAGE5_RESUME_MODE:-0}
+S5_RESUME_RETRIES=${S5_RESUME_RETRIES:-0}
+# Driver walltime must itself be schedulable: 168h was rejected by the queue
+# ("Job rejected by all possible destinations"; 24-48h demonstrably schedules).
+# The driver below block-waits each resume round, so one 48h driver typically
+# covers ~1 full extra round; later rounds are shorter (checkpoint skips done
+# segments). If a round still overruns, afterany still releases merge/pred with
+# the partial result + PARTIAL marker intact for a manual rerun.
+STAGE5_RESUME_WALLTIME=${STAGE5_RESUME_WALLTIME:-48:00:00}
+RESUME_ENV=${RESUME_ENV:-}
 
 # Assembled select strings: prefer a directly-set value, fall back to atomic parts
 STAGE_SELECT=${STAGE_SELECT:-"1:ncpus=${STAGE_NCPUS}:mem=${STAGE_MEM}"}
+# Per-stage memory override for stage 5 (the skim-heavy job). Stages 0-4 run
+# comfortably on the base 128GB — letting them request less means they start
+# immediately instead of queuing behind big-memory nodes. Stage 5 OOMs at
+# 128GB even serial (killed at ~118GB, footprint still climbing), so it gets
+# 256GB on a single exclusive node by default; override per submit as needed.
+STAGE5_MEM=${STAGE5_MEM:-256GB}
+STAGE5_SELECT=${STAGE5_SELECT:-$(echo "${STAGE_SELECT}" | sed "s/mem=${STAGE_MEM}/mem=${STAGE5_MEM}/")}
 MERGE_SELECT="1:ncpus=${MERGE_NCPUS}:mem=${MERGE_MEM}"
 PRED_SELECT=${PRED_SELECT:-"1:ncpus=${PRED_NCPUS}:mem=${PRED_MEM}"}
 
 # Prediction mode settings for pbs_pipeline_mode.pbs
 THREADS=${THREADS:-1}
 S5_WORKERS=${S5_WORKERS:-8}
+# Prediction re-runs Stage 5 too; cap its parallel workers and keep the node
+# exclusive so the cgroup is contiguous (mirrors the stage-5 protection above).
+PRED_S5_WORKERS=${PRED_S5_WORKERS:-2}
 PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
 INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS:-1}
+# Build SimWrapper dashboards (summarize/) after the prediction job.
+# GA_SIMWRAPPER=0 disables; SKIP_MAP=1 skips the geojson choropleth (faster).
+GA_SIMWRAPPER=${GA_SIMWRAPPER:-1}
+SKIP_MAP=${SKIP_MAP:-0}
+# Build the POLARIS-style demand SQLite store (<tag>-Demand.sqlite) after
+# prediction. GA_POLARIS=0 disables.
+GA_POLARIS=${GA_POLARIS:-1}
 
-# 507-zone SA2 population scope.  Set NEW_POP=1 to activate the new_pop
-# zoning system (OTAZ = SA2 code directly, matched to the GAN synth pop).
-# NEW_POP_MAPPED=1 is the production default - matches job_full_pipeline_dta_tested.pbs
-# and job_predict_dta_tested.pbs (both hardcode NEW_POP_MAPPED=1), so a bare
-# `qsub job_submit_ga_parallel_chain.pbs` produces GA results on the same
-# population scope the vehicle.dat pipeline expects, with no -v flags needed.
+# Full-size MATSim scenario run after prediction (GA_MATSIM_FULL=1, default on):
+# builds AND runs job_matsim_scenario.pbs at MATSIM_SAMPLE_FRAC=1.0 (100% of the
+# synthetic population) plus network-level analysis. Very memory-heavy (~2M
+# agents) — set the resource knobs to your largest available node. The
+# lightweight plans-only export above is separate and always GA_MATSIM-gated.
+GA_MATSIM_FULL=${GA_MATSIM_FULL:-1}
+MATSIM_SAMPLE_FRAC=${MATSIM_SAMPLE_FRAC:-1.0}
+MATSIM_ITERS=${MATSIM_ITERS:-20}
+MATSIM_END_HOURS=${MATSIM_END_HOURS:-30}
+MATSIM_HEAP=${MATSIM_HEAP:-200g}
+MATSIM_NCPUS=${MATSIM_NCPUS:-16}
+MATSIM_MEM=${MATSIM_MEM:-500GB}
+MATSIM_WALLTIME=${MATSIM_WALLTIME:-48:00:00}
+
+# Zone scope. Default = the fully-aligned SA2-direct 371 system: population# (OTAZ = 9-digit SA2), landuse (ORDER = SA2) and the 371 skim are all one zone
+# space — no legacy-ORDER remap, no 485/{371,324} mismatch. NEW_POP=1 wins over
+# NEW_POP_MAPPED in the loader. Set NEW_POP_MAPPED=1 (with the regenerated 371
+# crosswalk, demand_/sa2_to_order_crosswalk_371.csv) only if you need integer
+# 1..371 ORDER ids in the DynusT export.
 # NEW_POP_DIR: parent of saved_data/zone_ids_sa2/ (relative to PBS_O_WORKDIR).
-# PIPELINE_SKIMS_PATH: openmatrix-spec OMX for stage 5 (run
-#   demand_/11_convert_skims_to_openmatrix.py on HPC to generate it first).
-NEW_POP=${NEW_POP:-0}
-NEW_POP_MAPPED=${NEW_POP_MAPPED:-1}
+NEW_POP=${NEW_POP:-1}
+NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
 NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
 # Skim path default depends on mode:
 #   NEW_POP=1 (507-zone SA2 direct) : the openmatrix-spec converted OMX is
@@ -94,7 +406,7 @@ NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
 #   NEW_POP_MAPPED=1 or standard 329: leave empty so pipeline_logger.py picks
 #             downcasted_matrices_base.omx based on its own mode flags.
 if [ "${NEW_POP}" = "1" ] && [ "${NEW_POP_MAPPED}" != "1" ]; then
-    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/sa2_skims_507_omxspec.omx}
+    PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
 else
     PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-}
 fi
@@ -115,16 +427,353 @@ echo "New-pop (507) : NEW_POP=${NEW_POP}  NEW_POP_DIR=${NEW_POP_DIR}"
 echo "Skims path    : ${PIPELINE_SKIMS_PATH}"
 echo "=========================================="
 
+# ── Prune old auto-named job runs + stale PBS log files ──────────────────────
+# On each submit, remove things older than RUN_RETENTION_DAYS days:
+#   (a) AUTO-generated run dirs in RUN_ROOT — ONLY the auto-name patterns
+#       (ga_parallel_* and sa_*_staged__*); deliberately-named experiment dirs
+#       (mv*, s5diag, …) are NEVER removed;
+#   (b) PBS stdout/stderr files (<name>.o<jobid> / <name>.e<jobid>, ≥5-digit id)
+#       in the submit dir (PBS_O_WORKDIR, else cwd).
+# The age gate means the run being submitted and any still-running job's files
+# (both brand-new) are never matched. Best-effort: `|| true` keeps a prune
+# hiccup from aborting the submit under `set -e`.
+if [ "${RUN_PRUNE}" = "1" ]; then
+  if [ -d "${RUN_ROOT}" ]; then
+    echo "Pruning auto-named runs older than ${RUN_RETENTION_DAYS} days in ${RUN_ROOT} ..."
+    for _pat in 'ga_parallel_*' 'sa_*_staged__*'; do
+      find "${RUN_ROOT}" -maxdepth 1 -mindepth 1 -type d -name "${_pat}" \
+           -mtime +${RUN_RETENTION_DAYS} -print -exec rm -rf {} + 2>/dev/null || true
+    done
+  fi
+  _logdir="${PBS_O_WORKDIR:-.}"
+  echo "Pruning PBS .o/.e log files older than ${RUN_RETENTION_DAYS} days in ${_logdir} ..."
+  find "${_logdir}" -maxdepth 1 -type f -name '*.[oe][0-9][0-9][0-9][0-9][0-9]*' \
+       -mtime +${RUN_RETENTION_DAYS} -print -delete 2>/dev/null || true
+  echo "=========================================="
+fi
+
 submit_stage() {
   local sid="$1"
+  # Stage 5 doubles as the heavy spawn-mode worker job: trim its worker count
+  # (STAGE5_PARALLEL_SEGMENTS) for memory headroom. Other stages use GA_PARALLEL_SEGMENTS.
+  local _segs="${GA_PARALLEL_SEGMENTS}"
+  if [ "${sid}" = "5" ] && [ -n "${STAGE5_PARALLEL_SEGMENTS}" ]; then
+    _segs="${STAGE5_PARALLEL_SEGMENTS}"
+  fi
+  # Per-stage memory: stage 5 uses STAGE5_SELECT (default = STAGE_SELECT).
+  local _select="${STAGE_SELECT}"
+  if [ "${sid}" = "5" ]; then
+    _select="${STAGE5_SELECT}"
+  fi
   # Note: -v list uses comma as separator; no colon-containing values here.
+  # ${PREP_DEP} (set before the fan-out) gates each stage on the one-time
+  # estimator-upgrade barrier when enabled; empty otherwise (word-splits away).
   qsub \
     -N "ga_s${sid}_${RUN_TAG}" \
-    -l "select=${STAGE_SELECT}" \
+    ${PREP_DEP:-} \
+    -l "select=${_select}" \
+    -l "place=${STAGE_PLACE}" \
     -l "walltime=${STAGE_WALLTIME}" \
-    -v "STAGE_ID=${sid},RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},GA_BUDGET=${GA_BUDGET},GA_ESTIMATOR=${GA_ESTIMATOR},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA},GA_N_RESTARTS=${GA_N_RESTARTS},GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS},PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR},STAGE23_JOINT=${STAGE23_JOINT},GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT},GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH},GA_EARLY_STOP=${GA_EARLY_STOP},GA_S1_RIDGE=${GA_S1_RIDGE},GA_IMPUTE_INCOME=${GA_IMPUTE_INCOME},GA_RESOLVE_CONFLICTS=${GA_RESOLVE_CONFLICTS},STAGE5_ENABLE_MXL=${STAGE5_ENABLE_MXL},NEW_POP=${NEW_POP},NEW_POP_MAPPED=${NEW_POP_MAPPED},NEW_POP_DIR=${NEW_POP_DIR},PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH},GA_PROFILE=${GA_PROFILE},GA_COMPLEXITY_PENALTY=${GA_COMPLEXITY_PENALTY}" \
+    -v "STAGE_ID=${sid},RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},GA_BUDGET=${GA_BUDGET},GA_ESTIMATOR=${GA_ESTIMATOR},GA_ENGINE=${GA_ENGINE},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA},GA_N_RESTARTS=${GA_N_RESTARTS},GA_WALLTIME_SECONDS=${GA_WALLTIME_SECONDS},GA_CHECKPOINT_DIR=${GA_CHECKPOINT_DIR},GA_PARALLEL_SEGMENTS=${_segs},PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR},STAGE23_JOINT=${STAGE23_JOINT},GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT},GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH},GA_EARLY_STOP=${GA_EARLY_STOP},GA_S1_RIDGE=${GA_S1_RIDGE},GA_IMPUTE_INCOME=${GA_IMPUTE_INCOME},GA_RESOLVE_CONFLICTS=${GA_RESOLVE_CONFLICTS},STAGE5_ENABLE_MXL=${STAGE5_ENABLE_MXL},STAGE5_ENABLE_GSE=${STAGE5_ENABLE_GSE},STAGE5_CRASH_ZERO_TO_MAX=${STAGE5_CRASH_ZERO_TO_MAX},STAGE5_LOGSUM_SMOOTH=${STAGE5_LOGSUM_SMOOTH},STAGE5_LOGSUM_ORTHOG=${STAGE5_LOGSUM_ORTHOG},STAGE5_DEST_QUANTITY=${STAGE5_DEST_QUANTITY},STAGE5_DEST_HIST=${STAGE5_DEST_HIST},STAGE5_PT_MODES=${STAGE5_PT_MODES},STAGE5B_TRANSIT_ACCESS=${STAGE5B_TRANSIT_ACCESS},STAGE5_POWER_ACC=${STAGE5_POWER_ACC},USE_OVERTURE_LANDUSE=${USE_OVERTURE_LANDUSE},OVERTURE_REFRESH_SIZE=${OVERTURE_REFRESH_SIZE},STAGE4_MANDATORY_LOS=${STAGE4_MANDATORY_LOS},STAGE4_TIMING_MODEL=${STAGE4_TIMING_MODEL},MICRO_LOCATIONS=${MICRO_LOCATIONS},NEW_POP=${NEW_POP},NEW_POP_MAPPED=${NEW_POP_MAPPED},NEW_POP_DIR=${NEW_POP_DIR},PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH},GA_PROFILE=${GA_PROFILE},GA_COMPLEXITY_PENALTY=${GA_COMPLEXITY_PENALTY},GA_REHEAT_FRACTION=${GA_REHEAT_FRACTION},GA_STAGE123_GENS_MULT=${GA_STAGE123_GENS_MULT},GA_MUTATION_MIN=${GA_MUTATION_MIN},GA_STAGE4_GENS=${GA_STAGE4_GENS},GA_STAGE4_RESTARTS=${GA_STAGE4_RESTARTS},GA_STAGE4_EARLY_STOP=${GA_STAGE4_EARLY_STOP},GA_STAGE4_EARLY_STOP_PATIENCE=${GA_STAGE4_EARLY_STOP_PATIENCE},GA_STAGE4_EARLY_STOP_MIN_GENS=${GA_STAGE4_EARLY_STOP_MIN_GENS},GA_SA2_GENS=${GA_SA2_GENS},GA_SA2_RESTARTS=${GA_SA2_RESTARTS},GA_STAGE4_MXL_SEARCH=${GA_STAGE4_MXL_SEARCH},PIPELINE_PERSON_LATENT=${PIPELINE_PERSON_LATENT},PIPELINE_WFH=${PIPELINE_WFH},PIPELINE_MOBILITY=${PIPELINE_MOBILITY},PIPELINE_TOUR_SEQ=${PIPELINE_TOUR_SEQ},GA_MEM_PER_WORKER_GB=${GA_MEM_PER_WORKER_GB},XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE},GA_JAX_CACHE_MEM_LIMIT_GB=${GA_JAX_CACHE_MEM_LIMIT_GB},GA_JAX_CACHE_CHECK_EVERY=${GA_JAX_CACHE_CHECK_EVERY},CDAP_HOUSEHOLD_COORD=${CDAP_HOUSEHOLD_COORD},CDAP_HH_ESTIMATE=${CDAP_HH_ESTIMATE},JOINT_TOURS=${JOINT_TOURS},DEST_EST_SAMPLE_SIZE=${DEST_EST_SAMPLE_SIZE},STAGE5_DEST_SAMPLE_SIZE=${STAGE5_DEST_SAMPLE_SIZE},GA_MODE_DEGEN_PENALTY=${GA_MODE_DEGEN_PENALTY},ESTIMATORS_SKIP_UPGRADE=${ESTIMATORS_SKIP_UPGRADE},UNIFIED_LOGSUM_ACC=${UNIFIED_LOGSUM_ACC},GA_MV_COPULA=${GA_MV_COPULA},GA_MV_MARGINAL=${GA_MV_MARGINAL},GA_MV_PREDICT=${GA_MV_PREDICT}" \
+    -v "STAGE2_MH=${STAGE2_MH},STAGE2_MH_BURN=${STAGE2_MH_BURN},STAGE2_MH_DRAWS=${STAGE2_MH_DRAWS},STAGE2_MH_THIN=${STAGE2_MH_THIN},STAGE2_MH_SEED=${STAGE2_MH_SEED},STAGE2_MH_PROPOSAL_SCALE=${STAGE2_MH_PROPOSAL_SCALE}" \
     job_ga_stage_single.pbs | awk '{print $1}'
 }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stage-5 resume DRIVER (STAGE5_RESUME_MODE=1). Re-invoked as a PBS job by the
+# normal-mode submission below. It waits for stage 5 to finish, and if a PARTIAL
+# marker remains (walltime guard stopped it with segments unfinished) it
+# re-submits stage 5 — which RESUMES the unfished segments via GA_CHECKPOINT_DIR
+# — and chains another driver. It only exits once stage5_DONE is written (by the
+# final driver), so merge/prediction correctly wait for ALL segments.
+# ═══════════════════════════════════════════════════════════════════════════
+if [ "${STAGE5_RESUME_MODE}" = "1" ]; then
+  [ -n "${RESUME_ENV}" ] && . "${RESUME_ENV}"
+  _s5dir="${RUN_ROOT}/${RUN_TAG}/stage5"
+  _partial="${_s5dir}/PARTIAL"
+  _done="${_s5dir}/stage5_DONE"
+
+  # Validity gate (not just presence): a failed run can leave a live-named
+  # ga_results.pkl (pre-quarantine) or none at all. Blessing either as
+  # "complete" lets merge/predict run on baseline specs silently (observed on
+  # ga371_20260912r2). Refuse loudly instead so the failure is visible.
+  _failed=0
+  if [ -f "${_s5dir}/ga_progress.json" ] && grep -q '"failed"[[:space:]]*:[[:space:]]*true' "${_s5dir}/ga_progress.json"; then
+    _failed=1
+  fi
+  if [ ! -f "${_partial}" ] && [ -f "${_s5dir}/ga_results.pkl" ] && [ "${_failed}" = "0" ]; then
+    touch "${_done}"
+    echo "[s5-resume] stage5 result present with no PARTIAL marker -- stage 5 complete."
+    exit 0
+  fi
+  if [ "${_failed}" = "1" ]; then
+    echo "[s5-resume] stage5 marked FAILED (ga_progress.json) with no PARTIAL marker -- partial/quarantined artifact, needs resubmit; refusing to bless as complete."
+    exit 1
+  fi
+  if [ ! -f "${_s5dir}/ga_results.pkl" ]; then
+    echo "[s5-resume] no stage5 ga_results.pkl -- stage 5 never completed; needs (re)submit."
+    exit 1
+  fi
+
+  # Single-driver loop: each resume round is waited on INSIDE this job via a
+  # qstat poll, so there is exactly one driver for merge/pred to depend on
+  # (no multi-driver chain, no cross-driver polling). qstat exits nonzero once
+  # the job leaves the system, which ends the wait loop.
+  while [ -f "${_partial}" ] && [ "${S5_RESUME_RETRIES:-0}" -gt 0 ]; do
+    echo "[s5-resume] PARTIAL detected; resubmitting stage 5 (resume), retries left=${S5_RESUME_RETRIES}"
+    _jid5b=$(submit_stage 5)
+    echo "[s5-resume] waiting for ${_jid5b} ..."
+    while qstat "${_jid5b}" >/dev/null 2>&1; do sleep 120; done
+    S5_RESUME_RETRIES=$((S5_RESUME_RETRIES - 1))
+  done
+  if [ -f "${_partial}" ]; then
+    echo "[s5-resume] resume retries exhausted; allowing merge/prediction to use the partial result."
+  else
+    echo "[s5-resume] no PARTIAL marker -- stage 5 fully complete."
+  fi
+  touch "${_done}"
+  exit 0
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Estimator PREP barrier (ESTIMATOR_PREP_MODE=1). Re-invoked as a ONE-TIME PBS
+# job before the parallel stage fan-out. It ensures metacountregressor +
+# SearchLibrium meet the version floors — upgrading via PyPI only when below
+# floor (compute nodes have no egress, so the satisfied case stays offline; the
+# 6 parallel stage jobs never race concurrent pip installs into the shared
+# conda env), then smoke-tests the public imports so a broken/incompatible
+# wheel FAILS the barrier (afterok) instead of silently poisoning every stage.
+# ═══════════════════════════════════════════════════════════════════════════
+if [ "${ESTIMATOR_PREP_MODE:-0}" = "1" ]; then
+  cd "$PBS_O_WORKDIR"
+  # Pure-CPU JAX: the zigenv env ships the CUDA PJRT plugin (jax_cuda12) but
+  # cpu_batch nodes have ngpus=0, so plugin discovery dies with
+  # "cuInit(0) failed: CUDA_ERROR_NO_DEVICE" on the first JAX import. Pinning
+  # JAX_PLATFORMS=cpu makes JAX skip GPU discovery entirely (same trio every
+  # other job script in this repo already exports; this barrier was the gap).
+  export JAX_PLATFORM_NAME=cpu
+  export JAX_PLATFORMS=cpu
+  export CUDA_VISIBLE_DEVICES=""
+  module purge
+  module load Anaconda3/2024.02-1
+  conda activate "${CONDA_ENV}"
+  module unload Anaconda3
+  export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+  echo "[prep] Installing latest SearchLibrium from PyPI ..."
+  # SearchLibrium is deliberately refreshed on every chain submission so the
+  # stage workers use the current PyPI release, not merely a version above the
+  # historical floor. Failure is fatal: continuing would make the API smoke
+  # test and downstream stage failures misleading.
+  pip install --upgrade -q --retries 1 --timeout 20 SearchLibrium \
+    || { echo "[prep] FATAL: latest SearchLibrium upgrade failed"; exit 2; }
+  echo "[prep] Ensuring metacountregressor>=${METACOUNT_MIN} ..."
+  # MetaCount remains floor-checked. A newer local/dev install is kept, and
+  # an upgrade is fatal if the minimum version cannot be obtained.
+  _need_upgrade=$(python -c "
+import importlib.metadata as md
+floors = {'metacountregressor': '${METACOUNT_MIN}',
+          'SearchLibrium': '${SEARCHLIBRIUM_MIN}'}
+def _tup(s):
+    return tuple(int(x) for x in str(s).split('.'))
+need = []
+for _pkg, _floor in floors.items():
+    try:
+        _ver = md.version(_pkg)
+    except Exception:
+        _ver = None
+    if _ver is None or _tup(_ver) < _tup(_floor):
+        need.append(f'{_pkg}>={_floor}')
+print(' '.join(need))
+")
+  if [ -z "${_need_upgrade}" ]; then
+    echo "[prep] MetaCount floor already satisfied"
+  else
+    echo "[prep] estimators below floor, upgrading: ${_need_upgrade}"
+    # shellcheck disable=SC2086
+    pip install --upgrade -q ${_need_upgrade} \
+      || { echo "[prep] FATAL: estimator upgrade failed (offline / bad index)"; exit 2; }
+  fi
+  pip show metacountregressor 2>/dev/null | awk '/^Version:/{print "[prep] metacountregressor " $0}'
+  pip show SearchLibrium      2>/dev/null | awk '/^Version:/{print "[prep] SearchLibrium " $0}'
+  # Smoke-test the public API so an incompatible release fails the barrier rather
+  # than every downstream stage running against a broken package. Two layers:
+  #   (1) imports resolve, and
+  #   (2) representative CONSTRUCTION calls that mirror the pipeline's real
+  #       signatures (model_zoo._fit_sl_mnl / _fit_mcr) — constructor + .setup()
+  #       only, NOT .fit()/.run(). A renamed kwarg or method (API-signature
+  #       change) raises TypeError/AttributeError and FAILS the barrier; a mere
+  #       numerical/convergence issue on the tiny synthetic sample does not.
+  python -u -X utf8 - <<'PYEOF' || { echo "[prep] FATAL: estimator smoke-test failed"; exit 3; }
+import importlib.metadata as md
+import numpy as np
+from metacountregressor import ExperimentBuilder, ModelConstraints  # noqa: F401
+from SearchLibrium import MultinomialLogit, MixedLogit             # noqa: F401
+print("[prep] metacountregressor", md.version("metacountregressor"),
+      "| SearchLibrium", md.version("SearchLibrium"), "imports OK")
+
+rng = np.random.default_rng(0)
+n = 32
+X = rng.standard_normal((n, 2))
+varnames = ["x1", "x2"]
+
+def _sig_fail(what, exc):
+    print(f"[prep] FATAL: {what} API-SIGNATURE CHANGE -> {type(exc).__name__}: {exc}")
+    print(f"[prep]        update model_zoo/ga_external_estimators for the new "
+          f"{what} API before re-running.")
+    raise SystemExit(4)
+
+# (2a) SearchLibrium MNL — mirrors model_zoo._fit_sl_mnl (+ _sl_setup fallback):
+#      SL_MNL(_jax=...).setup(X, y, varnames=, alts=) with one-hot y on old
+#      releases, 1-D long-format chosen-alt vector on new ones.
+try:
+    y_oh = np.eye(2)[rng.integers(0, 2, n)]
+    _m = MultinomialLogit(_jax=True)
+    try:
+        _m.setup(X, y_oh, varnames=varnames, alts=[0, 1])
+    except ValueError as _ve:
+        if 'long format' not in str(_ve).lower():
+            raise
+        _m.setup(X, y_oh.argmax(axis=1).astype(int),
+                 varnames=varnames, alts=[0, 1])
+    print("[prep] SearchLibrium MultinomialLogit(_jax=).setup(varnames=,alts=) OK")
+except (TypeError, AttributeError) as e:
+    _sig_fail("SearchLibrium MultinomialLogit", e)
+except Exception as e:                       # numerical/data — not a signature break
+    print(f"[prep] WARN: SL MNL construction non-signature error (ignored): "
+          f"{type(e).__name__}: {e}")
+
+# (2b) metacountregressor — mirrors model_zoo._mcr_fit (new API):
+#      ExperimentBuilder(df, id_col=, y_col=) then fit_manual_model(spec).
+#      (1.0.151 removed the old ExperimentBuilder(X=, y=, varnames=, ...) form.)
+try:
+    import pandas as _pd
+    y_ct = rng.poisson(1.0, n)
+    _df = _pd.DataFrame({"_id": np.arange(n), "x1": X[:, 0], "x2": X[:, 1],
+                         "y": y_ct})
+    _b = ExperimentBuilder(_df, id_col="_id", y_col="y")
+    _spec = {"fixed_terms": varnames, "rdm_terms": [],
+             "rdm_cor_terms": [], "grouped_terms": [],
+             "hetro_in_means": [], "zi_terms": [],
+             "membership_terms": [], "dispersion": 0,
+             "latent_classes": 1}
+    _fit = _b.fit_manual_model(_spec, "poisson", R=1)
+    print("[prep] metacountregressor ExperimentBuilder(df,id_col,y_col) + "
+          "fit_manual_model OK")
+except (TypeError, AttributeError) as e:
+    _sig_fail("metacountregressor ExperimentBuilder", e)
+except Exception as e:                       # numerical/data — not a signature break
+    print(f"[prep] WARN: ExperimentBuilder construction non-signature error "
+          f"(ignored): {type(e).__name__}: {e}")
+
+print("[prep] estimator API smoke-test passed")
+PYEOF
+  # The PyPI upgrade above overwrites the locally-patched estimator (observed
+  # 2026-10-17: 89333 B patched -> 56160 B stock 0.0.261). Re-apply the repo
+  # patch so the latent-class destination features (estimate_dest_choice_lc,
+  # identify_weak_features) and the corrected mixture log-likelihood are present
+  # for the stage-5 shards this chain submits.
+  if [ -f "$PBS_O_WORKDIR/_install_patched_searchlibrium.sh" ]; then
+    bash "$PBS_O_WORKDIR/_install_patched_searchlibrium.sh" \
+      || echo "[prep] WARN: patched SearchLibrium re-apply failed (LC shards self-heal at run time)"
+  fi
+  echo "[prep] estimator prep complete."
+  exit 0
+fi
+
+# ════════════════════════ NORMAL submission flow ═════════════════════════════
+# Persist the resolved stage-5 params so the resume driver can reproduce the
+# exact same stage-5 qsub (resume) without forwarding dozens of -v overrides.
+RESUME_ENV="${RUN_ROOT}/${RUN_TAG}/stage5_resume_env.sh"
+mkdir -p "$(dirname "${RESUME_ENV}")"
+cat > "${RESUME_ENV}" <<EOF
+export RUN_ROOT='${RUN_ROOT}'
+export RUN_TAG='${RUN_TAG}'
+export CONDA_ENV='${CONDA_ENV}'
+export STAGE_NCPUS='${STAGE_NCPUS}'
+export STAGE_MEM='${STAGE_MEM}'
+export STAGE_WALLTIME='${STAGE_WALLTIME}'
+export STAGE_SELECT='${STAGE_SELECT}'
+export STAGE5_SELECT='${STAGE5_SELECT}'
+export STAGE5_MEM='${STAGE5_MEM}'
+export STAGE5_PARALLEL_SEGMENTS='${STAGE5_PARALLEL_SEGMENTS}'
+export GA_PARALLEL_SEGMENTS='${GA_PARALLEL_SEGMENTS}'
+export GA_ENGINE='${GA_ENGINE}'
+export GA_ESTIMATOR='${GA_ESTIMATOR}'
+export GA_BUDGET='${GA_BUDGET}'
+export STAGE_PLACE='${STAGE_PLACE}'
+export GA_WALLTIME_SECONDS='${GA_WALLTIME_SECONDS}'
+export WALLTIME_BUFFER_SECONDS='${WALLTIME_BUFFER_SECONDS}'
+export GA_CHECKPOINT_DIR='${GA_CHECKPOINT_DIR}'
+export STAGE5_MAX_RESUMES='${STAGE5_MAX_RESUMES}'
+export GA_USE_SA='${GA_USE_SA}'
+export GA_USE_BANDIT_SA='${GA_USE_BANDIT_SA}'
+export GA_N_RESTARTS='${GA_N_RESTARTS}'
+export PIPELINE_ACCELERATOR='${PIPELINE_ACCELERATOR}'
+export STAGE23_JOINT='${STAGE23_JOINT}'
+export GA_SIG_PENALTY_WEIGHT='${GA_SIG_PENALTY_WEIGHT}'
+export GA_SIG_PVAL_THRESH='${GA_SIG_PVAL_THRESH}'
+export GA_EARLY_STOP='${GA_EARLY_STOP}'
+export GA_S1_RIDGE='${GA_S1_RIDGE}'
+export GA_IMPUTE_INCOME='${GA_IMPUTE_INCOME}'
+export GA_RESOLVE_CONFLICTS='${GA_RESOLVE_CONFLICTS}'
+export STAGE5_ENABLE_MXL='${STAGE5_ENABLE_MXL}'
+export STAGE5_ENABLE_GSE='${STAGE5_ENABLE_GSE}'
+export GA_SEARCH_GSE='${GA_SEARCH_GSE}'
+export STAGE5_CRASH_ZERO_TO_MAX='${STAGE5_CRASH_ZERO_TO_MAX}'
+export STAGE5_LOGSUM_SMOOTH='${STAGE5_LOGSUM_SMOOTH}'
+export STAGE5_LOGSUM_ORTHOG='${STAGE5_LOGSUM_ORTHOG}'
+export STAGE5_DEST_QUANTITY='${STAGE5_DEST_QUANTITY}'
+export STAGE5_DEST_HIST='${STAGE5_DEST_HIST}'
+export STAGE5_PT_MODES='${STAGE5_PT_MODES}'
+export STAGE5B_TRANSIT_ACCESS='${STAGE5B_TRANSIT_ACCESS}'
+export USE_OVERTURE_LANDUSE='${USE_OVERTURE_LANDUSE}'
+export OVERTURE_REFRESH_SIZE='${OVERTURE_REFRESH_SIZE}'
+export STAGE5_POWER_ACC='${STAGE5_POWER_ACC}'
+export STAGE4_MANDATORY_LOS='${STAGE4_MANDATORY_LOS}'
+export STAGE4_TIMING_MODEL='${STAGE4_TIMING_MODEL}'
+export MICRO_LOCATIONS='${MICRO_LOCATIONS}'
+export NEW_POP='${NEW_POP}'
+export NEW_POP_MAPPED='${NEW_POP_MAPPED}'
+export NEW_POP_DIR='${NEW_POP_DIR}'
+export PIPELINE_SKIMS_PATH='${PIPELINE_SKIMS_PATH}'
+export GA_PROFILE='${GA_PROFILE}'
+export GA_COMPLEXITY_PENALTY='${GA_COMPLEXITY_PENALTY}'
+export GA_REHEAT_FRACTION='${GA_REHEAT_FRACTION}'
+export GA_STAGE123_GENS_MULT='${GA_STAGE123_GENS_MULT}'
+export GA_MUTATION_MIN='${GA_MUTATION_MIN}'
+export PIPELINE_PERSON_LATENT='${PIPELINE_PERSON_LATENT}'
+export PIPELINE_WFH='${PIPELINE_WFH}'
+export PIPELINE_MOBILITY='${PIPELINE_MOBILITY}'
+export PIPELINE_TOUR_SEQ='${PIPELINE_TOUR_SEQ}'
+export GA_MEM_PER_WORKER_GB='${GA_MEM_PER_WORKER_GB}'
+export XLA_PYTHON_CLIENT_PREALLOCATE='${XLA_PYTHON_CLIENT_PREALLOCATE}'
+export GA_JAX_CACHE_MEM_LIMIT_GB='${GA_JAX_CACHE_MEM_LIMIT_GB}'
+export GA_JAX_CACHE_CHECK_EVERY='${GA_JAX_CACHE_CHECK_EVERY}'
+export CDAP_HOUSEHOLD_COORD='${CDAP_HOUSEHOLD_COORD}'
+export CDAP_HH_ESTIMATE='${CDAP_HH_ESTIMATE}'
+export JOINT_TOURS='${JOINT_TOURS}'
+export DEST_EST_SAMPLE_SIZE='${DEST_EST_SAMPLE_SIZE}'
+export STAGE5_DEST_SAMPLE_SIZE='${STAGE5_DEST_SAMPLE_SIZE}'
+export GA_MODE_DEGEN_PENALTY='${GA_MODE_DEGEN_PENALTY}'
+export ESTIMATORS_SKIP_UPGRADE='${ESTIMATORS_SKIP_UPGRADE}'
+export UNIFIED_LOGSUM_ACC='${UNIFIED_LOGSUM_ACC}'
+EOF
+
+# ── One-time estimator floor barrier (before the parallel fan-out) ─────────
+# Enforces metacountregressor>=METACOUNT_MIN and SearchLibrium>=
+# SEARCHLIBRIUM_MIN ONCE (fetching from PyPI only when below floor, else
+# staying offline); every stage then depends afterok on it, so all 6 stages
+# run on floor-satisfying, import-verified wheels without racing concurrent
+# pip installs into the shared conda env.
+PREP_DEP=""
+if [ "${ESTIMATOR_PREP:-1}" = "1" ] && [ "${ESTIMATOR_SOURCE:-pypi}" != "editable" ]; then
+  jid_prep=$(qsub -N "ga_estprep_${RUN_TAG}" \
+    -l "select=1:ncpus=1:mem=8GB" -l "walltime=00:30:00" \
+    -v "ESTIMATOR_PREP_MODE=1,CONDA_ENV=${CONDA_ENV},METACOUNT_MIN=${METACOUNT_MIN},SEARCHLIBRIUM_MIN=${SEARCHLIBRIUM_MIN}" \
+    "$0")
+  echo "Submitted estimator-prep barrier: ${jid_prep} (metacount>=${METACOUNT_MIN}, SearchLibrium>=${SEARCHLIBRIUM_MIN})"
+  PREP_DEP="-W depend=afterok:${jid_prep}"
+fi
 
 jid0=$(submit_stage 0)
 jid1=$(submit_stage 1)
@@ -135,11 +784,23 @@ jid5=$(submit_stage 5)
 
 echo "Submitted stages: ${jid0} ${jid1} ${jid2} ${jid3} ${jid4} ${jid5}"
 
-deps="${jid0}:${jid1}:${jid2}:${jid3}:${jid4}:${jid5}"
+# Stage-5 resume driver: gates merge/prediction until stage 5 is fully complete
+# (or retries exhausted). It polls for stage5_DONE written by the final driver.
+# afterany (NOT afterok): the driver must run even when stage 5 is OOM-killed
+# (exit 137) so it can resubmit/resume from the checkpoint. With afterok a
+# failed stage 5 would leave this driver — and therefore merge — queued forever.
+jid_drv=$(qsub -N "ga_s5resume_${RUN_TAG}" \
+  -W "depend=afterany:${jid5}" \
+  -l "select=1:ncpus=1:mem=4GB" -l "walltime=${STAGE5_RESUME_WALLTIME}" \
+  -v "STAGE5_RESUME_MODE=1,S5_RESUME_RETRIES=${STAGE5_MAX_RESUMES},RESUME_ENV=${RESUME_ENV},RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV}" \
+  "$0")
+echo "Submitted stage-5 resume driver: ${jid_drv}"
+
+deps="${jid0}:${jid1}:${jid2}:${jid3}:${jid4}:${jid_drv}"
 
 jid_merge=$(qsub \
   -N "ga_merge_${RUN_TAG}" \
-  -W "depend=afterok:${deps}" \
+  -W "depend=afterany:${deps}" \
   -l "select=${MERGE_SELECT}" \
   -l "walltime=${MERGE_WALLTIME}" \
   -v "RUN_ROOT=${RUN_ROOT},RUN_TAG=${RUN_TAG},CONDA_ENV=${CONDA_ENV},STAGE_IDS=0_1_2_3_4_5,STRICT_MERGE=1" \
@@ -151,13 +812,114 @@ MERGED_DIR="${RUN_ROOT}/${RUN_TAG}/merged"
 
 jid_pred=$(qsub \
   -N "ga_pred_${RUN_TAG}" \
-  -W "depend=afterok:${jid_merge}" \
+  -W "depend=afterany:${jid_merge}" \
   -l "select=${PRED_SELECT}" \
+  -l "place=${STAGE_PLACE}" \
   -l "walltime=${PRED_WALLTIME}" \
-  -v "MODE=ga_staged,CONDA_ENV=${CONDA_ENV},RUN_ROOT=${RUN_ROOT},THREADS=${THREADS},S5_WORKERS=${S5_WORKERS},GA_ESTIMATOR=${GA_ESTIMATOR},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA},GA_BUDGET=${GA_BUDGET},GA_STAGED_REUSE_ESTIMATOR=1,GA_STAGED_GA_DIR=${MERGED_DIR},INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS},PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR},GA_N_RESTARTS=${GA_N_RESTARTS},GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT},GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH},NEW_POP=${NEW_POP},NEW_POP_MAPPED=${NEW_POP_MAPPED},NEW_POP_DIR=${NEW_POP_DIR},PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH},GA_PROFILE=${GA_PROFILE},GA_COMPLEXITY_PENALTY=${GA_COMPLEXITY_PENALTY}" \
+  -v "MODE=ga_staged,PIPELINE_RUN_TAG=${RUN_TAG},PIPELINE_RUN_DIR=${RUN_ROOT}/${RUN_TAG},CONDA_ENV=${CONDA_ENV},RUN_ROOT=${RUN_ROOT},THREADS=${THREADS},S5_WORKERS=${PRED_S5_WORKERS},GA_ESTIMATOR=${GA_ESTIMATOR},GA_ENGINE=${GA_ENGINE},GA_USE_SA=${GA_USE_SA},GA_USE_BANDIT_SA=${GA_USE_BANDIT_SA},STAGE5_CRASH_ZERO_TO_MAX=${STAGE5_CRASH_ZERO_TO_MAX},STAGE5_LOGSUM_SMOOTH=${STAGE5_LOGSUM_SMOOTH},STAGE5_LOGSUM_ORTHOG=${STAGE5_LOGSUM_ORTHOG},STAGE5_DEST_QUANTITY=${STAGE5_DEST_QUANTITY},STAGE5_DEST_HIST=${STAGE5_DEST_HIST},STAGE5_PT_MODES=${STAGE5_PT_MODES},STAGE5B_TRANSIT_ACCESS=${STAGE5B_TRANSIT_ACCESS},STAGE5_POWER_ACC=${STAGE5_POWER_ACC},USE_OVERTURE_LANDUSE=${USE_OVERTURE_LANDUSE},OVERTURE_REFRESH_SIZE=${OVERTURE_REFRESH_SIZE},STAGE4_MANDATORY_LOS=${STAGE4_MANDATORY_LOS},STAGE4_TIMING_MODEL=${STAGE4_TIMING_MODEL},MICRO_LOCATIONS=${MICRO_LOCATIONS},GA_BUDGET=${GA_BUDGET},GA_STAGED_REUSE_ESTIMATOR=1,GA_STAGED_GA_DIR=${MERGED_DIR},STAGE5_ENABLE_MXL=${STAGE5_ENABLE_MXL},STAGE5_ENABLE_GSE=${STAGE5_ENABLE_GSE},GA_SEARCH_GSE=${GA_SEARCH_GSE},INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS},PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR},GA_N_RESTARTS=${GA_N_RESTARTS},GA_SIG_PENALTY_WEIGHT=${GA_SIG_PENALTY_WEIGHT},GA_SIG_PVAL_THRESH=${GA_SIG_PVAL_THRESH},NEW_POP=${NEW_POP},NEW_POP_MAPPED=${NEW_POP_MAPPED},NEW_POP_DIR=${NEW_POP_DIR},PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH},GA_PROFILE=${GA_PROFILE},GA_COMPLEXITY_PENALTY=${GA_COMPLEXITY_PENALTY},GA_REHEAT_FRACTION=${GA_REHEAT_FRACTION},CDAP_HOUSEHOLD_COORD=${CDAP_HOUSEHOLD_COORD},CDAP_HH_ESTIMATE=${CDAP_HH_ESTIMATE},JOINT_TOURS=${JOINT_TOURS},PIPELINE_PERSON_LATENT=${PIPELINE_PERSON_LATENT},PIPELINE_WFH=${PIPELINE_WFH},PIPELINE_MOBILITY=${PIPELINE_MOBILITY},PIPELINE_TOUR_SEQ=${PIPELINE_TOUR_SEQ},GA_MEM_PER_WORKER_GB=${GA_MEM_PER_WORKER_GB},GA_SEARCH_PREDAY=${GA_SEARCH_PREDAY},STAGE6_TOUR_MODE_CONSISTENCY=${STAGE6_TOUR_MODE_CONSISTENCY},STAGE4_MANDATORY_LOS=${STAGE4_MANDATORY_LOS},STAGE4_TIMING_MODEL=${STAGE4_TIMING_MODEL},MICRO_LOCATIONS=${MICRO_LOCATIONS},DEST_EST_SAMPLE_SIZE=${DEST_EST_SAMPLE_SIZE},STAGE5_DEST_SAMPLE_SIZE=${STAGE5_DEST_SAMPLE_SIZE},GA_MODE_DEGEN_PENALTY=${GA_MODE_DEGEN_PENALTY},ESTIMATORS_SKIP_UPGRADE=${ESTIMATORS_SKIP_UPGRADE},UNIFIED_LOGSUM_ACC=${UNIFIED_LOGSUM_ACC},GA_MV_COPULA=${GA_MV_COPULA},GA_MV_MARGINAL=${GA_MV_MARGINAL},GA_MV_PREDICT=${GA_MV_PREDICT}" \
+  -v "STAGE2_MH=${STAGE2_MH},STAGE2_MH_BURN=${STAGE2_MH_BURN},STAGE2_MH_DRAWS=${STAGE2_MH_DRAWS},STAGE2_MH_THIN=${STAGE2_MH_THIN},STAGE2_MH_SEED=${STAGE2_MH_SEED},STAGE2_MH_PROPOSAL_SCALE=${STAGE2_MH_PROPOSAL_SCALE}" \
   pbs_pipeline_mode.pbs | awk '{print $1}')
 
 echo "Submitted prediction: ${jid_pred}"
+
+# Prediction run dir: pbs_pipeline_mode.pbs names MODE=ga_staged runs as
+#   <RUN_ROOT>/<pfx>_<estimator>_staged__<PIPELINE_RUN_TAG>
+# The PIPELINE_RUN_TAG is passed via qsub -v but long -v lines can truncate.
+# Instead of pre-computing, we write a marker file from the prediction job
+# and have dependent jobs read it. This file is written by pbs_pipeline_mode.pbs
+# after the run directory is created.
+PRED_RUN_MARKER="${RUN_ROOT}/${RUN_TAG}/prediction_run_dir.txt"
+echo "Prediction run dir marker: ${PRED_RUN_MARKER} (will be written by prediction job)"
+
+# MATSim export (GA_MATSIM=1, default on): convert the finished run's final
+# activity plan into a MATSim scenario. The ga_staged prediction job already
+# auto-exports via the finalisation path (PIPELINE_MATSIM=1); this dependent job
+# is a belt-and-braces re-export over the run dir and is non-blocking.
+# The RUN_DIR is read from the prediction_run_dir.txt marker file written by the prediction job.
+jid_matsim=""
+if [ "${GA_MATSIM:-1}" = "1" ]; then
+  jid_matsim=$(qsub \
+    -N "ga_matsim_${RUN_TAG}" \
+    -W "depend=afterany:${jid_pred}" \
+    -l "select=1:ncpus=1:mem=16GB" \
+    -l "walltime=00:30:00" \
+    -v "RUN_DIR_MARKER=${PRED_RUN_MARKER},CONDA_ENV=${CONDA_ENV},MATSIM_CRS=${MATSIM_CRS:-EPSG:28356}" \
+    job_matsim_export.pbs | awk '{print $1}')
+  echo "Submitted matsim export: ${jid_matsim}"
+fi
+
+# Full-size MATSim scenario (GA_MATSIM_FULL=1, default on): build AND run the
+# MATSim Controler at MATSIM_SAMPLE_FRAC=1.0 (100% synthetic population) plus
+# network-level analysis, after the prediction job finishes. This is the heavy
+# one — see the GA_MATSIM_FULL resource knobs above. jid_matsim_full is the id
+# to wait for if you chain anything after it.
+jid_matsim_full=""
+if [ "${GA_MATSIM_FULL}" = "1" ]; then
+  jid_matsim_full=$(qsub \
+    -N "ga_matsim_full_${RUN_TAG}" \
+    -W "depend=afterany:${jid_pred}" \
+    -l "select=1:ncpus=${MATSIM_NCPUS}:mem=${MATSIM_MEM}" \
+    -l "walltime=${MATSIM_WALLTIME}" \
+    -v "RUN_DIR_MARKER=${PRED_RUN_MARKER},MATSIM_SAMPLE_FRAC=${MATSIM_SAMPLE_FRAC},MATSIM_ITERS=${MATSIM_ITERS},MATSIM_END_HOURS=${MATSIM_END_HOURS},MATSIM_HEAP=${MATSIM_HEAP},MATSIM_CRS=${MATSIM_CRS:-EPSG:28356},CONDA_ENV=${CONDA_ENV}" \
+    job_matsim_scenario.pbs | awk '{print $1}')
+  echo "Submitted full-size MATSim scenario (${MATSIM_SAMPLE_FRAC}): ${jid_matsim_full}"
+fi
+
+# Optional SimWrapper dashboard build, runs after prediction completes.
+# Uses RUN_DIR_MARKER to find the actual prediction run directory.
+jid_summarize=""
+if [ "${GA_SIMWRAPPER}" = "1" ]; then
+  jid_summarize=$(qsub \
+    -N "ga_summarize_${RUN_TAG}" \
+    -W "depend=afterany:${jid_pred}" \
+    -l "select=1:ncpus=1:mem=8GB" \
+    -l "walltime=01:00:00" \
+    -v "RUN_DIR_MARKER=${PRED_RUN_MARKER},CONDA_ENV=${CONDA_ENV},SKIP_MAP=${SKIP_MAP}" \
+    job_simwrapper_summaries.pbs | awk '{print $1}')
+  echo "Submitted summarize: ${jid_summarize}"
+fi
+
+# Optional POLARIS-style demand store build (after prediction).
+# Uses RUN_DIR_MARKER to find the actual prediction run directory.
+jid_polaris=""
+if [ "${GA_POLARIS}" = "1" ]; then
+  jid_polaris=$(qsub \
+    -N "ga_polaris_${RUN_TAG}" \
+    -W "depend=afterany:${jid_pred}" \
+    -l "select=1:ncpus=2:mem=48GB" \
+    -l "walltime=01:00:00" \
+    -v "RUN_DIR_MARKER=${PRED_RUN_MARKER},CONDA_ENV=${CONDA_ENV}" \
+    job_build_polaris_store.pbs | awk '{print $1}')
+  echo "Submitted polaris store: ${jid_polaris}"
+fi
+
+# Stage 7: Parking choice (after prediction, depends on stage6_output.csv)
+# Uses RUN_DIR_MARKER to find the actual prediction run directory.
+jid_parking=""
+if [ "${STAGE7_PARKING}" = "1" ]; then
+  jid_parking=$(qsub \
+    -N "ga_parking_${RUN_TAG}" \
+    -W "depend=afterany:${jid_pred}" \
+    -l "select=1:ncpus=4:mem=64GB" \
+    -l "walltime=02:00:00" \
+    -v "RUN_DIR_MARKER=${PRED_RUN_MARKER},CONDA_ENV=${CONDA_ENV},PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH}" \
+    job_stage7_parking.pbs | awk '{print $1}')
+  echo "Submitted parking choice: ${jid_parking}"
+fi
+
+# DTA Feedback Loop (after parking, runs demand↔DTA iterations)
+# Uses RUN_DIR_MARKER to find the actual prediction run directory.
+jid_dta_feedback=""
+if [ "${DTA_FEEDBACK_ITERS}" -gt 0 ]; then
+  jid_dta_feedback=$(qsub \
+    -N "ga_dtafb_${RUN_TAG}" \
+    -W "depend=afterany:${jid_parking:-${jid_pred}}" \
+    -l "select=1:ncpus=8:mem=128GB" \
+    -l "walltime=${DTA_FEEDBACK_WALLTIME:-48:00:00}" \
+    -v "RUN_DIR_MARKER=${PRED_RUN_MARKER},CONDA_ENV=${CONDA_ENV},PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH},DTA_FEEDBACK_ITERS=${DTA_FEEDBACK_ITERS},DTA_ENGINE=${DTA_ENGINE},DTA_CONVERGENCE_THRESHOLD=${DTA_CONVERGENCE_THRESHOLD}" \
+    job_dta_feedback.pbs | awk '{print $1}')
+  echo "Submitted DTA feedback: ${jid_dta_feedback}"
+fi
 
 echo "=========================================="
 echo "Submission chain complete"
@@ -165,5 +927,9 @@ echo "Run tag         : ${RUN_TAG}"
 echo "Stage deps      : ${deps}"
 echo "Merge job       : ${jid_merge}"
 echo "Prediction job  : ${jid_pred}"
+echo "MATSim exp job  : ${jid_matsim:-disabled}"
+echo "MATSim full job : ${jid_matsim_full:-disabled} (sample=${MATSIM_SAMPLE_FRAC}, heap=${MATSIM_HEAP})"
+echo "Summarize job   : ${jid_summarize:-disabled}"
+echo "Polaris job     : ${jid_polaris:-disabled}"
 echo "Merged GA dir   : ${MERGED_DIR}"
 echo "=========================================="

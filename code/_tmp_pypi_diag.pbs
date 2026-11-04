@@ -1,0 +1,34 @@
+#!/bin/bash
+#PBS -N pypi_diag
+#PBS -P FPAXJW8067
+#PBS -l select=1:ncpus=1:mem=4GB
+#PBS -l walltime=00:10:00
+#PBS -o /mnt/hpccs01/home/ahernz/test_runs_tours/code/_tmp_pypi_diag.o
+#PBS -e /mnt/hpccs01/home/ahernz/test_runs_tours/code/_tmp_pypi_diag.e
+cd /mnt/hpccs01/home/ahernz/test_runs_tours/code || exit 1
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate zigenv
+echo "HOSTNAME=$(hostname)"
+echo "=== installed now ==="
+pip show SearchLibrium 2>/dev/null | egrep '^(Name|Version|Location|Editable)' || echo "  not installed"
+echo
+echo "=== what versions exist on PyPI? ==="
+pip index versions SearchLibrium 2>&1 | head -5
+echo
+echo "=== is 0.0.255 on PyPI? ==="
+pip download SearchLibrium==0.0.255 --no-deps -d /tmp/pypi255 2>&1 | tail -4
+echo
+echo "=== latest resolvable ==="
+pip install SearchLibrium== 2>&1 | grep -oE 'from versions: [^)]*' | head -2
+echo
+echo "=== publish tooling available? ==="
+python -c "import twine; print('twine', twine.__version__)" 2>&1 | head -2
+python -c "import build; print('build ok')" 2>&1 | head -2
+echo
+echo "=== pypi credentials present? ==="
+ls -la ~/.pypirc 2>/dev/null || echo "  no ~/.pypirc"
+ls -la ~/.config/pip/pip.conf /etc/pip.conf 2>/dev/null || echo "  no pip.conf"
+echo
+echo "=== env index vars ==="
+env | egrep -i 'PIP_|PYPI|INDEX_URL' || echo "  none set"
+echo "PIP_DIAG_DONE"

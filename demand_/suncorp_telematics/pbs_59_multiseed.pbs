@@ -1,0 +1,104 @@
+#!/bin/bash -l
+#PBS -N gd_multiseed
+#PBS -l walltime=08:00:00
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -J 8-9
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+#PBS -o logs/multiseed_^array_index^.log
+
+set -euo pipefail
+
+# Multi-seed confirmation for the game-day MetaCount search (script 59).
+#
+# Background: the shipped model (results/game_day_search_best.json, seed 7,
+# BIC 16973.31) found its best by SA iteration 40 of 160 and sat flat fo
+# the remaining 120 (cache-exhausted) iterations. A single chain / single
+# seed cannot rule out a local optimum. These two fresh chains (seeds 8, 9)
+# test whether independent runs land near the same BIC with overlapping
+# specs. Compare afterwards with:
+#   python scripts/59d_compare_seeds.py
+#
+# Design (isolation is the whole point):
+#   * Array index maps directly to seed: task 8 -> --seed 8, task 9 -> --seed 9.
+#   * Each seed writes to its OWN out-dir (results_multiseed/seed8|9) and
+#     fig-dir. Script 59 re-points BEST_JSON/PROGRESS_CSV/search59/ into
+#     out_dir, while inputs (segment_15min_panel.parquet, fixture_calendar)
+#     stay shared. The shipped results/ outputs feeding the paper and the
+#     MIP are NEVER touched.
+#   * NO --resume flag: fresh chains, so agreement across seeds is genuine
+#     confirmation rather than re-reading the seed-7 checkpoint.
+#   * Search settings mirror the winning run recorded in best.json
+#     (160 iters / chunk 20 / R 25 / slim vars / target trips_mean_gt_10),
+#     not the older 120/25/40 defaults, so BICs are directly comparable.
+#
+#   qsub pbs_59_multiseed.pbs
+#   # when both tasks finish (logs/multiseed_8.log, logs/multiseed_9.log):
+#   python scripts/59d_compare_seeds.py
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+RESULTS_DIR=$PROJ_DIR/results
+
+SEED="${PBS_ARRAY_INDEX}"
+OUT_DIR=$PROJ_DIR/results_multiseed/seed${SEED}
+FIG_DIR=$PROJ_DIR/figures_multiseed/seed${SEED}
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export JAX_PLATFORMS=cpu
+
+cd "$SCRIPT_DIR"
+
+python -m pip install --upgrade --retries 2 --timeout 20 metacountregressor \
+  || python -m pip install --upgrade --no-index \
+       --find-links /home/ahernz/suncorp_wheels metacountregressor \
+  || { echo "FATAL: metacountregressor install failed (PyPI and staged wheel)"; exit 1; }
+python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,188), v" \
+  || { echo "FATAL: metacountregressor older than 1.0.188 or import failed"; exit 1; }
+
+echo "=================================================================="
+echo "Job $PBS_JOBID (seed $SEED) started on $(hostname) at $(date)"
+echo "59 multi-seed confirmation: fresh SA chain, out-dir $OUT_DIR"
+echo "=================================================================="
+
+[ -s "$RESULTS_DIR/segment_15min_panel.parquet" ] \
+  || { echo "FATAL: missing results/segment_15min_panel.parquet (run 58 first)"; exit 1; }
+[ -s "$PROJ_DIR/data/fixture_calendar.csv" ] \
+  || { echo "FATAL: missing fixture_calendar.csv"; exit 1; }
+
+mkdir -p "$OUT_DIR" "$FIG_DIR"
+if [ -s "$OUT_DIR/game_day_search_best.json" ]; then
+  echo "FATAL: $OUT_DIR/game_day_search_best.json already exists -- refusing to"
+  echo "  overwrite a previous seed-$SEED chain. Delete it to re-run this seed."
+  exit 1
+fi
+
+# Settings mirror the winning seed-7 run (see best.json: iters 160,
+# chunk 20, R 25, target trips_mean_gt_10) for direct BIC comparability.
+python -u 59_game_day_search_predict.py \
+  --seed "$SEED" \
+  --out-dir "$OUT_DIR" --fig-dir "$FIG_DIR" \
+  --search-iters 160 --search-chunk 20 --chunk-time 3600 \
+  --wall-budget 18000 --n-starts 2 \
+  --search-R 25 --refit-R 200 --search-vars slim \
+  --target trips_mean_gt_10 2>&1
+
+for f in game_day_pred_15min.parquet game_day_holdout_metrics.json \
+         game_day_search_best.json; do
+  [ -s "$OUT_DIR/$f" ] || { echo "FATAL: seed $SEED missing $f"; exit 1; }
+done
+for f in game_day_search_convergence.png game_day_calibration.png; do
+  [ -s "$FIG_DIR/$f" ] || echo "WARN: seed $SEED missing figure $f"
+done
+
+echo "seed $SEED OK"
+echo "Job finished at $(date)"

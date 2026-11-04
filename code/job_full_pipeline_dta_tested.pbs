@@ -1,0 +1,59 @@
+#!/bin/bash -l
+#PBS -N full_pipeline_dta_tested
+#PBS -l walltime=20:59:00
+#PBS -l select=1:ncpus=8:mem=194GB:ngpus=1
+#PBS -j eo
+#PBS -m abe
+#PBS -r y
+
+# ─────────────────────────────────────────────────────────────────────────────
+# job_full_pipeline_dta_tested.pbs
+# ─────────────────────────────────────────────────────────────────────────────
+# One process, does everything: reuses the completed GA feature search,
+# builds (finalizes) stage 1-5 models from it, predicts the new_pop
+# population, and writes vehicle.dat straight into
+#   Z:\test_runs_tours\DTA\DTA_Brisbane_tested\vehicle.dat
+# (previous file backed up alongside it first).
+#
+# Relies on the _logsums() fix in stage5_destination_choice.py — without it
+# this fails the same way ga_pred_run06 did (stuck on the first of ~300
+# origin-zone batches, never finishing within any walltime).
+#
+#   qsub job_full_pipeline_dta_tested.pbs
+# ─────────────────────────────────────────────────────────────────────────────
+
+cd $PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+rm -f full_pipeline_dta_tested.o* full_pipeline_dta_tested.e*
+rm -f log_full_pipeline_dta_tested.out log_full_pipeline_dta_tested.err
+conda activate zigenv
+module unload Anaconda3
+
+export JAX_PLATFORM_NAME=cpu
+export JAX_PLATFORMS=cpu
+export CUDA_VISIBLE_DEVICES=""
+export TF_CPP_MIN_LOG_LEVEL=3
+export XLA_FLAGS="--xla_force_host_platform_device_count=${NCPUS:-8}"
+
+export NEW_POP_MAPPED=1
+export NEW_POP=0
+export GA_ESTIMATOR=sa_bandit
+export GA_RESULTS_PKL="runs/ga_parallel/run06/merged/ga_results.pkl"
+
+mkdir -p runs/full_pipeline_dta_tested/plots
+mkdir -p saved_data
+
+echo "=========================================="
+echo "PBS job $PBS_JOBID  full_pipeline_dta_tested"
+echo "Working dir: $PBS_O_WORKDIR"
+echo "Run tag:     ${RUN_TAG:-full_pipeline_dta_tested_${PBS_JOBID}}"
+echo "Output dir:  runs/full_pipeline_dta_tested__${RUN_TAG:-full_pipeline_dta_tested_${PBS_JOBID}}/  (actual tagged dir from pbs_pipeline_mode.pbs)"
+echo "Started:     $(date)"
+echo "=========================================="
+
+python -u run_full_pipeline_dta_tested.py > log_full_pipeline_dta_tested.out 2> log_full_pipeline_dta_tested.err
+
+EXIT_CODE=$?
+echo "Finished: $(date)  exit_code=${EXIT_CODE}"
+exit ${EXIT_CODE}

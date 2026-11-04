@@ -1,0 +1,41 @@
+#!/bin/bash
+#PBS -N install_sl_wheel
+#PBS -l select=1:ncpus=1:mem=8gb
+#PBS -l walltime=00:15:00
+#PBS -j oe
+# Install the upstreamed SearchLibrium wheel (>= 0.0.270) into the zigenv 3.12
+# env. The patches that the pipeline used to file-swap at job start
+# (latent_class rail guards, mh_choice_estimator LC functions, lc_rail_guard)
+# now ship IN the wheel alongside build_latent_class and the larch LC
+# membership fix, so a plain pip install replaces the SEARCHLIBRIUM_SELFHEAL
+# patch step. Runs on a compute node (never the head node).
+set -euo pipefail
+cd "$PBS_O_WORKDIR" || exit 1
+echo "=== install_sl_wheel on $(hostname) at $(date) ==="
+
+WHEEL=${WHEEL:-"$PBS_O_WORKDIR/_patches/SearchLibrium/searchlibrium-0.0.270-py3-none-any.whl"}
+[[ -f "$WHEEL" ]] || { echo "FATAL: wheel not found: $WHEEL"; exit 1; }
+echo "wheel: $WHEEL"
+
+module load Anaconda3/2024.02-1
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
+conda activate zigenv
+module unload Anaconda3          # so python/pip resolve to the zigenv 3.12 env
+export PATH="${CONDA_PREFIX:?conda activate zigenv failed}/bin:$PATH"
+
+echo "python : $(which python)  ($(python --version 2>&1))"
+# Replace just the package; keep its already-satisfied dependencies untouched.
+python -m pip install --no-deps --force-reinstall "$WHEEL"
+
+echo "=== verify installed SL in the job's python ==="
+python - <<'PY'
+import SearchLibrium as s
+print("SL", s.__version__, s.__file__)
+from SearchLibrium.larch_models import build_latent_class            # larch LC assembly
+from SearchLibrium.mh_choice_estimator import estimate_dest_choice_lc, _fit_frame_mnl
+from SearchLibrium.latent_class import LatentClassMixedLogit
+from SearchLibrium.lc_rail_guard import lc_result_rail
+assert hasattr(LatentClassMixedLogit, "_compute_rail_flags")
+print("OK: build_latent_class + LC estimator + rail guard all present")
+PY
+echo "=== DONE $(date) ==="

@@ -1,0 +1,35 @@
+#!/bin/bash -l
+#PBS -N smoke_jax_models
+#PBS -l select=1:ncpus=2:mem=32gb
+#PBS -l walltime=00:40:00
+#PBS -j oe
+set -uo pipefail
+
+CODE=/mnt/hpccs01/home/ahernz/test_runs_tours/code
+SCRATCH=$(mktemp -d /tmp/smoke_jax_models.XXXXXX)
+cd "$SCRATCH"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export JAX_PLATFORMS=cpu
+export JAX_ENABLE_X64=1
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
+# write-isolation: nothing may land in the production code/data tree
+export PYTHONPYCACHEPREFIX="$SCRATCH/pycache"
+export TMPDIR="$SCRATCH/tmp"
+export XDG_CACHE_HOME="$SCRATCH/cache"
+export MPLCONFIGDIR="$SCRATCH/mpl"
+mkdir -p "$PYTHONPYCACHEPREFIX" "$TMPDIR" "$XDG_CACHE_HOME" "$MPLCONFIGDIR"
+
+echo "=== smoke_jax_models started $(date) ==="
+echo "isolation: cwd + all caches under $SCRATCH ; code/data tree read-only"
+python -u "$CODE/smoke_jax_models.py"
+_ec=$?
+echo "=== smoke_jax_models finished $(date) exit=$_ec ==="
+rm -rf "$SCRATCH"
+exit $_ec

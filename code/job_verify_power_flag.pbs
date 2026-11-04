@@ -1,0 +1,25 @@
+#!/bin/bash -l
+# Cheap verification job for the E1 STAGE5_POWER_ACC flag.
+#   qsub -v "RUN_TAG=powerflag1,STAGE5_POWER_ACC=1" job_verify_power_flag.pbs
+# 1 cpu / 8 GB / 30 min. Exits 0 + prints E1 FLAG VERIFIED on success.
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=1:mem=8GB
+#PBS -l walltime=00:30:00
+
+set -euo pipefail
+RUN_TAG=${RUN_TAG:-powerflag_$(date +%Y%m%d_%H%M%S)}
+STAGE5_POWER_ACC=${STAGE5_POWER_ACC:-0}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+
+cd "$PBS_O_WORKDIR"
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+conda activate "$CONDA_ENV"
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+export STAGE5_POWER_ACC RUN_TAG
+
+echo "RUN_TAG=${RUN_TAG} STAGE5_POWER_ACC=${STAGE5_POWER_ACC} CONDA_ENV=${CONDA_ENV}"
+python -u verify_power_flag.py

@@ -1,0 +1,26 @@
+#!/bin/bash -l
+#PBS -N poster_val2
+#PBS -P FPAXJW8067
+#PBS -l walltime=06:00:00
+#PBS -l select=1:ncpus=8:mem=96GB
+#PBS -j oe
+#PBS -m n
+cd $PBS_O_WORKDIR
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+conda activate zigenv
+export PIPELINE_SKIMS_PATH=../demand_/skims_371.omx
+export STAGE5_ZONE_BRIDGE=1
+export STAGE5_STRICT_ZONES=1
+export JAX_PLATFORMS=cpu
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+BASE=runs/safety_baseline__27333960.aqua
+NOSA=runs/safety_nosafety__poster_fix_v2
+echo "[$(date)] validation M_S=$BASE M_0=$NOSA"
+python -u validate_safety_arms.py \
+  --run-dir "$BASE" --m0-run-dir "$NOSA" \
+  --out runs/safety_validation_poster_fix_v2 \
+  --split random --frac 0.30 --segments work,edu,nonmand \
+  --skims ../demand_/skims_371.omx
+RC=$?
+echo "[$(date)] validation v2 exit=$RC"
+exit $RC

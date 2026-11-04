@@ -1,0 +1,62 @@
+#!/bin/bash -l
+#PBS -N suncorp_gameday_autophase
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+set -euo pipefail
+
+# Job 60d: deployment MIP with DATA-DRIVEN phase boundaries.
+# Identical to the shipped deployment arm (61/2) except --phase-bins auto:
+# each fixture's relocation bins are chosen from its predicted surface at
+# the lowest-load valid valleys instead of the fixed kickoff/full-time cuts.
+# Writes only to results/mip_autophase and figures/mip_autophase.
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+RESULTS_DIR=$PROJ_DIR/results
+FIG_DIR=$PROJ_DIR/figures
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+
+cd "$SCRIPT_DIR"
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "60d: deployment MIP with AUTO phase boundaries (data-driven moves)"
+echo "=================================================================="
+
+[ -s "$RESULTS_DIR/game_day_pred_15min.parquet" ] \
+  || { echo "FATAL: missing results/game_day_pred_15min.parquet"; exit 1; }
+[ -s "$PROJ_DIR/data/osm_roads_suncorp.geojson" ] \
+  || { echo "FATAL: missing data/osm_roads_suncorp.geojson"; exit 1; }
+
+python -u 60_game_day_mip.py \
+  --pred "$RESULTS_DIR/game_day_pred_15min.parquet" \
+  --pred-col pred_speeding \
+  --out-dir "$RESULTS_DIR/mip_autophase" \
+  --fig-dir "$FIG_DIR/mip_autophase" \
+  --min-marg 0.5 --max-segments 250 --squads all \
+  --travel-speed-kmh 43.2 --detour-factor 1.3 \
+  --setup-min 5 --max-travel-m 8000 --obs-m 100 \
+  --max-relocations 2 --min-move-gap-bins 0 \
+  --min-separation-m 300 \
+  --phase-bins auto \
+  --phase-target-frac 0.05 --mobility-ab on 2>&1
+
+for f in game_day_mip_sites.csv game_day_mip_plans.csv game_day_mip_schedule.csv game_day_mip_summary.json game_day_mip.tex; do
+  [ -s "$RESULTS_DIR/mip_autophase/$f" ] || { echo "FATAL: missing $f"; exit 1; }
+done
+
+echo "60d OK (auto phase boundaries)"
+echo "Job finished at $(date)"

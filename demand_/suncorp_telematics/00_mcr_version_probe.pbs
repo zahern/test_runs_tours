@@ -1,0 +1,63 @@
+#!/bin/bash -l
+#PBS -N suncorp_mcr_probe
+#PBS -l walltime=00:20:00
+#PBS -l select=1:ncpus=2:mem=8GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# Upgrades metacountregressor in zigenv to the latest PyPI release and proves
+# that (a) the installed version IS the latest on PyPI, (b) dist and module
+# versions agree (no torn install), (c) the API surface the pipeline needs
+# still exists. The 59/60 chain is submitted with afterok on this job, so a
+# regression in a newer release fails HERE first, cheaply.
+
+set -euo pipefail
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+
+cd "$PROJ_DIR/scripts"
+
+echo "=== installed before ==="
+python -c "from importlib.metadata import version; print(version('metacountregressor'))"
+
+echo "=== pip upgrade (latest PyPI, staged-wheel fallback) ==="
+python -m pip install --upgrade --retries 2 --timeout 20 metacountregressor \
+  || python -m pip install --upgrade --no-index \
+       --find-links /home/ahernz/suncorp_wheels metacountregressor \
+  || echo "WARN: no PyPI/wheel reach; asserting installed version below"
+
+echo "=== version + torn-install + latest check ==="
+python - <<'PY'
+import json
+import urllib.request
+from importlib.metadata import version
+
+import metacountregressor as m
+
+v = version("metacountregressor")
+mv = getattr(m, "__version__", "?")
+print("distribution:", v, "module:", mv)
+assert tuple(int(x) for x in v.split(".")[:3]) >= (1, 0, 188), v
+assert v == mv, f"torn install: dist {v} != module {mv}"
+try:
+    latest = json.load(urllib.request.urlopen(
+        "https://pypi.org/pypi/metacountregressor/json",
+        timeout=30))["info"]["version"]
+    print("PyPI latest:", latest)
+    assert latest == v, f"installed {v} != PyPI latest {latest}"
+except Exception as exc:
+    print("WARN: could not reach PyPI to compare latest:", exc)
+print("MCR PROBE OK", v)
+PY
+
+echo "=== API check ==="
+python -u 00_mcr_api_check.py
+echo "PROBE OK"

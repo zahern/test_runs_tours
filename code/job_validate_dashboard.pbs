@@ -1,0 +1,232 @@
+#!/bin/bash -l
+# Post-estimation HHTS re-prediction + ActivitySim-style dashboards, one job.
+#
+# Chain of work, for a single run tag:
+#   1. re-predict the HHTS respondents with the fitted stages   run_tag_validation.py
+#   2. observed-vs-predicted charts, KPIs, figure gallery       build_validation_dashboard.py
+#      (step 1 builds the pages itself; --dash-only rebuilds them without refitting)
+#   3. SimWrapper bundle incl. the "HHTS validation" tab        build_simwrapper_summaries.py
+#
+# Standalone:
+#   qsub -q cpu_inter -v RUN_TAG=paper_s5lc_20261029 job_validate_dashboard.pbs
+#
+# Chained so it starts when estimation finishes:
+#   qsub -W depend=afterok:<ga-jobid>   -v RUN_TAG=<tag> job_validate_dashboard.pbs
+#   qsub -W depend=afterany:<ga-jobid>  -v RUN_TAG=<tag> job_validate_dashboard.pbs
+# Use afterany when the search can end non-zero but still leaves stage model pkls;
+# every step below is non-fatal, so a partial run still gets whatever pages fit.
+#
+# Required -v : RUN_TAG
+# Optional -v : RUN_ROOT (default runs/ga_parallel), RUN_DIR_MARKER (file holding
+#               the run dir, as written by the prediction jobs), CONDA_ENV,
+#               CONDA_BASE, SKIP_MAP=1 (no study-area map panel),
+#               DASH_ONLY=1 (rebuild pages from existing artifacts), DRY_RUN=1.
+#
+# Exit codes: 0 pages built; 2 bad run dir; 3 SimWrapper build failed;
+#             4 validation produced no stage figures (dashboards are empty);
+#             5 dashboard page files missing from summarize/.
+
+#PBS -N validate_dashboard
+#PBS -m n
+#PBS -r y
+#PBS -j oe
+#PBS -l select=1:ncpus=2:mem=16GB
+#PBS -l walltime=06:00:00
+
+set -uo pipefail
+
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:-}
+RUN_DIR_MARKER=${RUN_DIR_MARKER:-}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+SKIP_MAP=${SKIP_MAP:-0}
+DASH_ONLY=${DASH_ONLY:-0}
+DRY_RUN=${DRY_RUN:-0}
+
+# Run from the directory holding the scripts: PBS_O_WORKDIR when it does (the
+# usual qsub-from-code-dir case), otherwise the directory this job script is in.
+CODE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+WORK_DIR=${PBS_O_WORKDIR:-$CODE_DIR}
+[ -f "${WORK_DIR}/build_simwrapper_summaries.py" ] || WORK_DIR="${CODE_DIR}"
+cd "${WORK_DIR}"
+
+# ---------------------------------------------------------------- environment
+CONDA_BASE=${CONDA_BASE:-/mnt/hpccs01/home/ahernz/miniconda3}
+if [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
+  # shellcheck disable=SC1091
+  source "${CONDA_BASE}/etc/profile.d/conda.sh"
+  conda activate "${CONDA_BASE}/envs/${CONDA_ENV}" 2>/dev/null \
+    || conda activate "${CONDA_ENV}"
+elif command -v module >/dev/null 2>&1; then
+  module purge
+  module load Anaconda3/2024.02-1 || true
+  conda activate "${CONDA_ENV}" || true
+fi
+if [ -n "${CONDA_PREFIX:-}" ]; then
+  export PATH="${CONDA_PREFIX}/bin:${PATH}"
+fi
+hash -r
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+# ------------------------------------------------------------- run directory
+# Marker written by a prediction job wins over RUN_ROOT/RUN_TAG.
+if [ -n "${RUN_DIR_MARKER}" ] && [ -f "${RUN_DIR_MARKER}" ]; then
+  RUN_DIR=$(tr -d '\r\n' < "${RUN_DIR_MARKER}")
+  echo "Run dir from marker: ${RUN_DIR}"
+else
+  if [ -z "${RUN_TAG}" ]; then
+    echo "ERROR: set RUN_TAG (or RUN_DIR_MARKER)" >&2
+    exit 2
+  fi
+  RUN_DIR="${RUN_ROOT}/${RUN_TAG}"
+fi
+
+if [ ! -d "${RUN_DIR}" ]; then
+  echo "ERROR: run dir ${RUN_DIR} does not exist" >&2
+  exit 2
+fi
+RUN_DIR=$(cd "${RUN_DIR}" && pwd)
+# Keep the python steps on the run dir the job resolved, whether it came from a
+# tag or a marker file, so validation and summaries never disagree.
+export RUN_ROOT=$(dirname "${RUN_DIR}")
+export RUN_TAG=$(basename "${RUN_DIR}")
+
+PLOTS_DIR="${RUN_DIR}/plots/validation"
+SUMM_DIR="${RUN_DIR}/summarize"
+EXTRA=""
+if [ "${SKIP_MAP}" = "1" ]; then
+  EXTRA="--skip-map"
+fi
+
+N_MODELS=$(find "${RUN_DIR}" -maxdepth 3 -type f -name '*models*.pkl' 2>/dev/null | wc -l | tr -d ' ')
+
+echo "=========================================="
+echo "Job          : ${PBS_JOBID:-local}"
+echo "Code dir     : ${WORK_DIR}"
+echo "Run dir      : ${RUN_DIR}"
+echo "Started      : $(date)"
+echo "Python       : $(command -v python || echo 'not found')"
+echo "Stage models : ${N_MODELS} pkl found"
+echo "=========================================="
+
+if [ "${DRY_RUN}" = "1" ]; then
+  echo "DRY: cd ${RUN_DIR} && RUN_TAG=... python -u run_tag_validation.py"
+  echo "DRY: python -u build_simwrapper_summaries.py ${RUN_DIR} ${EXTRA}"
+  exit 0
+fi
+
+if [ "${N_MODELS}" = "0" ] && [ "${DASH_ONLY}" != "1" ]; then
+  echo "WARNING: no stage model pkl under ${RUN_DIR}; every stage will be skipped."
+  echo "         Pages are still built from whatever artifacts already exist."
+fi
+
+# ------------------------------------------- 1+2. HHTS re-prediction + pages
+RC_VAL=0
+if [ "${DASH_ONLY}" = "1" ]; then
+  echo "[1/3] dash-only: rebuilding pages from existing validation artifacts"
+  python -u -X utf8 - "${RUN_DIR}" <<'PY'
+import os, sys
+from build_validation_dashboard import build_validation_dashboard
+run_dir = sys.argv[1]
+built = build_validation_dashboard(run_dir, out_dir=os.path.join(run_dir, 'summarize'))
+if built is False:
+    raise SystemExit(1)
+PY
+  RC_VAL=$?
+else
+  echo "[1/3] re-predicting HHTS respondents (all fitted stages)"
+  python -u -X utf8 run_tag_validation.py
+  RC_VAL=$?
+fi
+if [ "${RC_VAL}" -ne 0 ]; then
+  echo "WARNING: validation step returned ${RC_VAL} (continuing)"
+fi
+
+# ---------------------------------------------- 3. SimWrapper dashboard bundle
+echo "[2/3] building SimWrapper bundle (map, coefficients, validation tab)"
+# shellcheck disable=SC2086
+python -u -X utf8 build_simwrapper_summaries.py "${RUN_DIR}" ${EXTRA}
+RC_SW=$?
+if [ "${RC_SW}" -ne 0 ]; then
+  echo "WARNING: SimWrapper summaries returned ${RC_SW}"
+fi
+
+# ------------------------------------------------------------- verification
+echo "[3/3] verifying artifacts"
+N_PAGES_MISSING=0
+N_PNG=0
+if [ -d "${PLOTS_DIR}" ]; then
+  N_PNG=$(find "${PLOTS_DIR}" -maxdepth 1 -type f -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
+fi
+N_STAGE=0
+if [ -f "${RUN_DIR}/validation_metrics.json" ]; then
+  N_STAGE=$(python - "${RUN_DIR}/validation_metrics.json" <<'PY' 2>/dev/null || echo 0
+import json, sys
+payload = json.load(open(sys.argv[1], encoding='utf-8'))
+stages = payload.get('stages') if isinstance(payload, dict) else payload
+print(len(stages or []))
+PY
+)
+fi
+
+for f in "${RUN_DIR}/validation_metrics.json" \
+         "${SUMM_DIR}/dashboard-2-validation.yaml" \
+         "${SUMM_DIR}/topsheet-validation.yaml" \
+         "${SUMM_DIR}/validation_gallery.html" \
+         "${SUMM_DIR}/val_kpis.csv"; do
+  if [ -f "$f" ]; then
+    echo "  ok      ${f#${RUN_DIR}/}"
+  else
+    echo "  MISSING ${f#${RUN_DIR}/}"
+    N_PAGES_MISSING=$((N_PAGES_MISSING + 1))
+  fi
+done
+# Tables depend on which stages reported: absent is informational, not a failure.
+for f in "${SUMM_DIR}/val_mode_share.csv" \
+         "${SUMM_DIR}/val_purpose_means.csv" \
+         "${SUMM_DIR}/val_destination_fit.csv" \
+         "${SUMM_DIR}/val_tod_profile.csv" \
+         "${SUMM_DIR}/val_trip_length.csv"; do
+  if [ -f "$f" ]; then
+    echo "  ok      ${f#${RUN_DIR}/}"
+  else
+    echo "  absent  ${f#${RUN_DIR}/} (stage not in this run)"
+  fi
+done
+echo "  figures : ${N_PNG} png in plots/validation"
+echo "  stages  : ${N_STAGE} stage comparisons in validation_metrics.json"
+
+# Marker so later jobs (publish/polling) can find the dashboard without a tag.
+{
+  echo "run_tag=${RUN_TAG:-$(basename "${RUN_DIR}")}"
+  echo "run_dir=${RUN_DIR}"
+  echo "summarize_dir=${SUMM_DIR}"
+  echo "gallery=${SUMM_DIR}/validation_gallery.html"
+  echo "built_at=$(date -Is 2>/dev/null || date)"
+  echo "validation_rc=${RC_VAL}"
+  echo "summaries_rc=${RC_SW}"
+  echo "figures=${N_PNG}"
+  echo "stages=${N_STAGE}"
+} > "${RUN_DIR}/validation_dashboard.txt"
+echo "  marker  : validation_dashboard.txt"
+
+echo "View with:  simwrapper open asim ${SUMM_DIR}"
+echo "Gallery:    ${SUMM_DIR}/validation_gallery.html"
+echo "Finished: $(date)"
+
+if [ "${RC_SW}" != "0" ]; then
+  echo "FAILED: SimWrapper bundle did not build (rc=${RC_SW})" >&2
+  exit 3
+fi
+if [ "${N_STAGE}" = "0" ]; then
+  echo "EMPTY: validation produced no stage comparisons; dashboards have no charts." >&2
+  echo "       Fit the stages first, or point RUN_TAG at a run holding stage model pkls." >&2
+  exit 4
+fi
+if [ "${N_PAGES_MISSING}" != "0" ]; then
+  echo "FAILED: ${N_PAGES_MISSING} dashboard page(s) missing from ${SUMM_DIR}" >&2
+  exit 5
+fi
+echo "OK: validation + dashboards built for ${RUN_DIR}"

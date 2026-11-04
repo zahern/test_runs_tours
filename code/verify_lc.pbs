@@ -1,0 +1,43 @@
+#!/bin/bash
+#PBS -N verify_lc_import
+#PBS -P FPAXJW8067
+#PBS -l select=1:ncpus=1:mem=4GB
+#PBS -l walltime=00:10:00
+#PBS -o /mnt/hpccs01/home/ahernz/test_runs_tours/code/verify_lc_import.o
+#PBS -e /mnt/hpccs01/home/ahernz/test_runs_tours/code/verify_lc_import.e
+cd /mnt/hpccs01/home/ahernz/test_runs_tours/code || exit 1
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate zigenv
+echo "HOSTNAME=$(hostname)"
+python - <<'PY'
+import traceback
+from SearchLibrium import mh_choice_estimator as M
+print("module file:", M.__file__)
+ok = True
+required = ["estimate_dest_choice", "estimate_dest_choice_lc",
+            "effective_sample_size", "r_hat"]
+optional = ["identify_weak_features", "estimate_dest_choice_interactions",
+            "add_actor_columns", "add_interaction_columns"]
+for name in required + optional:
+    has = hasattr(M, name)
+    tag = "REQUIRED" if name in required else "optional"
+    print("%-34s %-9s %s" % (name, tag, has))
+    if not has and name in required:
+        ok = False
+try:
+    from SearchLibrium.mh_choice_estimator import estimate_dest_choice_lc
+    print("IMPORT estimate_dest_choice_lc: OK")
+except Exception:
+    ok = False
+    traceback.print_exc()
+try:
+    import stage5_lc_genes
+    print("stage5_lc_genes import: OK")
+except Exception as exc:
+    print("stage5_lc_genes import FAILED:", type(exc).__name__, exc)
+import inspect
+src = inspect.getsource(M)
+print("leash present:", "SL_HHTS_MAX_HISTORY" in src, "| deque bound:", "deque(maxlen=" in src)
+print("OVERALL:", "PASS" if ok else "FAIL")
+PY
+echo VERIFY_DONE

@@ -1,0 +1,138 @@
+#!/bin/bash -l
+#PBS -N suncorp_seg_speed_pred
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# Job 17: speeding -> segment -> deploy (in order). NO risk weighting.
+#   speeding (43): finable exceedances >=10kph over limit + corridors.
+#   segment (47): SEARCH over segment characteristics -> hourly speeding
+#       predictions, game holdout + convergence.
+#   deploy (48): P4/P5 re-solved on pure predicted speeding counts.
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results
+FIG_DIR=$PROJ_DIR/figures
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export JAX_PLATFORMS=cpu
+
+# --- metacountregressor: latest PyPI release, staged-wheel fallback offline ---
+python -m pip install --upgrade --retries 2 --timeout 20 metacountregressor || python -m pip install --upgrade --no-index --find-links /home/ahernz/suncorp_wheels metacountregressor || { echo "FATAL: metacountregressor install failed (PyPI and staged wheel)"; exit 1; }
+python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,188), v" || { echo "FATAL: metacountregressor older than 1.0.188 or import failed"; exit 1; }
+
+cd "$SCRIPT_DIR"
+python -u 00_mcr_api_check.py 2>&1 || { echo "FATAL: metacountregressor API check failed (need ExperimentBuilder.build_evaluator/run/fit_manual_model + ModelConstraints)"; exit 1; }
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "Order: speeding (43) -> segment (47) -> deploy (48)"
+echo "=================================================================="
+
+# Raw inputs for speeding step (finable output itself is regenerated below).
+for f in "$RESULTS_DIR/event_points_full.csv.gz" "$DATA_DIR/osm_roads_suncorp.geojson" \
+         "$DATA_DIR/fixture_calendar.csv" "$RESULTS_DIR/post_selection_mip.csv" \
+         "$DATA_DIR/near_miss_hb_ecf.csv" "$DATA_DIR/road_meta.csv"; do
+  [ -s "$f" ] || { echo "FATAL: missing input $f"; exit 1; }
+done
+echo "Inputs OK."
+echo "Overture extract: $(ls -la $DATA_DIR/overture_transportation.parquet 2>/dev/null || echo 'absent (OSM-only geometry + Polaris-style KNN build)')"
+echo "POI counts: $(ls -la $DATA_DIR/segment_poi_counts.csv 2>/dev/null || echo 'absent (skipped gracefully)')"
+
+echo ""
+echo "Step 1/3: speeding - running 43_finable_speeding.py..."
+python -u 43_finable_speeding.py --margin 10 --max-exceedance 30 --staffed-p 5 2>&1
+[ $? -ne 0 ] && { echo "FATAL: 43 speeding failed"; exit 1; }
+[ -s "$RESULTS_DIR/finable_exceedances.csv.gz" ] || { echo "FATAL: 43 missing finable_exceedances.csv.gz"; exit 1; }
+[ -s "$RESULTS_DIR/finable_speeding_audit.json" ] || { echo "FATAL: 43 missing finable_speeding_audit.json"; exit 1; }
+echo "Speeding OK."
+
+# --- Refresh Polaris-style geometry features so 47 searches Overture fields
+if [ ! -s "$DATA_DIR/road_geometry_features.csv" ]; then
+  echo "Geometry features missing -> running 25_road_geometry_features.py..."
+  python -u 25_road_geometry_features.py 2>&1
+  [ $? -ne 0 ] && { echo "FATAL: geometry build failed"; exit 1; }
+else
+  echo "Geometry features present."
+fi
+
+echo ""
+echo "Step 2a/4: segment search - running 47 (one SparseEA-AGDS search, checkpointed)..."
+python -u 47_segment_speeding_predictive.py --search-only \
+  --max-exceedance 30 \
+  --engine jax --search-algo agds --search-iters 120 --search-chunk-iters 120 \
+  --search-R 40 --search-jobs 1 2>&1
+[ $? -ne 0 ] && echo "WARN: 47 search-only exited non-zero (partial checkpoint may still exist)"
+[ -f "$RESULTS_DIR/segment_search47_best.json" ] \
+  || { echo "FATAL: no best-spec checkpoint (nothing to resume from)"; exit 1; }
+echo "Search checkpoint OK (results return before finish; resumable)."
+
+echo ""
+echo "Step 2b/4: segment resume - refit + hourly predictions + copula + holdout..."
+python -u 47_segment_speeding_predictive.py \
+  --resume-from "$RESULTS_DIR/segment_search47_best.json" \
+  --max-exceedance 30 \
+  --refit-R 500 2>&1
+[ $? -ne 0 ] && { echo "FATAL: 47 segment resume failed (holdout guards or refit error)"; exit 1; }
+[ -s "$RESULTS_DIR/segment_speeding_pred_post_hourly.csv" ] || { echo "FATAL: 47 missing segment_speeding_pred_post_hourly.csv"; exit 1; }
+[ -s "$RESULTS_DIR/segment_speeding_pred_fixture_hourly.csv.gz" ] || { echo "FATAL: 47 missing segment_speeding_pred_fixture_hourly.csv.gz"; exit 1; }
+echo "Segment OK."
+
+echo ""
+echo "Step 3/4: deploy - running 48_speeding_only_deployment.py (pure speeding P4/P5)..."
+python -u 48_speeding_only_deployment.py --squad 5 --k 14 --delta-m 800 2>&1
+EXIT_CODE=$?
+
+echo ""
+echo "Running 49_matsim_export.py (offline MATSim scenario)..."
+python -u 49_matsim_export.py 2>&1 || echo "WARN: 49 MATSim export failed (non-fatal)"
+
+echo ""
+echo "Running 50_outcome_visualizer_3d.py (ANTARES-pattern 3D outcome)..."
+python -u 50_outcome_visualizer_3d.py 2>&1 || echo "WARN: 50 visualizer failed (non-fatal)"
+
+echo ""
+echo "Checking outputs..."
+for f in segment_speeding_pred_base.csv segment_speeding_pred_fixture.csv.gz \
+         segment_speeding_pred_fixture_hourly.csv.gz \
+         segment_speeding_pred_phase_totals.csv \
+         segment_speeding_pred_background.csv segment_speeding_holdout.csv \
+         segment_speeding_pred_post_hourly.csv \
+         segment_speeding_pred.tex segment_speeding_convergence.tex \
+         segment_speeding_pred_audit.json speeding_only_posts.csv \
+         speeding_only_deployment.csv speeding_only_perfixture.csv \
+         speeding_only_deployment.tex \
+         speeding_only_audit.json; do
+  if [ -f "$RESULTS_DIR/$f" ]; then echo "  OK $f"; else echo "  MISSING $f"; EXIT_CODE=1; fi
+done
+for f in segment_speeding_copula_compare.csv segment_speeding_copula.tex \
+         segment_speeding_copula_audit.json \
+         segment_speeding_pred_copula_phase.csv.gz \
+         segment_search47_progress.csv; do
+  if [ -f "$RESULTS_DIR/$f" ]; then echo "  OK $f"; else echo "  MISSING $f (copula/progress optional)"; fi
+done
+for f in segment_search47_progress.png; do
+  if [ -f "$FIG_DIR/$f" ]; then echo "  OK figures/$f"; else echo "  MISSING figures/$f (progress plot optional)"; fi
+done
+for f in matsim/network.xml matsim/population.xml matsim/facilities.xml; do
+  if [ -f "$RESULTS_DIR/$f" ]; then echo "  OK $f"; else echo "  MISSING $f (non-fatal)"; fi
+done
+for f in outcome_3d.html outcome_3d_data.json; do
+  if [ -f "$FIG_DIR/$f" ]; then echo "  OK $f"; else echo "  MISSING $f (non-fatal)"; fi
+done
+
+echo "=================================================================="
+echo "Job finished at $(date) - exit_code=$EXIT_CODE"
+echo "=================================================================="
+exit $EXIT_CODE

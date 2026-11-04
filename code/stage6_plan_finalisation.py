@@ -11,11 +11,12 @@ overwrite Stage 5's correctly-estimated modes.
 
 Stage 6 now does three things:
 
-  1. VALIDATION — check the trip chain for impossible records and fix them:
-       - Schedule gaps (time between activity ENDTIME and next trip STARTIME)
-       - Overnight trips (ENDTIME > 1439 / midnight)
-       - Zero or negative travel times
-       - Invalid zones (OTAZ or DTAZ = 0 or 330)
+   1. VALIDATION — check the trip chain for impossible records and fix them:
+        - Schedule gaps (time between activity ENDTIME and next trip STARTIME)
+        - Overnight trips (ENDTIME > 1439 / midnight)
+        - Zero or negative travel times
+        - Invalid zones (OTAZ or DTAZ = 0, 999 fringe/external, or outside 1-371.
+          NOTE: ORDER 330 is a REAL zone in the 371 system, never a catch-all)
        - Mode-distance mismatches (Walk for 50km, Bike for 80km)
        - Duplicate rows per person
 
@@ -51,6 +52,7 @@ import numpy as np
 import pandas as pd
 import logging
 import os
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -129,8 +131,10 @@ def validate_and_fix(plan: pd.DataFrame,
     - Negative or zero travtime → replaced with mode-default (10 min)
     - ENDTIME > 1439 → clipped to 1439 (midnight)
     - STARTIME < 240 → warn (pre-4am trips are unusual but not removed)
-    - OTAZ or DTAZ == 0 → flag; set DTAZ = OTAZ (intra-zonal fallback)
-    - OTAZ or DTAZ == 330 → the catch-all zone; warn
+     - OTAZ or DTAZ == 0 → flag; set DTAZ = OTAZ (intra-zonal fallback)
+     - OTAZ or DTAZ == 999 → fringe/external sentinel; warn (kept, excluded
+       from valid-zone metrics). Values outside 1-371 (other than 999) → flag.
+       ORDER 330 is a real 371-system zone and is NEVER treated as catch-all
     - Schedule gap between activity ENDTIME and next trip STARTIME →
       adjust next trip's STARTIME to close the gap
     - Mode-distance mismatch → downgrade to DA if walk/bike distance
@@ -189,34 +193,49 @@ def validate_and_fix(plan: pd.DataFrame,
                 if other in df.columns:
                     df.loc[zero_mask, col] = df.loc[zero_mask, other]
 
-            z330 = df[col] == 330
-            if z330.any():
-                _flag(z330, f'{col}=330_catchall')
+            # 371-only: 999 = fringe/external sentinel; out-of-range (excl. 999)
+            # is invalid. ORDER 330 is a real zone — never flagged.
+            zext = (df[col] == 999) | (~df[col].between(1, N_VALID_ZONES, inclusive='both'))
+            if zext.any():
+                _flag(zext, f'{col}=external_or_out_of_range')
                 if verbose:
-                    print(f"  WARNING: {z330.sum()} rows use catch-all zone 330 for {col}")
+                    print(f"  WARNING: {zext.sum()} rows have external/out-of-range {col} "
+                          f"(999 fringe or outside 1-{N_VALID_ZONES})")
 
     # ── 4. schedule gap repair (per person) ───────────────────────────────
-    if {'STARTIME', 'ENDTIME', 'row_type'}.issubset(df.columns):
-        repaired = 0
+    # ── Tier-1 time-window scheduler: conflict-free per-person day ───────────
+    # A person cannot be in two places at once. Sweep each person's rows in time
+    # order with a running "cursor" (earliest free minute); any row that starts
+    # before the cursor (an OVERLAP / conflict) is pushed forward to begin at the
+    # cursor, PRESERVING its own duration (unlike the old fix, which truncated
+    # activities to prev_end+travtime). Consumed time thus makes later slots
+    # unavailable — the availability-propagation you asked for. Disable with
+    # GA_RESOLVE_CONFLICTS=0.
+    if ({'STARTIME', 'ENDTIME'}.issubset(df.columns)
+            and os.environ.get('GA_RESOLVE_CONFLICTS', '1').strip() != '0'):
         df = df.sort_values(['person_id', 'STARTIME']).reset_index(drop=True)
-        for pid, grp in df.groupby('person_id', sort=False):
-            idx_list = grp.index.tolist()
-            for k in range(1, len(idx_list)):
-                prev_idx = idx_list[k - 1]
-                curr_idx = idx_list[k]
-                prev_end  = df.at[prev_idx, 'ENDTIME']
-                curr_start = df.at[curr_idx, 'STARTIME']
-                if curr_start < prev_end - 1:   # gap > 1 min
-                    df.at[curr_idx, 'STARTIME'] = prev_end
-                    df.at[curr_idx, 'ENDTIME']  = max(
-                        prev_end + df.at[curr_idx, 'travtime']
-                        if 'travtime' in df.columns else prev_end + 5,
-                        prev_end + 1
-                    )
-                    _flag(pd.Index([curr_idx]), 'schedule_gap')
-                    repaired += 1
-        if verbose and repaired:
-            print(f"  Repaired {repaired} schedule gaps")
+        _st = pd.to_numeric(df['STARTIME'], errors='coerce').fillna(0.0).to_numpy(float)
+        _en = pd.to_numeric(df['ENDTIME'], errors='coerce').fillna(0.0).to_numpy(float)
+        _pid = df['person_id'].to_numpy()
+        _conf = []
+        _cursor, _cur = -1.0, None
+        for _i in range(len(df)):
+            if _pid[_i] != _cur:
+                _cur, _cursor = _pid[_i], -1.0
+            _dur = max(_en[_i] - _st[_i], 0.0)
+            if _cursor >= 0 and _st[_i] < _cursor - 1e-6:      # overlap → shift, keep duration
+                _st[_i] = _cursor
+                _en[_i] = min(_st[_i] + _dur, 1439.0)
+                _conf.append(_i)
+            else:
+                _en[_i] = min(_en[_i], 1439.0)
+            _cursor = _en[_i]
+        df['STARTIME'], df['ENDTIME'] = _st, _en
+        if _conf:
+            _flag(pd.Index(_conf), 'time_conflict')
+            if verbose:
+                print(f"  Tier-1 scheduler: resolved {len(_conf)} time-overlap "
+                      f"conflict(s) (duration-preserving)")
 
     # ── 5. mode-distance mismatch ─────────────────────────────────────────
     if 'dist' in df.columns and 'mode_name' in df.columns:
@@ -251,7 +270,10 @@ def validate_and_fix(plan: pd.DataFrame,
 # 2. DESTINATION ZONE VALIDATION
 # ===========================================================================
 
-N_VALID_ZONES = 329   # zones 1–329; zone 330 = catch-all invalid
+# 371-system: zones 1-371 are all real; 999 = fringe/external sentinel.
+# ORDER 330 is a real zone and is NEVER a catch-all.
+N_VALID_ZONES = 371
+FRINGE_ZONE = 999
 
 
 def compute_zone_validation_metrics(
@@ -264,8 +286,8 @@ def compute_zone_validation_metrics(
 
     Metrics returned
     ----------------
-    pct_valid_dtaz        : % of trip rows with DTAZ in 1-329
-    pct_catchall_dtaz     : % of trip rows with DTAZ == 330 (invalid catch-all)
+    pct_valid_dtaz        : % of trip rows with DTAZ in 1-371
+    pct_catchall_dtaz     : % of trip rows with DTAZ == 999 (fringe/external)
     pct_intrazonal        : % of trips where OTAZ == DTAZ (stayed in zone)
     n_unique_dtaz         : number of distinct DTAZ values used
     mean_dtaz_per_person  : average number of unique destination zones per person
@@ -287,7 +309,7 @@ def compute_zone_validation_metrics(
         return {}
 
     valid_mask    = dtaz.between(1, N_VALID_ZONES, inclusive='both')
-    catchall_mask = dtaz == 330
+    catchall_mask = dtaz == FRINGE_ZONE
     intra_mask    = (otaz == dtaz) & valid_mask
 
     pct_valid    = valid_mask.sum() / n * 100
@@ -322,7 +344,7 @@ def compute_zone_validation_metrics(
     if 'mode_name' in trips.columns:
         for mode, grp in trips.groupby('mode_name'):
             n_mode = len(grp)
-            n_ca   = int((pd.to_numeric(grp['DTAZ'], errors='coerce') == 330).sum())
+            n_ca   = int((pd.to_numeric(grp['DTAZ'], errors='coerce') == FRINGE_ZONE).sum())
             catchall_by_mode[str(mode)] = round(n_ca / n_mode * 100, 2) if n_mode else 0.0
 
     metrics = {
@@ -343,7 +365,7 @@ def compute_zone_validation_metrics(
     if verbose:
         print("\n  ── Destination Zone Validation ──────────────────────────")
         print(f"     Valid DTAZ (1-{N_VALID_ZONES}): {pct_valid:.1f}%   "
-              f"Catch-all (330): {pct_catchall:.1f}%")
+              f"Fringe/external (999): {pct_catchall:.1f}%")
         print(f"     Intrazonal trips:  {pct_intra:.1f}%")
         print(f"     Unique zones used: {n_unique} / {N_VALID_ZONES}   "
               f"Entropy (0=concentrated, 1=uniform): {entropy:.3f}")
@@ -633,6 +655,103 @@ def save_motorised_trips(
 
 
 # ===========================================================================
+# ZONE CROSSWALK  (ABM zone numbering  ->  a specific DynusT network's zones)
+# ===========================================================================
+
+def apply_dynust_zone_crosswalk(motorised_trips: dict, crosswalk_path: str) -> dict:
+    """
+    Remap OTAZ/DTAZ from the ABM's zone numbering onto a target DynusT
+    network's own zone numbering, and drop trips that fall outside that
+    network's coverage.
+
+    Needed because write_dynus_vehicle_dat() writes OTAZ/DTAZ straight into
+    vehicle.dat's zone fields, which only works if the ABM's zone numbers
+    already match the target network's numbering 1:1. For networks where
+    they don't (e.g. a network covering a smaller sub-area, or with a
+    different zone count) use build_dynust_zone_crosswalk.py to build a
+    crosswalk CSV first (columns: ORDER, dynust_zone, dist_m, in_network),
+    then pass its path here.
+
+    Trips where the origin or destination ABM zone has in_network=False
+    (i.e. no DynusT zone in this network is anywhere near it) are dropped
+    entirely rather than forced onto a distant/wrong zone.
+
+    Parameters
+    ----------
+    motorised_trips : dict from save_motorised_trips()  {label: DataFrame}
+    crosswalk_path  : CSV from build_dynust_zone_crosswalk.py
+
+    Returns
+    -------
+    dict, same shape as motorised_trips, with OTAZ/DTAZ remapped to the
+    target network's zone numbers and out-of-coverage trips removed.
+    """
+    cw = pd.read_csv(crosswalk_path)
+    order_to_dynust = cw.set_index('ORDER')['dynust_zone'].to_dict()
+    in_network = set(cw.loc[cw['in_network'], 'ORDER'])
+    _zone_name = (cw.set_index('ORDER')['SA2_NAME16'].to_dict()
+                  if 'SA2_NAME16' in cw.columns else {})
+
+    remapped = {}
+    _oon_rows = []   # out-of-network audit rows, written next to vehicle.dat
+    for label, df in motorised_trips.items():
+        if df is None or len(df) == 0:
+            remapped[label] = df
+            continue
+        d = df.copy()
+        otaz = pd.to_numeric(d['OTAZ'], errors='coerce')
+        dtaz = pd.to_numeric(d['DTAZ'], errors='coerce')
+        keep = otaz.isin(in_network) & dtaz.isin(in_network)
+        n_before = len(d)
+
+        # ── audit the trips that FAIL the coverage test, per offending zone,
+        # before dropping them - so vehicle.dat ships with an explicit
+        # account of what demand the DTA network is not seeing.
+        if (~keep).any():
+            _bad = pd.concat([
+                otaz[~otaz.isin(in_network)].rename('zone'),
+                dtaz[~dtaz.isin(in_network)].rename('zone'),
+            ])
+            for z, n in _bad.value_counts().items():
+                _oon_rows.append({
+                    'segment': label, 'abm_zone': int(z) if pd.notna(z) else -1,
+                    'zone_name': _zone_name.get(z, ''),
+                    'n_trip_ends': int(n),
+                    'reason': ('not in crosswalk' if z not in order_to_dynust
+                               else 'in_network=False (outside DTA coverage)'),
+                })
+
+        d = d.loc[keep].copy()
+        d['OTAZ'] = otaz.loc[keep].map(order_to_dynust).astype(int)
+        d['DTAZ'] = dtaz.loc[keep].map(order_to_dynust).astype(int)
+        logger.info(
+            f"apply_dynust_zone_crosswalk[{label}]: {len(d):,}/{n_before:,} trips "
+            f"kept (both endpoints inside target network's coverage)"
+        )
+        remapped[label] = d
+
+    # Sidecar report next to the crosswalk: which zones carried demand that
+    # never reached vehicle.dat, and how much. This is the "inform" channel
+    # for out-of-network vehicles - read it whenever DTA volumes look light.
+    if _oon_rows:
+        _rep = pd.DataFrame(_oon_rows).sort_values('n_trip_ends', ascending=False)
+        _rep_path = os.path.join(os.path.dirname(os.path.abspath(crosswalk_path)),
+                                 'vehicle_dat_out_of_network.csv')
+        try:
+            _rep.to_csv(_rep_path, index=False)
+            _tot = int(_rep['n_trip_ends'].sum())
+            _top = _rep.head(5)[['abm_zone', 'zone_name', 'n_trip_ends']].to_dict('records')
+            logger.warning(
+                f"apply_dynust_zone_crosswalk: {_tot:,} trip-ends touched zones "
+                f"outside the DTA network and were EXCLUDED from vehicle.dat. "
+                f"Top zones: {_top}. Full report: {_rep_path}"
+            )
+        except Exception as _rep_e:
+            logger.warning(f"out-of-network report write failed: {_rep_e}")
+    return remapped
+
+
+# ===========================================================================
 # DYNUS-T  vehicle.dat  WRITER
 # ===========================================================================
 
@@ -649,7 +768,9 @@ def write_dynus_vehicle_dat(
     """
     Write a DynusT/DYNASMART-P vehicle.dat file from the motorised trip splits.
 
-    Format reference: DSP User's Guide v1.3.0, Section 4.23 (Table 4-27 / Figure 4-26)
+    Format reference: DSP User's Guide v1.3.0, Section 4.23 (Table 4-27 /
+    Figure 4-26) — page 78-79.  The 15 written fields mirror the layout of
+    the reference output_vehicle.dat file.
 
     ┌──────────────────────────────────────────────────────────────────┐
     │  VEHICLE.DAT FORMAT (DYNASMART-P / DynusT)                       │
@@ -657,44 +778,59 @@ def write_dynus_vehicle_dat(
     │  Record 1  (Basic data — one line)                               │
     │    Field 1  INT   Number of vehicles to load                     │
     │    Field 2  INT   Max destinations per vehicle (1 for O-D only)  │
-    │    Field 3  TEXT  Optional description                           │
+    │    Field 3  Text  Optional description                           │
     │                                                                  │
-    │  Record 2  (Header comment line — optional)                      │
+    │  Record 2  (Header comment line)                                 │
     │                                                                  │
     │  Record 3+ (Vehicle characteristics — one line per vehicle)      │
-    │    Field 1   I  w7   Vehicle ID (sequential from 1)              │
-    │    Field 2   I  w7   Upstream node of generation link (usec)     │
-    │    Field 3   I  w7   Downstream node of generation link (dsec)   │
-    │    Field 4   F  w8   Departure time in MINUTES (ascending order) │
-    │    Field 5   I  w6   User class: 1=unresponsive 2=SO 3=UE        │
-    │                      4=enroute-info 5=VMS                        │
-    │    Field 6   I  w6   Vehicle type: 1=car 2=truck 3=HOV           │
-    │    Field 7   I  w6   Occupancy: 1=LOV 2=HOV                      │
-    │    Field 8   I  w6   # nodes in path (1 if path.dat not used)    │
-    │    Field 9   I  w6   # destinations (incl. intermediate + final) │
-    │    Field 10  I  w6   En-route info: 0=none 1=available           │
-    │    Field 11  F  w8   Indifference band (min) for mode switch      │
-    │    Field 12  F  w8   Compliance rate 0.0–1.0 (class 4 only;     │
-    │                      set 0 for all other classes)                │
-    │    Field 13  I  w5   Origin zone number                          │
+    │    Field 1   veh_id     Vehicle ID (sequential from 1)           │
+    │    Field 2   usec       Upstream node of generation link         │
+    │    Field 3   dsec       Downstream node of generation link       │
+    │    Field 4   stime      Starting time (min), ascending order     │
+    │    Field 5   vehcls     Vehicle class: 5=car 6=HOV 2=truck       │
+    │    Field 6   vehtype    1=car 2=truck                            │
+    │    Field 7   ioc        Occupancy: 0=LOV 1=shared-ride           │
+    │    Field 8   #ONode     Nodes in path (1 = no path.dat used)     │
+    │    Field 9   #IntDe     Destinations incl. intermediate + final  │
+    │    Field 10  info       En-route info: 0=none 1=available        │
+    │    Field 11  ribf       Indifference band (min)                  │
+    │    Field 12  comp       Compliance rate 0.0–1.0                  │
+    │    Field 13  izone      Origin zone                              │
+    │    Field 14  Evac       0=non-evacuation vehicle                 │
+    │    Field 15  InitPos    Random initial position 0-1              │
     │                                                                  │
     │  Record 4+ (Destinations — one line per destination per vehicle) │
-    │    Field 1   I  w12  Zone number of destination                  │
-    │    Field 2   F  w7   Activity duration at destination (min)      │
-    │                      Always 0.00 for the FINAL destination        │
+    │    Field 1   dest_zone  Zone number of the destination           │
+    │    Field 2   dwell      Activity duration at destination (min);  │
+    │                      0.00 for the final destination (always)     │
     └──────────────────────────────────────────────────────────────────┘
 
-    Mode → DynusT vehicle type + occupancy + user class mapping
-    ------------------------------------------------------------
-    DA (mode 1)      veh_type=1 car,   occ=1 LOV, user_class=3 UE
-    Other/SR (mode 2) veh_type=1 car,  occ=2 HOV, user_class=3 UE
-    Transit (mode 5) veh_type=2 truck, occ=1 LOV, user_class=1 unresponsive
+    Exact column widths (15 fields, 105 chars/record; veh_id starts each
+    line with an 8-space leading offset, matching the reference file):
+
+      veh_id %9d  usec %7d  dsec %7d  stime %8.2f  vehcls %6d
+      vehtype %6d  ioc %6d  #ONode %6d  #IntDe %6d  info %6d
+      ribf %8.4f  comp %8.4f  izone %5d  Evac %5d  InitPos %12.8f
+
+    Mode → DynusT vehicle class + type + occupancy mapping
+    --------------------------------------------------------
+    DA (mode 1)       vehcls=5 car,  vehtype=1, ioc=0 LOV,  ribf=0.2000 comp=1.0000
+    Other/SR (mode 2) vehcls=5 car,  vehtype=1, ioc=1 shared-ride
+    Transit (mode 5)  vehcls=2 truck,vehtype=2, ioc=0 LOV
 
     Note: vehicles must be listed in ASCENDING departure-time order.
     usec/dsec are the upstream/downstream nodes of the generation link
-    for the origin zone.  If origin_link_map is not supplied, OTAZ is
-    used as a proxy for both (acceptable when DynusT resolves generation
-    links automatically from origin.dat).
+    for the origin zone (DynusT rejects vehicles whose upstream ==
+    downstream node).  If origin_link_map is not supplied, OTAZ is
+    used as a proxy for both and such vehicles are dropped — always
+    pass the map built from the network's origin.dat.  #ONode is the
+    number of path nodes (1 = no pre-specified path).  InitPos is a
+    random draw in [0,1], matching the reference output_vehicle.dat.
+
+    A matching path.dat is ALWAYS written next to vehicle.dat (one line
+    per vehicle: the upstream node of its generation link).  DynusT
+    terminates at demand generation when path.dat is empty, even with
+    #ONode=1.
 
     Parameters
     ----------
@@ -735,8 +871,14 @@ def write_dynus_vehicle_dat(
     n_vehicles = len(all_trips)
     max_stops  = 1   # one final destination per trip (no intermediate stops)
 
-    # ── Resolve numeric columns ────────────────────────────────────────────
-    dep_min  = pd.to_numeric(all_trips['departure_time'], errors='coerce').fillna(0.0)
+    # ── Normalise departure times to a 0-120 minute scale ──────────────────
+    # Reference output_vehicle.dat uses stime 0-120; shift so the earliest
+    # departure starts at 0 and scale the whole day to fit within 120 min.
+    dep_min     = pd.to_numeric(all_trips['departure_time'], errors='coerce').fillna(0.0)
+    _s0 = float(dep_min.min())
+    _s1 = float(dep_min.max())
+    _dep_range = (_s1 - _s0) or 1.0
+    dep_min_120 = (dep_min - _s0) * (120.0 / _dep_range)
     otaz_arr = pd.to_numeric(all_trips['OTAZ'], errors='coerce').fillna(1).astype(int)
     dtaz_arr = pd.to_numeric(all_trips['DTAZ'], errors='coerce').fillna(1).astype(int)
 
@@ -755,74 +897,131 @@ def write_dynus_vehicle_dat(
     # ucls:      user_class param for DA/SR, 1=unresponsive for Transit
     veh_type_arr  = mode_int.map({1: 1, 2: 1, 5: 2}).fillna(1).astype(int)
     occupancy_arr = mode_int.map({1: 1, 2: 2, 5: 1}).fillna(1).astype(int)
-    ucls_arr      = mode_int.map({1: user_class, 2: user_class, 5: 1}).fillna(1).astype(int)
 
-    # ── En-route info flag: only meaningful for user_class 4 ──────────────
-    # For class 1/2/3 set info=0, indiff=0.0, compliance=0.0
-    info_arr  = (ucls_arr == 4).astype(int)
-    ribf_arr  = np.where(ucls_arr == 4, indiff_band, 0.0)
-    comp_arr  = np.where(ucls_arr == 4, compliance_rate, 0.0)
+    # ribf/compliance: 0.2000/1.0000 (matching the reference output_vehicle.dat)
+    ribf_arr  = np.full(n_vehicles, 0.2000, dtype=float)
+    comp_arr  = np.full(n_vehicles, 1.0000, dtype=float)
+
+    # ── Generation-link nodes ──────────────────────────────────────────────
+    # usec/dsec must be a real, distinct-node generation link for the origin
+    # zone (DynusT rejects vehicles whose upstream == downstream node). Use the
+    # origin_link_map when available; otherwise fall back to the zone number as
+    # a node proxy. Any vehicle left with usec == dsec (e.g. a zone with no
+    # entry in origin_link_map) is DROPPED — DynusT cannot load it.
+    otaz_vals = otaz_arr.to_numpy()
+    if origin_link_map:
+        _lk = origin_link_map
+        usec_arr = np.array([_lk.get(int(z), (int(z), int(z)))[0] for z in otaz_vals], dtype=int)
+        dsec_arr = np.array([_lk.get(int(z), (int(z), int(z)))[1] for z in otaz_vals], dtype=int)
+    else:
+        usec_arr = otaz_arr.to_numpy()
+        dsec_arr = otaz_arr.to_numpy()
+
+    keep = usec_arr != dsec_arr
+    if not bool(keep.all()):
+        n_drop = int((~keep).sum())
+        logger.warning(
+            f"write_dynus_vehicle_dat: dropping {n_drop:,} vehicles whose "
+            f"generation link has identical up/downstream nodes (DynusT cannot "
+            f"load them)"
+        )
+        keep_ix = np.flatnonzero(keep)
+        usec_arr   = usec_arr[keep_ix]
+        dsec_arr   = dsec_arr[keep_ix]
+        otaz_arr   = otaz_arr.iloc[keep_ix].reset_index(drop=True)
+        dtaz_arr   = dtaz_arr.iloc[keep_ix].reset_index(drop=True)
+        dep_min_120= dep_min_120.iloc[keep_ix].reset_index(drop=True)
+        mode_int   = mode_int.iloc[keep_ix].reset_index(drop=True)
+        veh_type_arr   = veh_type_arr.iloc[keep_ix].reset_index(drop=True)
+        occupancy_arr  = occupancy_arr.iloc[keep_ix].reset_index(drop=True)
+        ribf_arr   = ribf_arr[keep_ix]
+        comp_arr   = comp_arr[keep_ix]
+        n_vehicles = int(keep.sum())
+        print(f"  Dropped {n_drop:,} vehicles with invalid generation links; "
+              f"{n_vehicles:,} remaining")
+
+    # InitPos: random initial position in [0,1] (as in the reference
+    # output_vehicle.dat), seeded so repeated runs are reproducible.
+    _seed_ip = int(n_vehicles) % (2**31 - 1)
+    _initpos_arr = np.random.default_rng(_seed_ip).random(n_vehicles)
 
     # ── Write file ────────────────────────────────────────────────────────
-    with open(path, 'w') as f:
+    # newline='' keeps the explicit \r\n endings untranslated (avoids
+    # \r\r\n on Windows); matches the reference file's CRLF line endings.
+    # path.dat MUST be written too: DynusT terminates at demand generation
+    # if path.dat is empty — one line per vehicle with the upstream node of
+    # the generation link (matches #ONode=1; DynusT then builds the real
+    # path itself, as seen in output_vehicle.dat).
+    path_dat = os.path.join(save_dir, 'path.dat')
+    with open(path, 'w', newline='') as f, open(path_dat, 'w', newline='') as fpath:
 
         # Record 1: vehicle count, max stops, description
-        f.write(f"{n_vehicles} {max_stops}   # {description}\n")
+        # (8-space leading offset; description matches reference file)
+        f.write(f"{n_vehicles:15d}{max_stops:12d}    # of vehicles in the file, Max # of STOPs\r\n")
 
-        # Record 2: column header (comment)
-        f.write("# usec    dsec    stime usrcls vehtyp  ioc #path #dest  info"
-                "    ribf    comp   OZ\n")
+        # Record 2: column header (comment) — same as reference file
+        f.write("        #   usec   dsec   stime vehcls vehtype ioc #ONode"
+                " #IntDe info ribf    comp   izone Evac InitPos"
+                "    VoT  tFlag pArrTime TP IniGas\r\n")
 
         for i in range(n_vehicles):
+            usec = int(usec_arr[i])
+            dsec = int(dsec_arr[i])
             otaz = int(otaz_arr.iloc[i])
             dtaz = int(dtaz_arr.iloc[i])
 
-            # Generation link nodes — use origin_link_map if provided
-            if origin_link_map and otaz in origin_link_map:
-                usec, dsec = origin_link_map[otaz]
-            else:
-                usec = dsec = otaz   # fallback: centroid node proxy
-
-            stime   = float(dep_min.iloc[i])
-            ucls    = int(ucls_arr.iloc[i])
+            stime   = float(dep_min_120.iloc[i])
             vt      = int(veh_type_arr.iloc[i])
             occ     = int(occupancy_arr.iloc[i])
-            info    = int(info_arr.iloc[i])
             ribf    = float(ribf_arr[i])
             comp    = float(comp_arr[i])
+            initpos = float(_initpos_arr[i])
 
-            # Vehicle characteristics line — exact field widths from Table 4-27
+            # vehcls: 5=passenger car, 2=truck (transit proxy)
+            vehcls = 5 if vt == 1 else 2
+            # ioc: 0=drive-alone (LOV), 1=shared-ride (HOV)
+            ioc = 0 if occ == 1 else 1
+
+            # 15-field vehicle record matching the reference output_vehicle.dat:
+            # veh_id, usec, dsec, stime, vehcls, vehtype, ioc, #ONode, #IntDe,
+            # info, ribf, comp, izone, Evac, InitPos.
             f.write(
-                f"{i+1:7d}"       # Field 1  veh_id         w7
-                f"{usec:7d}"      # Field 2  usec (upstream) w7
-                f"{dsec:7d}"      # Field 3  dsec (dnstream) w7
-                f"{stime:8.2f}"   # Field 4  stime (min)     w8(2)
-                f"{ucls:6d}"      # Field 5  user class      w6
-                f"{vt:6d}"        # Field 6  veh type        w6
-                f"{occ:6d}"       # Field 7  occupancy       w6
-                f"{n_path_nodes:6d}"  # Field 8  #path nodes  w6
-                f"{max_stops:6d}" # Field 9  #destinations   w6
-                f"{info:6d}"      # Field 10 info flag        w6
-                f"{ribf:8.4f}"    # Field 11 indiff band      w8(4)
-                f"{comp:8.4f}"    # Field 12 compliance rate  w8(4)
-                f"{otaz:5d}"      # Field 13 origin zone      w5
-                f"\n"
+                f"{i+1:9d}"           # veh_id (8-space leading offset)
+                f"{usec:7d}"          # usec (upstream node of generation link)
+                f"{dsec:7d}"          # dsec (downstream node)
+                f"{stime:8.2f}"       # stime (departure minutes, normalised to 0-120)
+                f"{vehcls:6d}"        # vehcls (5=car, 2=truck)
+                f"{vt:6d}"            # vehtype (1=car, 2=truck)
+                f"{ioc:6d}"           # ioc (0=LOV, 1=shared-ride)
+                f"{1:6d}"             # #ONode (nodes in path; 1 = no path.dat)
+                f"{max_stops:6d}"     # #IntDe (destinations incl. final)
+                f"{0:6d}"             # info (en-route info: 0=none, 1=available)
+                f"{ribf:8.4f}"        # ribf (indifference band, min)
+                f"{comp:8.4f}"        # comp (compliance rate 0-1.0)
+                f"{otaz:5d}"          # izone (origin zone number)
+                f"{0:5d}"             # Evac (0=non-evacuation)
+                f"{initpos:12.8f}"    # InitPos (random initial position 0-1)
+                f"\r\n"
             )
 
             # Destination record — one line per destination (max_stops=1 here)
             # Activity duration = 0.00 for the final destination (always)
-            f.write(f"{dtaz:12d}{0.0:7.2f}\n")
+            f.write(f"{dtaz:12d}{0.0:7.2f}\r\n")
+
+            # path.dat: one line per vehicle — initial path node = upstream
+            # node of the generation link (per DSP User's Guide §4.24).
+            fpath.write(f"{usec}\r\n")
 
     # ── Summary ───────────────────────────────────────────────────────────
     n_da      = int((mode_int == 1).sum())
     n_sr      = int((mode_int == 2).sum())
     n_transit = int((mode_int == 5).sum())
     print(
-        f"  Saved: vehicle.dat  ({n_vehicles:,} vehicles — "
+        f"  Saved: vehicle.dat + path.dat  ({n_vehicles:,} vehicles — "
         f"DA={n_da:,}  SR={n_sr:,}  Transit={n_transit:,})"
     )
     logger.info(
-        f"write_dynus_vehicle_dat: {n_vehicles} vehicles → {path} | "
+        f"write_dynus_vehicle_dat: {n_vehicles} vehicles → {path} (+ path.dat) | "
         f"DA={n_da} SR={n_sr} Transit={n_transit} | "
         f"dep_time range: {dep_min.min():.1f}–{dep_min.max():.1f} min"
     )
@@ -847,7 +1046,7 @@ DYNUS_OD_PERIODS = [
 def write_dynus_od_dat(
     trips: pd.DataFrame,
     save_dir: str,
-    n_zones: int = 329,
+    n_zones: int = 371,
     periods: list = None,
     modes: list = None,
     filename: str = 'od.dat',
@@ -872,7 +1071,7 @@ def write_dynus_od_dat(
     ----------
     trips      : Aimsun trip table (departure_time, OTAZ, DTAZ, mode columns)
     save_dir   : output directory
-    n_zones    : number of zones (329 for SEQ)
+    n_zones    : number of zones (371 for SEQ)
     periods    : list of (start_min, end_min, label) tuples (default DYNUS_OD_PERIODS)
     modes      : restrict to these mode_name values (None = all motorised modes)
     filename   : output filename (default 'od.dat')
@@ -1104,6 +1303,20 @@ MIN_DWELL = {
 # How much to tighten the distance constraint each repair iteration
 REPAIR_TT_REDUCTION = 0.75   # multiply max_tt by this each pass
 
+# Runaway protection for the per-activity Larch repair loop. Each repair
+# attempt builds a 1-case DataTree and triggers a fresh sharrow flow compile
+# (nb.TypingError → recompile → numpy fallback, ~1.5-2 s per call). Job
+# 23540863 spent ~17 h doing 32,586 such calls inside chunk 1/91 of Stage 6
+# and was killed by the 24 h walltime without writing any output. These caps
+# bound the damage: the loop stops after the time budget and reports how many
+# persons were left unrepaired instead of silently burning the walltime.
+REPAIR_TIME_BUDGET_S   = float(os.environ.get('STAGE6_REPAIR_TIME_BUDGET_S', '300'))
+# If the first sampled activities average more than this many seconds per
+# Larch call and nothing has been repaired yet, the per-case path is in the
+# recompile-every-call failure mode — abandon instead of limping through.
+REPAIR_SLOW_CALL_S     = float(os.environ.get('STAGE6_REPAIR_SLOW_CALL_S', '2.0'))
+REPAIR_SLOW_CALL_PROBE = 10   # activities to sample before the slow-call check
+
 
 def repair_compressed_dwells(
     plan: pd.DataFrame,
@@ -1195,8 +1408,40 @@ def repair_compressed_dwells(
 
     repaired   = 0
     unresolved = 0
+    n_attempt_errors = 0
+    _first_attempt_error = None
+    _n_acts_tried = 0
+    _t_start = time.monotonic()
+    _aborted_reason = None
 
-    for pid in bad_pids:
+    # The per-case Larch calls below re-trigger sharrow flow compilation on
+    # every activity; larch/sharrow log an 18-line "nb.TypingError" ERROR
+    # block plus "writing fresh flow code" INFO lines on each one (job
+    # 23540863 produced a 1M-line log this way). Suppress third-party log
+    # noise for the duration of the loop and restore afterwards.
+    _muted_loggers = {}
+    for _ln in ('larch', 'sharrow'):
+        _lg = logging.getLogger(_ln)
+        _muted_loggers[_ln] = _lg.level
+        _lg.setLevel(logging.CRITICAL)
+
+    try:
+      for pid in bad_pids:
+        if time.monotonic() - _t_start > REPAIR_TIME_BUDGET_S:
+            _aborted_reason = (
+                f"time budget exhausted ({REPAIR_TIME_BUDGET_S:.0f}s, "
+                f"override with STAGE6_REPAIR_TIME_BUDGET_S)"
+            )
+            break
+        if (_n_acts_tried >= REPAIR_SLOW_CALL_PROBE and repaired == 0
+                and (time.monotonic() - _t_start) / _n_acts_tried > REPAIR_SLOW_CALL_S):
+            _aborted_reason = (
+                f"first {_n_acts_tried} activities averaged "
+                f"{(time.monotonic() - _t_start) / _n_acts_tried:.1f}s/repair with 0 "
+                "repaired — per-case Larch path is recompiling its flow on every "
+                "call (see STAGE6_REPAIR_SLOW_CALL_S); not viable at this scale"
+            )
+            break
         person_rows = df[df['person_id'] == pid].copy()
         person_acts = person_rows[person_rows['row_type'] == 'activity']
         person_comp = compressed[compressed['person_id'] == pid]
@@ -1228,6 +1473,7 @@ def repair_compressed_dwells(
 
             current_max_tt = float(MODE_TT_CAP.get(1, 120.0))  # start from DA cap
             success = False
+            _n_acts_tried += 1
 
             for attempt in range(max_iterations):
                 # tighten distance constraint
@@ -1298,16 +1544,42 @@ def repair_compressed_dwells(
                         break
 
                 except Exception as e:
-                    logger.debug(f"Repair attempt {attempt+1} failed "
-                                 f"pid={pid} purpose={purpose}: {e}")
+                    n_attempt_errors += 1
+                    if _first_attempt_error is None:
+                        # First failure at WARNING with full context; the rest at
+                        # DEBUG (they are almost always the same root cause and
+                        # job 23540863 showed what per-attempt spam does to logs).
+                        _first_attempt_error = repr(e)
+                        logger.warning(
+                            f"Repair attempt failed (first of possibly many) "
+                            f"pid={pid} purpose={purpose}: {e!r} — further "
+                            f"attempt errors logged at DEBUG"
+                        )
+                    else:
+                        logger.debug(f"Repair attempt {attempt+1} failed "
+                                     f"pid={pid} purpose={purpose}: {e}")
                     continue
 
             if not success:
                 unresolved += 1
+    finally:
+        for _ln, _lvl in _muted_loggers.items():
+            logging.getLogger(_ln).setLevel(_lvl)
 
+    if _aborted_reason is not None:
+        _n_skipped = len(bad_pids) - repaired - unresolved
+        logger.warning(
+            f"repair_compressed_dwells ABORTED: {_aborted_reason}. "
+            f"{repaired} repaired, {unresolved} unresolvable, "
+            f"~{max(_n_skipped, 0)} persons left unrepaired (their compressed "
+            f"dwells pass through unchanged — same outcome as --no-repair)."
+        )
+    _summary = (f"  Repair loop: {repaired} activities repaired, "
+                f"{unresolved} unresolvable, {n_attempt_errors} attempt errors"
+                + (f", ABORTED ({_aborted_reason})" if _aborted_reason else ""))
     if verbose:
-        print(f"  Repair loop: {repaired} activities repaired, "
-              f"{unresolved} unresolvable")
+        print(_summary)
+    logger.info(_summary.strip())
 
     return df
 
@@ -1326,10 +1598,12 @@ def run_stage6(
     skim_lookup: Optional[dict] = None,
     sa2_geo: Optional[pd.DataFrame] = None,
     save_dir: str = 'saved_data',
+    dynust_zone_crosswalk: Optional[str] = None,
     repair_dwells: bool = True,
     max_repair_iterations: int = 3,
     dynus_sim_start_min: int = DYNUS_SIM_START_MIN,
     dynus_value_of_time: float = 15.0,
+    origin_link_map: Optional[dict] = None,
     verbose: bool = True,
 ) -> tuple:
     """
@@ -1348,10 +1622,25 @@ def run_stage6(
                          From get_zone_centroids_rich(landuse) in spatial_assignment.
                          Used to pin lat/lon onto every trip row.
     save_dir           : directory to write outputs
+    dynust_zone_crosswalk : path to a crosswalk CSV from
+                         build_dynust_zone_crosswalk.py (columns: ORDER,
+                         dynust_zone, dist_m, in_network). Pass this when the
+                         target DynusT network's zone numbering doesn't match
+                         the ABM's own zone numbers 1:1 (e.g. a network that
+                         only covers a sub-area) — remaps OTAZ/DTAZ and drops
+                         trips outside that network's coverage before writing
+                         vehicle.dat. Leave None to write OTAZ/DTAZ as-is
+                         (only correct when the two zone systems already match).
     repair_dwells      : whether to run destination repair loop (default True)
     max_repair_iterations : how many times to tighten distance per person
     dynus_sim_start_min : DynusT simulation start (minutes from midnight, default 360=6am)
     dynus_value_of_time : value of time written to vehicle.dat ($/hour)
+    origin_link_map   : {zone: (usec, dsec)} — generation-link node pairs per
+                        zone (from the network's origin.dat). Pass this so
+                        vehicle.dat gets real, distinct up/downstream nodes;
+                        otherwise zones fall back to the zone number as a node
+                        proxy and any vehicle left with identical nodes is
+                        dropped (DynusT cannot load it).
     verbose            : print progress
 
     Returns
@@ -1528,9 +1817,12 @@ def run_stage6(
     del all_aimsun_chunks
 
     motorised_splits = save_motorised_trips(trips_aimsun_all, save_dir)
+    if dynust_zone_crosswalk:
+        motorised_splits = apply_dynust_zone_crosswalk(motorised_splits, dynust_zone_crosswalk)
     write_dynus_vehicle_dat(
         motorised_splits,
-        save_dir = save_dir,
+        save_dir        = save_dir,
+        origin_link_map = origin_link_map,
     )
     write_dynus_od_dat(
         trips    = trips_aimsun_all,

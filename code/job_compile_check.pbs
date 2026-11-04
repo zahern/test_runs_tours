@@ -1,0 +1,127 @@
+#!/bin/bash -l
+#PBS -N compile_check
+#PBS -P FPAXJW8067
+#PBS -l select=1:ncpus=1:mem=4gb
+#PBS -l walltime=00:03:00
+#PBS -j oe
+#PBS -o compile_check.out
+#
+# Syntax gate for the latent-class / logsum edits (2026-10-13).
+#
+# The workstation has no working interpreter, so these files could not be
+# byte-compiled before submission. This job is the cheapest possible check:
+# python -m py_compile only parses and writes bytecode, it does not import,
+# so it is safe, fast, and needs no data. If this fails the edit is a syntax
+# error and nothing downstream is worth running.
+#
+# Exit codes:  0 = all clean   1 = at least one file failed to compile
+set -uo pipefail
+
+CODE=/mnt/hpccs01/home/ahernz/test_runs_tours/code
+SCRATCH=$(mktemp -d /tmp/compile_check.XXXXXX)
+cd "$SCRATCH" || exit 1
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+# Write-isolation: no .pyc may land in the production code/data tree.
+export PYTHONPYCACHEPREFIX="$SCRATCH/pycache"
+export TMPDIR="$SCRATCH/tmp"
+export XDG_CACHE_HOME="$SCRATCH/cache"
+mkdir -p "$PYTHONPYCACHEPREFIX" "$TMPDIR" "$XDG_CACHE_HOME"
+
+echo "=== compile_check started $(date) ==="
+echo "python: $(which python) ($(python --version 2>&1))"
+echo "code:   $CODE"
+echo
+
+# -- Python syntax -----------------------------------------------------------
+PY_FILES=(
+  stage5_destination_choice.py
+  ga_hypothesis_testing.py
+  stage5_lc_genes.py
+  _paper_stage5_arms.py
+  _patches/SearchLibrium/mh_choice_estimator.py
+)
+
+fail=0
+echo "-- py_compile ---------------------------------------------"
+for f in "${PY_FILES[@]}"; do
+  if [ ! -f "$CODE/$f" ]; then
+    printf '  MISSING  %s\n' "$f"; fail=1; continue
+  fi
+  if err=$(python -m py_compile "$CODE/$f" 2>&1); then
+    printf '  ok       %s\n' "$f"
+  else
+    printf '  FAIL     %s\n' "$f"
+    printf '%s\n' "$err" | sed 's/^/           /'
+    fail=1
+  fi
+done
+
+# -- Shell syntax -------------------------------------------------------------
+echo
+echo "-- bash -n ------------------------------------------------"
+for s in job_ga_shard_single.pbs; do
+  if [ ! -f "$CODE/$s" ]; then
+    printf '  MISSING  %s\n' "$s"; fail=1; continue
+  fi
+  if err=$(bash -n "$CODE/$s" 2>&1); then
+    printf '  ok       %s\n' "$s"
+  else
+    printf '  FAIL     %s\n' "$s"
+    printf '%s\n' "$err" | sed 's/^/           /'
+    fail=1
+  fi
+done
+
+# -- Edit spot-checks ---------------------------------------------------------
+# Cheap greps that catch the specific defects this session fixed, so a silent
+# regression shows up here rather than as a mysterious -1e9 three hours into a
+# 12h job.
+echo
+echo "-- edit spot-checks ---------------------------------------"
+chk() {  # chk <description> <file> <python-literal-substring>
+  if grep -qF -- "$3" "$CODE/$2" 2>/dev/null; then
+    printf '  ok       %s\n' "$1"
+  else
+    printf '  MISSING  %s  (%s)\n' "$1" "$2"; fail=1
+  fi
+}
+chk "logsum Larch loop defaults OFF" \
+    stage5_destination_choice.py "os.environ.get('STAGE5_LARCH_LOGSUM', '0')"
+chk "numpy logsum flat-surface gate" \
+    stage5_destination_choice.py "mode logsum is DEGENERATE"
+chk "_get_tt tracks fallback column" \
+    stage5_destination_choice.py "col = fallback_col"
+chk "LCCM fit verdict flag" \
+    stage5_destination_choice.py "_lccm_reason"
+chk "GA rejects bad LCCM fit" \
+    ga_hypothesis_testing.py "_lccm_ok"
+chk "MD/EV added to 5_mode mutex" \
+    ga_hypothesis_testing.py "'SOVTOLL_TIME__MD'"
+chk "LC restart ranks by (converged, ll)" \
+    _patches/SearchLibrium/mh_choice_estimator.py "_rank = (bool(converged), fit_ll)"
+chk "LC membership gammas perturbed" \
+    _patches/SearchLibrium/mh_choice_estimator.py "the membership gammas"
+chk "LC shares from responsibilities" \
+    _patches/SearchLibrium/mh_choice_estimator.py "np.asarray(resp).mean(axis=0)"
+chk "LC k pays for free class shares" \
+    stage5_lc_genes.py "else (K - 1)"
+chk "arms EM restart ranking" \
+    _paper_stage5_arms.py "(bool(conv), fit_ll)"
+
+echo
+if [ "$fail" -eq 0 ]; then
+  echo "RESULT: PASS - all files compile, all edits present"
+else
+  echo "RESULT: FAIL - see above"
+fi
+echo "=== compile_check finished $(date) ==="
+
+rm -rf "$SCRATCH"
+exit "$fail"

@@ -1,0 +1,97 @@
+#!/bin/bash -l
+#PBS -N suncorp_timewise_eb
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=8:mem=256GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Job 4: Time-resolved Empirical Bayes risk profiling (21_eb_timewise_risk.py)
+# Phase-resolved SPFs (type x phase), 24-hour mean risk profile, better-methods
+# comparison. Feeds the dashboard (05) and the conceptual/hold-out models (06).
+# ══════════════════════════════════════════════════════════════════════════════
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results
+FIG_DIR=$PROJ_DIR/figures
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+for pkg in statsmodels seaborn matplotlib pandas numpy; do
+    python -c "import ${pkg%%-*}" 2>/dev/null || pip install --upgrade $pkg
+done
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export JAX_PLATFORMS=cpu
+# OOM FIX (kills at EB_geo even at 128GB): stop XLA pre-allocating ~all RAM
+# on CPU backend; use the platform allocator instead.
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_ALLOCATOR=platform
+
+cd "$SCRIPT_DIR"
+
+echo "════════════════════════════════════════════════════════════════════════════"
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "Project dir:  $PROJ_DIR"
+echo "════════════════════════════════════════════════════════════════════════════"
+
+if [ ! -f "$DATA_DIR/segment_roads_part0_5000.csv.gz" ]; then
+    echo "ERROR: segment_roads_part0_5000.csv.gz not found!"
+    exit 1
+fi
+
+echo "Updating PROJ path for HPC..."
+sed -i "s|^PROJ = .*|PROJ = \"$PROJ_DIR\"|g" 21_eb_timewise_risk.py
+
+echo ""
+echo "Running 21_eb_timewise_risk.py..."
+# Drop stale step-6/7 outputs first: 25270105 died in the method comparison
+# AFTER writing the CSVs, and the old eb_timewise.tex then falsely passed
+# the output check. A crash must fail loudly, not masquerade as success.
+rm -f "$RESULTS_DIR/eb_timewise.tex" \
+      "$RESULTS_DIR/method_comparison.csv" \
+      "$FIG_DIR/eb_timewise_phase_curve.png" \
+      "$FIG_DIR/eb_timewise_hourly.png"
+python -u 21_eb_timewise_risk.py 2>&1
+EXIT_CODE=$?
+
+echo ""
+echo "Checking outputs..."
+OUTPUTS_OK=0
+for f in eb_timewise_segment_phase.csv eb_timewise_hourly.csv eb_timewise.tex method_comparison.csv; do
+    if [ -f "$RESULTS_DIR/$f" ]; then
+        echo "  OK $f"
+        OUTPUTS_OK=$((OUTPUTS_OK + 1))
+    else
+        echo "  MISSING $f"
+    fi
+done
+
+# Freshness: tex + method comparison must come from THIS run (newer than the
+# phase CSVs), otherwise an OOM kill mid-step-6 leaves stale files behind.
+if [ "$(stat -c %Y "$RESULTS_DIR/eb_timewise.tex" 2>/dev/null || echo 0)" -lt \
+     "$(stat -c %Y "$RESULTS_DIR/eb_timewise_segment_phase.csv" 2>/dev/null || echo 0)" ]; then
+    echo "  STALE eb_timewise.tex (older than segment_phase CSV)"
+    OUTPUTS_OK=0
+fi
+
+if [ $OUTPUTS_OK -eq 4 ]; then
+    echo "All timewise EB outputs created successfully!"
+else
+    echo "Some outputs missing/stale ($OUTPUTS_OK/4)"
+    EXIT_CODE=1
+fi
+
+echo "════════════════════════════════════════════════════════════════════════════"
+echo "Job finished at $(date) — exit_code=$EXIT_CODE"
+echo "════════════════════════════════════════════════════════════════════════════"
+exit $EXIT_CODE

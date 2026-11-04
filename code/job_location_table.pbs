@@ -1,0 +1,56 @@
+#!/bin/bash -l
+# =============================================================================
+# Build the POLARIS-style sub-zonal Location table from the local OSM extract.
+#   build_location_table.py:  saved_data/osm_cache/seq_osm.pbf (+ zone_centroids
+#   + seq_gtfs.zip)  ->  saved_data/location_table.csv
+# No internet needed (pbf + gtfs are pre-downloaded, same as the GTFS skim job).
+# One-off data build; re-run only when the OSM extract changes.
+#
+# Submit from the code dir:
+#   qsub job_location_table.pbs
+# =============================================================================
+#PBS -N location_table_371
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=4:mem=48GB
+#PBS -l walltime=08:00:00
+
+set -euo pipefail
+
+CONDA_ENV=${CONDA_ENV:-geotfenv}
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+echo "=== Verify geo imports (geotfenv) ==="
+python - <<'PY'
+import numpy, pandas, geopandas
+print("geopandas", geopandas.__version__)
+try:
+    import pyrosm; print("pyrosm", pyrosm.__version__, "(preferred POI reader)")
+except Exception as e:
+    print("pyrosm NOT available -> geopandas/GDAL OSM-driver fallback will be used:", e)
+PY
+
+echo "=== Build location table ==="
+python -u build_location_table.py
+
+echo "=== Verify output ==="
+python - <<'PY'
+import pandas as pd, os
+p = os.environ.get('LOCATION_OUT', 'saved_data/location_table.csv')
+d = pd.read_csv(p)
+print(f"location_table.csv: {len(d):,} locations, {d['zone'].nunique()} zones")
+print("land_use mix:", d['land_use'].value_counts().to_dict())
+print("cols:", list(d.columns))
+assert {'location','zone','x','y','land_use','lu_area','avg_parking_cost','tod_distance'} <= set(d.columns)
+print("OK")
+PY
+
+echo "Done. Output: saved_data/location_table.csv"

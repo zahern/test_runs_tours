@@ -1,0 +1,52 @@
+#!/bin/bash
+#PBS -N sl_pypi_install
+#PBS -P FPAXJW8067
+#PBS -l select=1:ncpus=1:mem=8GB
+#PBS -l walltime=00:20:00
+#PBS -o /mnt/hpccs01/home/ahernz/test_runs_tours/code/sl_pypi_install.o
+#PBS -e /mnt/hpccs01/home/ahernz/test_runs_tours/code/sl_pypi_install.e
+cd /mnt/hpccs01/home/ahernz/test_runs_tours/code || exit 1
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate zigenv
+echo "HOSTNAME=$(hostname)"
+
+echo "=== 1. versions available on PyPI ==="
+pip index versions SearchLibrium 2>&1 | head -5
+
+echo
+echo "=== 2. PRE-INSTALL state ==="
+pip show SearchLibrium 2>/dev/null | egrep '^(Name|Version|Location)'
+python -c "import SearchLibrium.mh_choice_estimator as M; print('  LC before:', hasattr(M,'estimate_dest_choice_lc'))" 2>&1 | tail -2
+
+echo
+echo "=== 3. INSTALL FROM PyPI ==="
+pip install --upgrade --retries 2 --timeout 60 SearchLibrium 2>&1 | tail -20
+echo "pip_rc=$?"
+
+echo
+echo "=== 4. POST-INSTALL state ==="
+pip show SearchLibrium 2>/dev/null | egrep '^(Name|Version|Location)'
+
+python - <<'PY'
+import inspect
+import SearchLibrium.mh_choice_estimator as M
+print("module file:", M.__file__)
+has_lc = hasattr(M, "estimate_dest_choice_lc")
+print("estimate_dest_choice_lc:", has_lc)
+if has_lc:
+    src = inspect.getsource(M)
+    checks = {
+        "hunk1 membership gamma jitter": "gammas = rng.normal(0.0, float(perturb_sigma), gammas.shape)",
+        "hunk2 collapsed-class reseed":  "_b = betas[_coll] + rng.normal",
+        "hunk3 restart rank by conv":    "_rank = (bool(converged), fit_ll)",
+        "hunk4 shares from resp":        "shares = np.asarray(resp).mean(axis=0)",
+    }
+    print("--- the four EM fixes from the 16:58 source ---")
+    for k, v in checks.items():
+        print("  %-32s %s" % (k, "YES" if v in src else "NO"))
+    print("  memory leash SL_HHTS_MAX_HISTORY:", "YES" if "SL_HHTS_MAX_HISTORY" in src else "NO")
+    import os
+    print("  installed bytes:", os.path.getsize(M.__file__))
+print("LC_READY" if has_lc else "LC_MISSING")
+PY
+echo SL_INSTALL_DONE

@@ -1,0 +1,134 @@
+#!/bin/bash -l
+#PBS -N p58rebuild
+# Rebuild the 15-minute panel so it carries the speeding_trips target.
+#
+# WHY A FULL REBUILD IS NEEDED. finalize_month() deletes each month's partials
+# as it consumes them, and results/_15min_tmp/ currently holds only
+# _pass_done.json (0 trips_*.parquet files). So the streaming pass has to be
+# re-run over the raw 7.3 GB traffic extract -- 916 chunks, 457.8M points.
+# Finalizing the 16 months afterwards is cheap by comparison.
+#
+# WHY _pass_done.json MUST GO. With the marker present, --all prints
+# "pass already complete; skipping", never re-streams, and finalize then finds
+# no partials and does nothing. The rebuild would appear to succeed while
+# producing nothing, so this script removes the marker and verifies that
+# partials actually appeared before it finalizes.
+#
+# Walltime: the original pass produced 916 chunks and is the long pole.
+#PBS -l walltime=20:00:00
+#PBS -l select=1:ncpus=8:mem=64gb
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+set -u
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+TRAFFIC=$PROJ_DIR/results/traffic_points_full.csv.gz
+MARKER=$PROJ_DIR/results/_15min_tmp/_pass_done.json
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export JAX_PLATFORMS=cpu
+export PYTHONIOENCODING=utf-8
+
+cd "$SCRIPT_DIR" || exit 1
+echo "=================================================================="
+echo "p58rebuild on $(hostname) at $(date)"
+echo "=================================================================="
+
+if [ ! -s "$TRAFFIC" ]; then
+  echo "FAIL: raw traffic extract missing or empty: $TRAFFIC"
+  exit 1
+fi
+echo "traffic extract: $(du -h "$TRAFFIC" | cut -f1)"
+
+# Archive rather than delete: the old panel is what produced the 26107921
+# results, and it costs nothing to keep until the new one is verified.
+if ls "$PROJ_DIR"/results/segment_15min_panel_????-??.parquet >/dev/null 2>&1; then
+  BAK=$PROJ_DIR/results/_panel_backup_pretarget
+  mkdir -p "$BAK"
+  echo "archiving existing monthly panels -> $BAK"
+  mv "$PROJ_DIR"/results/segment_15min_panel_????-??.parquet "$BAK"/ 2>/dev/null
+  if [ -f "$PROJ_DIR/results/segment_15min_panel.parquet" ]; then
+    mv "$PROJ_DIR/results/segment_15min_panel.parquet" "$BAK"/ 2>/dev/null
+  fi
+fi
+
+# Force the streaming pass. The marker is what makes --all skip it.
+if [ -f "$MARKER" ]; then
+  mv "$MARKER" "$MARKER.superseded_$(date +%Y%m%d_%H%M%S)"
+  echo "moved aside: $MARKER (its presence would skip the pass)"
+fi
+
+echo
+echo "### streaming pass over the raw extract ###"
+python -u 58_build_15min_panel.py --pass --all \
+  2>&1 | tail -40
+RC_PASS=${PIPESTATUS[0]}
+echo "pass exit: $RC_PASS"
+
+# Verify partials exist BEFORE finalizing. Without this check the run would
+# "succeed" having produced nothing.
+NPART=$(find "$PROJ_DIR/results/_15min_tmp" -name 'trips_*.parquet' 2>/dev/null | wc -l)
+echo "partials on disk after the pass: $NPART"
+if [ "$NPART" -lt 1 ]; then
+  echo "FAIL: the streaming pass produced no partials; refusing to finalize"
+  exit 1
+fi
+
+echo
+echo "### finalize months + merge ###"
+python -u 58_build_15min_panel.py --merge 2>&1 | tail -20
+RC_MERGE=${PIPESTATUS[0]}
+echo "merge exit: $RC_MERGE"
+
+echo
+echo "### verify the new columns are actually present ###"
+python - <<'PY'
+import sys
+import pyarrow.parquet as pq
+p = "/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics/results/segment_15min_panel.parquet"
+names = set(pq.ParquetFile(p).schema_arrow.names)
+need = {"speeding_trips", "speed_limit", "vehicle_count",
+        "mean_vehicle_speed_kmh", "trips_with_judged_speed"}
+missing = need - names
+print("columns present:", sorted(need & names))
+if missing:
+    print("FAIL: missing", sorted(missing))
+    sys.exit(1)
+import pandas as pd
+df = pd.read_parquet(p, columns=["road_osmid", "bin", "speeding_trips",
+                                "vehicle_count", "mean_vehicle_speed_kmh",
+                                "speed_limit"])
+print("rows: %d  segments: %d" % (len(df), df["road_osmid"].nunique()))
+print("speeding_trips total: %d" % int(df["speeding_trips"].sum()))
+bad = int(((df["speed_limit"] < 40) & (df["speeding_trips"] > 0)).sum())
+print("rows under an untrusted limit with a target: %d" % bad)
+over = int((df["speeding_trips"] > df["vehicle_count"]).sum())
+print("rows where target exceeds vehicle_count: %d" % over)
+if over:
+    print("FAIL: target is not bounded by its denominator")
+    sys.exit(1)
+if int(df["speeding_trips"].sum()) <= 0:
+    print("FAIL: the target is empty")
+    sys.exit(1)
+print("OK: panel carries a non-empty, bounded speeding_trips target")
+PY
+RC_VERIFY=$?
+
+echo
+echo "=================================================================="
+echo "p58rebuild exits: pass=$RC_PASS merge=$RC_MERGE verify=$RC_VERIFY"
+echo "=================================================================="
+if [ "$RC_PASS" -ne 0 ] || [ "$RC_MERGE" -ne 0 ] || [ "$RC_VERIFY" -ne 0 ]; then
+  exit 1
+fi
+exit 0

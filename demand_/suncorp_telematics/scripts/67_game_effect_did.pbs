@@ -1,0 +1,26 @@
+#!/bin/bash -l
+#PBS -N suncorp_did
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+set -euo pipefail
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+
+cd "$PROJ_DIR/scripts"
+# DiD benchmark: mechanicallly identified game effect on the exceeding rate
+# (game date vs matched same-slot non-game days), at segment x 15-min.
+# Independent yardstick for game_lift / sd_lift at deployment resolution.
+python -u 67_game_effect_did.py --target trips_mean_gt_10 2>&1
+echo "did done at $(date)"

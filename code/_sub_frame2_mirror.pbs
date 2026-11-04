@@ -1,0 +1,59 @@
+#!/bin/bash -l
+#PBS -N s5_frame2_mirror
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -m n
+#PBS -r y
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _sub_frame2_mirror.pbs
+# The mirror baseline for frame 2, re-submitted after the first attempt died in
+# the module loader:
+#     AttributeError: 'NoneType' object has no attribute 'loader'
+# spec_from_file_location could not infer a loader because the pre-fix module is
+# named stage5_destination_choice.py.bak_logsumfill_20261103_171452; the runner
+# now builds the spec from an explicit SourceFileLoader.
+#
+# Frame 2 already exists (runs/_s5_larch_perturb/work_dest_cache_s7.pkl, built by
+# job 27562237), so this job only refits: arm B is ~5 s, arm D is 11 restarts at
+# ~200 s, plus ~4 min to rebuild the frame from the cache.
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV:-zigenv}"
+module unload Anaconda3
+
+export NEW_POP=1 NEW_POP_MAPPED=0
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+if [[ -z "${SEARCHLIBRIUM_SRC:-}" && -f "${PBS_O_WORKDIR}/_patches/SearchLibrium/mh_choice_estimator.py" ]]; then
+  export SEARCHLIBRIUM_SRC="${PBS_O_WORKDIR}/_patches"
+fi
+
+export PAPER_SEGMENT=work
+export PAPER_N_CASES=0
+export PAPER_ARMS=B                   # A and D always run; C is skipped
+export PAPER_N_PERT=10                # 11 restarts, same as every other D fit
+export PAPER_LC_MAXITER=150
+export PAPER_MSTEP_MAXITER=200
+export PAPER_UTILITY="c_log_dist,c_crash,c_logsum,c_visit_work,c_crash_safety_dest"
+export PAPER_MEMB="STUDYING,sexp,incp,vehrd"
+export PAPER_DROP_NOLOGSUM=0          # keep the fallback tours: that is the point
+export JAX_PLATFORMS=cpu
+export CUDA_VISIBLE_DEVICES=""
+
+export PAPER_CACHE="runs/_s5_larch_perturb/work_dest_cache_s7.pkl"
+export PAPER_SAMPLE_SEED=7
+export PAPER_SEED=42
+export PAPER_S5_SOURCE="${PBS_O_WORKDIR}/stage5_destination_choice.py.bak_logsumfill_20261103_171452"
+
+export PAPER_OUT="runs/stage5_paper_arms/20261103_frame2_mirror_s42"
+mkdir -p "${PAPER_OUT}"
+
+echo "frame2 mirror -> ${PAPER_OUT} (pre-fix module: ${PAPER_S5_SOURCE})"
+python _paper_stage5_arms.py 2>&1 | tee "${PAPER_OUT}/job.out"
+echo "Finished: $(date) exit_code=${PIPESTATUS[0]}"

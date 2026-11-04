@@ -1,0 +1,159 @@
+#!/bin/bash -l
+# =====================================================================
+# job_asim_mtc_full.pbs — full ActivitySim prototype_mtc model run.
+#
+# Produces FULL MTC standard-model outputs (final_trips.csv with ~25k trips
+# over all 5,000 households) to replace the 79-row CI regress fixture that
+# M0 currently uses. Downstream: mtc_compare.py with
+#   MTC_TRIPS_CSV=runs/mtc_asim_full/output/final_trips.csv
+# (see job_mtc_ab.pbs) then yields real M1/M2 log-likelihoods + prediction
+# errors for the paper's MTC table.
+#
+# Environment: DEDICATED asimenv (NOT zigenv). ActivitySim 1.5.x pins
+# numpy<1.26, which would break zigenv's numpy-2 stack. Create ONCE on the
+# login node (has egress; compute nodes do not):
+#   conda create -y -n asimenv python=3.11 pip
+#   conda activate asimenv
+#   pip install -e /mnt/hpccs01/home/ahernz/test_runs_tours/activitysim-main
+#   python -c "import activitysim; print(activitysim.__version__)"
+# (Fallback if the checkout misbehaves: pip install "activitysim==1.5.1".)
+#
+# IMPORTANT: keep numpy<2 in this env. A transitive pandera upgrade took
+# runs/mtc_asim_full to a 0-byte output on 18/09 with
+#   AttributeError: `np.string_` was removed in the NumPy 2.0 release
+# raised from pandera/engines/pandas_engine.py. If the preflight below reports
+# numpy>=2, fix it with:
+#   conda activate asimenv && pip install 'numpy<2' 'pandas<2.2'
+# The preflight now deep-imports and version-checks, so this fails at submit
+# time with a readable message rather than an empty run.
+#
+# Run from the code dir:
+#   qsub job_asim_mtc_full.pbs
+# Override:
+#   qsub -v ASIMENV=asimenv,OUTDIR=runs/mtc_asim_full job_asim_mtc_full.pbs
+#
+# Resources: single-process full prototype_mtc (34 models, 5k HH) runs
+# ~15-45 min on a shared node; 8 h walltime is generous headroom.
+# ARTIFACTS: everything under OUTDIR (output/final_*.csv + logs).
+# =====================================================================
+#PBS -N asim_mtc_full
+#PBS -l select=1:ncpus=8:mem=64gb
+#PBS -l walltime=08:00:00
+#PBS -j oe
+#PBS -m n
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+CONDA_ENV=${CONDA_ENV:-asimenv}
+OUTDIR=${OUTDIR:-runs/mtc_asim_full}
+ASIM_HOME=${ASIM_HOME:-/mnt/hpccs01/home/ahernz/test_runs_tours/activitysim-main}
+EXAMPLE=${EXAMPLE:-$ASIM_HOME/activitysim/examples/prototype_mtc}
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+
+mkdir -p "$OUTDIR/output"
+
+echo "=========================================="
+echo "Full ActivitySim prototype_mtc run"
+echo "PBS job     : ${PBS_JOBID:-unknown}"
+echo "Code dir    : $(pwd)"
+echo "Out dir     : ${OUTDIR}"
+echo "Conda env   : ${CONDA_ENV}"
+echo "Example     : ${EXAMPLE}"
+echo "Started     : $(date)"
+echo "=========================================="
+
+# ── preflight: dedicated env + example tree ──
+# Deep-import check, not just `import activitysim`: the 18/09 re-run failed
+# with a 0-byte asim_mtc_full.out because pandera (pulled in transitively)
+# still referenced np.string_, removed in NumPy 2.0, and the failure only
+# surfaced inside ActivitySim's import chain. Import the modules the model
+# actually uses and report versions so a broken env fails here with a clear
+# message instead of producing an empty run.
+python - <<'PYEOF' || exit 2
+import sys
+print(f"python {sys.version.split()[0]}")
+try:
+    import numpy, pandas, activitysim
+    print(f"numpy {numpy.__version__}")
+    print(f"pandas {pandas.__version__}")
+    print(f"activitysim {activitysim.__version__}")
+    if int(numpy.__version__.split(".")[0]) >= 2:
+        print("FATAL: numpy>=2 with ActivitySim 1.5.x + old pandera is a known "
+              "breakage (np.string_ removed). Re-pin with "
+              "`pip install 'numpy<2'` in asimenv.", file=sys.stderr)
+        raise SystemExit(2)
+    import pandera
+    print(f"pandera {getattr(pandera, '__version__', '?')}")
+    from activitysim import globallogic  # deep import: catches the pandera path
+except SystemExit:
+    raise
+except Exception as exc:
+    print(f"FATAL: asimenv import check failed: {type(exc).__name__}: {exc}",
+          file=sys.stderr)
+    print("  If activitysim is missing entirely, create the env on the login node:",
+          file=sys.stderr)
+    print("    conda create -y -n asimenv python=3.11 pip; conda activate asimenv",
+          file=sys.stderr)
+    print(f"    pip install -e {__import__('os').environ.get('ASIM_HOME','<ASIM_HOME>')}",
+          file=sys.stderr)
+    raise SystemExit(2)
+PYEOF
+for _d in "${EXAMPLE}/configs" "${EXAMPLE}/data"; do
+  [ -d "$_d" ] || { echo "FATAL: missing ${_d}"; exit 2; }
+done
+[ -f "${EXAMPLE}/data/skims.omx" ] || { echo "FATAL: missing ${EXAMPLE}/data/skims.omx"; exit 2; }
+
+echo "--- running all 5,000 households (main configs, single process) ---"
+python -u "${EXAMPLE}/simulation.py" \
+  -c "${EXAMPLE}/configs" \
+  -d "${EXAMPLE}/data" \
+  -o "${OUTDIR}/output" \
+  > "${OUTDIR}/asim_mtc_full.out" 2> "${OUTDIR}/asim_mtc_full.err"
+EXIT_CODE=$?
+
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+
+# ── output validation gate (fail loudly, never feed a truncated file on) ──
+python - "$OUTDIR" <<'PYEOF'
+import os, sys
+import pandas as pd
+outdir = sys.argv[1]
+for _f, _min in (('final_trips.csv', 10000), ('final_tours.csv', 5000)):
+    _p = os.path.join(outdir, 'output', _f)
+    if not os.path.isfile(_p):
+        print(f'FATAL: missing {_p}')
+        raise SystemExit(2)
+    _df = pd.read_csv(_p, low_memory=False)
+    print(f'{_f}: rows={len(_df)} cols={len(_df.columns)}')
+    if len(_df) < _min:
+        print(f'FATAL: {_f} has {len(_df)} rows (< {_min}) — truncated run?')
+        raise SystemExit(2)
+    if _f == 'final_trips.csv':
+        need = {'trip_id', 'person_id', 'tour_id', 'trip_mode', 'origin', 'destination', 'purpose'}
+        missing = need - set(_df.columns)
+        if missing:
+            print(f'FATAL: final_trips.csv missing columns for mtc_compare: {missing}')
+            raise SystemExit(2)
+print('OUTPUT GATE: full MTC outputs valid — feed to mtc_compare via '
+      'MTC_TRIPS_CSV=<outdir>/output/final_trips.csv')
+PYEOF
+GATE_CODE=$?
+
+echo "Metrics : ${OUTDIR}/output/final_trips.csv"
+if [ "${EXIT_CODE}" -eq 0 ]; then
+  exit "${GATE_CODE}"
+else
+  exit "${EXIT_CODE}"
+fi

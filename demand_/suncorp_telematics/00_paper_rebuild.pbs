@@ -1,0 +1,112 @@
+#!/bin/bash -l
+#PBS -N suncorp_paper_rebuild
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ======================================================================
+# SINGLE sound job to populate the paper (replaces 01..10 chain).
+# Question answered: on a segment, does the RSP improve safety?
+# Method: SEGMENT-BASED spatial (which assigned post serves this segment)
+#   + with/without-platform simulation. No radius buffers, no
+#   temporal-across-dates modelling (RW/conceptual/holdout across ref_id
+#   are deprecated - see 40_rsp_spatial_effect.py header).
+#
+# Steps:
+#   1. Ensure P4 posts exist (rebuild via 28 if missing - spatial platform)
+#   2. Run 40_rsp_spatial_effect.py (convergent SPF + EB + Voronoi assignment
+#      + with/without counterfactual) -> rsp_*.tex/csv + figs
+#   3. Validate outputs loudly (fail job if unsound, do not write paper)
+#
+# Submit:
+#   cd /mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+#   qsub 00_paper_rebuild.pbs
+# ======================================================================
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results
+FIG_DIR=$PROJ_DIR/figures
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PROJ="$PROJ_DIR"
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+
+cd "$SCRIPT_DIR"
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "Project: $PROJ_DIR"
+echo "=================================================================="
+
+# --- 0. Guard inputs (fail fast, no fabricated attendances) ---
+for f in "$DATA_DIR/near_miss_hb_ecf.csv" \
+         "$DATA_DIR/segment_roads_part0_5000.csv.gz" \
+         "$DATA_DIR/osm_roads_suncorp.geojson" \
+         "$DATA_DIR/road_meta.csv"; do
+  if [ ! -s "$f" ]; then echo "FATAL: missing input $f"; exit 1; fi
+done
+echo "Inputs OK."
+
+# --- 1. Platform (posts) must exist; rebuild deterministically if absent ---
+if [ ! -s "$RESULTS_DIR/post_selection_mip.csv" ]; then
+  echo "Posts missing -> rebuilding P4 (K=14, delta=800m)..."
+  python -u 28_post_selection_mip.py \
+    --data-dir "$DATA_DIR" \
+    --out-results "$RESULTS_DIR" \
+    --out-figures "$FIG_DIR" \
+    --k 14 --delta-m 800 --decay-m 5000 \
+    --min-len-m 100 --time-limit 600 2>&1
+  [ $? -ne 0 ] && { echo "FATAL: P4 rebuild failed"; exit 1; }
+else
+  echo "Posts present: $(wc -l < "$RESULTS_DIR/post_selection_mip.csv") lines"
+fi
+
+# --- 2. THE paper pipeline (single sound script, segment-based) ---
+echo ""
+echo "Running 40_rsp_spatial_effect.py (segment-based, P=5 of K=14) ..."
+python -u 40_rsp_spatial_effect.py --staffed-p 5 2>&1
+EXIT_CODE=$?
+# Guard: python exiting 0 but writing nothing (e.g. missing __main__ call)
+# must fail here, not cryptically in validation.
+if [ $EXIT_CODE -ne 0 ] || [ ! -s "$RESULTS_DIR/rsp_audit.json" ]; then
+  echo "FATAL: RSP pipeline failed (exit=$EXIT_CODE, rsp_audit.json missing)"
+  exit 1
+fi
+
+# --- 3. Validate paper artefacts (loud, no silent bugs) ---
+echo ""
+echo "Validating paper artefacts..."
+python - "$RESULTS_DIR/rsp_audit.json" <<'EOF'
+import json, sys, os
+base = "/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics"
+a = json.load(open(f"{base}/results/rsp_audit.json"))
+assert a.get("spf_converged"), "SPF not converged"
+assert abs(a["total_eb"] - a["total_obs"]) / max(a["total_obs"], 1) < 0.05, "EB total far from observed"
+assert a.get("n_posts", 0) >= 10, "too few posts"
+for f in ["results/rsp_segment_effect.csv", "results/rsp_spatial_effect.tex",
+          "figures/rsp_uplift_vs_distance.png", "figures/rsp_coverage_simulation.png"]:
+    assert os.path.getsize(f"{base}/{f}") > 0, f"missing {f}"
+print(f"OK: SPF {a['spf_formula']} AIC={a['spf_aic']:.0f} alpha={a['spf_alpha']:.3f}")
+print(f"OK: rule={a.get('coverage_rule','segment-based')}")
+print(f"OK: coverage_with={100*a['coverage_with']:.1f}% preventable={a['preventable_events']:.0f}")
+print(f"OK: Spearman(assigned-dist,uplift)={a['spearman_dist_uplift']:.3f}")
+EOF
+EXIT_CODE=$?
+echo ""
+echo "=================================================================="
+echo "Job finished at $(date) - exit_code=$EXIT_CODE"
+echo "Paper inputs: results/rsp_spatial_effect.tex -> \\input in manuscript/main.tex"
+echo "  per-segment: results/rsp_segment_effect.csv (covered => RSP improves segment)"
+echo "=================================================================="
+exit $EXIT_CODE

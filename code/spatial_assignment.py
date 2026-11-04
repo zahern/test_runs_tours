@@ -1090,7 +1090,7 @@ _SA4_ANCHORS = {
 _MODE_COLORS = {
     'DA': '#1E5FA8', 'SR': '#2E9E6B', 'Transit': '#7B5EA7',
     'Walk': '#E07030', 'Bike': '#5B9E2B', 'Other': '#888888',
-    1: '#1E5FA8', 2: '#888888', 3: '#E07030', 4: '#5B9E2B', 5: '#7B5EA7',
+    1: '#1E5FA8', 2: '#2E9E6B', 3: '#E07030', 4: '#5B9E2B', 5: '#7B5EA7',
 }
 _PURPOSE_COLORS = {
     'work': '#1A5FA8', 'edu': '#0F6E56', 'shopping': '#993C1D',
@@ -1317,7 +1317,9 @@ def plot_person_movement(
         t_h = int(row.get('STARTIME', 0) / 60)
         t_m = int(row.get('STARTIME', 0) % 60)
         mode = str(row.get('mode_name', row.get('mode', '')))
-        dist = float(row.get('dist_km', 0))
+        # Prefer skim road distance ('dist') over haversine ('dist_km') —
+        # haversine between zone centroids can significantly overestimate.
+        dist = float(row.get('dist') or row.get('dist_km') or 0)
         ax.text((o_lon+d_lon)/2, (o_lat+d_lat)/2 + 0.002,
                 f"{t_h:02d}:{t_m:02d} {mode} {dist:.1f}km",
                 fontsize=6, color='white', ha='center', alpha=0.85,
@@ -1344,7 +1346,14 @@ def plot_person_movement(
     for sp in ax.spines.values(): sp.set_edgecolor('#334466')
 
     ptype = person.iloc[0].get('ptype','') if len(person) else ''
-    total_km = trips['dist_km'].sum() if 'dist_km' in trips.columns else 0
+    # Prefer skim road distance sum ('dist') over haversine centroid distance
+    # ('dist_km') — haversine overestimates road distance significantly.
+    if 'dist' in trips.columns and trips['dist'].notna().any():
+        total_km = trips['dist'].sum()
+    elif 'dist_km' in trips.columns:
+        total_km = trips['dist_km'].sum()
+    else:
+        total_km = 0
     # Use activity count for the human-readable title — that's what "trips" means
     # to a user (one trip = one out-of-home activity visit, not each trip leg).
     n_activities = len(acts)
@@ -1378,12 +1387,20 @@ def plot_distance_distribution(
     else:
         trips = plan_with_coords.copy()
 
-    if 'dist_km' not in trips.columns or len(trips) == 0:
+    if 'dist_km' not in trips.columns and 'dist' not in trips.columns:
         print("  No dist_km — run assign_coordinates() first")
         return None
 
+    # Prefer skim road distance ('dist') over haversine zone-centroid distance
+    # ('dist_km'): haversine overestimates road distance by ~20-40% for SEQ zones.
+    if 'dist' in trips.columns and trips['dist'].notna().any():
+        trips = trips.copy()
+        trips['dist_km'] = trips['dist']
+    elif 'dist_km' not in trips.columns:
+        return None
+
     mode_col = 'mode_name' if 'mode_name' in trips.columns else 'mode'
-    _mm = {1:'DA', 2:'Other', 3:'Walk', 4:'Bike', 5:'Transit'}
+    _mm = {1:'DA', 2:'SR', 3:'Walk', 4:'Bike', 5:'Transit'}
     if trips[mode_col].dtype != object:
         trips['mode_label'] = trips[mode_col].map(_mm).fillna('DA')
     else:
@@ -1394,7 +1411,7 @@ def plot_distance_distribution(
     # Panel 1 — histogram by mode
     ax = axes[0]
     bins = np.linspace(0, min(trips['dist_km'].quantile(0.98), 80), 45)
-    for mode in ['DA','Transit','Walk','Bike','Other']:
+    for mode in ['DA','SR','Transit','Walk','Bike']:
         sub = trips[trips['mode_label']==mode]['dist_km']
         if len(sub)==0: continue
         ax.hist(sub, bins=bins, alpha=0.6, color=_MODE_COLORS.get(mode,'#888'),
@@ -1457,7 +1474,7 @@ def plot_desire_lines(
         trips = trips.sample(sample_n, random_state=42)
 
     mode_col = 'mode_name' if 'mode_name' in trips.columns else 'mode'
-    _mm = {1:'DA', 2:'Other', 3:'Walk', 4:'Bike', 5:'Transit'}
+    _mm = {1:'DA', 2:'SR', 3:'Walk', 4:'Bike', 5:'Transit'}
     if trips[mode_col].dtype != object:
         trips['mode_label'] = trips[mode_col].map(_mm).fillna('DA')
     else:
@@ -1466,7 +1483,7 @@ def plot_desire_lines(
     fig, ax = plt.subplots(figsize=(13, 11), facecolor='#0d1117')
     ax.set_facecolor('#0d1117')
 
-    for mode in ['DA','Transit','Walk','Bike','Other']:
+    for mode in ['DA','SR','Transit','Walk','Bike']:
         sub = trips[trips['mode_label']==mode].dropna(
             subset=['origin_lat','origin_lon','dest_lat','dest_lon'])
         if len(sub)==0: continue
@@ -1562,10 +1579,18 @@ def plot_spatial_metrics(
     else:
         trips = plan_with_coords.copy()
 
-    if 'dist_km' not in trips.columns: return None
+    if 'dist_km' not in trips.columns and 'dist' not in trips.columns:
+        return None
+
+    # Prefer skim road distance over haversine zone-centroid distance
+    if 'dist' in trips.columns and trips['dist'].notna().any():
+        trips = trips.copy()
+        trips['dist_km'] = trips['dist']
+    elif 'dist_km' not in trips.columns:
+        return None
 
     mode_col = 'mode_name' if 'mode_name' in trips.columns else 'mode'
-    _mm = {1:'DA',2:'Other',3:'Walk',4:'Bike',5:'Transit'}
+    _mm = {1:'DA',2:'SR',3:'Walk',4:'Bike',5:'Transit'}
     if trips[mode_col].dtype != object:
         trips['mode_label'] = trips[mode_col].map(_mm).fillna('DA')
     else:
@@ -1574,18 +1599,21 @@ def plot_spatial_metrics(
     fig, axes = plt.subplots(2, 2, figsize=(14, 10), facecolor='white')
     ax1, ax2, ax3, ax4 = axes.flatten()
 
-    # (a)
-    dc = trips['dist_km'].clip(0, 60)
+    # (a) — cap at 60km for display but show real median/mean from full data
+    _dist_all = trips['dist_km']
+    dc = _dist_all.clip(0, 60)
     ax1.hist(dc, bins=60, color='#1E5FA8', alpha=0.8, edgecolor='white', lw=0.3)
-    ax1.axvline(dc.median(), color='#E07030', lw=2, ls='--', label=f'Median {dc.median():.1f}km')
-    ax1.axvline(dc.mean(),   color='#993556', lw=2, ls=':',  label=f'Mean {dc.mean():.1f}km')
+    ax1.axvline(_dist_all.median(), color='#E07030', lw=2, ls='--',
+                label=f'Median {_dist_all.median():.1f}km')
+    ax1.axvline(_dist_all.mean(),   color='#993556', lw=2, ls=':',
+                label=f'Mean {_dist_all.mean():.1f}km')
     ax1.set_xlabel('Trip distance (km)', fontsize=10); ax1.set_ylabel('Trips', fontsize=10)
     ax1.set_title('(a) Trip distance distribution', fontsize=11, pad=6)
     ax1.legend(fontsize=8, frameon=False); ax1.spines[['top','right']].set_visible(False)
     ax1.grid(axis='y', color='#eee', lw=0.5)
 
     # (b)
-    modes = [m for m in ['DA','Transit','Walk','Bike'] if m in trips['mode_label'].unique()]
+    modes = [m for m in ['DA','SR','Transit','Walk','Bike'] if m in trips['mode_label'].unique()]
     mdata = [trips.loc[trips['mode_label']==m,'dist_km'].clip(0,60).dropna().values for m in modes]
     bp = ax2.boxplot(mdata, vert=True, patch_artist=True,
                     medianprops=dict(color='white', lw=2),
@@ -1767,11 +1795,15 @@ if __name__ == '__main__':
     # per-person movement plots for the top 4 highest-mileage persons
     rt_col = 'row_type' if 'row_type' in plan_coords.columns else None
     trip_rows = plan_coords[plan_coords[rt_col] == 'trip'] if rt_col else plan_coords
-    if 'dist_km' in trip_rows.columns and 'person_id' in trip_rows.columns:
+    if 'person_id' in trip_rows.columns:
         import numpy as np
-        top_pids = (trip_rows.groupby('person_id')['dist_km']
-                    .sum().sort_values(ascending=False)
-                    .head(20).index.tolist())
+        # Prefer skim road distance ('dist') over haversine ('dist_km')
+        _dc = 'dist' if 'dist' in trip_rows.columns and trip_rows['dist'].notna().any() \
+              else ('dist_km' if 'dist_km' in trip_rows.columns else None)
+        if _dc:
+            top_pids = (trip_rows.groupby('person_id')[_dc]
+                        .sum().sort_values(ascending=False)
+                        .head(20).index.tolist())
         rng = np.random.default_rng(42)
         sample_pids = rng.choice(top_pids, size=min(4, len(top_pids)),
                                   replace=False).tolist()

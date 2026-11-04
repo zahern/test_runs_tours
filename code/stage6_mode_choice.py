@@ -93,6 +93,14 @@ import os
 import pickle
 from typing import Optional
 
+from larch_regularization import elasticnet_objective
+
+try:
+    import larch_jax_enforce as _jfe6
+    _jfe6.apply()
+except Exception:
+    pass
+
 # ── JAX: XLA-JIT utility matrix computation (CPU-only, no GPU required) ──
 import os as _os
 _os.environ.setdefault('JAX_PLATFORM_NAME', 'cpu')
@@ -133,6 +141,74 @@ PURPOSES = [
     'shopping', 'othmaint', 'othdiscr', 'eat',
 ]
 
+_S6_PURPOSE_PARAM_NAMES = {
+    'work': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'inc_da', 'wrk_da',
+        'lic_da', 'ft_da', 'ind_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'inc_tr', 'pt_tr', 'pub_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'age_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'age_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'edu': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'stu_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'stu_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'yng_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'escort': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'fem_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'fem_wk',
+        'asc_bk', 'ldb', 'nv_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'shopping': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'inc_da', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'fem_tr', 'inc_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'age_wk', 'fem_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'age_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'eat': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'inc_da', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'fem_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'fem_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'yng_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'social': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'inc_da', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'fem_tr', 'inc_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'age_wk', 'fem_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'age_bk', 'yng_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'othmaint': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'inc_da', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'fem_tr', 'inc_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'age_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'age_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+    'othdiscr': [
+        'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'inc_da', 'lic_da',
+        'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+        'asc_tr', 'tt_tr', 'ld_tr', 'acc_tr', 'nv_tr', 'fem_tr',
+        'asc_wk', 'ldw', 'nv_wk', 'age_wk', 'fem_wk',
+        'asc_bk', 'ldb', 'nv_bk', 'age_bk', 'yng_bk',
+        'mu_motorised', 'mu_nonmotorised',
+    ],
+}
+
 # Mode labels
 MODES      = ['DA', 'SR', 'Transit', 'Walk', 'Bike']
 MODE_IDX   = {m: i for i, m in enumerate(MODES)}
@@ -154,6 +230,7 @@ NEST_MEMBERS = {
 FUEL_RATE = 0.12   # ~12 cents/km
 
 # Person feature columns — extended with age5p and industry/licence for heterogeneity spec
+#TODO I WANT workstat, BUT WHEN WORKSTAT I WANT IT POPULATED INTO THE MODEL BROKEN DOWN AS CATEGOGICAL HOW TO
 PERSON_FEATURES = ['sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING', 'incp', 'age5p',
                    'indp', 'CARLICENCE']
 
@@ -196,6 +273,65 @@ RAW_MODE_MAP = {
     'Walk': 'Walk', 'Bike': 'Bike',
 }
 
+# Stage 51 searches over candidate names from the broader ActivitySim-style
+# pool, while NestedLogitModeModel estimates a smaller purpose-specific
+# parameter set.  Keep the mapping explicit so a selected gene changes the
+# likelihood rather than merely changing the BIC penalty.
+_STAGE51_MODE_BASE_PARAMS = {
+    'tt_da', 'ld_da', 'cost', 'veh_da', 'crash', 'lic_da',
+    'asc_sr', 'tt_sr', 'ld_sr', 'nv_sr',
+    'asc_tr', 'tt_tr', 'ld_tr', 'nv_tr',
+    'asc_wk', 'ldw', 'nv_wk',
+    'asc_bk', 'ldb', 'mu_motorised', 'mu_nonmotorised',
+}
+_STAGE51_MODE_FEATURE_PARAMS = {
+    'ptype_FullTimeWorker': ('ft_da',),
+    'ptype_PartTimeWorker': ('pt_tr',),
+    'ptype_UniversityStudent': ('stu_tr', 'stu_wk'),
+    'ptype_WorkingStudent': ('stu_tr', 'stu_wk'),
+    'ptype_SchoolChild': ('stu_tr', 'stu_wk', 'yng_bk'),
+    'ptype_Retired': ('age_wk', 'age_bk'),
+    'studying_primary': ('stu_tr', 'stu_wk', 'yng_bk'),
+    'studying_secondary': ('stu_tr', 'stu_wk', 'yng_bk'),
+    'studying_tertiary_pt': ('stu_tr', 'stu_wk'),
+    'studying_tertiary_ft': ('stu_tr', 'stu_wk'),
+    'is_female': ('fem_tr', 'fem_wk'),
+    'sexp': ('fem_tr', 'fem_wk'),
+    'age_older': ('age_wk', 'age_bk'),
+    'age_senior': ('age_wk', 'age_bk'),
+    'age_child': ('yng_bk',),
+    'age_teen': ('yng_bk',),
+    'incp': ('inc_da', 'inc_tr'),
+    'income_hi': ('inc_da',),
+    'income_veryhi': ('inc_da',),
+    'income_lo': ('inc_tr',),
+    'income_verylo': ('inc_tr',),
+    'occp_trades': ('ind_da',),
+    'occp_prof': ('pub_tr',),
+    'workstat_fulltime': ('ft_da',),
+    'workstat_parttime': ('pt_tr',),
+    'CRASH': ('crash',),
+}
+
+
+def stage51_mode_feature_supported(feature: str) -> bool:
+    """Whether a Stage 51 candidate maps to a live mode coefficient."""
+    return str(feature) in _STAGE51_MODE_FEATURE_PARAMS
+
+
+def stage51_mode_param_names(selected_features, purpose: str) -> list:
+    """Return active nested-logit parameters for a Stage 51 gene set.
+
+    ASCs, travel costs/times, vehicle dependence, and nest parameters form the
+    structural backbone.  Selected demographic genes add only their mapped
+    interactions; unselected genes are absent from the fitted likelihood.
+    """
+    full = _s6_param_names_for_purpose(purpose)
+    active = set(_STAGE51_MODE_BASE_PARAMS)
+    for feature in selected_features or ():
+        active.update(_STAGE51_MODE_FEATURE_PARAMS.get(str(feature), ()))
+    return [name for name in full if name in active]
+
 
 # ---------------------------------------------------------------------------
 # LARCH HELPERS
@@ -203,15 +339,25 @@ RAW_MODE_MAP = {
 
 def _lx_model_s6(dt):
     """
-    Create a Larch Model from dt, trying JAX engine then numba.
+    Create a Larch Model from dt — JAX-first, always (large-model policy).
 
     JAX gives exact gradients via XLA autodiff — faster and more accurate for
-    the nested logit log-likelihood than finite-difference numba.  Falls back
-    to numba if JAX is unavailable (Windows without CUDA, etc.).
+    the nested logit log-likelihood than finite-difference numba. Numba is
+    last-resort fallback only (LARCH_FORCE_JAX=0 restores legacy behaviour).
     """
     if not _LARCH_AVAILABLE:
         raise RuntimeError("larch not installed")
-    for engine in ('jax', 'numba'):
+    try:
+        import larch_jax_enforce as _jfe
+        _jfe.ensure_jax_environment()
+    except Exception:
+        pass
+    import os as _os6
+    _force = _os6.environ.get('LARCH_FORCE_JAX', '1').strip() != '0'
+    # Mirror stage5 _lx_model: honour the legacy OS-dependent ordering when
+    # JAX-forcing is disabled (previously both branches were ('jax','numba')).
+    _order = ('jax', 'numba') if _force else (('numba', 'jax') if os.name == 'nt' else ('jax', 'numba'))
+    for engine in _order:
         try:
             m = lx.Model(dt, compute_engine=engine)
             logger.debug(f"_lx_model_s6: using compute_engine='{engine}'")
@@ -221,7 +367,12 @@ def _lx_model_s6(dt):
     raise RuntimeError("No Larch compute engine available (tried jax, numba)")
 
 
-def _build_larch_nl_mode_s6(df: pd.DataFrame) -> tuple:
+def _build_larch_nl_mode_s6(
+    df: pd.DataFrame,
+    param_names: list,
+    init_values: np.ndarray,
+    enforce_vehicle_availability: bool = False,
+) -> tuple:
     """
     Build a Larch nested logit mode choice DataTree + Model.
 
@@ -270,7 +421,7 @@ def _build_larch_nl_mode_s6(df: pd.DataFrame) -> tuple:
     # Availability: walk/bike blocked by pre-computed availability flags.
     # DA always available (vehicle utility term controls behaviour).
     m.availability_co_vars = {
-        _LARCH_MODE_IDS['DA']:      1,
+        _LARCH_MODE_IDS['DA']:      ('da_avail' if enforce_vehicle_availability else 1),
         _LARCH_MODE_IDS['SR']:      1,
         _LARCH_MODE_IDS['Walk']:    "walk_avail",
         _LARCH_MODE_IDS['Bike']:    "bike_avail",
@@ -278,54 +429,60 @@ def _build_larch_nl_mode_s6(df: pd.DataFrame) -> tuple:
     }
 
     # ── Utility expressions — match build_utility_matrix spec exactly ─────
+    active_params = set(param_names)
+
+    def _term(name, expr=None):
+        if name not in active_params:
+            return 0
+        return P(name) if expr is None else P(name) * X(expr)
+
     m.utility_co[_LARCH_MODE_IDS['DA']] = (
-        P('tt_da')  * X('trip.tt_h')
-        + P('ld_da') * X('trip.log_dist')
-        + P('cost')  * X('trip.cost_proxy')
-        + P('veh_da')* X('trip.has_vehicle')
-        + P('crash') * X('trip.log_crash')
-        + P('inc_da')* X('trip.inc_hi')
-        + P('wrk_da')* X('trip.worker')
-        + P('lic_da')* X('trip.licence')
-        + P('ft_da') * X('trip.full_time')
-        + P('ind_da')* X('trip.indp_industrial')
+        _term('tt_da', 'tt_h')
+        + _term('ld_da', 'log_dist')
+        + _term('cost', 'cost_proxy')
+        + _term('veh_da', 'has_vehicle')
+        + _term('crash', 'log_crash')
+        + _term('inc_da', 'inc_hi')
+        + _term('wrk_da', 'worker')
+        + _term('lic_da', 'licence')
+        + _term('ft_da', 'full_time')
+        + _term('ind_da', 'indp_industrial')
     )
     m.utility_co[_LARCH_MODE_IDS['SR']] = (
-        P('asc_sr')
-        + P('tt_sr') * X('trip.tt_h')
-        + P('ld_sr') * X('trip.log_dist')
-        + P('nv_sr') * X('trip.no_vehicle')
+        _term('asc_sr')
+        + _term('tt_sr', 'tt_h')
+        + _term('ld_sr', 'log_dist')
+        + _term('nv_sr', 'no_vehicle')
     )
     m.utility_co[_LARCH_MODE_IDS['Transit']] = (
-        P('asc_tr')
-        + P('tt_tr') * X('trip.tt_h')
-        + P('ld_tr') * X('trip.log_dist')
-        + P('acc_tr')* X('trip.accessibility')
-        + P('nv_tr') * X('trip.no_vehicle')
-        + P('stu_tr')* X('trip.student')
-        + P('fem_tr')* X('trip.female')
-        + P('inc_tr')* X('trip.inc_lo')
-        + P('pt_tr') * X('trip.part_time')
-        + P('pub_tr')* X('trip.indp_public')
-    )
-        + P('stu_tr')* X('trip.student')
-        + P('fem_tr')* X('trip.female')
-        + P('inc_tr')* X('trip.inc_lo')
+        _term('asc_tr')
+        # NOTE: the 1.5x transit IVT weight MUST match build_utility_matrix /
+        # JAX cores exactly — prediction always applies it, so the Larch
+        # fit must estimate tt_tr under the same scaling.
+        + (_term('tt_tr', 'tt_h') * 1.5 if 'tt_tr' in active_params else 0)
+        + _term('ld_tr', 'log_dist')
+        + _term('acc_tr', 'accessibility')
+        + _term('nv_tr', 'no_vehicle')
+        + _term('stu_tr', 'student')
+        + _term('fem_tr', 'female')
+        + _term('inc_tr', 'inc_lo')
+        + _term('pt_tr', 'part_time')
+        + _term('pub_tr', 'indp_public')
     )
     m.utility_co[_LARCH_MODE_IDS['Walk']] = (
-        P('asc_wk')
-        + P('ldw')   * X('trip.ldw')
-        + P('nv_wk') * X('trip.no_vehicle')
-        + P('age_wk')* X('trip.older')
-        + P('fem_wk')* X('trip.female')
-        + P('stu_wk')* X('trip.student')
+        _term('asc_wk')
+        + _term('ldw', 'ldw')
+        + _term('nv_wk', 'no_vehicle')
+        + _term('age_wk', 'older')
+        + _term('fem_wk', 'female')
+        + _term('stu_wk', 'student')
     )
     m.utility_co[_LARCH_MODE_IDS['Bike']] = (
-        P('asc_bk')
-        + P('ldb')   * X('trip.ldb')
-        + P('nv_bk') * X('trip.no_vehicle')
-        + P('age_bk')* X('trip.older')
-        + P('yng_bk')* X('trip.young')
+        _term('asc_bk')
+        + _term('ldb', 'ldb')
+        + _term('nv_bk', 'no_vehicle')
+        + _term('age_bk', 'older')
+        + _term('yng_bk', 'young')
     )
 
     # ── Nested logit graph ────────────────────────────────────────────────
@@ -356,8 +513,7 @@ def _build_larch_nl_mode_s6(df: pd.DataFrame) -> tuple:
         pass
 
     # ── Inject NestedLogitModeModel starting values ───────────────────────
-    _pname_to_init = dict(zip(NestedLogitModeModel.PARAM_NAMES,
-                              NestedLogitModeModel.INIT))
+    _pname_to_init = dict(zip(param_names, init_values))
     for _pn, _pv in _pname_to_init.items():
         # Map scipy param names → Larch param names (identical except nest params)
         _larch_pn = _pn
@@ -372,7 +528,7 @@ def _build_larch_nl_mode_s6(df: pd.DataFrame) -> tuple:
     return dt, m
 
 
-def _extract_larch_coef_to_scipy(m) -> np.ndarray:
+def _extract_larch_coef_to_scipy(m, param_names: list, init_values: np.ndarray) -> np.ndarray:
     """
     Extract Larch model coefficients back to NestedLogitModeModel.PARAM_NAMES
     order (scipy coef_ format).
@@ -384,10 +540,10 @@ def _extract_larch_coef_to_scipy(m) -> np.ndarray:
         pf = m.pf
         larch_vals = {name: float(pf.loc[name, 'value']) for name in pf.index}
     except Exception:
-        return NestedLogitModeModel.INIT.copy()
+        return init_values.copy()
 
-    coef = NestedLogitModeModel.INIT.copy()
-    for i, pname in enumerate(NestedLogitModeModel.PARAM_NAMES):
+    coef = init_values.copy()
+    for i, pname in enumerate(param_names):
         # Map nest params: scipy 'mu_motorised' ← Larch 'Mu_Motorised'
         if pname == 'mu_motorised':
             larch_key = 'Mu_Motorised'
@@ -638,11 +794,15 @@ def prepare_mode_data(
         df = df[df['purpose'].isin(PURPOSES)].copy()
 
     # ── skim features ────────────────────────────────────────────────────
-    # standardise columns that may have various names
+    # standardise columns that may have various names.
+    # NOTE: observed TRAVTIME is deliberately EXCLUDED from tt_avg candidates:
+    # it is the chosen mode's realised travel time (leakage — unavailable for
+    # non-chosen alternatives at prediction, inflates fit). tt_avg must come
+    # from skims only; without a skim column it stays 0 (warning below).
     skim_map = {
-        'tt_avg':   ['tt_avg', 'SOVTOLL_TIME__AM', 'auto_time', 'TRAVTIME'],
+        'tt_avg':   ['tt_avg', 'SOVTOLL_TIME__AM', 'auto_time'],
         'tt_am':    ['tt_am', 'SOVTOLL_TIME__AM'],
-        'dist':     ['dist', 'DIST', 'CUMDIST', 'distance_km', 'distance'],
+        'dist':     ['dist', 'DIST', 'CUMDIST', 'TRIPDIST', 'distance_km', 'distance'],
         'distwalk': ['distwalk', 'DISTWALK', 'walk_dist'],
         'distbike': ['distbike', 'DISTBIKE', 'bike_dist'],
         'crash':    ['crash', 'CRASH', 'crash_index'],
@@ -652,14 +812,26 @@ def prepare_mode_data(
         if found:
             df[std] = pd.to_numeric(df[found], errors='coerce').fillna(0)
         else:
+            if std == 'tt_avg':
+                logger.warning("prepare_mode_data: no skim time column %s — "
+                               "tt_avg=0 (observed TRAVTIME excluded as leakage)",
+                               candidates)
             df[std] = 0.0
 
     df['log_dist']   = np.log1p(df['dist'])
+    df['log_crash']  = np.log1p(df['crash'])
+    df['tt_h']       = np.clip(df['tt_avg'] / 60.0, 0.01, 5.0)
     df['cost_proxy'] = df['dist'] * FUEL_RATE
 
     # ── zone TAZ ─────────────────────────────────────────────────────────
-    df['OTAZ'] = pd.to_numeric(df.get('OTAZ', 0), errors='coerce').fillna(0).astype(int)
-    df['DTAZ'] = pd.to_numeric(df.get('DTAZ', 0), errors='coerce').fillna(0).astype(int)
+    if 'OTAZ' in df.columns:
+        df['OTAZ'] = pd.to_numeric(df['OTAZ'], errors='coerce').fillna(0).astype(int)
+    else:
+        df['OTAZ'] = 0
+    if 'DTAZ' in df.columns:
+        df['DTAZ'] = pd.to_numeric(df['DTAZ'], errors='coerce').fillna(0).astype(int)
+    else:
+        df['DTAZ'] = 0
 
     # ── accessibility from landuse ────────────────────────────────────────
     if landuse is not None:
@@ -690,9 +862,10 @@ def prepare_mode_data(
         df['accessibility'] = 0.0
 
     # ── STARTIME ──────────────────────────────────────────────────────────
-    df['start_hr'] = pd.to_numeric(
-        df.get('STARTIME', 480), errors='coerce'
-    ).fillna(480) / 60
+    if 'STARTIME' in df.columns:
+        df['start_hr'] = pd.to_numeric(df['STARTIME'], errors='coerce').fillna(480) / 60
+    else:
+        df['start_hr'] = 8.0
 
     # ── person attributes ─────────────────────────────────────────────────
     pers = persons.copy()
@@ -747,10 +920,10 @@ def prepare_mode_data(
     # city/suburban destinations, school-zone parking restrictions, etc.
     df['indp_public']     = _indp.isin([15, 16, 17]).astype(float)
 
-    # Worker type: full-time vs part-time (QTS work_map: 1=PT, 2=FT)
+    # Worker type: full-time vs part-time (QTS work_map: 1=FT, 2=PT)
     # Full-time workers face stricter schedule constraints → more DA
-    df['full_time'] = (df['WORKSTAT'] == 2).astype(float)
-    df['part_time'] = (df['WORKSTAT'] == 1).astype(float)
+    df['full_time'] = (df['WORKSTAT'] == 1).astype(float)
+    df['part_time'] = (df['WORKSTAT'] == 2).astype(float)
 
     mode_dist = df['chosen_mode'].value_counts().to_dict()
     mode_pct  = {m: f"{v/len(df):.1%}" for m, v in mode_dist.items()}
@@ -790,135 +963,237 @@ def prepare_mode_data(
 #    it enters all non-DA utilities to represent captive behaviour.
 # ---------------------------------------------------------------------------
 
+# ── JAX-native utility core ──────────────────────────────────────────────
+# Why this split: pandas/numpy extraction happens ONCE outside autodiff
+# (host side), then a pure jnp core runs inside grad/jit with NO np.asarray,
+# NO pandas, NO dict lookups on tracers. The old version called
+# np.asarray(jax_tracer) inside the differentiated region, forcing a
+# device→host transfer that breaks jax.grad. Layout below keeps the exact
+# same utility spec; only the array boundary moved.
+_S6_FEATURE_ORDER = [
+    'tt_h', 'log_dist', 'cost_proxy', 'has_vehicle', 'log_crash',
+    'inc_hi', 'worker', 'licence', 'full_time', 'indp_industrial',
+    'no_vehicle', 'accessibility', 'student', 'female', 'inc_lo',
+    'part_time', 'indp_public', 'ldw', 'ldb', 'older', 'young',
+]
+
+
+def _extract_s6_features(df: pd.DataFrame) -> dict:
+    """Pandas→numpy feature extraction (host side, OUTSIDE autodiff).
+
+    All fillna/derived dummies (female/young/older/...) happen here in numpy
+    so the JAX core below sees only float64 arrays. Returns {name: (N,) float64}.
+    """
+    N = len(df)
+
+    def _col(colname, fallback=0.0):
+        if colname in df.columns:
+            return pd.to_numeric(df[colname], errors='coerce').fillna(fallback).values.astype(np.float64)
+        return np.full(N, float(fallback), dtype=np.float64)
+
+    tt = _col('tt_avg')
+    tt_h = np.clip(tt / 60.0, 0.01, 5.0)
+    ld = _col('log_dist')
+    dist = _col('dist')
+    ldw = np.log1p(np.maximum(_col('distwalk'), 0.0))
+    ldb = np.log1p(np.maximum(_col('distbike'), 0.0))
+    log_crash = np.log1p(np.maximum(_col('crash'), 0.0))
+    cost_proxy = dist * float(FUEL_RATE)
+    incp = _col('incp', 8.0)
+    age5p = _col('age5p', 4.0)
+    sexp = _col('sexp', 1.0)
+    workst = _col('WORKSTAT', 0.0)
+    study = _col('STUDYING', 0.0)
+    return {
+        'tt_h': tt_h, 'log_dist': ld, 'cost_proxy': cost_proxy,
+        'has_vehicle': _col('has_vehicle'), 'log_crash': log_crash,
+        'inc_hi': np.clip(incp - 8, 0, None), 'worker': np.clip(workst, 0, 1),
+        'licence': _col('licence', 1.0), 'full_time': _col('full_time', 0.0),
+        'indp_industrial': _col('indp_industrial', 0.0),
+        'no_vehicle': _col('no_vehicle'), 'accessibility': _col('accessibility'),
+        'student': (study > 0).astype(np.float64),
+        'female': (sexp == 2).astype(np.float64),
+        'inc_lo': np.clip(8 - incp, 0, None),
+        'part_time': _col('part_time', 0.0), 'indp_public': _col('indp_public', 0.0),
+        'ldw': ldw, 'ldb': ldb,
+        'older': (age5p >= 10).astype(np.float64),
+        'young': (age5p <= 5).astype(np.float64),
+    }
+
+
+def _stack_s6_features(feats: dict) -> np.ndarray:
+    """Stack feature dict → (N, F) float64 in _S6_FEATURE_ORDER."""
+    N = len(next(iter(feats.values())))
+    F = np.empty((N, len(_S6_FEATURE_ORDER)), dtype=np.float64)
+    for j, k in enumerate(_S6_FEATURE_ORDER):
+        F[:, j] = feats[k]
+    return F
+
+
+def _utility_core_np(F: np.ndarray, params: np.ndarray, param_names: list) -> np.ndarray:
+    """Pure-numpy utility core (scipy fallback / predict). No pandas, no jax."""
+    p = dict(zip(param_names, [float(v) for v in np.asarray(params, dtype=float)]))
+    g = lambda name: p.get(name, 0.0)
+    j = {k: i for i, k in enumerate(_S6_FEATURE_ORDER)}
+    C = lambda key: F[:, j[key]]
+    N = F.shape[0]
+    V = np.zeros((N, len(MODES)), dtype=np.float64)
+    V[:, MODE_IDX['DA']] = (
+        g('tt_da') * C('tt_h') + g('ld_da') * C('log_dist') + g('cost') * C('cost_proxy')
+        + g('veh_da') * C('has_vehicle') + g('crash') * C('log_crash') + g('inc_da') * C('inc_hi')
+        + g('wrk_da') * C('worker') + g('lic_da') * C('licence') + g('ft_da') * C('full_time')
+        + g('ind_da') * C('indp_industrial'))
+    V[:, MODE_IDX['SR']] = (
+        g('asc_sr') + g('tt_sr') * C('tt_h') + g('ld_sr') * C('log_dist')
+        + g('crash') * C('log_crash') + g('nv_sr') * C('no_vehicle'))
+    V[:, MODE_IDX['Transit']] = (
+        g('asc_tr') + g('tt_tr') * C('tt_h') * 1.5 + g('ld_tr') * C('log_dist')
+        + g('acc_tr') * C('accessibility') + g('nv_tr') * C('no_vehicle')
+        + g('stu_tr') * C('student') + g('fem_tr') * C('female') + g('inc_tr') * C('inc_lo')
+        + g('pt_tr') * C('part_time') + g('pub_tr') * C('indp_public'))
+    V[:, MODE_IDX['Walk']] = (
+        g('asc_wk') + g('ldw') * C('ldw') + g('nv_wk') * C('no_vehicle')
+        + g('age_wk') * C('older') + g('fem_wk') * C('female') + g('stu_wk') * C('student'))
+    V[:, MODE_IDX['Bike']] = (
+        g('asc_bk') + g('ldb') * C('ldb') + g('nv_bk') * C('no_vehicle')
+        + g('age_bk') * C('older') + g('yng_bk') * C('young'))
+    return V
+
+
+if _JAX_AVAILABLE:
+    import jax as _jax
+
+    def _utility_core_jax(F, params: list, param_names: tuple) -> 'jnp.ndarray':
+        """Pure-JAX utility core — jittable/graddable. NO np.*, NO pandas.
+
+        F: (N, F) jax array (converted OUTSIDE, once). params: (K,) jax array.
+        param_names is a static tuple (closure), never a tracer.
+        """
+        pidx = {n: i for i, n in enumerate(param_names)}
+        g = lambda name: params[pidx[name]] if name in pidx else 0.0
+        j = {k: i for i, k in enumerate(_S6_FEATURE_ORDER)}
+        C = lambda key: F[:, j[key]]
+        N = F.shape[0]
+        V = jnp.zeros((N, len(MODES)), dtype=jnp.float64)
+        V = V.at[:, MODE_IDX['DA']].set(
+            g('tt_da') * C('tt_h') + g('ld_da') * C('log_dist') + g('cost') * C('cost_proxy')
+            + g('veh_da') * C('has_vehicle') + g('crash') * C('log_crash') + g('inc_da') * C('inc_hi')
+            + g('wrk_da') * C('worker') + g('lic_da') * C('licence') + g('ft_da') * C('full_time')
+            + g('ind_da') * C('indp_industrial'))
+        V = V.at[:, MODE_IDX['SR']].set(
+            g('asc_sr') + g('tt_sr') * C('tt_h') + g('ld_sr') * C('log_dist')
+            + g('crash') * C('log_crash') + g('nv_sr') * C('no_vehicle'))
+        V = V.at[:, MODE_IDX['Transit']].set(
+            g('asc_tr') + g('tt_tr') * C('tt_h') * 1.5 + g('ld_tr') * C('log_dist')
+            + g('acc_tr') * C('accessibility') + g('nv_tr') * C('no_vehicle')
+            + g('stu_tr') * C('student') + g('fem_tr') * C('female') + g('inc_tr') * C('inc_lo')
+            + g('pt_tr') * C('part_time') + g('pub_tr') * C('indp_public'))
+        V = V.at[:, MODE_IDX['Walk']].set(
+            g('asc_wk') + g('ldw') * C('ldw') + g('nv_wk') * C('no_vehicle')
+            + g('age_wk') * C('older') + g('fem_wk') * C('female') + g('stu_wk') * C('student'))
+        V = V.at[:, MODE_IDX['Bike']].set(
+            g('asc_bk') + g('ldb') * C('ldb') + g('nv_bk') * C('no_vehicle')
+            + g('age_bk') * C('older') + g('yng_bk') * C('young'))
+        return V
+
+    def _nested_proba_jax(V, mu_m, mu_nm) -> 'jnp.ndarray':
+        """Pure-JAX nested proba matching NestedLogitModeModel._nested_proba."""
+        mi = MODE_IDX
+        Vm = V[:, jnp.array([mi['DA'], mi['SR'], mi['Transit']])] / mu_m
+        Vm = Vm - jnp.max(Vm, axis=1, keepdims=True)
+        Em, Sm = jnp.exp(Vm), jnp.exp(Vm).sum(axis=1, keepdims=True)
+        Pc_m = Em / Sm
+        Vn = V[:, jnp.array([mi['Walk'], mi['Bike']])] / mu_nm
+        Vn = Vn - jnp.max(Vn, axis=1, keepdims=True)
+        En, Sn = jnp.exp(Vn), jnp.exp(Vn).sum(axis=1, keepdims=True)
+        Pc_n = En / Sn
+        LSm = mu_m * jnp.log(Sm.squeeze() + 1e-12)
+        LSn = mu_nm * jnp.log(Sn.squeeze() + 1e-12)
+        LS = jnp.column_stack([LSm, LSn])
+        LS = LS - jnp.max(LS, axis=1, keepdims=True)
+        En2 = jnp.exp(LS)
+        Pn = En2 / En2.sum(axis=1, keepdims=True)
+        P = jnp.zeros_like(V)
+        P = P.at[:, mi['DA']].set(Pn[:, 0] * Pc_m[:, 0])
+        P = P.at[:, mi['SR']].set(Pn[:, 0] * Pc_m[:, 1])
+        P = P.at[:, mi['Transit']].set(Pn[:, 0] * Pc_m[:, 2])
+        P = P.at[:, mi['Walk']].set(Pn[:, 1] * Pc_n[:, 0])
+        P = P.at[:, mi['Bike']].set(Pn[:, 1] * Pc_n[:, 1])
+        return jnp.clip(P, 1e-12, 1.0)
+
+    def _neg_ll_jax_core(params, F, y_idx, param_names_t) -> 'jnp.ndarray':
+        mu_m, mu_nm = params[-2], params[-1]
+        V = _utility_core_jax(F, params[:-2], param_names_t)
+        P = _nested_proba_jax(V, mu_m, mu_nm)
+        return -jnp.sum(jnp.log(P[jnp.arange(y_idx.shape[0]), y_idx]))
+
+    _neg_ll_jax_jit = _jax.jit(_neg_ll_jax_core, static_argnames=('param_names_t',))
+    _neg_ll_grad_jit = _jax.jit(_jax.value_and_grad(_neg_ll_jax_core),
+                                static_argnames=('param_names_t',))
+else:
+    _utility_core_jax = None  # type: ignore
+    _nested_proba_jax = None  # type: ignore
+    _neg_ll_jax_core = None  # type: ignore
+    _neg_ll_jax_jit = None  # type: ignore
+    _neg_ll_grad_jit = None  # type: ignore
+
+
+def build_utility_matrix_jax(F_or_df, params, param_names: list):
+    """All-JAX utility: returns a JAX array, safe to call INSIDE grad.
+
+    Accepts a pre-stacked (N, F) JAX array (preferred, zero transfers) or a
+    DataFrame (converted once here — call this OUTSIDE the differentiated fn
+    in that case, then grad only through the returned core).
+    """
+    if not _JAX_AVAILABLE:
+        raise RuntimeError("JAX unavailable — use build_utility_matrix (numpy)")
+    import jax.numpy as _jnp
+    if isinstance(F_or_df, pd.DataFrame):
+        F = _jnp.asarray(_stack_s6_features(_extract_s6_features(F_or_df)), dtype=_jnp.float64)
+    else:
+        F = _jnp.asarray(F_or_df, dtype=_jnp.float64)
+    p = _jnp.asarray(np.asarray(params, dtype=np.float64), dtype=_jnp.float64)
+    return _utility_core_jax(F, p, tuple(param_names))
+
+
+def neg_ll_and_grad_jax(df: pd.DataFrame, y_idx: np.ndarray, params: np.ndarray,
+                        param_names: list):
+    """Jitted value+grad of the nested neg-LL. Single host→device transfer."""
+    if not _JAX_AVAILABLE:
+        raise RuntimeError("JAX unavailable")
+    import jax.numpy as _jnp
+    F = _jnp.asarray(_stack_s6_features(_extract_s6_features(df)), dtype=_jnp.float64)
+    yi = _jnp.asarray(np.asarray(y_idx, dtype=np.int32))
+    p = _jnp.asarray(np.asarray(params, dtype=np.float64), dtype=_jnp.float64)
+    return _neg_ll_grad_jit(p, F, yi, tuple(param_names))
+
+
 def build_utility_matrix(
     df: pd.DataFrame,
     params: np.ndarray,
     param_names: list,
 ) -> np.ndarray:
+    """Backward-compatible wrapper (numpy out). Spec unchanged.
+
+    Extraction in numpy (host), core in numpy. For grad, use
+    build_utility_matrix_jax / neg_ll_and_grad_jax instead of
+    differentiating through this wrapper.
     """
-    Compute utility for each mode for every observation.
+    F = _stack_s6_features(_extract_s6_features(df))
+    return _utility_core_np(F, params, param_names)
 
-    Returns V shape (N, 5) — one column per mode [DA, SR, Transit, Walk, Bike]
 
-    Uses JAX (XLA JIT) when available for faster gradient computation; falls
-    back to numpy.  All array ops use the same xp namespace.
+def _s6_param_names_for_purpose(purpose: str) -> list:
+    return list(_S6_PURPOSE_PARAM_NAMES.get(purpose, NestedLogitModeModel.PARAM_NAMES))
 
-    Richer specification vs original:
-    • Walk/bike use log(dist+1) instead of raw km — better empirical fit
-    • Age bands, income, employment status, gender heterogeneity per mode
-    • Crash risk (log) enters motorised modes — ATRF2022 safety term
-    • Transit accessibility from destination zone
-    """
-    xp  = jnp if _JAX_AVAILABLE else np
-    N   = len(df)
-    V   = np.zeros((N, len(MODES)))   # keep as numpy for indexing compat
-    p   = dict(zip(param_names, params))
 
-    def _get(name, default=0.0):
-        return p.get(name, default)
-
-    def _col(colname, fallback=0.0):
-        if colname in df.columns:
-            return df[colname].fillna(fallback).values.astype(float)
-        return np.full(N, fallback)
-
-    tt      = _col('tt_avg')          # auto travel time (min)
-    tt_h    = xp.clip(xp.asarray(tt) / 60.0, 0.01, 5.0)   # hours
-    ld      = xp.asarray(_col('log_dist'))        # log(dist+1) km
-    dist    = _col('dist')
-    dw      = _col('distwalk')        # raw walk km
-    db      = _col('distbike')        # raw bike km
-    # Log-transform walk/bike distances — empirically better fit than linear
-    ldw     = xp.log1p(xp.asarray(dw))   # log(distwalk + 1)
-    ldb     = xp.log1p(xp.asarray(db))   # log(distbike + 1)
-    crash   = xp.asarray(_col('crash'))
-    log_crash = xp.log1p(crash)           # ATRF2022 safety term
-    acc     = xp.asarray(_col('accessibility'))
-    hv      = xp.asarray(_col('has_vehicle'))   # 1 if HH has ≥1 vehicle
-    nv      = xp.asarray(_col('no_vehicle'))    # 1 if HH has 0 vehicles
-    cost    = xp.asarray(dist) * FUEL_RATE
-
-    # Person heterogeneity
-    incp    = xp.asarray(_col('incp',     8.0))   # income band 1-14
-    age5p   = xp.asarray(_col('age5p',    4.0))   # ABS 5-yr age band
-    sexp    = _col('sexp',     1.0)                # 1=male 2=female
-    workst  = xp.asarray(_col('WORKSTAT', 0.0))   # 1/2=employed
-    study   = xp.asarray(_col('STUDYING', 0.0))
-
-    female   = xp.asarray((sexp == 2).astype(float))
-    young    = (age5p <= 5).astype(float)   # ~under 30
-    older    = (age5p >= 10).astype(float)  # ~55+
-    worker   = xp.clip(workst, 0, 1)
-    student  = (study > 0).astype(float)
-    inc_hi   = xp.clip(incp - 8, 0, None)  # income above median
-    inc_lo   = xp.clip(8 - incp, 0, None)  # income below median
-
-    # Extended socio-demographics — worker type and industry
-    licence       = xp.asarray(_col('licence',       1.0))   # has car licence
-    full_time     = xp.asarray(_col('full_time',     0.0))   # full-time worker
-    part_time     = xp.asarray(_col('part_time',     0.0))   # part-time worker
-    indp_indust   = xp.asarray(_col('indp_industrial', 0.0)) # trade/industrial worker
-    indp_public   = xp.asarray(_col('indp_public',   0.0))   # public/health/edu worker
-
-    # ── DA (reference, ASC=0) ────────────────────────────────────────────
-    V[:, MODE_IDX['DA']] = np.asarray(
-        _get('tt_da')    * tt_h
-        + _get('ld_da')  * ld
-        + _get('cost')   * cost
-        + _get('veh_da') * hv
-        + _get('crash')  * log_crash   # safety deterrence (expect negative)
-        + _get('inc_da') * inc_hi      # high income → more DA
-        + _get('wrk_da') * worker      # workers → more DA
-        + _get('lic_da') * licence     # car licence → strong DA predictor
-        + _get('ft_da')  * full_time   # full-time workers commute by car more
-        + _get('ind_da') * indp_indust # industrial/trade workers: car-captive
+def _s6_param_spec(param_names: list):
+    bounds_map = dict(zip(NestedLogitModeModel.PARAM_NAMES, NestedLogitModeModel.BOUNDS))
+    init_map = dict(zip(NestedLogitModeModel.PARAM_NAMES, NestedLogitModeModel.INIT))
+    return (
+        np.array([init_map[name] for name in param_names], dtype=float),
+        [bounds_map[name] for name in param_names],
     )
-
-    # ── SR (shared-ride) ────────────────────────────────────────────────
-    V[:, MODE_IDX['SR']] = np.asarray(
-        _get('asc_sr')
-        + _get('tt_sr')   * tt_h
-        + _get('ld_sr')   * ld
-        + _get('crash')   * log_crash
-        + _get('nv_sr')   * nv         # no-vehicle → more SR (passenger)
-    )
-
-    # ── Transit ─────────────────────────────────────────────────────────
-    V[:, MODE_IDX['Transit']] = np.asarray(
-        _get('asc_tr')
-        + _get('tt_tr')   * tt_h * 1.5  # in-vehicle time penalty
-        + _get('ld_tr')   * ld
-        + _get('acc_tr')  * acc          # transit accessibility at destination
-        + _get('nv_tr')   * nv           # captive transit users (no vehicle)
-        + _get('stu_tr')  * student      # students → transit
-        + _get('fem_tr')  * female       # women slightly more transit
-        + _get('inc_tr')  * inc_lo       # lower income → transit
-        + _get('pt_tr')   * part_time    # part-time workers: flexible → transit
-        + _get('pub_tr')  * indp_public  # public/health/edu: transit-accessible sites
-    )
-
-    # ── Walk ─────────────────────────────────────────────────────────────
-    # Log-distance has better empirical fit than linear distance for walk.
-    V[:, MODE_IDX['Walk']] = np.asarray(
-        _get('asc_wk')
-        + _get('ldw')     * ldw          # log(distwalk+1)
-        + _get('nv_wk')   * nv           # no-vehicle captive
-        + _get('age_wk')  * older        # older persons less likely to walk
-        + _get('fem_wk')  * female       # gender shift
-        + _get('stu_wk')  * student      # students more walk
-    )
-
-    # ── Bike ─────────────────────────────────────────────────────────────
-    V[:, MODE_IDX['Bike']] = np.asarray(
-        _get('asc_bk')
-        + _get('ldb')     * ldb          # log(distbike+1)
-        + _get('nv_bk')   * nv           # no-vehicle captive
-        + _get('age_bk')  * older        # older persons less likely to bike
-        + _get('yng_bk')  * young        # young people more likely to bike
-    )
-
-    # Convert from JAX array to numpy for downstream scipy/indexing ops
-    return np.asarray(V)
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +1300,9 @@ class NestedLogitModeModel:
         self.coef_         = None
         self.converged_    = False
         self.purpose_      = None
+        self.param_names_  = list(self.PARAM_NAMES)
+        self.init_         = self.INIT.copy()
+        self.bounds_       = list(self.BOUNDS)
         self.n_obs_        = 0
         self.ll_null_      = None
         self.ll_final_     = None
@@ -1037,8 +1315,20 @@ class NestedLogitModeModel:
         self.pval_         = None
         self._larch_pf     = None    # Larch parameter frame (SE/tstat from Larch)
 
+    def _configure_for_purpose(self, purpose: str, active_param_names=None):
+        _full_names = _s6_param_names_for_purpose(purpose)
+        if active_param_names is None:
+            self.param_names_ = _full_names
+        else:
+            _active = set(active_param_names)
+            self.param_names_ = [name for name in _full_names if name in _active]
+            if not self.param_names_:
+                raise ValueError(f"No active mode parameters for purpose={purpose}")
+        self.init_, self.bounds_ = _s6_param_spec(self.param_names_)
+
     def _nested_proba(self, V: np.ndarray,
-                      mu_m: float, mu_nm: float) -> np.ndarray:
+                      mu_m: float, mu_nm: float,
+                      available: np.ndarray = None) -> np.ndarray:
         """
         Compute nested logit choice probabilities.
 
@@ -1047,6 +1337,9 @@ class NestedLogitModeModel:
         """
         mi  = MODE_IDX
         N   = len(V)
+        if available is not None:
+            V = np.asarray(V, dtype=float).copy()
+            V[~np.asarray(available, dtype=bool), mi['DA']] = -np.inf
 
         # ── within-nest probabilities ──────────────────────────────────
         # Motorised nest: DA, SR, Transit
@@ -1088,12 +1381,85 @@ class NestedLogitModeModel:
                 y: np.ndarray) -> float:
         mu_m  = float(params[-2])
         mu_nm = float(params[-1])
-        V     = build_utility_matrix(df, params[:-2], self.PARAM_NAMES[:-2])
-        P     = self._nested_proba(V, mu_m, mu_nm)
+        V     = build_utility_matrix(df, params[:-2], self.param_names_[:-2])
+        P     = self._nested_proba(V, mu_m, mu_nm,
+                                   available=getattr(self, '_da_avail_', None))
         ll    = np.sum(np.log(P[np.arange(len(y)), y]))
         return -ll
 
-    def fit(self, df: pd.DataFrame, purpose: str):
+    @staticmethod
+    def _derive_da_availability(df: pd.DataFrame, y: np.ndarray = None) -> np.ndarray:
+        """Drive-alone is unavailable when the person has no household vehicle."""
+        if 'has_vehicle' in df.columns:
+            available = pd.to_numeric(df['has_vehicle'], errors='coerce').fillna(0).values > 0.5
+        elif 'vehrd' in df.columns:
+            available = pd.to_numeric(df['vehrd'], errors='coerce').fillna(0).values >= 1
+        else:
+            available = np.ones(len(df), dtype=bool)
+        # Preserve the observed chosen alternative if the survey contains an
+        # inconsistent vehicle record; otherwise its likelihood would be zero.
+        if y is not None:
+            available = np.asarray(available, dtype=bool).copy()
+            available[np.asarray(y, dtype=int) == MODE_IDX['DA']] = True
+        return available
+
+    def _fit_mh_posterior(self, df: pd.DataFrame, y: np.ndarray,
+                          n_burn: int, n_draw: int, thin: int,
+                          seed: int, proposal_scale: float):
+        """Replace the MLE with a bounded random-walk MH posterior mean."""
+        from mh_choice_estimator import GaussianRandomWalkProposal
+
+        start = np.asarray(self.coef_, dtype=float).copy()
+        lower = np.asarray([b[0] for b in self.bounds_], dtype=float)
+        upper = np.asarray([b[1] for b in self.bounds_], dtype=float)
+
+        def logpost(theta):
+            theta = np.asarray(theta, dtype=float)
+            if np.any(theta < lower) or np.any(theta > upper):
+                return -np.inf
+            return -float(self._neg_ll(theta, df, y))
+
+        scale = np.maximum(np.abs(start) * 0.05, 0.05)
+        scale[-2:] = 0.03
+        proposal = GaussianRandomWalkProposal(
+            len(start), init_cov=np.diag(scale ** 2),
+            scaling=max(float(proposal_scale), 1e-6), seed=int(seed) + 31,
+        )
+        rng = np.random.default_rng(int(seed))
+        theta = start
+        current = logpost(theta)
+        draws = []
+        accepted = 0
+        total = max(int(n_burn), 0) + max(int(n_draw), 1) * max(int(thin), 1)
+        for iteration in range(1, total + 1):
+            candidate = proposal.propose(theta)
+            proposed = logpost(candidate)
+            if np.log(rng.uniform()) < proposed - current:
+                theta, current = candidate, proposed
+                accepted += 1
+            proposal.adapt(theta)
+            if iteration > int(n_burn) and (iteration - int(n_burn)) % max(int(thin), 1) == 0:
+                draws.append(theta.copy())
+        posterior = np.asarray(draws, dtype=float)
+        if posterior.ndim != 2 or len(posterior) < 2:
+            raise RuntimeError("Stage 51 MH produced too few posterior draws")
+        self.coef_ = posterior.mean(axis=0)
+        self.ll_final_ = -float(self._neg_ll(self.coef_, df, y))
+        self.fit_method_ = 'rwmh'
+        self.mh_accept_rate_ = accepted / max(total, 1)
+        self.mh_n_draws_ = int(len(posterior))
+        try:
+            from mh_choice_estimator import effective_sample_size
+            self.mh_ess_ = effective_sample_size(posterior)
+        except Exception:
+            self.mh_ess_ = None
+
+    def fit(self, df: pd.DataFrame, purpose: str,
+            active_param_names=None,
+            enforce_vehicle_availability: bool = False,
+            mh: bool = False, mh_burn: int = 1000,
+            mh_draws: int = 2000, mh_thin: int = 2,
+            mh_seed: int = 42, mh_proposal_scale: float = 1.0):
         """
         Estimate nested logit coefficients.
 
@@ -1106,12 +1472,19 @@ class NestedLogitModeModel:
         and stored in self.frozen_probs_ for synthetic population transfer.
         """
         self.purpose_ = purpose
+        self._configure_for_purpose(purpose, active_param_names=active_param_names)
         self.n_obs_   = len(df)
 
         y = np.array([MODE_IDX[m] for m in df['chosen_mode']])
+        self._enforce_vehicle_availability = bool(enforce_vehicle_availability)
+        self._da_avail_ = (
+            self._derive_da_availability(df, y)
+            if self._enforce_vehicle_availability else None
+        )
 
         # ── Pre-estimation diagnostics ────────────────────────────────────
         obs_dist = df['chosen_mode'].value_counts().to_dict()
+        self.obs_shares_ = {m: (obs_dist.get(m, 0) / max(len(df), 1)) for m in MODES}
         obs_pct  = {m: f"{obs_dist.get(m,0)/len(df):.1%}" for m in MODES}
         logger.info(f"  mode/{purpose} HHTS observed: {obs_pct}")
         logger.info(
@@ -1131,6 +1504,8 @@ class NestedLogitModeModel:
 
         # ── Attach walk/bike availability for Larch ───────────────────────
         df = df.copy()
+        if self._enforce_vehicle_availability:
+            df['da_avail'] = self._da_avail_.astype(int)
         if 'walk_avail' not in df.columns:
             if 'distwalk' in df.columns:
                 df['walk_avail'] = (df['distwalk'] < 6.0).astype(int)
@@ -1151,33 +1526,56 @@ class NestedLogitModeModel:
         _larch_succeeded = False
         if _LARCH_AVAILABLE:
             try:
-                _dt, _lm = _build_larch_nl_mode_s6(df)
+                _dt, _lm = _build_larch_nl_mode_s6(
+                    df, self.param_names_, self.init_,
+                    enforce_vehicle_availability=self._enforce_vehicle_availability,
+                )
                 try:
                     _lm.set_cap(10)
                     _lm.doctor(repair_ch_av="+")
                     _lm.doctor(repair_nan_utility=True)
                 except Exception:
                     pass
-                _lm_result = _lm.maximize_loglike(
-                    options={'maxiter': 600, 'ftol': 1e-10, 'gtol': 1e-7}
-                )
-                _ll_larch  = float(_lm_result.loglike)
-                # Fallback to relaxed tolerances if LL is NaN or very bad
-                if not np.isfinite(_ll_larch) or _ll_larch < self.ll_null_ * 2:
-                    logger.debug(
-                        f"  mode/{purpose}: Larch LL={_ll_larch:.1f} — retrying with "
-                        "relaxed tolerances"
-                    )
+                # Elastic-net (L1+L2) penalty on the objective, mirroring
+                # metacountregressor's penalized-likelihood estimation - see
+                # larch_regularization.py. Restored before LL is read back
+                # so self.ll_final_ reflects the true unpenalized likelihood.
+                _ennet_lm = elasticnet_objective(_lm)
+                _ennet_lm.__enter__()
+                # NOTE: scipy SLSQP (Larch's default) rejects gtol with
+                # OptimizeWarning and ignores it — SLSQP stopping is via ftol.
+                # (Same _slsqp_options rationale as stage5_destination_choice;
+                # duplicated here to avoid a stage5 import cycle.)
+                _slsqp = lambda d: {k: v for k, v in dict(d).items() if k in
+                                     {'maxiter', 'ftol', 'eps', 'disp',
+                                      'finite_diff_rel_step'}}
+                try:
                     _lm_result = _lm.maximize_loglike(
-                        options={'maxiter': 300, 'ftol': 1e-6, 'gtol': 1e-4}
+                        options=_slsqp({'maxiter': 600, 'ftol': 1e-10}),
+                        quiet=True,
                     )
-                    _ll_larch = float(_lm_result.loglike)
+                    _ll_larch  = float(_lm_result.loglike)
+                    # Fallback to relaxed tolerances if LL is NaN or very bad
+                    if not np.isfinite(_ll_larch) or _ll_larch < self.ll_null_ * 2:
+                        logger.debug(
+                            f"  mode/{purpose}: Larch LL={_ll_larch:.1f} — retrying with "
+                            "relaxed tolerances"
+                        )
+                        _lm_result = _lm.maximize_loglike(
+                            options=_slsqp({'maxiter': 300, 'ftol': 1e-6}),
+                            quiet=True,
+                        )
+                        _ll_larch = float(_lm_result.loglike)
+                finally:
+                    _ennet_lm.__exit__(None, None, None)
 
-                self.coef_   = _extract_larch_coef_to_scipy(_lm)
+                self.coef_   = _extract_larch_coef_to_scipy(_lm, self.param_names_, self.init_)
                 self.ll_final_ = _ll_larch
                 self.converged_ = True
-                # Detect which engine was actually used
-                _eng = getattr(_lm, '_compute_engine', 'unknown')
+                # Detect which engine was actually used (BUGFIX: attr is
+                # compute_engine, not _compute_engine — old code always logged
+                # 'unknown').
+                _eng = getattr(_lm, 'compute_engine', getattr(_lm, '_compute_engine', 'unknown'))
                 self._estimation_engine = f"larch_{_eng}"
                 logger.info(
                     f"  mode/{purpose}: Larch ({_eng}) converged — "
@@ -1191,12 +1589,12 @@ class NestedLogitModeModel:
                 try:
                     self._larch_pf = _lm.pf.copy()
                     _pf = self._larch_pf
-                    _k  = len(self.PARAM_NAMES)
+                    _k  = len(self.param_names_)
                     _se    = np.full(_k, np.nan)
                     _tstat = np.full(_k, np.nan)
                     _pval  = np.full(_k, np.nan)
                     from scipy.stats import norm as _snorm
-                    for _i, _pname in enumerate(self.PARAM_NAMES):
+                    for _i, _pname in enumerate(self.param_names_):
                         _lk = 'Mu_Motorised'    if _pname == 'mu_motorised' else \
                               'Mu_NonMotorised'  if _pname == 'mu_nonmotorised' else _pname
                         if _lk not in _pf.index:
@@ -1257,16 +1655,42 @@ class NestedLogitModeModel:
                     "zero walk/bike availability blocking gradient, or larch DataTree build error."
                 )
 
-        # ── 2. scipy L-BFGS-B fallback ───────────────────────────────────
+        # ── 2. scipy L-BFGS-B fallback (JAX grad when available) ──────────
         if not _larch_succeeded:
             from scipy.optimize import minimize
             try:
+                _jac = None
+                if _JAX_AVAILABLE and _neg_ll_grad_jit is not None:
+                    try:
+                        import jax.numpy as _jnp
+                        _F_j = _jnp.asarray(
+                            _stack_s6_features(_extract_s6_features(df)), dtype=_jnp.float64)
+                        _y_j = _jnp.asarray(np.asarray(y, dtype=np.int32))
+                        _pn_t = tuple(self.param_names_[:-2])
+
+                        def _fun_jax(p):
+                            return float(_neg_ll_jax_jit(
+                                _jnp.asarray(np.asarray(p, dtype=np.float64)), _F_j, _y_j, _pn_t))
+
+                        def _jac_jax(p):
+                            _, g = _neg_ll_grad_jit(
+                                _jnp.asarray(np.asarray(p, dtype=np.float64)), _F_j, _y_j, _pn_t)
+                            return np.asarray(g, dtype=float)
+                        # probe once; fall back to numeric diff if unhealthy
+                        _g0 = _jac_jax(self.init_.copy())
+                        if np.all(np.isfinite(_g0)) and float(np.linalg.norm(_g0)) > 0:
+                            _jac = _jac_jax
+                            logger.info("  mode/%s: scipy fallback using JAX exact grad", purpose)
+                    except Exception as _jg_e:
+                        logger.debug("  mode/%s: JAX grad unavailable (%r) — numeric diff", purpose, _jg_e)
+                        _jac = None
                 res = minimize(
-                    self._neg_ll,
-                    self.INIT.copy(),
-                    args=(df, y),
+                    self._neg_ll if _jac is None else _fun_jax,
+                    self.init_.copy(),
+                    args=(df, y) if _jac is None else (),
+                    jac=_jac if _jac is not None else None,
                     method='L-BFGS-B',
-                    bounds=self.BOUNDS,
+                    bounds=self.bounds_,
                     options={'maxiter': 1000, 'ftol': 1e-10},
                 )
                 self.coef_      = res.x
@@ -1295,12 +1719,12 @@ class NestedLogitModeModel:
                     _n_valid = int(np.isfinite(_se).sum())
                     logger.debug(
                         f"  mode/{purpose}: scipy SEs from hess_inv — "
-                        f"{_n_valid}/{len(self.PARAM_NAMES)} valid"
+                        f"{_n_valid}/{len(self.param_names_)} valid"
                     )
                     # Warn about near-zero SEs (potential collinearity)
                     _near_bound = [
-                        self.PARAM_NAMES[i]
-                        for i in range(len(self.PARAM_NAMES))
+                        self.param_names_[i]
+                        for i in range(len(self.param_names_))
                         if np.isfinite(_se[i]) and _se[i] < 0.002
                     ]
                     if _near_bound:
@@ -1311,9 +1735,9 @@ class NestedLogitModeModel:
                         )
                 except Exception as _se_e:
                     logger.debug(f"  mode/{purpose}: scipy SE extraction failed: {_se_e}")
-                    self.se_    = np.full(len(self.PARAM_NAMES), np.nan)
-                    self.tstat_ = np.full(len(self.PARAM_NAMES), np.nan)
-                    self.pval_  = np.full(len(self.PARAM_NAMES), np.nan)
+                    self.se_    = np.full(len(self.param_names_), np.nan)
+                    self.tstat_ = np.full(len(self.param_names_), np.nan)
+                    self.pval_  = np.full(len(self.param_names_), np.nan)
                 if not res.success:
                     logger.warning(
                         f"  mode/{purpose}: scipy L-BFGS-B did not fully converge "
@@ -1329,13 +1753,25 @@ class NestedLogitModeModel:
                     f"  mode/{purpose}: scipy fallback also failed: {_scipy_e!r}\n"
                     "  Model will use INIT starting values — predictions will be uninformative."
                 )
-                self.coef_      = self.INIT.copy()
+                self.coef_      = self.init_.copy()
                 self.converged_ = False
                 self.ll_final_  = self.ll_null_
                 self._estimation_engine = 'init_fallback'
-                self.se_        = np.full(len(self.PARAM_NAMES), np.nan)
-                self.tstat_     = np.full(len(self.PARAM_NAMES), np.nan)
-                self.pval_      = np.full(len(self.PARAM_NAMES), np.nan)
+                self.se_        = np.full(len(self.param_names_), np.nan)
+                self.tstat_     = np.full(len(self.param_names_), np.nan)
+                self.pval_      = np.full(len(self.param_names_), np.nan)
+
+        if mh:
+            try:
+                self._fit_mh_posterior(
+                    df, y, mh_burn, mh_draws, mh_thin,
+                    mh_seed, mh_proposal_scale,
+                )
+            except Exception as _mh_e:
+                logger.warning(
+                    f"  mode/{purpose}: MH failed; retaining MLE coefficients: {_mh_e}"
+                )
+                self.fit_method_ = 'mle_mh_fallback'
 
         # ── Compute rho² ─────────────────────────────────────────────────
         if self.ll_null_ and self.ll_null_ != 0:
@@ -1346,6 +1782,7 @@ class NestedLogitModeModel:
         # ── Post-estimation diagnostics ───────────────────────────────────
         P_train   = self.predict_proba(df)
         pred_dist = dict(zip(MODES, P_train.mean(axis=0)))
+        self.train_pred_shares_ = pred_dist
         pred_pct  = {m: f"{pred_dist[m]:.1%}" for m in MODES}
         logger.info(
             f"  mode/{purpose}: engine={self._estimation_engine}, "
@@ -1399,9 +1836,13 @@ class NestedLogitModeModel:
         mu_m  = float(self.coef_[-2])
         mu_nm = float(self.coef_[-1])
         V     = build_utility_matrix(
-            df, self.coef_[:-2], self.PARAM_NAMES[:-2]
+            df, self.coef_[:-2], self.param_names_[:-2]
         )
-        return self._nested_proba(V, mu_m, mu_nm)
+        available = (
+            self._derive_da_availability(df)
+            if getattr(self, '_enforce_vehicle_availability', False) else None
+        )
+        return self._nested_proba(V, mu_m, mu_nm, available=available)
 
     def predict_sampled(self, df: pd.DataFrame,
                         rng: np.random.Generator) -> np.ndarray:
@@ -1420,9 +1861,112 @@ class NestedLogitModeModel:
     def summary(self) -> pd.DataFrame:
         """Return coefficient summary table."""
         return pd.DataFrame({
-            'parameter': self.PARAM_NAMES,
+            'parameter': self.param_names_,
             'estimate':  np.round(self.coef_, 4),
         })
+
+
+def _rebalance_edu_walk_sr(P: np.ndarray, model) -> np.ndarray:
+    """Shift some probability mass Walk->SR for edu when walk is over-predicted."""
+    try:
+        obs = getattr(model, 'obs_shares_', None) or {}
+        obs_walk = float(obs.get('Walk', np.nan))
+        obs_sr = float(obs.get('SR', np.nan))
+        if not (np.isfinite(obs_walk) and np.isfinite(obs_sr)):
+            return P
+        idx_walk = MODE_IDX['Walk']
+        idx_sr = MODE_IDX['SR']
+        pred_walk = float(np.nanmean(P[:, idx_walk]))
+        pred_sr = float(np.nanmean(P[:, idx_sr]))
+        # Trigger only when mismatch is material.
+        if not (pred_walk > obs_walk + 0.03 and pred_sr + 0.02 < obs_sr):
+            return P
+        shift_share = min(pred_walk - obs_walk, obs_sr - pred_sr, 0.12)
+        if shift_share <= 0:
+            return P
+        walk_col = P[:, idx_walk].copy()
+        take = walk_col * (shift_share / max(pred_walk, 1e-9))
+        P[:, idx_walk] = np.clip(P[:, idx_walk] - take, 1e-12, 1.0)
+        P[:, idx_sr] = np.clip(P[:, idx_sr] + take, 1e-12, 1.0)
+        P = np.clip(P, 1e-12, 1.0)
+        P /= P.sum(axis=1, keepdims=True)
+        logger.info(
+            f"  edu share rebalance applied: Walk {pred_walk:.1%}->{float(np.mean(P[:, idx_walk])):.1%}, "
+            f"SR {pred_sr:.1%}->{float(np.mean(P[:, idx_sr])):.1%}"
+        )
+        return P
+    except Exception as _e:
+        logger.debug(f"edu share rebalance skipped: {_e}")
+        return P
+
+
+def _rebalance_to_observed_shares(P: np.ndarray, model, purpose: str) -> np.ndarray:
+    """
+    Stabilise purpose-level predicted shares toward observed HHTS shares.
+
+    Uses iterative column scaling (IPF-like) on the probability matrix so rows
+    remain proper probabilities while the purpose-level mean shares become more
+    representative. This prevents DA-collapse in sparse/noisy transfer cases.
+    """
+    try:
+        if P is None or len(P) == 0:
+            return P
+        obs = getattr(model, 'obs_shares_', None) or {}
+        obs_vec = np.array([float(obs.get(m, np.nan)) for m in MODES], dtype=float)
+        if not np.isfinite(obs_vec).all() or obs_vec.sum() <= 0:
+            return P
+        obs_vec = obs_vec / obs_vec.sum()
+
+        pred_vec = np.nanmean(P, axis=0)
+        pred_sum = float(np.nansum(pred_vec))
+        if not np.isfinite(pred_sum) or pred_sum <= 0:
+            return P
+        pred_vec = pred_vec / pred_sum
+
+        pred_da = float(pred_vec[MODE_IDX['DA']])
+        obs_da = float(obs_vec[MODE_IDX['DA']])
+        pred_non_da = float(1.0 - pred_da)
+        obs_non_da = float(1.0 - obs_da)
+
+        # Strong corrective blending when DA dominates unrealistically.
+        severe_da_collapse = (
+            (pred_da > 0.90 and obs_da < 0.80) or
+            (pred_non_da < max(0.12, obs_non_da * 0.45))
+        )
+        if severe_da_collapse:
+            alpha = 0.45
+        else:
+            max_gap = float(np.max(np.abs(pred_vec - obs_vec)))
+            if max_gap < 0.06:
+                return P
+            alpha = 0.22 if purpose != 'edu' else 0.30
+
+        target = (1.0 - alpha) * pred_vec + alpha * obs_vec
+
+        # Keep each mode alive relative to observed distribution.
+        floor = np.minimum(obs_vec * 0.55, obs_vec)
+        target = np.maximum(target, floor)
+        target = target / target.sum()
+
+        P_adj = np.clip(P.astype(float), 1e-12, 1.0)
+        for _ in range(4):
+            cur = P_adj.mean(axis=0)
+            cur = np.clip(cur, 1e-12, None)
+            scale = target / cur
+            P_adj *= scale[None, :]
+            P_adj = np.clip(P_adj, 1e-12, 1.0)
+            P_adj /= P_adj.sum(axis=1, keepdims=True)
+
+        new_vec = P_adj.mean(axis=0)
+        logger.info(
+            f"  {purpose} share stabilisation: "
+            f"DA {pred_da:.1%}->{float(new_vec[MODE_IDX['DA']]):.1%} (obs {obs_da:.1%}), "
+            f"non-DA {pred_non_da:.1%}->{float(1.0-new_vec[MODE_IDX['DA']]):.1%}"
+        )
+        return P_adj
+    except Exception as _e:
+        logger.debug(f"share stabilisation skipped for {purpose}: {_e}")
+        return P
 
 
 # ---------------------------------------------------------------------------
@@ -1433,7 +1977,7 @@ def estimate_mode_models(
     trips: pd.DataFrame,
     persons: pd.DataFrame,
     landuse: Optional[pd.DataFrame] = None,
-    min_sample: int = 50,
+    min_sample: int = 20,
 ) -> dict:
     """
     Fit one NestedLogitModeModel per activity purpose.
@@ -1470,7 +2014,7 @@ def estimate_mode_models(
         if m.rho2_ is not None and not np.isnan(m.rho2_) and m.rho2_ < 0.05:
             _warns.append(f"rho²={m.rho2_:.3f} — barely better than market shares")
         # Key parameter sign checks
-        _pdict = dict(zip(NestedLogitModeModel.PARAM_NAMES, m.coef_))
+        _pdict = dict(zip(m.param_names_, m.coef_))
         for _pname, _expected_sign in [('tt_da', 'neg'), ('ldw', 'neg'), ('ldb', 'neg')]:
             _v = _pdict.get(_pname, 0.0)
             if _expected_sign == 'neg' and _v > 0.001:
@@ -1739,6 +2283,10 @@ def predict_modes(
             P = model.predict_proba(subset)
             _prob_source = 'live'
 
+        if purpose == 'edu':
+            P = _rebalance_edu_walk_sr(P, model)
+        P = _rebalance_to_observed_shares(P, model, purpose)
+
         if purpose in models and not hasattr(models[purpose], '_prob_source_logged'):
             logger.debug(
                 f"  {purpose}: using {_prob_source} probabilities "
@@ -1793,6 +2341,103 @@ def predict_modes(
             "predict_modes. DA-dominated output suppresses model realism."
         )
 
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 4b. TOUR-MODE CONSISTENCY
+# ---------------------------------------------------------------------------
+# Priority for deriving a single tour mode when the primary-leg heuristic can't
+# be used: a private vehicle taken on ANY leg must serve the whole tour (you
+# cannot strand a car or bicycle mid-tour), so DA and Bike dominate; SR/Transit/
+# Walk have no vehicle-continuity constraint.
+_TOUR_MODE_PRIORITY = ['DA', 'Bike', 'SR', 'Transit', 'Walk']
+
+
+def enforce_tour_mode_consistency(df: pd.DataFrame, mode_col: str = 'mode') -> pd.DataFrame:
+    """Constrain every leg of a tour to a single, consistent tour mode.
+
+    Stage 6 picks each leg's mode independently, which can yield physically
+    impossible tours (a drive-alone leg stranded inside a transit tour, or a car
+    abandoned mid-tour). ActivitySim instead chooses ONE tour mode and constrains
+    the trip legs to it. Here the tour mode is the mode of the PRIMARY
+    (max-distance) leg — the main-destination leg — falling back to the
+    vehicle-continuity priority (DA/Bike dominate) when distances are unavailable.
+
+    Two modes via STAGE6_TOUR_MODE_CONSISTENCY:
+      • 'relaxed' / '1' (default) — the ActivitySim-style nuance: a genuine WALK
+        leg (walk access/egress) is allowed to remain inside a tour whose mode is
+        NOT a private vehicle (Transit / SR / Walk), because walking a sub-leg
+        never strands anything. Every other non-conforming leg is set to the tour
+        mode. Private-vehicle tours (DA, Bike) stay strict — a walk leg there
+        would abandon the car/bicycle — so ALL their legs take the tour mode.
+      • 'strict' — every leg is set to the tour mode, no exceptions.
+      • '0' / 'off' — disabled.
+
+    The raw per-leg prediction is preserved in ``<mode_col>_leg`` and the chosen
+    tour mode in ``tour_mode``. Grouping key preference:
+    ptour_id → person_id+tour_id → person_id+tour_num → person_id (whole day)."""
+    _cfg = os.environ.get('STAGE6_TOUR_MODE_CONSISTENCY', '1').strip().lower()
+    if _cfg in ('0', 'off', 'false', 'no'):
+        return df
+    _strict = _cfg in ('strict', '2')
+    if mode_col not in df.columns or df.empty:
+        return df
+    cols = set(df.columns)
+    if 'ptour_id' in cols:
+        tk = df['ptour_id'].astype(str)
+    elif {'person_id', 'tour_id'} <= cols:
+        tk = df['person_id'].astype(str) + '_' + df['tour_id'].astype(str)
+    elif {'person_id', 'tour_num'} <= cols:
+        tk = df['person_id'].astype(str) + '_' + df['tour_num'].astype(str)
+    elif 'person_id' in cols:
+        tk = df['person_id'].astype(str)
+        logger.info("tour-mode consistency: no tour id — grouping by person (whole day)")
+    else:
+        logger.warning("tour-mode consistency: no person/tour key — skipping")
+        return df
+
+    df = df.copy()
+    df['_tk'] = tk.values
+    _dist = pd.to_numeric(df.get('dist', pd.Series(np.nan, index=df.index)),
+                          errors='coerce')
+
+    _prio = {m: i for i, m in enumerate(_TOUR_MODE_PRIORITY)}
+
+    def _tour_mode(sub: pd.DataFrame):
+        modes = sub[mode_col].tolist()
+        d = _dist.loc[sub.index]
+        if d.notna().any() and d.max() > 0:
+            return sub.loc[d.idxmax(), mode_col]          # primary (max-dist) leg
+        valid = [m for m in modes if m in _prio]
+        return min(valid, key=lambda m: _prio[m]) if valid else (modes[0] if modes else None)
+
+    tmode = pd.Series(index=df.index, dtype=object)
+    for _k, sub in df.groupby('_tk'):
+        tmode.loc[sub.index] = _tour_mode(sub)
+
+    raw = df[mode_col].astype(object)
+    df[mode_col + '_leg'] = df[mode_col]                   # keep raw per-leg mode
+    df['tour_mode'] = tmode.values
+
+    new = tmode.copy()
+    n_walk_kept = 0
+    if not _strict:
+        # relaxed: keep a genuine walk access/egress leg when the tour mode is not
+        # a private vehicle (walking never strands a car/bike).
+        keep_walk = (raw == 'Walk') & tmode.notna() & (~tmode.isin(['DA', 'Bike']))
+        new[keep_walk] = 'Walk'
+        n_walk_kept = int(keep_walk.sum())
+    _ok = new.notna()
+    df.loc[_ok, mode_col] = new[_ok].values
+    changed = int((raw != df[mode_col].astype(object)).sum())
+    df = df.drop(columns=['_tk'])
+    n_tours = int(pd.Series(tk.values).nunique())
+    logger.info(f"tour-mode consistency [{'strict' if _strict else 'relaxed'}]: "
+                f"{changed}/{len(df)} legs reconciled across {n_tours} tours "
+                f"(primary max-dist leg; DA/Bike continuity)"
+                + ('' if _strict else f"; {n_walk_kept} walk access/egress legs kept")
+                + f". Raw per-leg mode preserved in '{mode_col}_leg'.")
     return df
 
 
@@ -1854,6 +2499,72 @@ def export_for_dashboard(activity_plan: pd.DataFrame,
 # ---------------------------------------------------------------------------
 # 6.  SAVE / LOAD
 # ---------------------------------------------------------------------------
+
+def _save_s6_destinations_html(activity_plan: pd.DataFrame, path: str) -> None:
+    """Save an HTML report showing predicted destination distributions by purpose.
+
+    Shows for each trip purpose: top-10 destination zones by trip count, median
+    distance, and a mini bar chart of mode share, sourced from the activity_plan
+    produced by run_stage6.
+    """
+    trips = activity_plan[activity_plan.get('row_type', pd.Series('trip')) == 'trip'].copy() \
+        if 'row_type' in activity_plan.columns else activity_plan.copy()
+
+    if trips.empty or 'purpose' not in trips.columns or 'DTAZ' not in trips.columns:
+        logger.warning("_save_s6_destinations_html: no trip rows / missing columns — skipped")
+        return
+
+    PURPS = [p for p in PURPOSES if p in trips['purpose'].values]
+    rows_html = []
+    for purp in PURPS:
+        sub = trips[trips['purpose'] == purp]
+        if sub.empty:
+            continue
+        n_total = len(sub)
+        top_zones = (sub['DTAZ'].value_counts().head(10)
+                     .reset_index().rename(columns={'DTAZ': 'zone', 'count': 'n_trips'}))
+        top_zones['pct'] = (top_zones['n_trips'] / n_total * 100).round(1)
+
+        dist_med = f"{sub['dist'].median():.1f} km" if 'dist' in sub.columns else 'n/a'
+
+        mode_share = ''
+        if 'mode' in sub.columns:
+            mc = sub['mode'].value_counts(normalize=True).mul(100).round(1)
+            mode_share = '  '.join(f'{m}: {v:.1f}%' for m, v in mc.items())
+
+        zone_rows = ''.join(
+            f"<tr><td>{r['zone']}</td><td>{r['n_trips']:,}</td>"
+            f"<td>{r['pct']:.1f}%</td></tr>"
+            for _, r in top_zones.iterrows()
+        )
+        rows_html.append(f"""
+        <h3>{purp} <span class="n">n={n_total:,}</span></h3>
+        <p>Median trip distance: <b>{dist_med}</b> &nbsp;|&nbsp; Mode share: {mode_share}</p>
+        <table>
+          <tr><th>DTAZ</th><th>Trips</th><th>Share</th></tr>
+          {zone_rows}
+        </table>""")
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Stage 6 — Destination distributions by purpose</title>
+<style>
+  body{{font-family:Arial,sans-serif;font-size:13px;margin:20px}}
+  h2{{color:#2c3e50}} h3{{color:#34495e;margin-top:18px}}
+  .n{{font-size:11px;color:#888;font-weight:normal}}
+  table{{border-collapse:collapse;margin-bottom:12px;font-size:12px}}
+  th,td{{border:1px solid #ddd;padding:4px 10px;text-align:left}}
+  th{{background:#eef2f7}}
+</style></head><body>
+<h2>Stage 6 — Predicted destinations by purpose</h2>
+<p>Top-10 DTAZ zones per purpose from synthetic population prediction.</p>
+{''.join(rows_html)}
+</body></html>"""
+
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(html)
+    print(f"  Stage 6 destinations → {path}")
+
 
 def save_models(models: dict, path: str = 'saved_data/stage6_models.pkl'):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1920,7 +2631,7 @@ def _s6_model_table_html(purpose: str, model: 'NestedLogitModeModel') -> str:
         f'<td style="text-align:right">{_fv(pv)}</td>'
         f'</tr>'
         for p, c, s, t, pv in zip(
-            model.PARAM_NAMES, coef, se, tstat, pval
+            model.param_names_, coef, se, tstat, pval
         )
     )
     rho2_str  = f'{model.rho2_:.3f}' if model.rho2_ is not None and np.isfinite(model.rho2_) else 'n/a'
@@ -2025,7 +2736,7 @@ def _save_s6_coefficients(models: dict, path: str):
         se    = model.se_    if model.se_    is not None else np.full(len(coef), np.nan)
         tstat = model.tstat_ if model.tstat_ is not None else np.full(len(coef), np.nan)
         pval  = model.pval_  if model.pval_  is not None else np.full(len(coef), np.nan)
-        for param, c, s, t, pv in zip(model.PARAM_NAMES, coef, se, tstat, pval):
+        for param, c, s, t, pv in zip(model.param_names_, coef, se, tstat, pval):
             rows.append({
                 'purpose':   purpose,
                 'parameter': param,
@@ -2115,9 +2826,20 @@ def run_stage6(
     print("\n[2/3] Predicting modes for synthetic population...")
     scheduled = predict_modes(synth_s5, models, landuse,
                               sample=sample, seed=seed)
+    # Constrain each tour's legs to a single consistent tour mode (ActivitySim-
+    # style: no stranded car / walk leg inside a transit tour, etc.).
+    scheduled = enforce_tour_mode_consistency(scheduled)
 
     print("\n[3/3] Building final activity plan...")
     activity_plan = build_activity_plan(scheduled)
+
+    # Save destinations-by-purpose HTML alongside the model pickle
+    if save_path:
+        _dest_html = save_path.replace('.pkl', '_destinations.html')
+        try:
+            _save_s6_destinations_html(activity_plan, _dest_html)
+        except Exception as _de:
+            logger.warning(f"Stage 6 destinations HTML failed: {_de}")
 
     print(
         f"\n{'='*55}\n"

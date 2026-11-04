@@ -1,0 +1,70 @@
+#!/bin/bash -l
+# Stage-B paper refresh after the phase-sharded predict run finishes:
+# validation report + publish_paper_artifacts.py into abm_safety/preprint.
+#
+# Required -v: RUN_TAG.
+# Optional -v: RUN_ROOT, CONDA_ENV, PUBLISH_PAPER=1, DRY_RUN=1.
+
+#PBS -N ga_predict_publish
+#PBS -m n
+#PBS -r y
+#PBS -P FPAXJW8067
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -l walltime=02:00:00
+
+set -euo pipefail
+
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:?RUN_TAG is required}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+PUBLISH_PAPER=${PUBLISH_PAPER:-1}
+DRY_RUN=${DRY_RUN:-0}
+
+cd "$PBS_O_WORKDIR"
+CONDA_BASE=${CONDA_BASE:-/mnt/hpccs01/home/ahernz/miniconda3}
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_BASE}/envs/${CONDA_ENV}"
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+echo "python: $(which python) ($(python --version 2>&1))"
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+export PIPELINE_RUN_DIR="${RUN_ROOT}/${RUN_TAG}/predict"
+export PIPELINE_OUT_DIR="${PIPELINE_RUN_DIR}"
+export GA_STAGED_GA_DIR="${RUN_ROOT}/${RUN_TAG}/merged"
+export GA_STAGED_REUSE_ESTIMATOR=1
+export NEW_POP=${NEW_POP:-1}
+export NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+export NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+if [ "${NEW_POP}" = "1" ] && [ "${NEW_POP_MAPPED}" != "1" ]; then
+  export PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+fi
+
+echo "=========================================="
+echo "Predict publish job : ${PBS_JOBID:-unknown}"
+echo "Run tag             : ${RUN_TAG}"
+echo "Started             : $(date)"
+echo "=========================================="
+
+if [ "${DRY_RUN}" = "1" ]; then
+  echo "DRY: generate_validation_report.py + publish_paper_artifacts.py --run-tag ${RUN_TAG}"
+  exit 0
+fi
+
+if python -u -X utf8 generate_validation_report.py; then
+  echo "Validation report written"
+else
+  echo "generate_validation_report skipped (non-fatal)"
+fi
+
+if [ "${PUBLISH_PAPER}" = "1" ]; then
+  if python -u -X utf8 publish_paper_artifacts.py --run-tag "${RUN_TAG}" --run-root "${RUN_ROOT}"; then
+    echo "Paper artifacts (Stage B) published -> ../abm_safety/preprint/{figures,tables}"
+  else
+    echo "publish_paper_artifacts skipped (non-fatal)"
+  fi
+fi
+
+echo "Finished: $(date)"

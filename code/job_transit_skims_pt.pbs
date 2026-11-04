@@ -1,0 +1,64 @@
+#!/bin/bash -l
+# Build GTFS-complete transit skims into an ISOLATED copy of skims_371.omx so
+# the live paper run (which reads ../demand_/skims_371.omx) is never touched.
+# Fills the ~49% missing WLK_LOC_WLK walk-access matrix and adds the
+# drive-egress (park-and-ride) DTIM/DDIST + walk transfer-wait, which the
+# Stage-5 transit access sub-nest (STAGE5_PT_MODES=1) needs.
+#
+#   qsub job_transit_skims_pt.pbs
+#
+#PBS -N transit_skims_pt
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -l walltime=04:00:00
+
+set -euo pipefail
+CONDA_ENV=${CONDA_ENV:-geotfenv}
+cd "$PBS_O_WORKDIR"
+
+SRC=${SRC:-../demand_/skims_371.omx}
+DST=${DST:-../demand_/skims_371_transit.omx}
+
+echo "=== isolate skims: $SRC -> $DST ==="
+if [ ! -f "$DST" ]; then
+  cp "$SRC" "$DST"
+  echo "copied."
+else
+  echo "destination already exists - reusing (delete to force a fresh copy)."
+fi
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+export PATH="$CONDA_PREFIX/bin:$PATH"; hash -r
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2
+export JAVA_TOOL_OPTIONS="-Xmx12G"
+echo "[env] python=$(which python)"
+
+# Build into the isolated copy.
+export OMX_PATH="$DST"
+export ORIGIN_STEP=${ORIGIN_STEP:-1}
+
+echo "=== 1/2 walk-access transit skim (fills WLK_LOC_WLK_TOTIVT) ==="
+python build_transit_gtfs_skims.py 2>&1
+
+echo "=== 2/2 drive-egress DTIM/DDIST + walk transfer-wait ==="
+python build_transit_dtim_xwait.py 2>&1 || echo "dtim/xwait builder non-fatal rc=$?"
+
+echo "=== verify coverage in $DST ==="
+python - <<PY
+import openmatrix as omx, numpy as np, os
+f = omx.open_file(os.environ["OMX_PATH"], "r")
+names = f.list_matrices()
+for n in ["WLK_LOC_WLK_TOTIVT__AM","WLK_LOC_DRV_TOTIVT__AM","WLK_LOC_DRV_DTIM__AM","WLK_LOC_WLK_XWAIT__AM"]:
+    if n in names:
+        a = np.array(f[n]); miss = float(np.mean(~np.isfinite(a) | (a<=0))*100)
+        print(f"  {n}: {miss:.1f}% missing/<=0  max={np.nanmax(a):.1f}")
+    else:
+        print(f"  {n}: ABSENT")
+f.close()
+PY
+echo "=== DONE $(date) ==="

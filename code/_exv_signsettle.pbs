@@ -1,0 +1,97 @@
+#!/bin/bash -l
+# =====================================================================
+# _exv_signsettle.pbs — Exampville E1/E2 re-run after the sign-gate
+# settlement fix (clamp -> refit -> re-gate, repeated to a fixed point).
+#
+# Same budget/environment as job 27508262 (exv_sg2) so the E1/E2 mode
+# comparison is like-for-like:
+#   EXV_E2_POP=12  GENS=8  S5_GENS=10  RESTARTS=1  GA_ENGINE=agds
+#   STAGE5_ESTIMATE_MU=1   ZONE_SYSTEM_N_ZONES=40
+#
+# Why: 27508262 ran the sign gate once, then the Mu gate rejected Mu_Motor
+# and its refit re-censored c_ivt_auto at -0.001000 (|t|=0.004) with nothing
+# re-checking it. _settle_scales_and_signs() now alternates both gates until
+# a full round refits nothing.
+#
+# Also sets STAGE5_MODE_HOLDFAST: with both IVT coefficients free, E1 censors
+# c_ivt_auto and E2 censors c_ivt_transit, so the two arms were not estimating
+# the same utility and part of the mode-LL gap was which term got switched
+# off. Holding the pair at exactly 0.0 in every fit (GA evaluations included)
+# gives both arms one IVT specification. The list is derived once from the
+# union of censored IVT terms in 27516742, not from this run's outcome.
+# Pass -v STAGE5_MODE_HOLDFAST= to disable the policy.
+# =====================================================================
+#PBS -N exv_sg3
+#PBS -l select=1:ncpus=2:mem=48gb
+#PBS -l walltime=06:00:00
+#PBS -j oe
+#PBS -m n
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR:-$(pwd)}"
+
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+CONDA_ENV=${CONDA_ENV:-zigenv}
+OUTDIR=${OUTDIR:-runs/exampville_s5signgate3_$(date +%Y%m%d)}
+CONDA_BASE=${CONDA_BASE:-/mnt/hpccs01/home/ahernz/miniconda3}
+if ! "${CONDA_BASE}/bin/conda" env list | grep -q "^${CONDA_ENV} "; then
+    echo "FATAL: conda env ${CONDA_ENV} missing under ${CONDA_BASE}" >&2
+    exit 3
+fi
+conda activate "${CONDA_BASE}/envs/${CONDA_ENV}"
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+export PYTHONPATH="${PBS_O_WORKDIR}/compat:${PYTHONPATH:-}"
+
+python -c "
+import numpy, pandas, larch, openmatrix
+print('numpy:', numpy.__version__, '| larch:', larch.__version__)
+"
+python -m py_compile exampville_compare.py exampville_connect.py stage5_destination_choice.py
+
+export JAX_PLATFORMS=cpu
+export JAX_PLATFORMS_ONLY=cpu
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export TF_CPP_MIN_LOG_LEVEL=3
+export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+
+# Identical search budget to 27508262.
+export EXV_E2_POP=${EXV_E2_POP:-12}
+export EXV_E2_GENS=${EXV_E2_GENS:-8}
+export EXV_E2_RESTARTS=${EXV_E2_RESTARTS:-1}
+export EXV_E2_S5_GENS=${EXV_E2_S5_GENS:-10}
+export GA_ENGINE=${GA_ENGINE:-agds}
+export GA_MAX_WORKERS=${GA_MAX_WORKERS:-1}
+export GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-2}
+export STAGE5_ESTIMATE_MU=${STAGE5_ESTIMATE_MU:-1}
+export ZONE_SYSTEM_N_ZONES=${ZONE_SYSTEM_N_ZONES:-40}
+# Identical IVT block in both arms (empty value disables the policy).
+# The list must cover the whole in-vehicle-time family, not just the two terms
+# MODE_UEC declares: run 27520087 held c_ivt_auto/c_ivt_transit only and the E2
+# search routed around the policy by selecting the time-period variants
+# c_ivt_auto_pm / c_ivt_auto_ev (both fitted at -0.221 with |t|=0).
+export STAGE5_MODE_HOLDFAST=${STAGE5_MODE_HOLDFAST-c_ivt_auto,c_ivt_transit,c_ivt_pt_drive,c_ivt_pt_bike,c_ivt_auto_pm,c_ivt_auto_md,c_ivt_auto_ev,c_ivt_hov2_am}
+
+mkdir -p "$OUTDIR"
+
+echo "=========================================="
+echo "Exampville transfer test (E0/E1/E2)"
+echo "PBS job     : ${PBS_JOBID:-unknown}"
+echo "Code dir    : $(pwd)"
+echo "Out dir     : ${OUTDIR}"
+echo "Sign gate   : settle-to-fixed-point (STAGE5_SIGN_GATE=${STAGE5_SIGN_GATE:-1})"
+echo "Held block  : STAGE5_MODE_HOLDFAST=${STAGE5_MODE_HOLDFAST:-<none>}"
+echo "Started     : $(date)"
+echo "=========================================="
+
+EXIT_CODE=0
+python -u exampville_compare.py --outdir "$OUTDIR" \
+  > "${OUTDIR}/exampville_compare.out" 2> "${OUTDIR}/exampville_compare.err" || EXIT_CODE=$?
+
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+echo "Metrics : ${OUTDIR}/exampville_metrics.json"
+exit "${EXIT_CODE}"

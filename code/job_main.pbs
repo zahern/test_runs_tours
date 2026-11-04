@@ -21,7 +21,8 @@ mkdir -p runs/main/plots
 echo "=========================================="
 echo "PBS job $PBS_JOBID  mode=main"
 echo "Working dir: $PBS_O_WORKDIR"
-echo "Output dir:  runs/main/"
+echo "Run tag:     ${RUN_TAG:-main_${PBS_JOBID}}"
+echo "Output dir:  runs/main__${RUN_TAG:-main_${PBS_JOBID}}/  (actual tagged dir from pbs_pipeline_mode.pbs)"
 echo "Started:     $(date)"
 echo "=========================================="
 

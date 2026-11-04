@@ -1,0 +1,67 @@
+#!/bin/bash -l
+# PT propagation check for unified logsum accessibility
+# (verify_logsum_accessibility.py): fitted PT stage-5 models -> per-purpose
+# logsum surfaces -> flatness + paired PT-on/off nest-invariant checks +
+# baseline diff.  Run AFTER a STAGE5_PT_MODES=1 refit merge.
+#
+# MODELS_371 MUST contain fitted model objects (save_models output), e.g.
+# saved_data/stage5_models.pkl - not a feature-name-only ga_results.pkl.
+#
+# Submit from the code dir:
+#   qsub -v MODELS_371=saved_data/stage5_models.pkl job_verify_logsum_acc.pbs
+# Optional -v: LANDUSE_371, SKIMS_371/PIPELINE_SKIMS_PATH, LOGSUM_OUT_PT,
+#              LOGSUM_BASELINE
+#
+#PBS -N verify_logsum_acc
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -l walltime=02:00:00
+
+set -euo pipefail
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+MODELS_371=${MODELS_371:-}
+LANDUSE_371=${LANDUSE_371:-saved_data/zone_landuse_overture.csv}
+PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+
+if [[ -z "${MODELS_371}" ]]; then
+    echo "FATAL: MODELS_371 (fitted PT stage-5 pickle) required via -v" >&2
+    exit 2
+fi
+if [[ ! -f "${MODELS_371}" ]]; then
+    echo "FATAL: MODELS_371 not found: ${MODELS_371}" >&2
+    exit 2
+fi
+
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# Force UTF-8 I/O so box-drawing/arrows/checkmarks in logs never mojibake.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+
+# The PT flag is read at stage5 import time; the script defaults it ON but
+# export explicitly so the job log makes the mode obvious.
+export STAGE5_PT_MODES=1
+
+echo "Verifying PT logsum accessibility propagation"
+echo "  models : ${MODELS_371}"
+echo "  landuse: ${LANDUSE_371}"
+echo "  skims  : ${PIPELINE_SKIMS_PATH}"
+
+python verify_logsum_accessibility.py \
+    --models "${MODELS_371}" \
+    --landuse "${LANDUSE_371}" \
+    --skims "${PIPELINE_SKIMS_PATH}"
+
+echo "Done. CSV (default): saved_data/logsum_acc_371_pt.csv"

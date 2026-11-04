@@ -1,0 +1,101 @@
+#!/bin/bash -l
+#PBS -N suncorp_gameday
+#PBS -l walltime=08:00:00
+#PBS -l select=1:ncpus=4:mem=96GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# Refuse to run outside PBS: keep all compute off the login/head node.
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+
+set -euo pipefail
+
+# Job 59: MetaCount structural search on 15-minute speeding counts + prediction
+# for future games. Depends on 58 (segment_15min_panel.parquet).
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+RESULTS_DIR=$PROJ_DIR/results
+FIG_DIR=$PROJ_DIR/figures
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=2
+export OPENBLAS_NUM_THREADS=2
+export MKL_NUM_THREADS=2
+export JAX_PLATFORMS=cpu
+
+cd "$SCRIPT_DIR"
+
+# PyPI first; compute-node DNS to PyPI has been observed to fail, so fall
+# back to the latest wheel staged on the shared filesystem (offline-proof).
+python -m pip install --upgrade --retries 2 --timeout 20 metacountregressor \
+  || python -m pip install --upgrade --no-index \
+       --find-links /home/ahernz/suncorp_wheels metacountregressor \
+  || { echo "FATAL: metacountregressor install failed (PyPI and staged wheel)"; exit 1; }
+python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,188), v; assert v==getattr(m,'__version__','?'), 'torn install: dist '+v+' != module '+str(getattr(m,'__version__','?'))" \
+  || { echo "FATAL: metacountregressor older than 1.0.188 or import failed (chunked search needs run(max_time=, refit=) + SearchOutputConfig checkpointing)"; exit 1; }
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "59: MetaCount search (15-min speeding) + future-game prediction"
+echo "=================================================================="
+
+[ -s "$RESULTS_DIR/segment_15min_panel.parquet" ] \
+  || { echo "FATAL: missing results/segment_15min_panel.parquet (run 58 first)"; exit 1; }
+[ -s "$PROJ_DIR/data/fixture_calendar.csv" ] \
+  || { echo "FATAL: missing fixture_calendar.csv"; exit 1; }
+
+# Resume the search checkpoint when a previous run left one; otherwise search.
+SEARCH_ARGS=(
+  --search-iters 120 --search-chunk 25 --chunk-time 3600
+  --wall-budget 18000 --n-starts 2
+  --search-R 40 --refit-R 100 --search-vars slim
+  --target trips_mean_gt_10
+  --prune-p 0.05
+)
+[ -s "$RESULTS_DIR/game_day_search_best.json" ] && SEARCH_ARGS+=(--resume)
+echo "Search resume: $([ -s "$RESULTS_DIR/game_day_search_best.json" ] && echo on || echo off)"
+
+# Search cost note: the SA runs in --search-chunk sized chunks with a wall
+# budget; every chunk writes the best spec + decision to
+# results/game_day_search_best.json, so a walltime kill loses at most the
+# current chunk. Re-submit the same PBS script to continue: the $RESUME_FLAG
+# below warm-starts the next chunk from the checkpoint and runs until
+# --search-iters total iterations are reached. R=40 on the <=100k-row sampled
+# train frame keeps each fit ~4x cheaper than the old 200k-row/R=80 run that
+# OOM'd at 66.7GB.
+#
+# Refit envelope (2026-10-16 OOM post-mortem): the step-4 JAX refit allocates
+# ~N x R x draws and OOM'd this script at 64GB with --refit-R 200 and 8 BLAS
+# threads on the newly searched (heavier) spec. The 61 job refit the SAME spec
+# in 96GB at R=100/OMP=2 (peak 72.5GB). Keep mem=96GB, OMP=2, refit-R<=100;
+# refit_only now also honours the N*R>12M low-mem guard instead of pinning
+# DE-vmap+SLSQP on unconditionally.
+#
+# --prune-p 0.05 mirrors the 61-launched shipped run (log o26809162 lines
+# 424/449: count model nothing to drop; propensity drops logexp + evu_x_att).
+# The 2026-10-16 14:31 rerun WITHOUT it shipped the unpruned propensity and
+# drifted from the shipped metrics (calibration_slope 1.022 vs 1.059), so the
+# flag belongs in the standalone script too.
+python -u 59_game_day_search_predict.py "${SEARCH_ARGS[@]}" 2>&1
+
+for f in game_day_pred_15min.parquet game_day_holdout_metrics.json \
+         game_day_search_best.json; do
+  [ -s "$RESULTS_DIR/$f" ] || { echo "FATAL: 59 missing $f"; exit 1; }
+done
+for f in game_day_search_convergence.png game_day_calibration.png \
+         game_day_surfaces.png game_day_coefs.png; do
+  [ -s "$FIG_DIR/$f" ] || echo "WARN: missing figure $f"
+done
+
+echo "59 OK"
+echo "Job finished at $(date)"

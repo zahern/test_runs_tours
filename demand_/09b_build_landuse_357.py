@@ -323,6 +323,110 @@ def main():
             out.loc[u_idx, c] = out.loc[nn_idx, c]
         out.loc[u_idx, "parcel_area_is_nn"] = True
 
+    # -- 1d. Fill REMAINING NaN legacy/QSpatial columns from the 507 build --
+    # The 60 universe zones missing from the 330-zone legacy file (step 1b
+    # LEFT join) would otherwise keep NaN QSpatial/activity/area cells, which
+    # downstream fillna(0) then silently zeroes — wiping real attractors such
+    # as recreation_ground for Toowoomba/Tweed/fringe gap zones (seen as a
+    # degenerate all-zero panel in accessibility_vs_landuse.png, job s5check).
+    # zone_landuse_507.csv covers the same 371 SA2 keys with no gaps and was
+    # verified unit-identical to the 357 values on the 311-zone overlap
+    # (2026-09: median ratio 1.0, corr 1.0 for every QSpatial/activity
+    # column), so it is a safe same-unit donor. Provenance of the donor's own
+    # gap values: the 507 build fills ITS gaps from fresh OSM POI counts
+    # (09_build_landuse_507.py OSM gap-fill — direct tag counts for park/
+    # sport/retail, composites for EATOUT/Shopping/etc.), i.e. real local
+    # data, not nearest-neighbour fabrication — verified 2026-09 (e.g.
+    # Wilsonton park=11 equals its OSM park POI count). Employment/pop/education have
+    # their own EMME/Census/TYPP fills above — 507 carries different vintages
+    # there (corr 0.3-0.5) — so those columns are NEVER touched here.
+    # sa2_area converts km²→m² (×1e6, ratio verified 1e6 on the overlap).
+    _FILL_507_PATH = os.path.join(OUT_DIR, "zone_landuse_507.csv")
+    _FILL_507_MANAGED = {
+        "TOTHH", "TOTPOP", "POPULATION", "AGE0519", "HSENROLL",
+        "AGREMPN", "MWTEMPN", "OTHEMP", "RETEMPN", "FPSEMPN", "HEREMPN",
+        "TOTEMP", "RESACRE", "CIACRE", "TOTACRE", "COLLFTE", "COLLPTE",
+        "Primary", "Secondary", "university", "college",
+        "Preschool_typp_resident", "Primary_typp_resident",
+        "Secondary_typp_resident", "TAFE_college_typp_resident",
+        "University_typp_resident", "parcel_area_is_nn",
+    }
+    out["landuse_is_507fill"] = False
+    try:
+        _f507 = pd.read_csv(_FILL_507_PATH)
+        _f507["SA2_MAIN16"] = _f507["SA2_MAIN16"].astype(int)
+        _f507 = _f507.drop_duplicates(subset=["SA2_MAIN16"]).set_index("SA2_MAIN16")
+        _n_507_zones, _n_507_cols = 0, 0
+        for _c in legacy_extra_cols:
+            if _c in _FILL_507_MANAGED or _c not in _f507.columns:
+                continue
+            _m = out[_c].isna()
+            if not bool(_m.any()):
+                continue
+            _donor = pd.to_numeric(_f507[_c], errors="coerce").reindex(
+                out["SA2_MAIN16"].astype(int).values)
+            # reindex keys by SA2 code → reset to positional alignment with out
+            _donor = pd.Series(_donor.values, index=out.index)
+            if _c == "sa2_area":
+                _donor = _donor * 1e6  # 507 stores km²; 357 stores m²
+            _got = _m & _donor.notna()
+            if bool(_got.any()):
+                out.loc[_got, _c] = _donor[_got]
+                out.loc[_got, "landuse_is_507fill"] = True
+                _n_507_cols += 1
+                print(f"  507-fill {_c}: {int(_got.sum())} zone(s)")
+        _n_507_rows = int(out["landuse_is_507fill"].sum())
+        print(f"507-backfill: {_n_507_cols} column(s) touched, "
+              f"{_n_507_rows}/{n_sa2} zones carry ≥1 507-filled cell "
+              f"(flagged landuse_is_507fill=True)")
+        _still_nan = [c for c in legacy_extra_cols
+                      if c not in _FILL_507_MANAGED and out[c].isna().any()]
+        if _still_nan:
+            # String columns (LandUse/SA4_NAME16/city) are never backfilled —
+            # report numeric gaps separately so one unfillable label column
+            # doesn't implicate all 60 gap zones. A zone is listed only if it
+            # is STILL NaN somewhere the donor actually covers it (donor-wide
+            # gaps such as *_total_priv, which 507 lacks for every gap zone,
+            # are a donor limitation, not a per-zone surprise).
+            _str_cols = {"LandUse", "SA4_NAME16", "city"}
+            _still_num = [c for c in _still_nan if c not in _str_cols]
+            # Gap universe = zones that needed any fill (sa2_area filled all
+            # 60, so the flag marks exactly the legacy-gap set). A column
+            # counts for the zone report only if the donor covers ≥1 gap
+            # zone in it — donor-wide gaps (*_total_priv, covered nowhere)
+            # are reported via the column NOTE above, not per zone.
+            _gap = out["landuse_is_507fill"]
+            _still_mask = pd.Series(False, index=out.index)
+            _donor_gap_mask = pd.Series(False, index=out.index)
+            for _c in _still_num:
+                try:
+                    _dz = pd.to_numeric(_f507[_c], errors="coerce").reindex(
+                        out["SA2_MAIN16"].astype(int).values)
+                    _dz = pd.Series(_dz.values, index=out.index)
+                    _covers_gap = bool((_dz[_gap].notna()).any())
+                    _still_mask = (_still_mask
+                                   | (out[_c].isna() & _dz.notna()))
+                    if _covers_gap:
+                        _donor_gap_mask = (_donor_gap_mask
+                                           | (out[_c].isna() & _dz.isna()))
+                except Exception:
+                    continue
+            _still_zones = sorted(
+                set(out.loc[_still_mask, "SA2_MAIN16"].astype(int).tolist()))
+            _donor_gap_zones = sorted(
+                set(out.loc[_donor_gap_mask, "SA2_MAIN16"].astype(int).tolist()))
+            print(f"NOTE: {len(_still_nan)} column(s) still have NaN after "
+                  f"507-fill (donor also gaps — e.g. 317011453 Mullumbimby, "
+                  f"which has no QSpatial extract in either build): "
+                  f"{_still_nan}")
+            print(f"      zones fillable-but-unfilled ({len(_still_zones)}): "
+                  f"{_still_zones} (empty means the backfill is complete)")
+            print(f"      zones NaN where the 507 donor is also gapped "
+                  f"({len(_donor_gap_zones)}): {_donor_gap_zones} — downstream "
+                  f"fillna(0) treats their missing attractors as zero")
+    except Exception as _e507:
+        print(f"NOTE: 507-backfill skipped ({_e507!r}) — NaN gap cells kept")
+
     # -- 5. Attach ABS geography attributes + provenance flag ----------------
     out["sa2_area_sqkm"] = zones["area_sqkm"].values
     out["sa2_name"] = zones["sa2_name"].values

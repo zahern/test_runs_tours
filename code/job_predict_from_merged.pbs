@@ -1,0 +1,154 @@
+#!/bin/bash -l
+# Predict + validate from a merged sharded-GA run, then refresh paper artifacts.
+#
+# Chain position: AFTER the merge job (ga_shardmerge_<TAG>).
+#   1. 21 shards (job_submit_ga_sharded.pbs) -> 2. merge (job_merge_ga_shards.pbs)
+#   3. THIS job (predict/validate from merged) -> 4. safety pair (optional).
+#
+# What it does:
+#   - pipeline_logger.py ga_staged with GA_STAGED_REUSE_ESTIMATOR=1 and
+#     GA_STAGED_GA_DIR=runs/ga_parallel/<TAG>/merged (no re-estimation;
+#     applies the searched specs to the full synthetic population).
+#   - generate_validation_report.py (Stage-B validation HTML + summary).
+#   - publish_paper_artifacts.py --run-tag <TAG> (Stage B: dest/safety figs,
+#     calibrated mode-share table, transfer tables into the preprint tree).
+#
+# Submit (from ~/test_runs_tours/code on an aqua login node):
+#   MERGE_JID=<merge_jobid>  # printed by job_submit_ga_sharded.pbs as "Submitted merge: ..."
+#   qsub -W depend=afterok:${MERGE_JID} -v "RUN_TAG=<TAG>" job_predict_from_merged.pbs
+#   # no dependency (merge already done):
+#   qsub -v "RUN_TAG=<TAG>" job_predict_from_merged.pbs
+#
+# Key overrides (-v, comma-separated):
+#   RUN_TAG (required)   sharded run tag, e.g. paper20260918
+#   OUTPUT_RUN_TAG       optional tag for prediction outputs; defaults to RUN_TAG_predict
+#   RUN_ROOT             default runs/ga_parallel
+#   CONDA_ENV            default zigenv
+#   GA_ESTIMATOR         default metacount_mv (must match the shard search)
+#   GA_ENGINE            default agds
+#   STAGE2_MH=1          fit start/end Tobit models with MH posterior means
+#   STAGE2_MH_BURN/DRAWS/THIN/SEED/PROPOSAL_SCALE tune the MH sampler
+#   PUBLISH_PAPER=0      set to 0 to skip the preprint refresh
+#   DRY_RUN=1            print plan without running
+#
+# Follow-up (safety Ms-vs-M0 pair for the paper's safety section):
+#   bash submit_pipeline_runs.sh --include-safety ...   # baseline -> nosafety -> analysis
+#   python -u publish_paper_artifacts.py --run-tag <TAG>  # re-run to pick up safety figs
+
+#PBS -N ga_predict_merged
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=8:mem=400GB
+#PBS -l walltime=20:00:00
+
+set -euo pipefail
+
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:?RUN_TAG is required (the sharded run tag)}
+OUTPUT_RUN_TAG=${OUTPUT_RUN_TAG:-${RUN_TAG}_predict}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+GA_ESTIMATOR=${GA_ESTIMATOR:-metacount_mv}
+GA_ENGINE=${GA_ENGINE:-agds}
+STAGE2_MH=${STAGE2_MH:-0}
+STAGE2_MH_BURN=${STAGE2_MH_BURN:-1000}
+STAGE2_MH_DRAWS=${STAGE2_MH_DRAWS:-2000}
+STAGE2_MH_THIN=${STAGE2_MH_THIN:-2}
+STAGE2_MH_SEED=${STAGE2_MH_SEED:-42}
+STAGE2_MH_PROPOSAL_SCALE=${STAGE2_MH_PROPOSAL_SCALE:-1.0}
+PUBLISH_PAPER=${PUBLISH_PAPER:-1}
+DRY_RUN=${DRY_RUN:-0}
+
+MERGED_DIR="${RUN_ROOT}/${RUN_TAG}/merged"
+
+cd "$PBS_O_WORKDIR"
+
+echo "=========================================="
+echo "Predict-from-merged job : ${PBS_JOBID:-unknown}"
+echo "Run tag      : ${RUN_TAG}"
+echo "Output tag   : ${OUTPUT_RUN_TAG}"
+echo "Merged source: ${MERGED_DIR}/ga_results.pkl"
+echo "Estimator/engine: ${GA_ESTIMATOR}/${GA_ENGINE}"
+echo "Stage 2 MH: ${STAGE2_MH} (burn=${STAGE2_MH_BURN}, draws=${STAGE2_MH_DRAWS}, thin=${STAGE2_MH_THIN})"
+echo "Publish paper: ${PUBLISH_PAPER}"
+echo "Started      : $(date)"
+echo "=========================================="
+
+if [ ! -f "${MERGED_DIR}/ga_results.pkl" ]; then
+  echo "FATAL: ${MERGED_DIR}/ga_results.pkl not found — merge job not done?"
+  exit 2
+fi
+
+if [ "${DRY_RUN}" = "1" ]; then
+  echo "DRY: would run pipeline_logger.py ga_staged with"
+  echo "  GA_STAGED_REUSE_ESTIMATOR=1 GA_STAGED_GA_DIR=${MERGED_DIR}"
+  echo "DRY: then generate_validation_report.py + publish_paper_artifacts.py --run-tag ${RUN_TAG}"
+  exit 0
+fi
+
+CONDA_BASE=${CONDA_BASE:-/mnt/hpccs01/home/ahernz/miniconda3}
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_BASE}/envs/${CONDA_ENV}"
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+echo "python: $(which python) ($(python --version 2>&1))"
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+export GA_METACOUNT_FORCE_CPU=${GA_METACOUNT_FORCE_CPU:-1}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+
+export GA_ESTIMATOR GA_ENGINE
+export STAGE2_MH STAGE2_MH_BURN STAGE2_MH_DRAWS STAGE2_MH_THIN
+export STAGE2_MH_SEED STAGE2_MH_PROPOSAL_SCALE
+export GA_STAGED_REUSE_ESTIMATOR=1
+export GA_STAGED_GA_DIR="${MERGED_DIR}"
+export PIPELINE_RUN_TAG="${OUTPUT_RUN_TAG}"
+export PIPELINE_RUN_ROOT="runs"
+# Stage-3 predict runs person-chunked in run_stage3 (runs/ga_parallel reuse flow);
+# smaller chunk = lower peak RSS. 128GB was too small (OOM at 133.9GB, 22/10).
+# 192GB was also too small: OOM-killed at 195.8GB at the Stage-5/6 vectorised
+# prediction step (22/10, exit 137), i.e. the peak is set by the full-population
+# pass, not the stage-3 chunks. 400GB gives real margin (queue allows up to 16TB).
+export STAGE3_PREDICT_CHUNK=${STAGE3_PREDICT_CHUNK:-250000}
+
+# Reuse the same population/skims convention as the shard search.
+export NEW_POP=${NEW_POP:-1}
+export NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+export NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+if [ "${NEW_POP}" = "1" ] && [ "${NEW_POP_MAPPED}" != "1" ]; then
+  export PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+fi
+
+# 1. Full-population prediction with the searched specs (no re-estimation).
+python -u -X utf8 pipeline_logger.py ga_staged
+EXIT_CODE=$?
+echo "ga_staged exit_code=${EXIT_CODE} finished $(date)"
+if [ "${EXIT_CODE}" -ne 0 ]; then
+  echo "FATAL: prediction failed — validation/paper steps skipped"
+  exit "${EXIT_CODE}"
+fi
+
+# 2. Validation report (non-fatal; collect_run_reports already runs inside
+#    pbs_pipeline_mode flows, but ga_staged via pipeline_logger.py direct call
+#    does not trigger it, so run the report explicitly).
+if python -u -X utf8 generate_validation_report.py; then
+  echo "Validation report written"
+else
+  echo "generate_validation_report skipped (non-fatal)"
+fi
+
+# 3. Paper refresh, Stage B (non-fatal).
+if [ "${PUBLISH_PAPER}" = "1" ]; then
+  if python -u -X utf8 publish_paper_artifacts.py --run-tag "${OUTPUT_RUN_TAG}" --run-root "${RUN_ROOT}"; then
+    echo "Paper artifacts (Stage B) published -> ../abm_safety/preprint/{figures,tables}"
+  else
+    echo "publish_paper_artifacts skipped (non-fatal)"
+  fi
+fi
+
+echo "Finished: $(date)"
+echo "Next: safety pair via submit_pipeline_runs.sh --include-safety, then re-run publish_paper_artifacts.py"

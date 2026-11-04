@@ -1,0 +1,103 @@
+#!/bin/bash
+#PBS -N install_searchlibrium
+#PBS -l ncpus=1,mem=8gb,walltime=00:15:00
+# Install the patched SearchLibrium estimator (destination-choice LC features)
+# into the zigenv site-packages, on a COMPUTE NODE (never the head node).
+#
+# Context: the package was re-installed as 0.0.261 (dist-info dated
+# 2026-10-16 07:45) whose stock mh_choice_estimator.py lacks
+# estimate_dest_choice_lc / _fit_frame_mnl / identify_weak_features /
+# estimate_dest_choice_interactions, so every GA stage-5 shard dies with
+# "cannot import name 'estimate_dest_choice_lc'".  Nothing inside the
+# package imports this module, so a whole-file swap is safe for 0.0.261.
+#
+# Steps: fresh backup of the current file -> run _install_patched_searchlibrium.sh
+# -> grep the installed file for every name the repo imports -> import test
+# under the real zigenv interpreter (with the defensive PATH fix, see
+# job_transit_dtim.pbs) -> informational import of stage5_lc_genes.
+
+cd "$PBS_O_WORKDIR" || exit 1
+echo "=== install_searchlibrium on $(hostname) at $(date) ==="
+
+SP="$HOME/miniconda3/envs/zigenv/lib/python3.12/site-packages/SearchLibrium"
+DST="$SP/mh_choice_estimator.py"
+
+if [[ ! -f "$DST" ]]; then
+  echo "FATAL: installed module not found: $DST"
+  exit 1
+fi
+
+BK="$DST.bak_20261016_preinstall"
+if [[ ! -f "$BK" ]]; then
+  cp -p "$DST" "$BK" || { echo "FATAL: backup failed"; exit 1; }
+  echo "backup written: $BK ($(wc -c < "$BK") B)"
+else
+  echo "backup already present: $BK"
+fi
+
+bash _install_patched_searchlibrium.sh || { echo "FATAL: installer rc=$?"; exit 1; }
+
+echo "=== post-install name checks in installed module ==="
+for f in estimate_dest_choice_lc _fit_frame_mnl identify_weak_features \
+         estimate_dest_choice_interactions estimate_dest_choice \
+         ChoiceSetFrame GaussianRandomWalkProposal effective_sample_size \
+         _mh_estimate; do
+  n=$(grep -c "$f" "$DST" || true)
+  printf '  %-36s %s\n' "$f" "$n"
+  if [[ "${n:-0}" -lt 1 ]]; then
+    echo "FATAL: name missing after install: $f"
+    exit 1
+  fi
+done
+
+DST_LC="$SP/latent_class.py"
+DST_RG="$SP/lc_rail_guard.py"
+for pair in "_compute_rail_flags $DST_LC" "lc_result_rail $DST_RG"; do
+  set -- $pair
+  n=$(grep -c "$1" "$2" || true)
+  printf '  %-36s %s\n' "$1" "${n:-0}"
+  if [[ "${n:-0}" -lt 1 ]]; then
+    echo "FATAL: rail guard missing after install: $1 in $2"
+    exit 1
+  fi
+done
+
+echo "=== import test under zigenv python ==="
+module purge
+module load Anaconda3/2024.02-1
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
+conda activate zigenv
+module unload Anaconda3
+export PATH="${CONDA_PREFIX:?conda activate zigenv failed}/bin:$PATH"
+hash -r
+python -c "import sys; assert sys.prefix == '${CONDA_PREFIX}', sys.executable"
+echo "python=$(python -V 2>&1) at $(which python)"
+
+python - <<'PY'
+import SearchLibrium
+from SearchLibrium.mh_choice_estimator import (
+    ChoiceSetFrame, GaussianRandomWalkProposal, effective_sample_size,
+    _mh_estimate, _fit_frame_mnl, identify_weak_features,
+    estimate_dest_choice, estimate_dest_choice_lc,
+    estimate_dest_choice_interactions)
+from SearchLibrium.latent_class import LatentClassMixedLogit
+from SearchLibrium.lc_rail_guard import lc_result_rail
+import SearchLibrium.mh_choice_estimator as m
+import SearchLibrium.latent_class as lc
+print(f"module file: {m.__file__}")
+print(f"latent class file: {lc.__file__}")
+print("IMPORT OK: all 9 required names + LC rail guards present")
+PY
+RC=$?
+if [[ "$RC" -ne 0 ]]; then
+  echo "FATAL: import test failed rc=$RC"
+  echo "rollback hint: cp -p '$BK' '$DST'"
+  exit 1
+fi
+
+echo "--- informational: import stage5_lc_genes ---"
+python -c "import stage5_lc_genes; print('stage5_lc_genes import OK')" \
+  || echo "WARN: stage5_lc_genes import rc=$? (inspect above; not fatal here)"
+echo "--- informational end ---"
+
+echo "INSTALL JOB DONE"

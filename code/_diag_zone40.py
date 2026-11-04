@@ -55,9 +55,10 @@ else:
 # ---- 3. DISTANCE from zone 40 ----
 try:
     import openmatrix as omx
-    f = omx.open_file('downcasted_matrices_base.omx','r')
+    # 371-only: the retired 330-system downcasted_matrices_base.omx is never used.
+    f = omx.open_file('../demand_/skims_371.omx','r')
     maps = f.listMappings()
-    mapping = dict(f.mapping(maps[0])) if maps else {i+1:i for i in range(330)}
+    mapping = dict(f.mapping(maps[0])) if maps else {i+1:i for i in range(371)}
     dist_mat = np.array(f['DIST'])
     f.close()
     # mapping: zone_number -> row_index

@@ -1,0 +1,52 @@
+#!/bin/bash -l
+# Full-segment PT/accessibility smoke gate before a production search.
+# This deliberately does not run vmap verification: the vmap implementation
+# is five-mode only, while this smoke uses the PT-aware NumPy logsum path.
+
+#PBS -N pt_access_gate
+#PBS -m n
+#PBS -r y
+#PBS -P FPAXJW8067
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=4:mem=96GB
+
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+
+CONDA_BASE=${CONDA_BASE:-/mnt/hpccs01/home/ahernz/miniconda3}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_BASE}/envs/${CONDA_ENV}"
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORMS=cpu
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+export STAGE5_PT_MODES=1
+export STAGE5B_TRANSIT_ACCESS=1
+export STAGE5_REQUIRE_LOGSUM_VARIANCE=1
+export STAGE5_LARCH_LOGSUM=0
+export STAGE5_VMAP_LOGSUM=0
+export STAGE5_VMAP_VERIFY=0
+export SMOKE_DATA=hhts
+export NEW_POP=1
+export NEW_POP_MAPPED=0
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+export SMOKE_N_TOURS="${SMOKE_N_TOURS:-1500}"
+export SMOKE_SEGMENTS="${SMOKE_SEGMENTS:-work,edu,nonmand}"
+export SMOKE_OUT="${SMOKE_OUT:-runs/pt_access_gate_${PBS_JOBID:-manual}/stage5_smoke_models.pkl}"
+export SMOKE_REPORT="${SMOKE_REPORT:-runs/pt_access_gate_${PBS_JOBID:-manual}_report.txt}"
+
+echo "PT/accessibility smoke gate: ${PBS_JOBID:-manual}"
+echo "python: $(which python) ($(python --version 2>&1))"
+echo "segments: ${SMOKE_SEGMENTS}"
+echo "modes: ${STAGE5_PT_MODES}, transit access: ${STAGE5B_TRANSIT_ACCESS}"
+
+python -u -X utf8 _smoke_s5_only.py

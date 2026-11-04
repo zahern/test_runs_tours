@@ -284,10 +284,14 @@ def plot_population_summary(plan: pd.DataFrame, save_path: str):
         # travtime is in minutes (skim output); dividing here keeps units consistent
         # regardless of total daily travel magnitude.
         raw_tt = pd.to_numeric(trips[tt_col], errors='coerce')
-        # Detect seconds encoding only (rare): median per-trip > 3600 sec → /60/60
-        if raw_tt.median() > 3600:
+        # Unit detection:
+        #   >600  : seconds per trip (very unlikely but possible) -> hours
+        #   >6    : minutes per trip (common) -> hours
+        #   <=6   : already hours
+        _tt_med = float(raw_tt.median()) if len(raw_tt.dropna()) else float('nan')
+        if np.isfinite(_tt_med) and _tt_med > 600:
             raw_tt = raw_tt / 3600.0
-        elif raw_tt.median() > 60:
+        elif np.isfinite(_tt_med) and _tt_med > 6:
             raw_tt = raw_tt / 60.0   # minutes → hours
         # else already in hours (skim returns hours) — leave as-is
         person_travtime = raw_tt.groupby(trips['person_id']).sum()
@@ -334,20 +338,22 @@ def plot_population_summary(plan: pd.DataFrame, save_path: str):
                 acts_nh['_dwell'] = 0.0
 
             person_dwell = acts_nh.groupby('person_id')['_dwell'].sum()
-            tour_time = person_travtime.add(person_dwell, fill_value=0).clip(0, 18)
+            # Allow full-day spread in diagnostics; avoid hard clipping at 18h
+            # which can hide unit issues and create an artificial pile-up.
+            tour_time = person_travtime.add(person_dwell, fill_value=0).clip(0, 24)
         else:
-            tour_time = person_travtime.clip(0, 18)
+            tour_time = person_travtime.clip(0, 24)
         if len(tour_time) > 5:
             med = tour_time.median()
             mn  = tour_time.mean()
             ax_tour.hist(tour_time, bins=36, color='#3D6B35', alpha=0.75,
-                         edgecolor='white', linewidth=0.4, range=(0, 18))
+                         edgecolor='white', linewidth=0.4, range=(0, 24))
             ax_tour.axvline(med, color='red', ls='--', lw=1.8, label=f'Median {med:.1f}h')
             ax_tour.axvline(mn,  color='orange', ls='--', lw=1.5, label=f'Mean {mn:.1f}h')
             ax_tour.set_xlabel('Total active time out-of-home (hours)')
             ax_tour.set_ylabel('Persons')
             ax_tour.set_title('Daily out-of-home activity + travel time')
-            ax_tour.set_xlim(0, 18)
+            ax_tour.set_xlim(0, 24)
             ax_tour.legend(fontsize=8)
             ax_tour.grid(alpha=0.3)
         else:
@@ -546,12 +552,17 @@ def plot_sample_plans(plan: pd.DataFrame, n: int = 8, save_path: str = None,
                               not (isinstance(raw_mn, float) and
                                    _math_module.isnan(raw_mn))) else ''
                 color   = MODE_COLORS.get(mode_n, '#CCCCCC')
+                # Distance for this trip leg (prefer haversine dist_km over skim dist)
+                _raw_d = tr.get('dist_km') if 'dist_km' in tr.index else tr.get('dist')
+                _has_d = (_raw_d is not None and
+                          not (isinstance(_raw_d, float) and _math_module.isnan(float(_raw_d))))
+                _dist_str = f' {float(_raw_d):.1f}km' if _has_d else ''
                 if t_end > t_start:
                     ax.barh(y=-0.3, width=t_end-t_start, left=t_start,
                             height=0.25, color=color, alpha=0.7, zorder=2)
-                    if (t_end - t_start) > 0.15 and mode_n:
+                    if (t_end - t_start) > 0.15 and (mode_n or _dist_str):
                         ax.text(t_start + (t_end - t_start)/2, -0.3,
-                                mode_n, ha='center', va='center',
+                                mode_n + _dist_str, ha='center', va='center',
                                 fontsize=6, color='white', fontweight='bold',
                                 zorder=3)
 
@@ -617,6 +628,17 @@ def plot_sample_plans(plan: pd.DataFrame, n: int = 8, save_path: str = None,
         t_start_str = _hm(person['STARTIME'].min()) if 'STARTIME' in person.columns else '?'
         t_end_str   = _hm(person['ENDTIME'].max())  if 'ENDTIME'  in person.columns else '?'
 
+        # Total daily distance (prefer haversine dist_km)
+        _total_km = None
+        if not trips_p.empty:
+            _d_col = 'dist_km' if 'dist_km' in trips_p.columns else \
+                     ('dist' if 'dist' in trips_p.columns else None)
+            if _d_col is not None:
+                _vals = trips_p[_d_col].dropna()
+                if len(_vals) > 0:
+                    _total_km = float(_vals.sum())
+        _dist_title = f'  ·  {_total_km:.1f}km total' if _total_km is not None else ''
+
         # Mode summary from trip rows
         if not trips_p.empty and 'mode_name' in trips_p.columns:
             mc = trips_p['mode_name'].value_counts()
@@ -627,6 +649,7 @@ def plot_sample_plans(plan: pd.DataFrame, n: int = 8, save_path: str = None,
         ax.set_title(
             f'Person {pid}  ·  {ptype}  ·  vehicles: {vehs}  ·  '
             f'{n_a} activities  ·  {t_start_str}–{t_end_str}'
+            + _dist_title
             + (f'  ·  modes: {mode_summary}' if mode_summary else ''),
             fontsize=8, pad=4
         )

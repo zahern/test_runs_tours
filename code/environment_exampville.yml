@@ -1,0 +1,17 @@
+name: exampville
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - scipy
+  - statsmodels
+  - matplotlib
+  - openmatrix
+  - pip
+  - pip:
+      - larch>=6.0
+      - searchlibrium>=0.0.239
+      - metacountregressor>=1.0.153

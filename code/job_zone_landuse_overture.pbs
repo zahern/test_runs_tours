@@ -1,0 +1,94 @@
+#!/bin/bash -l
+# =============================================================================
+# Build a comprehensive, up-to-date zone land-use table from the Overture
+# location table (counts + floor area by category: medical/education/retail/
+# office/food/recreation/civic/industrial/residential + work/school totals),
+# refreshing the existing zone_landuse.  Output: saved_data/zone_landuse_overture.csv
+#
+# Prereq: saved_data/location_table.csv  (qsub job_location_table_overture.pbs first)
+# Optional buildings floor area (OVERTURE_BUILDINGS=1) needs internet egress OR a
+# pre-downloaded OVERTURE_BUILDINGS_PARQUET.
+# Optional transport capacity (road_km/freeway_share per SA2, geometry only):
+#   auto (default) uses saved_data/overture_transport_seq.parquet if present,
+#   else skips; OVERTURE_TRANSPORT=1 queries Overture S3 (needs egress);
+#   pre-download on an egress node with:
+#     overturemaps download --bbox=152.0,-28.4,153.6,-26.5 \
+#         --type=segment -f geoparquet -o saved_data/overture_transport_seq.parquet
+#
+# Submit:  qsub job_zone_landuse_overture.pbs
+#   with buildings:  qsub -v "OVERTURE_BUILDINGS=1" job_zone_landuse_overture.pbs
+#   with transport:  qsub -v "OVERTURE_TRANSPORT=1" job_zone_landuse_overture.pbs
+# =============================================================================
+#PBS -N zone_landuse_ovm
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=4:mem=48GB
+#PBS -l walltime=03:00:00
+
+set -euo pipefail
+CONDA_ENV=${CONDA_ENV:-geotfenv}
+cd "$PBS_O_WORKDIR"
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+
+# ── Keep metacountregressor current from PyPI ────────────────────────────
+# ALWAYS attempts the upgrade on every job (no skip): the zone builds share
+# occupancy/size-term code paths with the estimator, so a stale wheel here
+# silently diverges from GA/predict. Serialized with flock; a failed upgrade
+# (offline?) is non-fatal — the job continues with whatever is installed.
+# ESTIMATOR_SOURCE=editable uses a local dev tree instead of PyPI.
+if [ "${ESTIMATOR_SOURCE:-pypi}" != "editable" ]; then
+    echo "[pkg] Upgrading metacountregressor to latest PyPI release..."
+    (
+        flock -w 900 9 2>/dev/null || echo "[pkg] (flock unavailable, proceeding without lock)"
+        pip install --upgrade -q --retries 1 --timeout 20 "metacountregressor" \
+            && echo "[pkg] metacountregressor upgraded (PyPI latest)" \
+            || echo "[pkg] WARNING: metacountregressor upgrade failed (offline?) — using whatever is installed"
+    ) 9>"${PBS_O_WORKDIR:-.}/.pkg_upgrade.lock"
+    pip show metacountregressor 2>/dev/null | awk '/^Version:/{print "[pkg] metacountregressor " $0}'
+fi
+
+echo "=== Build comprehensive zone land use from Overture ==="
+python -u build_zone_landuse_overture.py
+
+echo "=== Verify ==="
+python - <<'PY'
+import pandas as pd, os
+p = os.environ.get('ZONE_LANDUSE_OUT', 'saved_data/zone_landuse_overture.csv')
+d = pd.read_csv(p)
+new = [c for c in d.columns if c.startswith(('n_', 'area_'))]
+print(f"zone_landuse_overture.csv: {len(d)} zones, {len(d.columns)} cols, {len(new)} Overture feature cols")
+print("feature cols:", new[:20])
+# Jobs/education numbers straight from the map (occupancy model) + amenity
+# counts (poi_category). All three must be live — else the rebuild changed
+# nothing vs the stale table.
+assert {'est_workers','est_students','est_residents'} <= set(d.columns), \
+    "occupancy columns missing — location table lacked est_persons/person_kind"
+assert {'n_doctors_clinics','n_schools','n_universities'} <= set(d.columns), \
+    "amenity columns missing — location table lacked poi_category"
+assert len(d) == 371, f"expected 371 SA2 zones, got {len(d)}"
+# Loud (non-fatal) signal for a stale location_table.csv: when the location
+# table lacked est_persons/person_kind the occupancy columns are all zeros
+# (location_table_ovm job 25233620 died on the DuckDB geometry Binder error
+# before writing). Zeros pass the asserts above but wipe the size terms.
+if float(d['est_workers'].sum()) == 0.0 and float(d['est_students'].sum()) == 0.0:
+    print("WARNING: est_workers/est_students are ALL ZERO — location_table.csv "
+          "almost certainly lacks est_persons/person_kind (re-run "
+          "job_location_table_overture.pbs and check its Binder/geometry step)")
+# Cross-check vs census totals (informational — calibration, not a gate):
+# est_workers should track TOTEMP; est_students should track enrolments.
+import numpy as np
+def _corr(a, b):
+    a = pd.to_numeric(a, errors='coerce'); b = pd.to_numeric(b, errors='coerce')
+    ok = a.notna() & b.notna()
+    return float(np.corrcoef(a[ok], b[ok])[0,1]) if ok.sum() > 2 else float('nan')
+print(f"est_workers total={d['est_workers'].sum():,.0f} vs TOTEMP total={d['TOTEMP'].sum():,.0f} "
+      f"r={_corr(d['est_workers'], d['TOTEMP']):.3f}")
+print(f"est_students total={d['est_students'].sum():,.0f} "
+      f"r_vs_Primary={_corr(d['est_students'], d.get('Primary', 0)):.3f}")
+print("OK")
+PY
+echo "Done. Output: saved_data/zone_landuse_overture.csv"

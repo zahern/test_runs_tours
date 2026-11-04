@@ -1,0 +1,62 @@
+#!/bin/bash -l
+#PBS -N eb_search_deep
+#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -j oe
+#PBS -r n
+# Deep top-ups for the thin Part-S spots of eb_searched_rp job 25402029:
+#  S2-crash was still improving at gen 30 -> fresh 60-gen/12-pop re-search.
+#  S3-joint never beat its warm start in 12 gens -> 60-gen/30-pop x2 seeds.
+# Everything writes to SCRATCH dirs; winners are promoted to $PROJ_DIR
+# manually after comparing BICs (never overwrite good outputs blindly).
+# Est: crash ~1-2h, joint ~2-5h per seed. Total ~6-12h on 4 cpus.
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template
+SCR1=$PROJ_DIR/eb_deep_crash
+SCR2=$PROJ_DIR/eb_deep_joint_s44
+SCR3=$PROJ_DIR/eb_deep_joint_s45
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+# ALWAYS ensure the pinned estimator: flock-serialized so concurrent paper jobs
+# don't race pip into the shared env (hardened after jobs 25258209/25271015).
+mkdir -p /mnt/hpccs01/home/ahernz/test_runs_tours/code
+(
+    flock -w 900 9 2>/dev/null || echo "(flock unavailable, proceeding without lock)"
+    pip install --quiet --upgrade --retries 5 --timeout 60 metacountregressor 2>&1 | tail -5
+) 9>/mnt/hpccs01/home/ahernz/test_runs_tours/code/.pkg_upgrade.lock
+# Hard gate (this file has NO `set -e`, so a bare failing assert would NOT stop
+# the job -- reads distribution metadata, NOT m.__version__).
+python -c "from importlib.metadata import version as _v; v=tuple(map(int, _v('metacountregressor').split('.')[:3])); assert v>=(1,0,151), f\"stale mcr {_v('metacountregressor')} -- aborting\"; print('mcr', _v('metacountregressor'), 'OK')" || exit 1
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.6
+export JAX_PLATFORMS=cpu
+cd "$PROJ_DIR"
+mkdir -p "$SCR1" "$SCR2" "$SCR3"
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+EXIT_CODE=0
+python -u eb_searched_rp.py --data "$PROJ_DIR/near_miss_hb_ecf.csv" --out-dir "$SCR1" --search crash --crash-maxiter 60 --crash-popsize 12 2>&1
+[ $? -ne 0 ] && { echo "STEP crash-topup FAILED"; EXIT_CODE=1; }
+python -u eb_searched_rp.py --data "$PROJ_DIR/near_miss_hb_ecf.csv" --out-dir "$SCR2" --search joint --load-best --best-dir "$PROJ_DIR" --joint-gen 60 --joint-pop 30 --joint-seed 44 2>&1
+[ $? -ne 0 ] && { echo "STEP joint-s44 FAILED"; EXIT_CODE=1; }
+python -u eb_searched_rp.py --data "$PROJ_DIR/near_miss_hb_ecf.csv" --out-dir "$SCR3" --search joint --load-best --best-dir "$PROJ_DIR" --joint-gen 60 --joint-pop 30 --joint-seed 45 2>&1
+[ $? -ne 0 ] && { echo "STEP joint-s45 FAILED"; EXIT_CODE=1; }
+# Gates: crash re-search outputs.
+for f in "$SCR1/eb_search_best_crash.csv" "$SCR1/eb_search_hist_crash.csv" \
+         "$SCR1/eb_search_convergence_crash.png"; do
+  if [ ! -f "$f" ]; then echo "MISSING crash-topup output: $f"; EXIT_CODE=1; fi
+done
+# Gates: joint deep-search outputs, both seeds.
+for d in "$SCR2" "$SCR3"; do
+  for f in "$d/eb_search_joint_best.csv" "$d/eb_search_joint_best.tex" \
+           "$d/eb_search_hist_joint.csv" "$d/eb_search_convergence_joint.png"; do
+    if [ ! -f "$f" ]; then echo "MISSING joint-deep output: $f"; EXIT_CODE=1; fi
+  done
+done
+echo "Job finished at $(date) exit=$EXIT_CODE"
+exit $EXIT_CODE
+
+

@@ -1,0 +1,34 @@
+#!/bin/bash -l
+#PBS -N probe_fill_ba
+#PBS -l walltime=00:40:00
+#PBS -l select=1:ncpus=2:mem=32GB
+#PBS -m n
+#PBS -r y
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV:-zigenv}"
+module unload Anaconda3
+
+export NEW_POP=1 NEW_POP_MAPPED=0
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+export PAPER_SEGMENT="${PAPER_SEGMENT:-work}"
+export PAPER_CACHE="${PAPER_CACHE:-runs/_s5_larch_perturb/work_dest_cache.pkl}"
+export JAX_PLATFORMS=cpu
+export CUDA_VISIBLE_DEVICES=""
+if [[ -z "${SEARCHLIBRIUM_SRC:-}" && -f "${PBS_O_WORKDIR}/_patches/SearchLibrium/mh_choice_estimator.py" ]]; then
+  export SEARCHLIBRIUM_SRC="${PBS_O_WORKDIR}/_patches"
+fi
+
+BAK="$(ls -t stage5_destination_choice.py.bak_logsumfill_* | head -1)"
+STAMP="$(date -u +%Y%m%d_%H%M%S)_${PBS_JOBID:-local}"
+OUT="runs/_s5_probe_fill_ba/${STAMP}"
+mkdir -p "${OUT}"
+
+echo "before/after fill probe -> ${OUT} (OLD=${BAK})"
+python _probe_fill_before_after.py "${BAK}" 2>&1 | tee "${OUT}/probe.out"
+echo "Finished: $(date) exit_code=${PIPESTATUS[0]}" | tee -a "${OUT}/probe.out"

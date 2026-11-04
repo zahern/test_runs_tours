@@ -1,0 +1,89 @@
+#!/bin/bash -l
+#PBS -N s5_frame2_seed
+#PBS -l walltime=08:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -m n
+#PBS -r y
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _sub_frame2_seed.pbs
+# Error bar on the logsum-fill fix's effect (20261103_fillfix_keep).
+#
+# Why a new FRAME and not just a new PAPER_SEED: with PAPER_N_CASES=0 and an
+# existing cache, every arm fits the same sampled cases/alternatives.
+#   * arm B is deterministic on a fixed frame -> a second PAPER_SEED returns
+#     identical numbers, so it cannot contribute an error bar;
+#   * arm D varies only through restart jitter.
+# The importance-sampled alternative set is drawn at cache-build time with
+# SAMPLE_SEED (PAPER_SAMPLE_SEED), so a second value of that seed is what draws
+# a second frame.  On it we fit the SAME utility spec three ways:
+#
+#   mirror  pre-fix module  c_logsum with the 79 no-surface tours turned into a
+#                           distance mirror    (PAPER_S5_SOURCE=<*.bak_logsumfill_*>)
+#   fixed   patched module  same frame, fill rows left constant
+#   fixed s7 patched module same frame, restart seed 7 (arm-D restart noise)
+#
+# frame 1 (sample_seed 42) already exists:
+#   mirror 27554328 (B) / 27554405,27554407 (D, seeds 42/7)
+#   fixed  20261103_fillfix_keep (B + D, seed 42)
+# so this job supplies frame 2 and the shift becomes two paired differences.
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV:-zigenv}"
+module unload Anaconda3
+
+export NEW_POP=1 NEW_POP_MAPPED=0
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+if [[ -z "${SEARCHLIBRIUM_SRC:-}" && -f "${PBS_O_WORKDIR}/_patches/SearchLibrium/mh_choice_estimator.py" ]]; then
+  export SEARCHLIBRIUM_SRC="${PBS_O_WORKDIR}/_patches"
+fi
+
+export PAPER_SEGMENT=work
+export PAPER_N_CASES=0
+export PAPER_ARMS=B                   # A and D always run; C is skipped
+export PAPER_N_PERT=10                # 11 restarts, same as the frame-1 D fits
+export PAPER_LC_MAXITER=150
+export PAPER_MSTEP_MAXITER=200
+export PAPER_UTILITY="c_log_dist,c_crash,c_logsum,c_visit_work,c_crash_safety_dest"
+export PAPER_MEMB="STUDYING,sexp,incp,vehrd"
+export PAPER_DROP_NOLOGSUM=0          # keep the fallback tours: that is the point
+export JAX_PLATFORMS=cpu
+export CUDA_VISIBLE_DEVICES=""
+
+# Second frame: new cache path + new importance-sampling seed.  The first run
+# below builds it (its cache-build path prints [cache] built ...).
+export PAPER_CACHE="runs/_s5_larch_perturb/work_dest_cache_s7.pkl"
+export PAPER_SAMPLE_SEED=7
+
+LEGACY="${PBS_O_WORKDIR}/stage5_destination_choice.py.bak_logsumfill_20261103_171452"
+if [[ ! -f "${LEGACY}" ]]; then
+  echo "missing pre-fix module: ${LEGACY}" >&2
+  exit 1
+fi
+
+run() {   # $1 = label, $2 = output dir name; environment carries the settings
+  export PAPER_OUT="runs/stage5_paper_arms/$2"
+  mkdir -p "${PAPER_OUT}"
+  echo "=== $1 -> ${PAPER_OUT}"
+  echo "    cache=${PAPER_CACHE} sample_seed=${PAPER_SAMPLE_SEED}" \
+       "seed=${PAPER_SEED} s5_source=${PAPER_S5_SOURCE:-<in-tree>}"
+  python _paper_stage5_arms.py 2>&1 | tee "${PAPER_OUT}/job.out"
+}
+
+export PAPER_SEED=42
+run "frame2 fixed (restart seed 42)" 20261103_frame2_fixed_s42
+
+export PAPER_SEED=7
+run "frame2 fixed (restart seed 7)"  20261103_frame2_fixed_s7
+
+export PAPER_SEED=42
+export PAPER_S5_SOURCE="${LEGACY}"
+run "frame2 mirror (pre-fix module)" 20261103_frame2_mirror_s42
+
+echo "Finished: $(date) exit_code=$?"

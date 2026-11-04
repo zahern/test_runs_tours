@@ -1,0 +1,79 @@
+#!/bin/bash
+#PBS -N hb_crash_pred_search
+#PBS -j oe
+#PBS -o hb_vs_crash_search.log
+
+# ======================================================================
+# PBS Job: HB vs Crash Prediction Model Search
+# ======================================================================
+# UNCOMMENT THE RESOURCE LINE THAT WORKS FOR YOUR CLUSTER:
+# ======================================================================
+
+# Option 1: Modern PBS (select syntax) - WORKS ON YOUR CLUSTER
+#PBS -l select=1:ncpus=4:mem=32gb
+#PBS -l walltime=24:00:00
+#PBS -r n
+# No-restarts policy: single-run GA only.
+
+# Option 2: Older PBS (nodes syntax) - try if Option 1 fails
+##PBS -l nodes=1:ppn=4,mem=64gb
+##PBS -l walltime=24:00:00
+
+# Option 3: With vmem instead of mem
+##PBS -l select=1:ncpus=4:vmem=64gb
+##PBS -l walltime=24:00:00
+
+# Option 4: Lower resources if above exceed queue limits
+##PBS -l select=1:ncpus=2:mem=32gb
+##PBS -l walltime=12:00:00
+
+# ======================================================================
+# Environment setup
+# ======================================================================
+module purge
+# Try common module names - uncomment what works on your cluster
+module load python/3.11 2>/dev/null || true
+module load anaconda3/2023.09 2>/dev/null || true
+module load miniconda3 2>/dev/null || true
+module load gcc/11.2.0 2>/dev/null || true
+
+export JAX_PLATFORM_NAME=cpu
+export JAX_ENABLE_X64=1
+export JAX_LOG_COMPILES=0
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
+cd "$PBS_O_WORKDIR"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PAPER_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Use system python3 (install metacountregressor in your env if needed)
+PYTHON="python3"
+
+echo "============================================"
+echo "  HB vs Crash Prediction Search"
+echo "  Python:      $PYTHON"
+echo "  Node:        $(hostname)"
+echo "  Start:       $(date)"
+echo "============================================"
+
+$PYTHON -c "import metacountregressor; print('mcr v' + metacountregressor.__version__)"
+$PYTHON -c "import jax; print('JAX ' + jax.__version__ + ' platform=' + jax.default_backend())"
+
+$PYTHON "$SCRIPT_DIR/run_hb_search.py" \
+    --out-dir "$PAPER_DIR" \
+    --maxiter ${MCR_MAXITER:-60} \
+    --popsize ${MCR_POPSIZE:-15} \
+    --mcr-n-starts ${MCR_N_STARTS:-1} \
+    --mcr-max-iter ${MCR_MAX_ITER:-500} \
+    --solver ${MCR_SOLVER:-de}
+
+# Best-model gate: fail loudly if the reported best models were not written.
+for f in "$PAPER_DIR/best_models_master.tex" "$PAPER_DIR/hb_de_best_nm.tex" "$PAPER_DIR/hb_de_best_crash.tex"; do
+  if [ ! -f "$f" ]; then echo "MISSING best-model output: $f"; exit 1; fi
+done
+
+echo "============================================"
+echo "  End:       $(date)"
+echo "============================================"

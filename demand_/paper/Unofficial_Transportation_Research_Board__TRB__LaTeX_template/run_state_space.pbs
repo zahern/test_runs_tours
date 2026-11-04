@@ -1,0 +1,33 @@
+#!/bin/bash -l
+#PBS -N hb_state_space
+#PBS -l walltime=002:00:00
+#PBS -l select=1:ncpus=2:mem=16GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r n
+# No-restarts policy: do not auto-rerun.
+
+# ── Cluster paths ───────────────────────────────────────────────────────────
+SCRIPT_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+cd "$SCRIPT_DIR"
+
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+
+# Ensure metacountregressor is at the latest version
+pip install --upgrade metacountregressor 2>&1 | tail -3
+
+python -u hb_state_space.py \
+    --events    "$SCRIPT_DIR/hard_braking_events.csv" \
+    --segments  "$SCRIPT_DIR/near_miss_hb_ecf.csv" \
+    --de-best-hb "$SCRIPT_DIR/hb_de_best_nm.tex" \
+    --out-dir   "$SCRIPT_DIR"
+EXIT_CODE=$?
+
+echo "Job finished at $(date) — exit_code=$EXIT_CODE"
+exit $EXIT_CODE

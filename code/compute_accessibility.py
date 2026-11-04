@@ -46,6 +46,11 @@ ACCESSIBILITY_SPEC = {
             'TOTEMP':  1.0,   # total employment — computed as sum of below
             'FPSEMPN': 0.15,  # finance/professional bonus (white-collar)
             'HEREMPN': 0.10,  # healthcare bonus
+            'n_office': 1.0,      # Overture office POIs (active w/ USE_OVERTURE_LANDUSE=1)
+            'n_industrial': 0.2,  # Overture industrial POIs
+            'com_floor_m2': 0.000001,  # Overture commercial floor area (job capacity)
+            'jobs_office_n': 0.5,  # classified office job locations (count)
+            'jobs_office_m2': 0.0000005,  # classified office floorspace
         },
         'skim_col':    'SOVTOLL_TIME__AM',
         'decay_type':  'exp',
@@ -62,6 +67,7 @@ ACCESSIBILITY_SPEC = {
             'Secondary': 1.0,   # secondary school enrolment
             'Education': 50.0,  # tertiary facilities (scale up — count vs enrolment)
             'HSENROLL':  0.5,   # high school enrolment (supplement)
+            'n_education': 1.0,  # Overture education POIs (facility presence)
         },
         'skim_col':    'SOVTOLL_TIME__AM',
         'decay_type':  'exp',
@@ -77,6 +83,8 @@ ACCESSIBILITY_SPEC = {
             'Shopping': 10.0,   # facility count (scale up to match retail area)
             'retail':   0.001,  # retail floor area m² (normalise to comparable scale)
             'RETEMPN':  0.5,    # retail employment
+            'n_retail': 3.0,      # Overture retail POIs (current, comprehensive)
+            'area_retail': 0.0002,  # Overture retail floor area m²
         },
         'skim_col':    'SOVTOLL_TIME__AM',
         'decay_type':  'exp',
@@ -95,6 +103,10 @@ ACCESSIBILITY_SPEC = {
             'OTHERDISCRFacilities': 2.0,  # discretionary facilities
             'Healthcare':           2.0,   # healthcare facilities
             'retail':              0.0005, # retail area contribution
+            'n_food':               2.0,   # Overture food/dining POIs
+            'n_recreation':         0.05,  # Overture leisure POIs (large counts)
+            'n_health':             1.0,   # Overture health POIs
+            'n_addresses':          0.002, # Overture address density (trip ends)
         },
         'skim_col':    'SOVTOLL_TIME__AM',
         'decay_type':  'exp',
@@ -112,6 +124,11 @@ ACCESSIBILITY_SPEC = {
             'retail':     0.0003,
             'residential': 0.000005,  # residential floor area m²
             'TOTPOP':      0.01,
+            'n_food':       1.0,    # Overture dining POIs (walkable amenities)
+            'n_retail':     1.0,    # Overture retail POIs
+            'n_residential': 0.005, # Overture residential POI density
+            'res_floor_m2': 0.00001,  # Overture residential floor area (density)
+            'road_walk_km': 0.5,      # Overture footway/path/cycleway network
         },
         'skim_col':    'DISTWALK',
         'decay_type':  'logit',
@@ -125,6 +142,9 @@ ACCESSIBILITY_SPEC = {
             'TOTEMP':  0.5,
             'retail':  0.0002,
             'EATOUT':  2.0,
+            'n_retail': 0.5,  # Overture retail POIs
+            'n_food':   0.5,  # Overture dining POIs
+            'road_cycle_km': 1.0,  # Overture cycleway network
         },
         'skim_col':    'DISTBIKE',
         'decay_type':  'logit',
@@ -133,16 +153,63 @@ ACCESSIBILITY_SPEC = {
     },
 
     # ── Transit accessibility ─────────────────────────────────────────────────
-    # Transit reaches employment centres — use TOTEMP with gentle decay
+    # Employment reachable BY TRANSIT, time-decayed. Two fixes vs the old spec:
+    #  (1) skim_col is the real transit skim (WLK_LOC_WLK_TOTIVT__AM, walk-local-
+    #      walk transit in-vehicle minutes) — the old spec used SOVTOLL_TIME (an
+    #      AUTO skim), so "transit accessibility" was actually auto accessibility.
+    #  (2) steeper decay (0.06 vs 0.025) + lower cap (90 vs 150 min) so the measure
+    #      DIFFERENTIATES zones instead of saturating to a near-constant (~13
+    #      everywhere, CV≈3.5%). Transit access should be high near the CBD/rail and
+    #      low on the fringe; the flat measure is why c_transit_access injected no
+    #      cross-zone variation into the mode logsum → c_logsum could not identify.
+    #  zero_unreachable: transit OD pairs with no path come through the skim as 0.
+    #      Unlike auto (which reaches everywhere), a 0 here means NO SERVICE and
+    #      must count as WORST access (tt→cap), not instant/best access.
     'transit_acc': {
         'attractor_cols': {
             'TOTEMP':      1.0,
             'commercial': 0.000005,  # commercial area as CBD proxy
+            'n_office':    0.5,      # Overture office POIs (CBD/employment proxy)
+            'n_bus_stops': 0.5,      # Overture transit stops (service density)
+        },
+        'skim_col':        'WLK_LOC_WLK_TOTIVT__AM',
+        'decay_type':      'exp',
+        'decay_coeff':     0.06,
+        'cap_tt':          90.0,
+        'zero_unreachable': True,
+    },
+
+    # ── Auto power-consumption accessibility ──────────────────────────────────
+    # Attractor: diversified electrical load per SA2 (zone_power_371.csv).
+    # Rationale: metered-equivalent consumption is a revealed activity-
+    # intensity proxy — high-consumption zones concentrate the work, shopping
+    # and social opportunities trips seek, complementing employment counts
+    # (which miss informal/unmetered activity). Same gravity form as the
+    # work measure; com_kw over-weights commercial (job-activity) load.
+    'auto_power_acc': {
+        'attractor_cols': {
+            'energy_kwh_day': 1.0,
+            'peak_kw':        10.0,
+            'com_kw':         5.0,
         },
         'skim_col':    'SOVTOLL_TIME__AM',
         'decay_type':  'exp',
-        'decay_coeff': 0.025,
-        'cap_tt':      150.0,
+        'decay_coeff': 0.05,
+        'cap_tt':      120.0,
+    },
+
+    # ── Transit power-consumption accessibility ───────────────────────────────
+    # Same consumption attractor through the transit skim (zero = no service).
+    'transit_power_acc': {
+        'attractor_cols': {
+            'energy_kwh_day': 1.0,
+            'com_kw':         5.0,
+        },
+        'skim_col':        'WLK_LOC_WLK_TOTIVT__AM',
+        'decay_type':      'exp',
+        'decay_coeff':     0.06,
+        'cap_tt':          90.0,
+        'zero_unreachable': True,
     },
 
     # ── Recreation accessibility ──────────────────────────────────────────────
@@ -153,6 +220,8 @@ ACCESSIBILITY_SPEC = {
             'Entertainment':     3.0,
             'park':              0.001,
             'sport':             0.01,
+            'n_recreation':      0.05,        # Overture leisure POIs
+            'area_recreation':   0.00000002, # Overture recreation area m² (large scale)
         },
         'skim_col':    'SOVTOLL_TIME__AM',
         'decay_type':  'exp',
@@ -181,15 +250,25 @@ def enrich_landuse(landuse: pd.DataFrame) -> pd.DataFrame:
     """
     lu = landuse.copy()
 
+    def _col(name, default=0.0) -> pd.Series:
+        """Numeric column or zero-filled placeholder — derived measures must
+        not hard-fail on partial landuse tables."""
+        if name in lu.columns:
+            return pd.to_numeric(lu[name], errors='coerce').fillna(0.0)
+        return pd.Series(default, index=lu.index, dtype=float)
+
     # total employment — not in raw file, must be computed
     emp_cols = ['RETEMPN', 'FPSEMPN', 'HEREMPN', 'AGREMPN', 'MWTEMPN', 'OTHEMP']
-    lu['TOTEMP'] = lu[[c for c in emp_cols if c in lu.columns]].sum(axis=1)
+    lu['TOTEMP'] = lu[[c for c in emp_cols if c in lu.columns]].sum(axis=1) \
+        if any(c in lu.columns for c in emp_cols) else \
+        _col('TOTEMP')
 
     # density measures (per km² where sa2_area is in m²)
-    area = lu['sa2_area'].clip(lower=1e4)  # minimum 1 ha to avoid division noise
+    area = _col('sa2_area', 1e7).clip(lower=1e4)  # minimum 1 ha to avoid division noise
+    lu['TOTPOP'] = _col('TOTPOP')
     lu['pop_density'] = lu['TOTPOP']       / area * 1e6
     lu['emp_density'] = lu['TOTEMP']       / area * 1e6
-    lu['res_density'] = lu['residential']  / area  # fraction 0-1
+    lu['res_density'] = _col('residential')  / area  # fraction 0-1
 
     # combined school enrolment
     lu['school_enrol'] = (
@@ -200,9 +279,164 @@ def enrich_landuse(landuse: pd.DataFrame) -> pd.DataFrame:
     # total activity facility count
     act_cols = ['EATOUT','Shopping','Entertainment','ESCORT',
                 'OTHERMAINTENANCE','OTHERDISCRFacilities','Healthcare']
-    lu['activity_count'] = lu[[c for c in act_cols if c in lu.columns]].fillna(0).sum(axis=1)
+    lu['activity_count'] = lu[[c for c in act_cols if c in lu.columns]].fillna(0).sum(axis=1) \
+        if any(c in lu.columns for c in act_cols) else 0.0
 
     return lu
+
+
+# Overture POI/area columns available in zone_landuse_overture.csv
+# (build_zone_landuse_overture.py). These are joined in by
+# _merge_overture_attractors() when USE_OVERTURE_LANDUSE=1 and become live
+# attractor terms in ACCESSIBILITY_SPEC / _LOGSUM_PURPOSE_SPEC below.
+# Missing columns are skipped silently by the spec loops, so the specs are
+# safe to extend unconditionally — the terms only activate when present.
+_OVERTURE_ATTRACTOR_COLS = [
+    'n_civic', 'n_education', 'n_food', 'n_health', 'n_industrial',
+    'n_office', 'n_recreation', 'n_residential', 'n_retail',
+    'area_civic', 'area_education', 'area_food', 'area_health',
+    'area_industrial', 'area_office', 'area_recreation', 'area_residential',
+    'area_retail', 'n_is_work', 'n_is_school', 'n_is_discretionary',
+    'n_is_home', 'n_locations',
+    'road_km_motorway', 'road_km_primary', 'road_km_secondary',
+    'road_km_tertiary', 'road_km_local', 'road_km_car_total',
+    'road_speed_avg', 'road_walk_km', 'road_cycle_km',
+    'lu_area_residential', 'lu_area_retail', 'lu_area_commercial',
+    'lu_area_industrial', 'lu_area_school', 'lu_area_park', 'lu_area_civic',
+    'n_bus_stops', 'n_addresses',
+    'jobs_education_n', 'jobs_education_m2', 'jobs_health_n', 'jobs_health_m2',
+    'jobs_hospitality_n', 'jobs_hospitality_m2', 'jobs_industrial_n',
+    'jobs_industrial_m2', 'jobs_office_n', 'jobs_office_m2',
+    'jobs_retail_n', 'jobs_retail_m2', 'jobs_services_n', 'jobs_services_m2',
+    # Overture TRANSPORTATION capacity (build_zone_landuse_overture transport
+    # step — geometry only, never volumes). Available for validation / DTA
+    # feedback; NOT in ACCESSIBILITY_SPEC weights by design.
+    'road_km', 'freeway_km', 'arterial_km', 'freeway_share',
+    # Overture BUILDINGS detailed use (buildings step, OVERTURE_BUILDINGS=1 —
+    # real floorspace by use). res/com_floor_m2 ARE in ACCESSIBILITY_SPEC
+    # weights (walk/work); the finer bldg_* splits stay available for
+    # validation / GA selection.
+    'res_floor_m2', 'com_floor_m2', 'bldg_apt_m2', 'bldg_house_m2',
+    'bldg_retail_m2', 'bldg_office_m2', 'bldg_industrial_m2',
+    'bldg_public_m2', 'bldg_other_m2', 'bldg_apt_share',
+    # OSM supply + transit service (build_zone_supply.py — observed supply and
+    # scheduled service, NOT volumes). Available for validation / GA selection;
+    # NOT in ACCESSIBILITY_SPEC weights by design.
+    'n_parking', 'area_parking', 'n_parking_osm', 'parking_capacity', 'parking_area_m2',
+    'n_bike_parking', 'n_ev_charging', 'n_fuel', 'n_car_share', 'n_taxi',
+    'cycleway_km', 'n_transit_stops', 'transit_trips_am', 'transit_headway',
+    # Derived mix (build_zone_landuse_overture.py).
+    'lu_entropy', 'jobs_housing_ratio',
+]
+
+
+def _merge_overture_attractors(landuse: pd.DataFrame) -> pd.DataFrame:
+    """Left-join Overture POI count/area columns into the landuse frame.
+
+    Active only when USE_OVERTURE_LANDUSE=1 (same flag the chain already
+    forwards to stage/pred jobs). Joins on SA2_MAIN16 (the 371-zone key),
+    falling back to ORDER. Only ADDS columns missing from ``landuse`` — it
+    never overwrites existing values. Fully non-fatal: any failure logs and
+    returns the input unchanged.
+    """
+    if os.environ.get('USE_OVERTURE_LANDUSE', '0') != '1':
+        return landuse
+    try:
+        _here = os.path.dirname(os.path.abspath(__file__))
+        _ov_path = os.environ.get(
+            'OVERTURE_LANDUSE_PATH',
+            os.path.join(_here, 'saved_data', 'zone_landuse_overture.csv'))
+        if not os.path.exists(_ov_path):
+            logger.warning(f"USE_OVERTURE_LANDUSE=1 but {_ov_path} missing — "
+                           "accessibility falls back to legacy attractors")
+            return landuse
+        ov = pd.read_csv(_ov_path)
+        key = None
+        for cand in ('SA2_MAIN16', 'ORDER'):
+            if cand in landuse.columns and cand in ov.columns:
+                key = cand
+                break
+        if key is None:
+            logger.warning("USE_OVERTURE_LANDUSE=1 but no join key "
+                           "(SA2_MAIN16/ORDER) shared with the Overture table")
+            return landuse
+        add = [c for c in _OVERTURE_ATTRACTOR_COLS
+               if c in ov.columns and c not in landuse.columns]
+        if not add:
+            return landuse
+        lu = landuse.merge(ov[[key] + add], on=key, how='left')
+        for c in add:
+            lu[c] = pd.to_numeric(lu[c], errors='coerce').fillna(0.0)
+        nz = int((lu[add].fillna(0) > 0).any(axis=1).sum())
+        logger.info(f"[Accessibility] merged {len(add)} Overture attractor "
+                    f"columns on {key} ({nz}/{len(lu)} zones have POIs)")
+        return lu
+    except Exception as e:                                    # noqa: BLE001
+        logger.warning(f"Overture attractor merge failed (non-fatal): {e}")
+        return landuse
+
+
+# Power-network consumption columns (build_power_network_371.py ->
+# saved_data/power/zone_power_371.csv). Joined into the landuse frame so the
+# *_power_acc gravity measures see per-SA2 diversified load. Missing columns
+# are skipped silently by the spec loops, mirroring the Overture pattern.
+_POWER_CONSUMPTION_COLS = [
+    'peak_kw', 'peak_kva', 'energy_kwh_day', 'pv_kw',
+    'res_kw', 'com_kw', 'ind_kw', 'ev_kw',
+]
+
+
+def _merge_power_consumption(landuse: pd.DataFrame) -> pd.DataFrame:
+    """Left-join per-zone power consumption into the landuse frame.
+
+    Keys on SA2_MAIN16; falls back to ORDER when ORDER carries SA2 codes (the
+    371 convention set by run_accessibility_371.py). Only ADDS columns missing
+    from ``landuse`` — never overwrites. Fully non-fatal: missing file, missing
+    keys, or zero coverage all log and return the input unchanged.
+    """
+    try:
+        _here = os.path.dirname(os.path.abspath(__file__))
+        _pp = os.environ.get(
+            'POWER_371_PATH',
+            os.path.join(_here, 'saved_data', 'power', 'zone_power_371.csv'))
+        if not os.path.exists(_pp):
+            return landuse
+        pw = pd.read_csv(_pp)
+        if 'SA2_MAIN16' not in pw.columns:
+            logger.warning("power merge skipped: zone_power file lacks SA2_MAIN16")
+            return landuse
+        pw = pw.copy()
+        pw['SA2_MAIN16'] = pd.to_numeric(pw['SA2_MAIN16'], errors='coerce')
+        pw = pw.dropna(subset=['SA2_MAIN16']).drop_duplicates('SA2_MAIN16')
+        key = None
+        if 'SA2_MAIN16' in landuse.columns:
+            key = 'SA2_MAIN16'
+        elif 'ORDER' in landuse.columns:
+            _o = pd.to_numeric(landuse['ORDER'], errors='coerce')
+            if float((_o > 100000).mean()) > 0.9:
+                key = 'ORDER'
+        if key is None:
+            logger.warning("power merge skipped: no SA2 key "
+                           "(SA2_MAIN16 / ORDER-as-SA2) in landuse")
+            return landuse
+        add = [c for c in _POWER_CONSUMPTION_COLS
+               if c in pw.columns and c not in landuse.columns]
+        if not add:
+            return landuse
+        lu = landuse.copy()
+        lu['_pkey'] = pd.to_numeric(lu[key], errors='coerce')
+        lu = lu.merge(pw[['SA2_MAIN16'] + add].rename(
+            columns={'SA2_MAIN16': '_pkey'}), on='_pkey', how='left')
+        lu = lu.drop(columns=['_pkey'])
+        for c in add:
+            lu[c] = pd.to_numeric(lu[c], errors='coerce').fillna(0.0)
+        cov = float((lu[add].fillna(0) > 0).any(axis=1).sum())
+        logger.info(f"[Accessibility] merged {len(add)} power-consumption "
+                    f"columns on {key} ({cov:.0f}/{len(lu)} zones with load)")
+        return lu
+    except Exception as e:                                    # noqa: BLE001
+        logger.warning(f"power-consumption merge failed (non-fatal): {e}")
+        return landuse
 
 
 # =============================================================================
@@ -226,6 +460,18 @@ def _decay(tt: np.ndarray, decay_type: str, b: float) -> np.ndarray:
 # CORE COMPUTATION
 # =============================================================================
 
+def _is_time_matrix(col: str) -> bool:
+    """True if this skim column holds travel TIME (needs minutes conversion).
+
+    Distance (DIST*, *_DIST__*) and count (CRASH, *BOARDS*, *FAR*) matrices
+    are already in their native units — routing them through to_minutes()
+    only emits spurious "NOT in sidecar" warnings (and risks the legacy
+    value-guess dividing km data). Mirrors the codebase's own convention
+    ('min' if 'TIME' in col else 'km').
+    """
+    c = str(col).upper()
+    return ('TIME' in c) or ('TOTIVT' in c) or ('WAIT' in c)
+
 def compute_accessibility(
     landuse: pd.DataFrame,
     skim_df: pd.DataFrame,
@@ -241,8 +487,12 @@ def compute_accessibility(
     if spec is None:
         spec = ACCESSIBILITY_SPEC
 
-    # enrich landuse with derived columns
+    # enrich landuse with derived columns, then merge Overture POI/area
+    # attractors when USE_OVERTURE_LANDUSE=1 (no-op otherwise), then merge
+    # per-zone power consumption when zone_power_371.csv exists (no-op otherwise)
     lu = enrich_landuse(landuse)
+    lu = _merge_overture_attractors(lu)
+    lu = _merge_power_consumption(lu)
 
     # zone index
     lu_col = 'ORDER' if 'ORDER' in lu.columns else lu.index.name
@@ -285,16 +535,29 @@ def compute_accessibility(
                  .reindex(index=zone_ids, columns=zone_ids)
                  .fillna(0).values.astype(np.float32))
 
-        # unit detection
-        nonzero = piv[piv > 0]
-        if len(nonzero):
-            median_val = float(np.median(nonzero))
-            if median_val > 600:
-                piv = piv / 60.0
-                logger.info(f"  '{col}': converted seconds → minutes (median was {median_val:.0f})")
-            elif median_val > 200:
-                piv = piv / 10.0
-                logger.info(f"  '{col}': converted tenths → minutes")
+        # units via sidecar (measured) — legacy value-guessing only for
+        # unmeasured matrices (it misclassifies genuine 200–600 values).
+        # Distance/count matrices skip conversion entirely (already km/counts).
+        _converted = False
+        if _is_time_matrix(col):
+            try:
+                from read_skims import to_minutes as _to_minutes
+                piv = np.asarray(_to_minutes(col, piv), dtype=np.float32)
+                _converted = True
+            except Exception:
+                pass
+        else:
+            _converted = True  # native units (km/counts) — nothing to convert
+        if not _converted:
+            nonzero = piv[piv > 0]
+            if len(nonzero):
+                median_val = float(np.median(nonzero))
+                if median_val > 600:
+                    piv = piv / 60.0
+                    logger.info(f"  '{col}': converted seconds → minutes (median was {median_val:.0f})")
+                elif median_val > 200:
+                    piv = piv / 10.0
+                    logger.info(f"  '{col}': converted tenths → minutes")
             print(f"  Skim '{col}': "
                   f"median={np.median(nonzero):.1f}  "
                   f"p95={float(np.percentile(nonzero,95)):.1f}  "
@@ -306,10 +569,35 @@ def compute_accessibility(
     results = {}
     for acc_name, entry in spec.items():
         att_cols   = entry['attractor_cols']
+        # Skip measures whose attractor columns are ALL absent (e.g. the
+        # *_power_acc pair when no power build exists) instead of emitting a
+        # degenerate all-zero column into the reports and GA pools.
+        if not any(c in lu.columns for c in att_cols):
+            logger.warning(f"  '{acc_name}': no attractor columns in landuse — skipped")
+            continue
         skim_col   = entry['skim_col']
         decay_type = entry['decay_type']
         b          = entry['decay_coeff']
         cap_tt     = entry.get('cap_tt', 999.0)
+        # Env-overridable decay / cap so the gravity decay coefficients (which
+        # were hand-set at 0.05-0.08) can be calibrated or swept instead of
+        # frozen -- ACC_DECAY_<acc_name> / ACC_CAP_<acc_name> (upper-cased), or
+        # the blanket ACC_DECAY_SCALE multiplier on every measure. An outer
+        # sweep/search varies these; a per-GA-eval gene is not used because
+        # accessibility is precomputed once rather than rebuilt per candidate.
+        import os as _os
+        try:
+            _ov = _os.environ.get('ACC_DECAY_' + acc_name.upper())
+            if _ov is not None:
+                b = float(_ov)
+            _scale = _os.environ.get('ACC_DECAY_SCALE')
+            if _scale is not None:
+                b = b * float(_scale)
+            _capov = _os.environ.get('ACC_CAP_' + acc_name.upper())
+            if _capov is not None:
+                cap_tt = float(_capov)
+        except (TypeError, ValueError):
+            pass
 
         # build attractor vector (n_dest,)
         attractor = np.zeros(n_zones, dtype=np.float32)
@@ -324,7 +612,15 @@ def compute_accessibility(
 
         attractor = np.maximum(attractor, 0.0)
 
-        tt_mat  = np.minimum(skim_matrices[skim_col].copy(), cap_tt)
+        tt_mat  = skim_matrices[skim_col].copy()
+        # For transit-type skims a 0 means "no path" (unreachable), which must map
+        # to WORST access — not the instant/best access that tt=0 would give under
+        # exp(-b·0)=1. Push those pairs to the cap before decaying. (Off-diagonal
+        # only: keep the intrazonal diagonal at 0 so a zone always accesses itself.)
+        if entry.get('zero_unreachable'):
+            _off = ~np.eye(tt_mat.shape[0], dtype=bool)
+            tt_mat[_off & (tt_mat <= 0)] = cap_tt
+        tt_mat  = np.minimum(tt_mat, cap_tt)
         weights = _decay(tt_mat, decay_type, b)
 
         # log1p of weighted sum — ActivitySim _accumulate_accessibility
@@ -368,6 +664,24 @@ def compute_accessibility(
     acc_df = pd.DataFrame(results, index=zone_ids)
     acc_df.index.name = 'zone_id'
 
+    # ── ActivitySim-style mode-choice LOGSUM accessibility ────────────────
+    # The gravity measures above use a single impedance per measure; the
+    # ActivitySim accessibility module instead computes, per purpose, the log
+    # of the destination-sum of exp(size + mode-choice logsum). See
+    # compute_logsum_accessibility() for the formulation. Failures here are
+    # non-fatal: the legacy measures remain in place.
+    try:
+        ls_df = compute_logsum_accessibility(landuse, skim_df, zone_ids=zone_ids)
+        for c in ls_df.columns:
+            results[c] = ls_df[c].values
+            v = ls_df[c].values
+            print(f"  {c:20s}: min={v.min():.3f}  mean={v.mean():.3f}  max={v.max():.3f}")
+        acc_df = pd.DataFrame(results, index=zone_ids)
+        acc_df.index.name = 'zone_id'
+    except Exception as _le:
+        logger.warning(f"asim logsum accessibility failed (non-fatal, "
+                       f"legacy gravity measures kept): {_le}")
+
     if save_path:
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
         acc_df.to_csv(save_path)
@@ -376,11 +690,228 @@ def compute_accessibility(
     return acc_df
 
 
+# =============================================================================
+# ACTIVITYSIM-STYLE MODE-CHOICE LOGSUM ACCESSIBILITY
+# =============================================================================
+# ActivitySim's accessibility module computes, for each origin zone i and
+# purpose p, the log of the destination-sum of exp(size term + mode-choice
+# logsum):
+#
+#     acc_p(i) = ln Σ_j exp( size_p(j) + ln Σ_m exp(V_m(i,j)) )
+#
+#   size_p(j) = exp(γ·log1p(attractor_p(j)))   (ActivitySim size-term
+#               convention: a destination with zero attractor keeps base
+#               presence e⁰ = 1, so the sum never collapses)
+#   V_m(i,j)  = ASC_m + β_m · time_m(i,j)      (systematic mode utility)
+#
+# This is the impedance ActivitySim feeds its CDAP and accessibility models —
+# richer than single-mode gravity because it captures MODE COMPETITION (a
+# destination reachable by fast transit OR car contributes one combined
+# utility, not two) and MODE AVAILABILITY (walk/bike only over their feasible
+# distances; transit only where service exists). All coefficients are
+# env-tunable so the measures can be re-calibrated without code changes.
+
+_LOGSUM_PURPOSE_SPEC = {
+    'work':     {'TOTEMP': 1.0, 'FPSEMPN': 0.15, 'HEREMPN': 0.10,
+                 'n_office': 1.0, 'com_floor_m2': 0.000001,
+                 'jobs_office_n': 0.5, 'jobs_office_m2': 0.0000005},
+    'edu':      {'Primary': 1.0, 'Secondary': 1.0, 'Education': 50.0,
+                 'HSENROLL': 0.5, 'n_education': 1.0},
+    'shop':     {'Shopping': 10.0, 'retail': 0.001, 'RETEMPN': 0.5,
+                 'n_retail': 3.0},
+    'nonmand':  {'EATOUT': 5.0, 'Entertainment': 3.0, 'Shopping': 3.0,
+                 'OTHERMAINTENANCE': 2.0, 'OTHERDISCRFacilities': 2.0,
+                 'Healthcare': 2.0, 'retail': 0.0005,
+                 'n_food': 2.0, 'n_recreation': 0.05, 'n_addresses': 0.002},
+    'social':   {'park': 0.001, 'recreation_ground': 0.00001,
+                 'Entertainment': 3.0, 'n_recreation': 0.05},
+    'eat':      {'EATOUT': 5.0, 'n_food': 2.0},
+}
+
+
+def _asim_beta(name: str, default: float) -> float:
+    return float(os.environ.get(f'ASIM_{name}', default))
+
+
+def compute_logsum_accessibility(landuse: pd.DataFrame,
+                                 skim_df: pd.DataFrame,
+                                 zone_ids: np.ndarray = None) -> pd.DataFrame:
+    """
+    ActivitySim-faithful accessibility: per purpose,
+        acc_p(i) = ln Σ_j exp( size_p(j) + ln Σ_m exp(V_m(i,j)) )
+    with size terms from landuse attractors and mode utilities from the
+    real skims (car AM time, transit IVT, walk/bike distances converted to
+    minutes at typical speeds). Returns a DataFrame indexed by zone with
+    one `asim_<purpose>_acc` logsum column per purpose.
+    """
+    lu = enrich_landuse(landuse)
+    lu = _merge_overture_attractors(lu)
+    lu_col = 'ORDER' if 'ORDER' in lu.columns else lu.index.name
+    if lu_col in lu.columns:
+        lu = lu.set_index(lu_col)
+    if zone_ids is None:
+        zone_ids = np.sort(lu.index.astype(int).values)
+    zone_ids = np.asarray(zone_ids, dtype=int)
+    n = len(zone_ids)
+    lu = lu.reindex(zone_ids)
+
+    # ── skim zone-key crosswalk ───────────────────────────────────────────
+    # ORDER is positional (1..371) in the synthetic 371-zone build while the
+    # skims are keyed by the real zone code (SA2_MAIN16).  Filtering/pivoting
+    # skims on ORDER silently produced an empty skim subset -> every mode
+    # utility fell to the -700 sentinel and asim_*_acc came out ~= -694 for
+    # all zones (observed 16/10 in the safety + predict runs).  Map through
+    # SA2_MAIN16 when present; legacy builds where ORDER already carries the
+    # zone code keep working because SA2_MAIN16 is absent there.
+    if 'SA2_MAIN16' in lu.columns:
+        _codes = pd.to_numeric(lu['SA2_MAIN16'], errors='coerce')
+        zone_codes = _codes.fillna(pd.Series(zone_ids, index=lu.index)).astype(int).values
+    else:
+        zone_codes = zone_ids
+
+    # ── skim matrices (minutes) ───────────────────────────────────────────
+    sk = skim_df.copy()
+    sk['OTAZ'] = sk['OTAZ'].astype(int)
+    sk['DTAZ'] = sk['DTAZ'].astype(int)
+    sk = sk[sk['OTAZ'].isin(set(zone_codes)) & sk['DTAZ'].isin(set(zone_codes))]
+    if len(sk) == 0:
+        raise RuntimeError(
+            "Accessibility skims have no OTAZ/DTAZ in the landuse zone-code "
+            f"space (landuse codes e.g. {list(zone_codes[:3])}; skim OTAZ e.g. "
+            f"{sorted(set(skim_df['OTAZ'].astype(int)))[:3]}) — zone systems "
+            "are misaligned (ORDER vs SA2_MAIN16 vs skim OTAZ).")
+
+    try:
+        from read_skims import to_minutes as _to_minutes
+    except Exception:
+        _to_minutes = None
+
+    def _pivot(col):
+        if col not in sk.columns:
+            return None
+        piv = (sk.pivot_table(index='OTAZ', columns='DTAZ', values=col,
+                              aggfunc='first')
+                 .reindex(index=zone_codes, columns=zone_codes))
+        piv = piv.apply(pd.to_numeric, errors='coerce')
+        if _to_minutes is not None and _is_time_matrix(col):
+            # minutes via unit sidecar (measured); legacy guess only unknown.
+            # Distance/count matrices bypass conversion (native km/counts).
+            # _to_minutes returns a bare ndarray — re-wrap as DataFrame so
+            # downstream _util / walk_km.values / bike_km.values keep
+            # working. Without this, ANY sidecar-covered skim (always the
+            # car skim in production) crashes _util with
+            # "'numpy.ndarray' has no attribute 'values'", the outer
+            # try/except in compute_accessibility() swallows it, and NO
+            # asim_*_acc column is ever built (silent total loss of the
+            # logsum accessibility layer).
+            try:
+                conv = _to_minutes(col, piv.values)
+                return pd.DataFrame(np.asarray(conv, dtype=float),
+                                    index=piv.index, columns=piv.columns)
+            except Exception:
+                pass
+        nz = piv.values[piv.values > 0]
+        if len(nz):                       # unit normalisation (s → min)
+            med = float(np.median(nz))
+            if med > 600:
+                piv = piv / 60.0
+            elif med > 200:
+                piv = piv / 10.0
+        return piv
+
+    car_t = _pivot('SOVTOLL_TIME__AM')
+    if car_t is None:
+        car_t = _pivot('SOVTIME__AM')
+    trn_t = _pivot('WLK_LOC_WLK_TOTIVT__AM')
+    walk_km = _pivot('DISTWALK')
+    bike_km = _pivot('DISTBIKE')
+
+    b_car = _asim_beta('BETA_TIME_CAR', -0.035)
+    b_trn = _asim_beta('BETA_TIME_TRANSIT', -0.045)
+    b_wlk = _asim_beta('BETA_TIME_WALK', -0.060)
+    b_bik = _asim_beta('BETA_TIME_BIKE', -0.045)
+    asc_car = _asim_beta('ASC_CAR', 0.0)
+    asc_trn = _asim_beta('ASC_TRANSIT', -0.8)
+    asc_wlk = _asim_beta('ASC_WALK', -0.2)
+    asc_bik = _asim_beta('ASC_BIKE', -0.4)
+    walk_max_km = _asim_beta('WALK_MAX_KM', 5.0)
+    bike_max_km = _asim_beta('BIKE_MAX_KM', 15.0)
+    gamma = _asim_beta('SIZE_GAMMA', 0.1)
+    neg_big = -700.0                     # exp(-700) underflows to 0 cleanly
+
+    # ── mode utilities (n × n), NaN-safe ──────────────────────────────────
+    def _util(mat, beta, asc, unavailable=None):
+        if mat is None:
+            return None
+        v = mat.values.astype(float).copy()
+        v[v <= 0] = np.nan               # 0 = unreachable for time skims
+        u = asc + beta * v
+        if unavailable is not None:
+            u[unavailable] = neg_big
+        u[~np.isfinite(u)] = neg_big
+        return u
+
+    modes = []
+    if car_t is not None:
+        modes.append(_util(car_t, b_car, asc_car))
+    if trn_t is not None:
+        off = ~np.eye(n, dtype=bool)
+        u = _util(trn_t, b_trn, asc_trn)
+        u[off & (u <= neg_big + 1)] = neg_big     # explicit no-service
+        modes.append(u)
+    if walk_km is not None:
+        km = walk_km.values.astype(float)
+        km[km <= 0] = np.nan
+        mins = km / 4.8 * 60.0                    # 4.8 km/h walk speed
+        u = asc_wlk + b_wlk * mins
+        u[np.isnan(mins) | (km > walk_max_km)] = neg_big
+        modes.append(u)
+    if bike_km is not None:
+        km = bike_km.values.astype(float)
+        km[km <= 0] = np.nan
+        mins = km / 14.0 * 60.0                   # 14 km/h bike speed
+        u = asc_bik + b_bik * mins
+        u[np.isnan(mins) | (km > bike_max_km)] = neg_big
+        modes.append(u)
+    if not modes:
+        raise RuntimeError('no mode skims available for logsum accessibility')
+    for _u, _lbl in zip(modes, ('car', 'transit', 'walk', 'bike')[:len(modes)]):
+        _fin = _u[np.isfinite(_u) & (_u > neg_big + 1)]
+        logger.info(f"[asim] mode {_lbl:8s}: available={int(len(_fin))} "
+                    f"util min={_fin.min() if len(_fin) else float('nan'):.2f} "
+                    f"max={_fin.max() if len(_fin) else float('nan'):.2f}")
+
+    def _logsumexp(a, axis=0):
+        m = np.max(a, axis=axis)
+        m = np.where(np.isfinite(m), m, -700.0)
+        shifted = a - np.expand_dims(m, axis)
+        return m + np.log(np.clip(np.exp(shifted), 0, None).sum(axis=axis))
+
+    mode_stack = np.stack(modes, axis=0)          # (M, n, n)
+    mode_logsum = _logsumexp(mode_stack, axis=0)  # ln Σ_m exp(V_m)  (n, n)
+
+    # ── per-purpose accessibility ─────────────────────────────────────────
+    out = {}
+    for purpose, att in _LOGSUM_PURPOSE_SPEC.items():
+        attractor = np.zeros(n, dtype=float)
+        for col, w in att.items():
+            if col in lu.columns:
+                attractor += w * pd.to_numeric(lu[col], errors='coerce') \
+                    .fillna(0).clip(lower=0).values
+        size = np.exp(gamma * np.log1p(np.maximum(attractor, 0.0)))  # base 1
+        # acc_i = ln Σ_j exp(size_j + mode_logsum_ij)
+        acc = _logsumexp(size[None, :] + mode_logsum, axis=1)
+        out[f'asim_{purpose}_acc'] = acc
+
+    df = pd.DataFrame(out, index=zone_ids)
+    df.index.name = 'zone_id'
+    return df
+
+
 def attach_to_landuse(landuse: pd.DataFrame,
                       acc_df: pd.DataFrame) -> pd.DataFrame:
     """Merge accessibility measures into the landuse DataFrame."""
     lu = enrich_landuse(landuse)  # also add TOTEMP etc.
-
     lu_col = 'ORDER' if 'ORDER' in lu.columns else None
     if lu_col:
         lu = lu.merge(
@@ -408,8 +939,20 @@ _ACC_LANDUSE_PAIRS = [
     ('walk_acc',        'retail',     'retail landuse area'),
     ('bike_acc',        'TOTEMP',     'total employment'),
     ('transit_acc',     'TOTEMP',     'total employment'),
-    ('recreation_acc',  'park',       'park landuse area'),
+    # NOTE (2026-09): the SEQ landuse extract leaves the `park` / `sport` /
+    # `trees` categories essentially unpopulated (327/329 zones are exactly 0;
+    # verified in SEQ_SA2_2016_landuse_area.csv AND zone_order_and_landuse.csv,
+    # which agree). Open space in this build lives in `recreation_ground`.
+    # Pair recreation_acc against the populated column — plotting against
+    # `park` produced a degenerate all-zero panel whose auto-annotation then
+    # misdiagnosed a data gap as peripheral concentration (job s5check).
+    ('recreation_acc',  'recreation_ground', 'recreation-ground area'),
     ('auto_nonmand_acc', 'TOTPOP',    'population'),
+    # ActivitySim-style mode-choice logsum measures
+    ('asim_work_acc',    'TOTEMP',    'work logsum vs employment'),
+    ('asim_edu_acc',     'Education', 'edu logsum vs education'),
+    ('asim_shop_acc',    'Shopping',  'shop logsum vs shopping attractors'),
+    ('asim_nonmand_acc', 'TOTPOP',    'nonmand logsum vs population'),
 ]
 
 
@@ -460,6 +1003,15 @@ def plot_accessibility(landuse_enriched: pd.DataFrame,
         print(f"[Accessibility] plot → {p1}")
 
         # ── 2. accessibility vs landuse attractors ───────────────────────
+        # Area-like attractors are plotted as DENSITY (attractor / zone area):
+        # raw areas let large peripheral zones dominate and can flip r negative
+        # even when the measure is healthy. Accessibility aggregates OTHER
+        # zones' attractors with distance decay, so a negative own-zone r is
+        # plausible for peripheral attractors (e.g. parks) — annotated on the
+        # panel rather than treated as an error.
+        _area_col = next((c for c in ('sa2_area_sqkm', 'sa2_area', 'area_sqkm')
+                          if c in landuse_enriched.columns), None)
+        from scipy.stats import spearmanr as _spearman
         pairs = [(a, lc, lbl) for a, lc, lbl in _ACC_LANDUSE_PAIRS
                  if a in landuse_enriched.columns and lc in landuse_enriched.columns]
         if pairs:
@@ -472,12 +1024,51 @@ def plot_accessibility(landuse_enriched: pd.DataFrame,
                 x = pd.to_numeric(landuse_enriched[lc], errors='coerce')
                 y = pd.to_numeric(landuse_enriched[a], errors='coerce')
                 ok = x.notna() & y.notna()
-                r = float(np.corrcoef(np.log1p(x[ok].clip(lower=0)), y[ok])[0, 1]) if ok.sum() > 2 else float('nan')
-                axes[i].scatter(np.log1p(x[ok].clip(lower=0)), y[ok],
-                                s=12, alpha=0.55, color='#1C7293')
-                axes[i].set_xlabel(f'log1p({lc})', fontsize=8)
+                if _area_col is not None:
+                    area = pd.to_numeric(landuse_enriched[_area_col],
+                                         errors='coerce')
+                    # Zones with missing/non-positive area cannot form a
+                    # density (the old fillna(1.0) silently inflated them —
+                    # e.g. 60/371 zones lack sa2_area in zone_landuse_357.csv).
+                    # Exclude them from density panels instead.
+                    _ok_area = (area.reindex(x.index).notna()
+                                & (area.reindex(x.index) > 0))
+                    _n_drop = int((ok & ~_ok_area).sum())
+                    if _n_drop:
+                        print(f"[Accessibility] panel {a} vs {lc}: dropping "
+                              f"{_n_drop} zone(s) with missing/non-positive "
+                              f"'{_area_col}' (density undefined)")
+                    ok = ok & _ok_area
+                    x = x / area.reindex(x.index).clip(lower=1e-6)
+                    xlabel = f'{lc} density (per km², log1p)'
+                else:
+                    xlabel = f'log1p({lc})'
+                x = np.log1p(x.clip(lower=0))
+                r = float(np.corrcoef(x[ok], y[ok])[0, 1]) if ok.sum() > 2 else float('nan')
+                rs = float(_spearman(x[ok], y[ok])[0]) if ok.sum() > 2 else float('nan')
+                axes[i].scatter(x[ok], y[ok], s=12, alpha=0.55, color='#1C7293')
+                axes[i].set_xlabel(xlabel, fontsize=8)
                 axes[i].set_ylabel(a, fontsize=8)
-                axes[i].set_title(f'{a} vs {lbl}\nr = {r:.2f}', fontsize=9)
+                note = ''
+                # Degenerate attractor guard: a column that is ~all zeros
+                # (e.g. `park`/`sport` in the SEQ extract — 327/329 zeros) is a
+                # LANDUSE DATA gap, not peripheral concentration. Flag it
+                # plainly instead of the neg-r story below, whose r is
+                # meaningless on a near-constant x.
+                _x_raw = pd.to_numeric(landuse_enriched[lc],
+                                       errors='coerce')[ok]
+                _n_nz = int(((_x_raw.fillna(0)) > 0).sum())
+                _n_ok = int(ok.sum())
+                if _n_ok > 0 and (_n_nz < 3 or _n_nz / _n_ok < 0.10):
+                    note = (f'\nDEGENERATE attractor: {_n_nz}/{_n_ok} zones '
+                            f'non-zero — check the landuse build; r is '
+                            f'meaningless here')
+                elif np.isfinite(r) and r < 0:
+                    note = ('\nneg r: attractor concentrated in peripheral, '
+                            'low-accessibility zones;\naccessibility aggregates '
+                            "NEIGHBOURS' attractors (distance decay)")
+                axes[i].set_title(f'{a} vs {lbl}\n'
+                                  f'r={r:.2f}  ρ={rs:.2f}{note}', fontsize=8)
                 axes[i].grid(alpha=0.3)
             for j in range(len(pairs), len(axes)):
                 axes[j].set_visible(False)
@@ -519,7 +1110,7 @@ def run_accessibility(
             "above. If it mentions the 'lzf' filter, generate the readable "
             "conversion first:  cd ../demand_ && "
             "python 11_convert_skims_to_openmatrix.py  "
-            "(writes sa2_skims_507_omxspec.omx, which pipeline_logger "
+            "(writes skims_371.omx, which pipeline_logger "
             "prefers automatically)."
         )
 

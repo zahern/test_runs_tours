@@ -1,0 +1,57 @@
+#!/bin/bash -l
+#PBS -N skim_keyspace_probe
+#PBS -l walltime=00:05:00
+#PBS -l select=1:ncpus=1:mem=8GB
+#PBS -m n
+#PBS -r y
+#PBS -j oe
+
+# Diagnostic: what keyspace does skims_371.omx use (ORDER ints vs SA2 codes)?
+# Runs on a COMPUTE node. Read-only.
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV:-zigenv}"
+module unload Anaconda3
+
+SKIMS="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+echo "skims: ${SKIMS}  host: $(hostname)"
+
+python - "$SKIMS" <<'PYEOF'
+import sys
+import numpy as np
+import openmatrix as omx
+
+path = sys.argv[1]
+om = omx.open_file(path, "r")
+try:
+    mats = om.listMatrices()
+    print("n_matrices:", len(mats))
+    print("has SOVTOLL_TIME__AM:", "SOVTOLL_TIME__AM" in mats)
+    print("has WLK_LOC_WLK_TOTIVT__AM:", "WLK_LOC_WLK_TOTIVT__AM" in mats)
+    print("has DISTWALK:", "DISTWALK" in mats, "| DISTBIKE:", "DISTBIKE" in mats)
+    try:
+        ident = list(om.listIdentifiers())
+        print("n_identifiers:", len(ident))
+        print("identifier sample:", ident[:6])
+        kinds = set(type(x).__name__ for x in ident)
+        print("identifier types:", kinds)
+        big = sum(1 for x in ident if int(x) > 10000)
+        print("identifiers > 10000 (SA2-like):", big, "of", len(ident))
+    except Exception as e:
+        print("listIdentifiers failed:", type(e).__name__, e)
+    m = np.asarray(om["SOVTOLL_TIME__AM"])
+    print("SOVTOLL_TIME__AM shape:", m.shape, "min/max:", float(np.nanmin(m)), float(np.nanmax(m)))
+    # Can a SA2-like code index this array?
+    probe = [x for x in ident if int(x) > 10000][:1] if 'ident' in dir() else []
+    if probe:
+        try:
+            print("index by code", probe[0], "->", m[int(probe[0]), :3])
+        except Exception as e:
+            print("index by SA2 code FAILS:", type(e).__name__, e)
+finally:
+    om.close()
+print("PROBE DONE")
+PYEOF

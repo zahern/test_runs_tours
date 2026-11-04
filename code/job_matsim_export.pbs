@@ -1,0 +1,60 @@
+#!/bin/bash -l
+#PBS -N matsim_export
+#PBS -P FPAXJW8067
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -j oe
+#PBS -m n
+
+# ============================================================
+# job_matsim_export.pbs
+# Export the current synthetic population's activity plans to a
+# MATSim scenario (plans.xml, facilities.xml, config.xml, manifest).
+#
+#   qsub -v "RUN_TAG=qld_shard2" job_matsim_export.pbs
+#   qsub -v "EXPORT_SRC=runs/full_pipeline_dta_tested" job_matsim_export.pbs
+#
+# Source resolution order when EXPORT_SRC is unset:
+#   runs/ga_parallel/<TAG>_predict  ->  runs/<TAG>_predict
+#   ->  runs/ga_parallel/<TAG>  ->  runs/full_pipeline_dta_tested
+# ============================================================
+cd $PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+RUN_TAG=${RUN_TAG:-}
+EXPORT_SRC=${EXPORT_SRC:-}
+PIPELINE_RUN_ROOT=${PIPELINE_RUN_ROOT:-runs}
+
+_has_plans () {
+    [ -f "$1/trips_for_aimsun.csv" ] || [ -f "$1/stage6_output.csv" ]
+}
+
+if [ -z "$EXPORT_SRC" ] && [ -n "$RUN_TAG" ]; then
+    for cand in \
+        "${PIPELINE_RUN_ROOT}/ga_parallel/${RUN_TAG}_predict" \
+        "${PIPELINE_RUN_ROOT}/${RUN_TAG}_predict" \
+        "${PIPELINE_RUN_ROOT}/ga_parallel/${RUN_TAG}" \
+        "${PIPELINE_RUN_ROOT}/${RUN_TAG}"; do
+        if _has_plans "$cand"; then EXPORT_SRC="$cand"; break; fi
+    done
+fi
+if [ -z "$EXPORT_SRC" ]; then
+    EXPORT_SRC="${PIPELINE_RUN_ROOT}/full_pipeline_dta_tested"
+fi
+
+echo "[$(date)] MATSim export source: $EXPORT_SRC"
+if ! _has_plans "$EXPORT_SRC"; then
+    echo "FATAL: no trips_for_aimsun.csv / stage6_output.csv under $EXPORT_SRC"
+    exit 3
+fi
+
+mkdir -p "$EXPORT_SRC/matsim"
+python -u matsim_export.py \
+    --run-dir "$EXPORT_SRC" \
+    --out "$EXPORT_SRC/matsim" \
+    --crs EPSG:28356
+echo "[$(date)] matsim_export exit=$?"
+ls -la "$EXPORT_SRC/matsim"

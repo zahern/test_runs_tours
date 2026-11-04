@@ -1,0 +1,81 @@
+#!/bin/bash -l
+#PBS -N suncorp_concept_holdout
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Job 6: Conceptual forward model + event-based hold-out validation
+#   23_conceptual_forecast.py  -> future-event risk prediction (Sec. concept)
+#   24_holdout_validation.py   -> LOEO + prospective hold-out (Sec. holdout)
+# Depends on Job 4 (eb_timewise_segment_phase.csv).
+# ══════════════════════════════════════════════════════════════════════════════
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results
+FIG_DIR=$PROJ_DIR/figures
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+for pkg in statsmodels scipy matplotlib pandas numpy; do
+    python -c "import ${pkg%%-*}" 2>/dev/null || pip install --upgrade $pkg
+done
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export JAX_PLATFORMS=cpu
+
+cd "$SCRIPT_DIR"
+
+echo "════════════════════════════════════════════════════════════════════════════"
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "════════════════════════════════════════════════════════════════════════════"
+
+if [ ! -f "$RESULTS_DIR/eb_timewise_segment_phase.csv" ]; then
+    echo "ERROR: eb_timewise_segment_phase.csv missing (run 04_eb_timewise.pbs first)"
+    exit 1
+fi
+
+sed -i "s|^PROJ = .*|PROJ = \"$PROJ_DIR\"|g" 23_conceptual_forecast.py
+sed -i "s|^PROJ = .*|PROJ = \"$PROJ_DIR\"|g" 24_holdout_validation.py
+
+echo ""
+echo "Running 23_conceptual_forecast.py..."
+python -u 23_conceptual_forecast.py 2>&1
+EXIT_CODE=$?
+
+echo ""
+echo "Running 24_holdout_validation.py..."
+python -u 24_holdout_validation.py 2>&1
+if [ $? -ne 0 ]; then EXIT_CODE=$?; fi
+
+echo ""
+echo "Checking outputs..."
+OUTPUTS_OK=0
+for f in conceptual_forecast.tex holdout_validation.tex; do
+    if [ -f "$RESULTS_DIR/$f" ]; then
+        echo "  OK $f"
+        OUTPUTS_OK=$((OUTPUTS_OK + 1))
+    fi
+done
+
+if [ $OUTPUTS_OK -eq 2 ]; then
+    echo "All conceptual/hold-out outputs created!"
+else
+    echo "Some outputs missing ($OUTPUTS_OK/2)"
+    EXIT_CODE=1
+fi
+
+echo "════════════════════════════════════════════════════════════════════════════"
+echo "Job finished at $(date) — exit_code=$EXIT_CODE"
+echo "════════════════════════════════════════════════════════════════════════════"
+exit $EXIT_CODE

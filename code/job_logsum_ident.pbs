@@ -1,0 +1,47 @@
+#!/bin/bash -l
+#PBS -N logsum_ident
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=4:mem=48GB
+#PBS -m n
+#PBS -r y
+
+# ─────────────────────────────────────────────────────────────────────────────
+# job_logsum_ident.pbs
+# Settle whether arm B's c_logsum = 3.6e-16 is a genuine zero or an
+# unidentified direction, on the real work-segment destination frame.
+# Rebuilds the frame exactly as job_stage5_paper_arms.pbs does (same cache,
+# skims, segment and utility spec), then measures within-case variation, the
+# score/information at beta=0, a profile likelihood in c_logsum with the other
+# four coefficients refit at each fixed value, and the cost of dropping it.
+# The raw (pre-orthogonalization) mode logsum is profiled too, which says
+# whether _dest_tree's logsum-perp-distance step is what removed the signal.
+#
+# OUTPUT runs/_s5_logsum_diag/<PBS_JOBID or DIAG_OUT>: logsum_ident.json,
+#        work_dest_frame.parquet (reused by follow-up checks), job.out
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV:-zigenv}"
+module unload Anaconda3
+
+export NEW_POP=1 NEW_POP_MAPPED=0
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+export JAX_PLATFORMS=cpu
+export CUDA_VISIBLE_DEVICES=""
+
+if [[ -z "${SEARCHLIBRIUM_SRC:-}" && -f "${PBS_O_WORKDIR}/_patches/SearchLibrium/mh_choice_estimator.py" ]]; then
+  export SEARCHLIBRIUM_SRC="${PBS_O_WORKDIR}/_patches"
+fi
+
+STAMP="$(date -u +%Y%m%d_%H%M%S)_${PBS_JOBID:-local}"
+export DIAG_OUT="${DIAG_OUT:-runs/_s5_logsum_diag/${STAMP}}"
+mkdir -p "${DIAG_OUT}"
+
+echo "logsum identification -> ${DIAG_OUT}"
+python _diag_logsum_ident.py 2>&1 | tee "${DIAG_OUT}/job.out"
+echo "Finished: $(date) exit_code=${PIPESTATUS[0]}" | tee -a "${DIAG_OUT}/job.out"

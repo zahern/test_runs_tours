@@ -4,7 +4,7 @@ run_accessibility_371.py
 Standalone driver to recompute zone-level accessibility over the 371-zone SA2
 system, matching the 371 population/land use.
 
-ZONE MIGRATION (371): the 507 skims (sa2_skims_507_omxspec.omx) are keyed by
+ZONE MIGRATION (371): the 507 skims (skims_371.omx) are keyed by
 SA2 code, so accessibility runs in SA2-code space — land use zone ids must be
 SA2 codes too. This driver loads the 371 land use (09b_build_landuse_357.py
 output, keyed by SA2_MAIN16) and exposes SA2_MAIN16 as the `ORDER` column that
@@ -22,7 +22,7 @@ skim to pick up the real active-mode distances.
 Run (in zigenv; no internet needed):
   python run_accessibility_371.py \
       [--landuse ../new_pop/saved_data/zone_landuse_357.csv] \
-      [--skims ../demand_/sa2_skims_507_omxspec.omx] \
+      [--skims ../demand_/skims_371.omx] \
       [--out saved_data/accessibility_371.csv]
 """
 import argparse
@@ -36,7 +36,7 @@ DEMAND = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)
 NEWPOP = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                        '..', 'new_pop'))
 DEFAULT_LANDUSE = os.path.join(NEWPOP, 'saved_data', 'zone_landuse_357.csv')
-DEFAULT_SKIMS = os.path.join(DEMAND, 'sa2_skims_507_omxspec.omx')
+DEFAULT_SKIMS = os.path.join(DEMAND, 'skims_371.omx')
 DEFAULT_OUT = 'saved_data/accessibility_371.csv'
 
 

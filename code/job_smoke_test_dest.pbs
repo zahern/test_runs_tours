@@ -1,0 +1,21 @@
+#!/bin/bash -l
+# Quick destination-model smoke tests (Larch + overspecification detection).
+#   qsub job_smoke_test_dest.pbs   → smoke_test_dest.o<jobid>
+#PBS -N smoke_dest
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=2:mem=16GB
+#PBS -l walltime=00:30:00
+
+set -euo pipefail
+CONDA_ENV=${CONDA_ENV:-zigenv}
+cd "$PBS_O_WORKDIR"
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8 JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+
+echo "=== destination model smoke tests ==="
+python -u smoke_test_dest.py
+echo "exit code: $?"

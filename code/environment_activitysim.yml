@@ -1,0 +1,24 @@
+# ActivitySim BENCHMARK environment (isolated).
+#
+# Purpose: run the standard ActivitySim example models so their estimation
+# results can be compared against the QLD pipeline. Deliberately minimal — no
+# extras beyond what ActivitySim itself needs to run and estimate. It lives in
+# its OWN environment because ActivitySim pins its own numpy / numba / pandas /
+# pytables versions that conflict with the QLD estimation stack (jax 0.11 +
+# larch 6 + numba 0.62), which is exactly why two environments are needed.
+#
+# ActivitySim (conda-forge) pulls its full, self-consistent dependency set
+# (numpy, numba, pandas, pytables, openmatrix, pyarrow, larch for estimation
+# mode, ...). Pinning only python keeps the solve on ActivitySim's own tested
+# combination rather than forcing versions that fight it.
+#
+# Build (fresh, on the HPC):
+#   module load Anaconda3/2024.02-1
+#   conda env create -f environment_activitysim.yml -n asimbench
+name: asimbench
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - activitysim
+  - pip

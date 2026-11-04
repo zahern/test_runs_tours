@@ -1,0 +1,33 @@
+#!/bin/bash -l
+# Standalone HHTS validation for a run tag (obs-vs-pred plots, all stages).
+#
+#   qsub -q cpu_inter -l select=1:ncpus=2:mem=16gb -l walltime=06:00:00 \
+#        -v RUN_TAG=ga371_20260912r2,CONDA_ENV=zigenv job_validate_tag.pbs
+#   # or chained after a search job:
+#   qsub -W depend=afterok:<stage4-jobid> -q cpu_inter ... job_validate_tag.pbs
+#
+#PBS -N validate_tag
+#PBS -l select=1:ncpus=2:mem=16gb
+#PBS -l walltime=06:00:00
+#PBS -j oe
+#PBS -m n
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+RUN_TAG=${RUN_TAG:-ga371_20260912r2}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+RUN_TAG="$RUN_TAG" python -u run_tag_validation.py 2>&1
+echo "=== Done (exit_code=$?) ==="

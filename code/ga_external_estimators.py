@@ -447,8 +447,15 @@ except Exception as exc:
 
 
 def ga_estimator() -> str:
-    """Read GA_ESTIMATOR env var; default to 'default'."""
+    """Read GA_ESTIMATOR env var; default to 'default'.
+
+    'metacount_mv' selects the Stage-1 MULTIVARIATE activity-count model
+    (handled in pipeline_logger.ga_stage1); the per-segment GA feature SEARCH
+    itself uses the default univariate estimators, so it maps to 'default' here.
+    """
     v = os.environ.get('GA_ESTIMATOR', 'default').strip().lower()
+    if v == 'metacount_mv':
+        return 'default'
     if v not in ('default', 'metacount', 'searchlibrium', 'both', 'hybrid', 'sa_bandit'):
         logger.warning(f"Unknown GA_ESTIMATOR='{v}'; using 'default'")
         return 'default'
@@ -460,8 +467,14 @@ def ga_estimator() -> str:
 # ---------------------------------------------------------------------------
 
 def _bic_per_obs(log_lik: float, k: int, n: int) -> float:
-    """–BIC/n  (higher = better, matches ga_hypothesis_testing convention)."""
-    bic = -2.0 * log_lik + k * np.log(max(n, 2))
+    """–BIC/n  (higher = better, matches ga_hypothesis_testing convention).
+
+    The k·ln(n) complexity term is scaled by GA_COMPLEXITY_PENALTY (default 1.0
+    = standard BIC) exactly like the OLS path in _ols_bic, so the MNL stages
+    (stage-5 mode/dest) can be loosened below full-BIC parsimony. Values <1 keep
+    more behavioural coefficients; e.g. 0.4 ≈ between AIC and BIC at large n.
+    """
+    bic = -2.0 * log_lik + _GA_COMPLEXITY_PENALTY * k * np.log(max(n, 2))
     return -bic / max(n, 1)
 
 
@@ -477,6 +490,16 @@ def _bic_per_obs(log_lik: float, k: int, n: int) -> float:
 
 _FEATURE_WEAKNESS: Dict[str, float] = {}
 _WEAKNESS_DECAY = 0.95   # multiply all scores by this on each update call
+
+# Track cumulative stuck/at-bound/dropped occurrence count per feature.
+# When a feature reaches _MAX_STUCK_BEFORE_BLACKLIST, the bandit permanently
+# stops proposing it for the remainder of this stage.
+_STUCK_BLACKLIST: Dict[str, int] = {}
+_MAX_STUCK_BEFORE_BLACKLIST = 5
+
+# Higher penalty for stuck/dropped features so weakness accumulates faster
+# and the bandit's Beta posteriors move more aggressively away from them.
+_STUCK_PENALTY = 10.0  # was 5.0
 
 
 def _update_feature_weakness(
@@ -497,7 +520,8 @@ def _update_feature_weakness(
     evidence of a bad specification than mere insignificance, since it means
     the optimizer found no usable gradient at all for that term.
 
-    Stuck/at-bound → score += 5.0
+    Stuck/at-bound → score += 10.0  (and increments blacklist counter;
+                    after 5 occurrences the feature is permanently excluded)
     Weak (near-zero or insignificant), not stuck → score += 2.0
     Strong (none of the above) → score -= 0.5, clamped at 0
 
@@ -543,7 +567,8 @@ def _update_feature_weakness(
         insig      = np.isfinite(p) and p > p_thresh
         current    = _FEATURE_WEAKNESS.get(var, 0.0)
         if stuck:
-            _FEATURE_WEAKNESS[var] = current + 5.0
+            _FEATURE_WEAKNESS[var] = current + _STUCK_PENALTY
+            _STUCK_BLACKLIST[var] = _STUCK_BLACKLIST.get(var, 0) + 1
         elif near_zero or insig:
             _FEATURE_WEAKNESS[var] = current + 2.0
         else:
@@ -555,22 +580,39 @@ def get_feature_weakness() -> Dict[str, float]:
     return dict(_FEATURE_WEAKNESS)
 
 
+def get_stuck_blacklist() -> Dict[str, int]:
+    """Return a snapshot of features permanently blacklisted after repeated stuck/at-bound occurrences."""
+    return {k: v for k, v in _STUCK_BLACKLIST.items() if v >= _MAX_STUCK_BEFORE_BLACKLIST}
+
+
+def is_feature_blacklisted(name: str) -> bool:
+    """Check whether a feature has been permanently blacklisted for this stage."""
+    return _STUCK_BLACKLIST.get(name, 0) >= _MAX_STUCK_BEFORE_BLACKLIST
+
+
 def reset_feature_weakness() -> None:
-    """Clear weakness scores at the start of a new search stage."""
+    """Clear weakness scores and blacklist at the start of a new search stage."""
     _FEATURE_WEAKNESS.clear()
+    _STUCK_BLACKLIST.clear()
 
 
 def _metacount_significance_penalty(rows: list) -> float:
     """
-    BIC penalty for parameters that are near-zero or statistically insignificant.
+    BIC penalty for parameters that are near-zero, statistically insignificant,
+    or UNIDENTIFIED (no usable standard error).
 
-    A parameter is penalised if EITHER:
+    A parameter counts as weak if ANY of:
+      - it is stuck / at a bound (optimizer found no usable gradient), OR
+      - it is UNIDENTIFIED — it has a coefficient value but its standard error is
+        NaN / inf / non-positive (singular Hessian, perfect collinearity), which
+        also makes its p-value NaN. This is the worst case: the term inflates the
+        model with a coefficient the data cannot actually pin down, so it must be
+        penalised, not ignored (previously such rows slipped through because
+        `p > thresh` is False when p is NaN), OR
       - |coef_value| < GA_SIG_COEF_ZERO  (default 0.01)  — effectively zero, OR
-      - p_value > GA_SIG_PVAL_THRESH     (default 0.10)  — not significant at 10%
+      - p_value > GA_SIG_PVAL_THRESH     (default 0.10)  — not significant at 10%.
 
-    Penalty = GA_SIG_PENALTY_WEIGHT * (n_weak / n_tested)
-
-    Both env vars are tunable without code changes.
+    Penalty = GA_SIG_PENALTY_WEIGHT * (n_weak / n_tested). Env-tunable.
     """
     if not rows:
         return 0.0
@@ -578,20 +620,37 @@ def _metacount_significance_penalty(rows: list) -> float:
     coef_zero = float(os.environ.get('GA_SIG_COEF_ZERO',      '0.01'))
     p_thresh  = float(os.environ.get('GA_SIG_PVAL_THRESH',    '0.10'))
 
+    def _f(r, *keys):
+        for k in keys:
+            if k in r:
+                try:
+                    return float(r.get(k))
+                except Exception:
+                    return np.nan
+        return np.nan
+
     tested = 0
     n_weak = 0
     for r in rows:
-        try:
-            v = float(r.get('value', np.nan))
-        except Exception:
-            v = np.nan
-        try:
-            p = float(r.get('p_value', np.nan))
-        except Exception:
-            p = np.nan
-        if not np.isfinite(v) and not np.isfinite(p):
+        v  = _f(r, 'value', 'coef', 'estimate')
+        p  = _f(r, 'p_value', 'pval', 'p')
+        se = _f(r, 'std_err', 'stderr', 'se')
+        # Holdfast / structural rows carry no value AND no inference — skip them.
+        if not np.isfinite(v) and not np.isfinite(p) and not np.isfinite(se):
             continue
         tested += 1
+        # Stuck/at-bound: pinned at start value or a bound → zero usable gradient.
+        if r.get('stuck') or r.get('at_bound'):
+            n_weak += 1
+            continue
+        # Unidentified: has a value but no valid standard error → NaN/inf/<=0 SE,
+        # or a value with a NaN p-value (same root cause: SE couldn't be formed).
+        unidentified = np.isfinite(v) and (
+            (not np.isfinite(se)) or se <= 0.0 or (not np.isfinite(p))
+        )
+        if unidentified:
+            n_weak += 1
+            continue
         near_zero = np.isfinite(v) and abs(v) < coef_zero
         insig     = np.isfinite(p) and p > p_thresh
         if near_zero or insig:
@@ -1449,12 +1508,20 @@ def stage1_fitness_metacount(
 _GA_COMPLEXITY_PENALTY = max(0.0, float(os.environ.get('GA_COMPLEXITY_PENALTY', '1.0')))
 
 
-def _ols_bic(y: np.ndarray, X: np.ndarray) -> float:
+def _ols_bic(y: np.ndarray, X: np.ndarray, sig_penalty: bool = True) -> float:
     """Return –BIC/n for an OLS regression y ~ X (intercept already in X).
 
     The complexity penalty is scaled by GA_COMPLEXITY_PENALTY (default 1.0 =
     standard BIC); lower values keep more predictors in the Stage 2/3 search.
-    """
+
+    When sig_penalty and GA_SIG_PENALTY_WEIGHT>0, ALSO subtract a significance
+    penalty equal to GA_SIG_PENALTY_WEIGHT × (fraction of slope coefficients that
+    are insignificant or UNIDENTIFIED). OLS standard errors come nearly free from
+    (X'X)^-1; a slope is weak if |t| < GA_SIG_T_THRESH (default 1.96) OR its SE is
+    NaN / non-positive, and a perfectly collinear design (singular X'X) takes the
+    full penalty. This makes the fast GA search proxy avoid insignificant / rank-
+    deficient specs during selection, mirroring the metacount / final-fit penalty
+    (_metacount_significance_penalty)."""
     n, k = X.shape
     if n < k + 2:
         return -1e9
@@ -1468,7 +1535,27 @@ def _ols_bic(y: np.ndarray, X: np.ndarray) -> float:
         if rss <= 0 or not np.isfinite(rss):
             return -1e9
         bic = n * np.log(rss / n) + _GA_COMPLEXITY_PENALTY * k * np.log(n)
-        return -bic / n
+        score = -bic / n
+
+        if sig_penalty and k > 1:
+            w = float(os.environ.get('GA_SIG_PENALTY_WEIGHT', '0.10'))
+            if w > 0:
+                t_thresh = float(os.environ.get('GA_SIG_T_THRESH', '1.96'))
+                try:
+                    sigma2 = rss / max(n - k, 1)
+                    XtXinv = np.linalg.inv(X.T @ X)
+                    se = np.sqrt(np.clip(np.diag(XtXinv) * sigma2, 0.0, None))
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        tstat = np.where(se > 0, coef / se, np.nan)
+                    # slope coefficients only (index 0 is the intercept)
+                    ss, tt = se[1:], tstat[1:]
+                    if tt.size:
+                        weak = ((~np.isfinite(ss)) | (ss <= 0.0)
+                                | (~np.isfinite(tt)) | (np.abs(tt) < t_thresh))
+                        score -= w * (int(np.count_nonzero(weak)) / tt.size)
+                except np.linalg.LinAlgError:
+                    score -= w   # singular X'X (perfect collinearity) → full penalty
+        return score
     except Exception:
         return -1e9
 
@@ -1812,6 +1899,16 @@ def _to_long_format(
     return long.sort_values([id_col, 'alt_id']).reset_index(drop=True)
 
 
+_STAGE4_NONMAND_PURPOSES = frozenset(
+    {'escort', 'shopping', 'social', 'othmaint', 'othdiscr', 'eat'})
+
+
+def _stage4_subset(data: pd.DataFrame, purpose: str) -> pd.DataFrame:
+    if 'purpose' not in data.columns or purpose != 'nonmand':
+        return data[data['purpose'] == purpose] if 'purpose' in data.columns else data
+    return data[data['purpose'].isin(_STAGE4_NONMAND_PURPOSES)]
+
+
 def stage4_fitness_searchlibrium(
     genes: np.ndarray,
     data: pd.DataFrame,
@@ -1843,8 +1940,7 @@ def stage4_fitness_searchlibrium(
 
     scores = []
     for purpose in purposes:
-        sub = data[data.get('purpose', data.iloc[:, 0]) == purpose] \
-              if 'purpose' in data.columns else data
+        sub = _stage4_subset(data, purpose)
         if len(sub) < 20:
             continue
         avail_feats = [f for f in selected if f in sub.columns]
@@ -1943,7 +2039,7 @@ def stage4_fitness_searchlibrium_mixed(
 
     scores = []
     for purpose in purposes:
-        sub = data[data['purpose'] == purpose] if 'purpose' in data.columns else data
+        sub = _stage4_subset(data, purpose)
         if len(sub) < 30:
             continue
         avail_feats = [f for f in selected if f in sub.columns]
@@ -1967,8 +2063,12 @@ def stage4_fitness_searchlibrium_mixed(
                     _rdm_set = set(random_var_policy('stage4', avail_feats, rand_dist))
                 except Exception:
                     _rdm_set = set(avail_feats)
-            rv       = ({v: rand_dist for v in avail_feats if v in _rdm_set}
-                        or {v: rand_dist for v in avail_feats})
+            rv       = {v: rand_dist for v in avail_feats if v in _rdm_set}
+            if not rv:
+                logger.info(
+                    "[%s] no eligible continuous random parameters; "
+                    "skipping mixed-logit fitness", purpose)
+                continue
 
             mxl_kwargs: dict = dict(
                 X        = long[avail_feats].values.astype(float),
@@ -2016,6 +2116,7 @@ def _fit_bic_rv(long, avail_feats, alts, rv, n_obs, n_draws=50):
     Used by the greedy random-parameter search below; np.inf on any failure
     so a failed trial can never be selected.
     """
+    m = None
     try:
         if rv:
             m = MixedLogit()
@@ -2049,6 +2150,32 @@ def _fit_bic_rv(long, avail_feats, alts, rv, n_obs, n_draws=50):
         return -2.0 * ll + k * np.log(max(n_obs, 1))
     except Exception:
         return float('inf')
+    finally:
+        # These are screening fits, not retained production models. Search-
+        # time objects may hold X/y panels, simulated draws, probabilities, and
+        # compiled executables; release them before the next random-status
+        # trial so the greedy search has bounded live memory.
+        if m is not None:
+            try:
+                release = getattr(m, 'release_memory', None)
+                if callable(release):
+                    release()
+                else:
+                    clear_cache = getattr(type(m), '_clear_jit_cache', None)
+                    if callable(clear_cache):
+                        clear_cache()
+            except Exception:
+                pass
+            for attr in (
+                'X', 'X_original', 'y', 'y_original', 'panels',
+                'draws', 'drawstrans', 'choice_pred_prob',
+                'ind_pred_prob', 'pred_prob', 'prob_full',
+            ):
+                try:
+                    setattr(m, attr, None)
+                except Exception:
+                    pass
+        gc.collect()
 
 
 def _greedy_randvar_search(long, avail_feats, alts, rv0, rand_dist, n_obs,
@@ -2131,8 +2258,7 @@ def stage4_final_mixed_logit(
             _rdm_set = set(random_var_policy('stage4', selected_vars, rand_dist))
         except Exception:
             _rdm_set = set(selected_vars)
-    randvars = ({v: rand_dist for v in selected_vars if v in _rdm_set}
-                or {v: rand_dist for v in selected_vars})
+    randvars = {v: rand_dist for v in selected_vars if v in _rdm_set}
     try:
         from ga_constraints import rand_param_search_enabled, get_constraints
         _rand_search = rand_param_search_enabled()
@@ -2141,7 +2267,7 @@ def stage4_final_mixed_logit(
         _rand_search, _never_random = False, ()
 
     for purpose in purposes:
-        sub = data[data['purpose'] == purpose] if 'purpose' in data.columns else data
+        sub = _stage4_subset(data, purpose)
         if len(sub) < 30:
             continue
         avail_feats = [f for f in selected_vars if f in sub.columns]
@@ -2154,7 +2280,12 @@ def stage4_final_mixed_logit(
                 feat_cols=avail_feats, n_alts=n_alts,
             )
             alts = np.arange(n_alts)
-            rv   = {v: rand_dist for v in avail_feats if v in randvars} or {v: rand_dist for v in avail_feats}
+            rv   = {v: rand_dist for v in avail_feats if v in randvars}
+            if not rv:
+                logger.info(
+                    "[%s] no eligible continuous random parameters; "
+                    "skipping mixed-logit refit", purpose)
+                continue
             if _rand_search and len(avail_feats) >= 2:
                 # Random-parameter treatment as a searched decision, not a
                 # blanket default (GA_RAND_PARAM_SEARCH=1): greedy BIC toggle
@@ -2167,7 +2298,8 @@ def stage4_final_mixed_logit(
                 if not rv:
                     # MixedLogit.setup requires ≥1 random var; keep the first
                     # eligible one so the production fit below stays valid.
-                    _elig = [v for v in avail_feats if v not in set(_never_random)]
+                    _elig = [v for v in avail_feats if v in randvars
+                             and v not in set(_never_random)]
                     rv = {(_elig[0] if _elig else avail_feats[0]): rand_dist}
                     logger.info(f"[{purpose}] greedy search kept no random params - "
                                 f"retaining minimal mixture on '{list(rv)[0]}'")

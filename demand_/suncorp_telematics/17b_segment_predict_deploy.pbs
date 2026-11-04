@@ -1,0 +1,130 @@
+#!/bin/bash -l
+#PBS -N suncorp_seg_preddep
+#PBS -l walltime=08:00:00
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# Job 17b: segment resume -> deploy (in order). Assumes 17a already ran
+# speeding (43) + segment search. Here: refit NB-RP from the 17a checkpoint,
+# per-time/DOW/attendance predictions, game holdout + convergence (47 resume),
+# then pure-speeding P4/P5 deployment (48), MATSim, visualizer. NO risk weighting.
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results
+FIG_DIR=$PROJ_DIR/figures
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export JAX_PLATFORMS=cpu
+
+# metacountregressor: latest PyPI release, staged-wheel fallback offline.
+python -m pip install --upgrade --retries 2 --timeout 20 metacountregressor || python -m pip install --upgrade --no-index --find-links /home/ahernz/suncorp_wheels metacountregressor || { echo "FATAL: metacountregressor install failed (PyPI and staged wheel)"; exit 1; }
+python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,188), v" || { echo "FATAL: metacountregressor older than 1.0.188 or import failed"; exit 1; }
+
+cd "$SCRIPT_DIR"
+python -u 00_mcr_api_check.py 2>&1 || { echo "FATAL: metacountregressor API check failed"; exit 1; }
+for s in 47_segment_speeding_predictive.py 48_speeding_only_deployment.py \
+         49_matsim_export.py 50_outcome_visualizer_3d.py; do
+  sed -i "s|^PROJ = .*|PROJ = \"$PROJ_DIR\"|g" $s
+done
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "Order: segment resume (47) -> deploy (48)"
+echo "=================================================================="
+
+[ -s "$RESULTS_DIR/finable_exceedances.csv.gz" ] \
+  || { echo "FATAL: missing speeding output finable_exceedances.csv.gz (run 17a first)"; exit 1; }
+# Resume source: our checkpoint if present, else the raw SearchOutputConfig
+# JSON (47 --resume-from reads both formats).
+RESUME_JSON="$RESULTS_DIR/segment_search47_best.json"
+[ -s "$RESUME_JSON" ] || RESUME_JSON="$(ls -t $RESULTS_DIR/search47/seg_speed_*.json 2>/dev/null | head -1)"
+[ -s "$RESUME_JSON" ] \
+  || { echo "FATAL: no search spec to resume from (17a checkpoint or search47 JSON)"; exit 1; }
+echo "Resuming from: $RESUME_JSON"
+echo "Compass flow: $(ls -la $DATA_DIR/compass_flow.csv 2>/dev/null || echo 'absent (optional; exposure proxies used)')"
+echo "Stadium games: $(ls -la $DATA_DIR/stadium_games.csv 2>/dev/null || echo 'absent (optional; attendance-only game effects)')"
+
+echo "Step 1/2: segment resume - running 47 (refit + predict + holdout)..."
+python -u 47_segment_speeding_predictive.py \
+  --resume-from "$RESUME_JSON" \
+  --max-exceedance 30 \
+  --refit-R 300 2>&1
+[ $? -ne 0 ] && { echo "FATAL: 47 segment resume failed"; exit 1; }
+[ -s "$RESULTS_DIR/segment_speeding_pred_post_hourly.csv" ] || { echo "FATAL: 47 missing segment_speeding_pred_post_hourly.csv"; exit 1; }
+echo "Segment resume OK."
+
+echo "Step 2/2: deploy - running 48 (pure speeding P4/P5)..."
+python -u 48_speeding_only_deployment.py --squad 5 --k 14 --delta-m 800 2>&1
+EXIT_CODE=$?
+
+echo "Running 49 (MATSim export)..."
+python -u 49_matsim_export.py 2>&1 || echo "WARN: 49 failed (non-fatal)"
+
+echo "Running 50 (3D outcome visualizer)..."
+python -u 50_outcome_visualizer_3d.py 2>&1 || echo "WARN: 50 failed (non-fatal)"
+
+echo ""
+echo "Checking outputs..."
+for f in segment_speeding_pred_base.csv segment_speeding_pred_fixture.csv.gz \
+         segment_speeding_pred_fixture_hourly.csv.gz \
+         segment_speeding_pred_phase_totals.csv \
+         segment_speeding_pred_background.csv segment_speeding_holdout.csv \
+         segment_speeding_pred_post_hourly.csv \
+         segment_speeding_pred.tex segment_speeding_convergence.tex \
+         segment_speeding_pred_audit.json speeding_only_posts.csv \
+         speeding_only_deployment.csv speeding_only_perfixture.csv \
+         speeding_only_deployment.tex \
+         speeding_only_audit.json; do
+  if [ -f "$RESULTS_DIR/$f" ]; then echo "  OK $f"; else echo "  MISSING $f"; EXIT_CODE=1; fi
+done
+for f in segment_speeding_copula_compare.csv segment_speeding_copula.tex \
+         segment_speeding_copula_audit.json \
+         segment_speeding_pred_copula_phase.csv.gz \
+         segment_search47_progress.csv; do
+  if [ -f "$RESULTS_DIR/$f" ]; then echo "  OK $f"; else echo "  MISSING $f (copula/progress optional)"; fi
+done
+for f in matsim/network.xml matsim/population.xml matsim/facilities.xml; do
+  if [ -f "$RESULTS_DIR/$f" ]; then echo "  OK $f"; else echo "  MISSING $f (non-fatal)"; fi
+done
+for f in outcome_3d.html outcome_3d_data.json; do
+  if [ -f "$FIG_DIR/$f" ]; then echo "  OK $f"; else echo "  MISSING $f (non-fatal)"; fi
+done
+
+# --- sync pipeline outputs into the manuscript tree (single source of truth:
+# pipeline writes results/ + figures/; the paper reads manuscript/results/ +
+# manuscript/figures/). Without this step new PNGs "save" but are invisible
+# in the manuscript folder.
+echo ""
+echo "Syncing outputs into manuscript/..."
+MS_DIR=$PROJ_DIR/manuscript
+mkdir -p "$MS_DIR/results" "$MS_DIR/figures"
+for f in segment_speeding_pred.tex segment_speeding_convergence.tex \
+         segment_speeding_coef.tex segment_speeding_copula.tex \
+         speeding_only_deployment.tex \
+         segment_speeding_pred_audit.json speeding_only_audit.json \
+         segment_speeding_holdout.csv speeding_only_deployment.csv \
+         speeding_only_perfixture.csv segment_speeding_pred_phase_totals.csv; do
+  [ -f "$RESULTS_DIR/$f" ] && cp -u "$RESULTS_DIR/$f" "$MS_DIR/results/$f" && echo "  sync results/$f"
+done
+for f in segment_speeding_calibration.png segment_speeding_convergence.png \
+         segment_search47_progress.png \
+         speeding_only_coverage.png outcome_3d_data.json; do
+  [ -f "$FIG_DIR/$f" ] && cp -u "$FIG_DIR/$f" "$MS_DIR/figures/$f" && echo "  sync figures/$f"
+done
+
+echo "=================================================================="
+echo "Job finished at $(date) - exit_code=$EXIT_CODE"
+echo "=================================================================="
+exit $EXIT_CODE

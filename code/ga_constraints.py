@@ -78,10 +78,10 @@ except Exception:                                     # pragma: no cover
 #
 # Family = (continuous/redundant forms, category-band dummies).
 _ENCODING_FAMILIES = {
-    'income':    (['incp', 'incp_generic'],
+    'income':    (['incp', 'incp_generic', 'incp_motref', 'incp_active'],
                   ['income_verylo', 'income_lo', 'income_mid', 'income_midplus',
                    'income_midhi', 'income_hi', 'income_veryhi']),
-    'vehicle':   (['vehrd', 'veh_generic'],
+    'vehicle':   (['vehrd', 'veh_generic', 'veh_active', 'hh_vehicles_pred'],
                   ['no_vehicle', 'one_vehicle', 'has_vehicle', 'multi_vehicle']),
     'household': (['nprd', 'HHSIZE'],
                   ['hh_alone', 'hh_couple', 'hh_medium', 'hh_size_large']),
@@ -94,6 +94,13 @@ _ENCODING_FAMILIES = {
 _ALTERNATIVE_ENCODINGS = [
     ['wfh', 'wfh_flag', 'WFHWEEK', 'WFHDAY'],
     ['sexp', 'is_female'],
+    # Modeled household bike count (mobility_models) vs the observed 'bikes'
+    # count — the prediction is a smooth function of the same attributes, so the
+    # two are collinear; at most one in a spec.
+    ['bikes', 'hh_bikes_pred'],
+    # Tour-sequence length (tour_sequence) vs the observed tour count — both are
+    # counts of tours per person, mechanically near-identical.
+    ['n_tours', 'n_tours_seq'],
 ]
 
 
@@ -121,6 +128,17 @@ _CONTINUOUS_RANDOM = {
     'walk_acc': 'n', 'transit_acc': 'n', 'auto_work_acc': 'n',
     'auto_shop_acc': 'n', 'auto_nonmand_acc': 'n', 'bike_acc': 'n',
     'n_total': 'n', 'n_tours': 'n',
+}
+
+# Stage-4 timing variables are continuous and have a direct behavioural
+# interpretation as heterogeneous timing pressure. Keep them separate from the
+# shared count/activity pool so they are not offered as random coefficients in
+# unrelated stages.
+_TIMING_RANDOM = {
+    'day_position': 'n',
+    'time_consumed': 'n',
+    'duration_min': 'n',
+    'time_remaining': 'n',
 }
 
 # Structural / weakly-identified terms that must NEVER be random (stages 1-4):
@@ -166,7 +184,7 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         # for. Keep interaction dummies fixed — a random coefficient on a
         # 0/1 segment dummy is weakly identified at 50 draws.
         'mutually_exclusive': [list(g) for g in _ENCODING_MUTEX],
-        'force_random': dict(_CONTINUOUS_RANDOM),
+        'force_random': dict(_CONTINUOUS_RANDOM, **_TIMING_RANDOM),
         'never_random': list(_NEVER_RANDOM_14) + ['is_weekend', 'is_school_term'],
     },
     # Stage 5 — tour mode choice (Larch NL/MXL)
@@ -187,6 +205,15 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             ['c_work_walk', 'c_age_walk'],
             ['c_work_bike', 'c_age_bike'],
             ['c_work_transit', 'c_notwork_transit'],
+            # Worker-status encodings (GENE names actually in the mode pool): the
+            # WORKSTAT-derived binary and the equivalent ptype_* dummy encode the
+            # SAME construct and both gate the SAME c_*work_* coefficient, so
+            # co-selecting them just wastes a gene and muddies identification of
+            # the (already fragile) worker×mode captivity term. At most one each.
+            # (workstat_notworking vs ptype_Retired are NOT paired — retired is a
+            # subset of not-working, a legitimately distinct captivity signal.)
+            ['workstat_fulltime', 'ptype_FullTimeWorker'],
+            ['workstat_parttime', 'ptype_PartTimeWorker'],
             # CBD proximity: at most one of {c_cbd_transit, c_cbd_da, c_cbd_sr}
             # is independently identifiable (all reference emp.is_cbd).
             ['c_cbd_transit', 'c_cbd_da', 'c_cbd_sr'],
@@ -197,13 +224,14 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             # every non-DA alternative) OR the per-mode alternative-specific
             # block — never both. This lets the search literally swap between
             # "one income slope for all modes" and "a slope per mode".
-            ['incp_generic', 'incp', 'income_verylo', 'income_lo', 'income_mid',
+            ['incp_generic', 'incp_motref', 'incp_active', 'incp',
+             'income_verylo', 'income_lo', 'income_mid',
              'income_midplus', 'income_midhi', 'income_hi', 'income_veryhi'],
-            ['veh_generic', 'vehrd', 'no_vehicle', 'one_vehicle',
+            ['veh_generic', 'veh_active', 'vehrd', 'no_vehicle', 'one_vehicle',
              'has_vehicle', 'multi_vehicle'],
             ['crash_generic', 'CRASH'],
-            ['age_active_generic', 'age_child', 'age_teen', 'age_working',
-             'age_older', 'age_senior'],
+            ['age_active_generic', 'age_nonauto', 'age_child', 'age_teen',
+             'age_working', 'age_older', 'age_senior'],
             # In-vehicle-time period: at most ONE auto IVT period in a model
             # (AM is the backbone; PM/MD/EV are alternative representations).
             ['SOVTOLL_TIME__AM', 'SOVTOLL_TIME__PM',
@@ -222,7 +250,11 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         # _estimate_mixed_logit).
         'force_random': {'c_ivt': 'n', 'c_walk': 'n',
                          'c_bike': 'n', 'c_da_aff': 'n'},
+        # PT ASCs (STAGE5_PT_MODES=1) exist only when the flag is on; listing
+        # them here is missing-name-safe on 5-mode runs and keeps the GA/bandit
+        # rand-param genes from promoting them when it is.
         'never_random': ['ASC_SR', 'ASC_Walk', 'ASC_Bike', 'ASC_Transit',
+                         'ASC_PT_Walk', 'ASC_PT_Drive', 'ASC_PT_Bike',
                          'Mu_Motor', 'Mu_Root'],
         # ── Generic-vs-alternative-specific collapse (refit substitution) ────
         # Each entry: generic_gene -> the mode-generic replacement + the ASV
@@ -255,6 +287,41 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
                 'modes': ['Walk', 'Bike'],
                 'asv':   ['c_age_walk', 'c_age_bike'],
             },
+            # ── Intermediate grouped-reference encodings (larch MTC 017) ──────
+            # Beyond "all non-DA" vs "per-mode", let the search apply a person
+            # characteristic to an alternative GROUP, leaving the complement as a
+            # joint reference by omission (e.g. income on {Transit,Walk,Bike}
+            # with {DA,SR} as the grouped auto reference — the canonical 017
+            # "omit these alternatives from the block that applies to hhinc").
+            # Each is mutually exclusive with the other income/veh/age encodings
+            # (see _build_encoding_mutex); the reference group is non-empty by
+            # construction (validate_generic_groups guards this).
+            'incp_motref': {   # income on non-auto; {DA,SR} joint reference
+                'coeff': 'c_incp_motref',
+                'expr':  'person.incp',
+                'modes': ['Transit', 'Walk', 'Bike'],
+                'asv':   ['c_incp_da', 'c_incp_sr', 'c_incp_transit',
+                          'c_incp_active'],
+            },
+            'incp_active': {   # income on active only; {DA,SR,Transit} reference
+                'coeff': 'c_incp_active_grp',
+                'expr':  'person.incp',
+                'modes': ['Walk', 'Bike'],
+                'asv':   ['c_incp_da', 'c_incp_sr', 'c_incp_transit',
+                          'c_incp_active'],
+            },
+            'veh_active': {    # vehicles deter active; motor+transit reference
+                'coeff': 'c_veh_active',
+                'expr':  'person.vehrd',
+                'modes': ['Walk', 'Bike'],
+                'asv':   ['c_veh_da', 'c_veh_sr'],
+            },
+            'age_nonauto': {   # age on non-auto; {DA,SR} joint reference
+                'coeff': 'c_age_nonauto',
+                'expr':  'person.age5p',
+                'modes': ['Transit', 'Walk', 'Bike'],
+                'asv':   ['c_age_walk', 'c_age_bike'],
+            },
         },
         # ── Sign constraints (theoretical priors, enforced at build + refit) ─
         # 'neg' → coefficient bounded ≤ 0; 'pos' → bounded ≥ 0. Replaces the
@@ -262,6 +329,10 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         # _build_mode_model with one declarative list.
         'sign_constraints': {
             'c_ivt_auto': 'neg', 'c_ivt_transit': 'neg',
+            # PT access IVTs (STAGE5_PT_MODES=1; missing-name-safe otherwise).
+            # Design defaults are negative; a fitted positive IVT would be
+            # behaviourally perverse, so constrain like the other time terms.
+            'c_ivt_pt_drive': 'neg', 'c_ivt_pt_bike': 'neg',
             'c_ivt_auto_pm': 'neg', 'c_ivt_auto_md': 'neg', 'c_ivt_auto_ev': 'neg',
             'c_ivt_hov2_am': 'neg',
             'c_walk_time': 'neg', 'c_bike_time': 'neg',
@@ -269,13 +340,61 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             'c_xwait_transit': 'neg', 'c_drv_transit': 'neg',
             'c_crash_safety': 'neg',
             'ASC_Walk': 'neg',
+            # Habitual mode-usage captivity: more habitual use of a mode raises
+            # its utility (≥ 0). Also blocks a perverse sign from any residual
+            # collinearity with ownership terms.
+            'c_transit_use_transit': 'pos', 'c_car_use_da': 'pos',
+            'c_bike_use_bike': 'pos',
+            # Work-zone employment density (MTC wkempden): denser destination
+            # employment favours the non-auto modes (parking/congestion/transit
+            # supply), so each alt-specific density term attracts (≥ 0).
+            'c_empden_transit': 'pos', 'c_empden_walk': 'pos',
+            'c_empden_bike': 'pos', 'c_empden_sr': 'pos',
         },
         # ── Protected backbone (never removed by _prune_and_refit) ───────────
         'protected_backbone': [
             'ASC_SR', 'ASC_Walk', 'ASC_Bike', 'ASC_Transit',
-            'Mu_Car', 'Mu_Motor', 'Mu_NonMotor', 'Mu_Root',
+            # PT ASCs + access IVTs (STAGE5_PT_MODES=1; missing-name-safe on
+            # 5-mode runs). _prune_and_refit must never drop them: the PT
+            # coefficients are structurally always-included in the spec, so a
+            # prune would leave spec and parameter set inconsistent.
+            'ASC_PT_Walk', 'ASC_PT_Drive', 'ASC_PT_Bike',
+            'c_ivt_pt_drive', 'c_ivt_pt_bike',
+            'Mu_Motor', 'Mu_NonMotor', 'Mu_Root',
             'c_ivt_auto', 'c_ivt_transit', 'c_walk_time', 'c_bike_time',
+            # Zone-varying accessibility: breaks logsum-distance collinearity
+            'c_transit_access', 'c_empden_transit',
         ],
+        # ── Orthogonalization (mode choice) ────────────────────────────────
+        # Same {coeff: base} semantics as stage5_dest, consumed by
+        # _mode_tree (materialises residual columns on the tour/person frames
+        # BEFORE the DataTree is built) + _build_mode_utility (verified swap).
+        # Base may be a MODE_UEC coefficient key (e.g. 'c_veh_da') or a direct
+        # 'node.column' reference (e.g. 'od.DIST') when no distance coefficient
+        # exists in the mode spec — MODE_UEC carries no c_log_dist/c_dist term.
+        'orthogonalize_on': {
+            # Time terms residualized on OD network distance (tour-level)
+            'c_walk_time':   'od.DIST',
+            'c_bike_time':   'od.DIST',
+            'c_ivt_auto':    'od.DIST',
+            'c_ivt_transit': 'od.DIST',
+            # PT access IVTs (STAGE5_PT_MODES=1): same treatment as the 5-mode
+            # time terms; missing-name-safe on 5-mode runs (both the materialiser
+            # and the swap skip coeffs absent from the spec/uec).
+            'c_ivt_pt_drive': 'od.DIST',
+            'c_ivt_pt_bike':  'od.DIST',
+            # Crash exposure residualized on OD distance (tour-level): crash
+            # accumulates with trip length, so the raw term confounds safety
+            # sensitivity with distance deterrence. The residual identifies
+            # the crash effect independent of length. Freely estimated
+            # (sign-constrained neg); orthogonalisation does NOT fix its value.
+            'c_crash_veh':   'od.DIST',
+            # Income residualized on household vehicles (person-level)
+            'c_incp_da':     'c_veh_da',
+            'c_incp_sr':     'c_veh_sr',
+            'c_incp_transit':'c_veh_da',
+            'c_incp_active': 'c_veh_da',
+        },
     },
     # Stage 5 — destination choice (Larch MNL, flat CA)
     'stage5_dest': {
@@ -286,18 +405,20 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         'mutually_exclusive': [
             ['c_incp_dist', 'c_incp_band_dist'],
             ['c_age_dist', 'c_age_band_dist'],
-            # Agglomeration encoding: the generic c_aggl and the four themed
-            # variants (c_aggl_retail, c_aggl_office, c_aggl_edu, c_aggl_leisure)
-            # are mutually exclusive — at most ONE agglomeration form may be
-            # active. SA perturbations literally swap between "one blended
-            # agglomeration" and "themed agglomerations" as competing model forms.
-            # Agglomeration AND competition together: acdc_aggl and acdc_comp are
-            # ~perfectly collinear (|r|≈0.9998), so at most ONE of the whole
-            # agglomeration/competition family may be active (prevents the
-            # equal-and-opposite blow-up).
-            ['c_aggl', 'c_aggl_retail', 'c_aggl_office',
-             'c_aggl_edu', 'c_aggl_leisure',
-             'c_comp', 'c_comp_retail', 'c_comp_office'],
+            # Agglomeration: the blended composite (c_aggl), its collinear twin
+            # (c_comp, |r|≈0.9998) AND all 8 per-type themed variants
+            # (retail/office/edu/leisure/parks/health/food/civic) share the SAME
+            # spatial decay kernel, so they are mutually collinear. Letting them
+            # co-occur made the dest Hessian singular — every agglomeration term
+            # ended AT A BOUND with a degenerate proxy SE (fake p-values), and the
+            # GA penalty then couldn't tell them apart. Keep the WHOLE family a
+            # single at-most-one mutex; combined with the require-one below this
+            # forces EXACTLY ONE agglomeration term, so the search still identifies
+            # WHICH land-use component drives each segment ("mapping to
+            # components") but with a real, significant, identified coefficient.
+            ['c_aggl', 'c_comp', 'c_aggl_retail', 'c_aggl_office', 'c_aggl_edu',
+             'c_aggl_leisure', 'c_aggl_parks', 'c_aggl_health', 'c_aggl_food',
+             'c_aggl_civic'],
             # Home-pull: at most one of the two time-scaling variants.
             ['c_home_pull', 'c_home_pull_late'],
             # Accessibility: walk/transit accessibility is either conditioned
@@ -310,12 +431,18 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             # piecewise distance-bin spline, never both (they span the same
             # distance axis and are collinear together).
             ['c_dist', 'c_dist_0_2', 'c_dist_2_5', 'c_dist_5_10'],
-            # Accessibility form: the mode-choice logsum and the raw log-distance
-            # term both encode OD separation and are collinear, so at most ONE is
-            # active. Combined with the require-one group below this means EXACTLY
-            # one of {c_logsum, c_log_dist} — which stops the logsum coefficient
-            # being holdfast-at-0 / pruned for collinearity with c_log_dist.
-            ['c_logsum', 'c_log_dist'],
+            # Accessibility form: NO mutex between mode-choice logsum and raw
+            # log-distance (ActivitySim reflection). ActivitySim specs carry
+            # BOTH mode_choice_logsum and distance terms with freely estimated
+            # coefficients — the logsum is computed from the FULL mode spec
+            # (access, density, tolls — not time-only), so it is not collinear
+            # with distance once the logsum carries genuine access signal (see
+            # _logsums_numpy_fallback zone-varying terms + STAGE5_LOGSUM_ORTHOG,
+            # which separates any residual distance component honestly).
+            # The old exactly-one mutex structurally excluded c_logsum whenever
+            # c_log_dist won, i.e. it FORCED the "logsum sits at 0" symptom.
+            # Distance signal is still guaranteed by the require-one below
+            # (now at-least-one, so both may coexist and BIC decides).
         ],
         # Semantic pairing: when occupation-type person terms steer work
         # destinations, at least one matching industry attractor must be
@@ -323,10 +450,25 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         # on the map (occupation x distance alone has nothing to aim at).
         'min_behavioral': [
             (1, ['c_indp_finance', 'c_indp_health', 'c_indp_retail']),
-            # At least one accessibility/distance term must survive; with the
-            # c_logsum/c_log_dist mutex above this guarantees EXACTLY one is
-            # present, so the destination model never loses distance signal.
+            # At least one accessibility/distance term must survive (at-least-one:
+            # both may coexist — ActivitySim carries logsum AND distance — so
+            # the destination model never loses distance signal while the
+            # logsum is free to identify on access variation.
             (1, ['c_logsum', 'c_log_dist']),
+            # At least one agglomeration term must survive so spatial-structure
+            # signal is never dropped entirely. The generic blended c_aggl is
+            # DELIBERATELY EXCLUDED from this require-one: it is collinear with the
+            # fixed size_term (both ≈ log Σ size·decay), so whenever the search
+            # satisfied require-one with c_aggl the coefficient died at ~0 and the
+            # activity-specific themed terms never got their turn (the "ACDC
+            # component is all zeros" symptom). Requiring a THEMED term forces the
+            # search to say WHICH activity type's spatial spillover matters
+            # (retail/office/edu/…) with a coefficient identified independently of
+            # the aggregate size_term. c_aggl stays a mutex member (still
+            # selectable) but no longer counts toward the requirement.
+            (1, ['c_aggl_retail', 'c_aggl_office', 'c_aggl_edu',
+                 'c_aggl_leisure', 'c_aggl_parks', 'c_aggl_health',
+                 'c_aggl_food', 'c_aggl_civic']),
         ],
         # size_term and log_correction are structural (fixed priors /
         # sampling correction) — never random, never searched out.
@@ -343,9 +485,27 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             'c_dist_decay': 'pos', 'c_dist_decay_slow': 'pos',
             'c_aggl': 'pos', 'c_aggl_retail': 'pos', 'c_aggl_office': 'pos',
             'c_aggl_edu': 'pos', 'c_aggl_leisure': 'pos',
+            'c_aggl_parks': 'pos', 'c_aggl_health': 'pos',
+            'c_aggl_food': 'pos', 'c_aggl_civic': 'pos',
             'c_walk_acc': 'pos', 'c_transit_acc': 'pos', 'c_auto_work_acc': 'pos',
             # Mode-choice logsum: better accessibility -> more attractive dest.
             'c_logsum': 'pos',
+            # Newly-wired meaningful landuse attractors: more of the relevant
+            # land use -> more attractive destination (size-term semantics).
+            'c_nonmand_health': 'pos', 'c_nonmand_shop': 'pos',
+            'c_nonmand_hh': 'pos', 'c_edu_size': 'pos',
+            # Overture occupancy residuals: positive Overture news (more jobs /
+            # enrolments than census implies) -> more attractive destination.
+            'c_est_workers_resid': 'pos', 'c_est_students_resid': 'pos',
+            # Extended accessibility: crime/crash deter (neg); density,
+            # transit and visitability attract (pos).
+            'c_crime_violent': 'neg', 'c_crash_smooth': 'neg',
+            'c_transit_int': 'pos',
+            'c_attract_shop': 'pos', 'c_attract_food': 'pos',
+            'c_attract_health': 'pos', 'c_attract_edu': 'pos',
+            'c_attract_rec': 'pos',
+            'c_visit_work': 'pos', 'c_visit_edu': 'pos',
+            'c_visit_shop': 'pos', 'c_visit_social': 'pos',
         },
         # ── Protected backbone (never removed by _prune_and_refit) ───────────
         'protected_backbone': [
@@ -355,6 +515,77 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             # group guarantees one of the two is always present regardless.
             'c_size_term', 'log_correction', 'c_crash',
         ],
+        # ── Orthogonalization: when both terms are selected, residualize one on the other
+        # Maps term -> term_to_residualize_on. The residualized version replaces the
+        # original term in the utility, so collinear effects are separated.
+        # Example: 'c_crash' -> 'c_log_dist' means
+        #   log_CRASH_1_resid_on_log_DIST_1 = log_CRASH_1 - beta*log_DIST_1
+        # materialised in _dest_tree BEFORE the Dataset is built, then referenced
+        # by _build_dest_utility (verified swap — the column must exist in the
+        # dataset, otherwise the original expression is kept with a warning).
+        # NOTE: mode-choice pairs live under 'stage5_mode' (not here) — this dict
+        # must only contain DESTINATION coefficients (DEST_UEC / DEST_UEC_FLAT).
+        'orthogonalize_on': {
+            # Destination choice: crash residualized on distance
+            'c_crash':       'c_log_dist',
+            'c_crash_safety_dest': 'c_log_dist',
+            # NOTE: income pairs (c_incp_* on c_veh_*) are MODE coefficients and
+            # live under stage5_mode.orthogonalize_on — listing them here is
+            # dead weight (neither key is in DEST_UEC/DEST_UEC_FLAT) and trips
+            # the health-check overlap gate.
+            # Agglomeration: residualize on size_term
+            'c_aggl':        'c_size_term',
+            'c_aggl_retail': 'c_size_term',
+            'c_aggl_office': 'c_size_term',
+            'c_aggl_edu':    'c_size_term',
+            'c_aggl_leisure':'c_size_term',
+            'c_aggl_parks':  'c_size_term',
+            'c_aggl_health': 'c_size_term',
+            'c_aggl_food':   'c_size_term',
+            'c_aggl_civic':  'c_size_term',
+            # Landuse attractors share TOTEMP-derived size variance: residualize
+            # on size_term so the GA reads their marginal (not size-duplicated) pull.
+            'c_nonmand_health': 'c_size_term',
+            'c_nonmand_shop':   'c_size_term',
+            'c_nonmand_hh':     'c_size_term',
+            'c_edu_size':       'c_size_term',
+            # Extended accessibility: crime/crash deterrents residualize on
+            # distance (mirrors c_crash); densities/transit/visitability on
+            # size_term (mirrors the landuse attractors above). The ortho
+            # machinery keeps the original term if materialisation fails.
+            'c_crime_violent':  'c_log_dist',
+            'c_crash_smooth':   'c_log_dist',
+            'c_transit_int':    'c_size_term',
+            'c_attract_shop':   'c_size_term',
+            'c_attract_food':   'c_size_term',
+            'c_attract_health': 'c_size_term',
+            'c_attract_edu':    'c_size_term',
+            'c_attract_rec':    'c_size_term',
+            'c_visit_work':     'c_size_term',
+            'c_visit_edu':      'c_size_term',
+            'c_visit_shop':     'c_size_term',
+            'c_visit_social':   'c_size_term',
+            # ── Doctor-driven pairs (larch troubleshooting.overspecification
+            # on the real QLD work fit: 120 near-null Hessian directions) ────
+            # Direction 0 loads c_cbd_dest .53 / c_comp .51 /
+            # c_est_workers_resid -.40 / c_logsum -.38 / c_occp_dist -.38 /
+            # c_dist_decay_slow .13; direction 1 is a clean c_logsum ±.707 vs
+            # c_occp_dist ∓.707; the distance recodes load on further
+            # directions.  Residualise the interaction/weak member of each
+            # group on the structural control so those near-null directions
+            # collapse without dropping the behavioural term.  c_logsum's
+            # distance component is already residualised within-case by
+            # STAGE5_LOGSUM_ORTHOG, so it is deliberately not listed here.
+            'c_cbd_dest':          'c_size_term',
+            'c_comp':              'c_aggl',
+            'c_est_workers_resid': 'c_size_term',
+            'c_occp_dist':         'c_log_dist',
+            'c_dist_decay_slow':   'c_log_dist',
+            'c_dist_sq':           'c_log_dist',
+            'c_dist_0_2':          'c_log_dist',
+            'c_dist_2_5':          'c_log_dist',
+            'c_dist_5_10':         'c_log_dist',
+        },
     },
 }
 
@@ -380,7 +611,11 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
 #        "mutually_exclusive": [["c_aggl","c_aggl_retail"]],
 #        "min_behavioral": [[1, ["c_indp_finance","c_indp_health"]]],
 #        "sign_constraints": {"c_dist": "neg"},
+#        "orthogonalize_on": {"c_crash": "c_log_dist"},
 #        "generic_groups": { ... }               # advanced (mode only)
+#     },
+#     "stage5_mode": {
+#        "orthogonalize_on": {"c_ivt_auto": "od.DIST"},
 #     },
 #     "ptype_land": [                              # ptype ↔ land-attribute affinity
 #        {"ptype": "ptype_UniversityStudent", "land": "Education",
@@ -489,6 +724,12 @@ def _merge_constraint_dicts(base: dict, over: dict) -> dict:
                     groups.append(g)
             out['min_behavioral'] = groups
             continue
+        if key == 'orthogonalize_on':
+            # Merge orthogonalize_on dicts (overlay entries win)
+            bval = out.get(key, {})
+            if isinstance(bval, dict) and isinstance(oval, dict):
+                out[key] = {**bval, **oval}
+            continue
         bval = out.get(key)
         if isinstance(bval, list) and isinstance(oval, list):
             merged = list(bval)
@@ -560,7 +801,21 @@ def generic_groups(stage: Optional[str]) -> Dict[str, dict]:
     better-BIC form). Empty dict when the stage declares none.
     """
     c = get_constraints(stage) if stage else {}
-    return {k: dict(v) for k, v in c.get('generic_groups', {}).items()}
+    gg = {k: dict(v) for k, v in c.get('generic_groups', {}).items()}
+    # Identification guard: a grouped-reference encoding must leave a NON-EMPTY
+    # reference set (at least one alternative with no term), else the shared
+    # coefficient is confounded with the ASCs and is unidentified. Drop any
+    # entry whose 'modes' cover every alternative, loudly.
+    _ALL_MODES = {'DA', 'SR', 'Transit', 'Walk', 'Bike'}
+    bad = [k for k, v in gg.items()
+           if set(v.get('modes') or []) >= _ALL_MODES]
+    for k in bad:
+        import logging as _lg
+        _lg.getLogger(__name__).error(
+            "generic_groups[%r] applies to every alternative -> empty "
+            "reference (unidentified); dropped. Leave >=1 alt out.", k)
+        gg.pop(k, None)
+    return gg
 
 
 def sign_constraints(stage: Optional[str]) -> Dict[str, str]:
@@ -573,6 +828,20 @@ def sign_constraints(stage: Optional[str]) -> Dict[str, str]:
     """
     c = get_constraints(stage) if stage else {}
     return dict(c.get('sign_constraints', {}))
+
+
+def orthogonalize_on(stage: Optional[str]) -> Dict[str, str]:
+    """
+    Collinearity residualization map for a stage: {coeff: base}.
+
+    When both terms are active, the builder replaces coeff's column/expression
+    with its OLS residual on base (materialised at tree-build time, swapped by
+    verified presence — never a silent no-op). Merged with the user overlay
+    like every other dict-valued constraint. Empty dict when undeclared.
+    """
+    c = get_constraints(stage) if stage else {}
+    val = c.get('orthogonalize_on', {})
+    return dict(val) if isinstance(val, dict) else {}
 
 
 def protected_backbone(stage: Optional[str]) -> List[str]:
@@ -649,15 +918,16 @@ def random_var_policy(
     stage: Optional[str],
     selected_vars: Sequence[str],
     default_dist: str = 'n',
-    default_random: bool = True,
+    default_random: bool = False,
 ) -> Dict[str, str]:
     """
     Decide which of the selected variables get random coefficients.
 
     force_random entries always win (with their declared distribution);
     never_random entries are always excluded; the rest follow
-    ``default_random`` (True = current pipeline behaviour of randomising
-    every selected variable).
+    ``default_random``. The default is fixed unless a variable is explicitly
+    listed in ``force_random``; this keeps binary indicators and structural
+    controls out of the mixture unless a stage declares them eligible.
     """
     c = get_constraints(stage) if stage else {}
     force = dict(c.get('force_random', {}))
@@ -716,3 +986,87 @@ def stage5_extra_random_params() -> List[str]:
     """Extra Larch param names to randomise in the stage-5 mode MXL."""
     raw = os.environ.get('GA_STAGE5_RAND', '').strip()
     return [p.strip() for p in raw.split(',') if p.strip()] if raw else []
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Variable grouping for reports (larch `model.ordering` and the paper appendix)
+# ──────────────────────────────────────────────────────────────────────────
+# Single source of truth for how Stage-5 coefficients are grouped into
+# reporting categories (Level-of-service, Safety, Land-use, …), mirroring the
+# larch MTC example's ``m.ordering`` idiom
+# (https://larch.driftless.xyz/v6.0/examples/mtc/013_cbd.html). Each category is
+# (group_name, *regex_patterns); a parameter joins the first category whose
+# pattern matches. Consumed by stage5_destination_choice._apply_param_ordering
+# (sets model.ordering before reports) and by build_appendix_models.py (groups
+# the paper's coefficient tables and pins the Safety rows). Keeping it here lets
+# a constraint overlay re-group variables without touching estimation code.
+STAGE5_VARIABLE_GROUPS: Dict[str, tuple] = {
+    'mode': (
+        ("Structural: ASCs & nesting", "ASC_.*", "Mu_.*"),
+        ("Level of service", "c_ivt.*", ".*_time$", "c_wait.*", "c_peak.*",
+         "c_cost.*", "c_tt.*", "c_ovt.*", "c_fare.*"),
+        ("Safety", ".*crash.*", ".*CRASH.*", ".*safety.*"),
+        ("Person & household", "c_incp.*", "c_veh.*", "c_noveh.*",
+         "c_age.*", "c_young.*", "c_female.*", "c_ftwork.*",
+         "c_ptwork.*", "c_notwork.*", "c_hhsize.*", "c_joint.*",
+         "c_bikes.*"),
+        ("Other", ".*"),
+    ),
+    'dest': (
+        ("Structural: size & sampling", "c_size_term", "log_correction"),
+        ("Impedance & accessibility", "c_log_dist", "c_dist",
+         ".*intrazonal.*", "c_logsum", ".*_acc$"),
+        ("Safety", ".*crash.*", ".*CRASH.*", ".*safety.*"),
+        ("Spatial structure (ACDC)", "c_aggl", "c_comp"),
+        ("Land-use attractors", "c_indp_.*", "c_edu_.*",
+         "c_log_commercial.*", "c_nonmand_.*"),
+        ("Person interactions", "c_incp_.*", "c_age_.*", "c_veh_.*",
+         "c_occp_.*", "c_female_.*", "c_nprd_.*", "c_propensity.*",
+         "c_person.*"),
+        ("Other", ".*"),
+    ),
+}
+
+# Patterns whose coefficients are always shown in a report even when they fall
+# below a top-|t| truncation or are held at a bound — the force-included
+# structural/safety terms (so CRASH never silently vanishes from a table).
+STAGE5_REPORT_ALWAYS_SHOW = (
+    r".*crash.*", r".*CRASH.*", r".*safety.*",
+    r".*logsum.*", r"c_size_term", r"log_correction",
+)
+
+
+def stage5_variable_groups(kind: str = 'mode') -> tuple:
+    """Return the (group, *regex) ordering tuples for a Stage-5 model kind.
+
+    ``kind`` is 'mode' or 'dest' (anything non-'mode' maps to 'dest').
+    """
+    return STAGE5_VARIABLE_GROUPS['mode' if kind == 'mode'
+                                  else 'dest']
+
+
+def stage5_mxl_distribution_features() -> List[str]:
+    """Return MXL parameter families exposed as AGDS distribution genes."""
+    return ['c_ivt', 'c_walk', 'c_bike']
+
+
+def stage5_mxl_distribution_options() -> Dict[str, tuple]:
+    """Read per-family AGDS choices; fixed/Normal/negative-LogNormal are valid."""
+    options = {
+        name: ('fixed', 'normal', 'neglognormal')
+        for name in stage5_mxl_distribution_features()
+    }
+    raw = os.environ.get('GA_STAGE5_MXL_DISTS', '').strip()
+    if not raw:
+        return options
+    for item in raw.split(','):
+        if '=' not in item:
+            continue
+        name, values = (part.strip().lower() for part in item.split('=', 1))
+        if name not in options:
+            continue
+        parsed = tuple(value.strip() for value in values.split('|')
+                       if value.strip() in {'fixed', 'normal', 'neglognormal'})
+        if parsed:
+            options[name] = tuple(dict.fromkeys(('fixed',) + parsed))
+    return options

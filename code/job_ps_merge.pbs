@@ -1,0 +1,37 @@
+#!/bin/bash -l
+#PBS -N ps_merge
+#PBS -P FPAXJW8067
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ncpus=2:mem=8GB
+#PBS -j oe
+#PBS -m n
+
+# ============================================================
+# job_ps_merge.pbs
+# Merges the per-(protocol,segment) post-selection outputs in
+# runs/ps_inference/out/*.json into the paper tables:
+#   runs/ps_inference/tables/ps_diagnostics.csv
+#   runs/ps_inference/tables/auto_ps.tex
+# Cheap (seconds).  Safe to re-run at any time; reads only out/*.json.
+# ============================================================
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+export PYTHONUTF8=1
+
+echo "[$(date)] ps merge starting"
+if python -u post_selection_inference.py --merge \
+    --run-tag "${RUN_TAG:-paper_missing_20260929}" \
+    --run-root "${RUN_ROOT:-runs/ga_parallel}" \
+    --ps-root "${PS_ROOT:-runs/ps_inference}"; then
+  echo "[$(date)] ps merge exit=0"
+else
+  _mrc=$?
+  echo "[$(date)] ps merge FATAL rc=${_mrc}"
+  exit "${_mrc}"
+fi

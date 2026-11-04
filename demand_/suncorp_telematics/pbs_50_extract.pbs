@@ -1,0 +1,32 @@
+#!/bin/bash
+#PBS -N suncorp_extract
+#PBS -l select=1:ncpus=4:mem=16gb
+#PBS -l walltime=06:00:00
+#PBS -J 0-19
+#PBS -j oe
+#PBS -o logs/extract_^array_index^.log
+
+# Re-extract per-event telematics from the raw trip files for the FULL
+# 2025-01 .. 2026-03 period, as a 20-way PBS array job (each shard handles
+# every 20th raw file).  Merge the shards afterwards with 50b_merge_shards.py.
+#
+#   qsub pbs_50_extract.pbs
+#   # when all array tasks finish:
+#   python scripts/50b_merge_shards.py
+
+cd "$PBS_O_WORKDIR" || exit 1
+mkdir -p logs results
+module load miniconda3 2>/dev/null || true
+source activate zigenv 2>/dev/null || true
+
+# Point RAW_DIR at the raw trip files (5000 x trips-*.csv.gz).
+RAW_DIR="${RAW_DIR:-data/raw_near_miss_2026}"
+
+echo "shard ${PBS_ARRAY_INDEX} on $(hostname) at $(date)"
+python scripts/50_extract_raw_events.py \
+    --raw-dir "$RAW_DIR" \
+    --out results/event_points_full.csv.gz \
+    --date-min 2025-01-01 --date-max 2026-03-31 \
+    --shard "${PBS_ARRAY_INDEX}" --nshards 20 --ckpt 50
+
+echo "shard ${PBS_ARRAY_INDEX} done at $(date)"

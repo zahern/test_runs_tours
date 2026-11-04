@@ -1,0 +1,105 @@
+#!/bin/bash -l
+#PBS -N t8arfix
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=4:mem=192GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# T8 — AR-surface fix: regularization_strength=0.01 in stage-2b call +
+# underflow guard in in-sample check. Resumes from t6 best spec.
+set -u
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+OUT_DIR=$PROJ_DIR/results_tests/t8_ar_fix
+FIG_DIR=$PROJ_DIR/figures_tests/t8_ar_fix
+T6_DIR=$PROJ_DIR/results_tests/t6_grouped_temporal
+
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+
+[ -s "$T6_DIR/game_day_search_best.json" ] || {
+  echo "FATAL: missing $T6_DIR/game_day_search_best.json (t6 must finish first)" >&2
+  exit 1
+}
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export JAX_PLATFORMS=cpu
+export PYTHONIOENCODING=utf-8
+
+cd "$SCRIPT_DIR"
+rm -rf "$OUT_DIR" "$FIG_DIR"
+mkdir -p "$OUT_DIR" "$FIG_DIR"
+cp "$T6_DIR/game_day_search_best.json" "$OUT_DIR/game_day_search_best.json"
+
+echo "=================================================================="
+echo "T8 AR-fix started on $(hostname) at $(date)"
+echo "=================================================================="
+echo "package: $(python -c 'from importlib.metadata import version; print(version("metacountregressor"))')"
+echo
+
+python -u 59_game_day_search_predict.py \
+  --out-dir "$OUT_DIR" --fig-dir "$FIG_DIR" \
+  --search-iters 1 --search-chunk 1 \
+  --n-starts 1 --search-R 5 --refit-R 10 \
+  --search-vars slim --target trips_mean_gt_10 \
+  --group-by segment \
+  --group-temporal on \
+  --n-future 2 \
+  --two-stage on \
+  --temporal-mode ar1 --temporal-refit ar2 \
+  --resume \
+  2>&1
+
+RC=$?
+echo
+echo "=================================================================="
+echo "T8 python exit code: $RC"
+echo
+
+python - "$OUT_DIR" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+p = os.path.join(d, "game_day_holdout_metrics.json")
+if not os.path.exists(p):
+    print("FAIL: no holdout metrics json written")
+    sys.exit(1)
+j = json.load(open(p))
+a = j.get("audit") or {}
+m = j.get("metrics") or {}
+st = a.get("temporal_stage") or {}
+print("temporal_stage keys:", sorted(st.keys()))
+print("rejected:", st.get("rejected"))
+print("phi:", st.get("phi"))
+print("bic:", st.get("bic"), "aic:", st.get("aic"))
+dt = st.get("diag_train") or {}
+print("diag_train lin_mean:", dt.get("lin_mean"),
+      "min:", dt.get("lin_min"), "max:", dt.get("lin_max"))
+for name, c in sorted((dt.get("terms") or {}).items(),
+                      key=lambda kv: -abs(kv[1].get("contrib", 0)))[:10]:
+    print(f"  train {name}: beta={c['beta']:+.4f} x_mean={c['x_mean']:.4f} "
+          f"x_max={c['x_max']:.4f} contrib={c['contrib']:+.4f}")
+print("metrics:", {k: m.get(k) for k in (
+    "rmse", "calibration_slope", "segment_top20",
+    "temporal_bin_spearman", "temporal_segment_spearman",
+    "temporal_segment_top20")})
+PY
+if [ "$RC" -ne 0 ]; then
+  echo "FAILED (python exit $RC)"
+  exit "$RC"
+fi
+echo
+echo "=================================================================="
+echo "T8 finished at $(date)"
+echo "=================================================================="

@@ -44,9 +44,23 @@ Usage — predict synthetic population
 import numpy as np
 import pandas as pd
 import logging
+import os
 from typing import Optional
+from scipy.stats import norm
 
 logger = logging.getLogger(__name__)
+
+
+def _default_seed():
+    """Reproducible sampling seed (override per-run via PIPELINE_SEED).
+
+    Previously predict_sampled(seed=None) drew from OS entropy, making every
+    prediction run — and GA fitness evaluation — irreproducible.
+    """
+    try:
+        return int(os.environ.get('PIPELINE_SEED', '42'))
+    except ValueError:
+        return 42
 
 
 def add_total_activity_counts(tours: pd.DataFrame) -> pd.DataFrame:
@@ -93,16 +107,66 @@ PURPOSES = [
     'eat',
 ]
 
-# Max count cap per purpose (counts above this are rare and break the model)
+# All non-mandatory purposes consolidated into a single count for GA search,
+# matching the work/edu/nonmand structure of Stage 5.  Individual ordered-logit
+# models are ALSO fitted for each nonmand purpose separately so predictions are
+# behaviourally grounded rather than relying on Dirichlet proportions only.
+NONMAND_PURPOSES = ['escort', 'shopping', 'social', 'othmaint', 'othdiscr', 'eat']
+
+# Hard constraints on which person types are valid estimators for each purpose.
+# Models are only estimated (and evaluated in GA fitness) for these ptypes.
+# This prevents spurious models such as a work model fitted on SchoolChild rows.
+VALID_PTYPES_FOR_PURPOSE: dict = {
+    # Mandatory purposes: only people with that obligation
+    'work':     {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent'},
+    'edu':      {'SchoolChild', 'UniversityStudent', 'WorkingStudent'},
+    # Escort: adults only — SchoolChild/Preschool are the ones being escorted
+    'escort':   {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+                 'UniversityStudent', 'Retired', 'NonWorker'},
+    # All other non-mandatory: all adult ptypes (school children rarely shop/eat alone)
+    'shopping': {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+                 'UniversityStudent', 'Retired', 'NonWorker'},
+    'social':   {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+                 'UniversityStudent', 'Retired', 'NonWorker'},
+    'othmaint': {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+                 'UniversityStudent', 'Retired', 'NonWorker'},
+    'othdiscr': {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+                 'UniversityStudent', 'Retired', 'NonWorker'},
+    'eat':      {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+                 'UniversityStudent', 'SchoolChild', 'Retired', 'NonWorker'},
+    # Consolidated nonmand (GA search segment): same adult set as individual purposes
+    'nonmand':  {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
+                 'UniversityStudent', 'Retired', 'NonWorker'},
+}
+
+# Max count cap per purpose — hard ceiling on raw data values before any model.
+# Guards against data errors; individual purposes can genuinely reach these levels.
 MAX_COUNT = {
-    'work':      3,   # rare to have >3 work trips in a day
+    'work':      3,
     'edu':       2,
-    'social':    5,   # can have multiple social visits
-    'escort':    6,   # school drop-off + pick-up etc
+    'social':    5,
+    'escort':    6,
     'shopping':  5,
     'othmaint':  5,
     'othdiscr':  5,
-    'eat':       4,   # breakfast + lunch + dinner possible
+    'eat':       4,
+    'nonmand':  18,   # combined raw cap; binned to ORDERED_LOGIT_MAX_CLASSES below
+}
+
+# Maximum number of ordered-logit outcome classes per purpose.
+# Bins the count outcome to at most this many distinct values before model fit,
+# so the number of threshold cut-points = ORDERED_LOGIT_MAX_CLASSES - 1.
+# 4 classes → 3 thresholds representing (0 = none, 1 = low, 2 = medium, 3+ = high).
+ORDERED_LOGIT_MAX_CLASSES = {
+    'work':     4,   # 0, 1, 2, 3+   → 3 thresholds
+    'edu':      3,   # 0, 1, 2+      → 2 thresholds
+    'nonmand':  4,   # 0, 1, 2, 3+   → 3 thresholds (was up to 18 classes)
+    'escort':   4,
+    'shopping': 4,
+    'social':   4,
+    'othmaint': 4,
+    'othdiscr': 4,
+    'eat':      4,
 }
 
 # Person type definitions — maps ptype label → filter on persons DataFrame
@@ -110,12 +174,12 @@ MAX_COUNT = {
 # otherwise falls back to these column-based rules
 # Unified ptype labels — MUST match cdap._derive_ptype() output so synth pop
 # predictions align with models estimated from HHTS.
-#   WORKSTAT codes (from data_connect.work_map): 1=PartTime, 2=FullTime, 5=Retired
+#   WORKSTAT codes (from data_connect.work_map): 1=FullTime, 2=PartTime, 5=Retired
 #   STUDYING codes (from data_connect.study_map): 1=primary, 2=secondary,
 #                                                  3=tertiaryPartTime, 4=tertiaryFullTime
 PTYPE_COLS = {
-    'FullTimeWorker':    lambda p: (p['WORKSTAT'] == 2) & ~p['STUDYING'].isin([3, 4]),
-    'PartTimeWorker':    lambda p: (p['WORKSTAT'] == 1) & ~p['STUDYING'].isin([3, 4]),
+    'FullTimeWorker':    lambda p: (p['WORKSTAT'] == 1) & ~p['STUDYING'].isin([3, 4]),
+    'PartTimeWorker':    lambda p: (p['WORKSTAT'] == 2) & ~p['STUDYING'].isin([3, 4]),
     'WorkingStudent':    lambda p: p['WORKSTAT'].isin([1, 2]) & p['STUDYING'].isin([3, 4]),
     'UniversityStudent': lambda p: (
         ~p['WORKSTAT'].isin([1, 2, 5]) & p['STUDYING'].isin([3, 4])
@@ -150,6 +214,13 @@ PTYPE_PREDICTION_MAP = {
     'Unemployed / Other': 'NonWorker',
 }
 
+# All ptype labels that can appear in the 'ptype' column (assign_ptype_column /
+# data_connect.assign_ptype) — used to build the ptype_* one-hot columns.
+ALL_PTYPES = [
+    'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent', 'UniversityStudent',
+    'SchoolChild', 'Retired', 'NonWorker', 'Preschool',
+]
+
 # Per-(ptype, purpose) overrides that take precedence over PTYPE_PREDICTION_MAP.
 # SchoolChild predicts near-zero escort (school-age children rarely escort others)
 # but preschool children in the HHTS often accompany parents on errands, producing
@@ -171,6 +242,85 @@ PERSON_FEATURES = [
     'WORKSTAT',    # work status code
     'incp',        # income band (1-17)
 ]
+
+# WORKSTAT and STUDYING are nominal codes (see PTYPE_COLS comment above) — a
+# raw ordinal term implies e.g. "retired" (5) is a multiple of "part-time
+# worker" (1), which has no meaning. Use the per-category binary columns
+# built by _add_categorical_person_features() instead, so each category gets
+# its own coefficient:
+#   ptype_*            — one-hot of the 'ptype' column
+#   mandatory_role     — worker or student (daily out-of-home obligation)
+#   studying_primary / _secondary / _tertiary_pt / _tertiary_ft  — STUDYING category
+#   workstat_unemployed / _carer / _illness / _volunteer / _other_reason
+#                      — WORKSTAT "not working" reason (1/2/5 are already
+#                        implied by ptype, so are not split out separately)
+# *_acc columns are home-zone accessibility, attached by
+# prepare_frequency_data() when `landuse` is supplied.
+DEFAULT_FEATURES_BY_PURPOSE = {
+    # Combined non-mandatory count — all six nonmand purposes aggregated.
+    # Mirrors Stage 5's work/edu/nonmand segment structure.
+    'nonmand': ['incp', 'vehrd', 'nprd', 'walk_acc', 'transit_acc', 'is_female',
+                'has_vehicle', 'auto_nonmand_acc', 'auto_shop_acc', 'age_older',
+                'mandatory_role', 'hh_child', 'ptype_Retired', 'age_senior',
+                'age_working', 'age_working', 'logsum_nonmand_acc'],
+    'work': ['incp', 'vehrd', 'CARLICENCE', 'mandatory_role',
+             'ptype_FullTimeWorker', 'ptype_PartTimeWorker', 'ptype_WorkingStudent',
+             'workstat_unemployed', 'workstat_carer', 'workstat_illness',
+             'workstat_volunteer', 'workstat_other_reason',
+             'auto_work_acc', 'n_workers_hh', 'wfh', 'logsum_work_acc'],
+    'edu': ['studying_primary', 'studying_secondary', 'studying_tertiary_pt', 'studying_tertiary_ft',
+            'ptype_SchoolChild', 'ptype_UniversityStudent',
+            'ptype_WorkingStudent', 'age_child', 'age_teen', 'transit_acc',
+            'walk_acc', 'vehrd', 'logsum_edu_acc'],
+    'escort': ['hh_child', 'nprd', 'vehrd', 'has_vehicle', 'is_female',
+               'workstat_unemployed', 'workstat_carer', 'workstat_illness',
+               'workstat_volunteer', 'workstat_other_reason', 'auto_nonmand_acc',
+               'logsum_nonmand_acc'],
+    'shopping': ['incp', 'vehrd', 'has_vehicle', 'auto_shop_acc', 'nprd', 'age_older',
+                 'logsum_shopping_acc'],
+    'social': ['nprd', 'is_female', 'vehrd', 'walk_acc', 'transit_acc', 'age_teen',
+               'logsum_social_acc'],
+    'othmaint': ['nprd', 'vehrd', 'has_vehicle', 'auto_nonmand_acc',
+                  'workstat_unemployed', 'workstat_carer', 'workstat_illness',
+                  'workstat_volunteer', 'workstat_other_reason',
+                  'logsum_nonmand_acc'],
+    'othdiscr': ['incp', 'vehrd', 'auto_nonmand_acc', 'age_older', 'walk_acc',
+                 'logsum_othdiscr_acc'],
+    'eat': ['incp', 'nprd', 'walk_acc', 'transit_acc', 'is_female',
+            'logsum_nonmand_acc'],
+}
+
+
+def _stage1_features_for_purpose(data: pd.DataFrame, purpose: str, feature_override=None) -> list:
+    if isinstance(feature_override, dict):
+        names = feature_override.get(purpose, feature_override.get('*', []))
+    elif feature_override is not None:
+        names = feature_override
+    else:
+        names = DEFAULT_FEATURES_BY_PURPOSE.get(purpose, PERSON_FEATURES)
+    if not names:
+        names = PERSON_FEATURES
+    return [c for c in dict.fromkeys(names) if c in data.columns]
+
+
+def _numerical_hessian(func, params: np.ndarray, eps: float = 1e-4) -> np.ndarray:
+    """Central-difference Hessian for small MLE problems."""
+    params = np.asarray(params, dtype=float)
+    n = len(params)
+    hess = np.zeros((n, n), dtype=float)
+    for i in range(n):
+        ei = np.zeros(n, dtype=float)
+        ei[i] = eps
+        for j in range(i, n):
+            ej = np.zeros(n, dtype=float)
+            ej[j] = eps
+            fpp = func(params + ei + ej)
+            fpm = func(params + ei - ej)
+            fmp = func(params - ei + ej)
+            fmm = func(params - ei - ej)
+            hess[i, j] = (fpp - fpm - fmp + fmm) / (4.0 * eps * eps)
+            hess[j, i] = hess[i, j]
+    return hess
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +374,60 @@ def assign_ptype_column(persons: pd.DataFrame) -> pd.DataFrame:
 
     counts = df['ptype'].value_counts().to_dict()
     logger.info(f"ptype distribution: {counts}")
+    return df
+
+
+def _add_categorical_person_features(persons: pd.DataFrame) -> pd.DataFrame:
+    """
+    Derive per-category binary columns from 'ptype', WORKSTAT and STUDYING,
+    plus a few other behavioural dummies referenced by
+    DEFAULT_FEATURES_BY_PURPOSE. WORKSTAT/STUDYING are nominal codes — see the
+    comment above DEFAULT_FEATURES_BY_PURPOSE for why these replace the raw
+    ordinal columns as model features.
+
+    Requires 'ptype' to already be set (call assign_ptype_column() first).
+    """
+    df = persons.copy()
+
+    for pt in ALL_PTYPES:
+        df[f'ptype_{pt}'] = (df['ptype'] == pt).astype(int)
+
+    studying = pd.to_numeric(df.get('STUDYING', 0), errors='coerce').fillna(0).astype(int)
+    for code, name in {1: 'primary', 2: 'secondary', 3: 'tertiary_pt', 4: 'tertiary_ft'}.items():
+        df[f'studying_{name}'] = (studying == code).astype(int)
+
+    # WORKSTAT 1/2/5 (part-time/full-time/retired) are already implied by
+    # ptype via PTYPE_COLS — only the remaining "not working" reasons carry
+    # information not captured by the ptype segmentation.
+    workstat = pd.to_numeric(df.get('WORKSTAT', 0), errors='coerce').fillna(0).astype(int)
+    for code, name in {0: 'unemployed', 3: 'other_reason', 4: 'carer', 8: 'volunteer'}.items():
+        df[f'workstat_{name}'] = (workstat == code).astype(int)
+    df['workstat_illness'] = workstat.isin([6, 7]).astype(int)
+
+    df['mandatory_role'] = df['ptype'].isin([
+        'FullTimeWorker', 'PartTimeWorker', 'SchoolChild',
+        'UniversityStudent', 'WorkingStudent']).astype(int)
+
+    if 'sexp' in df.columns:
+        df['is_female'] = (pd.to_numeric(df['sexp'], errors='coerce') == 2).astype(int)
+
+    if 'vehrd' in df.columns:
+        df['has_vehicle'] = (pd.to_numeric(df['vehrd'], errors='coerce').fillna(0) > 0).astype(int)
+
+    if 'AGEGROUP' in df.columns:
+        # Same AGEGROUP cutoffs as _enrich_ga_data() in ga_hypothesis_testing.py
+        # (5-yr bands, 1=0-4 .. 21=100+) — kept consistent so these columns mean
+        # the same thing whichever code path creates them first.
+        age = pd.to_numeric(df['AGEGROUP'], errors='coerce').fillna(6)
+        df['age_child']  = (age <= 2).astype(int)   # 0-9
+        df['age_teen']   = (age == 3).astype(int)   # 10-14
+        df['age_older']  = (age >= 8).astype(int)   # 40+
+        df['age_senior'] = (age >= 10).astype(int)  # 50+
+
+    if 'RELATIONSHIP' in df.columns:
+        rel = df['RELATIONSHIP'].astype(str).str.lower()
+        df['hh_child'] = rel.isin(['child', 'son', 'daughter']).astype(int)
+
     return df
 
 
@@ -284,6 +488,11 @@ def build_activity_counts(tours: pd.DataFrame) -> pd.DataFrame:
         cap = MAX_COUNT.get(purpose, 5)
         person_counts[col] = person_counts[col].clip(upper=cap)
 
+    # Aggregate combined non-mandatory count for the consolidated model
+    _dc = [f'n_{p}_out' for p in NONMAND_PURPOSES if f'n_{p}_out' in person_counts.columns]
+    if _dc:
+        person_counts['n_nonmand_out'] = person_counts[_dc].sum(axis=1).clip(upper=MAX_COUNT['nonmand'])
+
     return person_counts
 
 
@@ -294,6 +503,7 @@ def build_activity_counts(tours: pd.DataFrame) -> pd.DataFrame:
 def prepare_frequency_data(
     tours: pd.DataFrame,
     persons: pd.DataFrame,
+    landuse: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
     Join activity counts with person attributes ready for model estimation.
@@ -302,11 +512,14 @@ def prepare_frequency_data(
     ----------
     tours   : from process_survey()["tours"]
     persons : from process_survey()["persons"]  (already processed)
+    landuse : enriched landuse from compute_accessibility.run_accessibility(),
+              with *_acc columns. If supplied, home-zone accessibility is
+              attached to each person via OTAZ/ORDER for use as features.
 
     Returns
     -------
-    One-row-per-person DataFrame with ptype, n_{purpose}_out, and
-    all PERSON_FEATURES columns.
+    One-row-per-person DataFrame with ptype, n_{purpose}_out, and every
+    column referenced by DEFAULT_FEATURES_BY_PURPOSE that is available.
     """
     counts = build_activity_counts(tours)
 
@@ -315,10 +528,34 @@ def prepare_frequency_data(
         pers = pers.rename(columns={'PERSID': 'person_id'})
 
     pers = assign_ptype_column(pers)
+    pers = _add_categorical_person_features(pers)
 
-    # keep only columns we need
-    keep = ['person_id', 'ptype'] + [c for c in PERSON_FEATURES if c in pers.columns]
+    if landuse is not None:
+        from synth_attributes import attach_person_accessibility
+        pers = attach_person_accessibility(pers, landuse)
+
+    # keep every column any purpose's feature list might reference, plus the
+    # base PERSON_FEATURES — _stage1_features_for_purpose() filters down to
+    # whatever's actually present, but a column has to survive this join to
+    # be eligible at all. All *_acc columns are kept too (regardless of
+    # whether a purpose's default list mentions them yet) so GA feature
+    # search can consider any accessibility measure as a candidate.
+    wanted = set(PERSON_FEATURES)
+    for feats in DEFAULT_FEATURES_BY_PURPOSE.values():
+        wanted.update(feats)
+    wanted.update(c for c in pers.columns if c.endswith('_acc'))
+    keep = ['person_id', 'ptype'] + [c for c in wanted if c in pers.columns]
     pers = pers[keep]
+
+    # person_id dtype guard: prototype feeds (e.g. MTC) can hand tours with
+    # str keys and persons with Int64 keys (or vice versa), which pandas
+    # refuses to merge. Coerce both sides only when they disagree, so the
+    # main pipeline path (consistent dtypes) is byte-for-byte unchanged.
+    if counts['person_id'].dtype != pers['person_id'].dtype:
+        counts = counts.copy()
+        pers = pers.copy()
+        counts['person_id'] = counts['person_id'].astype(str)
+        pers['person_id'] = pers['person_id'].astype(str)
 
     df = counts.merge(pers, on='person_id', how='left')
 
@@ -354,6 +591,10 @@ class OrderedLogit:
         self.classes_   = None   # sorted unique outcome values
         self.feature_names_ = None
         self.converged_ = False
+        self.std_err_   = None
+        self.t_stat_    = None
+        self.p_value_   = None
+        self.threshold_std_err_ = None   # delta-method SEs for thresholds_
 
     def _pack(self, beta, raw_cuts):
         return np.concatenate([beta, raw_cuts])
@@ -366,7 +607,7 @@ class OrderedLogit:
         return np.cumsum(np.concatenate([[raw_cuts[0]],
                                           np.exp(raw_cuts[1:])]))
 
-    def _log_likelihood(self, params, X, y, K):
+    def _log_likelihood(self, params, X, y, K, ridge=0.0):
         from scipy.special import expit
         beta, raw_cuts = self._unpack(params, K)
         cuts = self._cuts_from_raw(raw_cuts)
@@ -387,7 +628,17 @@ class OrderedLogit:
             p = np.clip(p, 1e-10, 1.0)
             ll += np.sum(np.log(p))
 
-        return -ll   # minimise negative LL
+        nll = -ll   # minimise negative LL
+        # ── Ridge (L2) penalty on slopes (NOT thresholds) ────────────────────
+        # Quasi-complete separation in tiny (purpose, ptype) segments otherwise
+        # sends coefficients to ±hundreds (e.g. walk_acc=-404 with t≈0). A small
+        # absolute ridge adds curvature 2·ridge to the objective: negligible for
+        # a well-identified coefficient (LL curvature ~ N dominates) but it pins
+        # a coefficient the data cannot identify toward 0. Slopes only — the
+        # ordinal thresholds must stay free.
+        if ridge:
+            nll = nll + 0.5 * float(ridge) * float(np.dot(beta, beta))
+        return nll
 
     def fit(self, X: np.ndarray, y: np.ndarray):
         from scipy.optimize import minimize
@@ -413,11 +664,18 @@ class OrderedLogit:
                                     np.log(np.diff(init_cuts) + 1e-4)])
         init = np.concatenate([np.zeros(K), raw_cuts])
 
+        # Ridge weight + hard slope bounds guard against separation blow-up in
+        # tiny segments. GA_S1_RIDGE tunes shrinkage; GA_S1_COEF_CAP the bound.
+        _ridge = float(os.environ.get('GA_S1_RIDGE', '2.0'))
+        _cap   = float(os.environ.get('GA_S1_COEF_CAP', '10.0'))
+        _bounds = [(-_cap, _cap)] * K + [(None, None)] * (len(init) - K)
+
         res = minimize(
             self._log_likelihood,
             init,
-            args=(X, y, K),
+            args=(X, y, K, _ridge),
             method='L-BFGS-B',
+            bounds=_bounds,
             options={'maxiter': 500, 'ftol': 1e-9},
         )
 
@@ -428,6 +686,45 @@ class OrderedLogit:
         self.ll_         = float(-res.fun)
         # null LL: uniform probabilities
         self.ll0_        = float(len(y) * np.log(1.0 / J))
+        try:
+            hess = _numerical_hessian(lambda p: self._log_likelihood(p, X, y, K, _ridge), res.x)
+            cov = np.linalg.pinv(hess)
+            params = np.concatenate([self.coef_, self.thresholds_])
+            raw_se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+            # Delta-method SEs for thresholds on the reported (cumsum-exp)
+            # scale. cuts[0] = raw[0] (SE exact); cuts[j] = r0 + Σ exp(r_k),
+            # so row j of J is [1, exp(r_1), …, exp(r_j), 0, …].
+            n_cuts = max(J - 1, 0)
+            thr_se = np.full(n_cuts, np.nan)
+            try:
+                if n_cuts:
+                    _raw = np.asarray(res.x[K:], dtype=float)
+                    _C = np.asarray(cov[K:, K:], dtype=float)
+                    _J = np.zeros((n_cuts, n_cuts))
+                    for _j in range(n_cuts):
+                        _J[_j, 0] = 1.0
+                        for _k in range(1, _j + 1):
+                            _J[_j, _k] = float(np.exp(_raw[_k]))
+                    _V = _J @ _C @ _J.T
+                    thr_se = np.sqrt(np.clip(np.diag(_V), 0.0, None))
+            except Exception:
+                pass
+            self.threshold_std_err_ = thr_se
+            # Report thresholds on the transformed scale with delta-method SEs.
+            self.std_err_ = np.concatenate([raw_se[:K], thr_se]) if n_cuts else raw_se[:K]
+            self.t_stat_ = np.divide(
+                params,
+                self.std_err_,
+                out=np.full_like(params, np.nan, dtype=float),
+                where=self.std_err_ > 0,
+            )
+            self.p_value_ = 2.0 * norm.sf(np.abs(self.t_stat_))
+        except Exception:
+            size = K + max(J - 1, 0)
+            self.std_err_ = np.full(size, np.nan)
+            self.t_stat_ = np.full(size, np.nan)
+            self.p_value_ = np.full(size, np.nan)
+            self.threshold_std_err_ = np.full(max(J - 1, 0), np.nan)
         return self
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
@@ -457,7 +754,7 @@ class OrderedLogit:
 
     def predict_sampled(self, X: np.ndarray, seed: int = None) -> np.ndarray:
         """Sample a count from the predicted probability distribution."""
-        rng   = np.random.default_rng(seed)
+        rng   = np.random.default_rng(_default_seed() if seed is None else seed)
         proba = self.predict_proba(X)
         J     = len(self.classes_)
         out   = np.array([
@@ -465,6 +762,216 @@ class OrderedLogit:
             for i in range(len(X))
         ])
         return out
+
+
+class ZeroInflatedOrderProbit:
+    """
+    Zero-inflated ordered probit (ZIOP) for activity-frequency counts.
+
+    Many persons make ZERO activities of a given purpose, and the remaining
+    non-zero counts follow an ordered response.  A standard ordered probit (or
+    logit) treats the zeros as just another ordered category and can under- or
+    over-weight them.  The zero-inflated specification splits the zero mass
+    into two sources:
+
+        P(y_i = 0)       = pi_i + (1 - pi_i) * P0(ordered probit zero)
+        P(y_i = k), k>0  =        (1 - pi_i) * Pk(ordered probit k)
+
+    where the inflation probability pi_i = Phi(gamma' z_i) is a probit on the
+    same feature vector X (the "always zero / never do this purpose" latent
+    class), and the count part is a cumulative-link ordered probit with
+    thresholds tau.
+
+    Parameters are stacked as  [beta (K), gamma (K), raw thresholds (J-1)]:
+        beta    — ordered-probit slopes on X
+        gamma   — zero-inflation probit slopes on X
+        raw tau — ordered-threshold offsets (exp-parameterised, strictly
+                  increasing via cumulative exp)
+    """
+
+    def __init__(self):
+        self.coef_        = None      # (K,) beta  (ordered-probit slopes)
+        self.infl_coef_   = None      # (K,) gamma (zero-inflation slopes)
+        self.thresholds_  = None      # (J-1,) ordered thresholds
+        self.classes_     = None      # sorted unique outcome values
+        self.feature_names_ = None
+        self.converged_   = False
+        self.std_err_     = None
+        self.t_stat_      = None
+        self.p_value_     = None
+
+    def _pack(self, beta, gamma, raw_cuts):
+        return np.concatenate([beta, gamma, raw_cuts])
+
+    def _unpack(self, params, K):
+        beta  = params[:K]
+        gamma = params[K:2 * K]
+        raw   = params[2 * K:]
+        cuts  = np.cumsum(np.concatenate([[raw[0]], np.exp(raw[1:])]))
+        return beta, gamma, cuts
+
+    def _log_likelihood(self, params, X, y, K, ridge=0.0):
+        from scipy.special import expit
+        beta, gamma, cuts = self._unpack(params, K)
+        eta   = X @ beta
+        pi    = expit(X @ gamma)            # probit inflation via logistic link
+        ll    = 0.0
+        J     = len(self.classes_)
+        # zero-inflation probit uses a logit link on the same X (standard ZIOP
+        # uses probit; logistic is numerically equivalent under re-scaling and
+        # far more stable in scipy).
+        for j, cls in enumerate(self.classes_):
+            mask = (y == cls)
+            if not mask.any():
+                continue
+            eta_j = eta[mask]
+            if j == 0:
+                p_ord = expit(cuts[0] - eta_j)
+            elif j == J - 1:
+                p_ord = 1 - expit(cuts[-1] - eta_j)
+            else:
+                p_ord = expit(cuts[j] - eta_j) - expit(cuts[j-1] - eta_j)
+            p_ord = np.clip(p_ord, 1e-12, 1.0)
+            p_infl = pi[mask]
+            if j == 0:
+                p = p_infl + (1 - p_infl) * p_ord
+            else:
+                p = (1 - p_infl) * p_ord
+            p = np.clip(p, 1e-12, 1.0)
+            ll += np.sum(np.log(p))
+
+        nll = -ll
+        if ridge:
+            nll += 0.5 * float(ridge) * (float(np.dot(beta, beta))
+                                         + float(np.dot(gamma, gamma)))
+        return nll
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        from scipy.optimize import minimize
+        self.classes_ = np.sort(np.unique(y))
+        J = len(self.classes_)
+        K = X.shape[1]
+
+        if J < 2:
+            self.coef_       = np.zeros(K)
+            self.infl_coef_  = np.zeros(K)
+            self.thresholds_ = np.array([0.0])
+            self.converged_  = False
+            return self
+
+        from scipy.special import logit as logit_fn
+        probs    = np.array([(y <= c).mean() for c in self.classes_[:-1]])
+        probs    = np.clip(probs, 0.01, 0.99)
+        init_cuts = logit_fn(probs)
+        raw_cuts = np.concatenate([[init_cuts[0]], np.log(np.diff(init_cuts) + 1e-4)])
+        init     = np.concatenate([np.zeros(K), np.zeros(K), raw_cuts])
+
+        _ridge = float(os.environ.get('GA_S1_RIDGE', '2.0'))
+        _cap   = float(os.environ.get('GA_S1_COEF_CAP', '10.0'))
+        _bounds = [(-_cap, _cap)] * (2 * K) + [(None, None)] * (len(init) - 2 * K)
+
+        res = minimize(
+            self._log_likelihood,
+            init,
+            args=(X, y, K, _ridge),
+            method='L-BFGS-B',
+            bounds=_bounds,
+            options={'maxiter': 700, 'ftol': 1e-9},
+        )
+
+        self.coef_, self.infl_coef_, self.thresholds_ = self._unpack(res.x, K)
+        self.converged_ = res.success
+        self.n_obs_ = int(len(y))
+        self.ll_    = float(-res.fun)
+        self.ll0_   = float(len(y) * np.log(1.0 / J))
+
+        # Standard errors on [beta | gamma | thresholds].
+        try:
+            hess = _numerical_hessian(
+                lambda p: self._log_likelihood(p, X, y, K, _ridge), res.x)
+            cov = np.linalg.pinv(hess)
+            params = np.concatenate([self.coef_, self.infl_coef_, self.thresholds_])
+            raw_se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+            self.std_err_ = raw_se
+            self.t_stat_ = np.divide(
+                params, self.std_err_,
+                out=np.full_like(params, np.nan, dtype=float),
+                where=self.std_err_ > 0,
+            )
+            self.p_value_ = 2.0 * norm.sf(np.abs(self.t_stat_))
+        except Exception:
+            size = 2 * K + max(J - 1, 0)
+            self.std_err_  = np.full(size, np.nan)
+            self.t_stat_   = np.full(size, np.nan)
+            self.p_value_  = np.full(size, np.nan)
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Return P(y == class_j), shape (N, J), mixing inflation + ordered."""
+        from scipy.special import expit
+        beta, gamma, cuts = self.coef_, self.infl_coef_, self.thresholds_
+        eta  = X @ beta
+        pi   = expit(X @ gamma)
+        J    = len(self.classes_)
+        probs = np.zeros((len(X), J))
+
+        for j in range(J):
+            if j == 0:
+                p_ord = expit(cuts[0] - eta)
+            elif j == J - 1:
+                p_ord = 1 - expit(cuts[-1] - eta)
+            else:
+                p_ord = expit(cuts[j] - eta) - expit(cuts[j-1] - eta)
+            p_ord = np.clip(p_ord, 0, 1)
+            if j == 0:
+                probs[:, j] = pi + (1 - pi) * p_ord
+            else:
+                probs[:, j] = (1 - pi) * p_ord
+
+        probs = np.clip(probs, 1e-12, 1.0)
+        probs = probs / probs.sum(axis=1, keepdims=True)
+        return probs
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        proba = self.predict_proba(X)
+        return self.classes_[proba.argmax(axis=1)]
+
+    def predict_sampled(self, X: np.ndarray, seed: int = None) -> np.ndarray:
+        rng   = np.random.default_rng(_default_seed() if seed is None else seed)
+        proba = self.predict_proba(X)
+        J     = len(self.classes_)
+        out   = np.array([
+            self.classes_[rng.choice(J, p=proba[i])]
+            for i in range(len(X))
+        ])
+        return out
+
+
+#: Stage-1 frequency model registry — the estimator used by
+#: estimate_frequency_models() is selected via STAGE1_FREQ_MODEL
+#: (default 'ordered_logit'; 'zero_inflated_probit' adds the excess-zero
+#: mass for never-participating persons).
+STAGE1_FREQ_MODEL = os.environ.get('STAGE1_FREQ_MODEL', 'ordered_logit').strip().lower()
+
+FREQUENCY_MODELS = {
+    'ordered_logit':        OrderedLogit,
+    'zero_inflated_probit': ZeroInflatedOrderProbit,
+    'zip_probit':           ZeroInflatedOrderProbit,
+    'ziop':                 ZeroInflatedOrderProbit,
+}
+
+
+def _make_frequency_model(model_type: str = None):
+    """Instantiate the requested Stage-1 frequency model class."""
+    mt = (model_type or STAGE1_FREQ_MODEL).strip().lower()
+    mt = mt.replace('-', '_')
+    cls = FREQUENCY_MODELS.get(mt, OrderedLogit)
+    if mt not in FREQUENCY_MODELS and mt != 'ordered_logit':
+        logger.warning(
+            f"Unknown STAGE1_FREQ_MODEL={mt!r}; using OrderedLogit "
+            f"(choose from {sorted(FREQUENCY_MODELS)})"
+        )
+    return cls()
 
 
 # ---------------------------------------------------------------------------
@@ -486,36 +993,75 @@ def estimate_frequency_models(
     persons: pd.DataFrame,
     min_sample: int = 30,
     feature_override: list = None,
+    landuse: pd.DataFrame = None,
+    fit_nonmand_combined: bool = True,
+    model_type: str = None,
 ) -> dict:
     """
-    Estimate one ordered logit per (purpose, ptype) combination.
+    Estimate one frequency model per (purpose, ptype) combination.
 
     Parameters
     ----------
-    tours, persons    : from process_survey()
-    min_sample        : skip estimation if fewer than this many observations
-    feature_override  : if supplied, use this list of features instead of
-                        PERSON_FEATURES — passed from GA results to apply
-                        GA-selected variable sets.
+    tours, persons       : from process_survey()
+    min_sample           : skip estimation if fewer than this many observations
+    feature_override     : if supplied, use this list of features instead of
+                           PERSON_FEATURES — passed from GA results to apply
+                           GA-selected variable sets.
+    landuse              : enriched landuse with *_acc columns, passed through
+                           to prepare_frequency_data() for home-zone
+                           accessibility features.
+    fit_nonmand_combined : if True (default), also estimate a single frequency
+                           model for n_nonmand_out = sum(all six nonmand purposes)
+                           and store Dirichlet split proportions in models['_nonmand']
+                           and models['_nonmand_split'].  predict_activity_frequency()
+                           uses these to replace the six individual predictions
+                           with a combined-count + multinomial-split prediction.
+    model_type           : 'ordered_logit' (default) or 'zero_inflated_probit'.
+                           Overrides STAGE1_FREQ_MODEL env var.  The
+                           zero-inflated ordered probit adds an excess-zero
+                           probit stage on top of the ordered count link.
     """
-    data = prepare_frequency_data(tours, persons)
-    if feature_override is not None:
-        feature_cols = [c for c in feature_override if c in data.columns]
-        if not feature_cols:
-            feature_cols = [c for c in PERSON_FEATURES if c in data.columns]
-    else:
-        feature_cols = [c for c in PERSON_FEATURES if c in data.columns]
-
+    data = prepare_frequency_data(tours, persons, landuse=landuse)
+    # ── GA dict override: recreate the engineered search-frame columns ────
+    # _run_ga_stage1 enriches its frame with ptype dummies, is_female,
+    # income flags, mandatory_role and _enrich_ga_data additions; a GA
+    # best_features dict can reference any of them. prepare_frequency_data
+    # only keeps columns named in DEFAULT_FEATURES_BY_PURPOSE (+ *_acc), so
+    # ensure them here or the "c in data.columns" filter silently drops
+    # every engineered GA selection.
+    if isinstance(feature_override, dict) and feature_override:
+        _attrs = dict(data.attrs)
+        try:
+            from ga_hypothesis_testing import ensure_ga_search_columns
+            data = ensure_ga_search_columns(data, persons, stage_id=1)
+            _missing = sorted(
+                {str(f) for vals in feature_override.values() for f in (vals or [])}
+                - set(data.columns)
+            )
+            logger.info(
+                f"GA feature override: ensured search-frame columns; "
+                f"unresolvable features: {_missing or 'none'}"
+            )
+        except Exception as _ee:
+            logger.warning(f"GA feature-column enrichment failed: {_ee}")
+        finally:
+            data.attrs.update(_attrs)
     models = {}
 
     for purpose in PURPOSES:
         col = f'n_{purpose}_out'
         models[purpose] = {}
 
-        ptypes = data['ptype'].unique()
+        # Only estimate for ptypes that logically can make trips of this purpose
+        _valid_set = VALID_PTYPES_FOR_PURPOSE.get(purpose, None)
+        ptypes = [
+            p for p in data['ptype'].unique()
+            if _valid_set is None or p in _valid_set
+        ]
 
         for ptype in ptypes:
             subset = data[data['ptype'] == ptype].copy()
+            feature_cols = _stage1_features_for_purpose(data, purpose, feature_override)
 
             if len(subset) < min_sample:
                 logger.warning(
@@ -524,6 +1070,10 @@ def estimate_frequency_models(
                 continue
 
             y = subset[col].values.astype(int)
+            # Bin to at most ORDERED_LOGIT_MAX_CLASSES categories so thresholds
+            # represent low / medium / high counts, not every individual value.
+            _max_cls = ORDERED_LOGIT_MAX_CLASSES.get(purpose, 4)
+            y = np.where(y >= _max_cls - 1, _max_cls - 1, y)
 
             # skip if everyone has 0 activities (not relevant for this ptype)
             if y.max() == 0:
@@ -531,13 +1081,71 @@ def estimate_frequency_models(
                 continue
 
             X_raw = subset[feature_cols].fillna(0).values.astype(float)
+            # ── Drop zero-variance columns BEFORE fitting ────────────────────
+            # A feature that is constant within this (purpose, ptype) segment
+            # (e.g. ptype_FullTimeWorker inside the WorkingStudent segment, or a
+            # workstat_* dummy that is all-0 here) carries no information: its
+            # coefficient is stuck at 0.0 with p≈1/NaN and it survives the
+            # magnitude/p-value prune below because removing it can fail the
+            # threshold-gap acceptance check. Removing it up front is the only
+            # reliable way to keep these dead 0.0 terms out of the final model.
+            _sd0 = X_raw.std(axis=0)
+            _keep0 = _sd0 > 1e-9
+            if not _keep0.all():
+                _dropped0 = [feature_cols[i] for i in range(len(feature_cols)) if not _keep0[i]]
+                logger.info(f"  {purpose}/{ptype}: dropping {len(_dropped0)} zero-variance "
+                            f"feature(s): {_dropped0}")
+                feature_cols = [feature_cols[i] for i in range(len(feature_cols)) if _keep0[i]]
+                X_raw = X_raw[:, _keep0]
+            if X_raw.shape[1] == 0:
+                logger.info(f"  {purpose}/{ptype}: all features zero-variance — skipping")
+                continue
             mu = X_raw.mean(axis=0)
             sd = X_raw.std(axis=0)
             sd[sd == 0] = 1.0
             X = (X_raw - mu) / sd
 
-            model = OrderedLogit()
+            model = _make_frequency_model(model_type)
             model.fit(X, y)
+            # ── Prune insignificant parameters (magnitude AND p-value) ────────
+            # Drop features that are near-zero OR statistically insignificant,
+            # then re-fit so standard errors reflect the trimmed specification.
+            # Iterate until no further pruning is possible (convergence in ≤3 rounds).
+            _zthresh  = float(os.environ.get('GA_SIG_COEF_ZERO',   '0.01'))
+            _pthresh  = float(os.environ.get('GA_SIG_PVAL_THRESH',  '0.10'))
+            for _prune_round in range(3):
+                if len(feature_cols) <= 1:
+                    break
+                coef_arr = np.asarray(model.coef_).ravel()
+                pvals    = getattr(model, 'p_value_', None)
+                # Keep a feature if its coefficient is large enough AND significant
+                keep_mask = np.ones(len(feature_cols), dtype=bool)
+                for _i in range(len(feature_cols)):
+                    near_zero = abs(coef_arr[_i]) < _zthresh
+                    insig     = (pvals is not None and _i < len(pvals)
+                                 and np.isfinite(pvals[_i]) and pvals[_i] > _pthresh)
+                    if near_zero or insig:
+                        keep_mask[_i] = False
+                keep_idx = np.where(keep_mask)[0]
+                if len(keep_idx) == len(feature_cols):
+                    break  # nothing to prune
+                if len(keep_idx) == 0:
+                    break  # would remove everything — stop
+                pruned_cols = [feature_cols[_i] for _i in keep_idx]
+                Xp = X[:, keep_idx]
+                try:
+                    mp = _make_frequency_model(model_type)
+                    mp.fit(Xp, y)
+                    if hasattr(mp, 'thresholds_') and len(mp.thresholds_) >= 2:
+                        gaps = np.diff(np.sort(mp.thresholds_))
+                        if gaps.min() >= 0.05:
+                            model        = mp
+                            feature_cols = pruned_cols
+                            X            = Xp
+                            mu           = mu[keep_idx]
+                            sd           = sd[keep_idx]
+                except Exception:
+                    break
             model.feature_names_ = feature_cols
 
             models[purpose][ptype] = {
@@ -556,9 +1164,165 @@ def estimate_frequency_models(
             )
 
     n_fitted = sum(len(v) for v in models.values())
-    print(f"Stage 1: fitted {n_fitted} ordered logit models "
+    _freq_model_name = _make_frequency_model(model_type).__class__.__name__
+    print(f"Stage 1: fitted {n_fitted} {_freq_model_name} models "
           f"({len(PURPOSES)} purposes × ptypes)")
+
+    # ── Combined non-mandatory count model (work/edu/nonmand GA segment) ────────
+    # This gives the total n_nonmand_out count.  Individual nonmand purposes are
+    # already fitted above in the PURPOSES loop with their own ptype-filtered
+    # ordered-logit models.  The Dirichlet split is kept as a fallback only.
+    if fit_nonmand_combined and 'n_nonmand_out' in data.columns:
+        models['_nonmand'] = {}
+        _nm_valid = VALID_PTYPES_FOR_PURPOSE.get('nonmand', None)
+        _nm_ptypes = [
+            p for p in data['ptype'].dropna().unique()
+            if _nm_valid is None or p in _nm_valid
+        ]
+        for ptype in _nm_ptypes:
+            subset = data[data['ptype'] == ptype].copy()
+            if len(subset) < min_sample:
+                continue
+            y = subset['n_nonmand_out'].values.astype(int)
+            _nm_max_cls = ORDERED_LOGIT_MAX_CLASSES.get('nonmand', 4)
+            y = np.where(y >= _nm_max_cls - 1, _nm_max_cls - 1, y)
+            if y.max() == 0:
+                continue
+            feature_cols = _stage1_features_for_purpose(data, 'nonmand', feature_override)
+            if not feature_cols:
+                break
+            X_raw = subset[feature_cols].fillna(0).values.astype(float)
+            mu = X_raw.mean(axis=0); sd = X_raw.std(axis=0); sd[sd == 0] = 1.0
+            X = (X_raw - mu) / sd
+            m = _make_frequency_model(model_type)
+            m.fit(X, y)
+            # p-value + magnitude pruning (same as per-purpose loop above)
+            _zthresh = float(os.environ.get('GA_SIG_COEF_ZERO',  '0.01'))
+            _pthresh = float(os.environ.get('GA_SIG_PVAL_THRESH', '0.10'))
+            for _ in range(3):
+                if len(feature_cols) <= 1:
+                    break
+                _c = np.asarray(m.coef_).ravel()
+                _pv = getattr(m, 'p_value_', None)
+                _km = np.ones(len(feature_cols), dtype=bool)
+                for _i in range(len(feature_cols)):
+                    if abs(_c[_i]) < _zthresh or (
+                        _pv is not None and _i < len(_pv)
+                        and np.isfinite(_pv[_i]) and _pv[_i] > _pthresh
+                    ):
+                        _km[_i] = False
+                _ki = np.where(_km)[0]
+                if len(_ki) in (0, len(feature_cols)):
+                    break
+                try:
+                    _mp = _make_frequency_model(model_type)
+                    _mp.fit(X[:, _ki], y)
+                    m = _mp; feature_cols = [feature_cols[i] for i in _ki]
+                    X = X[:, _ki]; mu = mu[_ki]; sd = sd[_ki]
+                except Exception:
+                    break
+            m.feature_names_ = feature_cols
+            models['_nonmand'][ptype] = {
+                'model': m, 'mu': mu, 'sd': sd, 'features': feature_cols,
+                'n_obs': len(subset), 'converged': m.converged_,
+            }
+            logger.info(f"  [nonmand/{ptype}] classes={m.classes_} feats={len(feature_cols)} n={len(subset)}")
+
+        # Dirichlet split kept as fallback; individual nonmand models (fitted in the
+        # PURPOSES loop above) are the primary prediction path.
+        models['_nonmand_split'] = estimate_nonmand_split(data)
+        n_nonmand_fitted = len(models['_nonmand'])
+        print(f"  + nonmand count model: {n_nonmand_fitted} ptype models "
+              f"(individual purpose models fitted in main loop above)")
+
     return models
+
+
+# ---------------------------------------------------------------------------
+# 4b.  NON-MANDATORY SPLIT HELPERS
+# ---------------------------------------------------------------------------
+
+def estimate_nonmand_split(data: pd.DataFrame) -> dict:
+    """
+    Estimate ptype-conditional proportions for splitting n_nonmand_out into
+    the six individual non-mandatory purposes via multinomial sampling.
+
+    Proportions are the observed share of each component in total nonmand
+    activity count per ptype, from HHTS persons with at least one nonmand trip.
+
+    Returns
+    -------
+    dict mapping ptype → np.ndarray shape (6,) summing to 1.0.
+    '_default' key holds global proportions as fallback.
+    """
+    nonmand_cols = [f'n_{p}_out' for p in NONMAND_PURPOSES]
+    _avail = [c for c in nonmand_cols if c in data.columns]
+    if not _avail:
+        unif = np.ones(len(NONMAND_PURPOSES)) / len(NONMAND_PURPOSES)
+        return {'_default': unif}
+
+    participants = data[data[_avail].sum(axis=1) > 0].copy()
+    split_props: dict = {}
+
+    for ptype, grp in participants.groupby('ptype'):
+        totals = np.array([grp[c].fillna(0).sum() for c in _avail], dtype=float)
+        if totals.sum() > 0:
+            split_props[ptype] = totals / totals.sum()
+        else:
+            split_props[ptype] = np.ones(len(NONMAND_PURPOSES)) / len(NONMAND_PURPOSES)
+
+    global_totals = np.array([participants[c].fillna(0).sum() for c in _avail], dtype=float)
+    split_props['_default'] = (global_totals / global_totals.sum()
+                               if global_totals.sum() > 0
+                               else np.ones(len(NONMAND_PURPOSES)) / len(NONMAND_PURPOSES))
+
+    logger.info("Nonmand split proportions by ptype:")
+    for pt, props in split_props.items():
+        if pt == '_default':
+            continue
+        logger.info("  %-22s %s" % (pt, "  ".join(f"{p}={v:.3f}" for p, v in zip(NONMAND_PURPOSES, props))))
+
+    return split_props
+
+
+def predict_nonmand_split(
+    synth: pd.DataFrame,
+    split_props: dict,
+    rng: np.random.Generator = None,
+) -> pd.DataFrame:
+    """
+    Distribute each person's n_nonmand_out across the six non-mandatory purposes
+    by ptype-conditional multinomial sampling.
+
+    Overwrites n_escort_out, n_shopping_out, n_social_out, n_othmaint_out,
+    n_othdiscr_out, n_eat_out.  Persons with n_nonmand_out == 0 get 0 for all.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    df = synth.copy()
+    for p in NONMAND_PURPOSES:
+        df[f'n_{p}_out'] = 0
+
+    _default_props = split_props.get('_default',
+                                     np.ones(len(NONMAND_PURPOSES)) / len(NONMAND_PURPOSES))
+
+    for ptype, grp in df.groupby('ptype'):
+        props = split_props.get(ptype, _default_props)
+        n_vals = grp['n_nonmand_out'].fillna(0).values.astype(int)
+        results = np.zeros((len(grp), len(NONMAND_PURPOSES)), dtype=int)
+
+        # Batch by unique n to vectorise multinomial sampling
+        for n in np.unique(n_vals):
+            if n <= 0:
+                continue
+            mask = n_vals == n
+            results[mask] = rng.multinomial(n, props, size=int(mask.sum()))
+
+        for j, purpose in enumerate(NONMAND_PURPOSES):
+            df.loc[grp.index, f'n_{purpose}_out'] = results[:, j]
+
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +1345,7 @@ def predict_activity_frequency(
     models: dict,
     sample: bool = True,
     seed: int = 42,
+    landuse: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
     Apply fitted models to a synthetic population.
@@ -594,6 +1359,9 @@ def predict_activity_frequency(
     sample  : if True, sample from predicted distribution (recommended);
               if False, return the modal prediction
     seed    : random seed for sampling
+    landuse : enriched landuse with *_acc columns — attached via OTAZ/ORDER
+              so synth predictions use the same accessibility features the
+              models were estimated with.
 
     Returns
     -------
@@ -612,9 +1380,45 @@ def predict_activity_frequency(
     if 'ptype' not in df.columns:
         df = assign_ptype_column(df)
 
+    # build the same categorical/accessibility features used at estimation
+    # time so the fitted coefficients apply meaningfully to the synth pop.
+    df = _add_categorical_person_features(df)
+    if landuse is not None:
+        from synth_attributes import attach_person_accessibility
+        df = attach_person_accessibility(df, landuse)
+    # Rebuild every other GA-searchable derived feature (workstat/studying
+    # flags, age bins, INDUSTRY/occp, household flags, taste interactions) so
+    # GA-selected terms resolve here instead of being silently zero-filled
+    # downstream. Non-fatal and idempotent (skips columns already built).
+    try:
+        from ga_hypothesis_testing import ensure_prediction_features
+        df = ensure_prediction_features(df, stage_id=1)
+    except Exception as _e:
+        logger.warning(f"prediction feature enrichment skipped: {_e}")
+
+    # ── day-pattern conditioning (ActivitySim hierarchy) ──────────────────
+    # If the GA selected dap_M/dap_N candidates, the synth side needs the same
+    # columns. Derive them from the predicted CDAP letter (written by
+    # predict_cdap / coordinate_household_cdap, which run before stage 1);
+    # dap_H is the reference category.
+    _cdap_col = next((c for c in ('CDAP', 'dap') if c in df.columns), None)
+    if _cdap_col is not None and ('dap_M' not in df.columns
+                                  or 'dap_N' not in df.columns):
+        _dap_letters = df[_cdap_col].astype(str).str.upper().str[0]
+        if 'dap_M' not in df.columns:
+            df['dap_M'] = (_dap_letters == 'M').astype(int)
+        if 'dap_N' not in df.columns:
+            df['dap_N'] = (_dap_letters == 'N').astype(int)
+
     # initialise output columns
     for purpose in PURPOSES:
         df[f'n_{purpose}_out'] = 0
+    df['n_nonmand_out'] = 0
+
+    # When the combined nonmand model is present, skip all six nonmand purposes
+    # in the per-purpose loop and predict them via the combined path below.
+    _use_nonmand_model = '_nonmand' in models and bool(models['_nonmand'])
+    _skip_purposes = set(NONMAND_PURPOSES) if _use_nonmand_model else set()
 
     # process each ptype group separately
     for ptype, grp in df.groupby('ptype'):
@@ -624,6 +1428,8 @@ def predict_activity_frequency(
         lookup_ptype = PTYPE_PREDICTION_MAP.get(ptype, ptype)
 
         for purpose in PURPOSES:
+            if purpose in _skip_purposes:
+                continue
             col = f'n_{purpose}_out'
 
             # per-(ptype, purpose) override takes precedence over the global map
@@ -664,6 +1470,36 @@ def predict_activity_frequency(
                 preds = model.predict(X)
 
             df.loc[idx, col] = preds
+
+    # ── Combined non-mandatory count prediction ───────────────────────────────
+    if _use_nonmand_model:
+        _nonmand_models = models['_nonmand']
+        _nonmand_fallback = (max(_nonmand_models.values(), key=lambda m: m['n_obs'])
+                             if _nonmand_models else None)
+        for ptype, grp in df.groupby('ptype'):
+            idx = grp.index
+            lookup_ptype = PTYPE_PREDICTION_MAP.get(ptype, ptype)
+            entry = (_nonmand_models.get(lookup_ptype)
+                     or _nonmand_models.get(ptype)
+                     or _nonmand_fallback)
+            if entry is None:
+                continue
+            feature_cols = entry['features']
+            X_raw = np.zeros((len(grp), len(feature_cols)))
+            for j, col_name in enumerate(feature_cols):
+                if col_name in grp.columns:
+                    X_raw[:, j] = grp[col_name].fillna(0).values.astype(float)
+            X = (X_raw - entry['mu']) / entry['sd']
+            if sample:
+                proba = entry['model'].predict_proba(X)
+                J = len(entry['model'].classes_)
+                preds = np.array([
+                    entry['model'].classes_[rng.choice(J, p=proba[i])]
+                    for i in range(len(grp))
+                ])
+            else:
+                preds = entry['model'].predict(X)
+            df.loc[idx, 'n_nonmand_out'] = preds
 
     # ── Preschool constraints ────────────────────────────────────────────────
     # Preschool children attend childcare/kindergarten (modelled as edu).
@@ -890,15 +1726,22 @@ def _emit_model_entry(rows: list, entry: dict, label: str) -> None:
 def save_models(models: dict, path: str = 'saved_data/stage1_models.pkl'):
     """Pickle the fitted models dict and write an HTML coefficient report."""
     import pickle, os
-    from paper_model_forms import write_stage_paper_artifacts
+    # Save pkl first — artifact generation is non-fatal.
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
     with open(path, 'wb') as f:
         pickle.dump(models, f)
     print(f"Models saved to {path}")
-    html_path = path.replace('.pkl', '_report.html')
-    _write_model_html(models, html_path, 'Stage 1 — Activity Frequency',
-                      notes=f'Saved: {path}')
-    write_stage_paper_artifacts('stage1', os.path.dirname(path) or 'saved_data')
+    try:
+        html_path = path.replace('.pkl', '_report.html')
+        _write_model_html(models, html_path, 'Stage 1 — Activity Frequency',
+                          notes=f'Saved: {path}')
+    except Exception as _html_e:
+        print(f"  Stage 1 HTML report failed (non-fatal): {_html_e}")
+    try:
+        from paper_model_forms import write_stage_paper_artifacts
+        write_stage_paper_artifacts('stage1', os.path.dirname(path) or 'saved_data')
+    except Exception as _paper_e:
+        print(f"  Stage 1 paper artifacts failed (non-fatal): {_paper_e}")
 
 
 def load_models(path: str = 'saved_data/stage1_models.pkl') -> dict:
@@ -1060,6 +1903,8 @@ def run_stage1(
     seed: int = 42,
     save_path: str = 'saved_data/stage1_models.pkl',
     feature_override: list = None,
+    landuse: pd.DataFrame = None,
+    model_type: str = None,
 ) -> tuple:
     """
     Estimate on HHTS, predict on synthetic population.
@@ -1073,6 +1918,11 @@ def run_stage1(
     save_path         : where to pickle the fitted models
     feature_override  : GA-selected feature list — passed to estimate_frequency_models
                         to use the GA's winning variables instead of PERSON_FEATURES.
+    landuse           : enriched landuse with *_acc columns — passed through to
+                        estimation and prediction so home-zone accessibility is
+                        used as a feature.
+    model_type        : 'ordered_logit' (default) or 'zero_inflated_probit'.
+                        Overrides STAGE1_FREQ_MODEL env var.
     """
     logging.basicConfig(level=logging.INFO, format='%(levelname)s  %(message)s')
     print("=" * 55)
@@ -1080,21 +1930,37 @@ def run_stage1(
     print("=" * 55)
     if feature_override:
         print(f"  Feature override: {feature_override}")
+    _freq_model_name = _make_frequency_model(model_type).__class__.__name__
+    print(f"  Frequency model: {_freq_model_name}")
 
     print("\n[1/2] Estimating models from HHTS...")
     models = estimate_frequency_models(tours, persons,
-                                       feature_override=feature_override)
+                                       feature_override=feature_override,
+                                       landuse=landuse,
+                                       model_type=model_type)
 
     if save_path:
         save_models(models, save_path)
 
     print("\n[2/2] Predicting synthetic population...")
     synth_pred = predict_activity_frequency(synth, models,
-                                            sample=sample, seed=seed)
+                                            sample=sample, seed=seed,
+                                            landuse=landuse)
+
+    if '_nonmand_split' in models and '_nonmand' in models and bool(models['_nonmand']):
+        print("  Splitting n_nonmand_out → escort/shopping/social/othmaint/othdiscr/eat (multinomial)...")
+        synth_pred = predict_nonmand_split(synth_pred, models['_nonmand_split'],
+                                           rng=np.random.default_rng(seed + 2))
 
     print("\n[3/3] Calibrating to HHTS aggregate rates...")
     rng_cal = np.random.default_rng(seed + 1)
     synth_pred = calibrate_activity_rates(synth_pred, persons, tours, rng=rng_cal)
+
+    # Re-sync the combined count after calibration adjusts the individual columns
+    if 'n_nonmand_out' in synth_pred.columns:
+        _dc = [f'n_{p}_out' for p in NONMAND_PURPOSES if f'n_{p}_out' in synth_pred.columns]
+        if _dc:
+            synth_pred['n_nonmand_out'] = synth_pred[_dc].sum(axis=1)
 
     print("\nStage 1 complete. Pass synth_pred to run_stage2().")
     return synth_pred, models
@@ -1218,6 +2084,18 @@ if __name__ == '__main__':
             save_path=UL_CSV,
         )
     else:
+        # ── resume: attach cached accessibility (if available) to landuse ─
+        ACC_CSV = 'saved_data/accessibility.csv'
+        if os.path.isfile(ACC_CSV):
+            from compute_accessibility import attach_to_landuse
+            log.info(f"Resume mode: attaching cached accessibility from {ACC_CSV}")
+            acc_df = pd.read_csv(ACC_CSV).set_index('zone_id')
+            landuse = attach_to_landuse(sc.get_land(), acc_df)
+        else:
+            log.warning(f"No cached accessibility found at {ACC_CSV} — "
+                        f"Stage 1 will run without accessibility features")
+            landuse = sc.get_land()
+
         # ── resume: load CDAP/UL output if available ─────────────────────
         if os.path.isfile(UL_CSV):
             log.info(f"Resume mode: loading {UL_CSV}")
@@ -1227,7 +2105,6 @@ if __name__ == '__main__':
             synth = pd.read_csv(CDAP_CSV)
         else:
             log.warning("No saved CDAP/UL output found — loading raw synth (no CDAP filter applied)")
-            landuse = sc.get_land()
             synth = _load_synth(zone_arg, landuse)
 
     # ── CDAP traveller filter ────────────────────────────────────────────
@@ -1240,7 +2117,7 @@ if __name__ == '__main__':
 
     # ── run Stage 1 ──────────────────────────────────────────────────────
     os.makedirs(_OUT, exist_ok=True)
-    synth_s1, models = run_stage1(out['tours'], out['persons'], travellers)
+    synth_s1, models = run_stage1(out['tours'], out['persons'], travellers, landuse=landuse)
     synth_s1.to_csv(os.path.join(_OUT, 'stage1_output.csv'), index=False)
     log.info(f"Stage 1 output saved → {_OUT}/stage1_output.csv")
     log.info(f"Pass {_OUT}/stage1_output.csv to stage2_day_duration.py")

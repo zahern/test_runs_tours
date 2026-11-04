@@ -14,8 +14,43 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings('ignore')
 
-DIR_BASE  = 'runs/safety_baseline'
-DIR_NOSA  = 'runs/safety_nosafety'
+
+def _latest_run_dir(prefix: str, base: str = None) -> str:
+    """
+    Return the most-recently-modified run directory whose name starts with
+    ``prefix`` (e.g. 'safety_baseline').  Falls back to ``runs/<prefix>``
+    (the old fixed name) if nothing with a job-tag suffix exists.
+    """
+    if base is None:
+        # Honor the PBS runner's RUN_ROOT (e.g. runs/ga_parallel) so arms
+        # submitted with RUN_ROOT!=runs are still found; fall back to 'runs'.
+        base = os.environ.get('PIPELINE_RUN_ROOT', 'runs')
+    import glob as _glob
+    pattern = os.path.join(base, prefix + '__*')
+    candidates = sorted(
+        _glob.glob(pattern),
+        key=lambda p: os.path.getmtime(p) if os.path.isdir(p) else 0,
+        reverse=True,
+    )
+    # Filter to directories only
+    candidates = [p for p in candidates if os.path.isdir(p)]
+    # Prefer a directory that actually contains completed stage-6 outputs:
+    # the newest dir is usually the most recent attempt, which may be an
+    # OOM-killed shell (observed 16/10) — comparing two empty runs produced
+    # an all-zero report.
+    complete = [p for p in candidates
+                if any(os.path.isfile(os.path.join(p, f))
+                       for f in ('stage6_output.csv', 'trips_for_aimsun.csv'))]
+    if complete:
+        return complete[0]
+    if candidates:
+        return candidates[0]
+    # Legacy fixed name
+    return os.path.join(base, prefix)
+
+
+DIR_BASE  = _latest_run_dir('safety_baseline')
+DIR_NOSA  = _latest_run_dir('safety_nosafety')
 DIR_OUT   = 'runs/safety_analysis'
 PLOTS_DIR = os.path.join(DIR_OUT, 'plots')
 os.makedirs(PLOTS_DIR, exist_ok=True)
@@ -23,7 +58,12 @@ os.makedirs(PLOTS_DIR, exist_ok=True)
 MODE_NAMES  = {1:'Drive Alone',2:'Shared Ride',3:'Walk',4:'Bike',5:'Transit'}
 MODE_COLORS = {'Drive Alone':'#E74C3C','Shared Ride':'#E67E22',
                'Walk':'#2ECC71','Bike':'#3498DB','Transit':'#9B59B6'}
+_NEW_POP_DIR = os.environ.get('NEW_POP_DIR', os.path.join('..', 'new_pop'))
 LANDUSE_CANDIDATES = [
+    # 371-zone system first (SA2-keyed; ORDER derived from SA2_MAIN16 below)
+    os.path.join(_NEW_POP_DIR, 'saved_data', 'zone_landuse_357.csv'),
+    os.path.join('saved_data', 'zone_landuse_overture.csv'),
+    # legacy 330-zone fallbacks
     'zone_order_and_landuse.csv',
     os.path.join('saved_data', 'zone_order_and_landuse.csv'),
 ]
@@ -45,6 +85,17 @@ def load_run(d, label):
 BASE = load_run(DIR_BASE, 'With Safety Skims')
 NOSA = load_run(DIR_NOSA, 'Without Safety Skims')
 
+_missing = []
+for _r in (BASE, NOSA):
+    if _r['plan'].empty and _r['aimsun'].empty:
+        _missing.append(f"{_r['label']} ({_r['dir']})")
+if _missing:
+    print("\nERROR: safety arm(s) have no stage6_output.csv / "
+          "trips_for_aimsun.csv: " + "; ".join(_missing))
+    print("       Refusing to compare incomplete runs — re-run "
+          "job_safety_experiment.pbs after the arms finish.")
+    sys.exit(2)
+
 
 def load_landuse():
     for p in LANDUSE_CANDIDATES:
@@ -52,6 +103,11 @@ def load_landuse():
             try:
                 df = pd.read_csv(p)
                 print(f"  ✓ landuse: {p} ({len(df):,} zones)")
+                # 371 convention (mirrors data_connect): ORDER carries the
+                # SA2 code when no legacy ORDER column exists.
+                if 'ORDER' not in df.columns and 'SA2_MAIN16' in df.columns:
+                    df['ORDER'] = pd.to_numeric(df['SA2_MAIN16'],
+                                                errors='coerce')
                 return df
             except Exception as e:
                 print(f"  × landuse failed from {p}: {e}")
@@ -228,8 +284,8 @@ def build_safety_proxy_summary():
         return {}
     lu = LANDUSE.copy()
     for col in ['EATOUT', 'Shopping', 'Entertainment', 'community', 'civic',
-                'park', 'sport', 'childcare', 'Healthcare', 'commercial',
-                'retail', 'industrial', 'TOTPOP']:
+                'park', 'sport', 'recreation_ground', 'childcare', 'Healthcare',
+                'commercial', 'retail', 'industrial', 'TOTPOP']:
         if col not in lu.columns:
             lu[col] = 0.0
         lu[col] = pd.to_numeric(lu[col], errors='coerce').fillna(0.0)
@@ -240,7 +296,12 @@ def build_safety_proxy_summary():
     lu['community_presence_proxy'] = (
         lu['community'] + lu['civic'] + lu['childcare'] + lu['Healthcare']
     )
-    lu['open_space_proxy'] = lu['park'] + lu['sport']
+    # open_space_proxy: `park`/`sport` are ~empty in the SEQ extract
+    # (327/329 zones exactly 0 — verified 2026-09); open space in this build
+    # lives in `recreation_ground`, so anchor on it with park/sport as
+    # add-ons rather than the base.
+    lu['open_space_proxy'] = (lu['recreation_ground'] + lu['park']
+                              + lu['sport'])
     lu['exposure_proxy'] = lu['TOTPOP'] + 0.25 * lu['industrial']
     return {
         'frontage_top3': lu.nlargest(3, 'activity_frontage_proxy')[['ORDER', 'activity_frontage_proxy']]
@@ -256,11 +317,39 @@ def build_safety_proxy_summary():
     }
 
 # ── HTML report ───────────────────────────────────────────────────────────────
-SAFETY_COEFFS = {
-    'WORK mode  c_crash_veh': -0.0782,  'EDU mode c_crash_veh':  0.0056,
-    'NONMAND    c_crash_veh': -0.0182,  'WORK dest c_crash':     -0.1863,
-    'EDU dest   c_crash':     -0.1995,  'NONMAND dest c_crash':  -0.2361,
-}
+def _read_safety_coeffs(baseline_coef_path: str) -> dict:
+    """Read crash/safety coefficients from the baseline coefficient CSV."""
+    coeffs = {}
+    if os.path.exists(baseline_coef_path):
+        try:
+            df = pd.read_csv(baseline_coef_path)
+            param_col = next((c for c in df.columns
+                             if c.lower() in ('parameter', 'coef_name', 'coefficient_name', 'name', 'variable')),
+                            df.columns[0])
+            val_col = next((c for c in df.columns
+                           if c.lower() in ('value', 'coef', 'estimate')), None)
+            if val_col:
+                crash_rows = df[df[param_col].str.lower().str.contains('crash', na=False)]
+                for _, row in crash_rows.iterrows():
+                    seg = str(row.get('segment', row.get('purpose', '')))
+                    param = str(row[param_col])
+                    val = pd.to_numeric(row[val_col], errors='coerce')
+                    key = f"{seg} {param}" if seg else param
+                    coeffs[key] = float(val) if pd.notna(val) else 0.0
+        except Exception:
+            pass
+    return coeffs
+
+SAFETY_COEFFS = _read_safety_coeffs(os.path.join(DIR_BASE, 'stage5_models_coefficients.csv'))
+if not SAFETY_COEFFS:
+    SAFETY_COEFFS = _read_safety_coeffs(os.path.join(DIR_BASE, 'stage5_tour_coefficients.csv'))
+if not SAFETY_COEFFS:
+    # Fallback defaults if no coefficient file is found
+    SAFETY_COEFFS = {
+        'WORK mode  c_crash_veh': -0.0782,  'EDU mode c_crash_veh':  0.0056,
+        'NONMAND    c_crash_veh': -0.0182,  'WORK dest c_crash':     -0.1863,
+        'EDU dest   c_crash':     -0.1995,  'NONMAND dest c_crash':  -0.2361,
+    }
 
 def write_report(summary, plot_files):
     out_path = os.path.join(DIR_OUT, 'safety_report.html')
@@ -349,6 +438,104 @@ Baseline: {DIR_BASE} | No-safety: {DIR_NOSA}</p>
     print(f"\n  HTML report → {out_path}")
     return out_path
 
+# ── Presentation injection ───────────────────────────────────────────────────
+_SLIDE_START = '<!--SAFETY_OUTCOME_SLIDE_START-->'
+_SLIDE_END   = '<!--SAFETY_OUTCOME_SLIDE_END-->'
+_PRESENTATIONS = [
+    os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  '..', 'abm_safety', 'intergrade_model_treivewal.html')),
+    os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  '..', 'abm_safety', 'model_review_deck.html')),
+]
+
+
+def inject_presentation_slide(summary, plot_files):
+    """Copy the comparison figures into abm_safety/Figures/safety_plots and
+    inject (or refresh) a 'safety vs no-safety outcome' slide into the
+    presentation decks. Both decks use the same track/section.slide pattern,
+    and their nav JS builds dots from track.children, so an appended section
+    is picked up automatically. Sentinel-wrapped so reruns replace in place.
+    Non-fatal: presentation refresh must never fail the analysis."""
+    import shutil, re as _re
+    try:
+        fig_dir = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            '..', 'abm_safety', 'Figures', 'safety_plots'))
+        os.makedirs(fig_dir, exist_ok=True)
+        for p in plot_files:
+            if os.path.exists(p):
+                shutil.copy2(p, os.path.join(fig_dir, os.path.basename(p)))
+
+        # headline deltas: summary rows are [baseline, nosafety, delta]
+        _d = summary.iloc[2] if len(summary) >= 3 else {}
+        def _g(key):
+            return str(_d.get(key, 'n/a')).replace('%', '') if hasattr(_d, 'get') else 'n/a'
+        stats = [
+            (_g('Active mode %'), 'active-mode share (walk+bike), pp change when crash risk is removed'),
+            (_g('Drive Alone'),   'drive-alone share, pp change'),
+            (_g('Walk'),          'walk share, pp change'),
+            (_g('Bike'),          'bike share, pp change'),
+        ]
+        tiles = ''.join(
+            f"<div class='stat'><div class='value'>{v}</div><div class='label'>{l}</div></div>"
+            for v, l in stats)
+        coef_rows = ''.join(
+            f"<li><code>{n}</code>: {v:.4f} "
+            f"({'deters exposure-weighted travel' if v < -0.01 else 'negligible / wrong sign - flagged'})</li>"
+            for n, v in list(SAFETY_COEFFS.items())[:6])
+        slide = f"""{_SLIDE_START}
+      <section class="slide" id="safety-outcome-slide">
+        <h2 class="slide-kicker">Experiment Outcome · auto-refreshed by safety_experiment_analysis.py</h2>
+        <h1 class="slide-title">Safety vs no-safety: what the crash skims change</h1>
+        <div class="body-area" style="gap:1.2vh;">
+          <div class="grid" style="grid-template-columns: repeat(4, 1fr);">{tiles}</div>
+          <div class="grid" style="grid-template-columns: 1fr 1fr; flex:1; min-height:0;">
+            <div class="card" style="min-height:0;">
+              <h3 style="margin-top:0;">Mode share: crash skims on vs off</h3>
+              <img src="Figures/safety_plots/01_mode_shares.png" style="max-width:100%; max-height:38vh; object-fit:contain;">
+            </div>
+            <div class="card" style="min-height:0;">
+              <h3 style="margin-top:0;">Where active travel shifts (by zone)</h3>
+              <img src="Figures/safety_plots/05_zone_active_shift.png" style="max-width:100%; max-height:38vh; object-fit:contain;">
+            </div>
+          </div>
+          <div class="card">
+            <h3 style="margin-top:0;">Implications for intended use</h3>
+            <ul class="plain" style="font-size:0.8rem; gap:0.4em;">
+              <li>The gap between the two runs is the demand suppressed by crash risk — zones with the largest active-mode shift are where safety infrastructure buys the most mode change, and are the priority list for the DTA scenario runs (vehicle.dat demand differs between arms).</li>
+              <li>Crash coefficients in the fitted models: <ul style="font-size:0.95em;">{coef_rows}</ul></li>
+              <li>Full detail: <code>safety_report.html</code> in the safety_analysis run dir.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+      {_SLIDE_END}"""
+
+        for deck in _PRESENTATIONS:
+            if not os.path.exists(deck):
+                continue
+            with open(deck, 'r', encoding='utf-8') as fh:
+                html = fh.read()
+            pat = _re.compile(_re.escape(_SLIDE_START) + '.*?' + _re.escape(_SLIDE_END),
+                              _re.DOTALL)
+            if pat.search(html):
+                html = pat.sub(slide, html)
+            else:
+                # append as the deck's final slide: after the last </section>
+                # inside the track (nav JS enumerates track.children)
+                idx = html.rfind('</section>')
+                if idx < 0:
+                    print(f'  [slide] no </section> in {deck} - skipped')
+                    continue
+                insert_at = idx + len('</section>')
+                html = html[:insert_at] + '\n\n' + slide + html[insert_at:]
+            with open(deck, 'w', encoding='utf-8') as fh:
+                fh.write(html)
+            print(f'  [slide] safety outcome slide -> {deck}')
+    except Exception as _e:
+        print(f'  [slide] presentation injection failed (non-fatal): {_e}')
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     print('='*60)
@@ -375,4 +562,5 @@ if __name__ == '__main__':
     print(f'\nSummary:\n{summary.to_string(index=False)}')
 
     write_report(summary, plots)
+    inject_presentation_slide(summary, plots)
     print(f'\n{"="*60}\nDONE — see {DIR_OUT}/safety_report.html\n{"="*60}')

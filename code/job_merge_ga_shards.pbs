@@ -1,0 +1,84 @@
+#!/bin/bash -l
+# Merge sharded GA artifacts into one ga_results.pkl (see SHARDED_JOBS.md).
+
+#PBS -m n
+#PBS -r y
+#PBS -P FPAXJW8067
+#PBS -l select=1:ncpus=1:mem=8GB
+#PBS -l walltime=01:00:00
+
+set -euo pipefail
+
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:?RUN_TAG is required}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+# Underscore-separated (qsub -v is comma-separated, so commas can't travel).
+STAGE_IDS=${STAGE_IDS:-0_1_2_3_4_5_51}
+STAGE_IDS=${STAGE_IDS//_/,}
+STRICT_MERGE=${STRICT_MERGE:-0}
+# Optional: take stage 5 from a promoted artifact instead of the shard pkls.
+# qsub -v "RUN_TAG=qld_conv1,STAGE5_FROM=runs/ga_parallel/qld_conv1/stage5/promoted/ga_results_promoted.pkl"
+# Without it, stage 5 merges the pre-promotion specs stored in
+# stage5/shards/*/ga_results.pkl (the 20/10 best fits only exist as npz there).
+STAGE5_FROM=${STAGE5_FROM:-}
+
+cd "$PBS_O_WORKDIR"
+# Single-conda rule (same as job_ga_shard_single.pbs): activate the console
+# miniconda env by explicit prefix — never by bare name, which the module
+# Anaconda would resolve against its own envs instead of ~/miniconda3/envs.
+CONDA_BASE=${CONDA_BASE:-/mnt/hpccs01/home/ahernz/miniconda3}
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_BASE}/envs/${CONDA_ENV}"
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+echo "python: $(which python) ($(python --version 2>&1))"
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+echo "=========================================="
+echo "Merge GA shards job : ${PBS_JOBID:-unknown}"
+echo "Run tag             : ${RUN_TAG}"
+echo "Stage ids           : ${STAGE_IDS}"
+echo "Strict              : ${STRICT_MERGE}"
+echo "Stage-5 source      : ${STAGE5_FROM:-shards/*/ga_results.pkl}"
+echo "Started             : $(date)"
+echo "=========================================="
+
+MERGE_ARGS=(--run-root "${RUN_ROOT}" --run-tag "${RUN_TAG}" --stage-ids "${STAGE_IDS}")
+if [ "${STRICT_MERGE}" = "1" ]; then
+  MERGE_ARGS+=(--strict)
+fi
+if [ -n "${STAGE5_FROM}" ]; then
+  if [ ! -f "${STAGE5_FROM}" ]; then
+    echo "FATAL: STAGE5_FROM=${STAGE5_FROM} does not exist" >&2
+    exit 5
+  fi
+  MERGE_ARGS+=(--stage5-from "${STAGE5_FROM}")
+fi
+
+python -u -X utf8 merge_ga_shards.py "${MERGE_ARGS[@]}"
+EXIT_CODE=$?
+
+REPORT_DIR="${RUN_ROOT}/${RUN_TAG}/merged"
+if python -u -X utf8 constraint_report.py --out-dir "${REPORT_DIR}"; then
+  echo "Constraint/search report -> ${REPORT_DIR}/constraint_report.{csv,html}"
+else
+  echo "constraint_report skipped (non-fatal)"
+fi
+
+# Optional auto-publish (Stage A) into the preprint tree:
+# qsub -v "RUN_TAG=<tag>,PUBLISH_PAPER=1" job_submit_ga_sharded.pbs
+# flows PUBLISH_PAPER through; Stage B (validation/safety) refreshes on the
+# next publish_paper_artifacts.py run after predict finishes.
+PUBLISH_PAPER=${PUBLISH_PAPER:-0}
+if [ "${PUBLISH_PAPER}" = "1" ]; then
+  if python -u -X utf8 publish_paper_artifacts.py --run-tag "${RUN_TAG}" --run-root "${RUN_ROOT}"; then
+    echo "Paper artifacts (Stage A) published -> ../abm_safety/preprint/{figures,tables}"
+  else
+    echo "publish_paper_artifacts skipped (non-fatal)"
+  fi
+fi
+
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+exit "${EXIT_CODE}"

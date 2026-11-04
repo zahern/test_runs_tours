@@ -97,19 +97,23 @@ AGEP_TO_AGEGROUP = {
 }
 
 # ── Work status (hrsp → WORKSTAT) ─────────────────────────────────────────
-# hrsp: 1=not in labour force, 2=unemployed, 3=1-15h, 4=16-24h,
-#        5=25-34h, 6=35-39h, 7=40h, 8=41-49h, 9=50h+
+# ABS HRSP is HOURS WORKED PER WEEK (not a labour-force status):
+#   1=0h (incl. N/A), 2=1-4, 3=5-9, 4=10-14, 5=15-19,
+#   6=20-24, 7=25-29, 8=30-34, 9=35-39, 10=40h+
 # WORKSTAT: 0=other/unemployed, 1=part-time, 2=full-time
+# NOTE: prefer deriving WORKSTAT from LFSP where available — hours alone cannot
+# distinguish "unemployed" from "employed 1-4h".
 HRSP_TO_WORKSTAT = {
-    1: 0,   # not in labour force
-    2: 0,   # unemployed
-    3: 1,   # 1-15h → part-time
-    4: 1,   # 16-24h → part-time
-    5: 1,   # 25-34h → part-time (borderline)
-    6: 2,   # 35-39h → full-time
-    7: 2,   # 40h
-    8: 2,   # 41-49h
-    9: 2,   # 50h+
+    1: 0,   # 0 hours / not applicable
+    2: 1,   # 1-4h   → part-time
+    3: 1,   # 5-9h   → part-time
+    4: 1,   # 10-14h → part-time
+    5: 1,   # 15-19h → part-time
+    6: 1,   # 20-24h → part-time
+    7: 1,   # 25-29h → part-time
+    8: 1,   # 30-34h → part-time
+    9: 2,   # 35-39h → full-time
+    10: 2,  # 40h+    → full-time
 }
 
 # ── Study type (stup/typp → STUDYING) ─────────────────────────────────────
@@ -239,6 +243,19 @@ def map_census_to_hhts(
 
     # ── AGEGROUP ──────────────────────────────────────────────────────
     if 'agep' in df.columns:
+        _ap = pd.to_numeric(df['agep'], errors='coerce')
+        # `agep` here means the 5-year BAND INDEX (1=0-4 ... 18=85+), NOT the raw
+        # ABS AGEP code (0=age 0, 1=age 1, ... 25=25-29 ... 37=85+).  Feeding raw
+        # AGEP silently mislabels every code outside 1-18 as '25-34' (~81% of the
+        # population) because AGEP_TO_AGEGROUP has no keys for 0 or 19-37.
+        # Use export_synth_pop_for_travel.py (or age5p below) to do the conversion.
+        if _ap.max() is not None and _ap.max() > 18:
+            raise ValueError(
+                "agep looks like raw ABS AGEP codes (max=%s) but must be the 5-year "
+                "band index 1..18 (1=0-4 ... 18=85+). Convert first, e.g. "
+                "band = agep//5 + 1 for agep<=24 else agep-19, or supply 'age5p'."
+                % _ap.max()
+            )
         df['AGEGROUP'] = df['agep'].map(AGEP_TO_AGEGROUP).fillna('25-34')
     elif 'age5p' in df.columns:
         bins   = [0,5,12,18,25,35,45,55,65,75,200]
@@ -763,7 +780,7 @@ def run_ga_extended(
         mutation_rate    = mutation_rate,
         crossover_rate   = 0.75,
         elitism_k        = 4,
-        min_features     = 2,
+        min_features     = 3,    # at least 3 features: prevents degenerate 1-2 var models
         tournament_k     = 4,
         stagnation_limit = 12,
         seed             = seed,
@@ -1067,6 +1084,12 @@ def run_ga_stage1(tours, persons, **kw):
     """Shim — delegates to ga_hypothesis_testing.run_ga_stage(stage=1)."""
     from ga_hypothesis_testing import run_ga_stage
     return run_ga_stage(stage=1, tours=tours, persons=persons, **kw)
+
+
+def run_ga_cdap(persons, **kw):
+    """Shim — delegates to ga_hypothesis_testing.run_ga_stage(stage=0)."""
+    from ga_hypothesis_testing import run_ga_stage
+    return run_ga_stage(stage=0, persons=persons, **kw)
 
 
 def run_ga_stage2(tours, persons, **kw):

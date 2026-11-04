@@ -1,0 +1,199 @@
+#!/bin/bash -l
+#PBS -N nearmiss_crash
+#PBS -l walltime=06:00:00
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r n
+# No-restarts policy: single-run GA; do not auto-rerun (a rerun would duplicate
+# a seeded single trajectory and confuse convergence reporting).
+
+# ============================================================================
+# Near-Miss / Crash Proxy Analysis -- full paper pipeline
+#
+# Runs nearmiss_crash_analysis.py end to end:
+#   Step 1  Dual Harmony Search (NM-response and Crash-response feature sets)
+#   Step 2  Full models on both responses (same geometry)
+#   Step 3  Coefficient proportionality test (NM vs Crash betas)
+#   Step 4  Specification transfer test
+#   Step 5  Encompassing test
+#   Step 6  Bivariate copula dependence test (Frank / Normal / Kimeldorf-
+#           Sampson, + Famoye and Marshall-Olkin baselines) -- this is the
+#           bivariate-copula analysis added this session.
+#   Step 7  Vuong non-nested model test
+#   Step 8  Evidence synthesis / verdict
+#
+# Outputs (all written to this directory unless noted):
+#   log_nearmiss_crash.out / .err   -- full run log
+#   proxy_analysis_evidence.csv     -- Step 8 evidence table
+#   bivariate_copula_comparison.csv -- Step 6 model comparison (Table 4 in the paper)
+#   bivariate_copula_best_coefs.csv -- Step 6 best-copula coefficient table
+#   plots/fig_model_comparison.png
+#   plots/fig_coef_proportionality.png
+#   plots/fig_copula_bic_comparison.png
+#   plots/fig_nm_crash_dependence.png
+#
+# SELF-CONTAINED SOURCE:
+#   bivariate_copula.py, main_hpc.py, main_hpc_lc_patch.py, and
+#   Solvers_METAJAX.py are vendored copies sitting in this same directory
+#   (not the pip-installed `metacountregressor` package). Because the job's
+#   own directory is first on sys.path, these vendored copies are what
+#   actually get imported -- this guarantees the JAX-Hessian / copula-
+#   formula fixes made this session are used, regardless of what version
+#   happens to be pip-installed in the cluster's conda env. If
+#   metacountregressor's bivariate_copula.py is ever upgraded upstream,
+#   re-sync these four files from the source repo before resubmitting.
+#
+# PREREQUISITE -- EDIT BEFORE SUBMITTING:
+#   NM_DATA_PATH below must point to the Linux-side path of
+#   near_miss_ecf.csv (the network share mapped as Z:\test_runs_tours\...
+#   on Windows). The exact cluster mount point was not known at the time
+#   this script was written -- the job fails fast with a clear error if
+#   this is left unset.
+#
+# SUBMIT:
+#   qsub job_nearmiss_crash.pbs
+# ============================================================================
+
+cd $PBS_O_WORKDIR
+
+# ------------------------------------------------------------------
+# Derive data path automatically.
+# near_miss_ecf.csv lives two directories above this .pbs file:
+#   <share>/test_runs_tours/demand_/paper/<TRB_folder>  <- PBS_O_WORKDIR
+#   <share>/test_runs_tours/demand_/near_miss_ecf.csv   <- data file
+# We use cd+pwd so the path is fully resolved before Python sees it,
+# which handles mixed-slash paths on Windows-side PBS clusters.
+# ------------------------------------------------------------------
+export NM_DATA_PATH="$(cd "${PBS_O_WORKDIR}/../.." && pwd)/near_miss_ecf.csv"
+echo "[$(date)] NM_DATA_PATH = $NM_DATA_PATH"
+
+module purge
+module load Anaconda3/2024.02-1
+
+# Clean old outputs from a previous attempt (the PBS .o file is the log)
+mkdir -p plots
+
+conda activate zigenv
+module unload Anaconda3
+
+# ------------------------------------------------------------------
+# JAX / XLA settings -- this analysis is CPU-only (scipy L-BFGS-B +
+# JAX autodiff for gradients/Hessians on small parameter vectors, no
+# GPU work at all), so force CPU explicitly and disable preallocation.
+# ------------------------------------------------------------------
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+
+# ------------------------------------------------------------------
+# Data path sanity check
+# ------------------------------------------------------------------
+if [ ! -f "$NM_DATA_PATH" ]; then
+    echo "ERROR: data file not found at: $NM_DATA_PATH"
+    echo "       PBS_O_WORKDIR was: $PBS_O_WORKDIR"
+    echo "       Expected near_miss_ecf.csv two directories above the"
+    echo "       job's submit directory. Check the share mount layout."
+    exit 1
+fi
+echo "[$(date)] Data file OK: $NM_DATA_PATH"
+
+# ------------------------------------------------------------------
+# Package check + confirm vendored source resolves ahead of any
+# pip-installed metacountregressor copy
+# ------------------------------------------------------------------
+echo "[$(date)] Checking packages ..."
+python -c "
+import jax, jaxlib, numpy, pandas, scipy, sklearn, psutil, matplotlib, joblib
+print('  jax', jax.__version__, '| jaxlib', jaxlib.__version__)
+print('  numpy', numpy.__version__, '| pandas', pandas.__version__)
+print('  matplotlib', matplotlib.__version__, '| sklearn', sklearn.__version__)
+import jaxopt
+print('  jaxopt OK')
+try:
+    import metacountregressor
+    print('  metacountregressor present (informational only -- see note below)')
+except ImportError:
+    print('  metacountregressor not pip-installed (fine -- not required; see note below)')
+
+import os
+import main_hpc, main_hpc_lc_patch, bivariate_copula
+for mod in (main_hpc, main_hpc_lc_patch, bivariate_copula):
+    resolved_dir = os.path.dirname(os.path.abspath(mod.__file__))
+    assert resolved_dir == os.getcwd(), (
+        f'{mod.__name__} resolved from {resolved_dir}, expected the job directory '
+        f'{os.getcwd()} -- the vendored copies are not shadowing the installed package '
+        f'as intended. Check that bivariate_copula.py / main_hpc.py / main_hpc_lc_patch.py '
+        f'/ Solvers_METAJAX.py are present alongside nearmiss_crash_analysis.py.'
+    )
+from bivariate_copula import compare_bivariate_copulas, fit_copula_bivariate_nb
+from main_hpc import compute_standard_errors
+from main_hpc_lc_patch import build_model_from_manual_spec, mixed_model_loglik, build_param_index
+print('  All required symbols OK (resolved from vendored copies in job dir)')
+" 2>&1 || {
+    echo "ERROR: package check failed -- see output above"
+    exit 1
+}
+echo ""
+
+echo "=========================================="
+echo "PBS job      : ${PBS_JOBID:-local}"
+echo "Working dir  : ${PBS_O_WORKDIR:-.}"
+echo "Node         : $(hostname)"
+echo "JAX_PLATFORMS: ${JAX_PLATFORMS}"
+echo "Started      : $(date)"
+echo "=========================================="
+echo ""
+
+# ------------------------------------------------------------------
+# Run the full analysis (Steps 1-8, including the bivariate copula
+# dependence test and all figure generation)
+# ------------------------------------------------------------------
+echo "===== RUNNING nearmiss_crash_analysis.py ====="
+python -u nearmiss_crash_analysis.py
+
+EXIT1=$?
+echo "[$(date)] Analysis finished  exit_code=${EXIT1}"
+if [ "${EXIT1}" -ne 0 ]; then
+    echo "Analysis FAILED -- check the PBS .o file for the full traceback above"
+fi
+
+# ------------------------------------------------------------------
+# Verify expected output artifacts were produced
+# ------------------------------------------------------------------
+echo ""
+echo "===== OUTPUT VERIFICATION ====="
+MISSING=0
+for f in \
+    proxy_analysis_evidence.csv \
+    bivariate_copula_comparison.csv \
+    bivariate_copula_best_coefs.csv \
+    plots/fig_model_comparison.png \
+    plots/fig_coef_proportionality.png \
+    plots/fig_copula_bic_comparison.png \
+    plots/fig_nm_crash_dependence.png \
+; do
+    if [ -f "$f" ]; then
+        echo "  OK       $f ($(stat -c%s "$f" 2>/dev/null || echo '?') bytes)"
+    else
+        echo "  MISSING  $f"
+        MISSING=1
+    fi
+done
+
+echo ""
+echo "=========================================="
+echo "FINISHED  : $(date)"
+echo "Analysis  : exit=${EXIT1}"
+echo "Log       : see the PBS .o file (all output printed above)"
+echo "Outputs   : *.csv (this directory)"
+echo "            plots/*.png"
+echo "=========================================="
+
+if [ "${EXIT1}" -ne 0 ] || [ "${MISSING}" -ne 0 ]; then
+    exit 1
+fi
+exit 0

@@ -1,0 +1,83 @@
+#!/bin/bash -l
+#PBS -N logsum_map_probe
+#PBS -l walltime=00:15:00
+#PBS -l select=1:ncpus=2:mem=16GB
+#PBS -m n
+#PBS -r y
+#PBS -j oe
+
+# Diagnostic for the flat-logsum fallback: can we build zone_to_idx?
+# Runs on a COMPUTE node. Read-only w.r.t. the pipeline data.
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV:-zigenv}"
+module unload Anaconda3
+
+export NEW_POP=1 NEW_POP_MAPPED=0
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+
+echo "host: $(hostname)  skims: ${PIPELINE_SKIMS_PATH}"
+
+python - <<'PYEOF'
+import os, warnings
+warnings.filterwarnings("ignore")
+import numpy as np
+import openmatrix as omx
+
+skims = omx.open_file(os.environ["PIPELINE_SKIMS_PATH"], "r")
+
+# 1) the mapping API the fallback relies on
+try:
+    maps = skims.listMappings()
+    print("listMappings():", maps)
+except Exception as e:
+    maps = None
+    print("listMappings() FAILED:", type(e).__name__, e)
+try:
+    if maps:
+        m0 = dict(skims.mapping(maps[0]))
+        items = list(m0.items())[:6]
+        print("mapping[0] size:", len(m0), "sample:", items)
+    else:
+        print("no mappings -> zone_to_idx would be EMPTY (flat logsums)")
+except Exception as e:
+    print("mapping() FAILED:", type(e).__name__, e)
+
+# 2) the robust route the pipeline already uses: OMX-derived universe
+try:
+    from stage5_destination_choice import _build_od_dataset
+    od = _build_od_dataset(skims, None)
+    ot = [int(z) for z in np.asarray(od.coords["otaz"].values).ravel()]
+    dt = [int(z) for z in np.asarray(od.coords["dtaz"].values).ravel()]
+    print("od dims:", dict(od.sizes))
+    print("otaz n:", len(ot), "first:", ot[:5])
+    print("dtaz n:", len(dt), "first:", dt[:5])
+    z2i = {z: i for i, z in enumerate(sorted(set(ot) | set(dt)))}
+    print("zone->idx map size:", len(z2i), "sample:",
+          list(z2i.items())[:4])
+    mat = np.asarray(skims["SOVTOLL_TIME__AM"])
+    print("SOVTOLL_TIME__AM shape:", mat.shape)
+    # does a code->position map produce a VARYING row for one origin?
+    probe_origins = [z for z in sorted(set(ot))[:3]]
+    for o in probe_origins:
+        row = mat[z2i[o], :]
+        print(f"origin {o} -> idx {z2i[o]}  row std={float(np.std(row)):.4f} "
+              f"min={float(row.min()):.2f} max={float(row.max()):.2f}")
+    # what the buggy mapping would do
+    print("buggy direct index by code:", end=" ")
+    try:
+        print(mat[ot[0], :3])
+    except Exception as e:
+        print("FAILED:", type(e).__name__, e)
+except Exception as e:
+    import traceback
+    print("_build_od_dataset probe FAILED:", type(e).__name__, e)
+    traceback.print_exc(limit=6)
+finally:
+    skims.close()
+print("PROBE DONE")
+PYEOF

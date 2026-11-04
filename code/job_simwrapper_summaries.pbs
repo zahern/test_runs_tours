@@ -1,0 +1,48 @@
+#!/bin/bash -l
+# Build SimWrapper dashboard summaries for a completed GA run.
+# Usage:
+#   qsub -v "RUN_ROOT=runs/ga_parallel,RUN_TAG=destfix,CONDA_ENV=zigenv,SKIP_MAP=0" job_simwrapper_summaries.pbs
+#   qsub -v "RUN_DIR_MARKER=runs/ga_parallel/exp1/prediction_run_dir.txt,CONDA_ENV=zigenv,SKIP_MAP=0" job_simwrapper_summaries.pbs
+
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=1:mem=8GB
+#PBS -l walltime=01:00:00
+
+set -euo pipefail
+
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:-}
+RUN_DIR_MARKER=${RUN_DIR_MARKER:-}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+SKIP_MAP=${SKIP_MAP:-0}
+
+cd "$PBS_O_WORKDIR"
+
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+conda activate "$CONDA_ENV"
+
+# Resolve run directory:
+# 1. RUN_DIR_MARKER file (written by prediction job) wins
+# 2. RUN_ROOT + RUN_TAG fallback
+if [ -n "${RUN_DIR_MARKER}" ] && [ -f "${RUN_DIR_MARKER}" ]; then
+  RUN_DIR=$(cat "${RUN_DIR_MARKER}" | tr -d '\n\r')
+  echo "Resolved RUN_DIR from marker: ${RUN_DIR}"
+else
+  [ -n "${RUN_TAG}" ] || { echo "ERROR: set RUN_TAG or RUN_DIR_MARKER" >&2; exit 2; }
+  RUN_DIR="${RUN_ROOT}/${RUN_TAG}"
+fi
+
+if [ ! -d "${RUN_DIR}" ]; then
+  echo "ERROR: run dir ${RUN_DIR} does not exist"
+  exit 2
+fi
+
+EXTRA=""
+if [ "${SKIP_MAP}" = "1" ]; then
+  EXTRA="--skip-map"
+fi
+
+python build_simwrapper_summaries.py "${RUN_DIR}" ${EXTRA}
+
+echo "SimWrapper summaries complete: ${RUN_DIR}/summarize"

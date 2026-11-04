@@ -1,36 +1,102 @@
-# ─────────────────────────────────────────────────────────────────────────
-# Generated pipeline data & large binaries — never track (kept git fast and
-# pushable; these are all regenerable outputs).
-# ─────────────────────────────────────────────────────────────────────────
-*.pkl
-*.omx
-*.pstats
-*.h5
+# ============================================================
+# .gitignore — test_runs_tours/code
+# ============================================================
+# NOTE: Git cannot filter by file size in .gitignore.
+# GitHub hard-rejects any single file > 100 MB at push time.
+# Add known large files explicitly in the section below, or
+# use Git LFS:  git lfs track "*.omx"
+# ============================================================
 
-# Stage / model / synth outputs
-**/saved_data/*_output.csv
-**/saved_data/cdap_output.csv
-**/saved_data/synth_population*.csv
-**/saved_data/synth_persons*.csv
-**/synth_population*.csv
-**/synth_persons*.csv
-**/saved_data/*.html
-**/saved_data/vehicle.dat
+# ── Virtual environment ─────────────────────────────────────
+.venv/
+venv/
+env/
 
-# Run artefacts, figures, profiling
-runs/
-**/Figures/
-**/plots/
-profile_*.pstats
-
-# DTA engine directories (multi-GB binaries: VehTrajectory, AltPath, fort.*, …)
-DTA/**/
-
-# PBS job logs
-*.o[0-9]*
+# ── Editor / AI assistant ───────────────────────────────────
+.vscode/
+.claude/
+.idea/
+TSP_Paper/
+TSP__Departmentment_of_Infrastructure___Mathematical_Program/
+# ── Cluster / PBS log files (*.err, *.out, *.eNNNNNNN, *.oNNNNNNN) ─────────
+*.err
+*.out
 *.e[0-9]*
+*.o[0-9]*
 
-# Keep small tracked references (negations after the broad rules above)
-!code/saved_data/seq_zone_ids_371.csv
-!**/seq_zone_ids_.csv
-!demand_/sa2_zones_reference_357.csv
+# ── Generated outputs and run artefacts ─────────────────────
+# saved_data/ is ignored in bulk, but zone_ids_sa2/ is source-controlled
+# (it is the synthetic population input, not a generated output).
+# Git cannot negate a directory-level rule, so we use wildcard form:
+
+#saved_data/*
+#!saved_data/zone_ids_sa2/
+runs/
+_runs/
+
+# ── External library bundled in repo ────────────────────────
+activitysim-main/
+
+# ── Shapefile / GIS folders and large spatial data ──────────
+SA1_SHP/
+SA2_2021_AUST_SHP_GDA2020/
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.sbn
+*.sbx
+
+# ── Large spreadsheets and datasets ─────────────────────────
+*.xlsx
+*.xls
+*.png
+*.html
+code/comprehensive_dataset.csv
+code/initial_trips_hhts.csv
+code/pddopulation_by_order_with_osm_and_landuse.csv
+
+# ── Text / LaTeX files (keep README.md, ignore everything else) ─────────────
+*.txt
+*.tex
+*.pdf
+*.ppt
+*.cmd
+*.pdf
+*.json
+*.csv
+*.docx
+*.zip
+*.htm
+*.pptx
+*.log
+*.exe
+*.pkl
+*.dat
+*.out
+*.o
+*.e
+
+
+
+# ── Known large binary / data files (> 100 MB) ──────────────
+# Uncomment or add any file whose size exceeds GitHub's 100 MB limit.
+# To check sizes:  Get-ChildItem -Recurse | Where-Object {$_.Length -gt 100MB}
+*.omx
+# comprehensive_dataset.csv
+# initial_trips_hhts.csv
+# pddopulation_by_order_with_osm_and_landuse.csv
+
+# ── Python cache / compiled files ───────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# ── OS artefacts ────────────────────────────────────────────
+.DS_Store
+Thumbs.db

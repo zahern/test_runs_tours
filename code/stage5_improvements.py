@@ -61,7 +61,7 @@ def filter_insignificant_params(coef_dict, std_err_dict, tstat_dict,
             # Core structural/nesting parameters
             'c_logsum', 'c_log_dist', 'c_size_term',
             # Nesting parameters  
-            'Mu_Root', 'Mu_Motor', 'Mu_NonMotor', 'Mu_Car',
+            'Mu_Root', 'Mu_Motor', 'Mu_NonMotor',
             'mu_motorised', 'mu_nonmotorised',
             # ASCs (always keep for interpretation)
             'ASC_DA', 'ASC_SR', 'ASC_Walk', 'ASC_Bike', 'ASC_Transit',

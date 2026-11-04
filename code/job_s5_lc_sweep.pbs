@@ -1,0 +1,179 @@
+#!/bin/bash -l
+# Stage-5 latent-class FORM sweep (no GA): K=2 vs K=3 for work, edu and
+# non-mandatory, using _paper_stage5_arms.py (arms A pooled MNL, B
+# SearchLibrium MNL, C larch LC, D SearchLibrium LC).
+#
+# This answers "is the LC form real and is 2 classes enough?" from BIC/n on the
+# full tour sets, for every purpose segment - in particular non-mandatory,
+# which the GA never got to because its shard hit the 12 h walltime.
+#
+# Prerequisite: a FITTED stage-5 pickle (save_models output), normally the one
+# produced by job_promote_stage5_qld_conv1.pbs.  The mode model in that pickle
+# supplies the mode logsums; the destination model supplies the utility
+# specification (PAPER_UTILITY=auto), so the same job works for all three
+# segments without hand-written per-segment coefficient lists.
+#
+# The mode alternative set must match the pickle, hence STAGE5_PT_MODES /
+# STAGE5B_TRANSIT_ACCESS default to the same 8-mode PT setting used by the
+# promotion job.  Set STAGE5_PT_MODES=0 if you swept a 5-mode pickle.
+#
+# Destination caches (runs/_s5_larch_perturb/<segment>_dest_cache.pkl) are built
+# on demand by the script and reused across K, so the K=3 pass is cheap once
+# K=2 has run.
+#
+# Submit from the code dir:
+#   qsub job_s5_lc_sweep.pbs
+# Optional -v: MODELS_PKL, SEGMENTS (default work,edu,nonmand),
+#              K_LIST (default 2,3), LC_N_CASES (0 = all tours),
+#              LC_N_PERT, LC_MAXITER, LC_PERTURB_SIGMA, LC_SEED,
+#              PAPER_OUT_ROOT, STAGE5_PT_MODES, STAGE5B_TRANSIT_ACCESS,
+#              STAGE5_DEST_SAMPLE_SIZE, CACHE_DIR
+
+#PBS -N s5_lc_sweep
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=8:mem=96gb
+#PBS -l walltime=24:00:00
+
+set -uo pipefail
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+MODELS_PKL=${MODELS_PKL:-saved_data/stage5_models.pkl}
+SEGMENTS=${SEGMENTS:-work,edu,nonmand}
+K_LIST=${K_LIST:-2,3}
+LC_N_CASES=${LC_N_CASES:-0}
+LC_N_PERT=${LC_N_PERT:-3}
+LC_MAXITER=${LC_MAXITER:-400}
+LC_PERTURB_SIGMA=${LC_PERTURB_SIGMA:-0.5}
+LC_SEED=${LC_SEED:-42}
+PAPER_OUT_ROOT=${PAPER_OUT_ROOT:-runs/s5_lc_form}
+CACHE_DIR=${CACHE_DIR:-runs/_s5_larch_perturb}
+PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+STAGE5_PT_MODES=${STAGE5_PT_MODES:-1}
+STAGE5_DEST_SAMPLE_SIZE=${STAGE5_DEST_SAMPLE_SIZE:-20}
+if [[ "${STAGE5_PT_MODES}" != "0" ]]; then
+    STAGE5B_TRANSIT_ACCESS=${STAGE5B_TRANSIT_ACCESS:-1}
+else
+    STAGE5B_TRANSIT_ACCESS=${STAGE5B_TRANSIT_ACCESS:-0}
+fi
+
+cd "${PBS_O_WORKDIR:-$PWD}"
+
+# Single-conda rule (same as job_promote_stage5_qld_conv1.pbs): activate the
+# console miniconda env by explicit prefix - `module load Anaconda3` +
+# `conda activate zigenv` can resolve a different same-named env.
+CONDA_BASE=${CONDA_BASE:-/mnt/hpccs01/home/ahernz/miniconda3}
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_BASE}/envs/${CONDA_ENV}"
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+
+export PYTHONPATH="${PWD}/compat:${PYTHONPATH:-}"
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export JAX_ENABLE_X64=${JAX_ENABLE_X64:-1}
+export LARCH_FORCE_JAX=${LARCH_FORCE_JAX:-1}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export NEW_POP=${NEW_POP:-1}
+export NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+export NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+export PIPELINE_SKIMS_PATH
+export STAGE5_DEST_SAMPLE_SIZE
+export STAGE5_PT_MODES STAGE5B_TRANSIT_ACCESS
+export PAPER_MSTEP_MAXITER=${PAPER_MSTEP_MAXITER:-200}
+
+# SearchLibrium: installed env package, else the vendored patch tree.
+if [[ -z "${SEARCHLIBRIUM_SRC:-}" && -d "${PWD}/_patches/SearchLibrium" ]]; then
+    export SEARCHLIBRIUM_SRC="${PWD}/_patches"
+fi
+[[ -n "${SEARCHLIBRIUM_SRC:-}" ]] && export SEARCHLIBRIUM_SRC
+
+if [[ ! -f "${MODELS_PKL}" ]]; then
+    echo "FATAL: MODELS_PKL not found: ${MODELS_PKL}" >&2
+    echo "       run job_promote_stage5_qld_conv1.pbs first, or pass -v MODELS_PKL=..." >&2
+    exit 2
+fi
+
+export MODELS_PKL
+python - "$MODELS_PKL" <<'PY' || exit 3
+import sys
+from stage5_destination_choice import load_models
+blob = load_models(sys.argv[1]) or {}
+if not blob:
+    sys.exit(f"FATAL: {sys.argv[1]} holds no fitted models")
+for seg in ("work", "edu", "nonmand"):
+    entry = blob.get(seg)
+    print(f"  {seg:8s}: mode_model={'Y' if entry and entry.get('mode_model') else 'N'} "
+          f"dest_model={'Y' if entry and entry.get('dest_model') else 'N'}")
+PY
+
+mkdir -p "${PAPER_OUT_ROOT}" "${CACHE_DIR}"
+LOG="${PAPER_OUT_ROOT}/sweep_${PBS_JOBID:-manual}.log"
+: > "${LOG}"
+
+echo "Stage-5 LC form sweep" | tee -a "${LOG}"
+echo "  models   : ${MODELS_PKL}" | tee -a "${LOG}"
+echo "  segments : ${SEGMENTS}" | tee -a "${LOG}"
+echo "  K        : ${K_LIST}" | tee -a "${LOG}"
+echo "  cases    : ${LC_N_CASES} (0 = all tours)" | tee -a "${LOG}"
+echo "  restarts : ${LC_N_PERT} perturbations, maxiter=${LC_MAXITER}, sigma=${LC_PERTURB_SIGMA}" | tee -a "${LOG}"
+echo "  out root : ${PAPER_OUT_ROOT}" | tee -a "${LOG}"
+echo "  caches   : ${CACHE_DIR}" | tee -a "${LOG}"
+echo "  modes    : STAGE5_PT_MODES=${STAGE5_PT_MODES} STAGE5B_TRANSIT_ACCESS=${STAGE5B_TRANSIT_ACCESS}" | tee -a "${LOG}"
+
+IFS=',' read -r -a SEG_ARR <<< "${SEGMENTS}"
+IFS=',' read -r -a K_ARR <<< "${K_LIST}"
+
+FAILED=()
+N_OK=0
+for SEG in "${SEG_ARR[@]}"; do
+    SEG="${SEG// /}"
+    [[ -z "${SEG}" ]] && continue
+    for K in "${K_ARR[@]}"; do
+        K="${K// /}"
+        [[ -z "${K}" ]] && continue
+        RUN_DIR="${PAPER_OUT_ROOT}/${SEG}_K${K}"
+        echo "" | tee -a "${LOG}"
+        echo "=== ${SEG} K=${K} -> ${RUN_DIR} ($(date -u +%H:%M:%S)) ===" | tee -a "${LOG}"
+        T0=$(date +%s)
+        PAPER_SEGMENT="${SEG}" \
+        PAPER_N_CLASSES="${K}" \
+        PAPER_N_CASES="${LC_N_CASES}" \
+        PAPER_UTILITY=auto \
+        PAPER_MODELS="${MODELS_PKL}" \
+        PAPER_CACHE="${CACHE_DIR}/${SEG}_dest_cache.pkl" \
+        PAPER_N_PERT="${LC_N_PERT}" \
+        PAPER_LC_MAXITER="${LC_MAXITER}" \
+        PAPER_LC_PERTURB_SIGMA="${LC_PERTURB_SIGMA}" \
+        PAPER_SEED="${LC_SEED}" \
+        PAPER_OUT="${RUN_DIR}" \
+        python _paper_stage5_arms.py 2>&1 | tee -a "${LOG}"
+        RC=${PIPESTATUS[0]}
+        echo "--- ${SEG} K=${K} rc=${RC} secs=$(( $(date +%s) - T0 ))" | tee -a "${LOG}"
+        if [[ ${RC} -eq 0 && -f "${RUN_DIR}/arms.md" ]]; then
+            N_OK=$((N_OK + 1))
+        else
+            FAILED+=("${SEG}_K${K}(rc=${RC})")
+        fi
+    done
+done
+
+echo "" | tee -a "${LOG}"
+echo "=== summary ===" | tee -a "${LOG}"
+for F in "${PAPER_OUT_ROOT}"/*_K*/arms.md; do
+    [[ -f "${F}" ]] || continue
+    echo "" | tee -a "${LOG}"
+    echo "--- ${F}" | tee -a "${LOG}"
+    grep -E '^\| (A|B|C|D) \|' "${F}" | tee -a "${LOG}" || true
+done
+
+if [[ ${#FAILED[@]} -gt 0 ]]; then
+    echo "FAILED runs: ${FAILED[*]}" | tee -a "${LOG}"
+fi
+if [[ ${N_OK} -eq 0 ]]; then
+    echo "FATAL: no run produced arms.md" >&2
+    exit 4
+fi
+echo "Done: ${N_OK} run(s) ok, log ${LOG}"

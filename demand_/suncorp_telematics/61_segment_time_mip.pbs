@@ -1,0 +1,223 @@
+#!/bin/bash -l
+#PBS -N suncorp_segtime_mip
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=4:mem=192GB
+# mem 96->128->192GB: 26910695 OOM'd at the refit (96GB, search's ~30GB still
+# resident); 26978013 OOM'd at 128GB even with the search skipped (8.4GB at
+# refit-start), because the GEN-10 best spec refits 35 fixed terms (GEN-9 had
+# 9), so DE+SLSQP peaks well above the N*R=10M guard's ~30GB estimate. We also
+# drop --refit-R 100->50 in SEARCH_ARGS to halve N*R for extra headroom.
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# Refuse to run outside PBS: keep all compute off the login/head node.
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+
+set -euo pipefail
+
+# End-to-end chain:
+#   58: build segment x 15-minute speeding panel (submitted separately)
+#   59: search the temporal speeding model and predict future fixtures
+#   60: solve the time-indexed MIP on exact segment midpoints
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results
+FIG_DIR=$PROJ_DIR/figures
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+# 2 search workers x 2 threads = 4 cpus (see --search-n-jobs below).
+export OMP_NUM_THREADS=2
+export OPENBLAS_NUM_THREADS=2
+export MKL_NUM_THREADS=2
+export JAX_PLATFORMS=cpu
+
+cd "$SCRIPT_DIR"
+
+# pip upgrade is flock-guarded: concurrent 61/61b jobs share zigenv, and two
+# simultaneous installs once raced and tore it (dist 1.0.151 over module
+# 1.0.143). The lock serialises the ensure step; the version check also
+# asserts dist == module so a torn env fails LOUDLY instead of fitting on
+# stale code. Requires >=1.0.165 (temporal_models for stage 2b).
+(
+  flock -w 900 9 || { echo "FATAL: pip lock timeout"; exit 1; }
+  python -m pip install --upgrade --no-deps --retries 2 --timeout 20 metacountregressor \
+    || python -m pip install --upgrade --no-deps --no-index --find-links /home/ahernz/suncorp_wheels metacountregressor \
+    || echo "WARN: metacountregressor upgrade unavailable offline; version assert below still applies"
+) 9>"$PROJ_DIR/.pip-upgrade.lock"
+python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,165), v; assert v==getattr(m,'__version__','?'), 'torn install: dist '+v+' != module '+str(getattr(m,'__version__','?'))"
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "61: segment time search -> segment midpoint MIP"
+echo "=================================================================="
+
+[ -s "$RESULTS_DIR/segment_15min_panel.parquet" ] \
+  || { echo "FATAL: missing segment_15min_panel.parquet; run 58 first"; exit 1; }
+[ -s "$DATA_DIR/fixture_calendar.csv" ] \
+  || { echo "FATAL: missing fixture_calendar.csv"; exit 1; }
+[ -s "$DATA_DIR/osm_roads_suncorp.geojson" ] \
+  || { echo "FATAL: missing osm_roads_suncorp.geojson"; exit 1; }
+
+# --search-iters 120: the existing checkpoint holds 40/40 iterations, so a
+# resubmit CONTINUES the same SA run from its decision vector for 80 more
+# iterations (the resume branch skips the completed search). --prune-p 0.05
+# then refits with significance-based backward elimination (count model and
+# propensity separately) before the two-stage/Bayes surface is built.
+# 2026-10-16 replay-fix resume: 160->200. 59 now seeds each
+# chunk's SA restart from chunk_seed (sa_base_seed monkeypatch),
+# gates warm_start_cache on `warm`, and credits only chunks that
+# actually evaluated something (>=6 replay chunks abort). Chunks
+# 9-10 therefore explore fresh neighborhoods instead of
+# replaying the cached-best proposal stream (o26766505 ch 4-8).
+# SEARCH_ITERS is overridable so a run can resume at the iteration count its
+# checkpoint already reached (e.g. -v SEARCH_ITERS=80). When done_iters >=
+# total_iters the search is skipped entirely and refit/predict runs on a fresh
+# process: the GEN-10 fresh search (o26910695) reached 80 iters inside the
+# 30000 s budget but was then cgroup-OOM-killed (81.8/96 GB) because the
+# search's ~30 GB was still resident when the future panel was built. Resuming
+# at 80 avoids carrying that allocation into refit.
+SEARCH_ARGS=(
+  --search-iters "${SEARCH_ITERS:-200}" --search-chunk 20 --chunk-time 7200
+  --wall-budget 30000 --n-starts 1
+  --search-R 25 --refit-R 50 --search-vars slim --search-n-jobs 2
+  --target trips_mean_gt_10 --group-by event
+  --two-stage on --temporal-refit ar1
+  --prune-p 0.05
+)
+# NOTE: --temporal-predict deliberately OFF (o26613390): it overwrote the
+# real two-stage surface with the AR-mean surface (~zero everywhere).
+# BAYES=on ships the approximate-Bayes posterior mean (Laplace) instead of
+# the plug-in two-stage, and records both surfaces' holdout metrics. Off by
+# default so the A/B is explicit: qsub -v BAYES=on 61_segment_time_mip.pbs
+[ "${BAYES:-off}" = "on" ] && SEARCH_ARGS+=(--bayes on)
+# --group-by event: per-event split — each fixture gets its own grouped
+# coefficients, shrunk toward game-attribute-driven means (fxt_*/ko_* already
+# eligible as heterogeneity drivers), so unseen future events predict from
+# attributes. Supersedes the latent-class idea: classes are observed.
+# NOTE 2: --search-iters 40, not 140: SEARCH_GEN=3 adds 8 wide vars
+# (dim 69->85, ~11 min/iter), so a fresh search needs ~7.5h for 40 iters;
+# refit + AR stage + predict + MIP take the rest inside 12h. The search is
+# resumable — later runs continue from this checkpoint. The quality gate
+# below guarantees the MIP runs even if the search is still partial.
+# NOTE: --no-de-warm/--no-slsqp deliberately NOT passed. The cold
+# LBFGS-only refit diverges on the 9-term forced-game spec (max|b|~1e5,
+# wasting hours before the warm retry saves it); DE warm-start + SLSQP
+# converges first try at N*R=10M (auto memory guard trips only above 12M,
+# RSS ~30GB << 96GB). --search-iters 140 (not 160): checkpoint is at 136,
+# so 4 iters finish the search and leave ~10h for refit+predict+MIP.
+[ -s "$RESULTS_DIR/game_day_search_best.json" ] && SEARCH_ARGS+=(--resume)
+
+echo "[61/1] searching temporal segment speeding model and predicting future games..."
+python -u 59_game_day_search_predict.py "${SEARCH_ARGS[@]}" 2>&1
+
+for f in game_day_pred_15min.parquet game_day_holdout_metrics.json \
+         game_day_search_best.json; do
+  [ -s "$RESULTS_DIR/$f" ] || { echo "FATAL: missing search output $f"; exit 1; }
+done
+
+# Quality-before-MIP gate: refuse rosters only when predictions are unusable.
+# Iter-count alone is the wrong test (a 136/160 search already yields slope
+# 1.44 / top20 0.38). Proceed when converged OR holdout quality passes;
+# refuse only when the surface is demonstrably garbage or missing.
+# Set REQUIRE_CONVERGED=1 to restore the strict iters-only refusal.
+python - "$RESULTS_DIR/game_day_search_best.json" "$RESULTS_DIR/game_day_holdout_metrics.json" <<'EOF'
+import json, os, sys
+d = json.load(open(sys.argv[1]))
+done, total = int(d.get("iters_completed", 0)), int(d.get("iters", 0))
+converged = total > 0 and done >= total
+allow_weak = os.environ.get("ALLOW_WEAK_SURFACE") == "1"
+ok_quality = False
+handoff_ok = False
+try:
+    full = json.load(open(sys.argv[2]))
+    m = full.get("metrics") or {}
+    a = full.get("audit") or {}
+    slope = float(m.get("calibration_slope", float("nan")))
+    top20 = float(m.get("segment_top20", 0.0) or 0.0)
+    rmse = float(m.get("rmse", float("inf")))
+    ok_quality = (0.2 <= slope <= 5.0) and (top20 >= 0.05) and (rmse < 10.0)
+    h = a.get("handoff") or {}
+    handoff_ok = bool(h.get("pass"))
+    ts = a.get("two_stage") or {}
+    print(f"holdout quality: slope={slope:.3f} top20={top20:.3f} rmse={rmse:.3f}")
+    print("handoff: pass=%s pearson_min=%s jaccard_top20=%s "
+          "coverage_top20=%s" % (h.get("pass"), h.get("pearson_min"),
+                                 h.get("top20_jaccard"),
+                                 h.get("top20_coverage_mean")))
+    print(f"two-stage: shipped={ts.get('shipped')} "
+          f"denominator={ts.get('denominator')}")
+except Exception as exc:
+    print(f"WARN: no readable holdout metrics ({exc})")
+print(f"search: {done}/{total} converged={converged}")
+if not handoff_ok and not allow_weak:
+    print("FATAL: handoff gate failed (positive per-fixture ranking / "
+          "game-specific plan / calibration); refusing MIP. "
+          "Set ALLOW_WEAK_SURFACE=1 to override.")
+    sys.exit(1)
+if converged or ok_quality:
+    print("GATE PASS: solving MIP" + (" (on partial search, quality-verified)" if not converged else ""))
+elif os.environ.get("REQUIRE_CONVERGED") == "1":
+    print(f"FATAL: REQUIRE_CONVERGED=1 and search partial ({done}/{total})")
+    sys.exit(1)
+else:
+    print(f"FATAL: search partial ({done}/{total}) AND predictions unusable; refusing MIP. Resubmit 61 to resume.")
+    sys.exit(1)
+EOF
+[ $? -ne 0 ] && exit 1
+
+if [ "${ALLOW_WEAK_SURFACE:-0}" = "1" ]; then
+  echo "OVERRIDE (human directive 2026-10-17): proceeding on the BIC-best surface despite handoff pass=False (pearson_min=0.1974, top20_jaccard=1.0 -> game_specific=false). Independent DiD benchmark (scripts/67, job 26839703) shows no observable game-day rate effect; a static WHERE ranking is data-supported. Deployment-config MIP proceeds; contrary evidence in results/game_day_holdout_metrics.json."
+fi
+echo "[61/2] solving time-indexed segment-midpoint MIP..."
+# Single-move plan set (--max-relocations 1) to match the manuscript's
+# one-relocation formulation; phase plans (2 moves) are off because they
+# changed both the squad size and the site set away from the model the
+# paper describes.
+# Travel time is dimensionally correct now (metres / (m/s) / 60) and is
+# rounded UP to whole 15-min bins, floored at one bin: a 5-8 km move costs
+# two bins, a shorter move one.
+python -u 60_game_day_mip.py \
+  --min-marg 0.5 --max-segments 250 --squads all \
+  --travel-speed-kmh 43.2 --detour-factor 1.3 \
+  --setup-min 5 --max-travel-m 8000 --obs-m 100 \
+  --max-relocations 1 --min-move-gap-bins 1 \
+  --min-separation-m 300 \
+  --mobility-ab on 2>&1
+
+for f in game_day_mip_sites.csv game_day_mip_plans.csv \
+         game_day_mip_schedule.csv game_day_mip_summary.json \
+         game_day_mip.tex; do
+  [ -s "$RESULTS_DIR/$f" ] || { echo "FATAL: missing MIP output $f"; exit 1; }
+done
+
+for f in game_day_search_convergence.png game_day_calibration.png \
+         game_day_surfaces.png game_day_coefs.png \
+         game_day_mip_map.png game_day_mip_schedules.png \
+         game_day_mip_selected_heatmap.png game_day_risk_dist.png \
+         game_day_mip_coverage.png game_day_mip_summary.png; do
+  [ -s "$FIG_DIR/$f" ] || echo "WARN: missing figure $f"
+done
+
+# Run manifest: one vintage stamp so mixed-run outputs are detectable.
+{
+  echo "job=$PBS_JOBID host=$(hostname) date=$(date -u +%FT%TZ)"
+  echo "search_best=$(cat $RESULTS_DIR/game_day_search_best.json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(str(d.get("iters_completed"))+"/"+str(d.get("iters"))+" BIC="+str(round(d.get("best_bic",0),1)))')"
+  ls -l --time-style=long-iso "$RESULTS_DIR"/game_day_pred_15min.parquet "$RESULTS_DIR"/game_day_mip_summary.json "$FIG_DIR"/game_day_mip_map.png "$FIG_DIR"/game_day_mip_coverage.png "$FIG_DIR"/game_day_mip_summary.png 2>/dev/null
+} > "$RESULTS_DIR/run_manifest.txt" 2>&1
+cat "$RESULTS_DIR/run_manifest.txt"
+
+echo "=================================================================="
+echo "61 OK: future segment-time predictions and segment-based temporal MIP"
+echo "Job finished at $(date)"
+echo "=================================================================="

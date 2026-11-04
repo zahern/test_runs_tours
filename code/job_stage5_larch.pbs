@@ -1,0 +1,247 @@
+#!/bin/bash -l
+#PBS -N qld_larch_dest
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=4:mem=128GB
+#PBS -m n
+#PBS -r y
+
+# ─────────────────────────────────────────────────────────────────────────────
+# job_stage5_larch.pbs
+# ─────────────────────────────────────────────────────────────────────────────
+# Verify the LARCH Stage-5 destination formulation now produces a finite LL.
+#
+# HISTORY. Every Larch destination arm so far returned LL=nan with
+# converged=False (runs/stage5_compare/stage5_larch_vs_searchlibrium_20260928)
+# and `_data_arrays=None` -> "'NoneType' object has no attribute 'wt'".
+# Three separate defects were fixed:
+#   1. ptour_id dtype mismatch in the xarray merge doubled the case axis
+#      (a73e884).
+#   2. The ALL-ZONES CA table built three arrays from independently-derived
+#      lengths -> pandas' opaque "All arrays must be of the same length".
+#      Now derived from zone_ids with an explicit logsum-shape check.
+#   3. THE LIKELY CAUSE OF THE nan: _logsums derived its zone universe from
+#      dt_mode['tour']['DTAZ'] (the HHTS-observed destinations, 325 zones)
+#      because dt_mode['od'] is a DataTree node with no .coords and the
+#      AttributeError was swallowed. The destination choice set is 372 zones
+#      (999 fringe + 371 SA2) from _build_od_dataset, so 46 alternatives had
+#      NO logsum -- and the logsum is a `ca` variable inside the destination
+#      utility, so any tour choosing one made the likelihood undefined.
+#      _logsums now falls back to the full OMX universe. Locally this changed
+#      'logsums 6720 x 325' -> 'logsums 6720 x 372'.
+#
+# NOTE: defect 3 could NOT be validated locally -- the local mode model is
+# degenerate (LL=-0.5, rho2=1.000 vs the cluster's -5151.24) because this box
+# runs numpy 2.5.2 / statsmodels 0.14.2, and the logsums derive from that mode
+# model. THIS JOB IS THE FIRST HONEST TEST.
+#
+# USAGE
+#   qsub job_stage5_larch.pbs                          # raw CRASH (control)
+#   qsub -v ARM=crash_rate job_stage5_larch.pbs        # per-km crash rate
+#   qsub -v ESTIMATOR=mh   job_stage5_larch.pbs        # same, SearchLibrium MH
+#
+# LATENT-CLASS GENE BLOCK (opt-in, tour-level dest GA)
+#   qsub -v ARM=crash_rate,STAGE5_LC_GENES=1 job_stage5_larch.pbs
+#   Adds lc_on/lc_nc3/lc_gap_mid/lc_gap_hi/lc_floor_hi/lc_memb:* genes after
+#   the base destination terms.  LC genomes are scored -BIC/n by
+#   SearchLibrium estimate_dest_choice_lc on the long frame with hard
+#   constraints (converged, no class collapse, crash_class_gap >= genome
+#   gap_min); lc_on auto-enables when any LC gene is set and repair forces a
+#   crash component.  Membership genes are BEHAVIORAL person types only
+#   (STUDYING/age5p/sexp/safety_sensitivity; add structural vars back with
+#   STAGE5_LC_MEMB_EXTRA=incp,vehrd).  The identification doctor guards every
+#   LC eval when STAGE5_LC_DOCTOR=reject|prune (crash protected): flagged
+#   genomes are failed, or the doctor's suggested_drop is removed and the fit
+#   retried once.  Pooled genomes still run the larch path.  Knobs:
+#   STAGE5_LC_N_INIT (2), STAGE5_LC_MAXITER (150), STAGE5_LC_SIGMA (0.5),
+#   STAGE5_LC_MEMB_L2 (0.1), STAGE5_LC_REQUIRE_CONV (1), STAGE5_LC_SEED (7),
+#   STAGE5_LC_DOCTOR (0), STAGE5_LC_DOCTOR_TOL (1e-8),
+#   STAGE5_LC_DOCTOR_MAX_WEAK (0), STAGE5_LC_DOCTOR_MAX_COND (1e12).
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV:-zigenv}"
+module unload Anaconda3
+
+ARM="${ARM:-crash_raw}"
+ESTIMATOR="${ESTIMATOR:-larch}"
+MIN_ESS="${STAGE5_CONVERGENCE_MIN_ESS:-20}"
+SAMPLE_SIZE="${STAGE5_DEST_SAMPLE_SIZE:-20}"
+PIPELINE_SEED="${PIPELINE_SEED:-42}"
+
+export NEW_POP=1 NEW_POP_MAPPED=0
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+export PIPELINE_SEED PIPELINE_ACCELERATOR=cpu LARCH_FORCE_JAX=1
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+export PYTHONPATH="${PBS_O_WORKDIR}:${PYTHONPATH:-}"
+export JAX_PLATFORMS=cpu JAX_PLATFORM_NAME=cpu CUDA_VISIBLE_DEVICES=""
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+
+case "${ARM}" in
+  crash_raw)
+    unset STAGE5_CRASH_SKIMS STAGE5_CRASH_MATRIX || true ;;
+  crash_rate)
+    export STAGE5_CRASH_SKIMS="${STAGE5_CRASH_SKIMS:-../demand_/crash_matrices_371.omx}"
+    export STAGE5_CRASH_MATRIX="${STAGE5_CRASH_MATRIX:-crash_rate_total}" ;;
+  crash_length)
+    export STAGE5_CRASH_SKIMS="${STAGE5_CRASH_SKIMS:-../demand_/crash_matrices_371.omx}"
+    export STAGE5_CRASH_MATRIX="${STAGE5_CRASH_MATRIX:-crash_length_km}" ;;
+  *) echo "FATAL: ARM must be crash_raw|crash_rate|crash_length" >&2; exit 2 ;;
+esac
+
+export STAGE5_DEST_ESTIMATOR="${ESTIMATOR}"
+export STAGE5_CONVERGENCE_MIN_ESS="${MIN_ESS}"
+export STAGE5_DEST_SAMPLE_SIZE="${SAMPLE_SIZE}"
+export STAGE5_DEST_ORTHOG="${STAGE5_DEST_ORTHOG:-1}"
+export STAGE5_STRICT_ESTIMATION=1
+export STAGE5_REQUIRE_DEST_ESTIMATION=1
+export STAGE5_MIN_TOURS="${STAGE5_MIN_TOURS:-30}"
+export STAGE5_CLEAR_SHARROW_CACHE=1
+
+OUT="runs/stage5_compare/${ESTIMATOR}_${ARM}_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "${OUT}/plots"
+
+{
+  echo "=========================================================="
+  echo "Stage-5 destination : ${ESTIMATOR} / ${ARM}"
+  echo "PBS job             : ${PBS_JOBID:-local}"
+  echo "Node                : $(hostname)"
+  echo "Crash matrix        : ${STAGE5_CRASH_MATRIX:-CRASH (from skims)}"
+  echo "Sample of alts      : ${SAMPLE_SIZE} (Manski-Lerman, -log q locked at 1)"
+  echo "Orthogonalise crash  : ${STAGE5_DEST_ORTHOG} (c_crash perp c_log_dist)"
+  echo "Output              : ${OUT}"
+  echo "Started             : $(date)"
+  echo "=========================================================="
+} | tee "${OUT}/job.out"
+
+# ── Preflight: env must be able to run the pipeline at all ───────────────────
+python - <<'PYEOF' 2>&1 | tee -a "${OUT}/job.out" || exit 2
+import sys
+missing = []
+for mod in ("numpy", "pandas", "scipy", "statsmodels", "lifelines", "pylogit",
+            "larch", "SearchLibrium", "openmatrix", "numba"):
+    try:
+        __import__(mod)
+    except Exception as exc:
+        missing.append(f"{mod} ({type(exc).__name__})")
+if missing:
+    print("FATAL missing: " + ", ".join(missing), file=sys.stderr)
+    raise SystemExit(2)
+import numpy, scipy, numba, pandas, larch
+print(f"  numpy {numpy.__version__} / scipy {scipy.__version__} / "
+      f"numba {numba.__version__} / pandas {pandas.__version__} / "
+      f"larch {larch.__version__}")
+# zigenv compatibility window (environment_qld.yml / constraints.txt):
+#   numpy [2.1,2.4)   numba [0.60,0.63)   scipy [1.15,1.16)   pandas <3
+# The old check rejected ALL numpy>=2, which is now the supported base and
+# would abort every job on the current zigenv.
+def _mm(v):
+    return tuple(int(x) for x in v.split(".")[:2])
+_np, _sp, _nb = _mm(numpy.__version__), _mm(scipy.__version__), _mm(numba.__version__)
+_bad = []
+if not ((2, 1) <= _np < (2, 4)):
+    _bad.append(f"numpy {numpy.__version__} not in [2.1,2.4)")
+if not ((1, 15) <= _sp < (1, 16)):
+    _bad.append(f"scipy {scipy.__version__} not in [1.15,1.16)")
+if not ((0, 60) <= _nb < (0, 63)):
+    _bad.append(f"numba {numba.__version__} not in [0.60,0.63)")
+if int(pandas.__version__.split(".")[0]) >= 3:
+    _bad.append(f"pandas {pandas.__version__} >= 3")
+if _bad:
+    print("FATAL: environment outside the documented zigenv window "
+          "(environment_qld.yml / constraints.txt): " + "; ".join(_bad),
+          file=sys.stderr)
+    raise SystemExit(2)
+print("  preflight OK (zigenv compatibility window)")
+PYEOF
+
+# ── Confirm the logsum fix is present in the code being run ──────────────────
+python - <<'PYEOF' 2>&1 | tee -a "${OUT}/job.out" || exit 2
+import os
+src = open("stage5_destination_choice.py", encoding="utf-8").read()
+checks = {
+    "logsum full-universe fallback": "FULL-UNIVERSE fallback" in src,
+    "ALL-ZONES logsum shape guard":  "ALL-ZONES logsum matrix has" in src,
+    "crash-matrix selector":         "STAGE5_CRASH_MATRIX" in src,
+    "within-case logsum gate":       "STAGE5_REQUIRE_LOGSUM_VARIANCE" in src,
+    "person attrs (age5p/props)":    "_ensure_person_attrs" in src,
+    "CBD SA2 bridge":                "order_legacy" in src,
+    "overture residual merge":       "zone_landuse_overture.csv" in src,
+    "gradient-norm gate":            "STAGE5_GRAD_NORM_MAX" in src,
+    "doctor-driven orthogonalise":   "c_est_workers_resid" in src,
+}
+for k, v in checks.items():
+    print(f"  {k:32s}: {v}")
+if not all(checks.values()):
+    print("FATAL: stage5_destination_choice.py is missing fixes this job "
+          "assumes (see above). Sync the code dir before submitting.",
+          file=sys.stderr)
+    raise SystemExit(2)
+# SearchLibrium features (needed when STAGE5_DEST_ESTIMATOR != larch)
+try:
+    import SearchLibrium.mh_choice_estimator as M
+    need = ("identify_weak_features", "PreconditionedRandomWalkProposal",
+            "estimate_dest_choice_interactions", "estimate_dest_choice_lc")
+    miss = [n for n in need if not hasattr(M, n)]
+    if miss:
+        print(f"  WARNING: zigenv SearchLibrium lacks {miss}. The estimator "
+              "falls back to SEARCHLIBRIUM_SRC/SearchLibrium/"
+              "mh_choice_estimator.py; set "
+              "SEARCHLIBRIUM_SRC=<workdir>/_patches (job_stage5_compare.pbs "
+              "does this by default), or upgrade the wheel with "
+              "pip install -U -c constraints.txt SearchLibrium.")
+    else:
+        print("  SearchLibrium features       : OK")
+except Exception as _e:
+    print(f"  WARNING: SearchLibrium feature check failed ({_e!r})")
+PYEOF
+
+set +e
+python -u stage5_compare_runner.py \
+    --out-dir "${OUT}" \
+    --min-ess "${MIN_ESS}" \
+    --required-segments work,edu,nonmand \
+    > "${OUT}/runner.stdout" 2> "${OUT}/runner.stderr"
+RC=$?
+set -e
+
+cat "${OUT}/runner.stdout" >> "${OUT}/job.out"
+cat "${OUT}/runner.stderr" >> "${OUT}/job.err" 2>/dev/null || true
+
+# ── Result gate: the whole point is a FINITE destination LL ──────────────────
+python - "${OUT}" <<'PYEOF' 2>&1 | tee -a "${OUT}/job.out"
+import json, os, sys
+out = sys.argv[1]
+p = os.path.join(out, "stage5_convergence_report.json")
+if not os.path.isfile(p):
+    print("  NO convergence report -- arm produced nothing"); raise SystemExit(0)
+d = json.load(open(p, encoding="utf-8"))
+finite = 0
+total = 0
+for row in d.get("rows", []):
+    if row.get("model_type") != "destination":
+        continue
+    total += 1
+    ll = row.get("loglike")
+    ok = ll is not None
+    finite += bool(ok)
+    print(f"  {row['segment']:8s} conv={str(row['converged']):5s} "
+          f"LL={ll} ESS={row.get('ess_min')} "
+          f"{'' if ok else '  <-- STILL nan: logsum fix did not resolve it'}")
+print(f"\n  destination arms with a FINITE LL: {finite}/{total}")
+print(f"  all converged: {d.get('all_required_models_converged')} passed: {d.get('passed')}")
+if total and finite == 0:
+    print("  VERDICT: the LL=nan persists -- there is at least one more cause "
+          "beyond the logsum zone universe. Check runner.stderr for the "
+          "NaN-poisoning variable.")
+elif finite == total:
+    print("  VERDICT: Larch destination now evaluates its likelihood. The "
+          "logsum zone-universe fix was the missing piece.")
+PYEOF
+
+echo "Finished: $(date) exit_code=${RC}" | tee -a "${OUT}/job.out"
+exit "${RC}"

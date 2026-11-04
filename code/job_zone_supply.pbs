@@ -1,0 +1,82 @@
+#!/bin/bash -l
+# =============================================================================
+# Parking + micromobility (OSM) and transit service (GTFS) supply per SA2.
+# Outputs: saved_data/zone_supply_osm.csv, saved_data/transit_supply_sa2.csv
+# (picked up automatically by job_zone_landuse_overture.pbs on its next run).
+#
+# Needs: saved_data/osm_cache/seq_osm.pbf + seq_gtfs.zip (both present),
+#        pyrosm NOT needed (GDAL driver path). No internet.
+# Skip a section: qsub -v "SKIP_TRANSIT=1" job_zone_supply.pbs
+#
+# Submit:  qsub job_zone_supply.pbs
+# =============================================================================
+#PBS -N zone_supply
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -l walltime=02:00:00
+
+set -euo pipefail
+CONDA_ENV=${CONDA_ENV:-geotfenv}
+cd "$PBS_O_WORKDIR"
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+
+# ── Keep metacountregressor current from PyPI ────────────────────────────
+# ALWAYS attempts the upgrade on every job (no skip): the zone builds share
+# occupancy/size-term code paths with the estimator, so a stale wheel here
+# silently diverges from GA/predict. Serialized with flock; a failed upgrade
+# (offline?) is non-fatal — the job continues with whatever is installed.
+# ESTIMATOR_SOURCE=editable uses a local dev tree instead of PyPI.
+if [ "${ESTIMATOR_SOURCE:-pypi}" != "editable" ]; then
+    echo "[pkg] Upgrading metacountregressor to latest PyPI release..."
+    (
+        flock -w 900 9 2>/dev/null || echo "[pkg] (flock unavailable, proceeding without lock)"
+        pip install --upgrade -q --retries 1 --timeout 20 "metacountregressor" \
+            && echo "[pkg] metacountregressor upgraded (PyPI latest)" \
+            || echo "[pkg] WARNING: metacountregressor upgrade failed (offline?) — using whatever is installed"
+    ) 9>"${PBS_O_WORKDIR:-.}/.pkg_upgrade.lock"
+    pip show metacountregressor 2>/dev/null | awk '/^Version:/{print "[pkg] metacountregressor " $0}'
+fi
+
+echo "=== Build OSM + transit supply per SA2 ==="
+python -u build_zone_supply.py
+
+echo "=== Verify ==="
+python - <<'PY'
+import pandas as pd, os
+def _safe_sum(d, col):
+    # d.get(col, 0) returns int 0 when the column is absent (e.g. parking
+    # cols in the transit file) — int has no .sum(). Guard explicitly.
+    if col not in d.columns:
+        return 0
+    try:
+        return d[col].sum()
+    except Exception:
+        return 0
+for p, keys in [('saved_data/zone_supply_osm.csv',
+                 {'n_parking', 'parking_capacity', 'n_bike_parking'}),
+                ('saved_data/transit_supply_sa2.csv',
+                 {'n_transit_stops', 'transit_trips_am'})]:
+    if not os.path.exists(p):
+        print(f"MISSING: {p} (section skipped or input absent)")
+        continue
+    d = pd.read_csv(p)
+    assert keys <= set(d.columns), f"{p} missing {keys - set(d.columns)}"
+    if 'n_parking' in d.columns:
+        print(f"{p}: {len(d)} zones | "
+              f"parking={int(_safe_sum(d, 'n_parking'))} "
+              f"cap={float(_safe_sum(d, 'parking_capacity')):,.0f} "
+              f"bike_park={int(_safe_sum(d, 'n_bike_parking'))} "
+              f"cycleway_km={float(_safe_sum(d, 'cycleway_km')):,.1f}")
+    else:
+        print(f"{p}: {len(d)} zones | "
+              f"stops={int(_safe_sum(d, 'n_transit_stops'))} "
+              f"trips_am={int(_safe_sum(d, 'transit_trips_am'))} "
+              f"headway_med={float(pd.to_numeric(d.get('transit_headway', 0), errors='coerce').median()):.1f}min")
+print("OK")
+PY
+echo "Done. Next: qsub job_zone_landuse_overture.pbs (merges these in)"

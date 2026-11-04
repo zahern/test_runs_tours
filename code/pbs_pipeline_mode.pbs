@@ -4,11 +4,11 @@
 # Submit via qsub with environment variables, for example:
 #   qsub -v MODE=main,ZONE_ARG=40,CONDA_ENV=zigenv,THREADS=2 pbs_pipeline_mode.pbs
 
-#PBS -j eo
 #PBS -m n
 #PBS -r y
+#PBS -l walltime=06:00:00
 
-set -eu
+set -euo pipefail
 
 MODE=${MODE:-main}
 ZONE_ARG=${ZONE_ARG:-}
@@ -18,6 +18,29 @@ S5_WORKERS=${S5_WORKERS:-1}
 RUN_ROOT=${RUN_ROOT:-runs}
 PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
 PIPELINE_RUN_TAG=${PIPELINE_RUN_TAG:-${PBS_JOBID:-$(date +%Y%m%d_%H%M%S)}}
+GA_ESTIMATOR=${GA_ESTIMATOR:-default}
+INSTALL_ESTIMATORS=${INSTALL_ESTIMATORS:-1}
+# ESTIMATOR_SOURCE=pypi (default, PyPI-latest) or editable (local dev trees).
+ESTIMATOR_SOURCE=${ESTIMATOR_SOURCE:-pypi}
+
+# 507-zone SA2 population scope — forward to pipeline_logger.py via os.environ.
+# NEW_POP=1 switches process_survey() to SA2-direct OTAZ (no ORDER lookup),
+# synth pop loader to zone_<sa2>.csv files, and skims to PIPELINE_SKIMS_PATH.
+NEW_POP=${NEW_POP:-0}
+NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-}
+export NEW_POP
+export NEW_POP_MAPPED
+export NEW_POP_DIR
+# Export PIPELINE_SKIMS_PATH only when non-empty; otherwise unset it entirely
+# so Python's os.environ.get() returns None → falls back to _DEFAULT_SKIMS_PATH.
+# An empty string from PBS (-v "PIPELINE_SKIMS_PATH=") is treated as unset.
+if [ -n "$PIPELINE_SKIMS_PATH" ]; then
+    export PIPELINE_SKIMS_PATH
+else
+    unset PIPELINE_SKIMS_PATH
+fi
 
 cd "$PBS_O_WORKDIR"
 
@@ -26,6 +49,142 @@ module load Anaconda3/2024.02-1
 conda activate "$CONDA_ENV"
 module unload Anaconda3
 
+# Force UTF-8 I/O so box-drawing/arrows/checkmarks in logs never mojibake.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+# ── Ensure MetaCount + SearchLibrium are installed ─────────────────────────
+# INSTALL_ESTIMATORS=1  → force (re-)install regardless of current state.
+# ESTIMATOR_SOURCE=pypi (default) always installs latest published releases.
+# ESTIMATOR_SOURCE=editable uses local source trees when present.
+#
+#   Editable-source setup (optional, for package development):
+#     pip install -e /mnt/hpccs01/home/ahernz/source/MetaCount
+#     pip install -e /mnt/hpccs01/home/ahernz/source/SearchLibrium
+#     pip install jax jaxlib jaxopt
+#
+_HPC_MC=/mnt/hpccs01/home/ahernz/source/MetaCount
+_HPC_SL=/mnt/hpccs01/home/ahernz/source/SearchLibrium
+
+# ── Always keep estimators current from PyPI ───────────────────────────────
+# PyPI has the newest releases (metacountregressor >=1.0.151,
+# SearchLibrium >=0.0.154). The 0.0.138 seen before was a STALE installed copy
+# that never upgraded. This step force-upgrades both from PyPI on EVERY job —
+# ALWAYS, no skip: the ESTIMATORS_SKIP_UPGRADE bypass is retired. Concurrent
+# jobs serialize with flock (shared lock in the code dir) instead of racing
+# pip installs into the shared env. ESTIMATOR_SOURCE=editable uses local dev
+# checkouts instead.
+if [ "$ESTIMATOR_SOURCE" != "editable" ]; then
+    echo "[pkg] Upgrading MetaCount + SearchLibrium to latest PyPI release..."
+    (
+        flock -w 900 9 2>/dev/null || echo "[pkg] (flock unavailable, proceeding without lock)"
+        pip install --upgrade -q --retries 1 --timeout 20 metacountregressor SearchLibrium \
+            && echo "[pkg] MetaCount + SearchLibrium upgraded (PyPI latest)" \
+            || echo "[pkg] WARNING: PyPI estimator upgrade failed (offline?) — using whatever is installed"
+    ) 9>"${PBS_O_WORKDIR:-.}/.pkg_upgrade.lock"
+fi
+
+_need_metacount=0
+_need_searchlib=0
+case "$GA_ESTIMATOR" in
+    metacount)     _need_metacount=1 ;;
+    searchlibrium) _need_searchlib=1 ;;
+    both)          _need_metacount=1; _need_searchlib=1 ;;
+    hybrid)        _need_metacount=1; _need_searchlib=1 ;;
+    sa_bandit)     _need_metacount=1; _need_searchlib=1 ;;
+esac
+# Bandit SA mode historically needed editable installs for banditsa/adaptive_search.
+# PyPI (>=1.0.151) now ships these, so the default stays on PyPI-latest: only an
+# explicit ESTIMATOR_SOURCE=editable opts out. Pass ESTIMATOR_SOURCE=editable
+# yourself if you are developing the estimator packages.
+if [ "${GA_USE_BANDIT_SA:-0}" = "1" ]; then
+    _need_metacount=1
+    _need_searchlib=1
+fi
+
+if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_metacount" = "1" ]; then
+    echo "[pkg] Installing MetaCount estimator (${ESTIMATOR_SOURCE})..."
+    if [ "$ESTIMATOR_SOURCE" = "editable" ] && [ -d "$_HPC_MC" ]; then
+        # Refresh the local checkout first — a stale clone keeps reporting an
+        # old version (0.0.138) no matter how often `pip install -e` re-runs.
+        git -C "$_HPC_MC" pull --ff-only 2>/dev/null \
+            && echo "[pkg] MetaCount source pulled ($(git -C "$_HPC_MC" rev-parse --short HEAD 2>/dev/null))" \
+            || echo "[pkg] MetaCount git pull skipped (not a clean git checkout)"
+        pip install -e "$_HPC_MC" --upgrade -q \
+            && echo "[pkg] MetaCount installed (editable: $_HPC_MC)"
+    else
+        # PyPI latest (already upgraded by the unconditional step above; this
+        # re-asserts it when INSTALL_ESTIMATORS/GA_ESTIMATOR forces a metacount run).
+        pip install --upgrade -q "metacountregressor" \
+            && echo "[pkg] MetaCount installed (PyPI latest)"
+    fi
+    # Only (re)install jax/jaxlib/jaxopt if the CURRENT env can't already import
+    # them. Previously this ran an unconditional `pip install --upgrade jax
+    # jaxlib jaxopt` on every job (INSTALL_ESTIMATORS defaults to 1, so this
+    # fired on every submission) - that installs the generic, non-CUDA-bundled
+    # jaxlib, silently overwriting a manually-fixed `jax[cuda12]` GPU install
+    # with a CPU/mismatched one on the very next job. job_sa_bandit.pbs and
+    # job_sa_bandit_507.pbs already use this same "skip if importable" guard;
+    # this brings pbs_pipeline_mode.pbs in line with them. If a real (re)install
+    # is ever needed, request jax[cuda12] explicitly (matching the known-good
+    # recipe: CUDA bundled in the wheel, not the system module) rather than
+    # bare jax/jaxlib, and run it on a GPU node - see PBS_RUN_GUIDE.md.
+    if ! python -c "import jax, jaxlib, jaxopt" 2>/dev/null; then
+        pip install --no-cache-dir -q "jax[cuda12]" jaxopt \
+            && echo "[pkg] jax[cuda12]/jaxopt installed"
+    else
+        echo "[pkg] jax/jaxlib/jaxopt already importable — skipping (not touching an existing GPU install)"
+    fi
+    # h5py is required for the SA1-resolution walk/bike skims
+    # (load_sa1_walk_skims). Without it every stage-5 evaluation logs
+    # "No module named 'h5py'" and silently falls back to SA2-level skims,
+    # degrading walk/bike accessibility fidelity (seen throughout job 23726229).
+    if ! python -c "import h5py" 2>/dev/null; then
+        pip install --no-cache-dir -q h5py \
+            && echo "[pkg] h5py installed (SA1 walk/bike skims)"
+    fi
+    # Exactly ONE CUDA plugin generation. jax[cuda12] is the pinned recipe;
+    # a stray cuda13 plugin (pulled in by an unpinned jax upgrade) races the
+    # cuda12 one at PJRT registration and one of them fails ALREADY_EXISTS in
+    # every process (job 23926202). Remove the cuda13 pair when both exist.
+    if python -c "import jax_plugins.xla_cuda13" 2>/dev/null \
+       && python -c "import jax_plugins.xla_cuda12" 2>/dev/null; then
+        pip uninstall -y -q jax-cuda13-plugin jax-cuda13-pjrt 2>/dev/null \
+            && echo "[pkg] removed duplicate cuda13 jax plugin (cuda12 is the pinned recipe)"
+    fi
+    # Clear stale bytecode — stale .pyc files persist across pip upgrades and cause
+    # wrong-line-number tracebacks and runtime errors from old bytecode.
+    python - <<'PYEOF' 2>/dev/null || true
+import importlib, shutil, os
+try:
+    import metacountregressor as _mc
+    _d = os.path.join(os.path.dirname(_mc.__file__), '__pycache__')
+    shutil.rmtree(_d, ignore_errors=True)
+    print(f'[pkg] cleared metacountregressor __pycache__: {_d}')
+except ImportError:
+    pass
+PYEOF
+fi
+
+if [ "$INSTALL_ESTIMATORS" = "1" ] || [ "$_need_searchlib" = "1" ]; then
+    echo "[pkg] Installing SearchLibrium estimator (${ESTIMATOR_SOURCE})..."
+    if [ "$ESTIMATOR_SOURCE" = "editable" ] && [ -d "$_HPC_SL" ]; then
+        git -C "$_HPC_SL" pull --ff-only 2>/dev/null \
+            && echo "[pkg] SearchLibrium source pulled ($(git -C "$_HPC_SL" rev-parse --short HEAD 2>/dev/null))" \
+            || echo "[pkg] SearchLibrium git pull skipped (not a clean git checkout)"
+        pip install -e "$_HPC_SL" --upgrade -q \
+            && echo "[pkg] SearchLibrium installed (editable: $_HPC_SL)"
+    else
+        pip install --upgrade -q "SearchLibrium" \
+            && echo "[pkg] SearchLibrium installed (PyPI latest)"
+    fi
+fi
+
+echo "[pkg] Installed estimator versions:"
+pip show metacountregressor 2>/dev/null | awk '/^Name:|^Version:|^Location:/{print "  " $0}' || true
+pip show SearchLibrium 2>/dev/null | awk '/^Name:|^Version:|^Location:/{print "  " $0}' || true
+# ──────────────────────────────────────────────────────────────────────────
+
 # Keep linear algebra and numba-backed sections from oversubscribing cores.
 # THREADS controls BLAS/numba; S5_WORKERS controls Stage 5 zone parallelism.
 # Rule of thumb: S5_WORKERS = ncpus / THREADS  (e.g. ncpus=8,THREADS=1 → S5_WORKERS=8)
@@ -33,21 +192,155 @@ export OMP_NUM_THREADS="$THREADS"
 export OPENBLAS_NUM_THREADS="$THREADS"
 export MKL_NUM_THREADS="$THREADS"
 export NUMEXPR_NUM_THREADS="$THREADS"
+# Pure-CPU jax on CPU jobs: skip PJRT GPU plugin discovery entirely. The env
+# has had BOTH xla_cuda12 and xla_cuda13 plugins installed; whichever
+# registered second crashed with "ALREADY_EXISTS: PJRT_Api" in every process
+# (main + all spawned workers, job 23926202), and whichever won registered a
+# CUDA client on a node with ngpus=0. JAX_PLATFORMS=cpu sidesteps both and
+# removes any GPU-plugin memory overhead from CPU-only search workers.
+if [ "${PIPELINE_ACCELERATOR:-cpu}" = "cpu" ]; then
+    export JAX_PLATFORMS=cpu
+fi
 export STAGE5_WORKERS="$S5_WORKERS"
+# Zones per Stage-5 prediction batch. 1 zone/batch re-triggers Larch/sharrow
+# flow compilation per zone (~15 min each × 330 zones ≈ days — job 23300124
+# burned a full walltime without reaching the prediction write). 50 → ~7
+# compilations, ~400 MB peak per batch.
+export STAGE5_BATCH_SIZE="${STAGE5_BATCH_SIZE:-50}"
+# Write each finished prediction batch to <run_dir>/stage5_batches/ and resume
+# from there after a walltime kill (STAGE5_BATCH_CHECKPOINT=0 disables).
+export STAGE5_BATCH_CHECKPOINT="${STAGE5_BATCH_CHECKPOINT:-1}"
+# Number of GA stage-2..5 segments (purposes/targets/tour segments) searched
+# concurrently in spawn-mode subprocesses. Empty = ga_hypothesis_testing.py
+# picks min(n_segments, cpu_count, 4) automatically. Set via
+# submit_pipeline_runs.sh --ga-parallel-segments.
+export GA_PARALLEL_SEGMENTS="${GA_PARALLEL_SEGMENTS:-}"
 export PIPELINE_ACCELERATOR
 export PIPELINE_RUN_TAG
 export PIPELINE_RUN_ROOT="$RUN_ROOT"
+export GA_ESTIMATOR
+export GA_USE_SA="${GA_USE_SA:-0}"
+export GA_USE_BANDIT_SA="${GA_USE_BANDIT_SA:-0}"
+# Search engine: default to SparseEA-AGDS (overridable with -v GA_ENGINE=ga|sa|bandit).
+# GA_ENGINE has precedence over GA_USE_SA/GA_USE_BANDIT_SA in _resolve_search_engine.
+export GA_ENGINE="${GA_ENGINE:-agds}"
+# When 1, GA_STAGED skips re-running estimation and loads ga_results.pkl from
+# the prior 'ga' run dir (resolved via per-estimator alias or GA_STAGED_GA_DIR).
+# Set automatically by submit_pipeline_runs.sh --split-estimation.
+export GA_STAGED_REUSE_ESTIMATOR="${GA_STAGED_REUSE_ESTIMATOR:-0}"
+# Explicit path override for the prior 'ga' run dir (optional).
+export GA_STAGED_GA_DIR="${GA_STAGED_GA_DIR:-}"
+# Allow Larch to auto-select engine (JAX first on Linux, numba fallback).
+# Hard-forcing numba can trigger nopython typing failures in Stage 5 idca flows.
+export GA_LARCH_ENGINE="${GA_LARCH_ENGINE:-auto}"
+# SA-Bandit: MetaCount can use GPU with on-demand memory allocation.
+# XLA_PYTHON_CLIENT_PREALLOCATE=false lets 4 workers share 1 GPU cleanly.
+# Each per-eval fit is small (1k-6k rows × 20-30 features) — GPU is μs vs CPU seconds.
+if [ "${GA_USE_BANDIT_SA:-0}" = "1" ] && [ "${PIPELINE_ACCELERATOR:-cpu}" = "gpu" ]; then
+    export GA_METACOUNT_FORCE_CPU=0
+    export XLA_PYTHON_CLIENT_PREALLOCATE=false
+else
+    export GA_METACOUNT_FORCE_CPU="${GA_METACOUNT_FORCE_CPU:-1}"
+fi
+# SA-Bandit: prevent JAX cache thrashing by overriding cgroup-detected limit.
+# 4 GPU workers at ~15 GB RSS each (less with GPU offloading) — well under 250 GB.
+if [ "${GA_USE_BANDIT_SA:-0}" = "1" ]; then
+    export GA_JAX_CACHE_MEM_LIMIT_GB="${GA_JAX_CACHE_MEM_LIMIT_GB:-200}"
+    export GA_JAX_CACHE_CHECK_EVERY="${GA_JAX_CACHE_CHECK_EVERY:-100}"
+    export GA_SIG_PENALTY_WEIGHT="${GA_SIG_PENALTY_WEIGHT:-0.50}"
+fi
+# When a real estimator is selected, mixing model families mid-search
+# (e.g. MetaCount NB2 on one evaluation, ordered-logit on the next) produces
+# non-comparable BIC values.  Disable statsmodels fallback for those cases.
+if [ "$GA_ESTIMATOR" = "default" ] || [ -z "$GA_ESTIMATOR" ]; then
+    export GA_ESTIMATOR_FALLBACK="${GA_ESTIMATOR_FALLBACK:-1}"
+else
+    export GA_ESTIMATOR_FALLBACK="${GA_ESTIMATOR_FALLBACK:-0}"
+fi
+# For GA search modes, force JAX to CPU to prevent CUDA kernel errors.
+# sa_bandit with GPU: allow JAX to auto-detect CUDA (per-eval MetaCount fits
+# benefit from GPU μs execution vs CPU seconds; workers share GPU via
+# XLA_PYTHON_CLIENT_PREALLOCATE=false).
+# ga_stage5_smoke uses GPU for the final model fit.
+case "$MODE" in
+    ga|ga_metacount|ga_searchlibrium)
+        if [ "${GA_USE_BANDIT_SA:-0}" = "1" ] && [ "${PIPELINE_ACCELERATOR:-cpu}" = "gpu" ]; then
+            :  # let JAX auto-detect GPU — per-worker GPU memory is small with PREALLOCATE=false
+        else
+            export JAX_PLATFORMS=cpu
+        fi
+        ;;
+    sa_smoke)
+        export JAX_PLATFORMS=cpu
+        ;;
+    ga_stage5_smoke)
+        if [ "${PIPELINE_ACCELERATOR:-cpu}" != "gpu" ]; then
+            export JAX_PLATFORMS=cpu
+        fi
+        ;;
+esac
 
-run_suffix="$MODE"
+# Derive SAFETY_EXPERIMENT_MODE from mode name so the pipeline knows which arm to run.
+# This avoids needing to pass it as a separate -v variable from submit_pipeline_runs.sh.
+case "$MODE" in
+    safety_baseline*)  export SAFETY_EXPERIMENT_MODE="${SAFETY_EXPERIMENT_MODE:-baseline}" ;;
+    safety_nosafety*)  export SAFETY_EXPERIMENT_MODE="${SAFETY_EXPERIMENT_MODE:-nosafety}"  ;;
+    safety_analysis*)  export SAFETY_EXPERIMENT_MODE="${SAFETY_EXPERIMENT_MODE:-both}"      ;;
+esac
+
+# Enable joint participation model estimation for the dedicated joint_model job.
+if [ "$MODE" = "joint_model" ]; then
+    export JOINT_PARTICIPATION_MODEL=1
+fi
+
+# Build a zone suffix component for all modes
+_zone_sfx=""
 if [ -n "$ZONE_ARG" ]; then
-    safe_arg=${ZONE_ARG//\//_}
-    safe_arg=${safe_arg//\\/_}
-    safe_arg=${safe_arg// /}
-    run_suffix="${MODE}_${safe_arg}"
+    _zone_sfx="${ZONE_ARG//\//_}"
+    _zone_sfx="${_zone_sfx//\\/_}"
+    _zone_sfx="${_zone_sfx// /}"
+fi
+
+# For GA/SA search modes always include estimator name and use clean search-prefix.
+# Pattern: {ga|sa}_{estimator}[_staged][_zone]  e.g. ga_default  sa_metacount_staged
+if [ "$MODE" = "ga" ] || [ "$MODE" = "ga_staged" ] || [ "$MODE" = "ga_stage5_smoke" ]; then
+    _estim="${GA_ESTIMATOR:-default}"
+    if [ "${GA_USE_SA:-0}" = "1" ] || [ "${GA_USE_BANDIT_SA:-0}" = "1" ]; then
+        _pfx="sa"
+        # sa_bandit + SA flags → 'sa_bandit' not 'sa_ga_sa_bandit'
+        [ "$_estim" = "sa_bandit" ] && _estim="bandit"
+    else
+        _pfx="ga"
+    fi
+    # mode tail: '' for 'ga', '_staged' for 'ga_staged', '_stage5_smoke' for smoke
+    _mode_tail="${MODE#ga}"
+    run_suffix="${_pfx}_${_estim}${_mode_tail}"
+    [ -n "$_zone_sfx" ] && run_suffix="${run_suffix}_${_zone_sfx}"
+else
+    # All other modes: existing logic
+    run_suffix="$MODE"
+    [ -n "$_zone_sfx" ] && run_suffix="${MODE}_${_zone_sfx}"
+    # Append estimator name so parallel estimator-variant runs land in distinct dirs.
+    # e.g. main_metacount__JOBID/  vs  main__JOBID/  vs  main_both__JOBID/
+    if [ -n "$GA_ESTIMATOR" ] && [ "$GA_ESTIMATOR" != "default" ]; then
+        run_suffix="${run_suffix}_${GA_ESTIMATOR}"
+    fi
+    # Prepend sa_ when running simulated annealing or bandit SA
+    if [ "${GA_USE_SA:-0}" = "1" ] || [ "${GA_USE_BANDIT_SA:-0}" = "1" ]; then
+        run_suffix="sa_${run_suffix}"
+    fi
 fi
 run_suffix="${run_suffix}__${PIPELINE_RUN_TAG}"
 
-mkdir -p "$RUN_ROOT/$run_suffix/plots"
+RUN_DIR="${PIPELINE_RUN_DIR:-${RUN_ROOT}/${run_suffix}}"
+mkdir -p "${RUN_DIR}/plots"
+
+# Write the actual prediction run directory to a marker file for dependent jobs
+# (MATSim export, full scenario, SimWrapper, etc.) to discover.
+# The chain script expects this at ${RUN_ROOT}/${PIPELINE_RUN_TAG}/prediction_run_dir.txt
+mkdir -p "${RUN_ROOT}/${PIPELINE_RUN_TAG}"
+echo "${RUN_ROOT}/${run_suffix}" > "${RUN_ROOT}/${PIPELINE_RUN_TAG}/prediction_run_dir.txt"
+echo "Wrote prediction run dir marker: ${RUN_ROOT}/${PIPELINE_RUN_TAG}/prediction_run_dir.txt -> ${RUN_ROOT}/${run_suffix}"
 
 echo "=========================================="
 echo "PBS job ${PBS_JOBID:-unknown}"
@@ -55,26 +348,347 @@ echo "Mode:        $MODE"
 echo "Zone arg:    ${ZONE_ARG:-<all>}"
 echo "Conda env:   $CONDA_ENV"
 echo "Threads:     $THREADS"
+echo "GA parallel segments: ${GA_PARALLEL_SEGMENTS:-<auto>}"
 echo "Accelerator: $PIPELINE_ACCELERATOR"
+echo "GA estimator:$GA_ESTIMATOR"
 echo "Run tag:     $PIPELINE_RUN_TAG"
 echo "Working dir: $PBS_O_WORKDIR"
 echo "Run dir:     ${RUN_ROOT}/${run_suffix}"
 echo "Started:     $(date)"
 echo "=========================================="
 
-if [ "$MODE" = "safety_analysis" ]; then
+# ── Write run outline ───────────────────────────────────────────────────────
+# Describes what this job is testing so outputs in the run dir are self-contained.
+_outline="${RUN_DIR}/run_outline.txt"
+cat > "$_outline" <<OUTLINE
+Run Outline
+===========
+PBS job       : ${PBS_JOBID:-unknown}
+Submit host   : ${PBS_O_HOST:-unknown}
+Mode          : ${MODE}
+Zone argument : ${ZONE_ARG:-<all zones>}
+GA estimator  : ${GA_ESTIMATOR}
+GA budget     : ${GA_BUDGET:-standard}
+Accelerator   : ${PIPELINE_ACCELERATOR}
+Threads       : ${THREADS}
+S5 workers    : ${S5_WORKERS}
+GA parallel segs: ${GA_PARALLEL_SEGMENTS:-<auto>}
+Resources     : $(qstat -f "${PBS_JOBID:-unknown}" 2>/dev/null | grep Resource_List | head -1 | sed 's/.*Resource_List.//' || echo 'n/a')
+Conda env     : ${CONDA_ENV}
+Working dir   : ${PBS_O_WORKDIR}
+Run dir       : ${RUN_ROOT}/${run_suffix}
+Log file      : ${RUN_DIR}/pipeline_run.log
+Started       : $(date -Iseconds)
+
+What this job tests
+-------------------
+$(case "$MODE" in
+    main)
+        echo "Full ABM pipeline (stages 1–6) on synthetic population."
+        echo "Estimates models on HHTS data, predicts for all SA2 zones."
+        echo "Estimator: ${GA_ESTIMATOR} (controls activity frequency / duration models)."
+        ;;
+    ga)
+        echo "GA variable selection on HHTS data (stages 1–5, estimation only)."
+        echo "Identifies best feature subsets via genetic algorithm."
+        echo "Estimator: ${GA_ESTIMATOR}."
+        echo "No synthetic-population prediction — run ga_staged or main afterwards."
+        ;;
+    ga_staged)
+        echo "GA variable selection (stages 1–5) + full pipeline prediction."
+        echo "Applies GA-selected features to synth population after estimation."
+        echo "Estimator: ${GA_ESTIMATOR}."
+        ;;
+    ga_stage5_smoke)
+        echo "GA Stage 5-only smoke test (ultra-small GA budget)."
+        echo "Runs estimation-only wiring check and writes stage reports/checkpoints."
+        echo "No full synthetic-population prediction in this mode."
+        ;;
+    sa_smoke)
+        echo "SA signal-bearing smoke test (5-phase: activity frequency, duration, schedule, mode NL, destination MNL)."
+        echo "Verifies SA perturbation, fitness signal, and progressive search across all pipeline stages."
+        echo "Exit 0 = all 10 checks pass. Exit 1 = at least one failure — gated jobs will not start."
+        ;;
+    safety_baseline)
+        echo "Safety experiment — baseline run with crash-risk skims active."
+        echo "Generates trip plans used to measure safety-aware mode shift."
+        ;;
+    safety_nosafety)
+        echo "Safety experiment — counterfactual run with crash-risk skims zeroed."
+        echo "Contrast with safety_baseline to measure mode-shift from safety utility."
+        ;;
+    safety_analysis)
+        echo "Safety experiment — compares baseline vs no-safety trip plans."
+        echo "Produces safety_experiment_report.html and zone-ranking CSV."
+        ;;
+    joint_model)
+        echo "Joint participation + duration model comparison."
+        echo "Fits Tobit-I and Heckman models on HHTS day-duration data."
+        echo "Writes stage2_joint_model_comparison.html into the most recent main run dir."
+        ;;
+    mcr_search)
+        echo "MetaCount ExperimentBuilder structure search."
+        echo "Family: ${MCR_FAMILY:-n/a}  Algorithm: ${MCR_ALGO:-sa}"
+        echo "Max iterations: ${MCR_MAX_ITER:-2000}  Halton draws R=${MCR_R:-200}."
+        echo "Searches over model structure (random parameters, dispersion, zero-inflation)."
+        ;;
+    *)
+        echo "Mode: ${MODE} — see pipeline_logger.py for details."
+        ;;
+esac)
+
+Outputs expected
+----------------
+$(case "$MODE" in
+    main|ga_staged)
+        echo "  stage1_coefficients.html  stage2_coefficients.html  stage3_coefficients.html"
+        echo "  stage4_coefficients.html  stage5_models_coefficients.html"
+        echo "  stage6_output.csv  trips_for_aimsun.csv"
+        echo "  plots/  — activity patterns, destination share, mode share"
+        ;;
+    ga)
+        echo "  ga_results.pkl  ga_reports/ga_summary.html"
+        echo "  ga_reports/ga_stage*_best_model.txt  ga_reports/ga_stage*_best_features.csv"
+        echo "  plots/ga_stage*.png  plots/ga_all_stages.png"
+        ;;
+    ga_stage5_smoke)
+        echo "  ga_results_stage5_smoke.pkl"
+        echo "  stage_reports/ga_stage5_smoke.*"
+        echo "  ga_reports/ga_summary.html  plots/ga_stage5.png"
+        ;;
+    sa_smoke)
+        echo "  pipeline_run.log  (PASS/FAIL per check, 10/10 required for exit 0)"
+        ;;
+    mcr_search)
+        echo "  mcr_search_result.json  best_spec.json  mcr_search_summary.html"
+        ;;
+    *)
+        echo "  See pipeline_run.log for outputs."
+        ;;
+esac)
+OUTLINE
+echo "  run_outline.txt → ${_outline}"
+
+set +e
+if [ "$MODE" = "sa_smoke" ]; then
+    stdbuf -oL python -u _test_sa_smoke.py \
+        2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
+elif [ "$MODE" = "safety_analysis" ]; then
     stdbuf -oL python -u safety_experiment_analysis.py \
-        2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+        2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
+elif [ "$MODE" = "paper_collect" ]; then
+    # Phase A: Generate synthetic population vs HHTS comparison report.
+    stdbuf -oL python -u compare_synth_hhts.py \
+        2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
+
+    # Phase B: Collect paper-ready outputs from the SA-bandit and safety_analysis runs
+    # and copy them to abm_safety/Figures/ for LaTeX inclusion.
+    stdbuf -oL python -u - << 'PYEOF' \
+        2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
+import shutil, os, glob, sys
+
+RUN_ROOT = os.environ.get('PIPELINE_RUN_ROOT', 'runs')
+PAPER_DIR = os.path.join('abm_safety', 'Figures')
+os.makedirs(PAPER_DIR, exist_ok=True)
+os.makedirs(os.path.join(PAPER_DIR, 'safety_plots'), exist_ok=True)
+
+print("=" * 60)
+print("PAPER OUTPUT COLLECTION")
+print(f"  Paper figures dir: {os.path.abspath(PAPER_DIR)}")
+print("=" * 60)
+
+# Find the most recent SA-bandit run directories
+sa_dirs = sorted(
+    glob.glob(os.path.join(RUN_ROOT, 'sa_bandit__*')),
+    key=os.path.getmtime, reverse=True
+)
+sa_dir = sa_dirs[0] if sa_dirs else None
+print(f"\n  SA-bandit run dir: {sa_dir or 'NOT FOUND'}")
+
+# Also check ga_staged dir for prediction outputs (stage5 coefficients)
+sa_staged_dirs = sorted(
+    glob.glob(os.path.join(RUN_ROOT, 'sa_bandit_staged__*')),
+    key=os.path.getmtime, reverse=True
+)
+sa_staged_dir = sa_staged_dirs[0] if sa_staged_dirs else None
+print(f"  SA-bandit staged dir: {sa_staged_dir or 'NOT FOUND'}")
+
+# Find the most recent safety_analysis directory
+anal_dirs = sorted(
+    glob.glob(os.path.join(RUN_ROOT, 'safety_analysis__*')),
+    key=os.path.getmtime, reverse=True
+)
+anal_dir = anal_dirs[0] if anal_dirs else None
+print(f"  Safety analysis dir: {anal_dir or 'NOT FOUND'}")
+
+copied = 0
+
+# Combine both dirs for searching outputs
+_search_dirs = [d for d in (sa_dir, sa_staged_dir) if d]
+
+# 1. GA convergence plot (from sa_dir — the estimation job)
+if sa_dir:
+    ga_plot = os.path.join(sa_dir, 'plots', 'ga_all_stages.png')
+    if not os.path.exists(ga_plot):
+        ga_plot = os.path.join(sa_dir, 'ga_all_stages.png')
+    if os.path.exists(ga_plot):
+        dst = os.path.join(PAPER_DIR, 'sa_bandit_ga_all_stages.png')
+        shutil.copy2(ga_plot, dst)
+        print(f"  [OK] sa_bandit_ga_all_stages.png")
+        copied += 1
+    else:
+        print(f"  [MISS] ga_all_stages.png not found in {sa_dir}")
+
+    # Per-stage GA convergence CSVs
+    ga_reports_dir = os.path.join(sa_dir, 'ga_reports')
+    if os.path.isdir(ga_reports_dir):
+        for f in os.listdir(ga_reports_dir):
+            if f.endswith('.csv'):
+                src = os.path.join(ga_reports_dir, f)
+                dst = os.path.join(PAPER_DIR, f'sa_bandit_{f}')
+                shutil.copy2(src, dst)
+                print(f"  [OK] sa_bandit_{f}")
+                copied += 1
+
+# 2. Stage 5 coefficient HTML (from sa_staged_dir or sa_dir)
+for _d in _search_dirs:
+    coef_html = os.path.join(_d, 'stage5_models_coefficients.html')
+    if not os.path.exists(coef_html):
+        coef_html = os.path.join(_d, 'stage5_tour_coefficients.html')
+    if not os.path.exists(coef_html):
+        coef_html = os.path.join(_d, 'ga_reports', 'ga_stage5_coef.html')
+    if not os.path.exists(coef_html):
+        coef_html = os.path.join(_d, 'stage5_coefficients.html')
+    if os.path.exists(coef_html):
+        dst = os.path.join(PAPER_DIR, 'sa_bandit_stage5_coef.html')
+        shutil.copy2(coef_html, dst)
+        print(f"  [OK] sa_bandit_stage5_coef.html (from {os.path.basename(_d)})")
+        copied += 1
+        break
+else:
+    print(f"  [MISS] stage5 coefficient HTML not found in any SA-bandit dir")
+
+# 3. Stage 5 models pickle for paper coefficient tables
+for _d in _search_dirs:
+    pkl_src = os.path.join(_d, 'stage5_models.pkl')
+    if os.path.exists(pkl_src):
+        shutil.copy2(pkl_src,
+                     os.path.join(PAPER_DIR, 'sa_bandit_stage5_models.pkl'))
+        print(f"  [OK] sa_bandit_stage5_models.pkl (from {os.path.basename(_d)})")
+        copied += 1
+        break
+if anal_dir:
+    # Safety comparison CSV
+    csv_src = os.path.join(anal_dir, 'safety_comparison.csv')
+    if os.path.exists(csv_src):
+        dst = os.path.join(PAPER_DIR, 'sa_bandit_safety_comparison.csv')
+        shutil.copy2(csv_src, dst)
+        print(f"  [OK] sa_bandit_safety_comparison.csv")
+        copied += 1
+
+    # Safety report HTML
+    report_src = os.path.join(anal_dir, 'safety_report.html')
+    if os.path.exists(report_src):
+        dst = os.path.join(PAPER_DIR, 'sa_bandit_safety_report.html')
+        shutil.copy2(report_src, dst)
+        print(f"  [OK] sa_bandit_safety_report.html")
+        copied += 1
+
+    # Safety comparison plots
+    src_plots = os.path.join(anal_dir, 'plots')
+    dst_plots = os.path.join(PAPER_DIR, 'safety_plots')
+    if os.path.isdir(src_plots):
+        for f in os.listdir(src_plots):
+            if f.endswith('.png'):
+                shutil.copy2(os.path.join(src_plots, f),
+                           os.path.join(dst_plots, f))
+                print(f"  [OK] safety_plots/{f}")
+                copied += 1
+
+# 5. Synthetic population vs HHTS comparison outputs
+# Produced by compare_synth_hhts.py (Phase A above)
+print(f"\n  Synth vs HHTS comparison:")
+for _fname, _dstname in [
+    ('synth_vs_hhts_comparison.csv', 'sa_bandit_synth_vs_hhts_comparison.csv'),
+    ('synth_population_report.html', 'sa_bandit_synth_population_report.html'),
+    ('plots/synth_vs_hhts_mode_share.png', 'safety_plots/synth_vs_hhts_mode_share.png'),
+    ('plots/synth_vs_hhts_trip_counts.png', 'safety_plots/synth_vs_hhts_trip_counts.png'),
+    ('plots/synth_vs_hhts_distance.png', 'safety_plots/synth_vs_hhts_distance.png'),
+]:
+    _src = os.path.join(anal_dir, _fname)
+    _dst = os.path.join(PAPER_DIR, _dstname)
+    if os.path.exists(_src):
+        os.makedirs(os.path.dirname(_dst), exist_ok=True)
+        shutil.copy2(_src, _dst)
+        print(f"  [OK] {_dstname}")
+        copied += 1
+
+print(f"\n  Total files copied: {copied}")
+print(f"  Paper-ready outputs -> {os.path.abspath(PAPER_DIR)}/")
+print("=" * 60)
+PYEOF
+elif [ "$MODE" = "joint_model" ]; then
+    # Tobit-I + Heckman joint participation+duration comparison.
+    # Loads data and the already-estimated Stage 2 models from the most-recent
+    # main run, then runs estimate_stage2_joint() and writes the comparison HTML.
+    stdbuf -oL python -u - << 'PYEOF' \
+        2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
+import sys, os
+sys.path.insert(0, '.')
+os.environ.setdefault('JOINT_PARTICIPATION_MODEL', '1')
+
+from pipeline_logger import load_data, estimate_stage2_joint, OUT_DIR
+from stage2_day_duration import load_models
+import glob, os as _os
+
+out = load_data()
+
+# Find the most recent stage2_models.pkl in any main run directory
+s2_pkl = _os.path.join(OUT_DIR, 'stage2_models.pkl')
+if not _os.path.isfile(s2_pkl):
+    candidates = sorted(glob.glob('runs/main*/stage2_models.pkl'), key=_os.path.getmtime)
+    if candidates:
+        s2_pkl = candidates[-1]
+        print(f'Using stage2 models from: {s2_pkl}')
+
+s2_models = None
+if _os.path.isfile(s2_pkl):
+    s2_models = load_models(s2_pkl)
+    print(f'Loaded two-stage models: {s2_pkl}')
+else:
+    print('WARNING: stage2_models.pkl not found - comparison will show joint models only')
+
+estimate_stage2_joint(out, s2_models=s2_models)
+print('Joint model estimation complete.')
+PYEOF
 else
     if [ -n "$ZONE_ARG" ]; then
         stdbuf -oL python -u pipeline_logger.py "$MODE" "$ZONE_ARG" \
-            2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+            2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
     else
         stdbuf -oL python -u pipeline_logger.py "$MODE" \
-            2>&1 | stdbuf -oL tee -a "${RUN_ROOT}/${run_suffix}/pipeline_run.log"
+            2>&1 | stdbuf -oL tee -a "${RUN_DIR}/pipeline_run.log"
     fi
 fi
-
 EXIT_CODE=$?
+set -e
+
+# ── Refresh the SA2 travel-pattern slide in the model-review deck ─────────
+# Aggregates the newest stage5/stage6 plan output by person attribute and
+# injects the stats into ../abm_safety/model_review_deck.html (sentinel
+# replace — see generate_sa2_pattern_slide.py). Non-fatal: a slide refresh
+# failure must never fail the pipeline job.
+python generate_sa2_pattern_slide.py \
+    || echo "[deck] SA2 pattern slide refresh failed (non-fatal)"
+# Archive this run's validation reports and refresh the deck's diagnostics
+# gallery (see collect_run_reports.py). Also non-fatal.
+python collect_run_reports.py \
+    || echo "[deck] run-report gallery refresh failed (non-fatal)"
+# Person-day exemplars for the zones dashboard "Person Day" tab + the deck's
+# "day in the life" slide. Only meaningful after stage6 output exists; the
+# script exits quietly when it doesn't. Non-fatal like the slide above.
+python generate_person_day_samples.py \
+    || echo "[deck] person-day sample refresh failed (non-fatal)"
+
 echo "Finished: $(date)  exit_code=${EXIT_CODE}"
 exit "$EXIT_CODE"

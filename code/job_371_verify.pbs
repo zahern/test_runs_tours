@@ -1,0 +1,125 @@
+#!/bin/bash -l
+#PBS -N verify_371
+#PBS -l select=1:ncpus=2:mem=8GB
+#PBS -l walltime=00:30:00
+#PBS -j oe
+#PBS -m n
+#PBS -r n
+#
+# 371 zone-system verification gate.
+# Exercises every module touched by the 371 lock-in on the real HPC env
+# (larch/openmatrix/jax present) with real repo data files. No estimation,
+# no model fits, no files written outside this job's log. Expected runtime < 5 min.
+#
+#   qsub job_371_verify.pbs
+cd "$PBS_O_WORKDIR"
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORMS=cpu
+export PIPELINE_ACCELERATOR=cpu
+export NEW_POP=1
+export NEW_POP_MAPPED=0
+export PIPELINE_SKIMS_PATH=../demand_/skims_371.omx
+
+python -u -X utf8 - <<'PY'
+import os, sys
+fail = []
+def check(name, cond, detail=""):
+    print(f"  [{'PASS' if cond else 'FAIL'}] {name} {detail}", flush=True)
+    if not cond:
+        fail.append(name)
+
+print("== 1. imports ==", flush=True)
+mods = {}
+for m in ["build_synth_population", "stage6_plan_finalisation",
+          "validate_hhts", "read_skims", "logsum_accessibility",
+          "ga_hypothesis_testing", "usual_location",
+          "stage5_destination_choice", "data_connect", "pipeline_logger",
+          "larch", "openmatrix", "jax"]:
+    try:
+        mods[m] = __import__(m)
+        print(f"  [PASS] import {m}", flush=True)
+    except Exception as e:
+        print(f"  [FAIL] import {m}: {type(e).__name__}: {e}", flush=True)
+        fail.append(f"import {m}")
+
+print("== 2. constants ==", flush=True)
+s6 = mods.get("stage6_plan_finalisation")
+if s6 is not None:
+    check("N_VALID_ZONES == 371", s6.N_VALID_ZONES == 371, f"({s6.N_VALID_ZONES})")
+    check("FRINGE_ZONE == 999", s6.FRINGE_ZONE == 999, f"({s6.FRINGE_ZONE})")
+s5 = mods.get("stage5_destination_choice")
+if s5 is not None:
+    check("EXTERNAL_TAZ == 999", s5.EXTERNAL_TAZ == 999, f"({s5.EXTERNAL_TAZ})")
+    check("FRINGE_ZONE == 999", s5.FRINGE_ZONE == 999, f"({s5.FRINGE_ZONE})")
+rs = mods.get("read_skims")
+if rs is not None:
+    check("EXPECTED_N_ZONES == 371", rs.EXPECTED_N_ZONES == 371,
+          f"({rs.EXPECTED_N_ZONES})")
+    ref = rs._active_zone_ref_csv()
+    check("zone ref is 371 file", ref is not None and ref.endswith("seq_zone_ids_371.csv"),
+          f"({ref})")
+
+print("== 3. zone universe ==", flush=True)
+if s5 is not None:
+    u = s5._default_zone_universe()
+    check("universe n == 371", len(u) == 371, f"({len(u)})")
+    check("universe all SA2-scale", all(x > 100_000_000 for x in u))
+
+print("== 4. data files ==", flush=True)
+import pandas as pd
+z = pd.read_csv("saved_data/seq_zone_ids_371.csv")
+check("seq_zone_ids_371 rows == 371", len(z) == 371, f"({len(z)})")
+check("ORDER 330 is real", 330 in set(z["ORDER"].astype(int)))
+xw = pd.read_csv(os.path.join("..", "demand_", "sa2_to_order_crosswalk_371.csv"))
+check("crosswalk rows == 371", len(xw) == 371, f"({len(xw)})")
+check("crosswalk ORDER 1..371",
+      xw["order"].min() == 1 and xw["order"].max() == 371)
+bsp = mods.get("build_synth_population")
+if bsp is not None:
+    check("DEFAULT_CROSSWALK is 371 file",
+          bsp._DEFAULT_CROSSWALK.endswith("sa2_to_order_crosswalk_371.csv"),
+          f"({bsp._DEFAULT_CROSSWALK})")
+
+print("== 5. stage6 zone validation semantics ==", flush=True)
+if s6 is not None:
+    trips = pd.DataFrame({
+        "DTAZ": [330, 330, 5, 999, 371, 12],
+        "OTAZ": [1, 2, 5, 7, 371, 12],
+        "travtime": [10, 20, 30, 40, 50, 60]})
+    m = s6.compute_zone_validation_metrics(trips, verbose=False)
+    check("ORDER 330 counted valid", m["pct_valid_dtaz"] == round(5 / 6 * 100, 2),
+          f"({m['pct_valid_dtaz']})")
+    check("999 counted catch-all", m["n_catchall"] == 1, f"({m['n_catchall']})")
+
+print("== 6. no live 330 sentinel assignments ==", flush=True)
+import re
+live_hits = []
+for f in ["stage5_destination_choice.py", "stage6_plan_finalisation.py",
+          "data_connect.py", "logsum_accessibility.py",
+          "ga_hypothesis_testing.py", "build_synth_population.py"]:
+    src = open(f, encoding="utf-8").read()
+    for pat in [r"==\s*330(?!\d)", r"!=\s*330(?!\d)",
+                r"range\(1,\s*330\)", r"fillna\(330\)", r"EXTERNAL_TAZ\s*=\s*330"]:
+        for mm in re.finditer(pat, src):
+            line = src[:mm.start()].count("\n") + 1
+            live_hits.append(f"{f}:{line}")
+code_hits = []
+for h in live_hits:
+    f, ln = h.split(":")
+    line = open(f, encoding="utf-8").read().splitlines()[int(ln) - 1]
+    if not line.lstrip().startswith("#"):  # comments only document the retired sentinel
+        code_hits.append(h)
+check("zero live 330-sentinel code sites", len(code_hits) == 0, f"({code_hits})")
+
+print("", flush=True)
+if fail:
+    print(f"VERIFY FAILED: {len(fail)} check(s): {fail}", flush=True)
+    sys.exit(1)
+print("VERIFY PASSED: 371 lock-in holds on all live paths", flush=True)
+PY
+echo "Finished: $(date) exit_code=$?"

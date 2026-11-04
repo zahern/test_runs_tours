@@ -1,0 +1,57 @@
+#!/bin/bash -l
+# Fit MetaCount's MULTIVARIATE activity-count model on the Stage-1 data
+# (per-purpose counts estimated jointly with a copula) and write reports —
+# standalone, without running the full GA chain. Fast way to see the
+# multivariate output + activity-type correlation matrix.
+#
+# Submit:  qsub job_stage1_multivariate.pbs
+# Override marginal/copula:
+#   qsub -v GA_MV_MARGINAL=nb,GA_MV_COPULA=gaussian job_stage1_multivariate.pbs
+#
+# Outputs (in the code dir / OUT_DIR):
+#   stage1_multivariate_coefficients.csv
+#   stage1_multivariate_correlation.csv
+#   stage1_multivariate_report.html
+
+#PBS -N stage1_mv_371
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=8:mem=128GB
+#PBS -l walltime=06:00:00
+
+set -euo pipefail
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export GA_METACOUNT_FORCE_CPU=${GA_METACOUNT_FORCE_CPU:-1}
+# 371 SA2-native data.
+export NEW_POP=${NEW_POP:-1}
+export NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+export GA_MV_MARGINAL=${GA_MV_MARGINAL:-nb}
+export GA_MV_COPULA=${GA_MV_COPULA:-gaussian}
+# If the installed metacountregressor lacks the multivariate module, point at
+# a source checkout that has it (stage1_multivariate also probes common paths).
+export METACOUNT_SRC=${METACOUNT_SRC:-}
+
+# Fail fast with a clear message if the multivariate module isn't importable.
+python -c "from metacountregressor.multivariate_count_regressor import fit_multivariate_activity_model" 2>/dev/null || {
+  echo "FATAL: metacountregressor.multivariate_count_regressor not importable in '$CONDA_ENV'."
+  echo "       Install the build that ships it, e.g.:"
+  echo "         pip install -e ~/source/MetaCount    (or set METACOUNT_SRC to its path)"
+  exit 3
+}
+
+echo "Fitting Stage-1 multivariate activity-count model (${GA_MV_MARGINAL}/${GA_MV_COPULA})..."
+python -u stage1_multivariate.py --out-dir saved_data
+
+echo "Done. See stage1_multivariate_report.html"

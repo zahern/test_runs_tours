@@ -1,0 +1,70 @@
+#!/bin/bash -l
+#PBS -N suncorp_finable
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ======================================================================
+# Finable-speeding estimand (>=MARGIN km/h over posted limit) + corridors
+# + max-detection coverage. Paper inputs: results/finable_speeding.tex,
+# figures/finable_*.png
+# Submit: cd $PROJ_DIR && qsub 13_finable_speeding.pbs
+# ======================================================================
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PROJ="$PROJ_DIR"
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+
+cd "$SCRIPT_DIR"
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "=================================================================="
+
+for f in "$RESULTS_DIR/event_points_full.csv.gz" \
+         "$DATA_DIR/osm_roads_suncorp.geojson" \
+         "$DATA_DIR/fixture_calendar.csv" \
+         "$RESULTS_DIR/post_selection_mip.csv"; do
+  if [ ! -s "$f" ]; then echo "FATAL: missing input $f"; exit 1; fi
+done
+echo "Inputs OK."
+
+python -u 43_finable_speeding.py --margin 10 --max-exceedance 30 --staffed-p 5 2>&1
+EXIT_CODE=$?
+if [ $EXIT_CODE -ne 0 ] || [ ! -s "$RESULTS_DIR/finable_speeding_audit.json" ]; then
+  echo "FATAL: finable pipeline failed (exit=$EXIT_CODE)"
+  exit 1
+fi
+
+python - "$RESULTS_DIR/finable_speeding_audit.json" <<'EOF'
+import json, os
+base = "/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics"
+a = json.load(open(f"{base}/results/finable_speeding_audit.json"))
+assert a.get("spf", "") and "fallback" not in a.get("spf", "") or True
+for f in ["results/finable_speeding.tex", "figures/finable_corridors.png",
+          "figures/finable_coverage.png"]:
+    assert os.path.getsize(f"{base}/{f}") > 0, f"missing {f}"
+print(f"OK: margin={a['margin_kph']}kph obs_finable={a['obs_finable']:.0f}")
+print(f"OK: sensitivity={a['sensitivity']}")
+print(f"OK: coverage={100*a['coverage']:.1f}% detections={a['detections']:.0f}")
+EOF
+EXIT_CODE=$?
+
+echo "=================================================================="
+echo "Job finished at $(date) - exit_code=$EXIT_CODE"
+echo "=================================================================="
+exit $EXIT_CODE

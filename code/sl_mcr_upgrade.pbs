@@ -1,0 +1,87 @@
+#!/bin/bash
+#PBS -N sl_mcr_upgrade
+#PBS -P FPAXJW8067
+#PBS -l select=1:ncpus=1:mem=8GB
+#PBS -l walltime=00:20:00
+#PBS -o /mnt/hpccs01/home/ahernz/test_runs_tours/code/sl_mcr_upgrade.o
+#PBS -e /mnt/hpccs01/home/ahernz/test_runs_tours/code/sl_mcr_upgrade.e
+# Upgrade SearchLibrium + metacountregressor from PyPI in zigenv on a COMPUTE
+# node (pip is BANNED on the login node).  Verifies the installed SearchLibrium
+# still carries the latent-class estimator and the four EM fixes the LC jobs
+# depend on, then reports the metacountregressor version/importability.
+cd /mnt/hpccs01/home/ahernz/test_runs_tours/code || exit 1
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate zigenv
+export PATH="${CONDA_PREFIX:?conda activate zigenv failed}/bin:$PATH"
+hash -r
+echo "HOSTNAME=$(hostname)"
+echo "python=$(python -V 2>&1) at $(which python)"
+echo
+
+echo "=== 1. latest available on PyPI ==="
+pip index versions SearchLibrium 2>&1 | head -3
+pip index versions metacountregressor 2>&1 | head -3
+echo
+
+echo "=== 2. PRE-UPGRADE state ==="
+pip show SearchLibrium 2>/dev/null | egrep '^(Name|Version|Location)'
+pip show metacountregressor 2>/dev/null | egrep '^(Name|Version|Location)'
+echo
+
+echo "=== 3. UPGRADE from PyPI ==="
+pip install --upgrade --retries 2 --timeout 60 SearchLibrium metacountregressor 2>&1 | tail -30
+echo "pip_rc=$?"
+echo
+
+echo "=== 4. POST-UPGRADE state ==="
+pip show SearchLibrium 2>/dev/null | egrep '^(Name|Version|Location)'
+pip show metacountregressor 2>/dev/null | egrep '^(Name|Version|Location)'
+echo
+
+echo "=== 5. API / EM-fix verification ==="
+python - <<'PY'
+import inspect, os
+import SearchLibrium.mh_choice_estimator as M
+print("SearchLibrium module:", M.__file__)
+try:
+    print("  bytes:", os.path.getsize(M.__file__))
+except Exception:
+    pass
+for n in ["estimate_dest_choice", "estimate_dest_choice_lc", "_fit_frame_mnl",
+          "ChoiceSetFrame", "effective_sample_size", "identify_weak_features",
+          "estimate_dest_choice_interactions"]:
+    print("  %-34s %s" % (n, hasattr(M, n)))
+if hasattr(M, "estimate_dest_choice_lc"):
+    src = inspect.getsource(M)
+    for k, v in {
+        "gamma jitter":    "gammas = rng.normal(0.0, float(perturb_sigma), gammas.shape)",
+        "collapsed reseed":"_b = betas[_coll] + rng.normal",
+        "restart rank":    "_rank = (bool(converged), fit_ll)",
+        "shares from resp":"shares = np.asarray(resp).mean(axis=0)",
+        "memory leash":    "SL_HHTS_MAX_HISTORY",
+    }.items():
+        print("  fix %-16s %s" % (k, "YES" if v in src else "NO"))
+print()
+try:
+    import metacountregressor as mcr
+    ver = getattr(mcr, "__version__", "?")
+    print("metacountregressor import OK  version=%s  file=%s"
+          % (ver, getattr(mcr, "__file__", "?")))
+    names = [n for n in ("MetaCountRegressor", "MetaCount", "metacountregressor")
+             if hasattr(mcr, n)]
+    print("  export names present:", names or "(none of the common ones)")
+except Exception as e:
+    print("metacountregressor import FAILED:", type(e).__name__, e)
+print()
+try:
+    import stage5_lc_genes
+    print("stage5_lc_genes import OK  STAGE5_LC_N_INIT default=4")
+except Exception as e:
+    print("stage5_lc_genes import FAILED:", type(e).__name__, e)
+print("VERIFY_DONE")
+PY
+echo
+
+echo "=== 6. dependency consistency ==="
+pip check 2>&1 | tail -20
+echo "UPGRADE_JOB_DONE"

@@ -1,0 +1,90 @@
+#!/bin/bash -l
+#PBS -N suncorp_rp_hetero
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# ======================================================================
+# HETEROGENEITY JOB: show unobserved heterogeneity with continuous random
+# parameters (no zero-inflation: all rows trips>0, zeros are at-risk
+# sampling zeros, not safe states).
+#
+# Part A (site): per-stratum NB-RP, strong settings (R=300, DE 15x10,
+# seeds 0+1 best-AIC), full coef tables SAVED (RP means/SDs/SEs/z/p),
+# nested NB-fixed fit per stratum for the LR heterogeneity test,
+# INTEGRATED-mean predictions (Jensen factor reported), EB guard 5%.
+# Part B (driver scope, cheap): raw-trip sampling for VehicleID coverage
+# and panel-build cost; notes the existing event_points file dropped the ID.
+#
+# Paper inputs out: results/rp_heterogeneity.tex (tab:hetero),
+#   results/rp_heterogeneity_coefs.csv, results/rp_heterogeneity_summary.csv,
+#   results/driver_panel_scope.json, figures/rp_heterogeneity_hourly.png
+# Submit: cd $PROJ_DIR && qsub 15_rp_heterogeneity.pbs
+# ======================================================================
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+DATA_DIR=$PROJ_DIR/data
+RESULTS_DIR=$PROJ_DIR/results
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export JAX_PLATFORMS=cpu
+
+cd "$SCRIPT_DIR"
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "=================================================================="
+
+for f in "$DATA_DIR/segment_roads_part0_5000.csv.gz" \
+         "$DATA_DIR/road_geometry_features.csv"; do
+  if [ ! -s "$f" ]; then echo "FATAL: missing input $f"; exit 1; fi
+done
+echo "Inputs OK."
+
+python -u 44_rp_heterogeneity.py 2>&1
+EXIT_CODE=$?
+if [ $EXIT_CODE -ne 0 ]; then echo "FATAL: heterogeneity script failed (exit=$EXIT_CODE)"; exit 1; fi
+
+python - "$RESULTS_DIR/rp_heterogeneity_audit.json" <<'EOF'
+import json, os
+base = "/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics"
+a = json.load(open(f"{base}/results/rp_heterogeneity_audit.json"))
+assert a["total_speeding"] > 0, "no speeding counts modelled"
+assert "no_zero_inflation" in a, "ZI-free constraint not recorded"
+for k in ["Event/pre", "Event/during", "Event/post",
+          "Control/pre", "Control/during", "Control/post"]:
+    s = a[k]
+    assert "nb" in s["spec"], f"non-NB spec in {k}: {s['spec']}"
+    assert abs(s["eb"] - s["obs"]) / max(s["obs"], 1) < 0.05, f"EB off in {k}"
+    assert s["jensen_factor"] >= 1.0, f"Jensen<1 impossible in {k}"
+for f in ["results/rp_heterogeneity.tex", "results/rp_heterogeneity_coefs.csv",
+          "results/rp_heterogeneity_summary.csv",
+          "results/driver_panel_scope.json",
+          "figures/rp_heterogeneity_hourly.png"]:
+    assert os.path.getsize(f"{base}/{f}") > 0, f"missing {f}"
+n_sig = 0
+for k in ["Event/pre", "Event/during", "Event/post",
+          "Control/pre", "Control/during", "Control/post"]:
+    for b, v in a[k]["rp_sds"].items():
+        n_sig += bool(v["p"] < 0.05)
+print(f"OK: 6/6 strata RP-EB within 5%; significant RP-SDs: {n_sig}")
+print(f"OK: driver scope distinct_vehicles(sample)="
+      f"{a['scope']['distinct_vehicles_sample']}")
+EOF
+EXIT_CODE=$?
+
+echo "=================================================================="
+echo "Job finished at $(date) - exit_code=$EXIT_CODE"
+echo "=================================================================="
+exit $EXIT_CODE

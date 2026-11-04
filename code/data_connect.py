@@ -38,7 +38,7 @@ class YourClass:
             return df_out
         elif alt_method  == 'DEST_SAMPLE':
             det_sample = pd.DataFrame({
-                'DTAZ': [np.random.choices(range(1,330),k=5)]
+                'DTAZ': [np.random.choices(range(1,372),k=5)]
             })
             df_out = df.merge(det_sample, how = 'cross')
 
@@ -615,6 +615,8 @@ def determine_primary_purpose(df):
     
     df_index["tour_primary_purpose"] = primary_idx["purpose"]
     df_index["tour_destination"]     = primary_idx["DTAZ"]
+    if 'DESTSA1_2021' in df.columns:
+        df_index["tour_destination_sa1"] = primary_idx["DESTSA1_2021"]
     df_index["primary_trip_for_tour"] = primary_idx["trip_id"]
 
     tour_origin_series = (
@@ -756,24 +758,57 @@ def build_as_tours(df):
         .reset_index(name='home_return_time')
     )
 
+    tour_agg = {
+        'primary_purpose': ('tour_primary_purpose', 'first'),
+        'tour_origin': ('tour_origin', 'first'),
+        'tour_destination': ('tour_destination', 'first'),
+        'start_cumdist': ('cumdist', 'min'),
+        'start_time': ('STARTIME', 'min'),
+        'end_time': (et_col, 'max'),
+        'end_cumdist': ('cumdist', 'max'),
+        'num_trips': ('trip_id', 'count'),
+        'outbound_stops': ('direction', lambda x: (x == 'outbound').sum()),
+        'inbound_stops': ('direction', lambda x: (x == 'inbound').sum()),
+        'tour_mode': ('mode', _modal_mode),
+    }
+    if 'tour_destination_sa1' in df.columns:
+        tour_agg['tour_destination_sa1'] = ('tour_destination_sa1', 'first')
+    if 'transit_submode' in df.columns:
+        tour_agg['transit_submode'] = ('transit_submode', _modal_transit_submode)
     tours = (
-        df[df["tour_id"] > 0]
-        .groupby(["person_id", "tour_id", 'HHID'])
-        .agg(
-            primary_purpose   = ("tour_primary_purpose", "first"),
-            tour_origin       = ("tour_origin", "first"),
-            tour_destination  = ("tour_destination", "first"),
-            start_cumdist     = ("cumdist", "min"),
-            start_time        = ('STARTIME', 'min'),
-            end_time          = (et_col, 'max'),   # departure from last stop
-            end_cumdist       = ("cumdist", "max"),
-            num_trips         = ("trip_id", "count"),
-            outbound_stops    = ("direction", lambda x: (x=="outbound").sum()),
-            inbound_stops     = ("direction", lambda x: (x=="inbound").sum()),
-            tour_mode         = ('mode', _modal_mode),
-        )
+        df[df['tour_id'] > 0]
+        .groupby(['person_id', 'tour_id', 'HHID'])
+        .agg(**tour_agg)
         .reset_index()
     )
+
+    # Tour-level transit access (main-trip anchor), carried only when the
+    # trip-level STAGE5B_TRANSIT_ACCESS derivation created the column. Stage-5
+    # mode choice splits observed Transit into PT_Walk / PT_Drive / PT_Bike
+    # from this label (STAGE5_PT_MODES=1); 'Ride' and missing labels stay on
+    # the generic Transit alternative. Main trip = min DESTPURP priority rank,
+    # matching the anchor convention used elsewhere in this module.
+    if 'transit_access' in df.columns and 'DESTPURP' in df.columns:
+        try:
+            _prio = {'work': 1, 'edu': 2, 'escort': 3, 'shopping': 4,
+                     'othmaint': 5, 'othdiscr': 6, 'eat': 7, 'social': 8,
+                     'home': 9}
+            _rank = pd.to_numeric(
+                df['DESTPURP'].map(_prio), errors='coerce').fillna(5.0)
+            _main_ix = _rank.groupby(
+                [df['person_id'], df['tour_id']]).idxmin().dropna()
+            _main_acc = (
+                df.loc[_main_ix, ['person_id', 'tour_id', 'transit_access']]
+                .rename(columns={'transit_access': 'tour_transit_access'})
+                .drop_duplicates(['person_id', 'tour_id'])
+            )
+            tours = tours.merge(
+                _main_acc, on=['person_id', 'tour_id'], how='left')
+            logging.info(
+                "tour_transit_access carried: "
+                f"{tours['tour_transit_access'].value_counts(dropna=False).to_dict()}")
+        except Exception as _mae:
+            logging.warning(f"tour_transit_access carry skipped ({_mae})")
 
     # replace end_time with home-return time where available
     tours = tours.merge(home_returns, on=['person_id', 'tour_id'], how='left')
@@ -995,7 +1030,24 @@ MODES = {
             'Ferry':'Transit',
             'School bus (private/chartered)': 'Transit'
         }
-
+TRANSIT_SUBMODES = {
+            'Public Bus': 'Bus',
+            'Public bus': 'Bus',
+            'Charter/Courtesy/Other bus': 'Bus',
+            'School bus (with route number)': 'Bus',
+            'School bus (private/chartered)': 'Bus',
+            'Train': 'Train',
+            'Light rail': 'Train',
+        }
+def _modal_transit_submode(x):
+    """Return the dominant Bus/Train label, or None when a tour has neither."""
+    if isinstance(x, pd.DataFrame):
+        x = x.iloc[:, 0]
+    vals = pd.Series(x).dropna().astype(str)
+    vals = vals[vals.isin(['Bus', 'Train'])]
+    if vals.empty:
+        return None
+    return vals.value_counts().index[0]
 class Synth_Connect:
     
     
@@ -1108,6 +1160,16 @@ class Synth_Connect:
         -------
         dict with keys: "tours", "trips", "persons"
         """
+        # SEED DISCIPLINE: _sample_lvl4 (np.random.choice), DEST_SAMPLE
+        # (random.sample) and VEHOCC draws below all use global RNGs, which
+        # made every estimation run irreproducible (and GA fitness noisy).
+        # Seed both here; override per-run via PIPELINE_SEED.
+        try:
+            _seed = int(os.environ.get('PIPELINE_SEED', '42'))
+        except ValueError:
+            _seed = 42
+        random.seed(_seed)
+        np.random.seed(_seed)
 
         # -------------------------------
         # LOAD DATA
@@ -1190,14 +1252,12 @@ class Synth_Connect:
 
         if self.new_pop:
             # 507-SA2-zone scope: OTAZ/DTAZ are the SA2 code directly, no ORDER
-            # lookup. Deliberately reuse 330 as the external/catch-all sentinel
-            # (not e.g. 999999999): SA2 codes are always 9-digit (>100,000,000),
-            # so 330 can never collide with a real new_pop zone either, and
-            # every existing "!= 330" catch-all check already scattered through
-            # stage5_destination_choice.py / stage6_plan_finalisation.py keeps
-            # working unchanged in new_pop mode.
+            # lookup. 371-only: external/unmapped endpoints use the 999 fringe
+            # sentinel directly (never 330 — ORDER 330 is a real zone in the
+            # 371 system and every "!= 330" catch-all check has been removed).
             import os as _os
-            EXTERNAL_TAZ = 330
+            EXTERNAL_TAZ = 999
+            FRINGE_ZONE = 999
             # Valid-zone universe: the UNION of the operative crosswalk list
             # (sa2_crosswalk_507.csv, 324 zones) and the full-SEQ reference
             # (sa2_zones_reference_357.csv, 371 zones after the 2026-07
@@ -1239,19 +1299,52 @@ class Synth_Connect:
                 ]).dropna().astype(int)
                 _ext_codes = sorted(set(_ext_codes[~_ext_codes.isin(_valid_zones)])) \
                     if _valid_zones else []
-                logging.warning(
-                    f"process_survey (new_pop): {_n_external} trip endpoints outside "
-                    f"the {len(_valid_zones or [])}-zone SEQ universe -> external "
-                    f"sentinel {EXTERNAL_TAZ} (excluded from zone choice). "
-                    f"{len(_ext_codes)} distinct external SA2s, first 10: {_ext_codes[:10]}"
-                )
+                
+                # Fringe penalty approach: aggregate external SA2s into the composite
+                # fringe zone (999). (EXTERNAL_TAZ is already 999, so unmapped
+                # endpoints are fringe from the start; this just names the codes.)
+                if _ext_codes:
+                    # Replace external SA2s with composite fringe zone
+                    ext_map = dict.fromkeys(_ext_codes, FRINGE_ZONE)
+                    trips['OTAZ'] = trips['OTAZ'].replace(ext_map)
+                    trips['DTAZ'] = trips['DTAZ'].replace(ext_map)
+                    persons['OTAZ'] = persons['OTAZ'].replace(ext_map)
+                    logging.info(
+                        f"process_survey (new_pop): {_n_external} trip endpoints mapped to "
+                        f"fringe zone {FRINGE_ZONE} (was {len(_ext_codes)} distinct external SA2s). "
+                        f"Fringe penalty will be applied in destination choice."
+                    )
+                else:
+                    logging.info(
+                        f"process_survey (new_pop): {_n_external} trip endpoints outside "
+                        f"the {len(_valid_zones or [])}-zone SEQ universe -> external "
+                        f"sentinel {EXTERNAL_TAZ} (excluded from zone choice). "
+                        f"{len(_ext_codes)} distinct external SA2s: {_ext_codes}"
+                    )
         else:
             # FIX 1: TAZ zone lookup (was missing entirely from process_survey)
-            sa2_to_order = pd.read_csv('seq_zone_ids_.csv')[['SA2_MAIN16', 'ORDER']]
+            # Use the 371 SA2->ORDER crosswalk (ORDER 1-371) so that all
+            # 371 native zones are covered; the legacy seq_zone_ids_.csv (1-330)
+            # only covers 91.8% and was the root cause of the 93.8% NaN DIST
+            # joins and Stage-5 warm-start OOM aborts.
+            # The crosswalk lives in saved_data/ (matching the NEW_POP branch at
+            # the from_idco/from_idca helper, and build_power_network_371.py).
+            # A bare 'seq_zone_ids_371.csv' resolves against the CWD, so any run
+            # launched from the code directory died with FileNotFoundError here.
+            _xwalk = os.path.join('saved_data', 'seq_zone_ids_371.csv')
+            if not os.path.isfile(_xwalk):
+                _xwalk = os.path.join(os.path.dirname(__file__),
+                                      'saved_data', 'seq_zone_ids_371.csv')
+            sa2_to_order = pd.read_csv(_xwalk)[['SA2_MAIN16', 'ORDER']]
             o = sa2_to_order.set_index('SA2_MAIN16')['ORDER']
-            trips['OTAZ'] = trips['ORIGSA2_2021'].map(o).fillna(330).astype(int)
-            trips['DTAZ'] = trips['DESTSA2_2021'].map(o).fillna(330).astype(int)
-            persons['OTAZ'] = persons['HOME_SA2_2021'].map(o).fillna(330).astype(int)
+            # 371-only: use FRINGE_ZONE=999 for external/unmapped zones directly
+            # (never collides with real SA2/ORDER; the legacy 330 sentinel is
+            # retired because ORDER 330 is a real zone in the 371 system).
+            EXTERNAL_TAZ = 999  # fringe/external sentinel (== FRINGE_ZONE)
+            FRINGE_ZONE = 999   # composite fringe zone for external SA2s
+            trips['OTAZ'] = trips['ORIGSA2_2021'].map(o).fillna(EXTERNAL_TAZ).astype(int)
+            trips['DTAZ'] = trips['DESTSA2_2021'].map(o).fillna(EXTERNAL_TAZ).astype(int)
+            persons['OTAZ'] = persons['HOME_SA2_2021'].map(o).fillna(EXTERNAL_TAZ).astype(int)
 
             _unmapped_o = trips['ORIGSA2_2021'].dropna().astype(int)
             _unmapped_origs = set(_unmapped_o[_unmapped_o.map(o).isna()])
@@ -1261,7 +1354,7 @@ class Synth_Connect:
             if _unmapped:
                 logging.warning(
                     f"process_survey: {len(_unmapped)} SA2 codes not in zone mapping "
-                    f"(defaulted to TAZ 330): {sorted(_unmapped)[:10]}"
+                    f"(defaulted to fringe zone {EXTERNAL_TAZ}): {sorted(_unmapped)[:10]}"
                 )
 
         # -------------------------------
@@ -1269,11 +1362,37 @@ class Synth_Connect:
         # -------------------------------
         # Save raw MAINMODE before mapping for VEHOCC-based DA→SR reclassification
         _raw_mainmode = trips['MAINMODE'].copy()
+        trips['transit_submode'] = _raw_mainmode.map(TRANSIT_SUBMODES)
 
         trips['MAINMODE'] = trips['MAINMODE'].map(MODES)
         # NOTE: do NOT set trips['mode'] here — load_trips() inside
         # build_tours_from_trips() renames MAINMODE→mode via COLUMN_MAP_R.
         # Pre-setting 'mode' here causes a duplicate column that crashes agg().
+        # Trip-level transit ACCESS from the mode chain (MODE1 = first leg).
+        # Gated by STAGE5B_TRANSIT_ACCESS=1 (default 0: column not created).
+        # Labels: Walk / Drive / Ride (kiss-ride) / Bike, for Transit trips.
+        try:
+            import os as _os
+            if _os.environ.get('STAGE5B_TRANSIT_ACCESS', '0').strip() == '1':
+                _TRANSIT_ACCESS_MAP = {
+                    'Walking': 'Walk',
+                    'Car driver': 'Drive',
+                    'Truck driver': 'Drive',
+                    'Motorcycle driver': 'Drive',
+                    'Car passenger': 'Ride',
+                    'Taxi': 'Ride',
+                    'Uber / Other Ride Share': 'Ride',
+                    'Bicycle': 'Bike',
+                    'E-bike or E-scooter': 'Bike',
+                }
+                _acc = trips['MODE1'].map(_TRANSIT_ACCESS_MAP)
+                trips['transit_access'] = _acc.where(
+                    trips['MAINMODE'] == 'Transit', None)
+                logging.info(
+                    f"transit_access labels: "
+                    f"{trips['transit_access'].value_counts(dropna=False).to_dict()}")
+        except Exception as _ta_e:
+            logging.warning(f"transit_access derivation skipped ({_ta_e})")
         trips['MODE1']    = trips['MODE1'].map(MODES)
 
         # Reclassify Car/Truck/Motorcycle driver → SR when vehicle had
@@ -1352,8 +1471,25 @@ class Synth_Connect:
         # (licence AND vehicle) instead of falling back to always-available —
         # that was the "availability vars missing [CARLICENCE, vehrd, ...]"
         # warning. Guarded below, so it's skipped if absent from persons.
+        # ── Observed CDAP on HHTS travellers (joint estimation) ──────────
+        # Attach deterministic observed-CDAP attributes (cdap_M/N/H, hh
+        # composition, joint-tour counts) to persons so every downstream
+        # estimator can condition on household coordination. Estimation-side
+        # counterpart of the prediction path's coordinated/sampled CDAP —
+        # same column names, observed provenance, no randomness, no leakage.
+        # Non-fatal: estimation proceeds without them on any failure.
+        try:
+            from cdap_households_estimation import attach_cdap_to_hhts
+            persons = attach_cdap_to_hhts(persons, as_tours)
+        except Exception as _cdap_e:
+            print(f"[process_survey] observed-CDAP attach skipped ({_cdap_e})")
         person_cols = ['person_id', 'sexp', 'vehrd', 'nprd', 'OTAZ', 'HOME_SA2_2021',
-                       'HHID', 'CARLICENCE']
+                       'HHID', 'CARLICENCE',
+                       'cdap_M', 'cdap_N', 'cdap_H',
+                       'cdap_hh_n_workers', 'cdap_hh_n_children',
+                       'cdap_hh_has_home_adult', 'cdap_child_x_home_adult',
+                       'cdap_is_child', 'n_joint_tours_hh',
+                       'is_joint_traveller', 'joint_party_n']
         person_cols = [c for c in person_cols if c in persons.columns]
         as_tours = as_tours.merge(persons[person_cols], on='person_id', how='left')
 
@@ -1419,11 +1555,12 @@ class Synth_Connect:
         #trips['OTAZ']
         #trips['DTAZ']
         
-        sa2_to_order = pd.read_csv('seq_zone_ids_.csv')[['SA2_MAIN16', 'ORDER']]
+        # 371-only: legacy seq_zone_ids_.csv (330 system) is never used.
+        sa2_to_order = pd.read_csv('saved_data/seq_zone_ids_371.csv')[['SA2_MAIN16', 'ORDER']]
         o = sa2_to_order.set_index('SA2_MAIN16')['ORDER']
-        
-        trips['OTAZ'] = trips['ORIGSA2_2021'].apply(lambda x: o.get(x)).fillna(330)
-        trips['DTAZ'] = trips['DESTSA2_2021'].apply(lambda x: o.get(x)).fillna(330)
+
+        trips['OTAZ'] = trips['ORIGSA2_2021'].apply(lambda x: o.get(x)).fillna(999)
+        trips['DTAZ'] = trips['DESTSA2_2021'].apply(lambda x: o.get(x)).fillna(999)
         person['HOME_SA2_2021'] = person['HOME_SA1_2021'].map(sa1_to_sa2)
 
         # -----------------------------------------
@@ -1490,6 +1627,7 @@ class Synth_Connect:
         WORK = {}
         
 
+        trips['transit_submode'] = trips['MAINMODE'].map(TRANSIT_SUBMODES)
         trips['MAINMODE'] = trips['MAINMODE'].map(MODES)
         trips['MODE1'] = trips['MODE1'].map(MODES)
         trips['ORIGPURP'] = trips['ORIGPURP'].map(purpose)
@@ -1750,7 +1888,7 @@ class Synth_Connect:
         elif alt_method  == 'DEST_SAMPLE':
             df = df.copy()
             df["DTAZ"] = df.apply(
-                lambda row: random.sample(range(1, 330), 1),
+                lambda row: random.sample(range(1, 372), 1),
                 axis=1
             )
             df_out = df.explode('DTAZ').reset_index(drop=True)
@@ -2086,9 +2224,26 @@ class Synth_Connect:
                 how="left",
                 validate="many_to_one"
             )
-        
-        
-        
+
+        # Carry the main trip's transit access label to the tour (same anchor
+        # as tour_mode above). Only present when STAGE5B_TRANSIT_ACCESS=1
+        # created the trip-level column; the stage-5 mode split reads it from
+        # the tours frame (STAGE5_PT_MODES=1).
+        if 'transit_access' in trips.columns:
+            main_access = (
+                trips.loc[main_trip_indices,
+                          ['PERSID', 'tour_id', 'transit_access']]
+                .rename(columns={'transit_access': 'tour_transit_access'})
+                .drop_duplicates(['PERSID', 'tour_id'])
+            )
+            tours = self._clean_merge(
+                tours,
+                main_access,
+                on=["PERSID", "tour_id"],
+                how="left",
+                validate="many_to_one"
+            )
+
         trips["tour_leg"] = "outbound"
         trips.loc[main_trip_indices, "tour_leg"] = "main"
         
@@ -2404,15 +2559,38 @@ class Synth_Connect:
             return self.land
         else:
             import os as _os
+            _land_order_is_sa2 = False
             if self.new_pop:
                 _new_pop_dir = (_os.environ.get('NEW_POP_DIR') or _DEFAULT_NEW_POP_DIR)
                 # ZONE MIGRATION (371): prefer the 09b build (zone_landuse_357.csv),
-                # which census-fills the ~49 non-EMME fringe zones (Toowoomba/Tweed)
-                # so they carry real work/education attraction. Fall back to the
-                # older zone_landuse_507.csv (same 371 zones, but sparse on the
+                # which census-fills the non-EMME fringe zones (Toowoomba/Tweed
+                # and rural remainder) so they carry real work/education
+                # attraction. Measured 2026-09-12: file holds all 371 SA2s (the
+                # "357" name is stale); 370 populated (only 310021279 Lake
+                # Manchester--England Creek, a reservoir catchment, is empty);
+                # 113 zones carry in_emme_network=False. The old "~49" count
+                # below predates the current build — do not cite it. Fall back
+                # to the older zone_landuse_507.csv (same 371 zones, but sparse on the
                 # fringe) only if the 357 build is absent. Override via LANDUSE_CSV.
-                _landuse_path = _os.environ.get('LANDUSE_CSV') or _os.path.join(
-                    _new_pop_dir, 'saved_data', 'zone_landuse_357.csv')
+                _landuse_path = _os.environ.get('LANDUSE_CSV')
+                # A/B switch: USE_OVERTURE_LANDUSE=1 loads the comprehensive
+                # Overture-derived land use (build_zone_landuse_overture.py →
+                # saved_data/zone_landuse_overture.csv). It's a strict SUPERSET of
+                # zone_landuse_357.csv (all original columns kept + Overture n_*/
+                # area_*/*_ovm feature columns), so it's a safe drop-in and the
+                # only change vs baseline is the extra columns being available to
+                # the size-term / GA candidates. Explicit LANDUSE_CSV still wins.
+                if not _landuse_path and _os.environ.get('USE_OVERTURE_LANDUSE', '0') == '1':
+                    _ov = _os.path.join(_os.path.dirname(__file__), 'saved_data',
+                                        'zone_landuse_overture.csv')
+                    if _os.path.exists(_ov):
+                        _landuse_path = _ov
+                        print(f"[get_land] USE_OVERTURE_LANDUSE=1 -> {_ov}")
+                    else:
+                        print(f"[get_land] USE_OVERTURE_LANDUSE=1 but {_ov} missing "
+                              "-> falling back to baseline landuse")
+                if not _landuse_path:
+                    _landuse_path = _os.path.join(_new_pop_dir, 'saved_data', 'zone_landuse_357.csv')
                 if not _os.path.exists(_landuse_path):
                     _landuse_path = _os.path.join(_new_pop_dir, 'saved_data',
                                                   'zone_landuse_507.csv')
@@ -2421,8 +2599,52 @@ class Synth_Connect:
                 # ORDER == SA2 code in the 507-zone scope (no ORDER indirection) so
                 # every downstream .merge(..., on='ORDER') keeps working unchanged.
                 self.land['ORDER'] = self.land['SA2_MAIN16']
+                # OPTIONAL aggressive A/B arm: OVERTURE_REFRESH_SIZE=1 swaps the
+                # existing size-term input columns for their Overture-derived counts
+                # (the *_ovm columns present only in zone_landuse_overture.csv), so
+                # the destination size terms are computed from current Overture
+                # features. Default OFF: USE_OVERTURE_LANDUSE alone just makes the
+                # Overture columns AVAILABLE (extra n_*/area_* cols) without altering
+                # the baseline size-term inputs — a conservative first A/B arm.
+                if _os.environ.get('OVERTURE_REFRESH_SIZE', '0') == '1':
+                    _ovm = [c for c in self.land.columns if c.endswith('_ovm')]
+                    _n = 0
+                    for _c in _ovm:
+                        _b = _c[:-4]
+                        if _b in self.land.columns:
+                            self.land[_b] = self.land[_c]; _n += 1
+                    if _n:
+                        print(f"[get_land] OVERTURE_REFRESH_SIZE=1 -> refreshed {_n} "
+                              "size-term columns from Overture *_ovm counts")
             else:
-                self.land = pd.read_csv('zone_order_and_landuse.csv')
+                # ZONE MIGRATION (371): the legacy zone_order_and_landuse.csv is a
+                # 330-zone file with legacy ORDER ids (1..330); only 311 of its SA2
+                # codes overlap the active 371-zone universe, so the accessibility /
+                # size terms / emp join silently cover 330 zones and the emp join
+                # misses every 371 skim zone (job 26948576: emp zones hit=0/372).
+                # The active system is SA2-keyed (skims_371.omx + SA2-direct synth
+                # population), so prefer the 371-zone landuse (all 371 SA2s, real
+                # attributes) and set ORDER = SA2 code so every downstream
+                # .merge(on='ORDER') and the logsum/emp joins align. Fall back to
+                # the legacy file only when the 371 build is absent.
+                _lu371 = _os.path.join(_DEFAULT_NEW_POP_DIR, 'saved_data',
+                                       'zone_landuse_357.csv')
+                if not _os.path.exists(_lu371):
+                    _lu371 = _os.path.join(_os.path.dirname(__file__),
+                                           'saved_data', 'zone_landuse_overture.csv')
+                # SA2-keyed OSM POI counts (same 371 zones as the landuse). Used
+                # below to enrich the POI size-term columns; keyed on SA2_MAIN16
+                # because ORDER now carries SA2 codes in this branch.
+                _osm_path = _os.path.join(_DEFAULT_NEW_POP_DIR, 'saved_data',
+                                          'SA2_2016_OSM_counts_507.csv')
+                if _os.path.exists(_lu371):
+                    self.land = pd.read_csv(_lu371)
+                    self.land['ORDER'] = self.land['SA2_MAIN16']
+                    _land_order_is_sa2 = True
+                    print(f"[get_land] ZONE MIGRATION (371): using {_lu371} "
+                          f"({len(self.land)} zones, ORDER=SA2_MAIN16)")
+                else:
+                    self.land = pd.read_csv('zone_order_and_landuse.csv')
             # Convert everything possible to numeric (keep column as-is if it can't)
             for col in self.land.columns:
                 try:
@@ -2443,10 +2665,13 @@ class Synth_Connect:
             # ── Enrich with OSM POI counts needed by size terms ───────────────
             # zone_order_and_landuse.csv (or zone_landuse_507.csv in new_pop mode)
             # lacks these OSM POI count columns. They live in
-            # pddopulation_by_order_with_osm_and_landuse.csv (legacy, ORDER-keyed)
-            # or SA2_2016_OSM_counts_507.csv (new_pop, SA2-keyed) and are merged
-            # in once here so all downstream stages see them.
-            #   university    edu:     zone 40 CBD has 5 (QUT, TAFE etc) — edu rank 259/330 without it
+            # pddopulation_by_order_with_osm_and_landuse.csv (legacy, ORDER-keyed,
+            # 330 zones) or SA2_2016_OSM_counts_507.csv (SA2-keyed, all 371 zones)
+            # and are merged in once here so all downstream stages see them. The
+            # 371 path (new_pop, or non-new_pop with ORDER=SA2) MUST use the
+            # SA2-keyed file: its ORDER already holds SA2 codes, so the legacy
+            # ORDER-keyed file matches nothing and silently zeroes every column.
+            #   university    edu:     zone 40 CBD has 5 (QUT, TAFE etc) — edu rank 259/371 without it
             #   college       edu:     community colleges / TAFE campuses (38 nz)
             #   kindergarten  escort:  early childhood centres (222 nz; lu 'childcare' = 1 nz)
             #   sports_centre social/othdiscr: sport & recreation venues (247 nz)
@@ -2465,12 +2690,16 @@ class Synth_Connect:
             ]
             _missing_osm = [c for c in _OSM_SIZE_COLS if c not in self.land.columns]
             if _missing_osm:
-                _pop_file = _osm_path if self.new_pop else 'pddopulation_by_order_with_osm_and_landuse.csv'
-                _key_col = 'SA2_MAIN16' if self.new_pop else 'ORDER'
+                _use_sa2_osm = self.new_pop or _land_order_is_sa2
+                _pop_file = _osm_path if _use_sa2_osm else 'pddopulation_by_order_with_osm_and_landuse.csv'
+                _key_col = 'SA2_MAIN16' if _use_sa2_osm else 'ORDER'
                 try:
                     if _os.path.exists(_pop_file):
                         _avail = [c for c in _missing_osm if c in pd.read_csv(_pop_file, nrows=0).columns]
                         _pop = pd.read_csv(_pop_file, usecols=[_key_col] + _avail)
+                        # Align the join-key dtype with self.land (numeric cols
+                        # were cast to float64 above) so float/int keys still match.
+                        _pop[_key_col] = _pop[_key_col].astype(self.land[_key_col].dtype)
                         for c in _avail:
                             _pop[c] = pd.to_numeric(_pop[c], errors='coerce').fillna(0)
                         self.land = self.land.merge(_pop[[_key_col] + _avail], on=_key_col, how='left')

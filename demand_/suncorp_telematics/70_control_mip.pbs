@@ -1,0 +1,79 @@
+#!/bin/bash -l
+#PBS -N suncorp_ctrl
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=2:mem=32GB
+#PBS -j oe
+#PBS -m be
+#PBS -r y
+
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+set -uo pipefail
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export JAX_PLATFORMS=cpu
+
+cd "$PROJ_DIR"
+OUT=$PROJ_DIR/results/control_mip_gt10
+mkdir -p "$OUT"
+
+echo "[ctrl] start $(date -Is) on $(hostname)"
+
+if [ ! -f results/obs_control_surface_gt10.parquet ] || \
+   [ ! -f results/obs_event_surface_gt10.parquet ]; then
+  echo "[ctrl] building observed surfaces"
+  python -u scripts/70_build_control_surfaces.py || { echo "[ctrl] builder FAILED"; exit 1; }
+else
+  echo "[ctrl] surfaces exist, reusing"
+fi
+
+COMMON=(
+  --min-marg 0.5 --max-segments 250 --squads all
+  --travel-speed-kmh 43.2 --detour-factor 1.3 --setup-min 5
+  --max-travel-m 8000 --obs-m 100
+  --max-relocations 1 --min-move-gap-bins 1 --min-separation-m 300
+  --mobility-ab on --allow-concentrated
+)
+
+run_arm () {
+  local tag=$1 pred=$2
+  local out=$OUT/$tag
+  if [ -f "$out/game_day_mip_summary.json" ]; then
+    echo "[ctrl] $tag exists, skipping solve"
+    return 0
+  fi
+  mkdir -p "$out" "$OUT/figs/$tag"
+  echo "[ctrl] solving $tag -> $out"
+  python -u scripts/60_game_day_mip.py --pred "$pred" \
+    --out-dir "$out" --fig-dir "$OUT/figs/$tag" "${COMMON[@]}" \
+    > "$OUT/$tag.log" 2>&1
+  local rc=$?
+  echo "[ctrl] $tag rc=$rc ($(date -Is))"
+  tail -5 "$OUT/$tag.log"
+  return $rc
+}
+
+run_arm event_obs results/obs_event_surface_gt10.parquet || true
+run_arm ctrl_d1   results/obs_control_surface_d1_gt10.parquet || true
+run_arm ctrl_obs  results/obs_control_surface_gt10.parquet || true
+
+echo "[ctrl] comparing arms"
+python -u scripts/70_compare.py || echo "[ctrl] compare FAILED"
+
+echo "[ctrl] scoring every plan on common observed surfaces"
+python -u scripts/70_score_plans.py || echo "[ctrl] score FAILED"
+
+echo "[ctrl] done $(date -Is)"

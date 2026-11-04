@@ -1,0 +1,53 @@
+#!/bin/bash -l
+#PBS -N envprobe
+#PBS -l walltime=00:10:00
+#PBS -l select=1:ncpus=1:mem=8gb
+#PBS -j oe
+#PBS -m a
+#PBS -r y
+
+# Throwaway environment probe: report the package state a compute node sees
+# in the zigenv conda env, replicating 61_segment_time_mip.pbs exactly.
+set -u
+
+echo "=== host / date ==="
+hostname
+date
+echo
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export JAX_PLATFORMS=cpu
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export PYTHONIOENCODING=utf-8
+
+echo "=== interpreter ==="
+which python
+python -V
+echo "CONDA_PREFIX=${CONDA_PREFIX:-unset}"
+echo
+
+echo "=== metacountregressor ==="
+python - <<'PY'
+import os, sys, importlib.util
+import metacountregressor as m
+import metacountregressor.main_hpc as mh
+from importlib.metadata import version
+print('package dir :', os.path.dirname(m.__file__))
+print('distribution:', version('metacountregressor'))
+print('main_hpc    :', mh.__file__)
+src = open(mh.__file__, encoding='utf-8', errors='replace').read()
+print('reject_summary    :', hasattr(mh.StructureEvaluator, 'reject_summary'))
+print('_reject_counts    :', '_reject_counts' in src)
+print('_variance_barrier :', '_variance_barrier' in src)
+print('nb_parameterization:',
+      importlib.util.find_spec('metacountregressor.nb_parameterization') is not None)
+for extra in ('temporal_models', 'survival_models', 'bivariate_copula'):
+    print('%-18s:' % extra,
+          importlib.util.find_spec('metacountregressor.' + extra) is not None)
+PY
+echo
+echo "=== ENVPROBE DONE ==="

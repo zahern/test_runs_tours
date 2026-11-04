@@ -1,0 +1,236 @@
+#!/bin/bash
+#PBS -N qld_stages05
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=8:mem=194GB
+#PBS -m abe
+#PBS -r y
+#PBS -j oe
+
+# ─────────────────────────────────────────────────────────────────────────────
+# job_qld_stages05.pbs
+# ─────────────────────────────────────────────────────────────────────────────
+# Full QLD run, stages 0-5, on the 371-zone universe.
+#
+# Zone universe: 371 SA2 zones (skims_371.omx is 371x371;
+# sa2_to_order_crosswalk_371.csv has 371 rows; all three
+# zone_landuse_*.csv have 371 rows). 368 of those have synthetic
+# persons -- new_pop/saved_data/zone_ids_sa2/zone_*.csv -- and 3 are
+# empty SA2s handled by the skipped_empty path (304041102, 310021279,
+# 311031315). The 325 order_*.csv files in code/saved_data are the
+# RETIRED 330-system scope and are never read with NEW_POP=1.
+#
+# Entry point is `pipeline_logger.py hhts_core` (main_2.py is deprecated
+# as a direct entrypoint; it still holds the stage implementations).
+#
+# MEMORY: 194GB, not the 96GB the s51 shards were bumped to. Stage 5 was
+# OOM-killed (exit 137) at ~118GB of a 128GB node in
+# runs/ga_parallel/landuse_attr_DEAD_OOM_20260906, so 96GB would fail
+# again. 194GB is the largest size in regular use across the job scripts.
+#
+# Run from the code dir:
+#   qsub job_qld_stages05.pbs
+#
+# Stage 5 estimator (decide before submitting -- see STAGE5_DEST_ESTIMATOR):
+#   qsub -v STAGE5_DEST_ESTIMATOR=larch  job_qld_stages05.pbs
+#   qsub -v STAGE5_DEST_ESTIMATOR=mh    job_qld_stages05.pbs
+#
+# Other overrides:
+#   qsub -v RUN_TAG=mytest,PIPELINE_SEED=42 job_qld_stages05.pbs
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+
+# ── Environment ───────────────────────────────────────────────────────────────
+# zigenv, NOT asimenv. This run needs lifelines, pylogit and a working
+# statsmodels, all of which are present in zigenv on numpy 1.26. A local
+# check on 2026-09-30 showed the whole stage-1/3 fitter set silently
+# degrading to None under numpy 2.5.2 / statsmodels 0.14.2 with lifelines
+# and pylogit absent -- every fit returned None and the pipeline reported
+# "fitted 0 cells ... ok".
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+CONDA_ENV="${CONDA_ENV:-zigenv}"
+RUN_TAG="${RUN_TAG:-qld_$(date +%Y%m%d_%H%M%S)}"
+PIPELINE_SEED="${PIPELINE_SEED:-42}"
+STAGE5_DEST_ESTIMATOR="${STAGE5_DEST_ESTIMATOR:-larch}"
+STAGE5_REQUIRE_DEST_ESTIMATION="${STAGE5_REQUIRE_DEST_ESTIMATION:-1}"
+STAGE5_STRICT_ESTIMATION="${STAGE5_STRICT_ESTIMATION:-1}"
+NCPUS="${NCPUS:-8}"
+THREADS="${THREADS:-${NCPUS}}"
+INSTALL_ESTIMATORS="${INSTALL_ESTIMATORS:-0}"
+
+# ── Dependency preflight ──────────────────────────────────────────────────────
+# Fail here, loudly, rather than four hours in. Checks the packages whose
+# absence degrades the fitters silently to None (main_2.py guards each
+# import with `except ImportError: X = None`).
+python - <<'PYEOF' || exit 2
+import sys
+missing = []
+for mod in ("numpy", "pandas", "scipy", "statsmodels", "lifelines",
+            "pylogit", "larch", "SearchLibrium"):
+    try:
+        __import__(mod)
+    except Exception as exc:
+        missing.append(f"{mod} ({type(exc).__name__})")
+import numpy, statsmodels
+print(f"  python     {sys.version.split()[0]}")
+print(f"  numpy      {numpy.__version__}")
+print(f"  statsmodels {statsmodels.__version__}")
+print(f"  lifelines  present")
+print(f"  pylogit    present")
+print(f"  SearchLibrium present")
+if missing:
+    print("FATAL: missing/broken: " + ", ".join(missing), file=sys.stderr)
+    print("  This env cannot run the QLD stages -- the fitters import these "
+          "inside `except ImportError: X = None` and silently produce no "
+          "models. Activate zigenv.", file=sys.stderr)
+    raise SystemExit(2)
+# Version window, not "numpy must be 1.x".  The old blanket numpy>=2 rejection
+# predates the current stack: the QLD estimation window is numpy>=2.1,<2.4
+# (constraints.txt / environment_qld.yml), and the stage-5 compare job fitted
+# mode models on numpy 2.3.5 in zigenv (work LL -4265, rho2 0.58) on
+# 2026-10-06.  Only reject what is genuinely outside the window.
+_np_parts = [int(p) for p in numpy.__version__.split(".")[:2]]
+if not ((2, 1) <= tuple(_np_parts) < (2, 4)):
+    print(f"FATAL: numpy {numpy.__version__} is outside the supported "
+          "estimation window (>=2.1,<2.4); sharrow/numexpr flows and the "
+          "MCR fits are only verified there.", file=sys.stderr)
+    raise SystemExit(2)
+PYEOF
+
+# ── CPU-only JAX/XLA (must precede any JAX import) ────────────────────────────
+export JAX_PLATFORM_NAME=cpu
+export JAX_PLATFORMS=cpu
+export CUDA_VISIBLE_DEVICES=""
+export TF_CPP_MIN_LOG_LEVEL=3
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_FLAGS="--xla_force_host_platform_device_count=${NCPUS}"
+
+export OMP_NUM_THREADS="${THREADS}"
+export OPENBLAS_NUM_THREADS="${THREADS}"
+export MKL_NUM_THREADS="${THREADS}"
+export NUMEXPR_NUM_THREADS="${THREADS}"
+
+# ── UTF-8 (CDAP prints box-drawing art; cp1252 stdout aborts runs) ────────────
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export LC_ALL=C.UTF-8
+
+export PYTHONPATH="${PBS_O_WORKDIR}:${PYTHONPATH:-}"
+
+# ── Population + skims: the 371-zone universe ─────────────────────────────────
+export NEW_POP=1
+export NEW_POP_MAPPED=0
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+export PIPELINE_ACCELERATOR=cpu
+export LARCH_FORCE_JAX=1
+
+# ── Reproducibility ───────────────────────────────────────────────────────────
+export PIPELINE_SEED="${PIPELINE_SEED}"
+
+# ── Stage 5 ───────────────────────────────────────────────────────────────────
+export STAGE5_DEST_ESTIMATOR
+export STAGE5_REQUIRE_DEST_ESTIMATION
+export STAGE5_STRICT_ESTIMATION
+export STAGE5_MIN_TOURS="${STAGE5_MIN_TOURS:-30}"
+export STAGE5_CLEAR_SHARROW_CACHE="${STAGE5_CLEAR_SHARROW_CACHE:-1}"
+
+# ── Run directory ─────────────────────────────────────────────────────────────
+RUN_DIR="runs/${RUN_TAG}"
+mkdir -p "${RUN_DIR}/plots"
+LOG_OUT="${RUN_DIR}/job.out"
+LOG_ERR="${RUN_DIR}/job.err"
+rm -f "$LOG_OUT" "$LOG_ERR"
+
+{
+  echo "=========================================================="
+  echo "QLD stages 0-5"
+  echo "PBS job   : ${PBS_JOBID:-local}"
+  echo "Node      : $(hostname)"
+  echo "Run tag   : ${RUN_TAG}"
+  echo "conda env : ${CONDA_ENV}"
+  echo "Skims     : ${PIPELINE_SKIMS_PATH}"
+  echo "NEW_POP   : ${NEW_POP} (371-zone SA2 universe)"
+  echo "Seed      : ${PIPELINE_SEED}"
+  echo "Dest est  : ${STAGE5_DEST_ESTIMATOR}"
+  echo "Started   : $(date)"
+  echo "=========================================================="
+  python -c "import numpy,statsmodels,sys;print(f'  numpy {numpy.__version__} / statsmodels {statsmodels.__version__} / py {sys.version.split()[0]}')" 2>&1 | tee -a "$LOG_OUT"
+  echo "----------------------------------------------------------"
+} | tee -a "$LOG_OUT"
+
+# ── Confirm the zone universe before spending hours on it ──────────────────────
+python - <<'PYEOF' 2>&1 | tee -a "$LOG_OUT"
+import glob, os, sys
+import h5py
+try:
+    with h5py.File(os.environ["PIPELINE_SKIMS_PATH"], "r") as h:
+        n_sk = h["data/DIST"].shape[0]
+    print(f"  skims zones      : {n_sk}")
+except Exception as exc:
+    print(f"  WARNING: could not read skims: {exc}", file=sys.stderr)
+d = os.path.join(os.environ.get("NEW_POP_DIR", "../new_pop"),
+                 "saved_data", "zone_ids_sa2")
+z = len(glob.glob(os.path.join(d, "zone_*.csv")))
+print(f"  synth-pop zones  : {z} (expect 368 = 371 minus 3 empty SA2s)")
+if z not in (0, 368, 371):
+    print(f"  WARNING: {z} zone files -- expected 368 for NEW_POP=1. "
+          f"If this is {325}, you are reading the retired 330-system scope.",
+          file=sys.stderr)
+PYEOF
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+set +e
+python -u pipeline_logger.py hhts_core \
+    >> "${LOG_OUT}" 2>> "${LOG_ERR}"
+EXIT_CODE=$?
+set -e
+
+{
+  echo "----------------------------------------------------------"
+  echo "Finished: $(date) exit_code=${EXIT_CODE}"
+} | tee -a "$LOG_OUT"
+
+# ── Result gate: never report success on an empty run ─────────────────────────
+# The stages log "ok" even when every fitter returned None, so check that
+# models actually exist rather than trusting the exit code.
+python - "$RUN_DIR" <<'PYEOF'
+import glob, json, os, sys
+run_dir = sys.argv[1]
+out = os.path.join(run_dir, "job.out")
+specs = os.path.join("saved_data", "best_specs.json")
+
+if os.path.isfile(specs):
+    try:
+        n = len(json.load(open(specs, encoding="utf-8")))
+        print(f"  BestSpecStore specs : {n}")
+    except Exception as exc:
+        print(f"  BestSpecStore        : unreadable ({exc})")
+else:
+    print("  BestSpecStore        : MISSING")
+
+# Zero-fitted cells are the known false-success signature.
+if os.path.isfile(out):
+    text = open(out, encoding="utf-8", errors="replace").read()
+    zeros = [ln.strip() for ln in text.splitlines() if "fitted 0" in ln]
+    for ln in zeros:
+        print(f"  ZERO-FIT WARNING    : {ln}")
+    if "saved 0 specs" in text:
+        print("  ZERO-FIT WARNING    : BestSpecStore saved 0 specs")
+
+models = glob.glob(os.path.join(run_dir, "**", "*models*.pkl"), recursive=True)
+print(f"  model artifacts     : {len(models)}")
+for m in models[:6]:
+    print(f"      {m}")
+if not models:
+    print("  NO MODEL ARTIFACTS -- the run produced nothing usable.")
+PYEOF
+
+exit "${EXIT_CODE}"

@@ -1,0 +1,156 @@
+#!/bin/bash -l
+#PBS -N ps_submit
+#PBS -P FPAXJW8067
+#PBS -l walltime=00:05:00
+#PBS -l select=1:ncpus=1:mem=2GB
+#PBS -j oe
+#PBS -m n
+
+# ============================================================
+# job_post_selection.pbs
+# Post-selection inference (PS-I / PS-III / PS-IV) for the paper.
+#
+#   qsub -v "RUN_TAG=qld_shard2" job_post_selection.pbs
+#   qsub -v "RUN_TAG=qld_shard2,PS_B=20,GA_BUDGET=smoke" job_post_selection.pbs
+#
+# Chain: prepare (person splits + bootstrap draws)
+#        -> array 0-8 over 3 protocols x 3 segments (replication searches)
+#        -> merge (tables/ps_diagnostics.csv + auto_ps.tex)
+# ============================================================
+cd $PBS_O_WORKDIR
+
+RUN_TAG=${RUN_TAG:?RUN_TAG is required}
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+PS_ROOT=${PS_ROOT:-runs/ps_inference}
+PS_B=${PS_B:-20}
+GA_BUDGET=${GA_BUDGET:-smoke}
+STAGE_ID=${STAGE_ID:-5}
+
+VARS="RUN_TAG=${RUN_TAG},RUN_ROOT=${RUN_ROOT},PS_ROOT=${PS_ROOT}"
+VARS="${VARS},PS_B=${PS_B},GA_BUDGET=${GA_BUDGET},STAGE_ID=${STAGE_ID}"
+
+# ── Job A: prepare splits ─────────────────────────────────────
+cat > _tmp_ps_prepare.pbs <<'INNER'
+#!/bin/bash -l
+#PBS -N ps_prepare
+#PBS -P FPAXJW8067
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -j oe
+#PBS -m n
+cd $PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+export PYTHONPATH="${PBS_O_WORKDIR}/compat:${PYTHONPATH:-}"
+hash -r
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export NEW_POP=${NEW_POP:-1}
+export NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+export NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+if [ "${NEW_POP}" = "1" ] && [ "${NEW_POP_MAPPED}" != "1" ]; then
+  export PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+fi
+echo "[$(date)] ps prepare starting"
+if python -u post_selection_inference.py --prepare \
+    --run-tag "${RUN_TAG}" --run-root "${RUN_ROOT}" --ps-root "${PS_ROOT}" \
+    --stage-id "${STAGE_ID}" --B "${PS_B}"; then
+  echo "[$(date)] ps prepare exit=0"
+else
+  _prc=$?
+  echo "[$(date)] ps prepare FATAL rc=${_prc} — array/merge will NOT proceed"
+  exit "${_prc}"
+fi
+INNER
+
+# ── Job B: replication searches (array 0-8) ───────────────────
+cat > _tmp_ps_run.pbs <<'INNER'
+#!/bin/bash -l
+#PBS -N ps_run
+#PBS -P FPAXJW8067
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -j oe
+#PBS -m n
+#PBS -J 0-8
+cd $PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+export PYTHONPATH="${PBS_O_WORKDIR}/compat:${PYTHONPATH:-}"
+hash -r
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+export GA_METACOUNT_FORCE_CPU=${GA_METACOUNT_FORCE_CPU:-1}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-1}
+export NEW_POP=${NEW_POP:-1}
+export NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+export NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+if [ "${NEW_POP}" = "1" ] && [ "${NEW_POP_MAPPED}" != "1" ]; then
+  export PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+fi
+PROTOS=(I III IV)
+SEGS=(work education nonmandatory)
+IDX=${PBS_ARRAY_INDEX:-${PBS_ARRAYID}}
+PROTO=${PROTOS[$((IDX / 3))]}
+SEG=${SEGS[$((IDX % 3))]}
+echo "[$(date)] ps run proto=${PROTO} seg=${SEG} (array ${IDX})"
+python -u post_selection_inference.py \
+    --protocol "${PROTO}" --segment "${SEG}" \
+    --run-tag "${RUN_TAG}" --run-root "${RUN_ROOT}" --ps-root "${PS_ROOT}" \
+    --stage-id "${STAGE_ID}" --B "${PS_B}" --budget "${GA_BUDGET}"
+_rc=$?
+echo "[$(date)] ps run ${PROTO}/${SEG} exit=${_rc}"
+exit "${_rc}"
+INNER
+
+# ── Job C: merge diagnostics ──────────────────────────────────
+cat > _tmp_ps_merge.pbs <<'INNER'
+#!/bin/bash -l
+#PBS -N ps_merge
+#PBS -P FPAXJW8067
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ncpus=2:mem=8GB
+#PBS -j oe
+#PBS -m n
+cd $PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+export PYTHONUTF8=1
+echo "[$(date)] ps merge starting"
+if python -u post_selection_inference.py --merge \
+    --run-tag "${RUN_TAG}" --run-root "${RUN_ROOT}" --ps-root "${PS_ROOT}"; then
+  echo "[$(date)] ps merge exit=0"
+else
+  _mrc=$?
+  echo "[$(date)] ps merge FATAL rc=${_mrc}"
+  exit "${_mrc}"
+fi
+INNER
+
+JID_A=$(qsub -v "${VARS}" _tmp_ps_prepare.pbs)
+echo "Submitted ps_prepare -> $JID_A"
+JID_B=$(qsub -v "${VARS}" -W depend=afterok:$JID_A _tmp_ps_run.pbs)
+echo "Submitted ps_run     -> $JID_B  (after $JID_A)"
+JID_C=$(qsub -v "${VARS}" -W depend=afterok:$JID_B _tmp_ps_merge.pbs)
+echo "Submitted ps_merge   -> $JID_C  (after $JID_B)"
+
+rm -f _tmp_ps_prepare.pbs _tmp_ps_run.pbs _tmp_ps_merge.pbs
+
+echo ""
+echo "Monitor:  qstat -u \$USER"
+echo "Outputs:  ${PS_ROOT}/tables/ps_diagnostics.csv, ${PS_ROOT}/tables/auto_ps.tex"

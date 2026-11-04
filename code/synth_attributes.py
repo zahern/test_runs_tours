@@ -117,10 +117,10 @@ PTYPE_LABELS = {
     2: 'PartTimeWorker',
     3: 'NonWorker',
     4: 'Retired',
-    5: 'Student',         # tertiary
-    6: 'School',          # primary/secondary
+    5: 'UniversityStudent',  # tertiary — must match HHTS assign_ptype in data_connect.py
+    6: 'SchoolChild',         # primary/secondary — must match HHTS assign_ptype
     7: 'Preschool',
-    8: 'JointWorkStudy',
+    8: 'WorkingStudent',      # full-time work + study — must match HHTS assign_ptype
 }
 
 def get_ptype(row) -> int:
@@ -377,4 +377,122 @@ def enrich_synth_population(
         f"STUDYING dist={df['STUDYING'].value_counts().to_dict()} | "
         f"ptype dist={df['ptype'].value_counts().to_dict()}"
     )
+    return df
+
+
+# ── HHTS-only attribute imputation ──────────────────────────────────────────
+# Attributes observed in the QTS HHTS but absent (or degenerate) in the
+# synthetic population files. Mode/dest UEC terms reference these on the
+# person table (e.g. c_bikes_bike → person.bikes, c_ebike_bike →
+# person.ebikes); without imputation they fall back to a constant default,
+# so the coefficient carries no variation at prediction time.
+# ebikes/escooter are listed so that the moment an ownership column appears
+# in the HHTS extract it flows through automatically — today HHTS only
+# records e-mobility as a travel MODE, not as ownership, so they are skipped.
+HHTS_SAMPLED_ATTRS = ['bikes', 'ebikes', 'escooter']
+
+
+def _needs_imputation(synth: pd.DataFrame, col: str) -> bool:
+    """True when the synth column is absent, all-NaN, or constant."""
+    if col not in synth.columns:
+        return True
+    vals = pd.to_numeric(synth[col], errors='coerce')
+    return vals.notna().sum() == 0 or vals.nunique(dropna=True) <= 1
+
+
+def sample_hhts_attributes(synth: pd.DataFrame,
+                           hhts_persons: pd.DataFrame,
+                           attrs: list = None,
+                           seed: int = 42) -> pd.DataFrame:
+    """
+    Impute HHTS-only attributes into the synthetic population by stratified
+    conditional sampling from the HHTS empirical distribution.
+
+    Strata: household vehicles (0/1/2/3+) × household size (1/2/3/4+) — both
+    exist on both tables and are the strongest cheap predictors of ownership
+    counts like bicycles. Weighted by the HHTS 'weight' column when present.
+    Household-level consistency: when the synth table carries a household id
+    (abshid/hhid), one value is drawn per household and broadcast to all its
+    members, so two siblings never disagree about how many bikes the garage
+    holds. Strata unseen in HHTS fall back to the global distribution.
+
+    Only imputes columns that are missing, all-NaN, or constant in synth —
+    real synth data is never overwritten.
+    """
+    df = synth.copy()
+    candidates = attrs if attrs is not None else HHTS_SAMPLED_ATTRS
+    todo = [a for a in candidates
+            if a in hhts_persons.columns and _needs_imputation(df, a)]
+    skipped = [a for a in candidates if a not in hhts_persons.columns]
+    if skipped:
+        logger.info(f"sample_hhts_attributes: not in HHTS, skipped: {skipped}")
+    if not todo:
+        logger.info("sample_hhts_attributes: nothing to impute")
+        return df
+
+    rng = np.random.default_rng(seed)
+
+    def _strata(frame: pd.DataFrame) -> pd.Series:
+        veh = pd.to_numeric(frame.get('vehrd'), errors='coerce') \
+                .fillna(1).clip(0, 3).astype(int)
+        size_col = next((c for c in ('nprd', 'HHSIZE', 'hhsize')
+                         if c in frame.columns), None)
+        hs = (pd.to_numeric(frame[size_col], errors='coerce')
+              .fillna(2).clip(1, 4).astype(int)
+              if size_col else pd.Series(2, index=frame.index))
+        return veh * 10 + hs
+
+    hh_strata = _strata(hhts_persons)
+    w_all = (pd.to_numeric(hhts_persons['weight'], errors='coerce').fillna(1.0)
+             if 'weight' in hhts_persons.columns
+             else pd.Series(1.0, index=hhts_persons.index))
+
+    hhid_col = next((c for c in ('abshid', 'hhid', 'HHID', 'hh_id')
+                     if c in df.columns), None)
+    if hhid_col is not None:
+        # one draw per household, broadcast to members
+        target = df.drop_duplicates(subset=[hhid_col])
+    else:
+        target = df
+    tgt_strata = _strata(target)
+
+    for attr in todo:
+        vals_raw = pd.to_numeric(hhts_persons[attr], errors='coerce')
+        ok = vals_raw.notna()
+        if ok.sum() == 0:
+            logger.warning(f"sample_hhts_attributes: HHTS '{attr}' all-NaN — skipped")
+            continue
+
+        # per-stratum empirical distributions (+ global fallback)
+        def _dist(mask):
+            v = vals_raw[mask]
+            w = w_all[mask]
+            tab = w.groupby(v).sum()
+            return tab.index.to_numpy(), (tab / tab.sum()).to_numpy()
+
+        g_vals, g_probs = _dist(ok)
+        out = np.empty(len(target), dtype=float)
+        for s in np.unique(tgt_strata):
+            t_mask = (tgt_strata == s).to_numpy()
+            h_mask = ok & (hh_strata == s)
+            vals, probs = _dist(h_mask) if h_mask.sum() >= 10 else (g_vals, g_probs)
+            out[t_mask] = rng.choice(vals, size=int(t_mask.sum()), p=probs)
+
+        if np.allclose(vals_raw[ok] % 1, 0):
+            out = out.astype(int)
+
+        if hhid_col is not None:
+            mapping = pd.Series(out, index=target[hhid_col].values)
+            df[attr] = df[hhid_col].map(mapping)
+        else:
+            df[attr] = out
+
+        _mean = float(pd.to_numeric(df[attr], errors='coerce').mean())
+        logger.info(
+            f"sample_hhts_attributes: imputed '{attr}' for {len(df)} persons "
+            f"({'per-household via ' + hhid_col if hhid_col else 'per-person'}) "
+            f"| synth mean={_mean:.3f} vs HHTS weighted mean="
+            f"{float(np.average(vals_raw[ok], weights=w_all[ok])):.3f}"
+        )
+
     return df

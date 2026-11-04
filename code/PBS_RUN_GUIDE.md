@@ -12,6 +12,152 @@ This document explains the new PBS launcher files and the commands they submit.
   Main entry point for `main`, `ga`, `ga_staged`, `safety_baseline`, and `safety_nosafety`.
 - `safety_experiment_analysis.py`
   Post-processing script for the safety experiment comparison.
+- `_run_ga_single_stage.py`
+  Runs exactly one GA stage (1-5) and writes a one-stage `ga_results.pkl` artifact.
+- `merge_ga_results.py`
+  Merges per-stage GA artifacts into one combined `ga_results.pkl`.
+- `job_ga_stage_single.pbs`
+  PBS worker that runs one GA stage (used by fan-out stage jobs).
+- `job_merge_ga_results.pbs`
+  PBS worker that merges completed stage outputs.
+- `job_submit_ga_parallel_chain.pbs`
+  PBS submitter job that launches stage 1..5 in parallel, then merge, then `ga_staged` prediction,
+  then MATSim export.
+- `matsim_export.py`
+  Converts a finished run's final activity plan into a MATSim scenario
+  (`plans.xml` + `facilities.xml` + `config.xml`).
+- `job_matsim_export.pbs`
+  Standalone PBS worker that runs `matsim_export.py` over a finished run directory.
+- `job_matsim_scenario.pbs`
+  Builds + runs a MATSim scenario (export → Controler → analysis) from a finished run.
+- `matsim_analysis.py`
+  Network-level analysis of a MATSim `output/` dir (link volumes, congestion, mode profiles).
+- `matsim/`
+  Staged MATSim toolkit: the pt2matsim jar, the population-independent network + GTFS transit
+  base inputs, the run driver, and rebuild scripts (see `matsim/README.md`).
+
+## Search Engine: SparseEA-AGDS (default)
+
+Every GA stage now runs the **SparseEA-AGDS** search engine by default (adaptive genetic operator +
+dynamic scoring + reference-point selection; Wang et al. 2025). It is selected with `GA_ENGINE=agds`,
+which every PBS worker defaults to (`job_ga_stage_single.pbs`, `pbs_pipeline_mode.pbs`,
+`job_stage3_model_suite.pbs`, and the `job_submit_ga_parallel_chain.pbs` fan-out). `GA_ENGINE` has
+precedence over the legacy `GA_USE_SA` / `GA_USE_BANDIT_SA` flags in
+`ga_hypothesis_testing._resolve_search_engine`.
+
+Override per run or per stage:
+
+```bash
+# whole chain back to landscape-routed portfolio
+qsub -v RUN_TAG=exp1,GA_ENGINE=portfolio job_submit_ga_parallel_chain.pbs
+# force plain GA everywhere
+qsub -v RUN_TAG=exp1,GA_ENGINE=ga job_submit_ga_parallel_chain.pbs
+# one stage only (single-stage worker)
+qsub -v STAGE_ID=5,RUN_TAG=exp1,GA_ENGINE_STAGE5=bandit job_ga_stage_single.pbs
+```
+
+Run directories are labelled by engine, e.g. `runs/agds_metacount_mv_staged__<jobid>/`.
+
+## MATSim Export
+
+Every full run emits a runnable **MATSim** scenario alongside the existing Aimsun/DynusT CSVs. The
+`ga_staged` prediction and the `stage3_model_suite` Stage 5/6 path auto-export via the finalisation
+step (`PIPELINE_MATSIM=1`, default on); the parallel chain also submits a dependent
+`job_matsim_export.pbs` (`GA_MATSIM=1`, default on). Output lands in `<run_dir>/matsim/`:
+
+```
+matsim/plans.xml            ← population: one plan per person (activities + mode legs)
+matsim/facilities.xml       ← one facility per zone centroid
+matsim/config.xml           ← minimal runnable MATSim config (CRS + inputs + scoring)
+matsim/export_manifest.json ← counts, CRS, source CSV, mode/activity histograms
+```
+
+Coordinates are the pipeline's zone centroids reprojected to **GDA94 / MGA Zone 56 (EPSG:28356)**;
+if the trip CSV carries per-trip coordinates (it does) those are used directly. Set
+`MATSIM_CRS=EPSG:4326` for raw lat/lon. Disable with `PIPELINE_MATSIM=0` (auto-export) /
+`GA_MATSIM=0` (chain job). Re-run standalone on any finished run:
+
+```bash
+qsub -v RUN_ROOT=runs/ga_parallel,RUN_TAG=exp1 job_matsim_export.pbs
+# or locally:
+python matsim_export.py --run-dir runs/<run> --crs EPSG:28356
+```
+
+### Population sampling
+
+The full synthetic population is ~2M agents, so a 100% `plans.xml` is multi-GB. Sample it:
+`MATSIM_SAMPLE_FRAC=0.1` (auto-export env) or `--sample-frac 0.1` (CLI) keeps a random 10%;
+`MATSIM_MAX_PERSONS` / `--max-persons` is a hard cap. Unset = full population.
+
+## MATSim: run the scenario + network analysis
+
+`job_matsim_scenario.pbs` turns a finished run into a **runnable MATSim scenario** and network-level
+plots. It reuses the population-independent base inputs staged in `matsim/` (a multimodal car+pt
+**network** from the OSM extract and the **SEQ GTFS transit** schedule — see `matsim/README.md`), so a
+run only: exports sampled plans → runs the MATSim Controler → renders analysis.
+
+```bash
+qsub -v "RUN_DIR=runs/agds_metacount_mv_staged__12345,MATSIM_SAMPLE_FRAC=0.1,MATSIM_ITERS=20,MATSIM_HEAP=64g" job_matsim_scenario.pbs
+```
+
+Car is routed on the network, pt uses the GTFS schedule, walk/bike/ride are teleported, and the flow +
+storage capacity are scaled to `MATSIM_SAMPLE_FRAC` (standard MATSim sample scaling). Outputs land in
+`RUN_DIR/matsim/`: `output/` (full MATSim output incl. events, trips, experienced plans) and `analysis/`
+(`network_volume_car.png`, `network_volume_total.png`, `network_congestion.png`,
+`mode_departure_profile.png`, `trip_distance_by_mode.png`, `summary.json`). For the full 2M population use
+a small sample with a big node; `MATSIM_SAMPLE_FRAC=1.0` only on a large-memory node. Standalone analysis
+on any MATSim output: `python matsim_analysis.py --output-dir <run>/matsim/output`.
+
+## Parallel Stage Chain (GA Fan-out + Merge + Prediction)
+
+This workflow is for running stages `1..5` simultaneously across separate PBS jobs,
+joining the stage models, then running `ga_staged` validation/prediction from the
+merged `ga_results.pkl`.
+
+### One-command submit
+
+```bash
+qsub -v RUN_TAG=exp_sa_parallel_001,GA_ESTIMATOR=sa_bandit,GA_BUDGET=fast,GA_N_RESTARTS=0 job_submit_ga_parallel_chain.pbs
+```
+
+What the submitter does:
+
+1. Submits 5 stage jobs in parallel (`job_ga_stage_single.pbs`): stage 1,2,3,4,5.
+2. Submits merge job (`job_merge_ga_results.pbs`) with `afterok` dependency on all 5 jobs.
+3. Submits prediction job (`pbs_pipeline_mode.pbs` with `MODE=ga_staged`) dependent on merge,
+   with `GA_STAGED_REUSE_ESTIMATOR=1` and `GA_STAGED_GA_DIR=<RUN_ROOT>/<RUN_TAG>/merged`.
+
+### Key environment variables
+
+- `RUN_TAG`
+  Logical experiment id. Artifacts are written under `RUN_ROOT/<RUN_TAG>/...`.
+- `RUN_ROOT`
+  Base directory for parallel-stage artifacts (default `runs/ga_parallel`).
+- `GA_ESTIMATOR`
+  Estimator selection (default `sa_bandit`).
+- `GA_BUDGET`
+  Budget profile (`smoke|ultrafast|fast|standard|thorough`).
+- `GA_N_RESTARTS`
+  Restart count override (default `0` in the parallel chain).
+- `STAGE_SELECT`, `STAGE_WALLTIME`
+  Resource shape for each stage job.
+- `PRED_SELECT`, `PRED_WALLTIME`
+  Resource shape for the final `ga_staged` prediction job.
+
+### Typical resource override example
+
+```bash
+qsub -v RUN_TAG=exp1,GA_ESTIMATOR=sa_bandit,GA_BUDGET=standard,GA_N_RESTARTS=0,STAGE_SELECT=1:ncpus=8:mem=128GB,STAGE_WALLTIME=36:00:00,PRED_SELECT=1:ncpus=8:mem=250GB,PRED_WALLTIME=24:00:00 job_submit_ga_parallel_chain.pbs
+```
+
+### Outputs
+
+- Stage artifacts:
+  `runs/ga_parallel/<RUN_TAG>/stage1/ ... stage5/`
+- Merged artifact for reuse:
+  `runs/ga_parallel/<RUN_TAG>/merged/ga_results.pkl`
+- Final prediction/validation run:
+  standard `ga_staged` run directory under `RUN_ROOT` (managed by `pipeline_logger.py`).
 
 ## Run Isolation
 
@@ -196,6 +342,79 @@ Inspect run outputs under:
 ```bash
 runs/<mode>__<jobid>/
 ```
+
+## Stage 3 Duration Model Suite
+
+`job_stage3_model_suite.pbs` estimates each requested duration variant, applies
+it to the synthetic Stage 2 population, and keeps the artifacts isolated by
+variant. The default `all` suite runs:
+
+- `lognormal`
+- `copula_hazard`
+- `lognormal_mdcev`
+- `copula_hazard_mdcev`
+
+Submit the full duration suite:
+
+```bash
+qsub job_stage3_model_suite.pbs
+```
+
+Run the duration suite and continue through Stage 4 timing/schedule placement:
+
+```bash
+qsub -v RUN_STAGE4=1 job_stage3_model_suite.pbs
+```
+
+Run one large end-to-end job from Stage 1 through Stage 6 for every duration
+variant. Stage 5 and Stage 6 are substantially heavier than the duration and
+timing stages, so request larger resources:
+
+```bash
+qsub -l select=1:ncpus=4:mem=194GB -l walltime=48:00:00 \
+  -v FRESH=1,RUN_STAGE5_6=1,SKIMS_PATH=downcasted_matrices_base.omx \
+  job_stage3_model_suite.pbs
+```
+
+`RUN_STAGE5_6=1` automatically enables Stage 4. The job then performs:
+
+1. Stage 1 activity-frequency estimation and synthetic prediction.
+2. Stage 2 day-budget estimation and synthetic prediction.
+3. Every requested Stage 3 duration variant.
+4. SearchLibrium timing estimation and Stage 4 schedule placement.
+5. Stage 5 destination, mode, and trip-chain estimation for each variant.
+6. Stage 6 mode prediction and final activity-plan output for each variant.
+
+The final per-variant artifacts are `stage5_output.csv` and
+`stage6_output.csv`, alongside their model pickles. The complete run status is
+recorded in `manifest.json`.
+
+Run only the two duration marginals:
+
+```bash
+qsub -v STAGE3_MODEL_SUITE=lognormal,copula_hazard job_stage3_model_suite.pbs
+```
+
+Run Stage 1 and Stage 2 first for a fresh zone-specific job:
+
+```bash
+qsub -v FRESH=1,ZONE=40,RUN_STAGE4=1 job_stage3_model_suite.pbs
+```
+
+Artifacts are written below `runs/stage3_model_suite/<PBS_JOBID>/` by default:
+
+- `<variant>/stage3_models.pkl` and `stage3_output.csv`
+- `<variant>/stage4_output.csv` when `RUN_STAGE4=1`
+- `stage4_timing_models.pkl` when `RUN_STAGE4=1`
+- `<variant>/stage5_models.pkl` and `stage5_output.csv` when `RUN_STAGE5_6=1`
+- `<variant>/stage6_models.pkl` and `stage6_output.csv` when `RUN_STAGE5_6=1`
+- `model_fit_summary.csv`
+- `manifest.json`
+
+The suite estimates the existing SearchLibrium planning-order RRM inside each
+Stage 3 run. When Stage 4 is enabled, it estimates the SearchLibrium timing RRM
+once and applies it to every duration variant. Use `STAGE3_MODEL_SUITE` to
+reduce the walltime or memory footprint when testing.
 
 Common logs to watch:
 

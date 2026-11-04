@@ -1,0 +1,42 @@
+#!/bin/bash -l
+#PBS -N suncorp_eval_debug
+#PBS -l walltime=00:20:00
+#PBS -l select=1:ncpus=2:mem=24GB
+#PBS -j oe
+#PBS -m be
+#PBS -r y
+
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+set -euo pipefail
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+RESULTS_DIR=$PROJ_DIR/results
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+cd "$SCRIPT_DIR"
+
+echo "[debug] compile"
+python -m py_compile 69_transfer_eval.py 69_sensitivity.py
+
+echo "[debug] realised-coverage eval on the shipped MIP (results/)"
+python -u 69_transfer_eval.py \
+  --mip-dir "$RESULTS_DIR" \
+  --out "$RESULTS_DIR/transfer_eval.json"
+
+echo "[debug] sensitivity dry run"
+python -u 69_sensitivity.py --dry-run
+
+echo "[debug] OK"

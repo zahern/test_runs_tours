@@ -1,0 +1,46 @@
+#!/bin/bash
+#PBS -N lc_upgrade_verify
+#PBS -P FPAXJW8067
+#PBS -l select=1:ncpus=1:mem=8GB
+#PBS -l walltime=00:30:00
+#PBS -o /mnt/hpccs01/home/ahernz/test_runs_tours/code/_tmp_lc_upgrade_verify.o
+#PBS -e /mnt/hpccs01/home/ahernz/test_runs_tours/code/_tmp_lc_upgrade_verify.e
+cd /mnt/hpccs01/home/ahernz/test_runs_tours/code || exit 1
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate zigenv
+echo "HOSTNAME=$(hostname)"
+echo "--- pre-upgrade state ---"
+python -c "import SearchLibrium.mh_choice_estimator as M; print('pre file:', M.__file__); print('pre has estimate_dest_choice_lc:', hasattr(M, 'estimate_dest_choice_lc'))"
+echo "--- installing vendored wheel ---"
+pip install ./_patches/SearchLibrium/searchlibrium-0.0.255-py3-none-any.whl
+echo "--- post-upgrade verify ---"
+python - <<'PY'
+import traceback
+from SearchLibrium import mh_choice_estimator as M
+print("module file:", M.__file__)
+ok = True
+for name in ["estimate_dest_choice", "estimate_dest_choice_lc",
+             "estimate_dest_choice_interactions", "identify_weak_features",
+             "add_actor_columns", "add_interaction_columns",
+             "effective_sample_size", "r_hat"]:
+    has = hasattr(M, name)
+    print("%-34s %s" % (name, has))
+    if not has:
+        ok = False
+try:
+    from SearchLibrium.mh_choice_estimator import estimate_dest_choice_lc
+    print("IMPORT estimate_dest_choice_lc: OK")
+except Exception:
+    ok = False
+    traceback.print_exc()
+import SearchLibrium as S
+for name in ["RandomRegret", "MixedLogit", "MultinomialLogit", "NestedLogit",
+             "OrderedLogit", "MDCEVModel", "HeckmanTwoStep", "BinaryProbit",
+             "LogisticRegression"]:
+    has = hasattr(S, name)
+    print("top %-28s %s" % (name, has))
+    if not has:
+        ok = False
+print("OVERALL:", "PASS" if ok else "FAIL")
+PY
+echo VERIFY_DONE

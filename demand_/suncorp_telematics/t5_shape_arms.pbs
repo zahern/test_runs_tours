@@ -1,0 +1,134 @@
+#!/bin/bash -l
+#PBS -N t5shape
+#PBS -l walltime=05:00:00
+#PBS -l select=1:ncpus=8:mem=64gb
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# T5 — the remaining exposure-shape alternatives, head to head.
+#
+# T4 tests the calibrated exposure. T5 asks what else could explain an
+# exposure LRT that rejects the pinned offset at chi2(1)=364, on top of
+# the calibration. All arms share the calibrated exposure so the ONLY
+# difference is the shape of the flow->speeding curve:
+#
+#   base   no shape terms (T4 arm B, repeated here as a self-contained control)
+#   hinge  orthogonalised piecewise-linear deviation basis on logexp
+#          -> lets the curve bend
+#   hw     logexp x highway class
+#          -> lets the ELASTICITY differ by road class
+#   hinge+hw both
+#   zi     role 6 offered to continuous/calendar candidates
+#          -> a structural-zero process alongside the count
+#
+# Latent classes are deliberately NOT run here. --max-latent-classes > 1
+# grows the decision vector from 2D+1 to 3D+2 and forces at least that many
+# classes in every spec, so a 3-iteration budget would report a
+# predetermined answer. Testing LC honestly needs a much larger
+# --search-iters and its own job.
+#
+# The winner is whatever lowers the LRT chi2 WITHOUT costing holdout
+# bin-Spearman. A chi2 win with flat holdout means the extra shape is not
+# buying prediction accuracy.
+set -u
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+BASE=$PROJ_DIR/results_tests/t5_base
+HINGE=$PROJ_DIR/results_tests/t5_hinge
+HW=$PROJ_DIR/results_tests/t5_hw
+BOTH=$PROJ_DIR/results_tests/t5_hingehw
+ZI=$PROJ_DIR/results_tests/t5_zi
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+python -m pip install --upgrade metacountregressor
+python - <<'PY'
+from importlib.metadata import version
+v = version('metacountregressor')
+print('metacountregressor', v, flush=True)
+assert tuple(int(x) for x in v.split('.')[:3]) >= (1, 0, 170), \
+    f'need >= 1.0.170, got {v}'
+PY
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export JAX_PLATFORMS=cpu
+export PYTHONIOENCODING=utf-8
+
+cd "$SCRIPT_DIR"
+for d in "$BASE" "$HINGE" "$HW" "$BOTH" "$ZI"; do
+  mkdir -p "$d" "$PROJ_DIR/figures_tests/$(basename "$d")"
+done
+
+echo "=================================================================="
+echo "T5 exposure-shape arms, on $(hostname) at $(date)"
+echo "=================================================================="
+
+run_arm() {
+  # $1 name  $2 out dir  $3.. extra flags
+  local name="$1"; shift
+  local out="$1"; shift
+  echo
+  echo "### ARM: $name  ($*) ###"
+  python -u 59_game_day_search_predict.py \
+    --out-dir "$out" \
+    --fig-dir "$PROJ_DIR/figures_tests/$(basename "$out")" \
+    --search-iters 3 --search-chunk 3 --wall-budget 2400 \
+    --n-starts 1 --search-R 10 --refit-R 30 \
+    --search-vars slim --target speeding_trips \
+    --group-by segment --n-future 2 \
+    --exposure free --exposure-lrt on \
+    --exposure-calibration on \
+    --temporal-refit none \
+    "$@" 2>&1
+  local rc=$?
+  echo "ARM $name exit: $rc"
+  return $rc
+}
+
+RC_BASE=0; RC_HINGE=0; RC_HW=0; RC_BOTH=0; RC_ZI=0
+run_arm base  "$BASE"  --exposure-basis none || RC_BASE=$?
+run_arm hinge "$HINGE" --exposure-basis hinge || RC_HINGE=$?
+run_arm hw    "$HW"    --exposure-basis linear+hw || RC_HW=$?
+run_arm both  "$BOTH"  --exposure-basis hinge+hw || RC_BOTH=$?
+run_arm zi    "$ZI"    --exposure-basis none --zero-inflation on || RC_ZI=$?
+
+echo
+echo "=================================================================="
+echo "T5 assertions"
+# ---------------------------------------------------------------- verify
+# Assert against the OUTPUT ARTEFACTS, not the PBS log.
+#
+# T5 (26077240) fitted all five arms and then died at
+#   LOG=$(ls -t "$PROJ_DIR"/t5shape.o* 2>/dev/null | head -1)
+#   log: none
+#   FAIL: no output file
+# so zero assertions ran and the job exited 1 with no verdict on five arms
+# of results. Grepping a file the job is still writing depends on filesystem
+# visibility timing the job does not control. Each arm writes its own
+# metrics JSON, so that is what gets checked.
+echo "=================================================================="
+echo "T5 assertions (from artefacts)"
+echo "=================================================================="
+python -u "$PROJ_DIR/t5_assert.py" "$PROJ_DIR/results_tests" 2>&1
+RC_ASSERT=$?
+if [ "$RC_ASSERT" -ne 0 ]; then
+  echo "  -> artefact assertions FAILED (rc=$RC_ASSERT)"
+fi
+
+echo
+echo "=================================================================="
+echo "T5 exits: base=$RC_BASE hinge=$RC_HINGE hw=$RC_HW both=$RC_BOTH zi=$RC_ZI assert=$RC_ASSERT"
+echo "=================================================================="
+if [ "$RC_BASE" -ne 0 ] || [ "$RC_HINGE" -ne 0 ] || [ "$RC_HW" -ne 0 ] || \
+   [ "$RC_BOTH" -ne 0 ] || [ "$RC_ZI" -ne 0 ] || [ "$RC_ASSERT" -ne 0 ]; then
+  exit 1
+fi
+exit 0

@@ -1,0 +1,99 @@
+#!/bin/bash -l
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=8:mem=128GB
+#PBS -l walltime=48:00:00
+
+# DTA Feedback Loop
+# Iterates: demand model -> DTA (MATSim/SUMO/DynusT) -> updated skims -> re-estimate
+# Controlled by DTA_FEEDBACK_ITERS, DTA_ENGINE, DTA_CONVERGENCE_THRESHOLD
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+
+echo "=========================================="
+echo "DTA Feedback Loop"
+echo "Job ID              : ${PBS_JOBID}"
+echo "Run Root            : ${RUN_ROOT}"
+echo "Run Tag             : ${RUN_TAG}"
+echo "DTA Iters           : ${DTA_FEEDBACK_ITERS}"
+echo "DTA Engine          : ${DTA_ENGINE}"
+echo "Convergence Thresh  : ${DTA_CONVERGENCE_THRESHOLD}"
+echo "Skims Path          : ${PIPELINE_SKIMS_PATH}"
+echo "=========================================="
+
+# Load environment
+source ~/.bashrc
+conda activate "${CONDA_ENV:-zigenv}"
+
+# Run DTA feedback loop
+python -c "
+import os
+import sys
+sys.path.insert(0, '.')
+import pandas as pd
+
+# Resolve prediction run directory using marker file (chain of: prediction -> parking -> DTA)
+RUN_DIR_MARKER = os.environ.get('RUN_DIR_MARKER', '')
+if RUN_DIR_MARKER and os.path.exists(RUN_DIR_MARKER):
+    with open(RUN_DIR_MARKER, 'r') as f:
+        pred_dir = f.read().strip()
+    print(f'Resolved pred_dir from marker: {pred_dir}')
+else:
+    _run_tag = os.environ.get('RUN_TAG', '')
+    _estim = os.environ.get('GA_ESTIMATOR', 'default')
+    _pfx = 'ga'
+    if os.environ.get('GA_USE_SA', '0') == '1' or os.environ.get('GA_USE_BANDIT_SA', '0') == '1':
+        _pfx = 'sa'
+        if _estim == 'sa_bandit':
+            _estim = 'bandit'
+    pred_dir = os.path.join(os.environ.get('RUN_ROOT', 'runs/ga_parallel'), f'{_pfx}_{_estim}_staged__{_run_tag}')
+    print(f'Computed pred_dir (fallback): {pred_dir}')
+
+# Stage 7 output is in the same prediction run directory
+plan_path = os.path.join(pred_dir, 'stage7_output.csv')
+if not os.path.exists(plan_path):
+    # Fallback to Stage 6 output
+    plan_path = os.path.join(pred_dir, 'stage6_output.csv')
+
+if not os.path.exists(plan_path):
+    print(f'ERROR: plan not found at {plan_path}')
+    sys.exit(1)
+
+plan = pd.read_csv(plan_path)
+print(f'Loaded plan: {len(plan)} rows')
+
+# Load persons
+persons_path = os.path.join(pred_dir, 'persons.csv')
+if not os.path.exists(persons_path):
+    persons_path = os.path.join(os.environ.get('RUN_ROOT', 'runs/ga_parallel'), _run_tag, 'merged', 'persons.csv')
+persons = pd.read_csv(persons_path)
+print(f'Loaded persons: {len(persons)}')
+
+# Load landuse
+landuse_path = 'saved_data/zone_landuse_overture.csv'
+if not os.path.exists(landuse_path):
+    landuse_path = 'saved_data/zone_order_and_landuse.csv'
+landuse = pd.read_csv(landuse_path) if os.path.exists(landuse_path) else pd.DataFrame()
+
+# Run DTA feedback
+from dta_feedback import run_dta_feedback_loop
+final_plan, final_skim = run_dta_feedback_loop(
+    plan=plan,
+    persons=persons,
+    landuse=landuse,
+    skim_path=os.environ.get('PIPELINE_SKIMS_PATH', ''),
+    iterations=int(os.environ.get('DTA_FEEDBACK_ITERS', '3')),
+    engine=os.environ.get('DTA_ENGINE', 'matsim'),
+    output_dir=os.path.join(pred_dir, 'dta_feedback'),
+    convergence_threshold=float(os.environ.get('DTA_CONVERGENCE_THRESHOLD', '0.02')),
+)
+
+# Save final equilibrated plan and skims
+final_plan.to_csv(os.path.join(pred_dir, 'stage7_dta_equilibrated.csv'), index=False)
+print(f'Final equilibrated plan: {len(final_plan)} rows')
+print(f'Final skims: {final_skim}')
+"
+
+echo "DTA Feedback Loop complete"

@@ -1,0 +1,33 @@
+#!/bin/bash -l
+#PBS -N suncorp_sens
+#PBS -l walltime=10:00:00
+#PBS -l select=1:ncpus=2:mem=32GB
+#PBS -j oe
+#PBS -m be
+#PBS -r y
+
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+set -euo pipefail
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export JAX_PLATFORMS=cpu
+
+cd "$SCRIPT_DIR"
+
+echo "[sens] start $(date -Is) on $(hostname)"
+python -u 69_sensitivity.py
+echo "[sens] done $(date -Is)"

@@ -1,0 +1,127 @@
+#!/bin/bash -l
+#PBS -N s5b_smoke
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ncpus=4:mem=16GB
+#PBS -j oe
+#PBS -m abe
+
+cd $PBS_O_WORKDIR
+
+echo "=== Stage 5b Smoke Test ==="
+echo "Job: $PBS_JOBID on $(hostname)"
+echo "Start: $(date)"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+# Quick environment check
+python -c "import larch, numpy, pandas, openmatrix; print('Imports OK')"
+
+# Run a minimal test using the local test script
+python - <<'PY'
+import sys
+sys.path.insert(0, '.')
+import pandas as pd
+import numpy as np
+from stage5b_trip_destination import run_stage5b, _load_skims
+
+# Create tiny synthetic data for smoke test
+np.random.seed(42)
+n_trips = 200
+n_zones = 50
+
+# Trips
+trips = pd.DataFrame({
+    'trip_id': range(n_trips),
+    'tour_id': np.repeat(range(n_trips // 4), 4)[:n_trips],
+    'person_id': np.random.randint(1, 50, n_trips),
+    'trip_num_in_tour': np.tile([1, 2, 3, 4], n_trips // 4)[:n_trips],
+    'is_outbound': np.tile([1, 1, 0, 0], n_trips // 4)[:n_trips],
+    'origin_taz': np.random.randint(1, n_zones + 1, n_trips),
+    'dest_taz': np.random.randint(1, n_zones + 1, n_trips),
+    'purpose': np.random.choice(['work', 'shop', 'social'], n_trips),
+    'mode': np.random.choice(['auto', 'transit', 'walk'], n_trips),
+    'depart_time_min': np.random.randint(0, 1440, n_trips),
+    'arrive_time_min': np.random.randint(0, 1440, n_trips),
+    'travel_time_min': np.random.randint(5, 60, n_trips),
+})
+
+# Make last outbound leg the tour dest
+for tour_id in trips['tour_id'].unique():
+    mask = (trips['tour_id'] == tour_id) & (trips['is_outbound'] == 1)
+    if mask.any():
+        last = trips.loc[mask, 'trip_num_in_tour'].max()
+        trips.loc[mask & (trips['trip_num_in_tour'] == last), 'is_tour_dest_leg'] = 1
+
+trips['is_tour_dest_leg'] = trips.get('is_tour_dest_leg', 0).fillna(0).astype(int)
+
+# Persons
+persons = pd.DataFrame({
+    'person_id': range(1, 51),
+    'home_taz': np.random.randint(1, n_zones + 1, 50),
+    'is_female': np.random.randint(0, 2, 50),
+    'income_hi': np.random.randint(0, 2, 50),
+    'hh_child': np.random.randint(0, 2, 50),
+    'occp_group': np.random.randint(1, 5, 50),
+    'ptype_FullTimeWorker': np.random.randint(0, 2, 50),
+    'ptype_UniversityStudent': np.random.randint(0, 2, 50),
+    'mtwp': np.random.randint(0, 2, 50),
+    'WFHWEEK': np.random.randint(0, 2, 50),
+    'incp': np.random.randn(50),
+})
+
+# Land use
+landuse = pd.DataFrame({
+    'zone_id': range(1, n_zones + 1),
+    'TOTEMP': np.random.randint(0, 500, n_zones),
+    'FPSEMPN': np.random.randint(0, 100, n_zones),
+    'HEREMPN': np.random.randint(0, 100, n_zones),
+    'RETEMPN': np.random.randint(0, 100, n_zones),
+    'TOTPOP': np.random.randint(0, 1000, n_zones),
+    'TOTHH': np.random.randint(0, 500, n_zones),
+    'HSENROLL': np.random.randint(0, 200, n_zones),
+})
+
+# Create dummy OMX skims
+import openmatrix as omx
+import tables
+omx_path = 'smoke_skims.omx'
+with omx.open_file(omx_path, 'w') as f:
+    n = n_zones
+    atom = tables.Float64Atom()
+    f.create_matrix('DIST', atom, (n, n))
+    f['DIST'][:] = np.random.rand(n, n) * 20
+    f.create_matrix('DISTWALK', atom, (n, n))
+    f['DISTWALK'][:] = f['DIST'][:]  # Intentionally collinear to test guard
+    f.create_matrix('DISTBIKE', atom, (n, n))
+    f['DISTBIKE'][:] = f['DIST'][:]  # Intentionally collinear
+    f.create_matrix('SOVTOLL_TIME__AM', atom, (n, n))
+    f['SOVTOLL_TIME__AM'][:] = np.random.rand(n, n) * 30 + 5
+    f.create_matrix('WLK_LOC_WLK_TOTIVT__AM', atom, (n, n))
+    f['WLK_LOC_WLK_TOTIVT__AM'][:] = np.random.rand(n, n) * 40 + 10
+    f.create_matrix('CRASH', atom, (n, n))
+    f['CRASH'][:] = np.random.rand(n, n) * 0.1
+
+print("Running Stage 5b smoke test...")
+result = run_stage5b(
+    trips=trips,
+    persons=persons,
+    skims_path=omx_path,
+    landuse=landuse,
+    g_tripdest=None,
+    output_dir='smoke_output',
+    save_models=False,
+    validate=True,
+)
+
+print(f"Models estimated: {list(result['models'].keys())}")
+print(f"BIC total: {result['bic_total']}")
+if result['validation'] is not None:
+    print(result['validation'])
+
+print("SMOKE TEST PASSED" if result['bic_total'] != np.inf else "SMOKE TEST FAILED")
+PY
+
+echo "End: $(date)"

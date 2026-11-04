@@ -1,0 +1,54 @@
+This is BibTeX, Version 0.99e
+Capacity: max_strings=200000, hash_size=200000, hash_prime=170003
+The top-level auxiliary file: main_check.aux
+Reallocating 'name_of_file' (item size: 1) to 9 items.
+The style file: abbrvnat.bst
+Reallocating 'name_of_file' (item size: 1) to 22 items.
+Database file #1: localbibliography.bib
+Warning--to sort, need author or key in Telework2026Timing
+Warning--to sort, need author or key in ABMDTAConvergence2024
+Warning--empty publisher in AASHTO2010HighwayManual
+Warning--empty year in ActivitySimConsortium
+Warning--empty year in ActivitySimPrototypeMTC
+You've used 85 entries,
+            2773 wiz_defined-function locations,
+            1260 strings with 27615 characters,
+and the built_in function-call counts, 40493 in all, are:
+= -- 3782
+> -- 2418
+< -- 37
++ -- 815
+- -- 729
+* -- 3547
+:= -- 6403
+add.period$ -- 385
+call.type$ -- 85
+change.case$ -- 494
+chr.to.int$ -- 84
+cite$ -- 177
+duplicate$ -- 1688
+empty$ -- 3097
+format.name$ -- 862
+if$ -- 8369
+int.to.chr$ -- 2
+int.to.str$ -- 1
+missing$ -- 80
+newline$ -- 563
+num.names$ -- 332
+pop$ -- 809
+preamble$ -- 1
+purify$ -- 413
+quote$ -- 0
+skip$ -- 1287
+stack$ -- 0
+substring$ -- 1311
+swap$ -- 112
+text.length$ -- 3
+text.prefix$ -- 0
+top$ -- 0
+type$ -- 915
+warning$ -- 5
+while$ -- 338
+width$ -- 0
+write$ -- 1349
+(There were 5 warnings)

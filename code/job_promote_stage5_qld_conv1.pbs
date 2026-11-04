@@ -1,0 +1,187 @@
+#!/bin/bash -l
+# Promote the 20/10 Stage-5 best_*.npz genes into fitted models, then rebuild
+# the 371-zone fitted logsum accessibility from those models.
+#
+# Why: the qld_conv1 Stage-5 shards were SIGKILLed at the 12 h walltime after
+# the GA wrote best_*.npz but before the post-search refit, so stage5_models.pkl
+# still holds the 13/10 fits. This job refits the winning feature sets (no GA
+# rerun), saves saved_data/stage5_models.pkl (+ coefficient CSV), then runs
+# build_fitted_logsum_371.py against the NEW models pickle.
+#
+# Submit from the code dir:
+#   qsub job_promote_stage5_qld_conv1.pbs
+# 8-mode (PT_Walk/PT_Drive/PT_Bike fitted + in the logsum) is the DEFAULT:
+#   qsub job_promote_stage5_qld_conv1.pbs
+# 5-mode (paper parity - the 20/10 shards searched 5 modes):
+#   qsub -v STAGE5_PT_MODES=0 job_promote_stage5_qld_conv1.pbs
+#
+# The PT flag is read when stage5_destination_choice is imported, so it must be
+# exported BEFORE python starts - the refit and the logsum then agree.
+# STAGE5_PT_ACCESS=1 matches the shard jobs' Variable_List (ga_s5*_qld_conv1):
+# refitting with it off would drop the coupled PT-access terms the GA saw.
+#
+#PBS -N promote_s5_qld_conv1
+#PBS -m n
+#PBS -r y
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -l walltime=06:00:00
+
+set -euo pipefail
+
+CONDA_ENV=${CONDA_ENV:-zigenv}
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+RUN_TAG=${RUN_TAG:-qld_conv1}
+STAGE5_PT_MODES=${STAGE5_PT_MODES:-1}
+STAGE5_PT_ACCESS=${STAGE5_PT_ACCESS:-1}
+# PT modes are only estimable if data_connect derives the observed access
+# label (tour_transit_access); that is gated by STAGE5B_TRANSIT_ACCESS.
+if [ "${STAGE5_PT_MODES}" != "0" ]; then
+    STAGE5B_TRANSIT_ACCESS=${STAGE5B_TRANSIT_ACCESS:-1}
+else
+    STAGE5B_TRANSIT_ACCESS=${STAGE5B_TRANSIT_ACCESS:-0}
+fi
+TARGET=${TARGET:-saved_data/stage5_models.pkl}
+LANDUSE_371=${LANDUSE_371:-saved_data/zone_landuse_overture.csv}
+SKIMS_371=${SKIMS_371:-../demand_/skims_371.omx}
+LOGSUM_OUT=${LOGSUM_OUT:-saved_data/logsum_acc_371.csv}
+
+cd "$PBS_O_WORKDIR"
+# Single-conda rule (same as job_ga_shard_single.pbs / job_merge_ga_shards.pbs):
+# activate the console miniconda env by explicit prefix - `module load
+# Anaconda3` + `conda activate zigenv` can resolve a different same-named env
+# and silently import a different SearchLibrium/larch build.
+CONDA_BASE=${CONDA_BASE:-/mnt/hpccs01/home/ahernz/miniconda3}
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_BASE}/envs/${CONDA_ENV}"
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+echo "python: $(which python) ($(python --version 2>&1))"
+export PYTHONPATH="${PBS_O_WORKDIR}/compat:${PYTHONPATH:-}"
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+
+export RUN_ROOT RUN_TAG
+export STAGE5_PT_MODES STAGE5_PT_ACCESS STAGE5B_TRANSIT_ACCESS
+export PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-${SKIMS_371}}
+
+# Match the shard jobs' data frame so the refit sees the same HHTS tours,
+# persons and landuse the GA estimated on.
+export NEW_POP=${NEW_POP:-1}
+export NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+export NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+
+echo "=============================================================="
+echo "Stage-5 promotion (${RUN_TAG})"
+echo "  modes      : 8-mode (PT) = ${STAGE5_PT_MODES}"
+echo "  PT access  : ${STAGE5_PT_ACCESS} (shard parity)  transit-access labels: ${STAGE5B_TRANSIT_ACCESS}"
+echo "  target     : ${TARGET}"
+echo "  stage dir  : ${RUN_ROOT}/${RUN_TAG}/stage5"
+echo "=============================================================="
+
+python promote_stage5_bests.py \
+    --run-root "${RUN_ROOT}" \
+    --tag "${RUN_TAG}" \
+    --target "${TARGET}" \
+    --dry-run
+
+echo
+echo "--- refitting + promoting ---"
+python promote_stage5_bests.py \
+    --run-root "${RUN_ROOT}" \
+    --tag "${RUN_TAG}" \
+    --target "${TARGET}"
+
+echo
+echo "=============================================================="
+echo "Checking the promoted models match the requested mode set"
+echo "=============================================================="
+
+python - "${TARGET}" "${STAGE5_PT_MODES}" <<'PY'
+import os
+import sys
+import pandas as pd
+
+target, pt_env = sys.argv[1], sys.argv[2]
+want_pt = str(pt_env).strip() != "0"
+csv_path = target.replace(".pkl", "_coefficients.csv")
+if not os.path.exists(csv_path):
+    raise SystemExit(f"FATAL: no coefficient CSV beside {target} ({csv_path})")
+df = pd.read_csv(csv_path)
+segments = sorted(df["segment"].unique())
+print(f"coefficients: {csv_path}")
+print(f"segments    : {segments}")
+missing = [s for s in ("work", "edu", "nonmand") if s not in segments]
+if missing:
+    raise SystemExit(f"FATAL: no fitted models for segment(s) {missing}")
+mode_rows = df[df["model_type"].astype(str).str.lower() == "mode"]
+pt = sorted({p for p in mode_rows["parameter"].astype(str) if "PT" in p.upper()})
+print(f"PT mode terms: {pt if pt else '(none)'}")
+if want_pt and not pt:
+    raise SystemExit(
+        "FATAL: STAGE5_PT_MODES=1 but the promoted mode models carry no "
+        "ASC_PT_*/PT cost terms - the refit did not pick up the 8-mode spec")
+if (not want_pt) and pt:
+    raise SystemExit(
+        "FATAL: STAGE5_PT_MODES=0 but the promoted mode models contain PT "
+        f"terms {pt} - stale or mixed-mode pickle")
+for seg, g in mode_rows.groupby("segment"):
+    print(f"  {seg:<8} mode params={len(g)}")
+print("OK: promoted mode set matches STAGE5_PT_MODES")
+PY
+
+echo
+echo "=============================================================="
+echo "Fitted logsum accessibility (371) from the promoted models"
+echo "=============================================================="
+
+MODELS_371="${TARGET}" \
+LANDUSE_371="${LANDUSE_371}" \
+SKIMS_371="${SKIMS_371}" \
+LOGSUM_OUT="${LOGSUM_OUT}" \
+EXPECTED_ZONES_371=371 \
+python build_fitted_logsum_371.py \
+    --models "${TARGET}" \
+    --landuse "${LANDUSE_371}" \
+    --skims "${SKIMS_371}" \
+    --out "${LOGSUM_OUT}"
+
+echo
+echo "--- verifying ${LOGSUM_OUT} ---"
+python - "${LOGSUM_OUT}" <<'PY'
+import sys
+import pandas as pd
+
+path = sys.argv[1]
+df = pd.read_csv(path)
+rows = len(df)
+cols = [c for c in df.columns if str(c).endswith('_acc')]
+print(f"{path}: {rows} rows x {len(cols)} logsum columns")
+print("columns:", ", ".join(map(str, cols)))
+if rows != 371:
+    raise SystemExit(f"FATAL: expected 371 zone rows, got {rows}")
+if 'zone_id' not in df.columns:
+    raise SystemExit("FATAL: no zone_id column")
+if df['zone_id'].duplicated().any():
+    raise SystemExit("FATAL: duplicate zone_id rows")
+if df[cols].isna().any().any():
+    bad = {c: int(df[c].isna().sum()) for c in cols if df[c].isna().any()}
+    raise SystemExit(f"FATAL: NaN logsums {bad}")
+for c in cols:
+    std = float(df[c].std())
+    print(f"  {c:<24} std={std:.6g} min={df[c].min():.4f} max={df[c].max():.4f}")
+    if std < 1e-9:
+        raise SystemExit(f"FATAL: flat surface in {c}")
+print("OK: 371-zone fitted logsum is complete and varying")
+PY
+
+echo
+echo "Done."
+echo "  models : ${TARGET}"
+echo "  logsum : ${LOGSUM_OUT}"
+echo "  report : ${RUN_ROOT}/${RUN_TAG}/stage5/promoted/promoted_features.json"

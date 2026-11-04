@@ -34,6 +34,15 @@ def _latest_run_dir(prefix: str, base: str = None) -> str:
     )
     # Filter to directories only
     candidates = [p for p in candidates if os.path.isdir(p)]
+    # Prefer a directory that actually contains completed stage-6 outputs:
+    # the newest dir is usually the most recent attempt, which may be an
+    # OOM-killed shell (observed 16/10) — comparing two empty runs produced
+    # an all-zero report.
+    complete = [p for p in candidates
+                if any(os.path.isfile(os.path.join(p, f))
+                       for f in ('stage6_output.csv', 'trips_for_aimsun.csv'))]
+    if complete:
+        return complete[0]
     if candidates:
         return candidates[0]
     # Legacy fixed name
@@ -75,6 +84,17 @@ def load_run(d, label):
 
 BASE = load_run(DIR_BASE, 'With Safety Skims')
 NOSA = load_run(DIR_NOSA, 'Without Safety Skims')
+
+_missing = []
+for _r in (BASE, NOSA):
+    if _r['plan'].empty and _r['aimsun'].empty:
+        _missing.append(f"{_r['label']} ({_r['dir']})")
+if _missing:
+    print("\nERROR: safety arm(s) have no stage6_output.csv / "
+          "trips_for_aimsun.csv: " + "; ".join(_missing))
+    print("       Refusing to compare incomplete runs — re-run "
+          "job_safety_experiment.pbs after the arms finish.")
+    sys.exit(2)
 
 
 def load_landuse():

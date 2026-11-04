@@ -76,12 +76,28 @@ def haversine_m(a1, o1, a2, o2):
                                           * np.sin(dl / 2) ** 2))
 
 
-def load_segment_sites(pred, path, max_segments, obs_m=100.0):
+def load_segment_sites(pred, path, max_segments, obs_m=100.0,
+                       chunk_m=0.0, max_chunks_per_road=3):
     """Create candidates at exact road-segment centerline midpoints.
 
     Each site also carries the road name, segment length and the
     observable fraction f = min(1, obs_m / length_m): one officer sees
     ~obs_m metres, so a 200 m segment yields only half its speeding.
+
+    chunk_m > 0: split every OSM way into EQUAL-length chunks (~chunk_m
+    metres each; short ways stay whole) and make each chunk a separate
+    candidate. OSM way length is arbitrary -- any node splits a way -- so
+    as single units a 1.5 km way and a 60 m stub are not comparable: the
+    way aggregates many times the exposure, its ONE midpoint can fall on
+    a cold stretch while its hot stretch is unpostable, and two officers
+    can never cover two parts of the same road. Chunks make the candidate
+    unit length-comparable. A way's predicted count is allocated to its
+    chunks by length share (uniform-intensity assumption -- no
+    sub-segment count exists), and each chunk is scored on what ONE
+    officer can capture there: observable = chunk_total * min(1, obs_m /
+    chunk_len). At most max_chunks_per_road chunks of one way enter the
+    pool (<=0 = no cap) so a single long road cannot crowd out the
+    shortlist.
     """
     import geopandas as gpd
 
@@ -91,30 +107,104 @@ def load_segment_sites(pred, path, max_segments, obs_m=100.0):
     roads["road_osmid"] = roads["road_osmid"].astype(np.int64)
     roads = roads.drop_duplicates("road_osmid").reset_index(drop=True)
     roads["length_m"] = roads.geometry.length
-    midpoint = roads.geometry.interpolate(0.5, normalized=True).to_crs(4326)
-    _nm = roads["name"].fillna("").astype(str) if "name" in roads.columns else ""
-    _rf = roads["ref"].fillna("").astype(str) if "ref" in roads.columns else ""
-    _hw = roads["highway"].fillna("").astype(str) if "highway" in roads.columns else ""
-    sites = pd.DataFrame({
-        "road_osmid": roads["road_osmid"].to_numpy(),
-        "lat": midpoint.y.to_numpy(float),
-        "lon": midpoint.x.to_numpy(float),
-        "length_m": roads["length_m"].to_numpy(float),
-        "road_name": [
-            (n.strip() or r.strip() or f"unnamed {_h}".strip())
-            for n, r, _h in zip(
-                _nm if not isinstance(_nm, str) else [""] * len(roads),
-                _rf if not isinstance(_rf, str) else [""] * len(roads),
-                _hw if not isinstance(_hw, str) else [""] * len(roads))],
-    })
-    sites["obs_frac"] = np.minimum(
-        1.0, float(obs_m) / np.maximum(sites["length_m"].to_numpy(float), 1e-9))
-    score = pred.groupby("road_osmid")["pred_speeding"].sum()
-    sites = sites.merge(score.rename("pred_total"), on="road_osmid", how="inner")
-    # Rank candidates by *observable* speeding (what police can capture).
-    sites["pred_observable"] = sites["pred_total"] * sites["obs_frac"]
-    sites = sites.sort_values(["pred_observable", "road_osmid"],
-                              ascending=[False, True]).reset_index(drop=True)
+    _nm = roads["name"].fillna("").astype(str) \
+        if "name" in roads.columns else None
+    _rf = roads["ref"].fillna("").astype(str) \
+        if "ref" in roads.columns else None
+    _hw = roads["highway"].fillna("").astype(str) \
+        if "highway" in roads.columns else None
+
+    def _name_of(i):
+        n = str(_nm.iloc[i]) if _nm is not None else ""
+        r = str(_rf.iloc[i]) if _rf is not None else ""
+        h = str(_hw.iloc[i]) if _hw is not None else ""
+        return (n.strip() or r.strip() or f"unnamed {h}".strip())
+
+    _score = pred.groupby("road_osmid")["pred_speeding"].sum()
+    if float(chunk_m) > 0:
+        import math as _math
+        _pts, _rows = [], []
+        for i in range(len(roads)):
+            _L = float(roads["length_m"].iloc[i])
+            _n = int(max(1, _math.ceil(_L / float(chunk_m)))) \
+                if _L > 1e-9 else 1
+            _geom = roads.geometry.iloc[i]
+            for k in range(_n):
+                try:
+                    _pt = _geom.interpolate((k + 0.5) / _n, normalized=True)
+                except Exception:  # noqa: BLE001 - degenerate geometry
+                    _pt = _geom.centroid
+                _pts.append(_pt)
+                _rows.append((i, k + 1, _n, _L / _n, _L))
+        _mid = gpd.GeoSeries(_pts, crs=28356).to_crs(4326)
+        sites = pd.DataFrame({
+            "road_osmid": [int(roads["road_osmid"].iloc[r[0]]) for r in _rows],
+            "lat": _mid.y.to_numpy(float),
+            "lon": _mid.x.to_numpy(float),
+            "length_m": [float(r[3]) for r in _rows],
+            "seg_len_m": [float(r[4]) for r in _rows],
+            "chunk_k": [int(r[1]) for r in _rows],
+            "n_chunks": [int(r[2]) for r in _rows],
+            "road_name": [
+                (_name_of(r[0]) if r[2] == 1
+                 else f"{_name_of(r[0])} #{r[1]}/{r[2]}")
+                for r in _rows],
+        })
+        sites["obs_frac"] = np.minimum(
+            1.0, float(obs_m)
+            / np.maximum(sites["length_m"].to_numpy(float), 1e-9))
+        # Left join: EVERY OSM segment keeps a risk value (missing -> 0,
+        # still floored above zero downstream), so no part of the network
+        # is risk-less.
+        sites = sites.merge(_score.rename("pred_total"), on="road_osmid",
+                            how="left")
+        sites["pred_total"] = pd.to_numeric(
+            sites["pred_total"], errors="coerce").fillna(0.0)
+        # Uniform allocation of the way's predicted count by length share.
+        sites["pred_total"] = (
+            sites["pred_total"].to_numpy(float)
+            * sites["length_m"].to_numpy(float)
+            / np.maximum(sites["seg_len_m"].to_numpy(float), 1e-9))
+        sites["pred_observable"] = sites["pred_total"] * sites["obs_frac"]
+        _obs_len = np.minimum(sites["length_m"].to_numpy(float),
+                              float(obs_m))
+        sites["pred_rate_pm"] = (sites["pred_observable"].to_numpy(float)
+                                 / np.maximum(_obs_len, 1e-9))
+        if int(max_chunks_per_road) > 0:
+            sites = (sites.sort_values(
+                ["road_osmid", "pred_observable"],
+                ascending=[True, False])
+                .groupby("road_osmid", as_index=False)
+                .head(int(max_chunks_per_road)))
+        sites = sites.sort_values(
+            ["pred_observable", "road_osmid", "chunk_k"],
+            ascending=[False, True, True]).reset_index(drop=True)
+    else:
+        midpoint = roads.geometry.interpolate(0.5, normalized=True).to_crs(4326)
+        sites = pd.DataFrame({
+            "road_osmid": roads["road_osmid"].to_numpy(),
+            "lat": midpoint.y.to_numpy(float),
+            "lon": midpoint.x.to_numpy(float),
+            "length_m": roads["length_m"].to_numpy(float),
+            "road_name": [_name_of(i) for i in range(len(roads))],
+        })
+        sites["obs_frac"] = np.minimum(
+            1.0, float(obs_m)
+            / np.maximum(sites["length_m"].to_numpy(float), 1e-9))
+        sites = sites.merge(_score.rename("pred_total"), on="road_osmid",
+                            how="left")
+        sites["pred_total"] = pd.to_numeric(
+            sites["pred_total"], errors="coerce").fillna(0.0)
+        # Rank candidates by *observable* speeding (what police can capture).
+        sites["pred_observable"] = sites["pred_total"] * sites["obs_frac"]
+        # Per-metre observable rate, so every segment reads as intensity,
+        # not just mass (short hot segments vs long warm ones).
+        _obs_len = np.minimum(sites["length_m"].to_numpy(float),
+                              float(obs_m))
+        sites["pred_rate_pm"] = (sites["pred_observable"].to_numpy(float)
+                                 / np.maximum(_obs_len, 1e-9))
+        sites = sites.sort_values(["pred_observable", "road_osmid"],
+                                  ascending=[False, True]).reset_index(drop=True)
     if max_segments > 0 and len(sites) > max_segments:
         sites = sites.head(int(max_segments)).copy()
     sites = sites.reset_index(drop=True)
@@ -123,7 +213,8 @@ def load_segment_sites(pred, path, max_segments, obs_m=100.0):
 
 
 def build_plans(site_lat, site_lon, speed_mps=12.0, setup_min=5.0,
-                max_m=4000.0, detour_factor=1.3, max_per_site=1):
+                max_m=4000.0, detour_factor=1.3, max_per_site=1,
+                min_gap_bins=0):
     """Enumerate hold and relocation plans.
 
     max_per_site is the number of officers a single hold plan may host. The
@@ -132,6 +223,13 @@ def build_plans(site_lat, site_lon, speed_mps=12.0, setup_min=5.0,
     long, under-observed site, which is the only way that arm can express
     "more people on the hot street". Relocation plans always hold exactly
     one officer, so they are never scaled.
+
+    min_gap_bins is the FLOOR on bins lost to a relocation. Travel minutes
+    are rounded UP to whole bins (tau = ceil(minutes / 15)), because an
+    officer who is mid-drive when a bin starts is unavailable for that
+    whole bin, and the result is floored at min_gap_bins. The shipped run
+    uses min_gap_bins=1, so every relocation costs at least one 15-min
+    bin; a 5-8 km move costs two.
     """
     n = len(site_lat)
     tau = np.full((n, n), 999, dtype=int)
@@ -139,12 +237,19 @@ def build_plans(site_lat, site_lon, speed_mps=12.0, setup_min=5.0,
         dist = haversine_m(site_lat[i], site_lon[i], site_lat, site_lon)
         for j in range(n):
             if i == j:
-                tau[i, j] = 1
+                tau[i, j] = 0
                 continue
             road_dist = float(dist[j]) * float(detour_factor)
             if road_dist <= max_m:
-                minutes = setup_min + road_dist / 1000.0 / speed_mps * 60.0
-                tau[i, j] = max(2, int(np.ceil(minutes / 15.0)))
+                # metres / (m/s) = seconds; /60 = minutes. The old
+                # expression divided by 1000 and multiplied by 60, which
+                # mixed km with m/s and overstated every drive by 3.6x.
+                # ceil (not floor) because an officer who is mid-drive
+                # when a bin starts is unavailable for that whole bin.
+                minutes = (setup_min
+                           + road_dist / max(float(speed_mps), 1e-9) / 60.0)
+                tau[i, j] = max(int(min_gap_bins),
+                                int(np.ceil(minutes / 15.0)))
     plans = []
     for j in range(n):
         plans.append({"cells": [(j, t) for t in range(REL_BINS)],
@@ -167,6 +272,115 @@ def build_plans(site_lat, site_lon, speed_mps=12.0, setup_min=5.0,
         for cell in plan["cells"]:
             cover_by_cell.setdefault(cell, []).append(k)
     return plans, cover_by_cell, tau
+
+
+def auto_phase_bins(profile, n_bins=2, lo=3, hi=REL_BINS - 4, min_sep=5):
+    """Data-driven phase boundaries: relocate when expected load is lowest.
+
+    Picks n_bins boundary bins from [lo, hi) with pairwise separation of at
+    least min_sep bins, minimising the summed predicted load at the chosen
+    bins (a move costs least when few offences are expected in that slot).
+    Ties break toward later boundaries. Falls back to the shipped default
+    if no valid combination exists.
+    """
+    import itertools
+    prof = np.asarray(profile, dtype=float)
+    best = None
+    for combo in itertools.combinations(range(int(lo), int(hi)), int(n_bins)):
+        if any(combo[i + 1] - combo[i] < min_sep
+               for i in range(len(combo) - 1)):
+            continue
+        score = float(sum(prof[b] for b in combo))
+        key = (score, [-b for b in combo])
+        if best is None or key < best[0]:
+            best = (key, combo)
+    if best is None:
+        return [12, 20][:n_bins]
+    return list(best[1])
+
+
+def build_phase_plans(r, tau, phase_bins, phase_sites=20, max_per_site=1):
+    """Phase-sequence plans: one site per phase, moves at phase boundaries.
+
+    THE PROBLEM THIS SOLVES. build_plans() enumerates hold plans plus plans
+    with AT MOST ONE relocation, and the binary covering objective then makes
+    holding dominate on every fixture (observed: 0 relocations across all six
+    games of job 26441572, and 330/330 stationary plans over the whole
+    P=1..10 sweep). One move cannot express "work the pre-game arrival on
+    one corridor, kickoff congestion on another, then the post-game egress on
+    a third", which is what the predicted timing actually says (peak bins 6-7
+    for the 19:00 NRL games against 13-25 for the afternoon ones).
+
+    Plans here are one site per phase. Phase boundaries come from
+    --phase-bins (default 12,20 = kickoff and full-time), so with 3 phases an
+    officer can relocate TWICE. Each phase's candidate pool is the top
+    --phase-sites sites by that phase's predicted load, which keeps the plan
+    set at pool^phases instead of n_sites^phases. Consecutive phases may name
+    the same site (a stationary plan is a valid sequence), and a transition is
+    only kept when the travel/setup time fits inside the next phase.
+
+    cells are (site, bin) pairs actually staffed; bins spent travelling are
+    absent, exactly as in the single-move path.
+    """
+    bnd = sorted({int(b) for b in phase_bins if 0 < int(b) < REL_BINS})
+    if not bnd:
+        return None, None
+    phases, start = [], 0
+    for b in bnd:
+        phases.append((start, b))
+        start = b
+    phases.append((start, REL_BINS))
+    pools = []
+    for (s, e) in phases:
+        load = np.asarray(r)[:, s:e].sum(axis=1)
+        order = np.argsort(-load, kind="stable")
+        pool = [int(j) for j in order[:max(1, int(phase_sites))]
+                if load[j] > 0]
+        if not pool:
+            pool = [int(order[0])]
+        pools.append(pool)
+    # Combinatorial guard: pool^phases explodes with fine boundaries. Trim
+    # the largest pools until the full product fits the cap, so a 7-phase
+    # request cannot accidentally enumerate a billion plans.
+    _cap = 200000
+    while True:
+        est = 1
+        for p in pools:
+            est *= max(1, len(p))
+        if est <= _cap or all(len(p) <= 2 for p in pools):
+            break
+        big = max(range(len(pools)), key=lambda i: len(pools[i]))
+        pools[big] = pools[big][:-1]
+    plans = []
+    import itertools
+    for combo in itertools.product(*pools):
+        legs, cur, leg_start, n_moves, ok = [], combo[0], 0, 0, True
+        for k in range(1, len(combo)):
+            nxt = combo[k]
+            b = phases[k][0]
+            if nxt != cur:
+                arrival = b + int(tau[cur, nxt])
+                if arrival >= phases[k][1]:
+                    ok = False
+                    break
+                legs.append((cur, leg_start, b))
+                cur, leg_start, n_moves = nxt, arrival, n_moves + 1
+        if not ok:
+            continue
+        legs.append((cur, leg_start, phases[-1][1]))
+        cells = [(j, t) for (j, s, e) in legs for t in range(s, e)]
+        if not cells:
+            continue
+        plans.append({
+            "cells": cells, "move": n_moves > 0, "n_moves": n_moves,
+            "legs": legs, "a": legs[0][0], "b": legs[-1][0],
+            "t1": (legs[0][2] if n_moves else None),
+            "cap": (int(max(1, max_per_site)) if n_moves == 0 else 1)})
+    cover_by_cell = {}
+    for k, plan in enumerate(plans):
+        for cell in plan["cells"]:
+            cover_by_cell.setdefault(cell, []).append(k)
+    return plans, cover_by_cell
 
 
 def fixture_variation(surfaces, top_n=(5, 10, 20)):
@@ -255,6 +469,28 @@ def fixture_variation(surfaces, top_n=(5, 10, 20)):
         str(k): int(np.argmax(prof[k])) for k in keys}
     distinct_peaks = len(set(out["peak_rel_bin_per_fixture"].values()))
     out["timing_is_game_specific"] = bool(distinct_peaks > 1)
+    # Within-fixture, within-segment temporal variation: does a given
+    # segment's predicted risk actually move across the 28 bins? This is
+    # the quantity the relocation rule depends on, so it is reported, not
+    # left implied by the cross-fixture profile above.
+    _cvs = []
+    for _k, _m in mats.items():
+        _mu = _m.mean(axis=1)
+        _ok = _mu > 0
+        if not _ok.any():
+            continue
+        _cvs.append((_m.std(axis=1)[_ok] / np.maximum(_mu[_ok], 1e-12), _k))
+    if _cvs:
+        _pooled = np.concatenate([_cv for _cv, _ in _cvs])
+        out["within_seg_cv_mean"] = round(float(np.mean(_pooled)), 3)
+        out["within_seg_cv_median"] = round(float(np.median(_pooled)), 3)
+        out["within_seg_cv_p90"] = round(float(np.percentile(_pooled, 90)), 3)
+        out["pct_segments_cv_lt_0_10"] = round(
+            100 * float((_pooled < 0.10).mean()), 1)
+        out["pct_segments_cv_lt_0_01"] = round(
+            100 * float((_pooled < 0.01).mean()), 1)
+        out["within_seg_cv_by_fixture"] = {str(k): round(float(cv.mean()), 3)
+                                            for cv, k in _cvs}
     if out.get("same_argmax_for_all_fixtures"):
         out["interpretation"] = (
             "the same streets win every fixture, so WHERE to post is not a "
@@ -263,7 +499,19 @@ def fixture_variation(surfaces, top_n=(5, 10, 20)):
     return out
 
 
-def solve_mclp(r, plans, cover_by_cell, squad):
+def solve_mclp(r, plans, cover_by_cell, squad, phase_targets=None,
+               time_limit=60.0, info=None):
+    """Binary maximal covering over plans.
+
+    phase_targets, when given, is a list of (phase_cells, frac): each adds
+        sum_{(j,t) in phase} r_jt * c_jt >= frac * sum_{(j,t) in phase} r_jt
+    i.e. a TIMING TARGET -- the solution must cover at least `frac` of each
+    phase's predicted load, which is what makes WHEN a decision rather than a
+    by-product. Targets can be infeasible at small squads; on infeasibility
+    the solve falls back to the untargeted MIP for that P and records it in
+    `info` so the run reports the fallback instead of silently ignoring the
+    flag.
+    """
     cells = [(j, t) for j in range(r.shape[0]) for t in range(r.shape[1])
              if r[j, t] > 0]
     if not cells:
@@ -286,15 +534,50 @@ def solve_mclp(r, plans, cover_by_cell, squad):
         lower.append(lo)
         upper.append(hi)
         n_rows += 1
+    # Constraint 1: Cell coverage: c_jt = 1 if any selected plan covers cell (j,t)
     for cell, n in cell_index.items():
         ks = cover_by_cell.get(cell, [])
         add_row([(n_plans + n, 1.0)] + [(k, -1.0) for k in ks],
                 -np.inf, 0.0)
+    # Constraint 2: At most one officer per cell (segment × time bin)
+    for cell, n in cell_index.items():
+        ks = cover_by_cell.get(cell, [])
+        if len(ks) > 1:
+            add_row([(k, 1.0) for k in ks], 0.0, 1.0)
+    # Squad size constraint
     add_row([(k, 1.0) for k in range(n_plans)], 0.0, float(squad))
-    matrix = csr_matrix((vals, (rows, cols)), shape=(n_rows, n_total))
-    result = milp(c=cost, constraints=LinearConstraint(matrix, lower, upper),
-                  integrality=np.ones(n_total), bounds=Bounds(0, 1),
-                  options={"time_limit": 60.0, "mip_rel_gap": 1e-4})
+    if phase_targets:
+        for phase_cells, frac in phase_targets:
+            entries = [(n_plans + cell_index[cell], float(r[cell]))
+                       for cell in phase_cells if cell in cell_index]
+            phase_total = float(sum(r[cell] for cell in phase_cells))
+            if entries and phase_total > 0 and frac > 0:
+                add_row(entries, float(frac) * phase_total, np.inf)
+
+    def _solve(mat_rows):
+        matrix = csr_matrix((vals, (rows, cols)),
+                            shape=(mat_rows, n_total))
+        return milp(c=cost,
+                    constraints=LinearConstraint(matrix, lower, upper),
+                    integrality=np.ones(n_total), bounds=Bounds(0, 1),
+                    options={"time_limit": float(time_limit),
+                             "mip_rel_gap": 1e-4})
+
+    result = _solve(n_rows)
+    if result.x is None and phase_targets:
+        # Infeasible timing targets at this P: rebuild without the phase rows
+        # and re-solve, recording the fallback. Returning an empty solution
+        # would corrupt the whole sweep curve.
+        if info is not None:
+            info["phase_targets_fallback"] = True
+        rows, cols, vals, lower, upper = [], [], [], [], []
+        n_rows = 0
+        for cell, n in cell_index.items():
+            ks = cover_by_cell.get(cell, [])
+            add_row([(n_plans + n, 1.0)] + [(k, -1.0) for k in ks],
+                    -np.inf, 0.0)
+        add_row([(k, 1.0) for k in range(n_plans)], 0.0, float(squad))
+        result = _solve(n_rows)
     if result.x is None:
         return [], 0.0
     chosen = np.round(result.x).astype(int)
@@ -412,11 +695,11 @@ def mobility_ab(r_scaled, r_raw, obs_frac, plans, cover_by_cell, squad,
     for tag, sel, cov in (("binary", sel_b, cov_b),
                           ("fractional", sel_f, cov_f)):
         if tag == "binary":
-            relocs = sum(plans[k]["move"] for k in sel)
+            relocs = sum(_plan_moves(plans[k]) for k in sel)
             n_off = len(sel)
         else:
             # sel_f is [(plan_index, n_officers)]
-            relocs = sum(n for k, n in sel if plans[k]["move"])
+            relocs = sum(n * _plan_moves(plans[k]) for k, n in sel)
             n_off = sum(n for _k, n in sel)
         out[f"{tag}_relocations"] = int(relocs)
         out[f"{tag}_covered"] = round(float(cov), 3)
@@ -461,22 +744,33 @@ def prune_plans(plans, r, max_moves):
     return new_plans, new_cover
 
 
-def solve_sweep(r, plans, cover_by_cell, pmax):
+def solve_sweep(r, plans, cover_by_cell, pmax, phase_targets=None, info=None):
     """Solve the covering MIP for every squad size 1..pmax.
 
     One MILP per P (<=60s each); the headline min-marg rule and the
     requested per-P plans are both derived from this single sweep so no
-    squad size is ever solved twice.
+    squad size is ever solved twice. phase_targets (see solve_mclp) apply to
+    every P; when they are infeasible at a small P the solve falls back and
+    records it in info.
     """
     sols, curve, previous = {}, [], 0.0
     for squad in range(1, int(pmax) + 1):
-        selected, covered = solve_mclp(r, plans, cover_by_cell, squad)
+        selected, covered = solve_mclp(r, plans, cover_by_cell, squad,
+                                       phase_targets=phase_targets,
+                                       info=info)
         marginal = covered - previous
         curve.append({"squad": squad, "covered": covered,
                       "marginal": marginal})
         sols[squad] = (selected, covered)
         previous = covered
     return sols, curve
+
+
+def _plan_moves(plan):
+    """Relocations in a plan, for both the legacy and phase-plan shapes."""
+    if "n_moves" in plan:
+        return int(plan["n_moves"])
+    return 1 if plan.get("move") else 0
 
 
 def select_squad(curve, min_marg, min_marg_frac, penetration=0.05):
@@ -551,9 +845,31 @@ def draw_selected_heatmap(ax, fx, r_all, chosen, labels, sites, tau,
     if chosen is None or len(chosen) == 0:
         ax.axis("off")
         return None
+    def _parse_legs(prow):
+        """[(site_label, start, end)] for both plan shapes."""
+        raw = str(prow.get("legs", "") or "")
+        if raw:
+            out = []
+            for tok in raw.split("|"):
+                try:
+                    site, rng = tok.rsplit(":", 1)
+                    s, e = rng.split("-")
+                    out.append((site, int(s), int(e)))
+                except Exception:  # noqa: BLE001
+                    continue
+            if out:
+                return out
+        a = str(prow["from_site"])
+        if not bool(prow.get("move", False)):
+            return [(a, 0, rel_bins)]
+        b = str(prow["to_site"])
+        t1 = int(prow["move_bin"])
+        arr = int(prow["arrival_bin"]) if prow["arrival_bin"] != "" else t1
+        return [(a, 0, t1), (b, arr, rel_bins)]
+
     used = []
     for _, prow in chosen.iterrows():
-        for lbl in (str(prow["from_site"]), str(prow["to_site"])):
+        for (lbl, _s, _e) in _parse_legs(prow):
             if lbl in labels and labels.index(lbl) not in used:
                 used.append(labels.index(lbl))
     if not used:
@@ -566,23 +882,40 @@ def draw_selected_heatmap(ax, fx, r_all, chosen, labels, sites, tau,
               interpolation="nearest")
     row_of = {j: n for n, j in enumerate(used)}
     ko = KICKOFF_BIN
+    import matplotlib.patches as _mp
     for officer, (_, prow) in enumerate(chosen.iterrows()):
         color = officer_colors[officer % len(officer_colors)]
-        a = row_of[labels.index(str(prow["from_site"]))]
-        moving = bool(prow.get("move", False))
-        if not moving:
-            ax.axhline(a, color=color, lw=1.7, alpha=0.95)
-        else:
-            b = row_of[labels.index(str(prow["to_site"]))]
-            t1 = int(prow["move_bin"])
-            arr = int(prow["arrival_bin"]) if prow["arrival_bin"] != "" \
-                else t1
-            ax.plot([0, t1], [a, a], color=color, lw=1.7)
-            ax.plot([t1, rel_bins - 1], [b, b], color=color, lw=1.7)
-            ax.plot([t1, max(arr, t1 + 1)], [a, b], color=color, lw=1.0,
-                    ls=":", alpha=0.85)
-        ax.text(rel_bins - 0.4, a, f" {officer + 1}", va="center", ha="right",
-                fontsize=7.5, color=color)
+        legs = _parse_legs(prow)
+        for (lbl, s, e) in legs:
+            if lbl not in labels:
+                continue
+            a = row_of[labels.index(lbl)]
+            # BLOCK: white-edged rectangle around the staffed leg.
+            ax.add_patch(_mp.Rectangle(
+                (s - 0.5, a - 0.5), max(e - s, 1), 1.0,
+                facecolor="none", edgecolor="white", lw=1.4, zorder=5))
+            ax.plot([s, max(e - 1, s)], [a, a], color=color, lw=1.7, zorder=6)
+        # DOT: officer number where they start each leg.
+        for (lbl, s, e) in legs:
+            if lbl not in labels:
+                continue
+            a = row_of[labels.index(lbl)]
+            ax.plot([s], [a], "o", color=color, ms=6, mec="white",
+                    mew=1.0, zorder=7)
+        if legs and legs[0][0] in labels:
+            a = row_of[labels.index(legs[0][0])]
+            ax.text(rel_bins - 0.4, a, f" {officer + 1}", va="center",
+                    ha="right", fontsize=7.5, color=color)
+        # ARROWS: red relocation arrows between legs.
+        for (l1, l2) in zip(legs[:-1], legs[1:]):
+            if l1[0] not in labels or l2[0] not in labels:
+                continue
+            a = row_of[labels.index(l1[0])]
+            b = row_of[labels.index(l2[0])]
+            ax.annotate("", xy=(max(l2[1], l1[2] + 1), b), xytext=(l1[2], a),
+                        arrowprops=dict(arrowstyle="->", color="red",
+                                        lw=1.6, shrinkA=2, shrinkB=2),
+                        zorder=7)
     ax.set_yticks(range(len(used)))
     ax.set_yticklabels(
         [f"{labels[j]}  {str(sites.iloc[j].get('road_name', ''))[:26]}"
@@ -624,11 +957,17 @@ def parse_squads(text, pmax):
 
 
 def solution_rows(fx, squad, selected, covered, total, plans_fx, sites,
-                    labels, tau, penetration):
+                    labels, tau, penetration, net_total=None):
     """Site/plan/schedule dicts for one (fixture, squad) solution."""
-    moves = sum(plans_fx[k]["move"] for k in selected)
-    used_sites = sorted({plans_fx[k]["a"] for k in selected}
-                        | {plans_fx[k]["b"] for k in selected})
+    moves = sum(_plan_moves(plans_fx[k]) for k in selected)
+    _used = set()
+    for k in selected:
+        p = plans_fx[k]
+        if p.get("legs"):
+            _used.update(int(j) for (j, _s, _e) in p["legs"])
+        else:
+            _used.update({p["a"], p["b"]})
+    used_sites = sorted(_used)
     coverage = covered / total if total > 0 else 0.0
     site_row = {
         "fixture": fx, "squad": squad, "relocations": int(moves),
@@ -643,25 +982,54 @@ def solution_rows(fx, squad, selected, covered, total, plans_fx, sites,
             for j in used_sites),
         "obs_frac": "|".join(f"{float(sites.iloc[j]['obs_frac']):.2f}"
                              for j in used_sites),
+        # Candidate unit length in metres (chunk length when --chunk-m is
+        # on): makes the length-bias check auditable straight from the CSV.
+        "length_m": "|".join(f"{float(sites.iloc[j]['length_m']):.0f}"
+                             for j in used_sites),
         "pred_events_sample": round(total, 3),
-        "pred_events_network": round(total / max(penetration, 1e-9), 1),
+        # True full-network predicted mass for this fixture (all segments,
+        # computed before the candidate shortlist), not a 1/penetration
+        # extrapolation. Falls back to the old scaling only if the
+        # full-network totals were unavailable.
+        "pred_events_network": round(
+            float(net_total) if net_total else
+            total / max(penetration, 1e-9), 1),
         "covered_sample": round(covered, 3),
-        "coverage": round(coverage, 4)}
+        # Candidate-share coverage (the headline) and network-share
+        # coverage (what fraction of ALL predicted speeding is covered),
+        # reported side by side so the denominator is never ambiguous.
+        "coverage": round(coverage, 4),
+        "coverage_network": (
+            round(covered / float(net_total), 4)
+            if net_total and net_total > 0 else None)}
     plan_rows, schedule_rows = [], []
     for officer, k in enumerate(selected):
         plan = plans_fx[k]
+        # Legs for both plan shapes: phase plans carry them; the legacy
+        # single-move shape is expanded to the same structure so the figure,
+        # the CSV and the schedule all read one representation.
+        if plan.get("legs"):
+            legs = list(plan["legs"])
+        elif plan.get("move"):
+            _arr = int(plan["t1"]) + int(tau[plan["a"], plan["b"]])
+            legs = [(plan["a"], 0, int(plan["t1"])),
+                    (plan["b"], _arr, REL_BINS)]
+        else:
+            legs = [(plan["a"], 0, REL_BINS)]
+        _nm = _plan_moves(plan)
         plan_rows.append({
             "fixture": fx, "squad": squad, "officer": officer + 1,
-            "from_site": labels[plan["a"]],
-            "to_site": labels[plan["b"]],
-            "from_road_osmid": int(sites.iloc[plan["a"]]["road_osmid"]),
-            "to_road_osmid": int(sites.iloc[plan["b"]]["road_osmid"]),
-            "from_road_name": str(sites.iloc[plan["a"]].get("road_name", "")),
-            "to_road_name": str(sites.iloc[plan["b"]].get("road_name", "")),
-            "move": bool(plan["move"]),
-            "move_bin": plan["t1"] if plan["move"] else "",
-            "arrival_bin": (plan["t1"] + int(tau[plan["a"], plan["b"]])
-                            if plan["move"] else ""),
+            "from_site": labels[legs[0][0]],
+            "to_site": labels[legs[-1][0]],
+            "from_road_osmid": int(sites.iloc[legs[0][0]]["road_osmid"]),
+            "to_road_osmid": int(sites.iloc[legs[-1][0]]["road_osmid"]),
+            "from_road_name": str(sites.iloc[legs[0][0]].get("road_name", "")),
+            "to_road_name": str(sites.iloc[legs[-1][0]].get("road_name", "")),
+            "move": bool(_nm > 0),
+            "n_moves": int(_nm),
+            "move_bin": (legs[0][2] if _nm else ""),
+            "arrival_bin": (legs[1][1] if len(legs) > 1 else ""),
+            "legs": "|".join(f"{labels[j]}:{s}-{e}" for (j, s, e) in legs),
             "cells": len(plan["cells"])})
         occupied = {(int(j), int(t)) for j, t in plan["cells"]}
         for rel_bin in range(REL_BINS):
@@ -682,10 +1050,57 @@ def solution_rows(fx, squad, selected, covered, total, plans_fx, sites,
     return site_row, plan_rows, schedule_rows
 
 
+def run_rollout_horizon(fixture, r, plans_fx, cover_fx, squad, sites, labels,
+                        tau, penetration, offsets, time_limit, net_total=None):
+    """ONE-OFF rolling-horizon probe on the REMAINING horizon.
+
+    This is NOT a full Bellman DP: it is the honest, cheap arm that answers
+    "does re-solving the MIP on a shortened horizon change the plan?".
+    For each requested offset `t` it zeroes the already-elapsed bins, then
+    re-solves the SAME covering MIP on the remaining bins at the same squad
+    size. Because the plan set and travel times are unchanged, this is a
+    pure horizon-shift, NOT a re-fit. Use it to see whether horizon length
+    alone changes WHERE to post. It does not claim to use up-to-the-minute
+    innovation; for that you need an online policy, not a static MIP.
+
+    Returns one dict per (fixture, offset); `plan_rows` is deliberately
+    NOT emitted into the baseline tables (the rollout rows are a separate
+    arm and should not look like a different full-horizon plan).
+    """
+    out = []
+    for off in offsets:
+        if not 0 <= int(off) < REL_BINS:
+            raise SystemExit(f"rollout offset {off} outside 0..{REL_BINS - 1}")
+        horizon = int(off)
+        r_roll = r.copy()
+        r_roll[:, :horizon] = 0.0
+        selected, covered = solve_mclp(r_roll, plans_fx, cover_fx, squad,
+                                       time_limit=float(time_limit))
+        if not selected:
+            continue
+        total = float(r_roll.sum())
+        site_row, _prows, _srows = solution_rows(
+            fixture, squad, selected, covered, total, plans_fx, sites,
+            labels, tau, penetration, net_total=net_total)
+        out.append({
+            "fixture": fixture, "step_bin": horizon, "squad": squad,
+            "n_sites": site_row["n_sites"], "sites": site_row["sites"],
+            "segment_osmids": site_row["segment_osmids"],
+            "coverage": site_row["coverage"]})
+    return out
+
+
 def main():
     global OFFICER_COLORS
     ap = argparse.ArgumentParser()
     ap.add_argument("--pred", default=str(PRED))
+    ap.add_argument("--pred-col", default="pred_speeding",
+                    help="parquet column consumed as the predicted speeding "
+                         "surface (e.g. pred_sd_game for the structural "
+                         "SD-twin surface; pred_speeding_calsd only exists "
+                         "when 59 ran with --sd-lift-cal-apply). Must be "
+                         "per-row counts in the same units; the run is "
+                         "tagged with the column used.")
     ap.add_argument("--min-marg", type=float, default=0.0,
                     help="secondary stop rule in ABSOLUTE predicted speeding "
                          "events on the network scale (the sample marginal is "
@@ -698,6 +1113,24 @@ def main():
     ap.add_argument("--obs-m", type=float, default=100.0,
                     help="metres of road one officer can observe; a segment "
                          "contributes min(1, obs-m / length-m) of its speeding")
+    ap.add_argument("--chunk-m", type=float, default=0.0, dest="chunk_m",
+                    help="split every OSM way into EQUAL-length chunks of "
+                         "~chunk-m metres and make each chunk a separate "
+                         "candidate site (0 = off, one midpoint per way). "
+                         "OSM way length is arbitrary, so without chunking a "
+                         "1.5 km way and a 60 m stub compete as single units, "
+                         "one officer can never be posted twice on a long "
+                         "road, and the way's midpoint can sit on a cold "
+                         "stretch of a hot road. Chunk scoring: the way's "
+                         "predicted count is split by chunk length share "
+                         "(uniform-intensity allocation; no sub-segment data "
+                         "exists) and observed at min(1, obs-m / chunk-m)")
+    ap.add_argument("--max-chunks-per-road", type=int, default=3,
+                    dest="max_chunks_per_road",
+                    help="cap on how many chunks of one road may enter the "
+                         "candidate pool, so a single long road cannot "
+                         "monopolise the shortlist (chunking only; <=0 = no "
+                         "cap)")
     ap.add_argument("--max-squad", type=int, default=0,
                     help="largest squad size the sweep may consider "
                          "(0 = PMAX = 10). This used to be a bare module "
@@ -741,6 +1174,42 @@ def main():
                     help="cap move plans per fixture by standalone value "
                          "(0 = keep all; full set is ~O(n^2) and blows the "
                          "MILP budget)")
+    ap.add_argument("--max-relocations", type=int, default=1,
+                    help="relocations an officer may make. 1 = the legacy "
+                         "hold-or-one-move plans. >=2 switches to PHASE plans "
+                         "(--phase-bins), one site per phase, so an officer "
+                         "can work pre-game on one corridor, kickoff on "
+                         "another and post-game on a third. Movement needs "
+                         "the objective to value WHEN, so pair with "
+                         "--phase-target-frac")
+    ap.add_argument("--phase-bins", default="12,20",
+                    help="phase boundaries in rel_bins; default 12 (kickoff) "
+                         "and 20 (~full-time). N boundaries give N+1 phases "
+                         "and up to N relocations per officer")
+    ap.add_argument("--phase-sites", type=int, default=20,
+                    help="candidate sites per phase for phase plans (plan set "
+                         "= pool^(n_phases); 20^3 = 8000 before pruning)")
+    ap.add_argument("--phase-target-frac", type=float, default=0.0,
+                    help="TIMING TARGET: require coverage of at least this "
+                         "fraction of EACH phase's predicted load "
+                         "(0 = off). This is what forces the plan to be "
+                         "time-aware; infeasible at small squads, where the "
+                         "solve falls back and records it")
+    ap.add_argument("--min-moves-per-officer", type=int, default=0,
+                    help="FORCE movement: only plans with at least this many "
+                         "relocations are eligible, so every officer's plan "
+                         "moves. 0 = movement allowed but not forced (the "
+                         "honest default: on the current surface the solver "
+                         "prefers stationary plans). Use with --max-relocations"
+                         " >= 2 to show multi-relocation plans and their "
+                         "coverage cost")
+    ap.add_argument("--min-move-gap-bins", type=int, default=0,
+                    help="bins lost to a relocation (floor). 0 (default) means "
+                         "travel that fits inside a 15-min bin costs NOTHING, "
+                         "so an officer can move directly into the next window "
+                         "when the destination is close; only whole bins of "
+                         "travel beyond the first are charged. Set 1 or 2 to "
+                         "reserve a full bin or more per move")
     ap.add_argument("--travel-speed-kmh", type=float, default=43.2,
                     help="police moving speed used for relocation feasibility")
     ap.add_argument("--detour-factor", type=float, default=1.3,
@@ -752,8 +1221,24 @@ def main():
     ap.add_argument("--limit-games", type=int, default=0)
     ap.add_argument("--pilot", action="store_true")
     ap.add_argument("--allow-concentrated", action="store_true",
-                    help="run the MIP even when one segment holds >50% of "
+                    help="run the MIP even when one segment holds >50%% of "
                          "predicted speeding (degenerate coverage)")
+    ap.add_argument("--min-separation-m", type=float, default=0.0,
+                    help="physical-distance placement: drop candidates within "
+                         "this many metres of a higher-load kept site "
+                         "(greedy, P4-style; 0 = off)")
+    ap.add_argument("--rollout", action="store_true",
+                    help="re-solve the covering MIP on the REMAINING horizon "
+                         "at the selected squad size. This is a horizon-shift "
+                         "probe, not an online refit. Use it to see whether "
+                         "the plan would change if the MIP were re-solved "
+                         "mid-event")
+    ap.add_argument("--rollout-offsets", default="14,20",
+                    help="comma-separated bin offsets at which to re-resolve "
+                         "(0-indexed; kickoff is bin 12). Default 14,20 = "
+                         "1 and 5 hours after kickoff")
+    ap.add_argument("--rollout-time-limit", type=float, default=30.0,
+                    help="per-step MILP time limit for the rollout")
     ap.add_argument("--out-dir", default=str(RES))
     ap.add_argument("--fig-dir", default=str(FIG))
     args = ap.parse_args()
@@ -771,6 +1256,36 @@ def main():
     pred["road_osmid"] = pd.to_numeric(pred["road_osmid"], errors="coerce")
     pred = pred.dropna(subset=["road_osmid"]).copy()
     pred["road_osmid"] = pred["road_osmid"].astype(np.int64)
+    _pcol = str(getattr(args, "pred_col", "pred_speeding") or "pred_speeding")
+    if _pcol != "pred_speeding":
+        if _pcol not in pred.columns:
+            raise SystemExit(f"FATAL: --pred-col {_pcol} not in {args.pred} "
+                             f"(have: {sorted(pred.columns)[:8]}...)")
+        pred["pred_speeding"] = pd.to_numeric(
+            pred[_pcol], errors="coerce").fillna(0.0).clip(lower=0.0)
+        print(f"   surface column: {_pcol} remapped onto pred_speeding")
+    else:
+        print("   surface column: pred_speeding (default)")
+    # Full-network day totals, computed BEFORE pred is filtered to candidate
+    # sites below: every predicted segment x fixture cell contributes, so
+    # the map and risk-dist figures show the whole network, not the
+    # shortlist. (Computing this after the site dropna silently reduces the
+    # "full network" to the candidate set.)
+    _full_tot_all = {}
+    try:
+        _gta = (pred.groupby(["fixture", "road_osmid"])["pred_speeding"]
+                .sum())
+        for _fx0 in pred["fixture"].unique():
+            try:
+                _full_tot_all[_fx0] = _gta.xs(_fx0, level="fixture").to_dict()
+            except KeyError:
+                _full_tot_all[_fx0] = {}
+        del _gta
+        print(f"   full-network totals: {len(_full_tot_all)} fixtures, "
+              f"{sum(len(v) for v in _full_tot_all.values())} segment totals")
+    except Exception as exc:  # noqa: BLE001
+        print(f"   WARN: full-network totals failed ({exc})")
+        _full_tot_all = {}
     _ct = pred.groupby("road_osmid")["pred_speeding"].sum().sort_values(ascending=False)
     _top1 = float(_ct.iloc[0] / max(_ct.sum(), 1e-12))
     print(f"   concentration: top segment {int(_ct.index[0])} holds "
@@ -781,15 +1296,84 @@ def main():
             "coverage would be degenerate (one site ~= all coverage). Refit the "
             "search model with winsorized geometry (59) or pass --allow-concentrated")
     sites = load_segment_sites(pred, GEOJSON, int(args.max_segments),
-                               obs_m=float(args.obs_m))
+                               obs_m=float(args.obs_m),
+                               chunk_m=float(getattr(args, "chunk_m", 0.0)),
+                               max_chunks_per_road=int(getattr(
+                                   args, "max_chunks_per_road", 3)))
     if len(sites) < 2:
         raise SystemExit("need at least two predicted segment candidates")
+    if float(getattr(args, "min_separation_m", 0.0) or 0.0) > 0:
+        # Physical-distance placement: greedy thin by observable load so no
+        # two candidates sit closer than min-separation (P4-style, but on
+        # segments). Highest-load site kept first.
+        _min_sep = float(args.min_separation_m)
+        _order = sites.sort_values(
+            ["pred_observable", "road_osmid"],
+            ascending=[False, True]).index.tolist()
+        _kept, _dropped = [], 0
+        _flat, _flon = sites["lat"].to_numpy(float), sites["lon"].to_numpy(float)
+        for _j in _order:
+            if all(haversine_m(_flat[_j], _flon[_j], _flat[_k], _flon[_k])
+                   >= _min_sep for _k in _kept):
+                _kept.append(_j)
+            else:
+                _dropped += 1
+        sites = sites.loc[sorted(_kept)].reset_index(drop=True)
+        sites["site_label"] = [f"S{i + 1}" for i in range(len(sites))]
+        print(f"   separation: kept {len(sites)} sites "
+              f"(dropped {_dropped} within {_min_sep:.0f} m)")
+        if len(sites) < 2:
+            raise SystemExit("min-separation left fewer than two candidates; "
+                             "lower --min-separation-m")
+    # Potential sites must always exceed any squad size: the MIP chooses
+    # P officers' posts out of a strictly larger pool.
+    if len(sites) <= int(PMAX):
+        raise SystemExit(
+            f"only {len(sites)} candidate sites for squads up to {PMAX}; "
+            "raise --max-segments or lower --min-separation-m")
     site_lat = sites["lat"].to_numpy(float)
     site_lon = sites["lon"].to_numpy(float)
     labels = sites["site_label"].tolist()
-    seg_map = dict(zip(sites["road_osmid"], sites.index))
-    pred["site"] = pred["road_osmid"].map(seg_map)
-    pred = pred.dropna(subset=["site"]).copy()
+    # Share of full-network predicted speeding that lies on the candidate
+    # shortlist. Everything else is on a segment with no post and can never
+    # be covered, so coverage is a share of the network risk that is within
+    # reach of the shortlist -- not of total network risk. Computed before
+    # pred is filtered to candidate rows just below.
+    try:
+        _cand_ids = set(int(v) for v in sites["road_osmid"].unique())
+        _net_mass = float(pred["pred_speeding"].sum())
+        _cand_mass = float(
+            pred.loc[pred["road_osmid"].isin(_cand_ids),
+                     "pred_speeding"].sum())
+        _cand_share = _cand_mass / max(_net_mass, 1e-12)
+        print(f"   candidate shortlist holds {_cand_share:.1%} of network "
+              f"predicted speeding ({len(_cand_ids)} of "
+              f"{pred['road_osmid'].nunique()} segments)")
+    except Exception as exc:  # noqa: BLE001
+        _cand_share = float("nan")
+        print(f"   WARN: candidate-share computation failed ({exc})")
+    if "seg_len_m" in sites.columns:
+        # Chunked candidates: one way maps to MANY sites, so the plain
+        # osmid -> index map would collapse every chunk of a road onto a
+        # single row and lose the rest. Expand each (fixture, osmid, bin)
+        # row to its chunks and split the count by length share, exactly as
+        # load_segment_sites allocates the totals.
+        _sec = sites[["road_osmid", "seg_len_m", "length_m"]].copy()
+        _sec["site"] = sites.index.to_numpy()
+        pred = pred.merge(_sec, on="road_osmid", how="inner")
+        pred["pred_speeding"] = (
+            pred["pred_speeding"].to_numpy(float)
+            * pred["length_m"].to_numpy(float)
+            / np.maximum(pred["seg_len_m"].to_numpy(float), 1e-9))
+        pred = pred.drop(columns=["length_m", "seg_len_m"])
+        print(f"   chunked candidates: {len(sites)} chunks from "
+              f"{int(sites['road_osmid'].nunique())} roads "
+              f"(chunk target {float(args.chunk_m):.0f} m, "
+              f"cap {int(args.max_chunks_per_road)}/road)")
+    else:
+        seg_map = dict(zip(sites["road_osmid"], sites.index))
+        pred["site"] = pred["road_osmid"].map(seg_map)
+        pred = pred.dropna(subset=["site"]).copy()
     pred["site"] = pred["site"].astype(int)
 
     plans, cover_by_cell, tau = build_plans(
@@ -797,9 +1381,27 @@ def main():
         speed_mps=float(args.travel_speed_kmh) / 3.6,
         setup_min=float(args.setup_min), max_m=float(args.max_travel_m),
         detour_factor=float(args.detour_factor),
-        max_per_site=int(args.max_officers_per_site))
+        max_per_site=int(args.max_officers_per_site),
+        min_gap_bins=int(args.min_move_gap_bins))
     print(f"   {len(sites)} sites, {len(plans)} plans "
           f"({len(plans) - len(sites)} single-move)")
+    _auto_phase = str(args.phase_bins).strip().lower().startswith("auto")
+    phase_bins = [] if _auto_phase else [
+        int(tok) for tok in str(args.phase_bins).split(",")
+        if tok.strip().isdigit()]
+    phase_bins = [b for b in sorted(set(phase_bins)) if 0 < b < REL_BINS]
+    use_phase = int(args.max_relocations) >= 2 and (
+        _auto_phase or bool(phase_bins))
+    phase_bins_by_fx = {}
+    if use_phase:
+        _shown = "AUTO per fixture" if _auto_phase else phase_bins
+        _nrel = 2 if _auto_phase else len(phase_bins)
+        print(f"   phase plans: boundaries {_shown}, up to "
+              f"{_nrel} relocation(s)/officer, "
+              f"pool {args.phase_sites} sites/phase, target frac "
+              f"{args.phase_target_frac:g}")
+    else:
+        print("   single-move plans (--max-relocations 1)")
 
     fixtures = list(pred["fixture"].unique())
     if args.limit_games:
@@ -814,6 +1416,15 @@ def main():
           f"(1 MILP per P per game, ceiling P={pmax})")
     site_rows, plan_rows, schedule_rows, curves = [], [], [], {}
     mobility_rows = []
+    rollout_rows = []
+    if args.rollout:
+        rollout_offsets = []
+        for tok in str(args.rollout_offsets).split(","):
+            tok = tok.strip()
+            if tok.isdigit():
+                rollout_offsets.append(int(tok))
+        if not rollout_offsets:
+            raise SystemExit("FATAL: --rollout-offsets parsed empty")
     perP_site_rows, perP_plan_rows, perP_sched_rows, curve_rows = [], [], [], []
     surfaces, raws = {}, {}
     for fx in fixtures:
@@ -828,14 +1439,78 @@ def main():
                           fill_value=0.0).to_numpy(float))
         # Observation constraint: scale each site's speeding by the
         # fraction one officer can actually see (f_j <= 1).
-        obs_frac = sites["obs_frac"].to_numpy(float)
-        r = r_raw * obs_frac[:, None]
+        r = r_raw * sites["obs_frac"].to_numpy(float)[:, None]
+        # Rate floor: every segment-bin keeps a tiny nonzero value so no
+        # segment is exactly worthless to the solver (and heatmaps stay
+        # informative); the floor is 1e-9 of the fixture total.
+        _floor = float(r.sum()) * 1e-9 / max(r.size, 1)
+        if _floor > 0:
+            r = np.maximum(r, _floor)
         surfaces[fx] = r
         raws[fx] = r_raw
-        plans_fx, cover_fx = prune_plans(plans, r, args.max_move_plans)
-        sols, curve = solve_sweep(r, plans_fx, cover_fx, pmax)
+        phase_bins_fx = phase_bins
+        if use_phase:
+            if _auto_phase:
+                phase_bins_fx = auto_phase_bins(r_raw.sum(axis=0))
+                phase_bins_by_fx[fx] = phase_bins_fx
+            _pp, _pc = build_phase_plans(
+                r, tau, phase_bins_fx, phase_sites=int(args.phase_sites),
+                max_per_site=int(args.max_officers_per_site))
+            if _pp is None:
+                raise SystemExit("phase plan generation returned no plans; "
+                                 "check --phase-bins")
+            # The phase pools only name the top sites per phase, so on their
+            # own they would REMOVE every other candidate site from the MIP
+            # (observed: coverage stalled at 8.5% and squad selection died at
+            # P=4). Always keep the legacy stationary plans -- every candidate
+            # site stays available as a hold option -- and let the phase plans
+            # add the movement capability on top.
+            _stationary = [p for p in plans if not p.get("move")]
+            plans_fx = _stationary + _pp
+            cover_fx = {}
+            for _k, _p in enumerate(plans_fx):
+                for _c in _p["cells"]:
+                    cover_fx.setdefault(_c, []).append(_k)
+            plans_fx, cover_fx = prune_plans(
+                plans_fx, r, args.max_move_plans)
+            if fx == fixtures[0]:
+                _n_multi = sum(1 for p in plans_fx if _plan_moves(p) > 1)
+                print(f"   plan set: {len(plans_fx)} plans "
+                      f"({len(_stationary)} stationary + moves; "
+                      f"{_n_multi} with >=2 relocations)")
+        else:
+            plans_fx, cover_fx = prune_plans(plans, r, args.max_move_plans)
+        _min_mv = int(getattr(args, "min_moves_per_officer", 0) or 0)
+        if _min_mv > 0:
+            _before = len(plans_fx)
+            plans_fx = [p for p in plans_fx if _plan_moves(p) >= _min_mv]
+            if not plans_fx:
+                raise SystemExit(
+                    f"no plan has >= {_min_mv} relocations; raise "
+                    "--phase-sites/--max-move-plans or lower the minimum")
+            cover_fx = {}
+            for _k, _p in enumerate(plans_fx):
+                for _c in _p["cells"]:
+                    cover_fx.setdefault(_c, []).append(_k)
+            print(f"   forcing >= {_min_mv} relocation(s)/officer: "
+                  f"{_before} -> {len(plans_fx)} eligible plans")
+        phase_targets = None
+        if use_phase and float(args.phase_target_frac) > 0:
+            _edges = [0] + list(phase_bins_fx) + [REL_BINS]
+            phase_targets = [
+                ([(j, t) for j in range(len(sites)) for t in range(s, e)],
+                 float(args.phase_target_frac))
+                for (s, e) in zip(_edges[:-1], _edges[1:])]
+        _pinfo = {}
+        sols, curve = solve_sweep(r, plans_fx, cover_fx, pmax,
+                                  phase_targets=phase_targets, info=_pinfo)
         curves[fx] = curve
+        if _pinfo.get("phase_targets_fallback"):
+            print(f"      WARN: timing targets infeasible at some P for "
+                  f"{str(fx)[:40]}; those P fell back to the untargeted MIP")
         total = float(r.sum())
+        _net_total_fx = float(
+            sum(_full_tot_all.get(fx, {}).values())) or None
         # Headline squad via the min-marg rule (backward compatible).
         # min_marg is compared on the NETWORK scale (divide the sample-scale
         # marginal by --penetration) to match the flag's documented units;
@@ -851,10 +1526,18 @@ def main():
             selected, covered = sols[p]
         site_row, prows, srows = solution_rows(
             fx, squad, selected, covered, total, plans_fx, sites,
-            labels, tau, args.penetration)
+            labels, tau, args.penetration, net_total=_net_total_fx)
         site_rows.append(site_row)
         plan_rows.extend(prows)
         schedule_rows.extend(srows)
+        if args.rollout:
+            _roll = run_rollout_horizon(fx, r, plans_fx, cover_fx, squad,
+                                        sites, labels, tau,
+                                        args.penetration, rollout_offsets,
+                                        args.rollout_time_limit,
+                                        net_total=_net_total_fx)
+            if _roll:
+                rollout_rows.extend(_roll)
         for entry in curve:
             curve_rows.append({
                 "fixture": fx, "squad": entry["squad"],
@@ -866,7 +1549,7 @@ def main():
             sel_p, cov_p = sols[p]
             srow, grows, grows_sched = solution_rows(
                 fx, p, sel_p, cov_p, total, plans_fx, sites,
-                labels, tau, args.penetration)
+                labels, tau, args.penetration, net_total=_net_total_fx)
             perP_site_rows.append(srow)
             perP_plan_rows.extend(grows)
             perP_sched_rows.extend(grows_sched)
@@ -878,7 +1561,9 @@ def main():
         # squad size and that is the answer.
         if str(getattr(args, "mobility_ab", "off")).lower() == "on":
             try:
-                _ab = mobility_ab(r, raws[fx], obs_frac, plans_fx, cover_fx,
+                _ab = mobility_ab(r, raws[fx],
+                                  sites["obs_frac"].to_numpy(float),
+                                  plans_fx, cover_fx,
                                   squad, time_limit=float(args.ab_time_limit))
                 _ab["fixture"] = str(fx)
                 mobility_rows.append(_ab)
@@ -928,6 +1613,11 @@ def main():
     perP_sched_df.to_csv(out_dir / "game_day_mip_schedule_perP.csv",
                          index=False)
     curve_df.to_csv(out_dir / "game_day_mip_curves.csv", index=False)
+    if args.rollout and rollout_rows:
+        _rdf = pd.DataFrame(rollout_rows)
+        _rdf.to_csv(out_dir / "game_day_mip_rolling.csv", index=False)
+        print(f"   rollout -> game_day_mip_rolling.csv ({len(_rdf)} rows, "
+              f"offsets={rollout_offsets})")
     if mobility_rows:
         _mdf = pd.DataFrame(mobility_rows)
         _mdf.to_csv(out_dir / "game_day_mip_mobility_ab.csv", index=False)
@@ -949,11 +1639,17 @@ def main():
           f"{len(perP_plan_df)} plan rows, {len(curve_df)} curve rows")
     summary = {
         "n_fixtures": len(fixtures),
+        "surface_col": str(getattr(args, "pred_col", "pred_speeding")),
         "sweep_squads": list(sweep_squads),
         "mean_squad": round(float(site_df["squad"].mean()), 2),
         "squad_range": [int(site_df["squad"].min()),
                         int(site_df["squad"].max())],
         "mean_coverage": round(float(site_df["coverage"].mean()), 4),
+        "mean_coverage_network": (
+            round(float(pd.to_numeric(
+                site_df["coverage_network"], errors="coerce").mean()), 4)
+            if "coverage_network" in site_df.columns
+            and site_df["coverage_network"].notna().any() else None),
         "mean_relocations": round(float(site_df["relocations"].mean()), 2),
         "distinct_site_sets": int(site_df["sites"].nunique()),
         "fixture_variation": fixture_variation(surfaces),
@@ -963,12 +1659,33 @@ def main():
         "segment_based": True,
         "candidate_segments": len(sites),
         "candidate_cap": int(args.max_segments),
+        "network_mass_in_candidates_pct": (
+            round(100.0 * _cand_share, 2)
+            if _cand_share == _cand_share else None),
         "travel_speed_kmh": float(args.travel_speed_kmh),
         "detour_factor": float(args.detour_factor),
         "setup_min": float(args.setup_min),
         "max_travel_m": float(args.max_travel_m),
         "obs_m": float(args.obs_m),
+        # Length audit: candidate unit lengths and how much of each way the
+        # shortlist can see, so a length-driven bias would be visible here
+        # instead of having to be inferred from the winners' names.
+        "chunk_m": float(getattr(args, "chunk_m", 0.0)),
+        "max_chunks_per_road": int(getattr(args, "max_chunks_per_road", 3)),
+        "candidate_unit_len_m": {
+            "median": round(float(np.median(
+                sites["length_m"].to_numpy(float))), 1),
+            "p90": round(float(np.percentile(
+                sites["length_m"].to_numpy(float), 90)), 1),
+            "max": round(float(np.max(
+                sites["length_m"].to_numpy(float))), 1),
+        },
         "mobility_ab": summary_mobility,
+        "max_relocations": int(args.max_relocations),
+        "phase_plans": bool(use_phase),
+        "phase_bins": list(phase_bins) if use_phase else [],
+        "phase_bins_auto": (phase_bins_by_fx or None),
+        "phase_target_frac": float(args.phase_target_frac),
     }
     (out_dir / "game_day_mip_summary.json").write_text(
         json.dumps({"summary": summary, "per_game": site_rows}, indent=2,
@@ -992,12 +1709,16 @@ def main():
         "\\bottomrule\n\\end{tabular}\\end{scriptsize}\n"
         "\\caption{Game-day police site selection solved on the predicted "
         "15-minute speeding surface (MetaCount search + NB refit). Each officer "
-        "relocates at most once; squad size and sites are solved per game. "
+        f"relocates at most {max(1, int(args.max_relocations))} time(s); "
+        "squad size and sites are solved per game. "
         "Coverage is the share of observable predicted speeding events on "
         "covered site x 15-min cells (one officer sees "
         f"{float(args.obs_m):.0f} m per segment). Road names, midpoints and "
         "observable fractions per staffed site are in "
-        "game_day_mip_sites.csv.}\n\\label{tab:gamedaymip}\\end{table}\n")
+        # Unescaped "_" here is TEXT mode inside \caption{} -> TeX emits
+        # "Missing $ inserted" and then derails math mode for the rest of
+        # the document, corrupting every later table.
+        "game\\_day\\_mip\\_sites.csv.}\n\\label{tab:gamedaymip}\\end{table}\n")
     (out_dir / "game_day_mip.tex").write_text(tex)
 
     print("[60/3] figures...")
@@ -1059,8 +1780,34 @@ def main():
             print(f"   WARN: segment map geometries unavailable ({exc}); "
                   "using bubbles")
             _geom, _have_geom, _bg = {}, False, []
-        from matplotlib.colors import LogNorm
+        from matplotlib.colors import Normalize, LogNorm
         from matplotlib.collections import LineCollection
+        # Zoomed deployment map: grey full-network context, candidate
+        # segments coloured by their day-total predicted speeding (log
+        # scale over the CANDIDATE range only -- the previous version
+        # normalised over all ~7.8k links, so every candidate washed into
+        # the same dark tone and the figure read as a wall of ink), staffed
+        # units drawn thick green with road names. Precomputed at load
+        # (_full_tot_all) before site filtering.
+        _full_tot = dict(_full_tot_all)
+        _FLOOR = 1.0e-6
+        _all_seg = []
+        if _have_geom:
+            for _o, _g in zip(_roads["road_osmid"], _roads.geometry):
+                _c = _coords_of(_g)
+                if _c and len(_c) >= 2:
+                    _all_seg.append((int(_o), [(float(a), float(b))
+                                               for a, b in _c]))
+        # Candidate view window: the shortlist's own bbox + ~1.5 km margin,
+        # so the deployment area fills the panel instead of being lost in
+        # the full 6 km extract.
+        if len(site_lat):
+            _xlo = float(np.min(site_lon)) - 0.016
+            _xhi = float(np.max(site_lon)) + 0.016
+            _ylo = float(np.min(site_lat)) - 0.014
+            _yhi = float(np.max(site_lat)) + 0.014
+        else:
+            _xlo = _xhi = _ylo = _yhi = None
         fig, axes = plt.subplots(nrows, ncols, figsize=(4.6 * ncols, 4.4 * nrows),
                                  squeeze=False)
         for i, fx in enumerate(fixtures):
@@ -1070,37 +1817,44 @@ def main():
             row = site_df[site_df["fixture"] == fx].iloc[0]
             selected = set(row["sites"].split("|")) if row["sites"] else set()
             _sel_idx = {labels.index(s) for s in selected if s in labels}
-            _vmax = max(float(totals.max()), 1e-9)
             if _have_geom:
+                _tot_map = _full_tot.get(fx) or {}
+                if not _tot_map:
+                    _tot_map = {int(sites.iloc[j]["road_osmid"]): float(totals[j])
+                                for j in range(len(sites))}
+                # Context: every other link in light grey, no colour scale.
                 if _bg:
-                    # zorder 1: the whole study-area network, faint, so the
-                    # panel reads as a road network rather than loose fragments
                     ax.add_collection(LineCollection(
-                        _bg, colors="#B8BEC4", linewidths=0.45,
-                        alpha=0.55, zorder=1))
-                _segs, _vals, _sel = [], [], []
+                        _bg, colors="#d9d9d9", linewidths=0.4, zorder=1))
+                # Candidates: coloured by their day-total predicted counts.
+                _segs, _vals = [], []
                 for j in range(len(sites)):
-                    _g = _geom.get(int(sites.iloc[j]["road_osmid"]))
+                    _o = int(sites.iloc[j]["road_osmid"])
+                    _g = _geom.get(_o)
                     if _g is None:
                         continue
-                    try:
-                        _coords = list(_g.coords)
-                    except Exception:  # noqa: BLE001 - multi-part: first part
-                        try:
-                            _coords = list(_g.geoms[0].coords)
-                        except Exception:
-                            continue
-                    _segs.append(_coords)
-                    _vals.append(float(totals[j]))
-                    _sel.append(j in _sel_idx)
-                _lc = LineCollection(
-                    _segs, cmap="magma", norm=LogNorm(vmin=max(min(_vals + [1e-3]), 1e-3),
-                                                      vmax=_vmax),
-                    array=np.array(_vals), linewidths=1.2, zorder=2)
-                ax.add_collection(_lc)
-                for j in range(len(sites)):
-                    if j not in _sel_idx:
+                    _c = _coords_of(_g)
+                    if not _c or len(_c) < 2:
                         continue
+                    _segs.append([(float(a), float(b)) for a, b in _c])
+                    _vals.append(max(float(_tot_map.get(_o, totals[j])),
+                                     _FLOOR))
+                if _vals:
+                    _vmin = max(float(np.percentile(_vals, 10)), _FLOOR)
+                    _vmax = max(float(np.percentile(_vals, 90)),
+                                _vmin * 2.0)
+                    ax.add_collection(LineCollection(
+                        _segs, cmap="YlOrRd",
+                        norm=LogNorm(vmin=_vmin, vmax=_vmax),
+                        array=np.array(_vals), linewidths=2.0, zorder=2))
+                else:
+                    _vmin = _vmax = _FLOOR
+                # Staffed units: layered highlight (black shadow, white
+                # casing, bright core) plus a star badge at the segment
+                # midpoint, labelled with length so the length-bias check is
+                # visible on the face of the figure. Plain green lines
+                # vanished against the red-hot candidate segments.
+                for j in sorted(_sel_idx):
                     _g = _geom.get(int(sites.iloc[j]["road_osmid"]))
                     if _g is None:
                         continue
@@ -1111,20 +1865,32 @@ def main():
                             _xs, _ys = _g.geoms[0].xy
                         except Exception:
                             continue
-                    ax.plot(list(_xs), list(_ys), color="#0B6E4F", lw=3.0,
-                            solid_capstyle="round", zorder=3)
-                    ax.annotate(labels[j], (site_lon[j], site_lat[j]),
+                    ax.plot(list(_xs), list(_ys), color="#000000", lw=9.5,
+                            alpha=0.28, solid_capstyle="round", zorder=3)
+                    ax.plot(list(_xs), list(_ys), color="#ffffff", lw=6.4,
+                            alpha=0.95, solid_capstyle="round", zorder=3)
+                    ax.plot(list(_xs), list(_ys), color="#00E5FF", lw=3.4,
+                            solid_capstyle="round", zorder=4)
+                    _mx = float(np.mean(_xs))
+                    _my = float(np.mean(_ys))
+                    ax.plot([_mx], [_my], marker="*", ms=19, mfc="none",
+                            mec="#000000", mew=2.6, alpha=0.55, zorder=5,
+                            ls="none")
+                    ax.plot([_mx], [_my], marker="*", ms=14, mfc="#00E5FF",
+                            mec="white", mew=1.8, zorder=6, ls="none")
+                    _rn = str(sites.iloc[j].get("road_name", "") or "")[:28]
+                    _lm = float(sites.iloc[j]["length_m"])
+                    ax.annotate(f"{labels[j]} {_rn} ({_lm:.0f} m)".strip(),
+                                (site_lon[j], site_lat[j]),
                                 fontsize=6, ha="center", va="center",
-                                color="white",
-                                bbox=dict(fc="#0B6E4F", ec="none", pad=1),
-                                zorder=4)
+                                color="black", fontweight="bold",
+                                bbox=dict(fc="#00E5FF", ec="white", pad=1),
+                                zorder=7)
                 ax.set_aspect(1.0 / max(np.cos(np.radians(
                     float(np.mean(site_lat)))), 1.0))  # ~equal at this latitude
-                if _bg:
-                    _allx = [p[0] for seg in _bg for p in seg]
-                    _ally = [p[1] for seg in _bg for p in seg]
-                    ax.set_xlim(min(_allx), max(_allx))
-                    ax.set_ylim(min(_ally), max(_ally))
+                if _xlo is not None:
+                    ax.set_xlim(_xlo, _xhi)
+                    ax.set_ylim(_ylo, _yhi)
                 else:
                     ax.autoscale_view()
             else:
@@ -1139,6 +1905,7 @@ def main():
                 ax.set_aspect(1.0 / max(np.cos(np.radians(
                     float(np.mean(site_lat)))), 1.0))
                 ax.autoscale_view()
+                _segs, _vmin, _vmax = [], _FLOOR, _FLOOR
             # A grid over a map is noise; drop it for the map panels only.
             ax.grid(False)
             ax.tick_params(labelsize=6)
@@ -1146,67 +1913,33 @@ def main():
                          f"cov={100 * row['coverage']:.0f}%", fontsize=8)
             ax.set_xlabel("lon", fontsize=7)
             ax.set_ylabel("lat", fontsize=7)
-            if _have_geom and _vals:
+            if _have_geom and _segs:
                 sm = plt.cm.ScalarMappable(
-                    cmap="magma",
-                    norm=LogNorm(vmin=max(min(_vals + [1e-3]), 1e-3),
-                                 vmax=max(max(_vals), 1e-9)))
+                    cmap="YlOrRd",
+                    norm=LogNorm(vmin=_vmin,
+                                 vmax=_vmax))
                 cb = fig.colorbar(sm, ax=ax, fraction=0.032, pad=0.02)
-                cb.set_label("observable predicted speeding", fontsize=6)
+                cb.set_label("predicted speeding, candidate segments",
+                              fontsize=6)
                 cb.ax.tick_params(labelsize=5)
         for j in range(n_fx, nrows * ncols):
             axes[j // ncols][j % ncols].axis("off")
-        fig.suptitle("Study-area road network (grey) with candidate segments "
-                     "coloured by observable\npredicted speeding (log scale); "
-                     "staffed sites outlined green", fontsize=10)
-        fig.tight_layout()
+        fig.suptitle("Day-total predicted speeding on candidate segments "
+                     "(log scale, zoomed to the shortlist); grey = rest of "
+                     "network; cyan + star = staffed units", fontsize=10)
+        fig.tight_layout(rect=[0, 0, 1, 0.93])
         fig.savefig(fig_dir / "game_day_mip_map.png", dpi=130)
         plt.close(fig)
 
-        fig, axes = plt.subplots(nrows, ncols, figsize=(4.8 * ncols, 3.4 * nrows),
-                                 squeeze=False)
-        for i, fx in enumerate(fixtures):
-            ax = axes[i // ncols][i % ncols]
-            r = surfaces[fx]
-            sns.heatmap(r, ax=ax, cmap="Greys", cbar=False,
-                        vmax=max(np.percentile(r, 99) * 1.3, 1e-9))
-            chosen = plan_df[plan_df["fixture"] == fx]
-            for officer, (_, prow) in enumerate(chosen.iterrows()):
-                color = OFFICER_COLORS[officer % 10]
-                if not prow["move"]:
-                    ax.plot(range(REL_BINS),
-                            [labels.index(prow["from_site"])] * REL_BINS,
-                            "-", color=color, lw=1.1)
-                else:
-                    t1 = int(prow["move_bin"])
-                    a = labels.index(prow["from_site"])
-                    b = labels.index(prow["to_site"])
-                    move = int(tau[a, b])
-                    ax.plot(range(t1), [a] * t1, "-", color=color, lw=1.1)
-                    ax.plot(range(t1 + move, REL_BINS),
-                            [b] * (REL_BINS - t1 - move), "-", color=color,
-                            lw=1.1)
-                    if t1 > 0:
-                        ax.plot([t1 - 1, t1 + move], [a, b], ":", color=color,
-                                lw=0.8)
-            ax.set_yticks(range(len(sites)))
-            ax.set_yticklabels(labels, fontsize=5)
-            ax.set_title(str(fx)[:38], fontsize=8)
-            ax.set_xlabel("15-min bin")
-        for j in range(n_fx, nrows * ncols):
-            axes[j // ncols][j % ncols].axis("off")
-        fig.suptitle("Officer schedules on predicted surfaces (<=1 relocation each)")
-        fig.tight_layout()
-        fig.savefig(fig_dir / "game_day_mip_schedules.png", dpi=130)
-        plt.close(fig)
-
-        # ---- selected-site heatmap -------------------------------------
-        # The schedules figure above plots all `--max-segments` candidate
-        # rows, of which only P are ever chosen, so 240 of 250 rows per
-        # panel are dead weight and the chosen rows are hard to find. This
-        # figure shows ONLY the sites that were actually staffed, ordered by
+        # ---- staffed-site schedules ------------------------------------
+        # Shows ONLY the sites that were actually staffed, ordered by
         # predicted load, with each officer's occupancy drawn on top -- so
-        # you can see, per game, what the smaller squad is doing and where.
+        # you can see, per game, what the squad is doing and where.
+        # The legacy schedule figure this replaced plotted all
+        # --max-segments candidate rows (with --max-segments up to 250+),
+        # of which only P are ever chosen: the staffed rows were P lines
+        # lost among hundreds, and the y-axis printed every candidate's
+        # row label. The staffed sites ARE the deployment; plot them.
         ncols2 = min(2, max(len(fixtures), 1))
         nrows2 = int(np.ceil(len(fixtures) / ncols2))
         fig, axes = plt.subplots(
@@ -1228,8 +1961,49 @@ def main():
             "with officer occupancy\n(coloured line = holding, dotted = "
             "relocating, dashed cyan = kickoff)", fontsize=10)
         fig.tight_layout(rect=(0, 0, 1, 0.94))
-        fig.savefig(fig_dir / "game_day_mip_selected_heatmap.png", dpi=130)
+        fig.savefig(fig_dir / "game_day_mip_schedules.png", dpi=130)
         plt.close(fig)
+
+        # ---- all-segments risk distribution ------------------------------
+        # Every OSM segment carries a day-total risk (floored above zero);
+        # one histogram per game so the full-network spread is visible, not
+        # just the staffed shortlist.
+        try:
+            _nfx = len(fixtures)
+            _nc = min(2, _nfx)
+            _nr = int(np.ceil(_nfx / _nc))
+            fig, axes = plt.subplots(_nr, _nc,
+                                     figsize=(6.4 * _nc, 3.4 * _nr),
+                                     squeeze=False)
+            for i, fx in enumerate(fixtures):
+                ax = axes[i // _nc][i % _nc]
+                _td = _full_tot.get(fx) or {}
+                _vt = np.asarray(
+                    [max(float(v), _FLOOR) for v in _td.values()],
+                    dtype=float)
+                if _vt.size == 0:
+                    _vt = np.asarray(
+                        [max(float(totals[j]), _FLOOR)
+                         for j in range(len(sites))], dtype=float)
+                ax.hist(np.log10(_vt), bins=40, color="#0B6E4F",
+                        edgecolor="white", linewidth=0.3)
+                ax.axvline(np.log10(max(float(np.median(_vt)), _FLOOR)),
+                           color="red", ls="--", lw=1.2, label="median")
+                ax.set_title(f"{str(fx)[:38]} (n={_vt.size} segments)",
+                             fontsize=8)
+                ax.set_xlabel("log10 day-total predicted speeding")
+                ax.set_ylabel("segments")
+                ax.legend(fontsize=7)
+            for j in range(_nfx, _nr * _nc):
+                axes[j // _nc][j % _nc].axis("off")
+            fig.suptitle("Every segment carries risk: day-total predicted "
+                         "speeding distribution per future game (log scale)",
+                         fontsize=10)
+            fig.tight_layout(rect=(0, 0, 1, 0.94))
+            fig.savefig(fig_dir / "game_day_risk_dist.png", dpi=130)
+            plt.close(fig)
+        except Exception as exc:  # noqa: BLE001 - distribution is diagnostic
+            print(f"   WARN: risk-dist figure failed ({exc})")
 
         fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
         for fx in fixtures:
@@ -1260,14 +2034,18 @@ def main():
         plt.close(fig)
 
         fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-        axes[0].bar(range(len(site_df)), site_df["squad"], color="#0B6E4F")
+        _b0 = axes[0].bar(range(len(site_df)), site_df["squad"],
+                          color="#0B6E4F")
+        axes[0].bar_label(_b0, fontsize=7)
         axes[0].set_xticks(range(len(site_df)))
         axes[0].set_xticklabels([str(f)[:18] for f in site_df["fixture"]],
                                 rotation=45, ha="right", fontsize=6)
         axes[0].set_ylabel("squad size")
-        axes[0].set_title("Officers per game")
-        axes[1].bar(range(len(site_df)), 100 * site_df["coverage"],
-                    color="#7A5195")
+        axes[0].set_title("Officers per game "
+                          f"(moves: {list(site_df['relocations'])})")
+        _b1 = axes[1].bar(range(len(site_df)), 100 * site_df["coverage"],
+                          color="#7A5195")
+        axes[1].bar_label(_b1, fmt="%.1f", fontsize=7)
         axes[1].set_xticks(range(len(site_df)))
         axes[1].set_xticklabels([str(f)[:18] for f in site_df["fixture"]],
                                 rotation=45, ha="right", fontsize=6)

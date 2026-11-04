@@ -1,0 +1,77 @@
+#!/bin/bash -l
+#PBS -N hb55retry
+#PBS -l select=1:ncpus=4:mem=32gb
+#PBS -l walltime=12:00:00
+#PBS -J 0-3
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+#PBS -o logs/hb55retry_^array_index^.log
+
+# Retry the 4 HB shards whose gzip output was truncated by dead workers
+# (EOF mid-stream, found by the local integrity sweep on 2026-10-29):
+#   005, 007, 008, 016
+# The 2026-10-09 run attributed crashes to faulty node cpu1n022; if this
+# retry fails on one node again, check qnodes / messages for repeats and
+# consider a node-scoped rerun for that shard.
+#
+# SAFETY: 55_rebuild_hb_full.py resumes in APPEND mode when a
+# "<out>.done_files" marker exists. After a mid-write kill the marker can
+# name files whose buffered output was lost, and appending to a bad gzip
+# member makes the whole stream unreadable. So we DELETE both the output
+# and the marker and rebuild each shard from scratch (~1/5 of the
+# original array job's work each).
+#
+# Submit from the project scratch root on the login node:
+#   qsub pbs_55_retry_shards.pbs
+# After all 4 tasks finish (verify back home with gzip -t), rebuild the
+# 4 shard panels locally and re-combine:
+#   python scripts/99c_build_hb_panel_full.py --shard 5
+#   python scripts/99c_build_hb_panel_full.py --shard 7
+#   python scripts/99c_build_hb_panel_full.py --shard 8
+#   python scripts/99c_build_hb_panel_full.py --shard 16
+#   python scripts/99c_build_hb_panel_full.py --combine
+
+cd "$PBS_O_WORKDIR" || exit 1
+mkdir -p logs results data
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export JAX_PLATFORMS=cpu
+
+RAW_DIR="${RAW_DIR:-data/raw_near_miss_2026}"
+SHARDS=(5 7 8 16)
+SHARD=${SHARDS[${PBS_ARRAY_INDEX}]}
+
+echo "retry shard ${SHARD} (task ${PBS_ARRAY_INDEX}) on $(hostname) at $(date)"
+
+OUT="results/hb_full.shard$(printf '%03d' ${SHARD}).csv.gz"
+rm -f "$OUT" "$OUT.done_files"
+
+python -u scripts/55_rebuild_hb_full.py \
+    --raw-dir "$RAW_DIR" \
+    --out results/hb_full.csv.gz \
+    --date-min 2025-01-01 --date-max 2026-03-31 \
+    --shard "${SHARD}" --nshards 20 --ckpt 25
+RC=$?
+
+echo "shard ${SHARD} done at $(date) exit=$RC"
+
+# Same loud-fail gate as the original array job.
+if [ ! -s "$OUT" ]; then
+    echo "MISSING/EMPTY shard output: $OUT"
+    exit 1
+fi
+if ! gzip -t "$OUT"; then
+    echo "CORRUPT (truncated gzip) shard output: $OUT"
+    exit 1
+fi
+echo "shard output OK: $OUT ($(stat -c%s "$OUT") bytes)"
+exit $RC

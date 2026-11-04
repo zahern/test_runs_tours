@@ -57,6 +57,13 @@ def _parse_args():
                         "(underscore form travels safely via qsub -v)")
     p.add_argument("--strict", action="store_true",
                    help="Fail if any expected segment is missing")
+    p.add_argument("--stage5-from", default="",
+                   help="AllStagesResult .pkl written by promote_stage5_bests.py "
+                        "(ga_results_promoted.pkl). When set, stage 5 is taken "
+                        "from that artifact and the stage-5 shard scan is "
+                        "skipped - the shard ga_results.pkl files still carry "
+                        "the pre-promotion (e.g. 13/10) feature specs, so merging "
+                        "them would silently revert the newer fits.")
     return p.parse_args()
 
 
@@ -76,6 +83,14 @@ def _is_empty(res) -> bool:
             segs = (getattr(res, "metadata", {}) or {}).get("segment_results", {})
             if not segs:
                 return True
+        # Phantom guard (2026-10-08): a 0-segment salvage carries finite
+        # fitness from best-so-far genes but zero completed segments (observed
+        # as live-named ~1KB ga_results.pkl next to FAILED markers). It must
+        # never merge as a real result.
+        _segs = (getattr(res, "metadata", {}) or {}).get("segment_results", {})
+        _fm = str(getattr(res, "fitness_metric", ""))
+        if not _segs and "salvaged" in _fm:
+            return True
         return False
     except Exception:
         return True
@@ -85,10 +100,12 @@ def _collect_stage(base: str, sid: int):
     """Return list of (source_label, GAResult-for-sid, shard_dir-or-None)."""
     found = []
     stage_dir = os.path.join(base, f"stage{sid}")
+    live_dirs = set()
     # sharded sources first (higher precedence on conflict handled by fitness)
     for pkl in sorted(glob.glob(os.path.join(stage_dir, "shards", "*",
                                               "ga_results.pkl"))):
         shard_dir = os.path.dirname(pkl)
+        live_dirs.add(shard_dir)
         try:
             allst = _load_allstages(pkl)
             res = allst.results.get(sid)
@@ -101,6 +118,27 @@ def _collect_stage(base: str, sid: int):
                 print(f"  stage {sid}: ignoring empty shard {shard_dir}")
         except Exception as exc:  # noqa: BLE001
             print(f"  stage {sid}: unreadable shard {pkl} ({exc})")
+    # Killed shards carry only ga_results_checkpoint.pkl (live pkl is written
+    # only on clean finalise; see _run_ga_shard kill-save handler). Fall back
+    # to the checkpoint for shard dirs with no live artifact — mirrors the
+    # legacy merge_ga_results.py salvage path. Phantom/empty guards apply.
+    for pkl in sorted(glob.glob(os.path.join(stage_dir, "shards", "*",
+                                              "ga_results_checkpoint.pkl"))):
+        shard_dir = os.path.dirname(pkl)
+        if shard_dir in live_dirs:
+            continue
+        try:
+            allst = _load_allstages(pkl)
+            res = allst.results.get(sid)
+            if res is None and len(allst.results) == 1:
+                res = next(iter(allst.results.values()))
+            if res is not None and not _is_empty(res):
+                found.append((f"shard-ckpt:{os.path.basename(shard_dir)}",
+                              res, shard_dir))
+                print(f"  stage {sid}: using checkpoint salvage "
+                      f"{os.path.basename(shard_dir)}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  stage {sid}: unreadable shard checkpoint {pkl} ({exc})")
     # legacy unsharded source
     legacy = os.path.join(stage_dir, "ga_results.pkl")
     if os.path.isfile(legacy):
@@ -177,7 +215,25 @@ def main() -> int:
                   "sources": {}, "missing": {}}
 
     for sid in stage_ids:
-        sources = _collect_stage(base, sid)
+        stage5_override = bool(sid == 5 and args.stage5_from)
+        if stage5_override:
+            # Authoritative stage-5 source: the promoted artifact (new refits).
+            # Scanning stage5/shards/* here would union the pre-promotion specs
+            # back in and fold the OLD feature lists into the merged spec.
+            _allst = _load_allstages(args.stage5_from)
+            _res5 = _allst.results.get(5)
+            if _res5 is None and len(_allst.results) == 1:
+                _res5 = next(iter(_allst.results.values()))
+            if _res5 is None or _is_empty(_res5):
+                print(f"ERROR: --stage5-from {args.stage5_from} carries no "
+                      f"usable stage-5 result")
+                return 4
+            sources = [("promoted", _res5, None)]
+            merge_info["stage5_from"] = args.stage5_from
+            print(f"Stage 5: using --stage5-from {args.stage5_from} "
+                  f"(stage-5 shard ga_results.pkl ignored)")
+        else:
+            sources = _collect_stage(base, sid)
         merge_info["sources"][str(sid)] = [label for label, _, _ in sources]
         if not sources:
             merge_info["missing"][str(sid)] = "no usable shard/legacy artifact"

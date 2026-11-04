@@ -1,0 +1,39 @@
+#!/bin/bash -l
+# Diagnostic: what does the standard activate pattern actually yield on a
+# compute node now that .headnodeguard is in PBS_O_PATH? Tiny, read-only.
+#PBS -N diag_env
+#PBS -m n
+#PBS -l select=1:ncpus=1:mem=2GB
+#PBS -l walltime=00:10:00
+
+set -uo pipefail
+CONDA_ENV=${CONDA_ENV:-geotfenv}
+
+echo "PBS_O_PATH=$PBS_O_PATH"
+echo "headnodeguard bin: $(ls -la /home/ahernz/.headnodeguard/bin/ 2>/dev/null | head -20)"
+
+module purge
+module load Anaconda3/2024.02-1
+
+echo "BEFORE: python=$(command -v python 2>/dev/null) ($(python -V 2>&1))"
+echo "BEFORE: conda=$(command -v conda 2>/dev/null) type=$(type -t conda 2>/dev/null)"
+
+conda activate "$CONDA_ENV"
+echo "activate rc=$?"
+echo "AFTER:  python=$(command -v python 2>/dev/null) ($(python -V 2>&1))"
+echo "AFTER:  CONDA_PREFIX=${CONDA_PREFIX:-unset} CONDA_DEFAULT_ENV=${CONDA_DEFAULT_ENV:-unset}"
+python -c "import sys; print('exe:', sys.executable); print('ver:', sys.version.split()[0])"
+
+echo "--- fallback A: absolute env python ---"
+/home/ahernz/miniconda3/envs/geotfenv/bin/python -c "import sys; print('ABS exe:', sys.executable); import r5py; print('ABS r5py:', r5py.__version__)" 2>&1 | tail -3
+
+echo "--- fallback B: explicit conda.sh source ---"
+set +u
+source /home/ahernz/miniconda3/etc/profile.d/conda.sh && conda activate "$CONDA_ENV"
+echo "source+activate rc=$?"
+set -u
+echo "SRC:    python=$(command -v python 2>/dev/null) ($(python -V 2>&1))"
+echo "SRC:    CONDA_PREFIX=${CONDA_PREFIX:-unset}"
+
+echo "--- r5py under whichever python is current ---"
+python -c "import r5py; print('r5py:', r5py.__version__)" 2>&1 | tail -2

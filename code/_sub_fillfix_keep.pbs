@@ -1,0 +1,57 @@
+#!/bin/bash -l
+#PBS -N s5_fillfix_keep
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+#PBS -m n
+#PBS -r y
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _sub_fillfix_keep.pbs
+# Re-fit the paper Stage-5 arms on the FULL work frame (fallback tours KEPT)
+# after gating the logsum ⊥ distance step to rows that carry a real surface
+# value.  Before the gate those 79 tours were residualized from a constant-zero
+# fill into -(β·distance), a distance mirror; the fit below is the same sample
+# and cache as 20261103_014622_27554328 (c_logsum = 0.3959) and as the
+# 79-tour-excluded run 27554327 (0.4005), so the three differ only in how the
+# unlisted tours are handled:
+#     mirror present   0.3959   (-- before this fix)
+#     tours dropped    0.4005
+#     constant fill    <- this run
+# Environment is stated here because PBS -v cannot carry comma-bearing values
+# (PAPER_UTILITY / PAPER_MEMB) through the ssh invocation.
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV:-zigenv}"
+module unload Anaconda3
+
+export NEW_POP=1 NEW_POP_MAPPED=0
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+if [[ -z "${SEARCHLIBRIUM_SRC:-}" && -f "${PBS_O_WORKDIR}/_patches/SearchLibrium/mh_choice_estimator.py" ]]; then
+  export SEARCHLIBRIUM_SRC="${PBS_O_WORKDIR}/_patches"
+fi
+
+export PAPER_SEGMENT=work
+export PAPER_N_CASES=0
+export PAPER_ARMS=B
+export PAPER_N_PERT=10                 # 11 restarts, matches the D comparison
+export PAPER_SEED=42
+export PAPER_LC_MAXITER=150
+export PAPER_MSTEP_MAXITER=200
+export PAPER_UTILITY="c_log_dist,c_crash,c_logsum,c_visit_work,c_crash_safety_dest"
+export PAPER_MEMB="STUDYING,sexp,incp,vehrd"
+export PAPER_DROP_NOLOGSUM=0           # keep the fallback tours: that is the point
+export JAX_PLATFORMS=cpu
+export CUDA_VISIBLE_DEVICES=""
+
+export PAPER_OUT="runs/stage5_paper_arms/20261103_fillfix_keep"
+mkdir -p "${PAPER_OUT}"
+
+echo "fill-fix refit -> ${PAPER_OUT} (arms=${PAPER_ARMS} n_pert=${PAPER_N_PERT})"
+python _paper_stage5_arms.py 2>&1 | tee "${PAPER_OUT}/job.out"
+echo "Finished: $(date) exit_code=${PIPESTATUS[0]}" | tee -a "${PAPER_OUT}/job.out"

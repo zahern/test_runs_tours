@@ -24,6 +24,7 @@ Invoked from ga_stage1 when GA_ESTIMATOR=metacount_mv; also runnable standalone
 and returns the MultivariateCountFit (or None on failure — never raises).
 """
 import logging
+import math
 import os
 
 import numpy as np
@@ -173,8 +174,14 @@ def _write_reports(fit, activity_cols, out_dir):
             b = float(beta[i]) if i < len(beta) else np.nan
             s = float(se[i]) if i < len(se) else np.nan
             t = (b / s) if (np.isfinite(b) and np.isfinite(s) and s > 0) else np.nan
+            # Wald p-value from the reported t (2026-10-09: the CSV previously
+            # shipped no p column, so audits counted 0/75 significant).
+            try:
+                p = float(math.erfc(abs(t) / math.sqrt(2.0))) if np.isfinite(t) else np.nan
+            except (TypeError, ValueError):
+                p = np.nan
             rows.append({'activity': act, 'term': nm, 'value': b, 'std_err': s,
-                         't_stat': t, 'nb_alpha': alpha})
+                         't_stat': t, 'p_value': p, 'nb_alpha': alpha})
     cdf = pd.DataFrame(rows)
     csv_path = os.path.join(out_dir, 'stage1_multivariate_coefficients.csv')
     cdf.to_csv(csv_path, index=False)

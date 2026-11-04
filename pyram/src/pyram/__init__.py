@@ -47,6 +47,9 @@ from pyram.models import (
     TripDestinationModel,
 )
 
+# DTA exports
+from pyram.dta import DTAFeedbackLoop, run_dta_feedback
+
 # Data exports
 from pyram.data import (
     load_hhts,
@@ -78,6 +81,9 @@ __all__ = [
     "ModeChoiceModel", 
     "ParkingChoiceModel",
     "TripDestinationModel",
+    # DTA
+    "DTAFeedbackLoop",
+    "run_dta_feedback",
     # Data
     "load_hhts",
     "load_skims",

@@ -47,6 +47,7 @@ import argparse
 import gc
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -133,6 +134,12 @@ REL_BINS = 28
 CONT_VARS = ["lanes_z", "maxspeed_z", "curvature_z", "dist_inter_z",
              "node_degree_z", "log_length", "lanes_known"]
 CAL_VARS = ["tod_sin", "tod_cos", "dow_sin", "dow_cos", "weekend"]
+# Day-of-week dummies (Sunday reference dropped by the search/BIC if unneeded;
+# all seven enter the pool so match-day effects are not forced sinusoidal).
+DOW_DUMMIES = [f"dow_d{i}" for i in range(7)]
+# Weather candidates, populated by load_weather_daily() when
+# data/weather_daily.csv exists (date,rain_mm,temp_max_c,...); empty otherwise.
+WEATHER_COLS = []
 GAME_VARS = ["in_event", "rel_hour", "log_att", "dist_stad", "event_x_dist"]
 # Terms that MUST survive selection, because the operational requirement is a
 # GAME-SPECIFIC, SEGMENT-LEVEL, TIME-RESOLVED deployment and the model cannot
@@ -204,24 +211,53 @@ GAME_ATTR_VARS = ["fxt_NRL", "fxt_ALeague", "big_game", "ko_tod_sin",
 # segment that demonstrably responds to games grows with the crowd, so a
 # 45k game weights responsive segments differently from a 39k game -> the
 # segment ranking becomes game-specific.
-INTERACT_VARS = ["rel_x_dist", "att_x_dist", "ev_x_lanes", "evu_x_att"]
+INTERACT_VARS = ["rel_x_dist", "att_x_dist", "ev_x_lanes", "evu_x_att",
+                 # KICKOFF x FLOW. Every other crossed term multiplies a
+                 # segment covariate by the CROWD, and a single crowd scalar
+                 # cannot reorder anything: for a game with attendance A the
+                 # multiplier is exp(log(A) * g(x)) for one segment score
+                 # g(x), which is monotone in g for every A, so all games rank
+                 # segments identically and only the spread changes (the
+                 # 0.997 pairwise Spearman). Kickoff is the only fixture
+                 # attribute that varies independently of the crowd, and
+                 # log_flow_z is a segment basis none of the crowd crosses use,
+                 # so sin/cos(kickoff) x flow gives a SECOND scoring direction:
+                 # an evening game can weight high-flow arterials differently
+                 # from an afternoon game, which moves the ordering.
+                 "ko_sin_x_flow", "ko_cos_x_flow",
+                 # Crowd x road interactions: big games use different roads, so
+                 # these let the ranking reorder by fixture (jaccard 1.0 fix).
+                 "att_x_lanes", "att_x_maxspeed", "att_x_length", "ko_x_dist"]
 GAME_WIDE_VARS = GAME_ATTR_VARS + INTERACT_VARS
 EVENT_X_VARS = ["evu_x_att"]
+# Reordering interactions (fixture attribute x segment attribute). A
+# fixture-level MAIN effect (in_event, log_att, ko_tod_*) shifts the whole
+# surface for that game but cannot change the WITHIN-fixture ranking, so it
+# leaves every game's top-20 identical (Jaccard 1.0). Only a crossed term can
+# reorder the segments, so these ARE the game-specific WHERE mechanism; like
+# evu_x_att they are forced in when they vary rather than left to pooled BIC,
+# which culls exactly this kind of within-game term (see the GAME_FORCE
+# comment). att_x_lanes = log_att x lanes_z is identified from BETWEEN-fixture
+# variation of attendance (it is collinear with lanes_z within a fixture), so
+# it lets the lanes slope, and hence the ranking, differ by game.
+REORDER_VARS = EVENT_X_VARS + ["att_x_lanes", "att_x_maxspeed",
+                               "att_x_length", "ko_x_dist",
+                               "ko_sin_x_flow", "ko_cos_x_flow"]
 
 
 def force_terms(work, args=None):
-    """GAME_FORCE, plus evu_x_att when it varies and forcing is enabled.
+    """GAME_FORCE, plus the varying reordering interactions (REORDER_VARS).
 
-    The event-uplift interaction is the direct mechanism for game-specific
-    reordering, and pooled BIC culls exactly this kind of within-game term
-    (see the GAME_FORCE comment). It is therefore forced by construction
-    unless --force-event-uplift off. A column that is constant (no
-    background sums, or no uplift variance) is not forced: the package's
+    REORDER_VARS are the only terms that can reorder segments BETWEEN games,
+    and pooled BIC culls exactly this kind of within-game term (see the
+    GAME_FORCE comment). They are therefore forced by construction unless
+    --force-event-uplift off. A column that is constant (no background sums,
+    or no uplift/attendance variance) is not forced: the package's
     identifiability screen would reject it and collapse the spec.
     """
     terms = [c for c in GAME_FORCE if c in work.columns]
     if str(getattr(args, "force_event_uplift", "on") or "on").lower() == "on":
-        for c in EVENT_X_VARS:
+        for c in REORDER_VARS:
             if c not in work.columns or c in terms:
                 continue
             try:
@@ -235,6 +271,8 @@ SLIM_CAL = ["tod_sin", "tod_cos", "weekend"]
 SLIM_GAME = ["in_event", "rel_hour", "log_att", "dist_stad", "event_x_dist"]
 BEST_JSON = RES / "game_day_search_best.json"
 PROGRESS_CSV = RES / "game_day_search_progress.csv"
+FAMILY_CSV_NAME = "game_day_search_family.csv"
+FAMILY_CSV = RES / FAMILY_CSV_NAME
 CHECKPOINT_COLS = ["road_osmid", "bin", TARGET_DEFAULT, "vehicle_count",
                    "mean_vehicle_speed_kmh",
                    # The posted limit the speeding target was derived against.
@@ -281,7 +319,11 @@ PROFILE_ROWS = 500000
 # interaction evu_x_att join the candidate set; evu_x_att is force-included
 # by default. Two new columns change the decision dimension, so pre-GEN-9
 # checkpoints must not warm-start.
-SEARCH_GEN = 9
+# GEN 10: the crossed reordering interactions (att_x_lanes/att_x_maxspeed/
+# att_x_length/ko_x_dist) are now FORCED by default (see REORDER_VARS), not
+# left to pooled BIC. The forced fixed set therefore changes, so a pre-GEN-10
+# checkpoint lacks these terms and must not warm-start.
+SEARCH_GEN = 10
 # Transferable temporal structure (all train-anchored, all known for future
 # fixtures — unlike autoregression, which needs unobserved future lags):
 #   seg_risk_z: EB-shrunk per-segment speeding propensity from train history
@@ -297,7 +339,38 @@ CLOCK_VARS = ["clock_prof"]
 # future lags). This is the direct "which streets respond to games" signal;
 # seg_risk_z only carries the overall level.
 EVENT_UPLIFT_VARS = ["seg_event_uplift_z"]
-TIME_X_VARS = RISK_VARS + LAG_VARS + CLOCK_VARS + EVENT_UPLIFT_VARS
+TIME_X_VARS = RISK_VARS + LAG_VARS + CLOCK_VARS + EVENT_UPLIFT_VARS + ["flow_anom"]
+FAMILY_ORDER = ["telematics", "weather", "game", "temporal", "geometry",
+                "calendar", "other"]
+
+
+def term_family(term):
+    """Characteristic family of a spec term (for convergence attribution).
+
+    Answers "which kind of information entered when": telematics outputs
+    (flows/exposure/uplifts), weather, game info, temporal shape, road
+    geometry, calendar. Suffixes (":normal") stripped before matching.
+    """
+    t = str(term).split(":")[0]
+    if t in tuple(WEATHER_COLS) or t.startswith(("rain", "temp", "weather")):
+        return "weather"
+    if t in tuple(TEMPORAL_VARS):
+        return "temporal"
+    if t in tuple(GAME_VARS) or t in tuple(GAME_WIDE_VARS) or t.startswith(
+            ("fxt_", "ko_", "big_game", "clock", "in_event", "rel_hour",
+             "log_att", "attendance", "event_x_dist", "dist_stad")):
+        return "game"
+    if t in tuple(CAL_VARS) or t in tuple(DOW_DUMMIES) or t.startswith(
+            ("tod_", "dow_", "weekend")):
+        return "calendar"
+    if (t in tuple(TIME_X_VARS) or "flow" in t or "exp" in t or "trips" in t
+            or "vehicle" in t or "uplift" in t or t.startswith("aadt")
+            or t == "logexp" or t.startswith("seg_")):
+        return "telematics"
+    if t.startswith(("hw_", "lanes", "maxspeed", "curv", "length", "log_length",
+                     "node_degree", "dist_inter")):
+        return "geometry"
+    return "other"
 # Segment-identity term for the grouped (role 4) effect.
 #
 # This started as a CONSTANT 1.0 column, on the reasoning that a
@@ -374,6 +447,193 @@ def _calibration(obs, pred):
         return float("nan"), float("nan")
     slope, intercept = np.polyfit(pred, obs, 1)
     return float(slope), float(intercept)
+
+
+# ---------------------------------------------------------- amplitude cal
+# The handoff gate measures two independent things: the SHAPE of the surface
+# (does the ranking differ between fixtures) and its AMPLITUDE (calibration
+# slope). Shrinking the reordering coefficients trades one against the other
+# and cannot satisfy both -- scripts/reorder_shrink_curve.py measures the two
+# admissible sets as disjoint (calibration needs s <= 0.65, the reordering
+# criterion needs s >= 0.98 on the same split).
+#
+# Amplitude, unlike shape, can be moved at zero cost to the ranking, because
+#
+#     p -> m * (p / m) ** k          (m = mean rate, k > 0)
+#
+# is strictly increasing for every k: every rank is preserved, so both
+# rank-based gate statistics are unchanged BY CONSTRUCTION rather than by
+# luck. It also stays positive for every p > 0, unlike the affine form
+# m + k(p-m), which goes negative below m(1 - 1/k) and has to be clipped; the
+# tie mass that clipping creates drags the surface Spearman down (0.9896 ->
+# 0.9375 at k=1.46), so that variant "passes" by destroying the ranking.
+SURFACE_AMP_COLS = ("pred_speeding", "pred_speeding_count",
+                    "pred_speeding_network", "pred_speeding_plugin",
+                    "pred_speeding_temporal", "pred_speeding_lo",
+                    "pred_speeding_hi")
+# An exponent outside this range is not a calibration correction, it is a
+# different model. The in-sample slope has to be believable before it is
+# allowed to reshape the surface that ships.
+SURFACE_AMP_BOUNDS = (0.50, 2.50)
+
+
+def fit_surface_amplitude(work, info, args, audit, sample_rows=40000):
+    """In-sample calibration slope of the count surface on TRAIN game rows.
+
+    Finds k so that p -> m(p/m)^k makes the slope of Y on the predicted mean
+    equal to 1 on the rows the model was fitted to. Background rows are
+    excluded: their log_att is 0 by construction, and the handoff gate scores
+    in-event rows only, so calibrating against a background-heavy pool would
+    answer a different question than the one the gate asks.
+
+    Returns (k, m). This FAILS the run instead of returning 1.0 when the
+    slope is unusable: a surface that was asked to be amplitude-calibrated
+    and silently was not would reach the handoff gate looking merely
+    uncalibrated, which is the one thing this gate exists to prevent.
+    """
+    if "Y" not in work.columns:
+        raise SystemExit("--surface-amp-cal: training frame has no Y column")
+    pool = work
+    if "in_event" in work.columns:
+        _ev = pd.to_numeric(work["in_event"], errors="coerce").fillna(0.0)
+        if int((_ev > 0.5).sum()) >= 200:
+            pool = work[_ev > 0.5]
+    n = int(min(int(sample_rows), len(pool)))
+    if n < 500:
+        raise SystemExit(f"--surface-amp-cal: only {n} train game rows; "
+                         "an amplitude cannot be calibrated from that")
+    samp = pool.sample(n=n, random_state=int(getattr(args, "seed", 7)))
+    pred = np.maximum(predict_metacount_sim(
+        samp, info, id_col="row_id", y_col="Y",
+        R=max(100, int(getattr(args, "surface_amp_r", 200))),
+        chunk=25000), 1e-12)
+    y = pd.to_numeric(samp["Y"], errors="coerce").to_numpy(float)
+    slope, icept = _calibration(y, pred)
+    if not np.isfinite(slope) or slope <= 0:
+        raise SystemExit(
+            f"--surface-amp-cal: in-sample calibration slope is {slope}; "
+            "the fit cannot calibrate its own amplitude")
+    m = float(np.exp(np.mean(np.log(pred))))
+    # LEVEL, not just slope. The calibration slope is invariant to a global
+    # multiplicative shift of pred, so it cannot answer "does the surface ship
+    # at half its own training rate" -- a surface that is 0.5x everywhere has
+    # slope 1.0 exactly. These two ratios are the in-sample analogues of the
+    # holdout pred/E vs train Y/E comparison: sum(pred)/sum(Y) is the shipped
+    # level, and the exposure-normalised ratio is the same statement per unit
+    # of exposure. With a free intercept in a Poisson/NB likelihood the first
+    # is 1 by the score equation, so a value far from 1 means either the
+    # intercept did not enter eta or the offset column changed scale.
+    _sum_y = max(float(np.sum(y)), 1e-12)
+    level_ratio = float(np.sum(pred) / _sum_y)
+    rate_ratio = None
+    if "logexp" in samp.columns:
+        # Per-ROW exposure weighting. Writing this as (sum pred / sum E) /
+        # (sum Y / sum E) collapses algebraically to level_ratio -- the same
+        # number printed twice, which is what the first measure run did. The
+        # rate statement only differs from the level statement when each row
+        # is divided by ITS OWN exposure.
+        _E = np.exp(np.asarray(samp["logexp"], float))
+        _E = np.where(np.isfinite(_E) & (_E > 0), _E, np.nan)
+        _ok = np.isfinite(_E)
+        if _ok.sum() > 10:
+            _den = float(np.sum(y[_ok] / _E[_ok]))
+            if _den > 0:
+                rate_ratio = float(np.sum(pred[_ok] / _E[_ok]) / _den)
+    audit["surface_amp"] = {
+        "in_sample_slope": round(float(slope), 4),
+        "in_sample_intercept": (round(float(icept), 5)
+                                if np.isfinite(icept) else None),
+        "in_sample_level_ratio": round(level_ratio, 4),
+        "in_sample_rate_ratio": (round(rate_ratio, 4)
+                                 if rate_ratio is not None else None),
+        "k": round(float(slope), 4), "mean_rate": round(m, 6),
+        "n_rows": n, "population": "train game rows"}
+    print(f"   [amp] in-sample calibration on {n:,} train game rows: "
+          f"slope={slope:.4f} -> k={slope:.4f} (m={m:.5f})")
+    print(f"   [amp] in-sample level: sum(pred)/sum(Y)={level_ratio:.4f}"
+          + (f", pred/E over Y/E={rate_ratio:.4f}"
+             if rate_ratio is not None else ""))
+    # The bounds guard applies to APPLYING the exponent, not to MEASURING it.
+    # In 'measure' mode a slope of, say, 0.36 is the finding: refusing to go on
+    # (and with it, skipping the holdout) would hide the very number the run
+    # was made for. Applying is different -- an exponent outside the band is a
+    # different model, so it must abort before it reshapes anything.
+    lo, hi = SURFACE_AMP_BOUNDS
+    if not (lo <= float(slope) <= hi):
+        if str(getattr(args, "surface_amp_cal", "off")).lower() == "measure":
+            print(f"   [amp] WARN: in-sample slope {slope:.3f} outside "
+                  f"[{lo}, {hi}]; measured only, nothing is rescaled. An "
+                  "exponent in this range would be a different model, so "
+                  "--surface-amp-cal on would refuse it")
+        else:
+            raise SystemExit(
+                f"--surface-amp-cal: in-sample slope {slope:.3f} outside "
+                f"[{lo}, {hi}]; that is a broken fit, not a correction")
+    return float(slope), m
+
+
+def apply_surface_amplitude(out, k, m, audit=None, obs=None):
+    """Reshape every shipped rate column by p -> m(p/m)^k.
+
+    obs is passed for DIAGNOSTIC reporting only (the holdout slope before and
+    after the map); k is already fixed from training rows and is never
+    re-derived from these observations.
+    """
+    cols = [c for c in SURFACE_AMP_COLS if c in out.columns]
+    if not cols:
+        raise SystemExit("surface amplitude: no rate column to rescale")
+    pre = np.maximum(out["pred_speeding"].to_numpy(float), 1e-12)
+    # Monotonicity is the entire argument for this map, so check it instead
+    # of asserting it: ranks must be identical on a sample of rows.
+    _s = np.random.RandomState(0).choice(len(pre), size=min(50000, len(pre)),
+                                         replace=False)
+    _ra = pd.Series(pre[_s]).rank().to_numpy()
+    _rb = pd.Series(m * (pre[_s] / m) ** k).rank().to_numpy()
+    rank_rho = float(np.corrcoef(_ra, _rb)[0, 1]) if len(_s) > 10 else float("nan")
+    # Build the holdout diagnostic BEFORE the mutation below. Doing it after
+    # meant both "before" and "after" were read off the mapped column: the
+    # first run printed "holdout slope 0.0004 -> 0.0000" when the pre-map
+    # surface was known to be 1.4613, so the AFOR value was mislabelled as
+    # BEFORE and the one number that shows the exponent does not transfer
+    # was hidden.
+    diag = None
+    if obs is not None and "observed" in getattr(obs, "columns", []):
+        try:
+            _key = out[["fixture", "road_osmid", "bin"]].copy()
+            _key["p_pre"] = pre
+            diag = _key.merge(
+                obs[["fixture", "road_osmid", "bin", "observed"]],
+                on=["fixture", "road_osmid", "bin"], how="inner")
+        except Exception as exc:  # noqa: BLE001
+            print(f"   WARN: amp diagnostic frame failed ({exc})")
+            diag = None
+    post_mean = {}
+    for c in cols:
+        v = np.maximum(out[c].to_numpy(float), 1e-12)
+        out[c] = m * (v / m) ** k
+        post_mean[c] = round(float(out[c].mean()), 8)
+    if audit is not None:
+        audit.setdefault("surface_amp", {}).update({
+            "applied_columns": cols, "rank_spearman_pre_post": rank_rho,
+            "post_mean": post_mean})
+    print(f"   [amp] surface p -> m(p/m)^{k:.4f} on {len(cols)} rate "
+          f"column(s); rank check rho={rank_rho:.6f}")
+    if diag is not None and len(diag) > 10:
+        try:
+            p_pre = diag["p_pre"].to_numpy(float)
+            s0, _ = _calibration(diag["observed"], p_pre)
+            s1, _ = _calibration(diag["observed"], m * (p_pre / m) ** k)
+            if audit is not None:
+                audit["surface_amp"].update({
+                    "holdout_slope_before": round(float(s0), 4),
+                    "holdout_slope_after": round(float(s1), 4),
+                    "holdout_note": ("diagnostic only; k came from train "
+                                     "rows, not from these observations")})
+            print(f"   [amp] holdout slope {s0:.4f} -> {s1:.4f} "
+                  "(reporting only; k was fitted on train rows)")
+        except Exception as exc:  # noqa: BLE001
+            print(f"   WARN: amp holdout diagnostic failed ({exc})")
+    return out
 
 
 def load_panel(path, target=None):
@@ -616,6 +876,8 @@ def add_calendar(frame):
     frame["weekend"] = (dow >= 5).astype(float)
     frame["tod_quarter"] = dt.dt.hour * BINS_PER_HOUR + dt.dt.minute // 15
     frame["dow"] = dow
+    for i in range(7):
+        frame[f"dow_d{i}"] = (dow == i).astype(float)
     return frame
 
 
@@ -627,6 +889,13 @@ def build_profile(background):
 
 
 def add_exposure(frame, ctx, seg_flow, profile):
+    # Idempotent: drop previously derived columns first. A second call on an
+    # already-exposed frame (e.g. the no-game twin, copied from the game
+    # grid) would otherwise merge bin_factor onto itself -> bin_factor_x/_y
+    # and KeyError downstream (o26642598: counterfactual failed on all 6
+    # fixtures, killing game_lift and the SD comparison with it).
+    frame = frame.drop(columns=["bin_factor", "exp", "logexp", "log_flow_z"],
+                       errors="ignore")
     if profile:
         prof = pd.DataFrame(
             [(dow, quarter, factor) for (dow, quarter), factor
@@ -647,6 +916,9 @@ def add_exposure(frame, ctx, seg_flow, profile):
         frame["log_flow_z"] = np.clip((_lf - _m) / (_s if _s > 0 else 1.0), -3.0, 3.0)
     except Exception:
         frame["log_flow_z"] = 0.0
+    # Now that log_flow_z exists, build the kickoff x flow crosses here rather
+    # than in add_game_wide (which always runs first and would read zeros).
+    frame = add_kick_flow_crosses(frame)
     return frame
 
 
@@ -878,6 +1150,110 @@ def add_exposure_shape(frame, params=None, hinge=False, interact_hw=False):
     return out, (params if params else None)
 
 
+# --------------------------------------------------------------------------
+# GAME-DAY CELLS: the resolution at which a fixture-specific effect is
+# estimable.
+#
+# T9 asked for a grouped random slope per fixture on six segment-level
+# covariates (dist_stad, seg_event_uplift_z, lanes_z, maxspeed_z, rel_sin,
+# rel_cos): 39 fixtures x 6 = 234 coefficients identified from 3,816 events,
+# i.e. ~16 events per coefficient, each of them a *different* function of the
+# segment attributes. That is why the surface came back with one shape for
+# both games and 97.7% of its variance between segments -- there was nothing
+# to estimate the game-specific part with.
+#
+# The parameters that ARE identifiable at this event count are cell-level:
+# road class x distance-to-stadium band. 3 classes x 4 bands = 12 cells, and
+# the fixture-specific part enters through game-day ATTRIBUTES (attendance,
+# kickoff, in-event, the within-window Fourier pair) whose coefficients are
+# estimated per cell. So a sellout derby and a quiet Sunday fixture differ,
+# and they differ by road class and distance band, which is the resolution
+# 3.8k events can support.
+GAME_CELL_CLASSES = {
+    "motorway": "arterial", "motorway_link": "arterial",
+    "trunk": "arterial", "trunk_link": "arterial",
+    "primary": "arterial", "primary_link": "arterial",
+    "secondary": "secondary", "secondary_link": "secondary",
+    "tertiary": "secondary", "tertiary_link": "secondary",
+    "residential": "local", "living_street": "local",
+    "service": "local", "unclassified": "local",
+}
+# Fixed km edges, NOT quantiles: the same cell must mean the same thing on a
+# future frame, which is fitted with the train frame's categories. Edges are
+# approximate Brisbane CBD radii (Suncorp sits ~1 km from the CBD core).
+GAME_CELL_DIST_EDGES = (0.0, 1.0, 2.5, 5.0, np.inf)
+GAME_CELL_DIST_LABELS = ("d0_1km", "d1_2.5km", "d2.5_5km", "d5km_plus")
+# Coarse alternative (--grouped-game-bands band): three distance bands with
+# road class collapsed away. With 3 classes x 4 bands the grid has 12 cells but
+# only 9 populated, and the thinnest (`secondary|d0_1km`) carries 16 events
+# against 7 grouped coefficients -- ~2 events per parameter. Dropping the class
+# dimension gives 3 groups of ~145 / 2075 / 1012 events, i.e. 21 coefficients
+# over 3.2k events, so the level of each band is estimated from the whole ring
+# rather than from one road class in it. The class split is not lost from the
+# surface: `hw_*` dummies and the att_x_length / att_x_dist interactions still
+# vary within a band.
+GAME_CELL_BAND_EDGES3 = (0.0, 1.0, 2.5, np.inf)
+GAME_CELL_BAND_LABELS3 = ("d0_1km", "d1_2.5km", "d2.5plus")
+# Set from --grouped-game-bands in main() BEFORE any frame is built, because
+# add_game_cells is called (through add_static) on the event, background and
+# future frames alike and all three must produce the same grouping key.
+GAME_CELL_GRAIN = "class_band"
+GAME_CELL_COL = "gcell"
+
+
+def game_cell_categories():
+    """The fixed category list for the active cell grain."""
+    if GAME_CELL_GRAIN == "band":
+        return [str(b) for b in GAME_CELL_BAND_LABELS3]
+    if GAME_CELL_GRAIN == "class":
+        return ["arterial", "secondary", "local"]
+    return [f"{c}|{b}" for c in ("arterial", "secondary", "local")
+            for b in GAME_CELL_DIST_LABELS]
+
+
+def add_game_cells(frame, class_col="highway", dist_col="dist_stad"):
+    """Add the road-class x distance-band cell key used as the grouping dim.
+
+    Written for every frame that goes through add_static -- event windows,
+    sampled background and future-game frames -- because the grouped random
+    coefficient is indexed by this column at prediction time as well as fit
+    time, and a missing group column would silently give each row its own
+    group.
+    """
+    n = len(frame)
+    cls = (frame[class_col].astype("string").str.strip().str.lower()
+           if class_col in frame.columns
+           else pd.Series(["unclassified"] * n, index=frame.index))
+    cls = cls.fillna("unclassified")
+    frame["gclass"] = cls.map(GAME_CELL_CLASSES).fillna("local").astype(str)
+    dist = (pd.to_numeric(frame[dist_col], errors="coerce")
+            if dist_col in frame.columns
+            else pd.Series([0.0] * n, index=frame.index))
+    dist = dist.fillna(0.0).to_numpy(float)
+    if GAME_CELL_GRAIN == "band":
+        frame["gband"] = pd.cut(dist, bins=list(GAME_CELL_BAND_EDGES3),
+                                labels=list(GAME_CELL_BAND_LABELS3),
+                                right=False, include_lowest=True).astype(str)
+        key = frame["gband"].astype(str)
+    else:
+        frame["gband"] = pd.cut(dist, bins=list(GAME_CELL_DIST_EDGES),
+                                labels=list(GAME_CELL_DIST_LABELS),
+                                right=False, include_lowest=True).astype(str)
+        key = (frame["gclass"].astype(str) + "|"
+               + frame["gband"].astype(str))
+        if GAME_CELL_GRAIN == "class":
+            key = frame["gclass"].astype(str)
+    # FIXED category list, not observed values. metacountregressor codes the
+    # group column with astype("category").cat.codes, which derives its
+    # categories from whatever frame it is handed: a prediction frame that
+    # happens to lack one cell would shift every later code and silently apply
+    # another cell's coefficients. Declaring the categories keeps the coding
+    # identical on the fit frame and every future frame.
+    frame[GAME_CELL_COL] = pd.Categorical(key,
+                                          categories=game_cell_categories())
+    return frame
+
+
 def add_static(frame, ctx):
     merged = frame.merge(ctx, on="road_osmid", how="left")
     for col in CONT_VARS:
@@ -892,6 +1268,7 @@ def add_static(frame, ctx):
     # "unknown" dummy that static_context() no longer emits.
     merged["highway"] = (merged["highway"].astype("string")
                          .fillna("unclassified").astype(str))
+    merged = add_game_cells(merged)
     return merged
 
 
@@ -939,11 +1316,55 @@ def add_game_wide(frame, crowd_med=None):
     frame["rel_x_dist"] = rh * ds
     frame["att_x_dist"] = la * ds
     frame["ev_x_lanes"] = ie * lz
+    mz = pd.to_numeric(frame["maxspeed_z"], errors="coerce").fillna(0.0).to_numpy(float) if "maxspeed_z" in frame.columns else np.zeros(n)
+    ll = pd.to_numeric(frame["log_length"], errors="coerce").fillna(0.0).to_numpy(float) if "log_length" in frame.columns else np.zeros(n)
+    frame["att_x_lanes"] = la * lz
+    frame["att_x_maxspeed"] = la * mz
+    frame["att_x_length"] = la * ll
+    frame["ko_x_dist"] = koh * ds
+    # Kickoff x flow (the second, CROWD-INDEPENDENT scoring direction -- see
+    # the INTERACT_VARS note) is built by add_kick_flow_crosses below, not
+    # here: log_flow_z is dropped and rebuilt inside add_exposure, which runs
+    # AFTER this function in every frame path. Computing it here reads a
+    # missing column, gets zeros, and leaves two dead terms in the design --
+    # the same failure that once made evu_x_att all-zero for a whole search.
+    frame = add_kick_flow_crosses(frame)
     # NOTE: evu_x_att is NOT computed here. seg_event_uplift_z is attached by
     # apply_temporal_x, which runs AFTER this function in every frame path
     # (build_game_frame -> ... -> apply_temporal_x), so computing it here
     # silently produced an all-zero column and the search could never use it.
     # apply_temporal_x owns the interaction.
+    return frame
+
+
+def add_kick_flow_crosses(frame):
+    """sin/cos(kickoff) x segment flow -- the crowd-independent direction.
+
+    Idempotent and cheap, so it is called from BOTH add_game_wide and
+    add_exposure: whichever runs last sees log_flow_z, and the value is
+    rebuilt identically (it is a pure function of ko/flow). Kickoff is taken
+    from ko_hour when present, else from the ko_tod_* columns, else the
+    crosses are left at zero and the reorder guard in main() fails the run
+    rather than fitting two dead columns.
+    """
+    n = len(frame)
+    koh = (pd.to_numeric(frame["ko_hour"], errors="coerce")
+           .fillna(0.0).to_numpy(float) if "ko_hour" in frame.columns
+           else None)
+    if koh is not None:
+        ks = np.sin(2 * np.pi * koh / 24.0)
+        kc = np.cos(2 * np.pi * koh / 24.0)
+    elif "ko_tod_sin" in frame.columns:
+        ks = pd.to_numeric(frame["ko_tod_sin"], errors="coerce").fillna(0.0).to_numpy(float)
+        kc = pd.to_numeric(frame["ko_tod_cos"], errors="coerce").fillna(0.0).to_numpy(float)
+    else:
+        ks = np.zeros(n)
+        kc = np.zeros(n)
+    lfz = (pd.to_numeric(frame["log_flow_z"], errors="coerce").fillna(0.0)
+           .to_numpy(float) if "log_flow_z" in frame.columns
+           else np.zeros(n))
+    frame["ko_sin_x_flow"] = ks * lfz
+    frame["ko_cos_x_flow"] = kc * lfz
     return frame
 
 
@@ -1023,6 +1444,204 @@ def estimate_clock_prof(train_events, target):
     return prof
 
 
+def estimate_flow_anomaly(panel, cal, train_ids, future_ids, seed=7):
+    """Per-segment trailing same-DOW flow anomaly (memory-safe).
+
+    WHY (collapsed telematics): exposure enters as static seg_flow x one
+    global uplift curve, so no predictor varies by segment x game and the
+    ranking cannot reorder streets. This builds the missing segment x game
+    telematics WITHOUT materialising history per row: one (road_osmid, date)
+    aggregate (~3M rows transient), then per-fixture / per-week lookups.
+    NOT a static mean: the baseline is the same-DOW mean 5-11 weeks back,
+    the signal the trailing 4 same-DOW occurrences (1-4 weeks back), both
+    strictly past-only and known before kickoff. log-ratio, winsorized +-3.
+    Returns (anom_by_fixture, anom_by_weekkey, audit) where week keys are
+    (week_monday, dow) -> Series(seg -> anom).
+    """
+    audit = {"estimated": False}
+    try:
+        _bin = pd.to_datetime(panel["bin"], utc=True).dt.tz_convert(TZ)
+        # tz-naive Brisbane wall time everywhere below: mixing aware/naive
+        # datetimes raises "Invalid comparison ..." (o26613390) and zeroes
+        # the whole anomaly.
+        _date = _bin.dt.normalize().dt.tz_localize(None)
+        _dow = _bin.dt.dayofweek.to_numpy()
+        _seg = pd.to_numeric(panel["road_osmid"], errors="coerce").to_numpy()
+        _v = pd.to_numeric(panel["vehicle_count"], errors="coerce").fillna(0.0).to_numpy(float)
+        del _bin
+        _fut_ko = pd.to_datetime(
+            cal[cal["fixture_id"].isin(set(future_ids))]["ko"],
+            utc=True).dt.tz_convert(TZ).dt.tz_localize(None)
+        _cutoff = _fut_ko.min().normalize() if len(_fut_ko) else _date.max()
+        if getattr(_cutoff, "tzinfo", None) is not None:
+            _cutoff = _cutoff.tz_localize(None)
+        _daily = pd.DataFrame({"seg": _seg, "date": _date.to_numpy(),
+                               "dow": _dow, "v": _v})
+        del _seg, _v, _date, _dow
+        _daily = (_daily[_daily["date"] < _cutoff.to_numpy()]
+                  .groupby(["seg", "date", "dow"], observed=True)["v"].sum())
+        # NB: _daily is already the ("v") Series from the groupby above, so
+        # aggregate its values directly (["v"]] here raised "Column not
+        # found: v", zeroing the whole anomaly in o26650291).
+        _mat = _daily.groupby(["seg", "date"]).sum().unstack(fill_value=0.0)
+        del _daily
+        _dates = pd.to_datetime(_mat.columns)
+        _cols = {pd.Timestamp(d).normalize(): d for d in _dates}
+        _dows = _dates.dayofweek.to_numpy()
+
+        def _window_mean(ref, lags):
+            _cc = [_cols.get((ref - pd.Timedelta(days=int(k))).normalize())
+                   for k in lags]
+            _cc = [c for c in _cc if c is not None]
+            if not _cc:
+                return None
+            return _mat[_cc].mean(axis=1)
+
+        def _anom(trail, base):
+            _a = (np.log1p(trail.fillna(0.0).to_numpy(float))
+                  - np.log1p(base.reindex(trail.index).fillna(0.0).to_numpy(float)))
+            return pd.Series(np.clip(_a, -3.0, 3.0), index=trail.index)
+
+        _ko = dict(zip(cal["fixture_id"].astype(str),
+                         pd.to_datetime(cal["ko"], utc=True).dt.tz_convert(TZ).dt.tz_localize(None)))
+        _all_fx = [str(f) for f in list(train_ids) + list(future_ids)]
+        anom_fx, _cov = {}, []
+        for _fx in _all_fx:
+            _k = _ko.get(_fx, None)
+            if _k is None:
+                continue
+            _kd = _k.normalize()
+            _trail = _window_mean(_kd, range(1, 29))
+            _bd = _kd.dayofweek
+            # Same-DOW baseline occurrences 5-11 weeks back (no overlap with
+            # the trailing 1-4 week signal window).
+            _same = [(_kd - pd.Timedelta(days=35 + _d * 7)).normalize()
+                     for _d in range(7)]
+            _same = [c for c in _same if c in _cols]
+            if _trail is None or not _same:
+                continue
+            _base = _mat[[_cols[c] for c in _same]].mean(axis=1)
+            _s = _anom(_trail, _base)
+            anom_fx[_fx] = _s
+            _cov.append(float((_trail > 0).mean()))
+        # Background weeks: every Monday in span x DOW -> Series(seg).
+        _mind = _mat.columns.min().normalize()
+        _mons = pd.date_range(start=_mind - pd.Timedelta(days=_mind.dayofweek),
+                              end=_cutoff, freq="W-MON")
+        anom_wk = {}
+        for _w in _mons:
+            _w0 = _w.normalize()
+            for _d in range(7):
+                _ref = _w0 + pd.Timedelta(days=int(_d))
+                _trail = _window_mean(_ref, range(1, 29))
+                _same = [(_ref - pd.Timedelta(days=28 + _d * 7 + _k2)).normalize()
+                         for _k2 in range(7)]
+                _same = [c for c in _same if c in _cols]
+                if _trail is None or not _same:
+                    continue
+                _base = _mat[[_cols[c] for c in _same]].mean(axis=1)
+                anom_wk[(_w0, _d)] = _anom(_trail, _base)
+        del _mat
+        gc.collect()
+        _all = np.concatenate([s.to_numpy(float) for s in anom_fx.values()]) \
+            if anom_fx else np.array([0.0])
+        audit = {"estimated": True, "n_fixtures": len(anom_fx),
+                 "n_weekkeys": len(anom_wk),
+                 "mean_coverage": round(float(np.mean(_cov)), 3) if _cov else 0.0,
+                 "sd": round(float(_all.std()), 4)}
+        print(f"   flow anomaly: {len(anom_fx)} fixtures, {len(anom_wk)} "
+              f"week-keys, coverage={audit['mean_coverage']}, sd={audit['sd']}")
+    except Exception as exc:  # noqa: BLE001 - candidate degrades to zero
+        print(f"   WARN: flow-anomaly estimate failed ({exc})")
+        return {}, {}, audit
+    return anom_fx, anom_wk, audit
+
+
+def apply_flow_anomaly(frame, anom_fx=None, anom_wk=None, by="fixture",
+                       disabled=False):
+    """Attach flow_anom (0.0 default when maps missing/disabled).
+
+    by="fixture": keyed on frame["fixture"] (event + future grids).
+    by="week": keyed on (row-week Monday, row DOW) (background rows).
+    """
+    if disabled or (not anom_fx and not anom_wk):
+        if "flow_anom" not in frame.columns:
+            frame["flow_anom"] = 0.0
+        return frame
+    out = pd.Series(0.0, index=frame.index)
+    try:
+        if by == "week":
+            _dt = pd.to_datetime(frame["bin"], utc=True).dt.tz_convert(TZ).dt.tz_localize(None)
+            _wk = (_dt.dt.normalize()
+                   - pd.to_timedelta(_dt.dt.dayofweek, unit="D"))
+            _dw = _dt.dt.dayofweek.to_numpy()
+            for (_w, _d), _idx in frame.groupby([_wk, pd.Series(_dw, index=frame.index)]).groups.items():
+                _s = (anom_wk or {}).get((pd.Timestamp(_w).normalize(), int(_d)), None)
+                if _s is None:
+                    continue
+                out.loc[_idx] = frame.loc[_idx, "road_osmid"].map(_s).fillna(0.0)
+        else:
+            for _fx, _idx in frame.groupby("fixture").groups.items():
+                _s = (anom_fx or {}).get(str(_fx), None)
+                if _s is None:
+                    continue
+                out.loc[_idx] = frame.loc[_idx, "road_osmid"].map(_s).fillna(0.0)
+    except Exception:  # noqa: BLE001 - partial attach keeps zeros
+        pass
+    frame["flow_anom"] = pd.to_numeric(out, errors="coerce").fillna(0.0).clip(-3.0, 3.0)
+    return frame
+
+
+def load_weather_daily():
+    """Drop-in weather hook: data/weather_daily.csv (date,rain_mm,temp_max_c,...).
+
+    Absent today (no weather in panel, hard-braking CSV or data/) -> ({}, [])
+    and the search pool is unchanged. Add the file (one row per date,
+    numeric columns) and its columns enter the fixed-only candidate pool,
+    z-scored on pre-cutoff dates (no leakage), merged by date in every frame.
+    Returns (weather_by_date dict, stats dict).
+    """
+    global WEATHER_COLS
+    WEATHER_COLS = []
+    _p = DATA / "weather_daily.csv"
+    if not _p.is_file():
+        return {}, {}
+    try:
+        _w = pd.read_csv(_p)
+        _w["date"] = pd.to_datetime(_w["date"]).dt.normalize()
+        _num = [c for c in _w.columns
+                if c != "date"
+                and pd.api.types.is_numeric_dtype(pd.to_numeric(_w[c], errors="coerce"))]
+        if not _num:
+            return {}, {}
+        WEATHER_COLS = list(_num)
+        _out, _stats = {}, {}
+        for _c in _num:
+            _s = pd.to_numeric(_w[_c], errors="coerce")
+            _stats[_c] = (float(_s.mean()), float(_s.std()) if float(_s.std()) > 0 else 1.0)
+            _out[_c] = dict(zip(_w["date"], _s))
+        print(f"   weather: {len(_w)} days, cols={WEATHER_COLS}")
+        return _out, _stats
+    except Exception as exc:  # noqa: BLE001
+        print(f"   WARN: weather load failed ({exc})")
+        WEATHER_COLS = []
+        return {}, {}
+
+
+def apply_weather(frame, wmap=None, wstats=None, disabled=False):
+    """Merge daily weather by row date; z-scored, 0.0 when missing."""
+    if disabled or not wmap:
+        return frame
+    try:
+        _dt = pd.to_datetime(frame["bin"], utc=True).dt.tz_convert(TZ).dt.normalize()
+        for _c, _d in wmap.items():
+            _m, _s = (wstats or {}).get(_c, (0.0, 1.0))
+            frame[_c] = ((_dt.map(_d).astype(float) - _m) / _s).fillna(0.0).clip(-3.0, 3.0)
+    except Exception:  # noqa: BLE001
+        pass
+    return frame
+
+
 def apply_temporal_x(frame, seg_risk_map=None, clock_prof=None,
                      seg_event_uplift_map=None):
     """Attach seg_risk_z / clock_prof / exp_lag1 / seg_event_uplift_z."""
@@ -1068,6 +1687,849 @@ def apply_temporal_x(frame, seg_risk_map=None, clock_prof=None,
                              .fillna(0.0).astype(float)
                              if "exp" in frame.columns else 0.0)
     return frame
+
+
+SD_EDGES = np.linspace(-30.0, 60.0, 19)
+
+
+def _crc(s):
+    import zlib
+    return zlib.crc32(str(s).encode())
+
+
+def _sd_limit(frame):
+    """Speed limit per row: panel speed_limit, else ctx maxspeed_kmh."""
+    for col in ("speed_limit", "maxspeed_kmh"):
+        if col in frame.columns:
+            v = pd.to_numeric(frame[col], errors="coerce")
+            if v.notna().any():
+                return v.fillna(v.median()).to_numpy(float)
+    return np.full(len(frame), 50.0)
+
+
+def fit_speed_density(df, min_rows=200, penetration=0.05, bin_hours=0.25,
+                      kj_prior_real=120.0, kj_mode="theory", shrink_rows=2000.0):
+    """Greenshields v = vf*(1 - k/kj) per highway class.
+
+    JAM DENSITY IS NOT A STATISTICAL PARAMETER -- so it is not estimated.
+    kj is set by road geometry: at standstill each vehicle occupies its
+    length plus a gap, ~6-8 m, so kj_real ~ 120-165 veh/km/lane whatever
+    the traffic. That is why kj_mode defaults to "theory": the knee is
+    known physics, and letting the data choose it is what produced the
+    noise-dominated spread (trunk_link 0.6 vs tertiary_link 1.0 on the same
+    count scale, two classes with near-identical free-flow speed). Fitting
+    it was fitting an extrapolation through data that never approaches jam.
+
+    Only vf (free-flow speed) is estimated, because free-flow IS densely
+    observed. So the model is pure prediction on one parameter and a
+    physical constant on the other -- no EB, no shrinkage, no prior
+    weighting.
+
+    THE UNITS ARE NOT A BUG. k = q/v uses per-bin probe COUNTS, so it is a
+    count-scale density:  k_real = k_cnt / (bin_hours * penetration). The
+    theory knee on the count scale is kj_real*bin_hours*penetration
+    (~120*0.25*0.05 = 1.5), which is exactly where the OLS estimates landed
+    (0.6-3.0) -- so the count convention is consistent between fit and
+    predict and only the ESTIMATOR was noisy.
+
+    kj_mode:
+      theory (default) - kj from geometry, vf fitted. Pure prediction.
+      ols     - kj from the OLS slope (noisy; kept for the sensitivity arm).
+      eb      - kj shrunk toward theory by near-jam support (superseded).
+
+    Returns {class: (vf, kj)} plus '_diag' and the theory anchors for the
+    audit.
+    """
+    d = pd.DataFrame({
+        "cls": df["highway"].fillna("unclassified").astype(str)
+        if "highway" in df.columns else "unclassified",
+        "q": pd.to_numeric(df["vehicle_count"], errors="coerce").fillna(0.0)
+        if "vehicle_count" in df.columns else 0.0,
+        "v": pd.to_numeric(df["mean_vehicle_speed_kmh"], errors="coerce")
+        if "mean_vehicle_speed_kmh" in df.columns else np.nan,
+    })
+    d = d[np.isfinite(d["v"].to_numpy()) & (d["v"].to_numpy() > 0)].copy()
+    scales = 1.0 / max(float(bin_hours) * max(float(penetration), 1e-9),
+                       1e-12)
+    kj_thy = float(kj_prior_real) / scales    # count units
+    mode = str(kj_mode or "theory").lower()
+
+    def _one(g):
+        """Return (vf, kj, diag). vf from data; kj per `mode`."""
+        if len(g) < min_rows:
+            return None
+        k = (g["q"] / g["v"]).to_numpy(float)
+        v = g["v"].to_numpy(float)
+        cap = float(np.quantile(k, 0.99)) if len(k) else 0.0
+        m = k <= max(cap, 1e-9)
+        k, v = k[m], v[m]
+        if len(k) < min_rows:
+            return None
+        # vf: intercept of v on k at k->0 is well identified (free-flow is
+        # densely observed), so fit it on the LOW-density core only.
+        klo = k <= np.quantile(k, 0.5)
+        kk, vv = (k[klo], v[klo]) if klo.sum() >= min_rows else (k, v)
+        A = np.vstack([np.ones_like(kk), kk]).T
+        (a, b), _, _, _ = np.linalg.lstsq(A, vv, rcond=None)
+        vf = float(np.clip(a, 5.0, 130.0))
+        n_near = float((k >= 0.5 * kj_thy).sum())
+        kj_ols = float(-vf / b) if b < -1e-9 else float("nan")
+        if mode == "ols":
+            kj = kj_ols if np.isfinite(kj_ols) else kj_thy
+            kj = float(max(kj, 0.9 * kj_thy))
+        elif mode == "eb":
+            w = n_near / (n_near + max(float(shrink_rows), 1.0))
+            kj = (w * kj_ols + (1.0 - w) * kj_thy) \
+                if np.isfinite(kj_ols) else kj_thy
+            kj = float(max(kj, 0.9 * kj_thy))
+        else:
+            kj = kj_thy
+        diag = {"vf": round(vf, 2), "kj": round(float(kj), 3),
+                "kj_mode": mode,
+                "kj_ols": (round(float(kj_ols), 3)
+                           if np.isfinite(kj_ols) else None),
+                "n_near_jam": int(n_near), "n_rows": int(len(g)),
+                "vf_fit_rows": int(len(kk))}
+        return vf, kj, diag
+
+    out, diag = {}, {}
+    for cls, g in list(d.groupby("cls")) + [("_global", d)]:
+        r = _one(g)
+        if r is not None:
+            out[str(cls)] = (r[0], r[1])
+            diag[str(cls)] = r[2]
+    out["_diag"] = diag
+    out["_theory_kj_cnt"] = kj_thy
+    out["_theory_kj_real"] = float(kj_prior_real)
+    out["_density_scale"] = scales
+    out["_kj_mode"] = mode
+    return out
+
+
+def fit_propensity_lookup(df, target):
+    """Empirical speeding rate per (highway class, exceedance bin).
+
+    exceedance e = observed speed - limit; rate = Y.sum()/veh.sum() per
+    cell, smoothed. This is the SD loop's behavioural link: density ->
+    speed -> exceedance -> rate. Fit on TRAIN windows only.
+    """
+    d = pd.DataFrame({
+        "cls": df["highway"].fillna("unclassified").astype(str)
+        if "highway" in df.columns else "unclassified",
+        "q": pd.to_numeric(df["vehicle_count"], errors="coerce").fillna(0.0)
+        if "vehicle_count" in df.columns else 0.0,
+        "v": pd.to_numeric(df["mean_vehicle_speed_kmh"], errors="coerce")
+        if "mean_vehicle_speed_kmh" in df.columns else np.nan,
+        "y": pd.to_numeric(df[target], errors="coerce").fillna(0.0)
+        if target in df.columns else 0.0,
+    })
+    d["lim"] = _sd_limit(df)
+    d = d[np.isfinite(d["v"].to_numpy()) & (d["v"].to_numpy() > 0)].copy()
+    d["e"] = d["v"] - d["lim"]
+    d["bin"] = np.clip(np.digitize(d["e"].to_numpy(float), SD_EDGES) - 1,
+                       0, len(SD_EDGES) - 2)
+    nb = len(SD_EDGES) - 1
+    out = {}
+    for cls, g in list(d.groupby("cls")) + [("_global", d)]:
+        agg = g.groupby("bin").agg(ys=("y", "sum"), qs=("q", "sum"))
+        rate = (agg["ys"] / agg["qs"].clip(lower=1e-9)).reindex(
+            range(nb), fill_value=np.nan)
+        rate = rate.fillna(rate.mean()).fillna(0.0)
+        rate = rate.rolling(3, center=True, min_periods=1).mean()
+        out[str(cls)] = rate.to_numpy(float)
+    return out
+
+
+# ------------------------------------------------------------------ symbolic
+# Genetic-programming form discovery for the SD loop (zero new deps).
+# Trees are nested tuples: ('x',) | ('c',) | (op, left, right?) with ops
+# +,-,*,pdiv (protected), neg, sq, sqrt(abs), nexp=exp(-abs), log1p(abs),
+# squash=1/(1+exp(-x)). Shape is what GP searches: each tree is scored as
+# y = a*f(x)+b with OLS (a,b) per evaluation, BIC = n*log(RSS/n)+k*log(n)
+# with k = node count. Seeded with theory forms + elitism, so discovery can
+# only tie-or-beat Greenshields/logistic; bounded by time budget with silent
+# fallback to the fixed forms. Operates on BINNED data (tens of points), so
+# a full run is seconds, not hours.
+_GP_BINOPS = ("+", "-", "*", "/")
+_GP_UNOPS = ("neg", "sq", "sqrt", "nexp", "log", "squash")
+
+
+def _gp_eval(tree, x):
+    with np.errstate(all="ignore"):
+        if tree[0] == "x":
+            return np.asarray(x, dtype=float)
+        if tree[0] == "c":
+            return np.ones_like(np.asarray(x, dtype=float))
+        op = tree[0]
+        if op in _GP_BINOPS:
+            a = _gp_eval(tree[1], x)
+            b = _gp_eval(tree[2], x)
+            if op == "+":
+                r = a + b
+            elif op == "-":
+                r = a - b
+            elif op == "*":
+                r = a * b
+            else:
+                r = a / np.where(np.abs(b) < 1e-6, np.sign(b) * 1e-6
+                                 if np.any(b) else 1e-6, b)
+            return r
+        a = _gp_eval(tree[1], x)
+        if op == "neg":
+            return -a
+        if op == "sq":
+            return a * a
+        if op == "sqrt":
+            return np.sqrt(np.abs(a))
+        if op == "nexp":
+            return np.exp(-np.abs(np.clip(a, -50.0, 50.0)))
+        if op == "log":
+            return np.log1p(np.abs(a))
+        # squash
+        return 1.0 / (1.0 + np.exp(-np.clip(a, -50.0, 50.0)))
+
+
+def _gp_nodes(tree):
+    if tree[0] in ("x", "c"):
+        return 1
+    return 1 + sum(_gp_nodes(t) for t in tree[1:])
+
+
+def _gp_random(rng, depth, full):
+    if depth <= 0 or (not full and rng.random() < 0.35):
+        return ("x",) if rng.random() < 0.7 else ("c",)
+    if rng.random() < 0.6 or depth == 1:
+        op = rng.choice(_GP_BINOPS)
+        return (op, _gp_random(rng, depth - 1, full),
+                _gp_random(rng, depth - 1, full))
+    return (rng.choice(_GP_UNOPS), _gp_random(rng, depth - 1, full))
+
+
+def _gp_subtrees(tree):
+    yield tree
+    for t in tree[1:]:
+        if isinstance(t, tuple):
+            yield from _gp_subtrees(t)
+
+
+def _gp_replace(tree, target_id, new, _cid=None):
+    if _cid is None:
+        _cid = [0]
+    if _cid[0] == target_id:
+        return new
+    if tree[0] in ("x", "c"):
+        _cid[0] += 1
+        return tree
+    _cid[0] += 1
+    return (tree[0],) + tuple(
+        _gp_replace(t, target_id, new, _cid) if isinstance(t, tuple) else t
+        for t in tree[1:])
+
+
+def _gp_fitness(tree, x, y, w):
+    try:
+        f = np.asarray(_gp_eval(tree, x), dtype=float)
+        m = np.isfinite(f)
+        if m.sum() < 3 or np.std(f[m]) <= 1e-12:
+            return np.inf, (0.0, 0.0)
+        ff, yy, ww = f[m], y[m], w[m]
+        A = np.vstack([ff, np.ones_like(ff)]).T * np.sqrt(ww)[:, None]
+        yw = yy * np.sqrt(ww)
+        (a, b), _, _, _ = np.linalg.lstsq(A, yw, rcond=None)
+        resid = yy - (a * ff + b)
+        rss = float(np.sum(ww * resid * resid))
+        n = float(np.sum(ww > 0))
+        if not np.isfinite(rss) or rss <= 0:
+            return np.inf, (0.0, 0.0)
+        bic = n * np.log(rss / max(n, 1e-9)) + _gp_nodes(tree) * np.log(max(n, 2.0))
+        return float(bic), (float(a), float(b))
+    except Exception:
+        return np.inf, (0.0, 0.0)
+
+
+def _gp_to_str(tree):
+    if tree[0] == "x":
+        return "x"
+    if tree[0] == "c":
+        return "1"
+    sym = {"+": "+", "-": "-", "*": "*", "/": "/"} .get(tree[0], tree[0])
+    if tree[0] in _GP_BINOPS:
+        return f"({_gp_to_str(tree[1])} {sym} {_gp_to_str(tree[2])})"
+    return f"{tree[0]}({_gp_to_str(tree[1])})"
+
+
+def _gp_to_latex(tree):
+    """Render a discovered tree as LaTeX math (infix, operator names)."""
+    if tree[0] == "x":
+        return "x"
+    if tree[0] == "c":
+        return "1"
+    if tree[0] in _GP_BINOPS:
+        a, b = _gp_to_latex(tree[1]), _gp_to_latex(tree[2])
+        if tree[0] == "+":
+            return f"{a} + {b}"
+        if tree[0] == "-":
+            return f"{a} - {b}"
+        if tree[0] == "*":
+            return f"{a} \\cdot {b}"
+        return f"\\frac{{{a}}}{{{b}}}"
+    a = _gp_to_latex(tree[1])
+    if tree[0] == "neg":
+        return f"-{a}"
+    if tree[0] == "sq":
+        return f"{a}^{{2}}"
+    if tree[0] == "sqrt":
+        return f"\\sqrt{{|{a}|}}"
+    if tree[0] == "nexp":
+        return f"e^{{-|{a}|}}"
+    if tree[0] == "log":
+        return f"\\log(1 + |{a}|)"
+    return f"\\sigma({a})"
+
+
+def _tex_num(v, nd=2, default="--"):
+    try:
+        f = float(v)
+        if not np.isfinite(f):
+            return default
+        return f"{f:.{nd}f}"
+    except Exception:
+        return default
+
+
+def write_math_program(out_dir, audit, metrics, sd_fig=None):
+    """Auto-generate game_day_mathprog.tex: the PURELY STATISTICAL programme
+    for per-segment crash-count prediction, with FITTED numbers.
+
+    Y_{ist} ~ NB/Mallows count regression (searched fixed + random terms,
+    Laplace posterior mean) x binomial propensity, EB-shrunk per segment,
+    calibrated, aggregated per segment and rescaled to network scale. No
+    simulation dynamics enter: every line below is the fitted statistical
+    model that ships the P6 roster surface. Self-contained paragraph +
+    equations + fitted-coefficients table; the manuscript \\input's it (see
+    63_paper_assets.pbs copy step). sd_fig is accepted for compatibility
+    and ignored: the statistical programme carries no simulation figure.
+    """
+    out_dir = Path(out_dir)
+    audit = audit or {}
+    m = metrics or {}
+    refit = audit.get("refit") or {}
+    prop = audit.get("propensity") or {}
+    ts = audit.get("two_stage") or {}
+    target = audit.get("target", "trips_mean_gt_10")
+    # Fitted count-model fixed effects from the shipped coefs table (written
+    # just before this call). Random-parameter rows (mean()/sd()/group_)
+    # are reported separately below, not as fixed effects.
+    fixed_rows = []
+    rdm_rows = []
+    try:
+        _cdf = pd.read_csv(out_dir / "game_day_model_coefs.csv")
+        for _, _r in _cdf.iterrows():
+            _v = str(_r["variable"])
+            _t = (float(_r["coefficient"]), float(_r["std_err"]),
+                  float(_r["p_value"]))
+            if _v == "__INTERCEPT__":
+                continue
+            if re.match(r"^(mean\(|sd\(|group_)", _v):
+                rdm_rows.append((_v,) + _t)
+            else:
+                fixed_rows.append((_v,) + _t)
+    except Exception:
+        fixed_rows, rdm_rows = [], []
+    _b0 = None
+    try:
+        _b0 = float(_cdf.set_index("variable").loc[
+            "__INTERCEPT__", "coefficient"])
+    except Exception:
+        pass
+    alpha = refit.get("alpha", None)
+    try:
+        alpha = None if alpha is None else float(alpha)
+    except Exception:
+        alpha = None
+    # Both branches are consumed inside \begin{equation} (see the
+    # Y_{stg} \mid \lambda_{stg} \sim ... line below), so no "$" wrappers:
+    # a "$" there closes the display math and corrupts the whole equation.
+    fam = ("Poisson" if (alpha is None or alpha == 0.0)
+           else f"NB2(\\alpha={_tex_num(alpha, 3)})")
+    prop_terms = prop.get("terms") or {}
+    _pg = [(k, float(v[0]), float(v[1])) for k, v in prop_terms.items()]
+    nfx = audit.get("n_future_fixtures", 6)
+    pen = audit.get("penetration", 0.05)
+    try:
+        pen = float(pen)
+    except Exception:
+        pen = 0.05
+    slope = m.get("calibration_slope", None)
+    icept = m.get("calibration_intercept", None)
+    segspec = m.get("segment_spearman", None)
+    top20 = m.get("segment_top20", None)
+    lift = m.get("game_lift_share", None)
+    lift_fx = m.get("game_lift_share_by_fixture", None) or {}
+
+    def _tt(v):
+        return "\\texttt{" + str(v).replace("_", "\\_") + "}"
+
+    def _frow(v, b, se, p):
+        _sig = "***" if p < 0.001 else ("**" if p < 0.01 else
+                                        ("*" if p < 0.05 else ""))
+        return (f"{_tt(v)} & ${_tex_num(b, 3)}$ & ${_tex_num(se, 4)}$ & "
+                f"${_tex_num(p, 4)}${_sig} \\\\")
+
+    fixed_body = ("\n".join(_frow(*r) for r in fixed_rows) if fixed_rows
+                  else "% no fixed effects recovered from coefs table")
+    rdm_body = ("\n".join(_frow(*r) for r in rdm_rows) if rdm_rows
+                else "% no random-parameter rows recovered")
+    prop_body = ("\n".join(
+        f"{_tt(k)} & ${_tex_num(b, 4)}$ & ${_tex_num(se, 4)}$ \\\\"
+        for k, b, se in _pg) if _pg else "% no propensity terms in audit")
+    lift_fx_str = (", ".join(
+        f"{str(k)[:24]}: ${_tex_num(v, 3)}$"
+        for k, v in list(lift_fx.items())[:6]) if lift_fx
+        else "not computed")
+    n_fixed = len(fixed_rows)
+    n_rdm = len(rdm_rows)
+    # _b0_str is interpolated INSIDE \begin{equation} ... \end{equation}
+    # (see the \\beta_0 \\;({_b0_str}) line below). Wrapping it in "$...$"
+    # closes the surrounding math at the first "$", so the rest of the
+    # display is typeset as text and TeX then reports "Missing $ inserted",
+    # "\hat allowed only in math mode" and "You can't use `\eqno' in math
+    # mode" -- all far from this line. Emit the number bare.
+    _b0_str = (f"{_tex_num(_b0, 3)}" if _b0 is not None
+               else "\\text{[n/a]}")
+    _aic = _tex_num(refit.get("aic", None), 1)
+    _bic = _tex_num(refit.get("bic", None), 1)
+    _spec = str(refit.get("spec_label", ""))
+    _slope = _tex_num(slope, 3) if slope is not None else "not computed"
+    _icept = _tex_num(icept, 4) if icept is not None else "not computed"
+    _segspec = (_tex_num(segspec, 3) if segspec is not None
+                else "not computed")
+    _top20 = (_tex_num(top20, 3) if top20 is not None else "not computed")
+    _lift = (_tex_num(lift, 3) if lift is not None else "not computed")
+    _denom = str((ts.get("denominator", None)
+                  or prop.get("denominator", "")) or "trips")
+    _paic = _tex_num(prop.get("aic", None), 1)
+    _pbic = _tex_num(prop.get("bic", None), 1)
+    _rate = _tex_num(prop.get("mean_rate", None), 5)
+    _pen_pct = _tex_num(1.0 / max(pen, 1e-12), 1)
+
+    tex = (
+        "% game_day_mathprog.tex - generated by 59_game_day_search_predict.py\n"
+        "% PURELY STATISTICAL per-segment crash-count programme: every line\n"
+        "% is the fitted count/propensity model that ships the roster surface.\n"
+        "\\paragraph{Statistical programme for per-segment crash-count "
+        "prediction.} For segment $s$, 15-minute bin $t$ and fixture $g$, "
+        # target is a column name (e.g. "trips_mean_gt_10") interpolated
+        # into running TEXT, where a raw "_" makes TeX emit "Missing $
+        # inserted" and desynchronise math mode for everything after it.
+        f"let $Y_{{stg}}$ be the observed {str(target).replace('_', chr(92) + '_')} "
+        f"count and $E_{{stg}}$ "
+        "the probe-trip exposure. The count regression is "
+        f"{fam} with {_spec} structure "
+        f"({n_fixed} fixed terms, {n_rdm} random-parameter rows; "
+        f"AIC ${_aic}, BIC ${_bic}):\n"
+        "\\begin{equation}\n"
+        "Y_{stg}\\mid\\lambda_{stg} \\sim "
+        f"{'\\mathrm{{Poisson}}' if fam == 'Poisson' else fam}"
+        "(\\lambda_{stg}),"
+        "\\qquad \\log\\lambda_{stg} = "
+        f"\\beta_0 \\;({_b0_str})"
+        " + \\beta_E\\,\\log(E_{stg}{+}1) + "
+        "\\mathbf{x}_{stg}'\\boldsymbol{\\beta} + "
+        "\\mathbf{z}_{stg}'\\mathbf{b}_s, "
+        "\\quad \\mathbf{b}_s\\sim N(\\mathbf{0},\\Sigma),"
+        " \\label{eq:stat-count}\n"
+        "\\end{equation}\n"
+        "with $\\mathbf{x}$ the searched fixed design "
+        f"(\\Cref{{tab:statfixed}}, {n_fixed} terms) and $\\mathbf{{z}}$ the "
+        "random-parameter design (\\Cref{tab:statrandom}). Conditional on the measured denominator "
+        f"$n={_denom}$, the speeding propensity is binomial:\n"
+        "\\begin{equation}\n"
+        "k_{stg}\\mid n_{stg},p_{stg} \\sim \\mathrm{Binomial}"
+        "(n_{stg},p_{stg}),"
+        "\\qquad \\mathrm{logit}\\,p_{stg} = "
+        "\\gamma_0 + \\mathbf{w}_{stg}'\\boldsymbol{\\gamma},"
+        " \\label{eq:stat-prop}\n"
+        "\\end{equation}\n"
+        "with $\\mathbf{w}$ the fitted propensity design "
+        f"(\\Cref{{tab:statprop}}; AIC ${_paic}$, BIC ${_pbic}$, mean rate "
+        f"${_rate}$). The shipped per-cell mean is the posterior-mean "
+        "product $\\mu_{stg}=\\mathrm{E}[n_{stg}]\\cdot p_{stg}$, "
+        "EB-shrunk per segment, calibrated as "
+        f"$\\mathrm{{observed}}={_slope}\\cdot\\mathrm{{predicted}}"
+        # Two separate inline math spans: closing the first "$" before the
+        # comma. Without it TeX reads "0.197, top-20 " as one math run and
+        # everything after it desynchronises.
+        f"+{_icept}$ (holdout segment Spearman ${_segspec}$, top-20 "
+        f"${_top20}$), and aggregated per segment and fixture as "
+        "$\\hat\\Lambda^{(g)}_s=\\sum_t\\mu_{stg}$, rescaled to network "
+        f"scale by $1/{_tex_num(pen, 2)}$ (penetration; $\\times{_pen_pct}$). "
+        "The game-attributable share is "
+        f"${_lift}$ pooled ({lift_fx_str}). The maximal-covering roster "
+        "(Programme~P6) solves on $\\hat\\Lambda^{(g)}_s$.\n"
+        "\\begin{table}[htbp]\n\\centering\n\\begin{scriptsize}\n"
+        "\\begin{tabular}{lrrr}\n\\toprule\n"
+        "Count-model fixed term & $\\hat\\beta$ & SE & $p$ \\\\\n"
+        "\\midrule\n" + fixed_body + "\n\\bottomrule\n"
+        "\\end{tabular}\\end{scriptsize}\n"
+        "\\caption{Fitted count-model fixed effects "
+        f"({_spec}; {_tex_num(refit.get('aic', None), 1)} AIC; "
+        "*** $p<0.001$, ** $p<0.01$, * $p<0.05$). Random-parameter rows "
+        "below are the searched heterogeneity structure, not fixed effects.}\n"
+        "\\label{tab:statfixed}\\end{table}\n"
+        "\\begin{table}[htbp]\n\\centering\n\\begin{scriptsize}\n"
+        "\\begin{tabular}{lrrr}\n\\toprule\n"
+        "Random-parameter row & estimate & SE & $p$ \\\\\n"
+        "\\midrule\n" + rdm_body + "\n\\bottomrule\n"
+        "\\end{tabular}\\end{scriptsize}\n"
+        "\\caption{Searched random-parameter structure "
+        "(means/sds of segment- or group-varying slopes).}\n"
+        "\\label{tab:statrandom}\\end{table}\n"
+        "\\begin{table}[htbp]\n\\centering\n\\begin{scriptsize}\n"
+        "\\begin{tabular}{lrr}\n\\toprule\n"
+        "Propensity term & $\\hat\\gamma$ & SE \\\\\n"
+        "\\midrule\n" + prop_body + "\n\\bottomrule\n"
+        "\\end{tabular}\\end{scriptsize}\n"
+        "\\caption{Fitted binomial propensity "
+        f"(AIC ${_paic}, BIC ${_pbic}).}}\n"
+        "\\label{tab:statprop}\\end{table}\n")
+    # NOTE: sd_fig is accepted for call compatibility but intentionally
+    # unused: this fragment is the purely statistical programme (no
+    # simulation figure). The SD showcase figure ships separately.
+    (out_dir / "game_day_mathprog.tex").write_text(tex)
+    return out_dir / "game_day_mathprog.tex"
+
+
+def make_sd_figure(out, sd_curves, prop_lookup, sd_forms, flow_uplift,
+                   demand_eta, crowd_med, metrics, fig_path):
+    """Showcase figure for the SD system: loop schematic, fitted v(k) and
+    R(e) per class, and the game-vs-not lift it produces. Raises on missing
+    inputs (caller guards); never touches the shipped surface.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+
+    if out is None or len(out) == 0:
+        raise ValueError("no prediction rows")
+    need = {"pred_sd_game", "pred_sd_nogame", "sd_lift", "fixture", "rel_bin"}
+    if not need <= set(out.columns):
+        raise ValueError(f"missing SD columns: {sorted(need - set(out.columns))}")
+    if not sd_curves:
+        raise ValueError("no speed-density curves")
+    # curve classes only: skip the shrinkage diagnostic/_theory_* entries
+    classes = [c for c in sd_curves
+               if c != "_global" and not str(c).startswith("_")
+               and isinstance(sd_curves[c], tuple) and len(sd_curves[c]) == 2]
+    forms = sd_forms or {}
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    (ax0, ax1), (ax2, ax3) = axes
+    # -- panel 1: stock-flow schematic ------------------------------------
+    ax0.set_xlim(0, 10)
+    ax0.set_ylim(0, 10)
+    ax0.axis("off")
+    ax0.set_title("Stock-flow loop (game on/off = demand experiment)",
+                  fontsize=10)
+    _boxes = [
+        (5.0, 9.0, "GAME $G_g$\non / off", "#D9E6F2"),
+        (5.0, 7.5, "DEMAND  $q = q^0\\cdot u[b]\\cdot C(A)$", "#FCE4CC"),
+        (5.0, 6.0, "DENSITY  $k = q/v$  (stock)", "#E2EFDA"),
+        (5.0, 4.5, "SPEED  $v = F_c(k)$", "#E2EFDA"),
+        (5.0, 3.0, "EXCEEDANCE  $e = v-L$", "#FFF2CC"),
+        (5.0, 1.5, "PROPENSITY  $p = R_c(e)$", "#FFF2CC"),
+        (5.0, 0.2, "COUNTS  $y = q\\cdot p$  $\\rightarrow$  "
+         "LIFT $\\Delta=y^{game}-y^0$", "#F2DCDB"),
+    ]
+    for i, (x, y, txt, fc) in enumerate(_boxes):
+        ax0.add_patch(FancyBboxPatch(
+            (x - 3.4, y - 0.45), 6.8, 0.9,
+            boxstyle="round,pad=0.05", fc=fc, ec="#333333", lw=0.8))
+        ax0.text(x, y, txt, ha="center", va="center", fontsize=8)
+        if i:
+            ax0.annotate("", xy=(x, y + 0.45), xytext=(x, y + 1.05),
+                         arrowprops=dict(arrowstyle="-|>", color="#333333",
+                                         lw=1.2))
+    ax0.text(9.9, 9.6,
+             f"uplift $\\bar u$={float(np.mean(flow_uplift)):.2f}\n"
+             f"$\\eta$={float(demand_eta):.2f}\n"
+             f"$A_{{ref}}$={float(crowd_med):.0f}",
+             fontsize=7, va="top", ha="right")
+    # -- panel 2: fitted speed-density curves ------------------------------
+    kgrid = np.linspace(0.0, 120.0, 200)
+    for cls in classes:
+        vf, kj = sd_curves.get(cls, (50.0, np.inf))
+        v = (np.asarray(vf) * (1.0 - kgrid / kj)
+             if np.isfinite(kj) else np.full_like(kgrid, vf))
+        ax1.plot(kgrid, np.clip(v, 0, None), lw=1.4, label=str(cls))
+        fe = (forms.get(cls) or {}).get("speed")
+        if fe is not None:
+            tree, (a, b) = fe[0], fe[1]
+            with np.errstate(all="ignore"):
+                fv = a * np.asarray(_gp_eval(tree, kgrid)) + b
+            ax1.plot(kgrid, np.clip(np.where(np.isfinite(fv), fv, np.nan),
+                                     0, None), lw=1.0, ls="--")
+    ax1.set_xlabel("density k (veh/km)")
+    ax1.set_ylabel("speed v (km/h)")
+    ax1.set_title("Fitted speed-density $v=F_c(k)$ (solid) + GP form (dashed)",
+                  fontsize=10)
+    ax1.legend(fontsize=6, ncol=2)
+    ax1.set_ylim(bottom=0)
+    # -- panel 3: propensity on exceedance ----------------------------------
+    _ctr = (SD_EDGES[:-1] + SD_EDGES[1:]) / 2.0
+    for cls in classes:
+        rates = np.asarray(prop_lookup.get(
+            cls, prop_lookup.get("_global", np.zeros(len(_ctr)))),
+            dtype=float)
+        ax2.plot(_ctr, rates, lw=1.4, label=str(cls))
+    ax2.set_xlabel("exceedance e = v - L (km/h)")
+    ax2.set_ylabel("per-trip speeding rate")
+    ax2.set_yscale("log")
+    ax2.set_title("Propensity $R_c(e)$ (binned table; log scale)",
+                  fontsize=10)
+    ax2.legend(fontsize=6, ncol=2)
+    # -- panel 4: what the loop produces ------------------------------------
+    _g = out.groupby("fixture")[["pred_sd_game", "pred_sd_nogame",
+                                 "sd_lift"]].sum()
+    _g["share"] = _g["sd_lift"] / _g["pred_sd_game"].clip(lower=1e-12)
+    _labels = [str(f)[:26] for f in _g.index]
+    _cols = ["#0B6E4F" if v >= 0 else "#B03A2E" for v in _g["share"]]
+    ax3.barh(_labels[::-1], (_g["share"] * 100.0).to_numpy()[::-1],
+             color=_cols[::-1])
+    ax3.set_xlabel("SD game lift share (%)")
+    ax3.set_title("Game-day increase / decrease by fixture", fontsize=10)
+    ax3.axvline(0.0, color="k", lw=0.8)
+    _pool = float(_g["sd_lift"].sum() / max(_g["pred_sd_game"].sum(), 1e-12))
+    _corr = metrics.get("sd_vs_reg_lift_corr", None) if metrics else None
+    ax3.text(0.98, 0.02, f"pooled {_pool:+.1%}  "
+             f"corr(SD, regression)={_corr}",
+             transform=ax3.transAxes, ha="right", va="bottom", fontsize=8,
+             bbox=dict(fc="white", ec="#999999", pad=2))
+    fig.tight_layout()
+    fig.savefig(fig_path, dpi=130)
+    plt.close(fig)
+    return fig_path
+
+
+def gp_discover_form(x, y, w=None, seed_trees=(("x",), ("c",)),
+                     pop=16, gens=20, seed=0, budget_s=60.0, max_depth=4):
+    """Bounded symbolic regression. Returns (tree, (a,b), bic, form_str).
+
+    Seeds guarantee theory is in the gene pool; elitism keeps the best, so
+    the returned form never loses to the seeds. Any failure -> (None,...).
+    """
+    import time as _t
+    t0 = _t.time()
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    w = np.ones_like(y) if w is None else np.asarray(w, dtype=float)
+    m = np.isfinite(x) & np.isfinite(y) & np.isfinite(w) & (w > 0)
+    x, y, w = x[m], y[m], w[m]
+    if len(x) < 8 or np.std(y) <= 0:
+        return None, (0.0, 0.0), np.inf, "insufficient-data"
+    rng = np.random.default_rng(int(seed))
+    population = list(seed_trees)
+    while len(population) < pop:
+        population.append(_gp_random(rng, rng.integers(1, 4), bool(rng.integers(0, 2))))
+    scored = [(_gp_fitness(t, x, y, w), t) for t in population]
+    scored.sort(key=lambda s: s[0][0])
+    elite = [scored[0][1], scored[1][1]] if len(scored) > 1 else [scored[0][1]]
+    for _ in range(int(gens)):
+        if _t.time() - t0 > float(budget_s):
+            break
+        children = list(elite)
+        while len(children) < pop:
+            r = rng.random()
+            p1 = scored[int(rng.integers(0, max(2, pop // 2)))][1]
+            if r < 0.55:
+                p2 = scored[int(rng.integers(0, max(2, pop // 2)))][1]
+                s1 = list(_gp_subtrees(p1))
+                s2 = list(_gp_subtrees(p2))
+                child = _gp_replace(p1, int(rng.integers(0, len(s1))),
+                                    s2[int(rng.integers(0, len(s2)))])
+            elif r < 0.8:
+                s1 = list(_gp_subtrees(p1))
+                child = _gp_replace(p1, int(rng.integers(0, len(s1))),
+                                    _gp_random(rng, 2, False))
+            else:
+                child = _gp_random(rng, 3, False)
+            nodes = _gp_nodes(child)
+            if nodes > 25:
+                child = p1
+            children.append(child)
+        scored = [(_gp_fitness(t, x, y, w), t) for t in children]
+        scored.sort(key=lambda s: s[0][0])
+        elite = [scored[0][1]]
+    (bic, (a, b)), best = scored[0]
+    if not np.isfinite(bic):
+        return None, (0.0, 0.0), np.inf, "no-finite-form"
+    return best, (a, b), bic, f"{a:.4g}*({_gp_to_str(best)})+{b:.4g}"
+
+
+def fit_sd_forms(df, target, sd_curves, budget_s=240.0, seed=0):
+    """Per-class GP form discovery for the SD loop (bounded, seeded).
+
+    Speed shape on binned (k, v); propensity shape on binned log-rates over
+    exceedance. Seeds: linear (=Greenshields in k) + constant for speed;
+    linear + squash for propensity. Returns {cls: {"speed": (tree,a,b,str)
+    |None, "prop": ...|None, "bic_fixed":.., "bic_gp":..}}. Any failure or
+    timeout -> None entries (param/table path stands).
+    """
+    import time as _t
+    t0 = _t.time()
+    d = pd.DataFrame({
+        "cls": df["highway"].fillna("unclassified").astype(str)
+        if "highway" in df.columns else "unclassified",
+        "q": pd.to_numeric(df["vehicle_count"], errors="coerce").fillna(0.0)
+        if "vehicle_count" in df.columns else 0.0,
+        "v": pd.to_numeric(df["mean_vehicle_speed_kmh"], errors="coerce")
+        if "mean_vehicle_speed_kmh" in df.columns else np.nan,
+        "y": pd.to_numeric(df[target], errors="coerce").fillna(0.0)
+        if target in df.columns else 0.0,
+    })
+    d["lim"] = _sd_limit(df)
+    d = d[np.isfinite(d["v"].to_numpy()) & (d["v"].to_numpy() > 0)].copy()
+    d["k"] = d["q"] / d["v"].clip(lower=1.0)
+    d["e"] = d["v"] - d["lim"]
+    out = {}
+    for cls, g in d.groupby("cls"):
+        if _t.time() - t0 > float(budget_s):
+            break
+        entry = {"speed": None, "prop": None}
+        try:
+            # Speed-density shape: quantile-binned (k, v).
+            qb = pd.qcut(g["k"], 12, duplicates="drop")
+            b = g.groupby(qb, observed=True).agg(k=("k", "mean"),
+                                                 v=("v", "mean"),
+                                                 n=("v", "size")).dropna()
+            if len(b) >= 8:
+                tree, ab, bic, fs = gp_discover_form(
+                    b["k"].to_numpy(), b["v"].to_numpy(),
+                    w=b["n"].to_numpy(),
+                    seed_trees=(("x",), ("c",),
+                                ("-", ("x",), ("c",))),
+                    pop=12, gens=12, seed=seed + (_crc(str(cls)) % 1000),
+                    budget_s=15.0)
+                if tree is not None:
+                    entry["speed"] = (tree, ab, fs, round(float(bic), 1))
+            # Propensity shape: binned log-rates over exceedance.
+            eb = np.clip(np.digitize(g["e"].to_numpy(float), SD_EDGES) - 1,
+                         0, len(SD_EDGES) - 2)
+            gg = g.assign(_eb=eb).groupby("_eb").agg(
+                ys=("y", "sum"), qs=("q", "sum"),
+                e=("e", "mean"))
+            gg = gg[gg["qs"] > 0].copy()
+            gg["lr"] = np.log((gg["ys"] / gg["qs"]).clip(lower=1e-9))
+            if len(gg) >= 8 and np.std(gg["lr"].to_numpy()) > 1e-9:
+                tree, ab, bic, fs = gp_discover_form(
+                    gg["e"].to_numpy(), gg["lr"].to_numpy(),
+                    w=gg["qs"].to_numpy(),
+                    seed_trees=(("x",), ("c",),
+                                ("squash", ("x",))),
+                    pop=12, gens=12,
+                    seed=seed + 54321 + (_crc(str(cls)) % 1000),
+                    budget_s=15.0)
+                if tree is not None:
+                    entry["prop"] = (tree, ab, fs, round(float(bic), 1))
+        except Exception:
+            pass
+        out[str(cls)] = entry
+    return out
+
+
+def sd_regime(q, cls_arr, sd_curves):
+    """Operating regime of the twin: where does the flow actually put density?
+
+    Returns the share of rows in each band of rho = k/kj (rho<0.2 free flow,
+    0.2-0.5 transition, 0.5-0.9 CONGESTION-ACTIVE, >=0.9 jam). If the
+    congestion-active share is ~0, the structurally-identified twin CANNOT
+    produce a congestion suppression in this data, and any negative game
+    lift has to be identified by the regression instead. That is a finding
+    about the data, not a bug in the twin - and it should be reported as
+    such rather than papered over with a huge calibration slope.
+    """
+    q = np.maximum(np.asarray(q, dtype=float), 0.0)
+    cls_arr = np.asarray(cls_arr, dtype=str)
+    glob = sd_curves.get("_global", (50.0, 1.5))
+    vf = np.array([sd_curves.get(c, glob)[0] for c in cls_arr], float)
+    kj = np.array([sd_curves.get(c, glob)[1] for c in cls_arr], float)
+    with np.errstate(all="ignore"):
+        k = q / np.clip(vf, 1.0, None)
+        rho = k / np.clip(kj, 1e-9, None)
+    rho = np.clip(np.where(np.isfinite(rho), rho, 0.0), 0.0, 2.0)
+    n = max(len(rho), 1)
+    return {
+        "free_flow_rho_lt_.2": round(float((rho < 0.2).sum()) / n, 4),
+        "transition_.2_.5": round(
+            float(((rho >= 0.2) & (rho < 0.5)).sum()) / n, 4),
+        "congestion_active_.5_.9": round(
+            float(((rho >= 0.5) & (rho < 0.9)).sum()) / n, 4),
+        "jam_ge_.9": round(float((rho >= 0.9).sum()) / n, 4),
+        "rho_median": round(float(np.median(rho)), 4),
+        "rho_p95": round(float(np.percentile(rho, 95)), 4),
+        "n_rows": int(len(rho)),
+    }
+
+
+def sd_predict(q, cls_arr, lim_arr, sd_curves, prop_lookup, sd_forms=None):
+    """Forward-simulate the stock-flow loop: q -> k=q/v -> v -> e -> rate.
+
+    Param path: Greenshields v(vf,kj) + binned rate table. GP path (per
+    class, when discovery found a form): v = a*f(k)+b and log-rate =
+    a*g(e)+b through the same fixed-point. Fixed-point capped at 3 rounds;
+    everything clipped, so a wild form degrades to bounds, never NaN.
+    """
+    q = np.maximum(np.asarray(q, dtype=float), 0.0)
+    cls_arr = np.asarray(cls_arr, dtype=str)
+    glob = sd_curves.get("_global", (50.0, np.inf))
+    vf = np.array([sd_curves.get(c, glob)[0] for c in cls_arr], float)
+    kj = np.array([sd_curves.get(c, glob)[1] for c in cls_arr], float)
+    forms = sd_forms or {}
+    has_speed = np.array([bool((forms.get(c) or {}).get("speed"))
+                          for c in cls_arr])
+    v = vf.copy()
+    for _ in range(3):
+        k = q / np.clip(v, 1.0, None)
+        v_par = np.where(np.isfinite(kj), vf * (1.0 - k / kj), vf)
+        if has_speed.any():
+            v_gp = v.copy()
+            for c in np.unique(cls_arr[has_speed]):
+                m = (cls_arr == c) & has_speed
+                tree, (a, b) = (forms[c]["speed"][0],
+                                forms[c]["speed"][1])
+                with np.errstate(all="ignore"):
+                    fv = a * np.asarray(_gp_eval(tree, k[m]),
+                                        dtype=float) + b
+                fv = np.clip(np.where(np.isfinite(fv), fv, vf[m]),
+                             1.0, np.maximum(vf[m], 1.0) * 1.5)
+                v_gp[m] = fv
+            v = np.where(has_speed, v_gp, v_par)
+        else:
+            v = v_par
+        v = np.clip(v, 1.0, np.maximum(vf, 1.0) * 1.5)
+    e = v - np.asarray(lim_arr, dtype=float)
+    bi = np.clip(np.digitize(e, SD_EDGES) - 1, 0, len(SD_EDGES) - 2)
+    nb = len(SD_EDGES) - 1
+    g_rates = prop_lookup.get("_global", np.zeros(nb))
+    rates = np.array([
+        np.asarray(prop_lookup.get(c, g_rates), dtype=float)[b]
+        for c, b in zip(cls_arr, bi)], float)
+    has_prop = np.array([bool((forms.get(c) or {}).get("prop"))
+                         for c in cls_arr])
+    if has_prop.any():
+        r_gp = rates.copy()
+        for c in np.unique(cls_arr[has_prop]):
+            m = (cls_arr == c) & has_prop
+            tree, (a, b) = (forms[c]["prop"][0], forms[c]["prop"][1])
+            with np.errstate(all="ignore"):
+                lr = (a * np.asarray(_gp_eval(tree, e[m]), dtype=float)
+                      + b)
+            rr = np.exp(np.clip(np.where(np.isfinite(lr), lr, -20.0),
+                                -20.0, 1.0))
+            r_gp[m] = rr
+        rates = np.where(has_prop, r_gp, rates)
+    counts = q * np.clip(rates, 0.0, 2.0)
+    return counts, v, q / np.clip(v, 1.0, None)
 
 
 def estimate_flow_uplift_by_class(train_events, background, bg_by_class,
@@ -1142,6 +2604,362 @@ def estimate_flow_uplift(train_events, background, bg_mean=None):
         return np.ones(REL_BINS)
 
 
+def estimate_seg_crowd_elasticity(train_events, pooled_eta,
+                                  min_fixtures=8, pseudo=0.0):
+    """Per-segment crowd elasticity of game-day flow: dlog E[q] / dlog A.
+
+    WHY A SCALAR IS NOT ENOUGH. One crowd multiplier per game scales every
+    segment by the same factor: game totals move 1.67x while the RANKING is
+    mathematically preserved (measured: top-20 Jaccard 0.90-1.00, 4/250
+    segments ever moving). A game-varying plan needs the crowd to enter
+    PER SEGMENT.
+
+    COUNT MODEL, PER SEGMENT. Each segment gets its own Poisson (or NB, on
+    Pearson overdispersion) GLM,
+        q_i,g ~ Poisson(mu_i,g),  log mu_i,g = b0_i + b1_i log(A_g+1)
+                                    - log(n_bins_i,g)
+    i.e. the same estimator as the pooled fit, so the two are directly
+    comparable and the response stays a non-negative integer count with a
+    Poisson variance. This is deliberately NOT log(count)-OLS, which
+    dropped every zero-count fixture -- precisely the thin, low-speeding
+    segments whose behaviour the plan needs.
+
+    A GLM per segment (not one random-parameters metacount fit) because the
+    quantity wanted is INDIVIDUAL elasticities to reorder segments, and
+    that needs per-segment coefficients, not draws from a fitted
+    distribution.
+
+    `pseudo` > 0 shrinks b1_i toward the pooled eta with weight
+    n/(n+pseudo) (EB fallback arm). Default 0 = PURE PREDICTION: each
+    segment's own Poisson coefficient, nothing borrowed. Segments with too
+    few fixtures or a degenerate design fall back to the pooled eta (a
+    support requirement, not shrinkage).
+    """
+    out, diag = {}, {}
+    try:
+        if train_events is None or len(train_events) == 0:
+            return {}, {}
+        if "attendance" not in train_events.columns:
+            return {}, {}
+        _t = train_events.copy()
+        _t["_a"] = pd.to_numeric(_t["attendance"], errors="coerce")
+        _t["_q"] = pd.to_numeric(_t.get("vehicle_count", np.nan),
+                                 errors="coerce")
+        _t = _t[np.isfinite(_t["_a"].to_numpy()) & (_t["_a"] > 0)
+                & np.isfinite(_t["_q"].to_numpy()) & (_t["_q"] >= 0)]
+        if len(_t) < 50:
+            return {}, {}
+        _la = np.log(_t["_a"].to_numpy(float) + 1.0)
+        _t["_la"] = _la
+        res = {}
+        for sid, sub in _t.groupby("road_osmid"):
+            q = sub["_q"].to_numpy(float)
+            la = sub["_la"].to_numpy(float)
+            # offset = log(position within fixture): the target is a
+            # per-bin rate, so each fixture contributes its bin count
+            _off = np.log(np.maximum(
+                sub.groupby("fixture").cumcount().to_numpy(float) + 1.0, 1.0))
+            nf = int(sub["fixture"].nunique())
+            if nf < int(min_fixtures) or float(np.var(la)) <= 1e-10:
+                res[sid] = (float(pooled_eta), 0.0, nf)
+                continue
+            b, se, _z, _p, _phi, _n, _fam = _fit_elasticity_nb(
+                q, la, offset=_off)
+            if not np.isfinite(b):
+                res[sid] = (float(pooled_eta), 0.0, nf)
+                continue
+            if float(pseudo) > 0.0:
+                w = float(nf) / (float(nf) + float(pseudo))
+                b = w * b + (1.0 - w) * float(pooled_eta)
+            res[sid] = (float(b), 1.0, nf)
+        for sid, (e, w, nf) in res.items():
+            out[int(sid)] = float(e)
+        if out:
+            _e = np.array(list(out.values()))
+            diag = {"n_segments": int(len(out)),
+                    "n_own_estimate": int(sum(
+                        1 for _, (_, w, _) in res.items() if w > 0.05)),
+                    "pseudo": float(pseudo),
+                    "estimator": "per-segment Poisson/NB GLM, "
+                                 "offset=log(bins), response=counts",
+                    "eta_mean": round(float(_e.mean()), 4),
+                    "eta_sd": round(float(_e.std()), 4),
+                    "eta_p05": round(float(np.percentile(_e, 5)), 4),
+                    "eta_p95": round(float(np.percentile(_e, 95)), 4),
+                    "pooled_eta": round(float(pooled_eta), 4)}
+        return out, diag
+    except Exception as exc:  # noqa: BLE001 - pooled fallback
+        return {}, {"error": str(exc)[:200]}
+
+
+def _ols_slope(x, y):
+    """OLS slope + SE + two-sided p (t, df=n-2). Returns (b, se, p, n)."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    n = len(x)
+    if n < 4 or float(np.var(x)) <= 1e-12:
+        return float("nan"), float("nan"), float("nan"), int(n)
+    b = float(np.cov(x, y, bias=True)[0, 1] / max(float(np.var(x)), 1e-12))
+    resid = y - (y.mean() + b * (x - x.mean()))
+    s2 = float((resid ** 2).sum() / max(n - 2, 1))
+    se = float(np.sqrt(s2 / max(float(((x - x.mean()) ** 2).sum()), 1e-12)))
+    t = b / max(se, 1e-12)
+    try:
+        from scipy.stats import t as _t
+        p = float(2.0 * _t.sf(abs(t), max(n - 2, 1)))
+    except Exception:  # noqa: BLE001 - normal approximation fallback
+        import math
+        p = float(math.erfc(abs(t) / math.sqrt(2.0)))
+    return b, se, p, int(n)
+
+
+def _phase_of_bin(rel_bin):
+    """Event phase (pre/during/post) from 15-min rel_bin (28 bins, KO-3h..+4h).
+
+    pre: bins 0-9 (KO-3h..KO-0.5h); during: 10-17; post: 18-27.
+    """
+    b = np.asarray(rel_bin, dtype=float)
+    out = np.full(b.shape, "post", dtype=object)
+    out[b < 18] = "during"
+    out[b < 10] = "pre"
+    return out if out.shape else "post"
+
+
+def _fit_elasticity_nb(y, log_att, offset=None, names=("const", "log_att")):
+    """Poisson/NB GLM for log(E[y]) = b0 + b1*log_att (+ offset).
+
+    b1 is the crowd elasticity. Uses the COUNT likelihood throughout:
+    the response is a non-negative integer count, so a Poisson (or NB when
+    the overdispersion warrants it) GLM with a log link is the correct
+    functional form. OLS on log(counts) is NOT: it (a) drops zero-count
+    segments, biasing the slope upward exactly where speeding is thinnest,
+    (b) treats variance as constant, and (c) has no natural way to take the
+    exposure offset. Same estimator family as the rest of the pipeline
+    (count models), which is why it is a GLM here rather than in the
+    random-parameters search.
+
+    Returns (b1, se, z, p, phi, n, family) with phi the Pearson
+    overdispersion (mean 1 = Poisson).
+    """
+    import statsmodels.api as sm
+    y = np.asarray(y, dtype=float)
+    la = np.asarray(log_att, dtype=float)
+    m = np.isfinite(y) & np.isfinite(la) & (y >= 0)
+    y, la = y[m], la[m]
+    n = int(len(y))
+    if n < 4 or float(np.var(la)) <= 1e-12:
+        return (float("nan"),) * 4 + (float("nan"), 0, "none")
+    X = np.column_stack([np.ones(n), la])
+    off = None if offset is None else np.asarray(offset, dtype=float)[m]
+    fam, label = sm.families.Poisson(), "Poisson"
+    res = sm.GLM(y, X, family=fam, offset=off).fit()
+    phi = float(res.pearson_chi2 / max(res.df_resid, 1))
+    # Overdispersion -> NB with that alpha (standard Pearson-moment choice).
+    if phi > 1.5:
+        try:
+            res = sm.GLM(y, X, family=sm.families.NegativeBinomial(
+                alpha=max(phi, 1e-6)), offset=off).fit()
+            label = "NB2"
+        except Exception:  # noqa: BLE001 - keep Poisson
+            label = "Poisson(overdispersed)"
+    b1 = float(res.params[1])
+    se = float(res.bse[1]) if np.isfinite(res.bse[1]) else float("nan")
+    z = b1 / se if se > 0 else float("nan")
+    try:
+        from scipy.stats import norm
+        p = float(2.0 * norm.sf(abs(z))) if np.isfinite(z) else float("nan")
+    except Exception:  # noqa: BLE001
+        import math
+        p = float(math.erfc(abs(z) / math.sqrt(2.0))) if np.isfinite(z) \
+            else float("nan")
+    return b1, se, z, p, phi, n, label
+
+
+def estimate_demand_elasticity(train_events):
+    """Crowd elasticity of game-day probe flow from a COUNT model.
+
+    eta = d log E[q] / d log A: how much more traffic a bigger crowd draws.
+    The SD simulation multiplies game flow by (A/att_ref)^eta so same-code,
+    same-kickoff fixtures with different crowds get different surfaces
+    (o26642598: identical SD lifts for two NRL 19:00 games). eta=0 disables
+    crowd scaling.
+
+    ESTIMATOR. Poisson/NB GLM on the summed per-fixture counts with the
+    number of contributing bins as an offset, so the response is a rate:
+        q_g ~ Poisson(mu_g),  log mu_g = b0 + eta*log(A_g+1) - log(n_bins_g)
+    NOT OLS on log(counts), which is what this used to do: it silently
+    dropped the many fixtures whose counts are zero and whose speeding is
+    exactly what we are trying to model, and it assumed constant variance
+    on a count scale. The raw (unclipped) eta is reported with SE/z/p, plus
+    per-phase etas, because a clipped 0.00 previously hid a genuinely
+    negative slope.
+    """
+    rep = {"n_fixtures": 0}
+    try:
+        g = (train_events.groupby("fixture")
+             .agg(q=("vehicle_count", "sum"),
+                  n=("vehicle_count", "size"),
+                  a=("attendance", "first")))
+        g = g[np.isfinite(g["a"]) & (g["a"] > 0)].copy()
+        rep["n_fixtures"] = int(len(g))
+        rep["att_range"] = ([round(float(g["a"].min()), 1),
+                             round(float(g["a"].max()), 1)] if len(g) else [])
+        if len(g) < 4:
+            rep["note"] = "too few fixtures"
+            return 0.0, rep
+        _off = np.log(np.maximum(g["n"].to_numpy(float), 1.0))
+        b, se, z, p, phi, n, fam = _fit_elasticity_nb(
+            g["q"].to_numpy(float), np.log(g["a"].to_numpy(float) + 1.0),
+            offset=_off)
+        rep.update({"eta_raw": round(float(b), 4),
+                    "eta_se": round(float(se), 4) if np.isfinite(se) else None,
+                    "eta_z": round(float(z), 3) if np.isfinite(z) else None,
+                    "eta_p": round(float(p), 4) if np.isfinite(p) else None,
+                    "phi": round(float(phi), 3) if np.isfinite(phi) else None,
+                    "eta_n": int(n), "family": fam,
+                    "estimator": "poisson/nb glm on counts, offset=log(bins)"})
+        eta = float(np.clip(b, 0.0, 1.5)) if np.isfinite(b) else 0.0
+        rep["eta"] = round(eta, 3)
+        rep["by_phase"] = {}
+        if "rel_bin" in train_events.columns:
+            _te = train_events.copy()
+            _te["__phase"] = _phase_of_bin(
+                pd.to_numeric(_te["rel_bin"], errors="coerce").fillna(-1))
+            for _ph, _gp in _te.groupby("__phase"):
+                _gg = (_gp.groupby("fixture")
+                       .agg(q=("vehicle_count", "sum"),
+                            n=("vehicle_count", "size"),
+                            a=("attendance", "first")))
+                _gg = _gg[np.isfinite(_gg["a"]) & (_gg["a"] > 0)]
+                if len(_gg) < 4:
+                    continue
+                _b, _se, _z, _p, _phi, _n, _fam = _fit_elasticity_nb(
+                    _gg["q"].to_numpy(float),
+                    np.log(_gg["a"].to_numpy(float) + 1.0),
+                    offset=np.log(np.maximum(_gg["n"].to_numpy(float), 1.0)))
+                rep["by_phase"][str(_ph)] = {
+                    "eta_raw": round(float(_b), 4),
+                    "eta": round(float(np.clip(_b, 0.0, 1.5)), 3),
+                    "se": round(float(_se), 4) if np.isfinite(_se) else None,
+                    "p": round(float(_p), 4) if np.isfinite(_p) else None,
+                    "n_fixtures": int(_n), "family": _fam}
+        return eta, rep
+    except Exception as exc:  # noqa: BLE001 - SD auxiliary
+        rep["error"] = str(exc)
+        return 0.0, rep
+
+
+def calibrate_sd_lift(train_events, background, target, sd_curves,
+                      prop_lookup, sd_forms, flow_uplift, demand_etas,
+                      att_ref):
+    """Calibrate the SD twin to observed train lift (share-on-share WLS).
+
+    Observed lift per train fixture is a SHARE: obs/window-counts over the
+    background expectation minus 1. The SD lift must enter the regression on
+    the same scale, i.e. also a share (sum of row lifts over sum of row
+    no-game counts) -- regressing a share on raw lift COUNTS mixes units
+    across fixtures of different sizes and inflates the intercept into
+    every future row (o26674777: calibrated share 0.959 from a +0.28/row
+    intercept). Returns (a, b, se_b, p_b, table_df); on any problem returns
+    (0.0, 1.0, nan, nan, empty) i.e. the uncalibrated twin stands.
+    Never fatal by itself -- the caller decides.
+    """
+    empty = pd.DataFrame()
+    try:
+        if (train_events is None or background is None
+                or sd_curves is None or prop_lookup is None):
+            return 0.0, 1.0, float("nan"), float("nan"), empty, "missing inputs"
+        if target not in train_events.columns:
+            return 0.0, 1.0, float("nan"), float("nan"), empty, "no target"
+        _bg_rate = float(pd.to_numeric(
+            background[target] if target in background.columns
+            else background.get("vehicle_count", pd.Series(dtype=float)),
+            errors="coerce").fillna(0.0).mean())
+        _obs = train_events.groupby("fixture").agg(
+            obs=(target, "sum"), n=("fixture", "size"),
+            att=("attendance", "first"))
+        _obs["exp_bg"] = _bg_rate * _obs["n"].astype(float)
+        _obs["lift_obs"] = (_obs["obs"] / _obs["exp_bg"].clip(lower=1e-9)
+                            - 1.0)
+        # SD twin on train rows (observed flow = game flow).
+        _te = train_events.copy()
+        _q = pd.to_numeric(_te.get("vehicle_count", 0.0),
+                           errors="coerce").fillna(0.0).to_numpy(float)
+        _rb = pd.to_numeric(_te.get("rel_bin", 0),
+                            errors="coerce").fillna(0).to_numpy(int).clip(
+                                0, REL_BINS - 1)
+        _fu = (np.asarray(flow_uplift, dtype=float)
+               if flow_uplift is not None and len(flow_uplift) == REL_BINS
+               else np.ones(REL_BINS))
+        _qs = _q / np.clip(_fu[_rb], 1e-9, None)
+        _att_map = _obs["att"].to_dict()
+        _at = _te["fixture"].map(_att_map).fillna(0.0).to_numpy(float)
+        _ebyp = demand_etas if isinstance(demand_etas, dict) else {}
+        _ph = _phase_of_bin(
+            pd.to_numeric(_te.get("rel_bin", 0),
+                          errors="coerce").fillna(-1).to_numpy())
+        _ev = np.array([float(_ebyp.get(str(p), 0.0)) for p in _ph])
+        _cm = np.where((_at > 0) & (float(att_ref or 0) > 0),
+                       np.clip((_at / max(float(att_ref), 1e-9))
+                               ** np.clip(_ev, -1.0, 1.5), 0.25, 4.0), 1.0)
+        _qg = _q * _cm
+        _cls = (_te["highway"].fillna("unclassified").astype(str).to_numpy()
+                if "highway" in _te.columns
+                else np.array(["unclassified"] * len(_te)))
+        _lim = _sd_limit(_te)
+        _g, _, _ = sd_predict(_qg, _cls, _lim, sd_curves,
+                              prop_lookup, sd_forms)
+        _n, _, _ = sd_predict(_qs, _cls, _lim, sd_curves,
+                              prop_lookup, sd_forms)
+        _te["_sdg"] = np.maximum(_g, 1e-12)
+        _te["_sdn"] = np.maximum(_n, 1e-12)
+        _te["_sdlift"] = _te["_sdg"] - _te["_sdn"]
+        _agg = _te.groupby("fixture").agg(_sdlift=("_sdlift", "sum"),
+                                          _sdn=("_sdn", "sum"))
+        # SHARE on SHARE: fixture SD lift share vs observed lift share.
+        _tab = pd.DataFrame({"lift_obs": _obs["lift_obs"],
+                             "lift_sd": (_agg["_sdlift"]
+                                         / _agg["_sdn"].clip(lower=1e-12)),
+                             "w": _obs["obs"] + 1.0}).dropna()
+        _tab = _tab[np.isfinite(_tab["lift_sd"].to_numpy())]
+        if len(_tab) < 4:
+            return 0.0, 1.0, float("nan"), float("nan"), _tab, "too few fixtures"
+        _x = _tab["lift_sd"].to_numpy(float)
+        _y = _tab["lift_obs"].to_numpy(float)
+        _w = _tab["w"].to_numpy(float)
+        _w = _w / _w.sum() * len(_w)
+        _X = np.column_stack([np.ones_like(_x), _x])
+        _XtX = (_X * _w[:, None]).T @ _X
+        _Xty = (_X * _w[:, None]).T @ _y
+        try:
+            _beta = np.linalg.solve(_XtX, _Xty)
+        except Exception:  # noqa: BLE001 - singular; stand pat
+            return 0.0, 1.0, float("nan"), float("nan"), _tab, "singular"
+        _res = _y - _X @ _beta
+        _df = max(len(_y) - 2, 1)
+        _s2 = float((_w * _res ** 2).sum() / _df)
+        try:
+            _cov = _s2 * np.linalg.inv(_XtX)
+            _se_b = float(np.sqrt(max(_cov[1, 1], 0.0)))
+        except Exception:  # noqa: BLE001
+            _se_b = float("nan")
+        _b = float(_beta[1])
+        _t = _b / max(_se_b, 1e-12) if np.isfinite(_se_b) else float("nan")
+        try:
+            from scipy.stats import t as _t_dist
+            _p = float(2.0 * _t_dist.sf(abs(_t), _df)) \
+                if np.isfinite(_t) else float("nan")
+        except Exception:  # noqa: BLE001
+            import math
+            _p = float(math.erfc(abs(_t) / math.sqrt(2.0))) \
+                if np.isfinite(_t) else float("nan")
+        return float(_beta[0]), _b, _se_b, _p, _tab, "ok"
+    except Exception as exc:  # noqa: BLE001 - uncalibrated twin stands
+        return 0.0, 1.0, float("nan"), float("nan"), empty, str(exc)[:200]
+
+
 def build_game_frame(panel, bin_ns, cal, ctx, seg_flow, profile, fixture_ids,
                      crowd_med=None):
     """Rows for the fixtures in `fixture_ids` (unique per calendar row).
@@ -1206,9 +3024,11 @@ def enrich_background(bg, ctx, seg_flow, profile):
 
 def search_frame(frame, target):
     cols = (["road_osmid", "bin", target, "code", "fixture"] + CAL_VARS
+            + DOW_DUMMIES + WEATHER_COLS
             + GAME_VARS + GAME_WIDE_VARS + TEMPORAL_VARS + TIME_X_VARS
             + CONT_VARS + [
                 "exp", "logexp", "highway", "aadt_z", "log_flow_z",
+                GAME_CELL_COL, "gclass", "gband",
                 # The measured denominator. The response is a count of
                 # speeding TRIPS, so its true denominator is the number of
                 # trips that got a speed reading -- NOT trip_count, because
@@ -1239,7 +3059,8 @@ def search_frame(frame, target):
         # Fallback only if log_length was not carried through upstream.
         work[SEG_GROUP_VAR] = 0.0
     work["row_id"] = np.arange(len(work))
-    for col in (CAL_VARS + GAME_VARS + GAME_WIDE_VARS + TEMPORAL_VARS
+    for col in (CAL_VARS + DOW_DUMMIES + WEATHER_COLS + GAME_VARS
+                + GAME_WIDE_VARS + TEMPORAL_VARS
                 + TIME_X_VARS + CONT_VARS
                 + ["logexp", "Y", "aadt_z", "log_flow_z"]):
         if col in work.columns:
@@ -1476,6 +3297,41 @@ def _append_progress(row):
                                index=False)
 
 
+# --- SA chunk-seed plumbing (patch) ---------------------------------
+# MultiStartSA.optimize() runs restart i as run_single(i, start_index=i)
+# and run_single seeds with np.random.seed(seed=i). ExperimentBuilder.run
+# only records the chunk seed as metadata (the SA never sees it), and the
+# SA path runs inline (experiment_package.run never forwards n_jobs to
+# MultiStartSA), so with n_starts=1 -- the shape of every warm chunk --
+# EVERY chunk replays the SAME RNG stream from the same warm start:
+# byte-identical proposal sequences landing as pure cache hits (o26766505
+# chunks 4-8: 0 new evals, 0.0 s chunks credited in full). Recognise an
+# `sa_base_seed` kwarg (forwarded via run(**algo_kwargs) ->
+# MultiStartSA(**defaults) -> self.sa_kwargs) and seed restart i with
+# base+i. The pop keeps the private kwarg away from
+# AdvancedSimulatedAnnealing(**sa_kwargs).
+_SA_SEED_PATCHED = False
+try:
+    from metacountregressor.Solvers_METAJAX import MultiStartSA as _MSSA
+
+    if not getattr(_MSSA, "_chunk_seed_patched", False):
+        _mssa_orig_run_single = _MSSA.run_single
+
+        def _mssa_run_single_seeded(self, seed, start_index=0):
+            base = self.sa_kwargs.pop("sa_base_seed", None)
+            if base is not None:
+                seed = int(base) + int(seed)
+            return _mssa_orig_run_single(self, seed,
+                                         start_index=start_index)
+
+        _MSSA.run_single = _mssa_run_single_seeded
+        _MSSA._chunk_seed_patched = True
+    _SA_SEED_PATCHED = True
+except Exception as _sa_patch_exc:  # noqa: BLE001
+    print(f"   WARN: SA chunk-seed patch unavailable ({_sa_patch_exc}); "
+          "chunks will keep reusing the seed stream")
+
+
 def run_search(work, args, audit, out_dir, resume_state=None):
     from metacountregressor import ExperimentBuilder, ModelConstraints
 
@@ -1493,7 +3349,8 @@ def run_search(work, args, audit, out_dir, resume_state=None):
     # impossible, which is exactly the bug that left grouped_terms empty.
     cand_cont = [c for c in cont_list + ["log_length"] + aadt_cands
                  + [SEG_GROUP_VAR] if c in work.columns]
-    cand_cal = [c for c in cal_list if c in work.columns]
+    cand_cal = [c for c in cal_list + DOW_DUMMIES + WEATHER_COLS
+                if c in work.columns]
     cand_game = [c for c in game_list if c in work.columns]
     # Temporal shape vars are searchable fixed-only terms; --no-temporal-vars
     # drops them from the candidate pool (peak shape then comes only from
@@ -1545,8 +3402,12 @@ def run_search(work, args, audit, out_dir, resume_state=None):
                               *cand_timex, *shape_cols)
                    .no_zi("logexp", *zi_banned))
     allow = [c for c in cand_cont if c not in hw]
-    if allow:
+    _fixed_only = bool(getattr(args, "fixed_only", False))
+    if allow and not _fixed_only:
         constraints = constraints.allow_random(*allow, distributions=["normal"])
+    if _fixed_only:
+        print("   fixed-only: random-parameter roles banned (fixed/excluded "
+              "search + fixed refit, no RP draws)")
     # --- per-segment temporal response (opt-in) -------------------------
     # With --group-temporal on, the temporal basis may take role 4 (grouped)
     # as well as fixed, so the WITHIN-WINDOW SHAPE can differ by segment
@@ -1558,6 +3419,7 @@ def run_search(work, args, audit, out_dir, resume_state=None):
     # so {1, 4} here also removes role 0 -- the term must appear.
     gt_vars = ([c for c in ("rel_sin", "rel_cos") if c in work.columns]
                if str(getattr(args, "group_temporal", "off")).lower() == "on"
+               and not _fixed_only
                else [])
     for _v in gt_vars:
         constraints = (constraints.set_roles(_v, [1, 4])
@@ -1600,7 +3462,10 @@ def run_search(work, args, audit, out_dir, resume_state=None):
         SEG_GROUP_VAR if _group_col == "segment"
         else f"{SEG_GROUP_VAR} (probe skipped: --group-by {_group_col} is "
              "not a segment grouping)")
-    if _use_g and _gid is not None:
+    if _fixed_only:
+        builder = ExperimentBuilder(work, id_col="row_id", y_col="Y")
+        roles = [0, 1]
+    elif _use_g and _gid is not None:
         builder = ExperimentBuilder(work, id_col="row_id", y_col="Y",
                                     group_id_col=_gid)
         roles = [0, 1, 2, 3, 4, 5]
@@ -1646,7 +3511,10 @@ def run_search(work, args, audit, out_dir, resume_state=None):
     # Probe the grouped axis BEFORE the SA loop. The search cannot reach a
     # role-4 structure on its own (see _probe_grouped), and without this the
     # grouping decision is made by default rather than by evidence.
-    _probe_grouped(evaluator, _group_col if _use_g else None, audit, args)
+    if not _fixed_only:
+        _probe_grouped(evaluator, _group_col if _use_g else None, audit, args)
+    else:
+        audit["grouped_probe"] = {"skipped": "fixed-only"}
     search_dir = out_dir / "search59"
     search_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -1672,6 +3540,9 @@ def run_search(work, args, audit, out_dir, resume_state=None):
     t0 = time.time()
     search_error = None
     chunk_failures = 0
+    stalled = 0
+    replay_chunks = 0
+    n_eval = 0
     cwd = os.getcwd()
     try:
         os.chdir(search_dir)
@@ -1684,7 +3555,24 @@ def run_search(work, args, audit, out_dir, resume_state=None):
                       "continue)")
                 break
             n = min(chunk, total_iters - done)
-            warm = best_decision is not None
+            chunk_idx = int(done // max(1, int(chunk)))
+            # Fresh RNG stream per chunk: same seed + same warm start replays
+            # the byte-identical proposal sequence as pure cache hits (0.0s
+            # chunks that learn nothing — o26613390 chunks 3-8). Jittering
+            # the seed sends every chunk into a NEW neighborhood.
+            chunk_seed = int(args.seed) + 7919 * chunk_idx
+            # Stall-triggered cold restart: two chunks with no improvement
+            # means the warm neighborhood is exhausted; restart from random
+            # inits to jump elsewhere (the evaluator cache stays warm, so
+            # overlap with tried specs is still free).
+            if stalled >= 2:
+                print(f"   [search] no improvement for {stalled} chunks; "
+                      f"cold-restarting chunk {chunk_idx + 1} "
+                      f"(seed={chunk_seed})")
+                warm = False
+                stalled = 0
+            else:
+                warm = best_decision is not None
             n_starts = int(args.n_starts) if not warm else 1
             # Bound the chunk wall time: --chunk-time bounds a whole chunk,
             # the wall budget bounds the search stage, and SA's max_time is
@@ -1700,20 +3588,40 @@ def run_search(work, args, audit, out_dir, resume_state=None):
                 algo=args.search_algo,
                 max_iter=int(n),
                 n_starts=n_starts,
-                seed=int(args.seed),
-                n_jobs=1,
+                seed=int(chunk_seed),
+                n_jobs=max(1, int(getattr(args, "search_n_jobs", 1))),
                 output_config=out_cfg,
                 max_time=max_time,
                 refit=False,
-                warm_start_cache=True,
+                # Only a warm chunk may harvest the cached incumbent as
+                # its init vector. The library pops this flag and, when
+                # True without explicit init_solutions, seeds the SA
+                # from the cached best -- which silently cancels a cold
+                # (stall-restart) chunk (o26766505 chunk 3 printed
+                # "[resume] warming start from cached best" right after
+                # the cold restart was announced).
+                warm_start_cache=bool(warm),
             )
             if warm:
                 run_kwargs["init_solutions"] = [best_decision]
+            if _SA_SEED_PATCHED:
+                # Popped in the patched MultiStartSA.run_single above;
+                # restart i is seeded with chunk_seed+i so every chunk
+                # walks a BRAND NEW RNG stream instead of replaying
+                # np.random.seed(start_index=i).
+                run_kwargs["sa_base_seed"] = int(chunk_seed)
             print(f"   [search] chunk {done // chunk + 1}: iters "
                   f"{done + 1}..{done + n} of {total_iters} "
-                  f"(starts={run_kwargs['n_starts']}, warm={warm})")
+                  f"(starts={run_kwargs['n_starts']}, warm={warm}, "
+                  f"seed={chunk_seed})")
             error = None
             result = None
+            # Cache size BEFORE the chunk: replay detection needs the
+            # delta (n_eval is cumulative and hides 0-new-eval chunks).
+            try:
+                _n_eval_before = int(_extract_search_best(evaluator)[2] or 0)
+            except Exception:  # noqa: BLE001
+                _n_eval_before = 0
             try:
                 result = builder.run(evaluator, **run_kwargs)
             except Exception as exc:  # noqa: BLE001 - keep the best cached spec
@@ -1722,11 +3630,18 @@ def run_search(work, args, audit, out_dir, resume_state=None):
                       "cached spec")
                 traceback.print_exc()
             score, spec, n_eval, decision = _extract_search_best(evaluator)
+            _prev_best = best_bic
             if np.isfinite(score) and (best_bic is None
                                        or score < float(best_bic)):
                 best_bic = float(score)
                 best_spec = spec
                 best_decision = decision
+            _improved = (best_bic is not None and (
+                _prev_best is None or best_bic < _prev_best - 1e-9))
+            if _improved:
+                stalled = 0
+            elif best_bic is not None:
+                stalled += 1
             search_error = error or search_error
             # Count the generations that actually ran: a chunk stopped by
             # --chunk-time (max_time) completes fewer than its nominal n, and
@@ -1742,6 +3657,20 @@ def run_search(work, args, audit, out_dir, resume_state=None):
                     ran = n
             elif n_eval == 0:
                 ran = 0
+            # Honest credit: a replay chunk -- no new cache entries AND
+            # no best improvement -- learned nothing and must NOT
+            # advance the iteration counter, or a stuck seed stream
+            # reads as "160/160 converged" while half the chunks
+            # merely re-walked the cached incumbent (o26766505).
+            new_evals = max(0, int(n_eval) - int(_n_eval_before))
+            if new_evals <= 0 and not _improved:
+                ran = 0
+                replay_chunks += 1
+                print(f"   [search] replay chunk {replay_chunks}: "
+                      f"new_evals=0 and no improvement; iteration "
+                      f"counter held at {done}/{total_iters}")
+            else:
+                replay_chunks = 0
             done += int(ran)
             _write_json_atomic(BEST_JSON, {
                 "best_spec": best_spec, "best_bic": best_bic,
@@ -1767,6 +3696,45 @@ def run_search(work, args, audit, out_dir, resume_state=None):
                 else round(float(best_bic), 2),
                 "n_cache_evals": int(n_eval),
                 "timestamp_iso": _utcnow_iso()})
+            # Characteristic attribution: which families make up the best
+            # spec now, what entered/left vs the previous chunk, and the
+            # BIC gain. Proves convergence *by characteristic* (telematics
+            # vs weather vs game info vs geometry...), not just a falling
+            # scalar.
+            try:
+                _terms = []
+                if isinstance(best_spec, dict):
+                    for _k in ("fixed_terms", "rdm_terms", "rdm_cor_terms",
+                               "grouped_terms", "hetro_in_means",
+                               "hetro_in_variances"):
+                        _terms += [str(t).split(":")[0]
+                                   for t in (best_spec.get(_k) or [])]
+                _fam = {}
+                for _t in _terms:
+                    _f = term_family(_t)
+                    _fam[_f] = _fam.get(_f, 0) + 1
+                _prev = getattr(run_search, "_prev_fam", None)
+                _added = sorted(set(_fam) - set(_prev or {}))
+                _dropped = sorted(set(_prev or {}) - set(_fam))
+                run_search._prev_fam = dict(_fam)
+                _prev_bic = getattr(run_search, "_prev_bic", None)
+                _dbic = ("" if _prev_bic is None or best_bic is None
+                         else round(float(best_bic) - float(_prev_bic), 2))
+                run_search._prev_bic = best_bic
+                _frow = {"chunk": int(done // chunk),
+                         "iters_completed": int(done),
+                         "best_bic": ("" if best_bic is None
+                                      else round(float(best_bic), 2)),
+                         "delta_bic": _dbic,
+                         "added_families": "|".join(_added),
+                         "dropped_families": "|".join(_dropped)}
+                for _f in FAMILY_ORDER:
+                    _frow[f"n_{_f}"] = int(_fam.get(_f, 0))
+                _fhdr = not FAMILY_CSV.exists()
+                pd.DataFrame([_frow]).to_csv(FAMILY_CSV, mode="a",
+                                             header=_fhdr, index=False)
+            except Exception as exc:  # noqa: BLE001 - diagnostic only
+                print(f"   WARN: family attribution failed ({exc})")
             if error and n_eval == 0:
                 chunk_failures += 1
                 if chunk_failures >= 2:
@@ -1775,6 +3743,14 @@ def run_search(work, args, audit, out_dir, resume_state=None):
                     break
             else:
                 chunk_failures = 0
+            if replay_chunks >= 6:
+                _stall_msg = (f"search stalled: {replay_chunks} "
+                              "consecutive replay chunks (no new "
+                              "evaluations, no best improvement)")
+                print(f"   WARN: {_stall_msg}; stopping the search loop")
+                search_error = (f"{search_error}; {_stall_msg}"
+                                if search_error else _stall_msg)
+                break
             _clear_jax_caches()
     finally:
         os.chdir(cwd)
@@ -1796,6 +3772,8 @@ def run_search(work, args, audit, out_dir, resume_state=None):
         "engine": engine_used,
         "variables": variables,
         "search_error": search_error,
+        "replay_chunks": int(replay_chunks),
+        "n_cache_evals": int(n_eval),
         "rejections": _rej,
     }
     _tot_rej = sum(int(v.get("count", 0)) for v in _rej.get("counts", {}).values())
@@ -1859,6 +3837,158 @@ def ensure_spec(spec, work, audit, force_game=True, keep_temporal=True,
     spec["fixed_terms"] = fixed
     spec["rdm_terms"] = [t for t in spec.get("rdm_terms", [])
                          if str(t).split(":")[0] in work.columns]
+    # --force-grouped-temporal: the SA search cannot reach role 4 on its own
+    # (the grouped probe in run_search is a diagnostic), so if it is on we
+    # append the grouped-probe WINNERS to the refit spec directly. Only
+    # active with --group-temporal on --group-by segment; otherwise the
+    # probe is recorded but the refit stays as searched.
+    if str(getattr(args, "force_grouped_temporal", "off") or "off").lower() == "on" \
+            and str(getattr(args, "group_temporal", "off") or "off").lower() == "on" \
+            and str(getattr(args, "group_by", "highway") or "highway") == "segment":
+        probe = audit.get("grouped_probe") or {}
+        winners = sorted({k.split("|")[0] for k, v
+                          in (probe.get("results") or {}).items()
+                          if isinstance(v, dict) and v.get("grouped_wins")})
+        if not winners:
+            # Resumed run: the grouped probe lives in run_search and is not
+            # re-executed. Fall back to the canonical temporal basis so the
+            # force is still meaningful rather than a silent no-op.
+            winners = [c for c in ("rel_sin", "rel_cos")
+                       if c in work.columns]
+        grouped = {str(t).split(":")[0] for t in (spec.get("grouped_terms") or [])}
+        for t in winners:
+            if t in work.columns and t not in grouped:
+                grouped.add(t)
+        spec["grouped_terms"] = sorted(grouped)
+        audit["force_grouped_temporal"] = {
+            "applied": bool(spec["grouped_terms"]), "terms": spec["grouped_terms"],
+            "source": "probe" if probe.get("results") else "fallback"}
+
+    # Hierarchical Game-Day coefficients. The grouped (role 4) block is the
+    # only term that can let the surface move BETWEEN games, and
+    # --grouped-game-grain decides what a coefficient is estimated per:
+    #   cell    (default) road class x distance band -> 12 groups, each with
+    #           one coefficient per game-day attribute. Identified from the
+    #           ~3.8k observed events, and a future fixture is predicted from
+    #           its own attendance/kickoff because those enter as covariates.
+    #   fixture the T9 parameterisation: 39 x k segment-level slopes, which is
+    #           not estimable at this event count.
+    # The cell grain does not encode a per-derby idiosyncrasy; that is the
+    # price of having 3.8k events, and it is why the audit records the cell
+    # parameter count next to the event count.
+    if str(getattr(args, "force_grouped_game", "off") or "off").lower() == "on":
+        # GRAIN. 'cell' groups by road class x distance band (12 cells) and
+        # estimates the coefficient on each game-day ATTRIBUTE there; 'fixture'
+        # is the T9 parameterisation, one slope per fixture on each of the
+        # segment-level covariates. Cell is the default because the fixture
+        # grain asks for 39 x len(terms) coefficients out of ~3.8k events and
+        # therefore cannot be estimated (it is what produced a surface whose
+        # two games shared 16 of their top-20 streets).
+        _grain = str(getattr(args, "grouped_game_grain", "cell") or "cell").lower()
+        if _grain not in ("cell", "fixture"):
+            raise SystemExit("--grouped-game-grain must be cell|fixture, got "
+                             f"{_grain!r}")
+        if _grain == "cell" and GAME_CELL_COL not in work.columns:
+            print(f"   [hier] WARN: {GAME_CELL_COL} missing from the search "
+                  "frame; falling back to fixture grain (rebuild the panel "
+                  "with add_static to get the cell key)")
+            _grain = "fixture"
+        _raw = str(getattr(args, "grouped_game_terms", "") or "")
+        _terms = [t.strip() for t in _raw.split(",") if t.strip()]
+        if not _terms:
+            _defaults = (("log_att", "in_event", "rel_sin", "rel_cos",
+                          "ko_tod_sin", "ko_tod_cos", "big_game")
+                         if _grain == "cell" else
+                         ("dist_stad", "seg_event_uplift_z", "lanes_z",
+                          "maxspeed_z", "rel_sin", "rel_cos"))
+            _terms = [c for c in _defaults if c in work.columns]
+        grouped = {str(t).split(":")[0] for t in (spec.get("grouped_terms") or [])}
+        for _t in _terms:
+            if _t in work.columns:
+                grouped.add(_t)
+        _gb = {str(t).split(":")[0] for t in grouped}
+        # ROLE HYGIENE (T9 patch, 2026-10-28). The package requires
+        # "one role per variable" across {fixed, rdm, rdm_cor, grouped,
+        # hetro_in_means}; collisions make nb-full/nb-nohetero unidentifiable
+        # and the refit silently falls back to nb-ind (T9 job 27158122).
+        # 1) a grouped random slope carries its own level -> not fixed.
+        _fixed_before = [str(t).split(":")[0] for t in (spec.get("fixed_terms") or [])]
+        _dropped_fixed = sorted(set(_fixed_before) & _gb)
+        spec["fixed_terms"] = [t for t in (spec.get("fixed_terms") or [])
+                               if str(t).split(":")[0] not in _gb]
+        # (below, pre-existing) also not both an id-random and a grouped
+        # random parameter: the package assigns one random role per base.
+        spec["rdm_terms"] = [t for t in (spec.get("rdm_terms") or [])
+                             if str(t).split(":")[0] not in _gb]
+        spec["rdm_cor_terms"] = [t for t in (spec.get("rdm_cor_terms") or [])
+                                 if str(t).split(":")[0] not in _gb]
+        spec["grouped_terms"] = sorted(
+            (t if ":" in t else f"{t}:normal") for t in grouped)
+        spec["group_id_col"] = (GAME_CELL_COL if _grain == "cell" else "fixture")
+        _attrs = [c for c in ("log_att", "ko_tod_sin", "ko_tod_cos",
+                              "fxt_NRL", "fxt_ALeague", "big_game")
+                  if c in work.columns]
+        het = {str(t).split(":")[0] for t in (spec.get("hetro_in_means") or [])}
+        for _a in _attrs:
+            het.add(_a)
+        # 2) het-in-means targets must themselves be random parameters, and a
+        #    variable cannot be grouped and hetero simultaneously. Prune:
+        #    (a) grouped bases carry their own per-fixture slope (they are
+        #        already the hierarchy), (b) bases that are fixed-only would
+        #        collide with the fixed role (log_att, fxt_NRL, big_game,
+        #        ko_tod_*, dow_d4, post_game, ev_x_lanes, seg_risk_z, ...).
+        _random_bases = {str(t).split(":")[0]
+                         for t in (spec.get("rdm_terms") or []) +
+                                 (spec.get("rdm_cor_terms") or [])}
+        _het_before = sorted(het)
+        het = {t for t in het if t in _random_bases}
+        spec["hetro_in_means"] = sorted(het)
+        # Cell accounting: how many groups the grouped block actually has to
+        # estimate, and how thin they are. This is the number that decides
+        # whether the re-parameterisation is doing anything.
+        _cell_info = {}
+        if _grain == "cell" and GAME_CELL_COL in work.columns:
+            _yv = (pd.to_numeric(work["Y"], errors="coerce").fillna(0.0)
+                   if "Y" in work.columns else pd.Series(np.zeros(len(work))))
+            _g = work.groupby(GAME_CELL_COL)
+            _cells = {str(k): {"rows": int(len(v)),
+                               "events": int(float(_yv.loc[v.index].sum()))}
+                      for k, v in _g}
+            _ev = sorted(d["events"] for d in _cells.values())
+            _cell_info = {
+                "n_cells": int(len(_cells)),
+                "cells": _cells,
+                "events_min": int(_ev[0]) if _ev else 0,
+                "events_median": (int(np.median(_ev)) if _ev else 0),
+                "events_max": int(_ev[-1]) if _ev else 0,
+                "n_params": int(len(spec["grouped_terms"]) * len(_cells)),
+                "all_present_in_work": bool(len(_cells))}
+            _cell_info["bands"] = GAME_CELL_GRAIN
+            print(f"   [hier] cell grain[{GAME_CELL_GRAIN}]: "
+                  f"{_cell_info['n_cells']} cells "
+                  f"(events {_cell_info['events_min']}/"
+                  f"{_cell_info['events_median']}/{_cell_info['events_max']} "
+                  f"min/med/max) x {len(spec['grouped_terms'])} grouped "
+                  f"terms = {_cell_info['n_params']} coefficients")
+        audit["force_grouped_game"] = {
+            "applied": bool(spec["grouped_terms"]),
+            "grain": _grain,
+            "grouped_terms": list(spec["grouped_terms"]),
+            "group_id_col": spec["group_id_col"],
+            "hetro_in_means": list(spec["hetro_in_means"]),
+            "cell_grain": _cell_info,
+            # T9 patch provenance: what was dropped and why
+            "dropped_from_fixed": _dropped_fixed,
+            "het_dropped_not_random": sorted(set(_het_before) - het)}
+        if str(getattr(args, "two_stage", "on")) == "on":
+            print("   [hier] WARNING: --two-stage is ON. The shipped "
+                  "surface is denominator x propensity, and the propensity "
+                  "is a fixed-effects GLM, so the fixture-grouped random "
+                  "slopes will NOT appear in pred_speeding. Use "
+                  "--two-stage off to ship the hierarchical count surface.")
+            audit["force_grouped_game"]["warning"] = (
+                "two-stage propensity is fixed-effects; grouped game slopes "
+                "apply to the count surface only")
     return spec
 
 
@@ -1901,6 +4031,131 @@ def _spec_fields(spec, work):
     return fields
 
 
+# Covariates that re-express the exposure offset's own quantity. With the
+# logexp coefficient pinned at 1.0 these cannot be free: see
+# drop_offset_duplicates.
+OFFSET_DUPLICATE_TERMS = ("log_flow_z", "aadt_z")
+
+
+def drop_offset_duplicates(fields, exposure="free", mode="auto"):
+    """Drop free flow/AADT terms that would re-free a pinned exposure offset.
+
+    WHY: `--exposure offset` pins the coefficient on logexp at 1.0, but the
+    design also carries free covariates built from the SAME traffic volume.
+    On the band+cross+NB arm log_flow_z was fitted at c=-0.265 with a slope
+    of b=0.512 on logexp, so the net response to flow was
+
+        d(log mu)/d(log exp) = 1 + c/b = 0.48
+
+    -- the pin was not a restriction, only half of one. The surface then
+    reacts to flow at 0.48x, which is a compression of 2.07x. That is the
+    in-sample calibration slope of 2.03 the amplitude experiments kept
+    chasing, and it is visible on the holdout as a too-steep exposure
+    gradient: 1.08x under-prediction in the bottom exposure octile against
+    9.38x in the top, i.e. 8.7x too steep, which is the 3.95x level deficit.
+
+    Only the MAIN EFFECT is dropped. The kickoff x flow crosses
+    (ko_sin_x_flow / ko_cos_x_flow) multiply flow by a game attribute, so
+    they carry the between-game reordering rather than a second copy of the
+    level, and removing them would trade the calibration defect for the
+    reordering one.
+
+    `mode` is auto|on|off. auto drops only when the offset is actually
+    pinned, so one script can serve both arms of the A/B.
+
+    Returns (fields, record) so the caller can audit and print it.
+    """
+    rec = {"mode": str(mode), "exposure": str(exposure), "enabled": False,
+           "dropped": {}, "kept_interactions": [], "reason": None}
+    mode = str(mode or "auto").lower()
+    if mode not in ("auto", "on", "off"):
+        raise SystemExit(f"--exposure-pin-drop must be auto|on|off, got {mode!r}")
+    pinned = str(exposure or "free").lower() in ("offset", "hazard")
+    if mode == "off":
+        rec["reason"] = "disabled by --exposure-pin-drop off"
+        return fields, rec
+    if not pinned:
+        rec["reason"] = (f"exposure is {exposure!r}: the free logexp "
+                         "coefficient already carries the elasticity, so "
+                         "there is no pin to protect")
+        if mode == "on":
+            print("   [exposure-pin] WARNING: --exposure-pin-drop on has no "
+                  "effect with --exposure free; pass --exposure offset")
+        return fields, rec
+    out = dict(fields)
+    for key in ("fixed_terms", "rdm_terms", "rdm_cor_terms",
+                "hetro_in_means", "hetro_in_variances"):
+        keep, gone = [], []
+        for t in (fields.get(key) or []):
+            (gone if str(t).split(":")[0].strip() in OFFSET_DUPLICATE_TERMS
+             else keep).append(t)
+        if gone:
+            out[key] = keep
+            rec["dropped"][key] = list(gone)
+    # Surviving terms that are flow-derived INTERACTIONS (e.g. ko_sin_x_flow),
+    # reported so the log makes clear the reordering channel was not dropped.
+    rec["kept_interactions"] = [
+        str(t) for t in (out.get("fixed_terms") or [])
+        if "_x_" in str(t)
+        and any(tok in str(t).lower() for tok in ("flow", "aadt"))]
+    rec["enabled"] = bool(rec["dropped"])
+    if not rec["dropped"]:
+        rec["reason"] = ("no free volume covariate in the searched design, "
+                         "so the pin is already the whole flow response")
+    return out, rec
+
+
+def refit_fidelity_problem(audit, allow_degraded=False):
+    """Gate message when the shipped refit is not the searched model.
+
+    The staged ladder inside fit_metacount_nb degrades silently by design (it
+    has to return *something*), so the question "is this the model we asked
+    for?" has to be asked by the caller that ships the surface. On T9 job
+    27247312 it was not: the ladder landed on poisson-fixed, the run printed
+    "GATE OK", and the fixed-effects surface -- with no fixture-grouped slope
+    in it at all -- was ready to be handed to the MIP.
+
+    Returns None when the fit is faithful (or the operator opted in), else a
+    one-line problem string for the gate.
+    """
+    ref = audit.get("refit") or {}
+    if not ref or not ref.get("degraded") or allow_degraded:
+        return None
+    req = ref.get("requested") or {}
+    fit = ref.get("fitted") or {}
+    drops = ref.get("design_drops") or []
+    drops_s = (", ".join(f"{d.get('term')}:{d.get('reason')}" for d in drops)
+               or "none")
+    return ("refit degraded: shipped %s, not the searched structure "
+            "(grouped %d->%d, random %d->%d; rejected: %s; dropped: %s). "
+            "Request the family explicitly (--refit-model poisson) to make "
+            "that swap a decision, or pass --allow-degraded-fit to inspect "
+            "the fallback."
+            % (ref.get("spec_label") or "?",
+               len(req.get("grouped") or []),
+               len(fit.get("grouped_terms") or []),
+               len(req.get("rdm") or []),
+               len(fit.get("rdm_terms") or []),
+               "; ".join(ref.get("rejected_stages") or []) or "none",
+               drops_s))
+
+
+def handoff_gate_problem(audit, pilot=False, allow_weak=False):
+    """Gate message when the surface is not fit to hand to the MIP.
+
+    Split out of main() so the rule is testable and so the failure reason
+    reaches the operator instead of a bare "GATE OK".
+    """
+    h = audit.get("handoff") or {}
+    if pilot or allow_weak or h.get("pass"):
+        return None
+    why = "; ".join(h.get("failures") or [])
+    if not why:
+        why = "not evaluated: %s" % (h.get("error") or "no verdict written")
+    return ("handoff gate: surface is not fit to hand to the MIP (%s). "
+            "Set ALLOW_WEAK_SURFACE=1 only to inspect it." % why)
+
+
 def refit_only(work, spec, args, audit):
     """JAX refit on the 100k-row search frame only (no future data alive).
 
@@ -1937,22 +4192,71 @@ def refit_only(work, spec, args, audit):
                              "(log-scale exposure) in the search frame")
         _offset_col = "logexp"
     audit["exposure_mode"] = _exp
+    # A pinned offset is only a restriction if nothing else re-fits the same
+    # flow. Dropping the free volume covariates is what makes --exposure
+    # offset actually pin the elasticity instead of half of it.
+    fields, _pin = drop_offset_duplicates(
+        fields, exposure=_exp,
+        mode=str(getattr(args, "exposure_pin_drop", "auto") or "auto"))
+    audit["exposure_pin_drop"] = _pin
+    if _pin["enabled"]:
+        print("   [exposure-pin] dropped free volume covariate(s) that would "
+              "re-fit the pinned offset: "
+              + ", ".join(f"{k}={v}" for k, v in _pin["dropped"].items()))
+        if _pin["kept_interactions"]:
+            print("       kept " + ", ".join(_pin["kept_interactions"])
+                  + " (kickoff x flow: they reorder segments between games,"
+                  " they do not re-scale the level)")
+    else:
+        print(f"   [exposure-pin] no drop ({_pin.get('reason')})")
     audit["refit_model_requested"] = _mode
     audit["refit_dispersion_gene"] = int(spec.get("dispersion", -1))
+    # WHERE THE FAMILY CAME FROM. With --search-iters 0 (every pinned A/B in
+    # this directory) no gene is evaluated in this run, so a Poisson refit
+    # here is not a decision the data made -- it is whatever the checkpoint
+    # recorded, possibly for a different panel and a different spec. On the
+    # band+cross split that inheritance shipped poisson-full while a forced
+    # nb-full scored 460 BIC points better with a finite alpha=2.84, i.e. the
+    # "dispersion collapsed to Poisson" reading of the run was wrong.
+    _rlx = str(getattr(args, "refit_model", "searched") or "searched").lower()
+    _inherited = _rlx in ("searched", "auto", "")
+    audit["refit_dispersion_source"] = ("spec (not re-evaluated this run)"
+                                        if _inherited else "forced by flag")
     print(f"   refit likelihood: {_mode} "
           f"(search dispersion gene={spec.get('dispersion')}); "
           f"exposure: {_exp}"
           + (f" pinned at coef 1.0 via offset[{_offset_col}]"
              if _offset_col else " free coefficient"))
+    if _inherited and int(getattr(args, "search_iters", 0) or 0) == 0:
+        print("   [dispersion] family inherited from the resolved spec; this "
+              "run fitted no alternative, so a Poisson gene here was not a "
+              "decision made on this data. --refit-model nb|poisson forces "
+              "it and --refit-model is worth setting explicitly for any "
+              "pinned arm.")
     _rss_gb("refit-start")
+    # Same auto low-mem rule as fit_metacount_nb, honoured HERE: this call
+    # used to pin DE-vmap + SLSQP ON unconditionally, so the guard that
+    # exists for large N*R (it triggers only on None) never engaged and the
+    # 2026-10-16 refit of the heavier searched spec at R=200 OOM'd the 64GB
+    # pbs. DE-vmap evaluates a whole population of draws and SLSQP holds
+    # grad buffers -- both scale with N*R -- so above 12M fall back to the
+    # LBFGS polish; the divergence-retry below re-escalates to DE+SLSQP
+    # (R capped at 60) if the cold polish stalls.
+    _nr = int(len(work)) * int(args.refit_R)
+    _small = _nr <= 12_000_000
+    if not _small:
+        print(f"   [metacount] low-mem guard: N*R={_nr:,} > 12M; DE "
+              "warm-start + SLSQP disabled for this refit (LBFGS polish)")
     info = fit_metacount_nb(work, y_col="Y", id_col="row_id",
                             model=_mode, R=int(args.refit_R),
                             offset_col=_offset_col,
                             de_maxiter=int(args.de_maxiter),
                             de_popsize=int(args.de_popsize),
                             verbose=True,
-                            continuous_de_warm_start=(not args.no_de_warm),
-                            use_slsqp=(not args.no_slsqp), **fields)
+                            continuous_de_warm_start=((not args.no_de_warm)
+                                                      and _small),
+                            use_slsqp=((not args.no_slsqp) and _small),
+                            **fields)
     if str(info.get("spec_label", "")).startswith("statsmodels-"):
         # JAX stages all diverged (typical: LBFGS-only from a cold init on
         # sparse 15-min counts stalls on the flat eta plateau). One
@@ -1981,14 +4285,47 @@ def refit_only(work, spec, args, audit):
             print(f"  [metacount] warm retry failed ({exc}); keeping "
                   "GLM fallback")
     _rss_gb("refit-done")
+    # FIT FIDELITY: did the shipped fit actually carry the searched
+    # structure? The staged ladder inside fit_metacount_nb silently degrades
+    # (nb-full -> nb-nohetero -> nb-ind -> nb-fixed -> poisson-fixed). T9 job
+    # 27247312 landed on poisson-fixed, shipped a fixed-effects surface with
+    # no fixture-grouped slopes at all, and still printed "GATE OK" because
+    # nothing compared the requested model with the fitted one.
+    _degraded = bool(info.get("degraded", False))
+    _drops = info.get("design_drops") or []
+    _drift = info.get("drift_retries") or []
+    if _degraded:
+        _lost = [r for r in (info.get("rejected_stages") or [])]
+        print(f"   [refit] DEGRADED: requested {_mode} on the searched "
+              f"structure, shipped {info['spec_label']}")
+        for _r in _lost:
+            print(f"   [refit]   rejected: {_r}")
+        for _d in _drift:
+            print(f"   [refit]   drift-dropped {_d['dropped']} "
+                  f"({_d['from']} -> {_d['to']})")
+        _req = info.get("requested") or {}
+        print(f"   [refit]   structure: grouped {len(_req.get('grouped') or [])}"
+              f" requested -> {len(info.get('grouped_terms') or [])} fitted; "
+              f"random {len(_req.get('rdm') or [])} requested -> "
+              f"{len(info.get('rdm_terms') or [])} fitted")
     audit["refit"] = {"spec_label": info["spec_label"],
+                      "degraded": _degraded,
+                      "design_drops": _drops,
+                      "drift_retries": _drift,
+                      "rejected_stages": info.get("rejected_stages") or [],
+                      "requested": info.get("requested") or {},
                       "searched_spec": {k: spec.get(k) for k in
                                         ("fixed_terms", "rdm_terms",
                                          "rdm_cor_terms", "grouped_terms",
                                          "hetro_in_means")},
                       "fitted": {k: info.get(k) for k in
                                  ("fixed_terms", "rdm_terms",
-                                  "rdm_cor_terms", "grouped_terms")},
+                                  "rdm_cor_terms", "grouped_terms",
+                                  # the grouping actually fitted: without
+                                  # these the artifact cannot say whether
+                                  # the surface is per-cell or per-fixture
+                                  "group_id_col", "n_groups",
+                                  "group_categories")},
                       "aic": info["aic"], "bic": info["bic"],
                       "alpha": info["alpha"],
                       # Likelihood actually fitted, so the reported BIC is
@@ -2110,6 +4447,26 @@ def _fixture_variation(out, top_n=(10, 20)):
     out_d["site_overlap_jaccard"] = jac
     out_d["unique_argmax_sites"] = int(len({wide[c].idxmax() for c in cols}))
     out_d["game_specific_ranking"] = bool(jac.get("top20") != 1.0)
+    # Expose the fluctuation directly, not just its variance share: pairwise
+    # Spearman between fixtures' segment totals, and each fixture's leading
+    # segments. A surface that varies only in level has pairwise rho ~ 1.0
+    # and identical top lists; a surface whose functional form depends on the
+    # game-day has lower rho and reordered leaders.
+    from itertools import combinations
+    pair = {}
+    for _i, _j in combinations(range(len(cols)), 2):
+        _a = wide[cols[_i]].rank()
+        _b = wide[cols[_j]].rank()
+        _c = (float(np.corrcoef(_a, _b)[0, 1])
+              if _a.std() > 0 and _b.std() > 0 else float("nan"))
+        pair[f"{str(cols[_i])[:30]}|{str(cols[_j])[:30]}"] = (
+            round(_c, 4) if np.isfinite(_c) else None)
+    _pv = [v for v in pair.values() if v is not None]
+    out_d["pairwise_surface_spearman"] = pair
+    out_d["pairwise_surface_spearman_mean"] = (
+        round(float(np.mean(_pv)), 4) if _pv else None)
+    out_d["top_segments_per_fixture"] = {
+        str(c): [int(x) for x in wide[c].nlargest(10).index] for c in cols}
     return out_d
 
 
@@ -2123,8 +4480,26 @@ def _pearson(a, b):
     return float(np.corrcoef(a, b)[0, 1])
 
 
+# Handoff-gate thresholds. These are calibrated on the recorded runs, not
+# chosen a priori: t8_ar_fix (the reference surface) scores top-20 Jaccard
+# 0.739 and calibration slope 1.019, while t9_hier -- which reported pass --
+# scores 0.818 and 4.356 with pairwise surface Spearman 0.9963. The old gate
+# accepted any Jaccard < 1.0 and any slope in [0.2, 5.0], so "16 of 20 streets
+# shared by both games" and "predictions 4x too steep" were both certified.
+HANDOFF_TOP20_JACCARD_MAX = 0.80
+# The surface-Spearman cap is deliberately extreme. Applied to all ~7.5k
+# segments, a surface that reorders its top-20 but leaves the bulk alone still
+# correlates ~0.98 with its sibling, so a 0.95 cap would reject exactly the
+# surface the MIP can use. 0.99 means "rank-identical to the noise floor": it
+# catches a pure level shift (t9_hier: 0.9963) without punishing a real
+# reordering.
+HANDOFF_SURFACE_SPEARMAN_MAX = 0.99
+HANDOFF_CALIBRATION_BAND = (0.75, 1.35)
+
+
 def compute_handoff(merged, out, metrics, top_n=20):
-    """Can this surface be handed to the MIP? Three checks, all measured.
+    """Can this surface be handed to the MIP? Every check measured, none
+    generous.
 
     The MIP solves a maximal-covering problem on pred_speeding, so what
     matters is not pooled RMSE but whether the ranking is right WITHIN each
@@ -2139,11 +4514,17 @@ def compute_handoff(merged, out, metrics, top_n=20):
                        r negative by construction -- see diag_proof.py)
       top20_coverage   share of the observed top-20 mass that falls inside
                        the predicted top-20, against the 20/n random floor
-    and across fixtures: the top-20 site-set Jaccard from _fixture_variation.
+    and across fixtures: the top-20 site-set Jaccard and the pairwise surface
+    Spearman from _fixture_variation.
 
-    pass = ranking is positive on every fixture, the plan is game-specific,
-    and the surface is calibrated. A surface that fails can still be run with
-    ALLOW_WEAK_SURFACE=1 in the chain, but it is never silently shipped.
+    pass = ranking is positive on every fixture, the plan is game-specific
+    AND the surface is calibrated. "Game-specific" now means the two games
+    share at most HANDOFF_TOP20_JACCARD_MAX of their top-20 (and their
+    per-segment predictions correlate below HANDOFF_SURFACE_SPEARMAN_MAX),
+    and "calibrated" means a slope inside HANDOFF_CALIBRATION_BAND. A single
+    fixture cannot demonstrate cross-game differentiation, so it cannot pass
+    either. Failing surfaces are listed in res["failures"]; the run gate
+    refuses them unless ALLOW_WEAK_SURFACE=1.
     """
     res = {"n_fixtures": 0, "per_fixture": {}}
     need = {"fixture", "road_osmid", "observed", "pred_speeding"}
@@ -2181,17 +4562,79 @@ def compute_handoff(merged, out, metrics, top_n=20):
     try:
         fv = _fixture_variation(out)
         res["top20_jaccard"] = (fv.get("site_overlap_jaccard") or {}).get("top20")
+        res["pairwise_surface_spearman_mean"] = fv.get(
+            "pairwise_surface_spearman_mean")
+        res["variance_between_fixtures_pct"] = fv.get(
+            "variance_between_fixtures_pct")
+        res["unique_argmax_sites"] = fv.get("unique_argmax_sites")
     except Exception:  # noqa: BLE001
         res["top20_jaccard"] = None
-    slope = metrics.get("calibration_slope")
-    res["calibration_slope"] = slope
-    res["positive_ranking"] = bool(rs and res["pearson_min"] > 0.0)
-    res["game_specific"] = bool(res["top20_jaccard"] is not None
-                                and res["top20_jaccard"] < 1.0)
+        res["pairwise_surface_spearman_mean"] = None
+    res["calibration_slope"] = metrics.get("calibration_slope")
+    return _handoff_verdict(res)
+
+
+def _handoff_verdict(res):
+    """Apply the handoff thresholds to an already-measured dict.
+
+    Pure (no frames, no metrics passed separately) so the same rule can be
+    replayed against a recorded run's numbers -- which is how the thresholds
+    above were set and how a change to them can be checked against every past
+    surface instead of only the next one.
+    """
+    slope = res.get("calibration_slope")
+    _jac = res.get("top20_jaccard")
+    _rho = res.get("pairwise_surface_spearman_mean")
+    _lo, _hi = HANDOFF_CALIBRATION_BAND
+    fails = []
+
+    _pmin = res.get("pearson_min")
+    res["positive_ranking"] = bool(res.get("n_fixtures") and _pmin is not None
+                                   and float(_pmin) > 0.0)
+    if not res["positive_ranking"]:
+        fails.append(
+            f"no positive per-fixture ranking (pearson_min={res['pearson_min']})")
+
+    # game_specific: the surface must actually REORDER between games. Sharing
+    # 16 of 20 streets is not reordering; it is the same list with a reshuffle
+    # at the tail, and the MIP would deploy it as one plan.
+    if res["n_fixtures"] < 2:
+        res["game_specific"] = False
+        fails.append(f"only {res['n_fixtures']} fixture(s) scored: cross-game "
+                      "differentiation cannot be demonstrated")
+    elif _jac is None:
+        res["game_specific"] = False
+        fails.append("top-20 Jaccard not measured (fixture_variation failed)")
+    elif float(_jac) > HANDOFF_TOP20_JACCARD_MAX:
+        res["game_specific"] = False
+        fails.append(
+            f"top-20 Jaccard {_jac} > {HANDOFF_TOP20_JACCARD_MAX}: the "
+            "games share too much of their top-20 to be separate plans")
+    elif _rho is not None and float(_rho) > HANDOFF_SURFACE_SPEARMAN_MAX:
+        res["game_specific"] = False
+        fails.append(
+            f"pairwise surface Spearman {_rho} > "
+            f"{HANDOFF_SURFACE_SPEARMAN_MAX}: the two surfaces differ in "
+            "level, not in shape, so the ranking is fixture-independent")
+    else:
+        res["game_specific"] = True
+
     res["calibrated"] = bool(slope is not None and np.isfinite(slope)
-                             and 0.2 <= float(slope) <= 5.0)
+                             and _lo <= float(slope) <= _hi)
+    if not res["calibrated"]:
+        fails.append(
+            f"calibration slope {slope} outside [{_lo}, {_hi}]"
+            + (" -- predictions overstate the spread by "
+               f"{float(slope) / _hi:.1f}x"
+               if slope is not None and np.isfinite(slope)
+               and float(slope) > _hi else ""))
+
+    res["thresholds"] = {"top20_jaccard_max": HANDOFF_TOP20_JACCARD_MAX,
+                        "surface_spearman_max": HANDOFF_SURFACE_SPEARMAN_MAX,
+                        "calibration_band": list(HANDOFF_CALIBRATION_BAND)}
+    res["failures"] = fails
     res["pass"] = bool(res["positive_ranking"] and res["game_specific"]
-                       and res["calibrated"] and res["n_fixtures"] >= 1)
+                       and res["calibrated"] and res["n_fixtures"] >= 2)
     return res
 
 
@@ -2347,6 +4790,73 @@ def laplace_fixed_factors(frame, info, S, seed=0):
                 "n_with_se": int(np.sum(sds > 0)),
                 "mean_se": float(sds.mean()) if len(sds) else 0.0}
     return np.exp(np.clip(delta, -30.0, 30.0)), coverage
+
+
+def _z_to_p(z):
+    from math import erfc
+    return float(erfc(abs(float(z)) / np.sqrt(2.0)))
+
+
+def prune_propensity(work, args, spec, design_cols, r0, p_thresh,
+                     prior_sd=None):
+    """Backward-eliminate insignificant UNFORCED terms from the propensity.
+
+    GAME_FORCE terms are never candidates: with ~3k successes the binomial
+    SEs dwarf game coefs, so unguarded pruning deletes the whole game block
+    and ships a static surface (o26537982). Weak forced terms are handled by
+    shrinkage (prior_sd), not deletion. The handoff gate remains the arbiter
+    over the final surface.
+
+    Returns (final_fit, report). final_fit falls back to r0 if every
+    refit fails.
+    """
+    names = list(r0["names"])
+    coef = np.asarray(r0["coef"], dtype=float)
+    se = np.asarray(r0["se"], dtype=float)
+    dropped = []
+    r = r0
+    # GAME_FORCE and the forced reordering interactions are never elimination
+    # candidates: with ~3k successes the binomial SEs dwarf game coefs, so
+    # unguarded pruning deletes the whole game block and ships a static
+    # surface (o26537982). Shrinkage (prior_sd) handles weak terms; pruning
+    # only removes unforced terms.
+    _protected = set(GAME_FORCE) | set(force_terms(work, args))
+    while len(names) > 2:
+        p = np.array([_z_to_p(c / max(s, 1e-12))
+                      for c, s in zip(coef, se)])
+        cand, worst = None, 0.0
+        for j in range(1, len(names)):
+            if names[j] in _protected:
+                continue
+            if p[j] > worst:
+                cand, worst = j, float(p[j])
+        if cand is None or worst <= float(p_thresh):
+            break
+        dropped.append(names[cand])
+        keep = [n for j, n in enumerate(names) if j != cand]
+        design = [c for c in design_cols if c in keep]
+        if not design:
+            break
+        r2, out2 = refit_binomial(work, args, {}, spec=spec,
+                                  design_cols=design, prior_sd=prior_sd,
+                                  audit_key=None, quiet=True)
+        if r2 is None:
+            break
+        r = r2
+        names = list(r["names"])
+        coef = np.asarray(r["coef"], dtype=float)
+        se = np.asarray(r["se"], dtype=float)
+    p_final = {n: round(_z_to_p(c / max(s, 1e-12)), 5)
+               for n, c, s in zip(r["names"], np.asarray(r["coef"], float),
+                                  np.asarray(r["se"], float))}
+    return r, {"dropped": dropped, "kept": list(r["names"]),
+               "p_threshold": float(p_thresh), "p_values": p_final,
+               # The SHIPPED propensity coefficients: without these the
+               # audit would still report the pre-prune full-design fit.
+               "terms": {n: [float(c), float(s)] for n, c, s in
+                         zip(r["names"], np.asarray(r["coef"], float),
+                             np.asarray(r["se"], float))},
+               "loglik": float(r["loglik"]), "bic": float(r["bic"])}
 
 
 def bayes_predictive_draws(denom_draws, p_draws, alpha=None, seed=0):
@@ -2551,26 +5061,26 @@ def refit_binomial(work, args, audit, spec=None, label="binomial refit",
 
 
 def plot_pred_vs_actual(out, merged, fig_dir, out_dir, top_n=20):
-    """PROOF OF CONCEPT: does the predicted ranking hold up against ACTUAL
-    observed speeding for the same games?
+    """PROOF OF CONCEPT at FULL COVERAGE: does the shipped surface track the
+    ACTUAL observed counts, cell by cell?
 
-    The surfaces figure shows what the model predicted. This shows whether
-    the prediction was any good, which is the only thing that justifies
-    deploying on it. Two views per game:
-
-      * predicted vs observed per top-N segment, with a 1:1 line
-      * the share of OBSERVED speeding falling in each quartile of the
-        PREDICTED ranking -- a model that ranks well puts most of the real
-        events in its top quartile
-
-    Honest framing, stated in the caption: this is a top-N comparison, not
-    a network-wide coverage claim. The deployment figure is the share of
-    observed speeding on the staffed sites, reported separately by stage 60.
+    The previous version scored each game on only its top-20 predicted
+    segments. Those 20 cells were picked BY the prediction, so the scatter
+    could not answer "does the surface rank the network well" -- it is a
+    selection-biased micro-sample that reliably produces r~-0.10 (over-
+    prediction at the very top) and reads as if the model were anti-
+    correlated with reality. The honest check uses EVERY observed
+    segment x 15-min cell: counts against counts (small integers, mostly
+    zeros), rank correlation over the whole holdout, and the share of
+    observed speeding caught by the top predicted quarter of cells
+    (25% = chance). `out` (future predictions) is kept in the signature for
+    callers; the comparison itself needs only `merged` (holdout cells).
     """
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from matplotlib.colors import LogNorm
     except Exception as exc:  # noqa: BLE001
         print(f"   WARN: pred-vs-actual figure unavailable ({exc})")
         return None
@@ -2578,90 +5088,207 @@ def plot_pred_vs_actual(out, merged, fig_dir, out_dir, top_n=20):
     if merged is None or not len(merged):
         print("   WARN: no observed rows; skipping pred-vs-actual figure")
         return None
+    if not {"fixture", "observed", "pred_speeding"}.issubset(merged.columns):
+        print("   WARN: pred-vs-actual skipped (merged lacks "
+              "fixture/observed/pred_speeding)")
+        return None
 
-    _fx = list(out["fixture"].unique())
-    ncol = min(2, max(len(_fx), 1))
-    nrow = int(np.ceil(len(_fx) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(6.4 * ncol, 5.2 * nrow),
+    def _cell_stats(_obs, _pred):
+        _o = np.asarray(_obs, dtype=float)
+        _p = np.asarray(_pred, dtype=float)
+        _m = np.isfinite(_o) & np.isfinite(_p)
+        _o, _p = _o[_m], _p[_m]
+        if len(_o) < 8:
+            return None
+        _rho = float(_spearman(_o, _p))
+        _r = (float(np.corrcoef(_o, _p)[0, 1])
+              if _o.std() > 0 and _p.std() > 0 else float("nan"))
+        _idx = np.argsort(-_p, kind="stable")
+        _parts = np.array_split(_o[_idx], 4)
+        _tot = max(float(_o.sum()), 1e-9)
+        _qsh = [round(float(_x.sum() / _tot), 4) for _x in _parts]
+        return {"n_cells": int(len(_o)),
+                "n_nonzero": int((_o > 0).sum()),
+                "spearman": round(_rho, 4),
+                "pearson_r": round(_r, 4),
+                "top_quartile_obs_share": _qsh[0],
+                "quartile_obs_share": _qsh,
+                "obs_total": round(float(_o.sum()), 2),
+                "pred_total": round(float(_p.sum()), 2)}
+
+    _fx = [str(f) for f in merged["fixture"].astype(str).unique()]
+    _panels = [("ALL GAMES", merged)]
+    for fx in _fx:
+        _panels.append((fx, merged[merged["fixture"].astype(str) == fx]))
+    # Per-axis limits are computed inside the panel loop (each panel's own
+    # prediction range); a shared square domain crushed the cloud onto the
+    # y-axis because cell counts are tiny integers.
+    ncol = 2
+    nrow = int(np.ceil(len(_panels) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(6.2 * ncol, 4.6 * nrow),
                              squeeze=False)
     rows = []
-    for i, fx in enumerate(_fx):
+    for i, (label, frame) in enumerate(_panels):
         ax = axes[i // ncol][i % ncol]
-        _p = (out[out["fixture"] == fx]
-              .groupby("road_osmid")["pred_speeding"].sum()
-              .sort_values(ascending=False).head(int(top_n)))
-        try:
-            _o = (merged[merged["fixture"] == fx]
-                  .groupby("road_osmid")["observed"].sum())
-        except Exception:  # noqa: BLE001
-            _o = pd.Series(dtype=float)
-        _j = pd.concat([_p.rename("pred"), _o.rename("obs")], axis=1)
-        _j = _j.dropna()
-        if len(_j) < 4:
+        _o = pd.to_numeric(frame["observed"], errors="coerce").fillna(0.0)
+        _p = pd.to_numeric(frame["pred_speeding"], errors="coerce").fillna(0.0)
+        st = _cell_stats(_o, _p)
+        if st is None:
             ax.axis("off")
             continue
-        r = float(np.corrcoef(_j["pred"], _j["obs"])[0, 1])
-        ax.scatter(_j["obs"], _j["pred"], s=26, alpha=0.75,
-                   color="#0B6E4F", edgecolors="k", linewidths=0.4)
-        _mx = float(max(_j["obs"].max(), _j["pred"].max())) * 1.08
-        ax.plot([0, _mx], [0, _mx], ls="--", lw=1.0, color="#888888",
-                label="1:1")
-        ax.set_xlim(0, _mx)
-        ax.set_ylim(0, _mx)
-        ax.set_xlabel("OBSERVED speeding (actual)")
-        ax.set_ylabel("PREDICTED speeding")
-        # share of observed by quartile of the PREDICTED ranking
-        _s = _j.sort_values("pred", ascending=False)
-        _nq = min(4, max(len(_s) // 2, 2))
-        _q = np.array_split(_s["obs"].to_numpy(), _nq)
-        _sh = [float(x.sum()) for x in _q]
-        _tot = max(sum(_sh), 1e-9)
-        _pct = [100.0 * x / _tot for x in _sh]
-        _ax2 = ax.inset_axes([0.63, 0.63, 0.34, 0.33])
-        _ax2.bar(range(_nq), _pct, color="#0B6E4F", width=0.7)
-        _ax2.set_xticks(range(_nq))
-        _ax2.set_xticklabels([f"Q{i + 1}" for i in range(_nq)], fontsize=5)
-        _ax2.tick_params(labelsize=5)
-        _ax2.set_title("obs %% by pred rank", fontsize=5.5)
-        for _k, _v in enumerate(_pct):
-            _ax2.text(_k, _v, f"{_v:.0f}", ha="center", va="bottom",
-                      fontsize=5)
-        ax.set_title(f"{str(fx)[:44]}\nr={r:.2f}  n={len(_j)}  "
-                     f"top quartile holds {_pct[0]:.0f}% of observed",
-                     fontsize=9)
-        ax.legend(fontsize=6, loc="upper left")
-        rows.append({"fixture": str(fx), "n_segments": int(len(_j)),
-                     "pearson_r": round(r, 4),
-                     "top_quartile_obs_share": round(_pct[0] / 100.0, 4),
-                     "obs_total": round(float(_j["obs"].sum()), 2),
-                     "pred_total": round(float(_j["pred"].sum()), 2)})
-    for j in range(len(_fx), nrow * ncol):
+        _on = _o.to_numpy(float)
+        _pn = _p.to_numpy(float)
+        _plim = max(float(np.percentile(_pn, 99)), 1.0) * 1.05
+        _olim = max(float(_on.max()), 1.0) * 1.05
+        hb = ax.hexbin(_pn, _on, gridsize=42,
+                       extent=(0, _plim, 0, _olim), mincnt=1, cmap="viridis",
+                       norm=LogNorm())
+        ax.plot([0, _olim], [0, _olim], ls="--", lw=1.0, color="#bbbbbb",
+                zorder=3, label="1:1")
+        ax.set_xlim(0, _plim)
+        ax.set_ylim(0, _olim)
+        ax.set_xlabel("PREDICTED finable speeding (count per cell)",
+                      fontsize=7.5)
+        ax.set_ylabel("OBSERVED finable speeding (count)", fontsize=7.5)
+        cb = fig.colorbar(hb, ax=ax, fraction=0.035, pad=0.02)
+        cb.set_label("segment x bin cells", fontsize=6)
+        cb.ax.tick_params(labelsize=5.5)
+        # Cumulative capture curve on a twin axis: cells ranked by
+        # prediction, left to right; y = share of all observed events
+        # captured. This is what the deployment actually buys, and it is
+        # drawn on the same panel so the rank story and the scatter cannot
+        # be read apart.
+        _tot = max(float(_on.sum()), 1e-9)
+        _ord = np.argsort(-_pn, kind="stable")
+        _ys = np.cumsum(_on[_ord]) / _tot
+        _xs = (np.arange(len(_on)) + 1) / float(len(_on))
+        _i25 = max(int(round(0.25 * len(_ys))) - 1, 0)
+        _q1 = float(_ys[_i25])
+        ax2 = ax.twinx()
+        ax2.plot(_xs, _ys, color="#1f77b4", lw=1.8, alpha=0.95, zorder=4)
+        ax2.plot([0.25], [_q1], "o", color="#1f77b4", ms=5, zorder=5)
+        ax2.annotate(f"Q1 -> {100 * _q1:.0f}%", (0.25, _q1),
+                     textcoords="offset points", xytext=(6, -11),
+                     fontsize=6.5, color="#1f77b4")
+        ax2.set_ylim(0.0, 1.02)
+        ax2.set_ylabel("share of observed captured", fontsize=6.5)
+        ax2.tick_params(labelsize=5.5, colors="#1f77b4")
+        ax.set_title(f"{label[:44]}\nrho={st['spearman']:.2f}  "
+                     f"r={st['pearson_r']:.2f}  "
+                     f"Q1 holds {100 * _q1:.1f}% of "
+                     f"observed  (cells={st['n_cells']:,}, "
+                     f"{st['n_nonzero']:,} nonzero)", fontsize=7.5)
+        _rrow = {"fixture": label}
+        _rrow.update(st)
+        rows.append(_rrow)
+    for j in range(len(_panels), nrow * ncol):
         axes[j // ncol][j % ncol].axis("off")
+    axes[0][0].legend(fontsize=6, loc="upper left")
     fig.suptitle(
-        "PROOF OF CONCEPT: predicted ranking vs ACTUAL observed speeding, "
-        "per future game\n(top-%d segments by prediction; inset = share of "
-        "observed speeding in each predicted-rank quartile.\n"
-        "A ranking that works puts most real events in Q1. Top-N only -- not "
-        "a network-wide coverage claim.)" % int(top_n), fontsize=10)
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
+        "Full-coverage proof: predicted COUNT vs observed COUNT, every "
+        "segment x 15-min cell in the holdout\n"
+        "(shade = cell count, log scale; dashed = 1:1; blue curve = "
+        "observed-event share captured as cells are ranked by prediction; "
+        "Q1 = top quartile, 25% = chance)", fontsize=9.5)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
     _p_out = Path(fig_dir) / "game_day_pred_vs_actual.png"
     fig.savefig(_p_out, dpi=130)
     plt.close(fig)
     try:
         pd.DataFrame(rows).to_csv(
             Path(out_dir) / "game_day_pred_vs_actual.csv", index=False)
+        _cells = merged[["fixture", "road_osmid", "bin",
+                         "observed", "pred_speeding"]].copy()
+        for _c in ("pred_speeding_count", "pred_sd_game", "game_lift"):
+            if _c in merged.columns:
+                _cells[_c] = pd.to_numeric(merged[_c], errors="coerce")
+        _cells.to_csv(Path(out_dir) / "game_day_pred_vs_actual_cells.csv.gz",
+                      index=False, compression="gzip")
+        print("   pred-vs-actual cells -> game_day_pred_vs_actual_cells.csv.gz"
+              f" ({len(_cells):,} rows)")
     except Exception as exc:  # noqa: BLE001
         print(f"   WARN: pred-vs-actual table failed ({exc})")
-    for rr in rows:
-        print(f"   [value] {str(rr['fixture'])[:34]:34s} r={rr['pearson_r']:.2f}"
-              f"  Q1 holds {100 * rr['top_quartile_obs_share']:.0f}% of observed"
-              f"  obs_total={rr['obs_total']:.0f}")
+    if rows:
+        _all = rows[0]
+        print(f"   [value] ALL GAMES rho={_all['spearman']:.2f} "
+              f"Q1 holds {100 * _all['top_quartile_obs_share']:.1f}% of "
+              f"observed  cells={_all['n_cells']:,}")
+    for rr in rows[1:]:
+        print(f"   [value] {rr['fixture'][:34]:34s} rho={rr['spearman']:.2f}"
+              f"  Q1 holds {100 * rr['top_quartile_obs_share']:.1f}% of "
+              f"observed  obs_total={rr['obs_total']:.0f}  "
+              f"cells={rr['n_cells']:,}")
     print(f"   pred-vs-actual -> {_p_out.name}, "
-          f"game_day_pred_vs_actual.csv")
+          "game_day_pred_vs_actual.csv, game_day_pred_vs_actual_cells.csv.gz")
     return rows
 
 
-def report_exposure_coefficient(info, audit, label="shipped refit"):
+def _offset_net_elasticity(coefs, frame):
+    """Net exposure elasticity when logexp is pinned as an offset.
+
+    WHY: "pinned at 1.0" only pins the coefficient on logexp. The design
+    can also carry FREE covariates built from the SAME traffic volume --
+    log_flow_z (z-scored log segment flow) and aadt_z -- and those eat the
+    elasticity again. For a covariate z with free coefficient c whose
+    slope on logexp is b, a change in flow that moves logexp by one unit
+    moves z by 1/b, so
+
+        d(log mu)/d(log exp) = 1 + c / b
+
+    On the band+cross+NB arm this came out at 0.48: log_flow_z (b=0.512,
+    c=-0.265) cancelled half of the pinned term. The surface then reacts
+    to flow at half strength, which is invisible in the fit (the mean is
+    preserved) but shows up as a compressed surface -- an in-sample
+    calibration slope of 2.03 is exactly 1/0.48 -- and as a 4x holdout
+    level deficit concentrated in the high-flow cells. A net far from 1
+    means the offset is not a restriction, whatever the audit says.
+    """
+    info = {"term": None, "net_elasticity": None, "terms": {}}
+    try:
+        if frame is None or coefs is None or "variable" not in coefs.columns:
+            info["reason"] = "no design frame or coefficient table"
+            return info
+        # Only covariates that measure the offset's own quantity. A term
+        # whose slope on logexp is under 0.1 logexp units has effectively
+        # no overlap, and dividing by it would just inflate noise.
+        cand = [v for v in ("log_flow_z", "aadt_z")
+                if v in frame.columns and v in set(
+                    coefs["variable"].astype(str))]
+        le = pd.to_numeric(frame["logexp"], errors="coerce")
+        net = 1.0
+        for v in cand:
+            z = pd.to_numeric(frame[v], errors="coerce")
+            ok = le.notna() & z.notna() & np.isfinite(le) & np.isfinite(z)
+            if int(ok.sum()) < 100 or float(z[ok].std()) <= 0:
+                continue
+            b = float(np.polyfit(z[ok].to_numpy(float), le[ok].to_numpy(float),
+                                 1)[0])
+            row = coefs[coefs["variable"].astype(str) == v].iloc[0]
+            c = float(row.get("coef_mle", row.get("coefficient", np.nan)))
+            if not (np.isfinite(b) and np.isfinite(c)) or abs(b) < 0.10:
+                info["terms"][v] = {"slope_on_logexp": b, "coef": c,
+                                   "used": False}
+                continue
+            contrib = c / b
+            net += contrib
+            info["terms"][v] = {"slope_on_logexp": round(b, 4),
+                                "coef": round(c, 4),
+                                "elasticity_removed": round(-contrib, 4),
+                                "used": True}
+        info["net_elasticity"] = round(net, 4)
+        info["terms"] = {k: v for k, v in info["terms"].items()}
+        used = [k for k, v in info["terms"].items() if v.get("used")]
+        if not used:
+            info["reason"] = ("no free covariate overlaps the offset, so the "
+                              "pinned coefficient is the whole response")
+        return info
+    except Exception as exc:  # noqa: BLE001 - diagnostic only
+        info["reason"] = f"elasticity check failed: {exc}"
+        return info
+
+
+def report_exposure_coefficient(info, audit, label="shipped refit",
+                                frame=None):
     """Print the free exposure coefficient with its uncertainty.
 
     WHY: the exposure LRT only says the pinned offset (coefficient 1) is
@@ -2696,9 +5323,32 @@ def report_exposure_coefficient(info, audit, label="shipped refit"):
         out["reason"] = ("logexp absent from the design (expected when the "
                          "exposure is pinned as an offset)")
         out["candidates"] = cand
+        # A pinned logexp coefficient is NOT a pinned elasticity: free
+        # volume covariates on the same flow cancel it silently.
+        net = _offset_net_elasticity(coefs, frame)
+        out["offset_net_elasticity"] = net
         audit["exposure_coef_report"] = out
         print("   [exposure] no free logexp coefficient (pinned offset mode"
               + (f"; near matches: {cand}" if cand else "") + ")")
+        _e = net.get("net_elasticity")
+        if _e is None:
+            print(f"       net elasticity: not measurable "
+                  f"({net.get('reason')})")
+        else:
+            _used = [k for k, v in net["terms"].items() if v.get("used")]
+            _rem = ", ".join(
+                f"{k} removes "
+                f"{net['terms'][k]['elasticity_removed']:.3f}"
+                for k in _used)
+            print(f"       NET exposure elasticity = {_e:.3f} (pinned 1.0"
+                  + (f"; {_rem}" if _rem else "") + ")")
+            if abs(_e - 1.0) > 0.10:
+                print(f"       WARNING: {_used} re-frees the offset. The "
+                      "surface responds to flow at "
+                      f"{_e:.2f}x, so it is compressed by "
+                      f"{1.0 / max(_e, 1e-6):.2f}x and will under-predict "
+                      "high-flow cells -- an in-sample calibration slope"
+                      " well above 1 is the same defect")
         return out
 
     r = row.iloc[0]
@@ -2770,6 +5420,11 @@ def _exposure_lrt(work, spec, args, audit, refit_info):
     try:
         from metacount_nb import fit_metacount_nb
         fields = _spec_fields(spec, work)
+        # Mirror the shipped arm's pin handling: a 1-df test of the pin only
+        # means something if the alternative differs in the pin ALONE.
+        fields, _ = drop_offset_duplicates(
+            fields, exposure=other,
+            mode=str(getattr(args, "exposure_pin_drop", "auto") or "auto"))
         _mode = refit_info.get("model", "nb")
         print(f"   [exposure] LRT: fitting the {other} arm for comparison...")
         alt = fit_metacount_nb(
@@ -2839,6 +5494,202 @@ def _exposure_lrt(work, spec, args, audit, refit_info):
     return res
 
 
+# Rows the per-cell response probe keeps alive past the panel free. Every row
+# is one segment x 15-min bin inside a future game window, so 4k rows puts a
+# few hundred rows in every populated cell without holding the 846k-row frame.
+CELL_PROBE_ROWS = 4000
+
+
+def _cell_probe_predict(frame, info, spec, args, target):
+    """Predict a frame with the FITTED model; return (pred, cell codes).
+
+    Mirrors the future-game prediction path column for column (search_frame ->
+    prepare_metacount_frame -> add_exposure_shape) because the fit's design
+    depends on columns those steps create.
+    """
+    hw_cols = [str(c) for c in (spec.get("fixed_terms") or [])
+               if str(c).startswith("hw_")]
+    fw = search_frame(frame.copy(), target)
+    fw, _ = prepare_metacount_frame(fw, exposure_col="exp",
+                                    highway_col="highway")
+    fw, _ = add_exposure_shape(
+        fw, params=getattr(args, "_exp_shape_params", None),
+        hinge=str(getattr(args, "exposure_basis", "none")) in
+        ("hinge", "hinge+hw"),
+        interact_hw=str(getattr(args, "exposure_basis", "none"))
+        in ("hinge+hw", "linear+hw", "hw"))
+    for col in hw_cols:
+        if col not in fw.columns:
+            fw[col] = 0.0
+    # Fail here, with the missing names, rather than inside the design build
+    # after the refit has already been paid for.
+    _need = set(str(c).split(":")[0]
+                for role in ("fixed_terms", "rdm_terms", "rdm_cor_terms")
+                for c in (spec.get(role) or []))
+    _need |= set(str(c).split(":")[0]
+                 for role in ("grouped_terms",)
+                 for c in (spec.get(role) or []))
+    _missing = sorted(c for c in _need
+                      if c and c != "logexp" and c not in fw.columns
+                      and not c.startswith("hw_"))
+    if _missing:
+        raise RuntimeError(f"probe frame is missing design terms {_missing}")
+    pred = predict_metacount_sim(
+        fw, info, id_col="row_id", y_col="Y",
+        R=max(200, int(getattr(args, "refit_R", 200))), chunk=25000)
+    cells = (fw[GAME_CELL_COL].astype(str).to_numpy()
+             if GAME_CELL_COL in fw.columns
+             else np.array(["all"] * len(fw), dtype=object))
+    return np.maximum(np.asarray(pred, dtype=float), 1e-9), cells
+
+
+def _cell_counterfactual(probe, kind):
+    """Copy of the probe with one game-day channel moved.
+
+    att_x2       : crowd doubled at the OBSERVED exposure (flow proxy), every
+                   log_att interaction rebuilt, so this is the direct crowd
+                   channel and not the exposure-mediated one. big_game is
+                   held at its observed value: it is a level shift on the
+                   same variable, so doubling a crowd must not relabel the
+                   tier too.
+    big_game_on  : the crowd tier switched to 1 wherever it is 0, at the
+                   observed crowd.
+
+    There is deliberately no in-window / out-of-window contrast here. Every
+    game row has in_event == 1, so that term is collinear with the intercept
+    WITHIN the game window; the fit only separates it because the training
+    frame also carries background (non-game) rows, which makes its coefficient
+    an event-versus-background level (-6.5 in the cell-grain fit) rather than a
+    game-day multiplier. Switching in_event off on a game row is therefore not
+    a counterfactual the model supports.
+    """
+
+    def _num(frame, col):
+        if col not in frame.columns:
+            return None
+        return (pd.to_numeric(frame[col], errors="coerce")
+                .replace([np.inf, -np.inf], 0.0).fillna(0.0).to_numpy(float))
+
+    alt = probe.copy()
+    if kind == "att_x2":
+        # search_frame keeps log_att but drops the raw attendance column, so
+        # the crowd level is recovered from log1p(attendance) when absent.
+        att = _num(alt, "attendance")
+        la_old = _num(alt, "log_att")
+        if la_old is None:
+            raise RuntimeError("probe frame has no log_att; cannot move crowd")
+        if att is None:
+            att = np.expm1(la_old)
+        alt["attendance"] = att * 2.0
+        la = np.log1p(alt["attendance"].to_numpy(float))
+        alt["log_att"] = la
+        for src, col in (("dist_stad", "att_x_dist"),
+                         ("lanes_z", "att_x_lanes"),
+                         ("maxspeed_z", "att_x_maxspeed"),
+                         ("log_length", "att_x_length")):
+            vals = _num(alt, src)
+            if col in alt.columns and vals is not None:
+                alt[col] = la * vals
+        # evu_x_att = seg_event_uplift_z * log_att. The uplift column itself is
+        # not carried into the design frame, so rescale the product by the
+        # ratio of the two crowd levels rather than dropping the term.
+        if "evu_x_att" in alt.columns:
+            ev = _num(alt, "evu_x_att")
+            if ev is not None:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    ratio = np.where(np.abs(la_old) > 1e-12, la / la_old, 1.0)
+                alt["evu_x_att"] = ev * np.where(np.isfinite(ratio), ratio, 1.0)
+    elif kind == "big_game_on":
+        alt["big_game"] = 1.0
+    else:  # pragma: no cover - caller controls the kinds
+        raise ValueError(f"unknown counterfactual {kind!r}")
+    return alt
+
+
+def report_cell_response(probe, info, spec, args, audit, out_dir):
+    """Per-cell game-day multipliers, read off the FITTED model.
+
+    The grouped rows of the coefficient table ('group_mean(log_att)' and the
+    matching SDs) are on the design's STANDARDISED scale --
+    metacountregressor's summary only un-standardises the FIXED rows -- so a
+    multiplier cannot be read off that table without re-deriving each column's
+    SD. This asks the model instead: predict the same rows at the observed
+    value and at a counterfactual value, and report the ratio of the predicted
+    totals per cell. Whatever scale the grouped block lives on cancels.
+
+    The grouped block also estimates a POPULATION mean and an SD, not a
+    per-group point estimate (the package draws beta_g from N(mean, sd)); so
+    these ratios are draw-averaged predictions, and the between-cell spread
+    they show is what the model actually applies, not a fitted per-cell BLUP.
+    """
+    if probe is None or len(probe) == 0:
+        return None
+    gg = audit.get("force_grouped_game") or {}
+    if str(gg.get("grain") or "") != "cell":
+        return None
+    target = args.target
+    base, cells = _cell_probe_predict(probe, info, spec, args, target)
+    alts = {}
+    for kind in ("att_x2", "big_game_on"):
+        alt, alt_cells = _cell_probe_predict(
+            _cell_counterfactual(probe, kind), info, spec, args, target)
+        if len(alt) != len(base) or not np.array_equal(alt_cells, cells):
+            raise RuntimeError(
+                f"counterfactual {kind!r} did not align with the base frame "
+                f"({len(alt)} vs {len(base)} rows)")
+        alts[kind] = alt
+
+    df = pd.DataFrame({"cell": cells, "base": base})
+    for kind, arr in alts.items():
+        df[kind] = arr
+    for c in ("dist_stad", "log_length"):
+        if c in probe.columns:
+            df[c] = pd.to_numeric(probe[c], errors="coerce").fillna(0.0).to_numpy(float)
+
+    events = ((gg.get("cell_grain") or {}).get("cells") or {})
+    rows = []
+    for cell, sub in df.groupby("cell", sort=True):
+        b = float(sub["base"].sum())
+        if not np.isfinite(b) or b <= 0:
+            continue
+        rows.append({
+            "cell": cell,
+            "probe_rows": int(len(sub)),
+            "events": int((events.get(cell) or {}).get("events", 0)),
+            "mean_dist_km": round(float(sub["dist_stad"].mean()), 3)
+            if "dist_stad" in sub.columns else np.nan,
+            "mean_log_length": round(float(sub["log_length"].mean()), 3)
+            if "log_length" in sub.columns else np.nan,
+            # Ratio of predicted TOTALS, so each cell's multiplier is weighted
+            # by where its flow actually is rather than by row count.
+            "mult_att_x2": round(float(sub["att_x2"].sum()) / b, 4),
+            "mult_big_game": round(float(sub["big_game_on"].sum()) / b, 4),
+        })
+    tab = pd.DataFrame(rows)
+    if tab.empty:
+        return None
+    tab = tab.sort_values("mean_dist_km").reset_index(drop=True)
+    path = out_dir / "game_day_cell_response.csv"
+    tab.to_csv(path, index=False)
+    audit["cell_response"] = {
+        "path": str(path),
+        "probe_rows": int(len(probe)),
+        "n_cells": int(len(tab)),
+        "mult_att_x2_range": [float(tab["mult_att_x2"].min()),
+                              float(tab["mult_att_x2"].max())],
+        "mult_big_game_range": [float(tab["mult_big_game"].min()),
+                                float(tab["mult_big_game"].max())],
+        "basis": "draw-averaged counterfactual predictions, fitted model",
+    }
+    print("   [cell-response] crowd x2 -> flow multiplier by cell:")
+    for _, r in tab.iterrows():
+        print(f"     {r['cell']:<22} events={int(r['events']):>5} "
+              f"d={r['mean_dist_km']:.2f}km "
+              f"crowd x2 -> x{r['mult_att_x2']:.3f} "
+              f"(big game x{r['mult_big_game']:.3f})")
+    return tab
+
+
 def refit_and_predict(work, future_work, spec, args, audit):
     # Legacy batched path (main now uses refit_only + per-fixture predict).
     # Kept consistent: full spec + sanity-gated staged fallback.
@@ -2855,7 +5706,18 @@ def predict_future_chunked(info, future_cal, segs, ctx, seg_flow, profile,
                            clock_prof=None, flow_uplift_by_hw=None,
                            exp_cal=None, flow_info=None, prop_fit=None,
                            prop_bayes=None, stage_a_bayes=None,
-                           seg_event_uplift_map=None):
+                            seg_event_uplift_map=None,
+                            flow_anom_by_fixture=None,                              wmap=None,
+                             wstats=None, sd_curves=None,
+                             prop_lookup=None, sd_forms=None,
+                             demand_eta=None, demand_att_ref=None,
+                             demand_eta_by_phase=None,
+                             demand_eta_raw_by_phase=None,
+                             demand_eta_raw=None,
+                             sd_lift_cal=None,
+                             seg_event_uplift=None,
+                             seg_eta_ratio=None,
+                             audit=None):
     """Per-fixture future prediction (numpy only, no JAX).
 
     Joint flow->speeding stage 2: future exposure uses PREDICTED flow
@@ -2870,6 +5732,9 @@ def predict_future_chunked(info, future_cal, segs, ctx, seg_flow, profile,
     the shipped pred_speeding stays JAX unless --temporal-predict is set.
     """
     out_parts = []
+    # Failures collected across fixtures so a broken channel cannot be
+    # mistaken for a working one (see the SD block below).
+    _sd_fail = []
     hw_cols = [c for c in work.columns if c.startswith("hw_")]
     _u = (np.asarray(flow_uplift, dtype=float)
           if flow_uplift is not None else np.ones(REL_BINS))
@@ -2900,6 +5765,8 @@ def predict_future_chunked(info, future_cal, segs, ctx, seg_flow, profile,
         grid["event_x_dist"] = grid["dist_stad"]
         grid = add_game_wide(grid, crowd_med=crowd_med)
         grid = add_exposure(grid, ctx, seg_flow, profile)
+        grid = apply_flow_anomaly(grid, flow_anom_by_fixture, by="fixture")
+        grid = apply_weather(grid, wmap, wstats)
         # Per-class u takes precedence over the pooled vector. A single
         # u[b] for the whole network cannot let a residential street and a
         # 4-lane arterial respond differently to a game, which is the most
@@ -3042,8 +5909,280 @@ def predict_future_chunked(info, future_cal, segs, ctx, seg_flow, profile,
             except Exception as exc:  # noqa: BLE001
                 print(f"   WARN: two-stage predict failed ({exc}); "
                       "shipping the count surface")
+        # ------------------------------------------------- counterfactual
+        # No-game twin: same segments x bins with the game switched off.
+        # Answers how counts differ game-day vs not from the FITTED model
+        # (no refit): event/time/game attrs zeroed, static-profile exposure
+        # (no uplift, no game anomaly), place effects kept. Plug-in
+        # propensity (no Bayes draws) keeps the cost to one extra
+        # R=two_stage_flow_R denominator sim.
+        if (flow_info is not None and prop_fit is not None
+                and not getattr(args, "no_counterfactual", False)):
+            try:
+                g0 = grid.copy()
+                g0["in_event"] = 0.0
+                g0["rel_hour"] = 0.0
+                g0["rel_hour_sq"] = 0.0
+                g0["rel_sin"] = 0.0
+                g0["rel_cos"] = 1.0
+                g0["pre_game"] = 0.0
+                g0["post_game"] = 0.0
+                g0["event_x_dist"] = 0.0
+                g0["attendance"] = 0.0
+                g0["log_att"] = 0.0
+                g0["fixture_type"] = ""
+                g0["ko_hour"] = 0.0
+                g0["ko_tod_sin"] = 0.0
+                g0["ko_tod_cos"] = 0.0
+                g0["fxt_NRL"] = 0.0
+                g0["fxt_ALeague"] = 0.0
+                g0["big_game"] = 0.0
+                g0["rel_x_dist"] = 0.0
+                g0["att_x_dist"] = 0.0
+                g0["ev_x_lanes"] = 0.0
+                # Reordering interactions MUST be zeroed here too: g0 is a
+                # copy of grid, so unlike enrich_background it does NOT
+                # recompute add_game_wide after zeroing the mains. Leaving
+                # these set would leak game signal into the no-game twin
+                # (pred_nogame), so game_lift/pred_sd_nogame would be wrong.
+                g0["att_x_lanes"] = 0.0
+                g0["att_x_maxspeed"] = 0.0
+                g0["att_x_length"] = 0.0
+                g0["ko_x_dist"] = 0.0
+                g0["seg_event_uplift_z"] = 0.0
+                # Static exposure: profile only (no game uplift/anomaly);
+                # weather and frozen calibration are measurement scale,
+                # not game effects, so they apply to both surfaces.
+                g0 = add_exposure(g0, ctx, seg_flow, profile)
+                g0 = apply_weather(g0, wmap, wstats)
+                if exp_cal:
+                    g0 = calibrate_exposure(g0, exp_cal)
+                g0 = apply_temporal_x(g0, seg_risk_map, clock_prof, None)
+                fw0 = search_frame(g0.assign(Y=0.0), args.target)
+                fw0, _ = prepare_metacount_frame(fw0, exposure_col="exp",
+                                                 highway_col="highway")
+                fw0, _ = add_exposure_shape(
+                    fw0, params=getattr(args, "_exp_shape_params", None),
+                    hinge=str(getattr(args, "exposure_basis", "none")) in
+                    ("hinge", "hinge+hw"),
+                    interact_hw=str(getattr(args, "exposure_basis", "none"))
+                    in ("hinge+hw", "linear+hw", "hw"))
+                for col in hw_cols:
+                    if col not in fw0.columns:
+                        fw0[col] = 0.0
+                denom0 = np.maximum(predict_metacount_sim(
+                    fw0, flow_info, id_col="row_id", y_col="Y",
+                    R=max(200, int(getattr(args, "two_stage_flow_R", 60))),
+                    chunk=25000), 1e-9)
+                p0 = np.clip(np.asarray(
+                    predict_propensity(fw0, prop_fit), dtype=float),
+                    1e-12, 1.0 - 1e-12)
+                keys["pred_nogame"] = np.maximum(denom0 * p0, 1e-12)
+                keys["game_lift"] = (keys["pred_speeding"].to_numpy(float)
+                                     - keys["pred_nogame"].to_numpy(float))
+                del g0, fw0, denom0, p0
+            except Exception as exc:  # noqa: BLE001 - game surface stands
+                print(f"   WARN: counterfactual failed ({exc}); "
+                      "shipping game surface only")
+        # ------------------------------------------------- system dynamics
+        # Stock-flow twin: q -> k=q/v -> v(vf,kj) -> exceedance -> rate,
+        # simulated on predicted game flow AND static flow. The SD lift is
+        # an independent, structurally-identified estimate of the regression
+        # game_lift: same demand experiment, different identification.
+        # Crowd channel: game flow is scaled by (A/att_ref)^eta so same-code,
+        # same-kickoff fixtures with different crowds get different SD
+        # surfaces (unguarded eta=0 reproduces the unscaled surface).
+        if (sd_curves is not None and prop_lookup is not None
+                and not getattr(args, "no_sd", False)):
+            try:
+                _qg = pd.to_numeric(grid["pred_flow"],
+                                    errors="coerce").fillna(0.0).to_numpy(float)
+                _fu = pd.to_numeric(grid["flow_uplift"],
+                                    errors="coerce").fillna(1.0).to_numpy(float)
+                _qs = _qg / np.clip(_fu, 1e-9, None)
+                _att = float(grid["attendance"].iloc[0]) \
+                    if "attendance" in grid.columns and len(grid) else 0.0
+                _eta = float(demand_eta) if demand_eta is not None else 0.0
+                _aref = float(demand_att_ref) \
+                    if demand_att_ref is not None else 0.0
+                # Per-phase crowd scaling with RAW etas (negative = bigger
+                # crowds draw less flow: saturation/diversion, as observed).
+                # Exponent clipped to [-1, 1.5]; multiplier to [0.25, 4].
+                # Falls back to clipped etas, then the overall raw eta.
+                _ebyp = (demand_eta_raw_by_phase
+                         if isinstance(demand_eta_raw_by_phase, dict)
+                         and demand_eta_raw_by_phase
+                         else (demand_eta_by_phase
+                               if isinstance(demand_eta_by_phase, dict)
+                               else {}))
+                if _att > 0 and _aref > 0 and _ebyp:
+                    _rb = np.asarray(grid["rel_bin"].to_numpy(int)).clip(
+                        0, REL_BINS - 1) if "rel_bin" in grid.columns \
+                        else np.zeros(len(grid), dtype=int)
+                    _ph = _phase_of_bin(_rb)
+                    _raw0 = float(demand_eta_raw) \
+                        if demand_eta_raw is not None else float(_eta)
+                    _ev = np.array([float(_ebyp.get(str(p), _raw0))
+                                    for p in _ph], dtype=float)
+                    # SEGMENT-SPECIFIC crowd elasticity, ESTIMATED (not a
+                    # constant): eta_i = EB-shrunk per-segment dlog q/dlog A
+                    # over the train fixtures, relative to the pooled eta.
+                    # A scalar multiplier scales every segment equally, which
+                    # changes game TOTALS but preserves the ranking (the
+                    # measured failure: top-20 Jaccard 0.90-1.00, 4/250
+                    # segments ever moving). Weighting by the segment's own
+                    # estimated elasticity is what can reorder sites.
+                    _w = np.ones(len(grid), dtype=float)
+                    if seg_eta_ratio:
+                        _z = pd.to_numeric(
+                            grid["road_osmid"].map(seg_eta_ratio),
+                            errors="coerce").fillna(1.0).to_numpy(float)
+                        _w = np.clip(_z, 0.1, 4.0)
+                    _cm = np.clip((_att / _aref)
+                                  ** np.clip(_ev * _w, -1.0, 1.5), 0.25, 4.0)
+                elif _att > 0 and _aref > 0 and _eta != 0.0:
+                    _cm = float(np.clip((_att / _aref) ** _eta, 0.25, 4.0))
+                else:
+                    _cm = 1.0
+                _qg = _qg * _cm
+                if "highway" in grid.columns:
+                    _cls = (grid["highway"].fillna("unclassified")
+                            .astype(str).to_numpy())
+                else:
+                    _cls = np.array(["unclassified"] * len(grid))
+                _lim = _sd_limit(grid)
+                _sd_g, _, _ = sd_predict(_qg, _cls, _lim, sd_curves,
+                                         prop_lookup, sd_forms)
+                _sd_n, _, _ = sd_predict(_qs, _cls, _lim, sd_curves,
+                                         prop_lookup, sd_forms)
+                # Operating regime: can the twin bite at all on THIS fixture?
+                # NOTE: `audit` is an OPTIONAL sink. It MUST NOT be
+                # referenced unconditionally: an earlier revision raised
+                # NameError('audit') inside this try-block, which the broad
+                # `except Exception` swallowed into a one-line WARN -- so
+                # every SD simulation silently failed, the parquet shipped
+                # with no SD columns, the flow-driven temporal surface had
+                # nothing to fall back on, and the run still exited 0 with
+                # "59 OK". Diagnostics must never be able to break a path
+                # they are only observing.
+                _reg = sd_regime(_qg, _cls, sd_curves)
+                if isinstance(audit, dict):
+                    audit.setdefault("sd_regime_by_fixture", {})[
+                        str(grid["fixture"].iloc[0])] = _reg
+                keys["sd_regime_rho_p95"] = float(_reg["rho_p95"])
+                keys["sd_regime_congestion_share"] = float(
+                    _reg["congestion_active_.5_.9"])
+                keys["pred_sd_game"] = np.maximum(_sd_g, 1e-12)
+                keys["pred_sd_nogame"] = np.maximum(_sd_n, 1e-12)
+                keys["sd_lift"] = keys["pred_sd_game"] - keys["pred_sd_nogame"]
+                keys["sd_crowd_mult"] = float(np.mean(_cm)) \
+                    if np.size(_cm) > 1 else float(_cm)
+                # Calibrated twin. UNITS-FIXED: the calibration is a FIXTURE
+                # share map (lift share -> observed lift share), so it is
+                # applied to the fixture's ROW-WISE SD lift, rescaled so the
+                # fixture total lands on the calibrated share. Scaling the
+                # rows (rather than adding a fixture scalar to a different
+                # surface) keeps the twin's segment-level variation, which is
+                # the only thing that can produce a game-varying site list.
+                #
+                # The earlier form, pred_nogame + share*pred_sd_nogame,
+                # added a regression-scale surface to an SD-scale one: the
+                # blend's ranking ROTATED as the share changed by fixture,
+                # which produced top-20 Jaccard 0.00 across three games.
+                try:
+                    _ca, _cb = sd_lift_cal \
+                        if sd_lift_cal is not None else (0.0, 1.0)
+                    _ca, _cb = float(_ca), float(_cb)
+                except Exception:  # noqa: BLE001
+                    _ca, _cb = 0.0, 1.0
+                _ng = keys["pred_sd_nogame"].to_numpy(float)
+                _sl = keys["sd_lift"].to_numpy(float)
+                _base = float(_ng.sum())
+                _share_sd = float(_sl.sum() / max(_base, 1e-12))
+                _share_target = _ca + _cb * _share_sd
+                # REPORTING-ONLY by default. The calibration is a forward
+                # regression of an observed ratio (obs / fitted background)
+                # on a model output (twin lift) -- errors-in-variables, n~35,
+                # no out-of-sample validation of the slope. Applying it lets
+                # an unidentifiable coefficient rescale a shipped surface,
+                # and if the target share flips sign against the twin's, _k
+                # clips to 0 and the "calibrated" surface degenerates to the
+                # NO-GAME baseline, i.e. a counterfactual shipped as the game
+                # prediction. Neither belongs in the default pipeline: the
+                # deployment surface must stay a direct prediction of what
+                # will be observed. Opt in with --sd-lift-cal-apply.
+                _apply_cal = bool(getattr(args, "sd_lift_cal_apply", False))
+                if _apply_cal and abs(_share_sd) > 1e-9:
+                    _k = float(np.clip(_share_target / _share_sd, 0.0, 5.0))
+                else:
+                    _k = 1.0
+                keys["sd_lift_share_sd"] = _share_sd
+                keys["sd_lift_share_cal"] = float(_share_target)
+                keys["sd_lift_cal_scale"] = _k
+                keys["sd_lift_cal"] = _k * _sl
+                # The calibrated SURFACE columns exist only when the
+                # calibration is explicitly applied. Off by default they
+                # would be bit-identical to pred_sd_game, and a duplicate
+                # surface under a different name is exactly the kind of
+                # output confusion this pipeline keeps paying for (60b
+                # consumed pred_speeding_calsd as if it were independent).
+                if _apply_cal:
+                    keys["pred_sd_game_cal"] = np.maximum(
+                        _ng + keys["sd_lift_cal"].to_numpy(float), 1e-12)
+                    if "pred_nogame" in keys.columns:
+                        _inc = keys["sd_lift_cal"].to_numpy(float)
+                        keys["pred_speeding_calsd"] = np.maximum(
+                            _ng + _inc, 1e-12)
+                del _qg, _fu, _qs, _cls, _lim, _sd_g, _sd_n
+            except Exception as exc:  # noqa: BLE001 - regression stands
+                # A swallowed failure here used to ship a parquet with no SD
+                # columns, no flow-temporal surface, and "59 OK" -- the run
+                # looked successful while a whole channel was missing. Count
+                # it and make it LOUD; the post-run gate turns a total
+                # failure into a non-zero exit.
+                _sd_fail.append(f"{type(exc).__name__}: {exc}"[:200])
+                print(f"   ERROR: SD simulation failed ({exc}) ["
+                      f"{len(_sd_fail)} fixture(s) affected]")
         if temporal_fit is not None:
             try:
+                # Same term-level diagnosis on the future frame: compare with
+                # the audit's diag_train to find which fixed column moved
+                # off-scale between the fit panel and the future grid.
+                import metacountregressor.temporal_models as _tmmod
+                _dmf = getattr(_tmmod, "_design_matrix", None)
+                if _dmf is not None:
+                    _Xf = _dmf(fw, temporal_fit.fixed_terms, True)
+                    _bf = np.asarray(temporal_fit.beta, dtype=float)
+                    _nf = ["(Intercept)"] + list(temporal_fit.fixed_terms)
+                    _lng_f = _Xf @ _bf
+                    _rb_col = "rel_bin" if "rel_bin" in fw.columns else "bin"
+                    _rb_f = pd.to_numeric(fw[_rb_col], errors="coerce").to_numpy(float)
+                    _perbin_f = {str(int(_b)): round(float(np.nanmean(_lng_f[_rb_f == _b])), 3)
+                                 for _b in sorted(set(_rb_f[~np.isnan(_rb_f)]))}
+                    print(f"   [temporal-diag] future lin mean={np.nanmean(_lng_f):.3f} "
+                          f"min={np.nanmin(_lng_f):.3f} max={np.nanmax(_lng_f):.3f}")
+                    print(f"   [temporal-diag] future per-bin lin mean={_perbin_f}")
+                    _contrib_f = {}
+                    for _i, _n in enumerate(_nf):
+                        _colf = _Xf[:, _i]
+                        _contrib_f[_n] = {
+                            "beta": float(_bf[_i]),
+                            "x_mean": float(np.nanmean(_colf)),
+                            "x_max": float(np.nanmax(np.abs(_colf))),
+                            "contrib": float(_bf[_i] * np.nanmean(_colf)),
+                        }
+                    _topf = sorted(_contrib_f.items(),
+                                   key=lambda kv: -abs(kv[1]["contrib"]))[:10]
+                    for _n, _c in _topf:
+                        print(f"   [temporal-diag]   future {_n}: "
+                              f"beta={_c['beta']:+.3f} x_mean={_c['x_mean']:.3f} "
+                              f"x_max={_c['x_max']:.3f} contrib={_c['contrib']:+.3f}")
+            except Exception as _exc2:  # noqa: BLE001 - diagnosis only
+                print(f"   [temporal-diag] future diag failed: {_exc2}")
+                _contrib_f = {"__error__": {"beta": 0.0, "x_mean": 0.0,
+                                            "x_max": 0.0, "contrib": 0.0}}
+                _perbin_f = {}
+                _lng_f = None
                 tpred = np.maximum(
                     np.asarray(temporal_fit.predict(fw), dtype=float), 1e-9)
                 # Magnitude guard at the WRITE site, not just at fit time.
@@ -3077,9 +6216,68 @@ def predict_future_chunked(info, future_cal, segs, ctx, seg_flow, profile,
             except Exception as exc:  # noqa: BLE001 - JAX surface stands
                 print(f"   WARN: temporal predict failed ({exc}); "
                       "keeping JAX surface")
+        _tmode = str(getattr(args, "temporal_mode", "flow") or "flow").lower()
+        if _tmode == "flow":
+            # Flow-driven dynamics replace the AR surface: the calibrated-SD
+            # game surface (density-mediated, time-varying via predicted
+            # flow) is the temporal surface. Same magnitude guard as AR.
+            try:
+                _src = ("pred_speeding_calsd"
+                        if "pred_speeding_calsd" in keys.columns
+                        else ("pred_sd_game_cal"
+                              if "pred_sd_game_cal" in keys.columns
+                              else ("pred_sd_game"
+                                    if "pred_sd_game" in keys.columns
+                                    else None)))
+                if _src is None:
+                    print("   [temporal-flow] no SD surface on this fixture; "
+                          "keeping JAX surface")
+                else:
+                    tpred = np.maximum(
+                        np.asarray(keys[_src].to_numpy(float),
+                                   dtype=float), 1e-9)
+                    _tmax = float(np.max(tpred)) if tpred.size else 0.0
+                    _ref = float(np.max(keys["pred_speeding"])) \
+                        if "pred_speeding" in keys.keys() \
+                        and len(keys["pred_speeding"]) else 0.0
+                    _cap = max(1e3, 1e6 * max(_ref, 1.0))
+                    if not np.isfinite(_tmax) or _tmax > _cap:
+                        print(f"   [temporal-flow] REFUSING to write "
+                              f"pred_speeding_temporal: max={_tmax:.3g} "
+                              f"exceeds cap={_cap:.3g}; keeping JAX surface")
+                    else:
+                        keys["pred_speeding_temporal"] = tpred
+                        keys["temporal_source"] = _src
+                        if getattr(args, "temporal_predict", False):
+                            keys["pred_speeding"] = tpred
+                            keys["pred_speeding_network"] = (
+                                tpred / max(args.penetration, 1e-9))
+            except Exception as exc:  # noqa: BLE001 - JAX surface stands
+                print(f"   WARN: flow-temporal predict failed ({exc}); "
+                      "keeping JAX surface")
+        # Per-game diagnostic: how much does THIS game's surface reorder
+        # segments relative to the game-average? Logged per fixture so the
+        # first game where the crowd channel goes uniform again is visible
+        # in the log instead of being inferred from a frozen MIP site set.
+        try:
+            _p = np.asarray(keys["pred_speeding"].to_numpy(float))
+            if len(_p) and isinstance(audit, dict):
+                audit.setdefault("per_game_pred_total", {})[
+                    str(keys["fixture"].iloc[0])] = round(float(_p.sum()), 1)
+                audit.setdefault("per_game_crowd_mult_range", {})[
+                    str(keys["fixture"].iloc[0])] = [
+                        round(float(np.min(_cm)), 3),
+                        round(float(np.max(_cm)), 3)]
+        except Exception:  # noqa: BLE001 - diagnostic only
+            pass
         out_parts.append(keys)
         del grid, fw, pred, keys
         gc.collect()
+    if _sd_fail and isinstance(audit, dict):
+        audit["sd_simulation_failures"] = _sd_fail
+        audit["sd_simulation_ok"] = False
+    elif isinstance(audit, dict):
+        audit["sd_simulation_ok"] = True
     return pd.concat(out_parts, ignore_index=True)
 
 
@@ -3118,12 +6316,14 @@ def fit_temporal_stage(train_events, spec, work, args, audit, target):
     # then whole-window sample to cap.
     full_ids = panel.groupby("panel_id")["rel_bin"].nunique()
     full_ids = full_ids[full_ids >= REL_BINS].index.to_numpy()
-    if len(full_ids) < 50:
+    _min_win = int(getattr(args, "temporal_min_windows", 30) or 30)
+    if len(full_ids) < _min_win:
         audit["temporal_stage"]["error"] = (
-            f"only {len(full_ids)} full windows (<50); AR needs contiguous "
-            "series — use the transferable temporal-x features instead")
+            f"only {len(full_ids)} full windows (<{_min_win}); AR needs "
+            "contiguous series — use the transferable temporal-x features "
+            "instead")
         print(f"   [temporal] skipped: {len(full_ids)} full windows "
-              "(need >=50)")
+              f"(need >={_min_win})")
         return None
     cap = max(100, int(args.temporal_panels))
     ids = full_ids
@@ -3148,7 +6348,8 @@ def fit_temporal_stage(train_events, spec, work, args, audit, target):
     fit = fit_temporal_random_parameter_model(
         panel, id_col="panel_id", time_col="rel_bin", y_col=target,
         fixed_terms=fixed, random_terms=rands, likelihood="nb",
-        temporal_model=str(args.temporal_refit), n_draws=32, maxiter=150)
+        temporal_model=str(args.temporal_refit), n_draws=32, maxiter=150,
+        regularization_strength=0.01)
     phi = {k: float(v) for k, v in dict(fit.temporal_parameters).items()}
     phi_max = max([abs(v) for v in phi.values()] + [0.0])
     if phi_max > float(getattr(args, "temporal_phi_max", 0.95)):
@@ -3179,18 +6380,70 @@ def fit_temporal_stage(train_events, spec, work, args, audit, target):
     print(f"   [temporal] {fit.temporal_model} converged={fit.converged} "
           f"phi={audit['temporal_stage']['phi']} BIC={fit.bic:.1f} "
           f"({audit['temporal_stage']['elapsed_s']}s)")
-    # In-sample overflow check: population means must live on the observed
-    # scale. A "converged" fit with exp-blown predictions (o25938147:
-    # rmse 1.7e21) is unusable for --temporal-predict — discard now.
+    # AR-surface diagnosis: betas + term-level design contributions on the
+    # fit panel. The t6/t6b runs fitted a sane AR (in-sample predict ok) but
+    # the future surface collapsed to the 1e-9 clip; per-term train-vs-future
+    # contributions are the only way to see which column diverges.
+    try:
+        audit["temporal_stage"]["coefficient_bound"] = float(fit.coefficient_bound)
+    except Exception:  # noqa: BLE001
+        pass
+    _dm = None
+    try:
+        import metacountregressor.temporal_models as _tmmod
+        _dm = getattr(_tmmod, "_design_matrix", None)
+    except Exception:  # noqa: BLE001
+        pass
+    if _dm is not None:
+        try:
+            _X = _dm(panel, fit.fixed_terms, True)
+            _b = np.asarray(fit.beta, dtype=float)
+            _names = ["(Intercept)"] + list(fit.fixed_terms)
+            _contrib = {}
+            for _i, _n in enumerate(_names):
+                _col = _X[:, _i]
+                _contrib[_n] = {
+                    "beta": float(_b[_i]),
+                    "x_mean": float(np.nanmean(_col)),
+                    "x_max": float(np.nanmax(np.abs(_col))),
+                    "contrib": float(_b[_i] * np.nanmean(_col)),
+                }
+            _lng = _X @ _b
+            _rb_arr = pd.to_numeric(panel["rel_bin"], errors="coerce").to_numpy(float)
+            _perbin = {str(int(rb)): round(float(np.nanmean(_lng[_rb_arr == rb])), 3)
+                       for rb in sorted(set(_rb_arr[~np.isnan(_rb_arr)]))}
+            audit["temporal_stage"]["diag_train"] = {
+                "lin_mean": float(np.nanmean(_lng)),
+                "lin_min": float(np.nanmin(_lng)),
+                "lin_max": float(np.nanmax(_lng)),
+                "per_rel_bin_lin_mean": _perbin,
+                "terms": _contrib,
+            }
+            print(f"   [temporal-diag] train lin mean={np.nanmean(_lng):.3f} "
+                  f"min={np.nanmin(_lng):.3f} max={np.nanmax(_lng):.3f}")
+            _top = sorted(_contrib.items(), key=lambda kv: -abs(kv[1]["contrib"]))[:8]
+            for _n, _c in _top:
+                print(f"   [temporal-diag]   train {_n}: beta={_c['beta']:+.3f} "
+                      f"x_mean={_c['x_mean']:.3f} x_max={_c['x_max']:.3f} "
+                      f"contrib={_c['contrib']:+.3f}")
+        except Exception as _exc:  # noqa: BLE001
+            print(f"   [temporal-diag] train diag failed: {_exc}")
+    # In-sample sanity check: population means must live on the observed
+    # scale. Reject both overflow (o25938147: rmse 1.7e21) AND underflow
+    # (this run: mean exp(Xb) ~ 1e-129 vs observed ~0.3).
     try:
         _in = np.asarray(fit.predict(panel), dtype=float)
         _ob = pd.to_numeric(panel[target], errors="coerce").fillna(0.0).to_numpy(float)
-        if (not np.all(np.isfinite(_in)) or float(np.mean(_in))
-                > 100.0 * max(float(np.mean(_ob)), 1e-9)):
-            print(f"   [temporal] REJECTED: in-sample mean "
-                  f"{float(np.mean(_in[np.isfinite(_in)])):.3g} vs observed "
-                  f"{float(np.mean(_ob)):.3g}; keeping JAX surface")
-            audit["temporal_stage"]["rejected"] = "in-sample overflow"
+        _in_mean = float(np.mean(_in[np.isfinite(_in)]))
+        _ob_mean = max(float(np.mean(_ob)), 1e-9)
+        if (not np.all(np.isfinite(_in)) or _in_mean
+                > 100.0 * _ob_mean or _in_mean < 0.01 * _ob_mean):
+            print(f"   [temporal] REJECTED: in-sample mean {_in_mean:.3g} "
+                  f"vs observed {_ob_mean:.3g} (ratio {_in_mean/_ob_mean:.2g}); "
+                  "keeping JAX surface")
+            audit["temporal_stage"]["rejected"] = (
+                "in-sample overflow" if _in_mean > _ob_mean
+                else "in-sample underflow")
             return None
     except Exception as exc:  # noqa: BLE001
         print(f"   [temporal] REJECTED: predict check failed ({exc})")
@@ -3222,6 +6475,34 @@ def main():
                     help="SA restarts on the first chunk (1 on warm chunks)")
     ap.add_argument("--search-R", type=int, default=40)
     ap.add_argument("--refit-R", type=int, default=200)
+    ap.add_argument("--surface-amp-cal", default="off",
+                    choices=["off", "on", "measure"],
+                    help="'on' rescales the shipped rate surface by "
+                         "p -> m(p/m)^k, with k the in-sample calibration "
+                         "slope on train game rows. It moves the amplitude "
+                         "without touching any rank (rank check "
+                         "rho=1.000000), but DO NOT turn it on expecting the "
+                         "gate to pass: measured on the band+cross split, the "
+                         "train rows give k=2.0345 while the holdout needs "
+                         "1.02-1.11, so the exponent does not transfer and the "
+                         "holdout slope goes 1.4613 -> 0.0004. 'measure' runs "
+                         "the identical estimation and records it in "
+                         "audit.surface_amp (plus "
+                         "surface_amp_in_sample.json) but leaves the surface "
+                         "untouched, so one refit can report the in-sample "
+                         "calibration of a spec without changing it. See "
+                         "fit_surface_amplitude.")
+    ap.add_argument("--surface-amp-r", type=int, default=200,
+                    help="draw budget for the in-sample calibration pass")
+    ap.add_argument("--search-n-jobs", type=int, default=1,
+                    help="parallel fitness workers per chunk (embarrassingly "
+                         "parallel; ~1.5-1.8x per extra worker). Match with "
+                         "OMP threads = ncpus // n-jobs (see 61); each worker "
+                         "holds its own compiled executables (~10-30GB).")
+    ap.add_argument("--train-cap", type=int, default=100000,
+                    help="rows for the search frame (refit always uses the "
+                         "full frame). Cost scales ~linearly; 64k ≈ 1.5x "
+                         "faster per eval with noisier BIC.")
     ap.add_argument("--de-maxiter", type=int, default=8)
     ap.add_argument("--de-popsize", type=int, default=8)
     ap.add_argument("--no-de-warm", action="store_true",
@@ -3260,6 +6541,15 @@ def main():
                          "interactions act on the rate. Both must fit; any "
                          "failure falls back to the count surface and the "
                          "handoff gate records it. On by default")
+    ap.add_argument("--prune-p", type=float, default=0.0,
+                    help="refit with significance pruning: after the first "
+                         "count refit, drop fixed terms with p > this value "
+                         "(exposure logexp is never dropped) and refit once; "
+                         "the two-stage propensity is then backward-"
+                         "eliminated on the same rule. The forced game block "
+                         "is what guarantees game-specific reordering, so "
+                         "pruning can remove it -- the handoff gate decides "
+                         "whether the pruned surface still ships. 0 = off")
     ap.add_argument("--two-stage-flow-R", type=int, default=60,
                     help="Monte-Carlo draws for the stage-A denominator "
                          "surface (only used when the searched structure has "
@@ -3357,12 +6647,34 @@ def main():
                     help="after the shipped refit, fit the opposite exposure "
                          "arm and report the 1-df likelihood-ratio test "
                          "(doubles refit time)")
+    ap.add_argument("--exposure-pin-drop", default="auto",
+                    choices=["auto", "on", "off"],
+                    help="with --exposure offset, drop the free volume "
+                         "covariates (log_flow_z, aadt_z) that re-fit the "
+                         "pinned elasticity. Pinning logexp at 1.0 only pins "
+                         "THAT coefficient: on the band+cross+NB arm "
+                         "log_flow_z cancelled it back to a net elasticity of "
+                         "0.48, compressing the surface by 2.07x (the "
+                         "in-sample calibration slope of 2.03) and leaving an "
+                         "8.7x-too-steep exposure gradient on the holdout. "
+                         "'auto' (default) drops when the offset is pinned "
+                         "and does nothing otherwise; 'off' reproduces the "
+                         "pre-2026-11 arms for an A/B; kickoff x flow crosses "
+                         "are never dropped")
     ap.add_argument("--refit-model", default="searched",
                     choices=["searched", "nb", "poisson"],
                     help="likelihood for the refit. 'searched' (default) "
                          "follows the structural search's dispersion gene, so "
                          "the shipped model is the one BIC chose; 'nb'/'poisson' "
                          "force it")
+    ap.add_argument("--allow-degraded-fit", action="store_true",
+                    help="let the run PASS even when the refit fell down the "
+                         "staged ladder (nb-full -> nb-fixed -> poisson-fixed) "
+                         "or lost searched grouped/random structure. Default "
+                         "OFF: a degraded refit ships a different model from "
+                         "the one that was searched, so the run must fail. "
+                         "Set only for a deliberate diagnostic run, and read "
+                         "audit.refit.degraded in the metrics json")
     ap.add_argument("--search-vars", default="slim", choices=["slim", "full"])
     ap.add_argument("--group-by", default="highway",
                     choices=["highway", "segment", "event"],
@@ -3378,8 +6690,60 @@ def main():
                          "search space, and the existing --group-by setting "
                          "decides what a 'group' is (segment/fixture/...). "
                          "With the flag off, temporal terms stay fixed-only, "
-                         "so --group-temporal on|off is a genuine A/B of "
-                         "per-segment time dependence")
+                          "so --group-temporal on|off is a genuine A/B of "
+                          "per-segment time dependence")
+    ap.add_argument("--force-grouped-temporal", default="off",
+                    choices=["on", "off"],
+                    help="after the grouped probe runs, APPEND the probe's "
+                         "group-role winners (e.g. rel_sin/rel_cos) to the "
+                         "refit spec. The SA search cannot reach role 4 on "
+                         "its own, so this forces the evidence into the "
+                         "refit. Only meaningful with --group-temporal on "
+                         "--group-by segment")
+    ap.add_argument("--force-grouped-game", default="off",
+                    choices=["on", "off"],
+                    help="estimate HIERARCHICAL GAME-DAY coefficients: force "
+                         "the listed terms into the grouped (role 4) block, "
+                         "grouped by --grouped-game-grain (default: the road "
+                         "class x distance-band cell, 12 groups). With the "
+                         "cell grain each game-day attribute gets one "
+                         "coefficient per cell, so the surface's response to "
+                         "attendance and kickoff is estimated at the "
+                         "resolution 3.8k events can support, and an unseen "
+                         "fixture is predicted from its own attributes. "
+                         "Combine with --group-by event and --two-stage off "
+                         "so the shipped surface is the count model that "
+                         "carries these coefficients")
+    ap.add_argument("--grouped-game-bands", default="class_band",
+                    choices=["class_band", "band", "class"],
+                    help="resolution of the cell key when "
+                         "--grouped-game-grain cell. 'class_band' (default) "
+                         "is road class x distance band (3 x 4 = 12 groups, 9 "
+                         "populated here, thinnest 16 events); 'band' collapses "
+                         "road class away and gives three distance bands "
+                         "(0-1 km, 1-2.5 km, 2.5+ km) of ~145 / ~2.1k / ~1k "
+                         "events, for when the 12-cell grid is too thin; "
+                         "'class' gives the three road classes only.")
+    ap.add_argument("--grouped-game-grain", default="cell",
+                    choices=["cell", "fixture"],
+                    help="what a game-day random coefficient is estimated "
+                         "PER. 'cell' (default) groups by road class x "
+                         "distance-to-stadium band (3 x 4 = 12 groups) and "
+                         "estimates each grouped term's coefficient there, "
+                         "so the game-day response is identified from ~3.8k "
+                         "events. 'fixture' is the T9 parameterisation: one "
+                         "coefficient per fixture per term, i.e. 39 x k "
+                         "coefficients, which is not estimable at this event "
+                         "count and is what produced a surface whose two "
+                         "games shared 16 of their top-20 streets")
+    ap.add_argument("--grouped-game-terms", default="",
+                    help="comma-separated terms to give grouped random "
+                         "coefficients (the grouping dimension is "
+                         "--grouped-game-grain). Defaults per grain: cell -> "
+                         "log_att,in_event,rel_sin,rel_cos,ko_tod_sin,"
+                         "ko_tod_cos,big_game; fixture -> dist_stad,"
+                         "seg_event_uplift_z,lanes_z,maxspeed_z,rel_sin,"
+                         "rel_cos")
     ap.add_argument("--no-force-game", action="store_true",
                     help="allow the search to drop game-day terms (default: "
                          "in_event/rel_hour/log_att/event_x_dist are forced)")
@@ -3395,17 +6759,31 @@ def main():
                     help="predict future exposure from the static background "
                          "profile only (default: joint flow->speeding with "
                          "game-day flow uplift)")
+    ap.add_argument("--temporal-mode", default="flow",
+                    choices=["ar1", "flow", "off"],
+                    help="stage-2b dynamics source. 'ar1': NB2+AR refit on "
+                         "contiguous windows (needs metacountregressor>=1.0.165; "
+                         "adds zero holdout skill to date: temporal_bin_spearman "
+                         "= 0.0). 'flow' (default): skip the AR fit and use the "
+                         "flow-driven calibrated-SD game surface as the temporal "
+                         "surface instead (density-mediated dynamics from "
+                         "predicted time-varying flow). 'off': no temporal "
+                         "surface at all.")
     ap.add_argument("--temporal-refit", default="ar1",
                     choices=["none", "ar1", "ar2"],
                     help="stage 2b: refit searched spec as NB2 + AR model on "
                          "contiguous train windows (needs "
-                         "metacountregressor>=1.0.165; skipped otherwise)")
+                         "metacountregressor>=1.0.165; skipped otherwise; "
+                         "ignored unless --temporal-mode ar1)")
     ap.add_argument("--temporal-panels", type=int, default=500,
                     help="max segment x fixture windows for stage 2b "
                          "(whole windows kept contiguous; ~45 min at 500)")
     ap.add_argument("--temporal-predict", action="store_true",
                     help="ship the AR population-mean surface to the MIP "
                          "instead of the JAX draw-averaged surface")
+    ap.add_argument("--temporal-min-windows", type=int, default=30,
+                    help="minimum full 28-bin windows for stage-2b AR "
+                         "(44 exist today; the old 50 floor always skipped)")
     ap.add_argument("--no-temporal-vars", action="store_true",
                     help="drop within-window temporal-shape terms "
                          "(rel_hour_sq/sin/cos, pre/post_game) from the "
@@ -3419,17 +6797,81 @@ def main():
                          "if any |phi| exceeds this (phi~=1 integrates "
                          "noise into astronomical counts, e.g. the "
                          "phi1=0.9976 / rmse=1.7e21 fit)")
+    ap.add_argument("--no-counterfactual", action="store_true",
+                    help="skip the no-game twin surface (pred_nogame / "
+                         "game_lift); saves one extra denominator sim "
+                         "per fixture")
+    ap.add_argument("--no-sd", action="store_true",
+                    help="skip the system-dynamics stock-flow twin "
+                         "(pred_sd_game / pred_sd_nogame / sd_lift)")
+    ap.add_argument("--seg-eta-pseudo", type=float, default=0.0,
+                    help="EB pseudo-count for the per-segment crowd "
+                         "elasticity. 0 (default) = PURE PREDICTION: each "
+                         "segment uses its own OLS dlog q/dlog A with no "
+                         "shrinkage. >0 shrinks toward the pooled eta with "
+                         "weight n/(n+pseudo) as a fallback arm; the holdout "
+                         "Spearman of both is reported so the choice is made "
+                         "on out-of-sample skill")
+    ap.add_argument("--sd-kj-mode", default="theory",
+                    choices=["theory", "ols", "eb"],
+                    help="jam density in the Greenshields twin. 'theory' "
+                         "(default, pure prediction): kj is fixed by road "
+                         "geometry (~120 veh/km/lane), only vf is estimated - "
+                         "fitting kj from data was fitting an extrapolation "
+                         "through never-jam observations. 'ols': fit kj too "
+                         "(noisy; sensitivity arm). 'eb': EB shrink of the "
+                         "OLS kj toward theory (superseded by 'theory')")
+    ap.add_argument("--sd-regime-report", action="store_true", default=True,
+                    help="record the share of predicted rows in each density "
+                         "band (free-flow/transition/congestion-active/jam) "
+                         "so it is visible whether the twin can suppress "
+                         "speeding at all")
+    ap.add_argument("--sd-lift-cal-apply", action="store_true",
+                    default=False,
+                    help="APPLY the SD-lift calibration (lift_obs = a + "
+                         "b*lift_sd) to the shipped SD surfaces. Off by "
+                         "default: the slope is a forward regression of an "
+                         "observed ratio on a model output, fit on ~35 "
+                         "fixtures with no out-of-sample validation, so it "
+                         "is reported, not trusted. The shipped twin stays a "
+                         "direct prediction of what will be observed")
+    ap.add_argument("--sd-form", default="search",
+                    choices=["fixed", "search"],
+                    help="SD functional forms: fixed theory "
+                         "(Greenshields + binned table) or bounded GP search "
+                         "seeded with theory (never worse than fixed)")
+    ap.add_argument("--sd-gp-budget", type=float, default=240.0,
+                    help="total seconds for GP form discovery across "
+                         "classes (bounded; fixed forms stand on timeout)")
+    ap.add_argument("--no-flow-anom", action="store_true",
+                    help="skip the trailing same-DOW flow anomaly "
+                         "(segment x game telematics); compare with/without "
+                         "to test whether it reorders streets")
+    ap.add_argument("--fixed-only", action="store_true",
+                    help="skip random parameters entirely (no RP search or "
+                         "refit draws): roles fixed/excluded only. Keeps "
+                         "everything else (temporal AR, flow uplift, "
+                         "two-stage, propensity, MIP). Much faster per eval.")
+    # NOTE: --temporal-min-windows is defined once above (line ~4893); a
+    # duplicate definition here previously made argparse raise
+    # "conflicting option string" at startup (job 26678809).
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--resume", action="store_true",
                     help="continue the search from results/game_day_search_best.json")
     ap.add_argument("--out-dir", default=str(RES))
     ap.add_argument("--fig-dir", default=str(FIG))
     args = ap.parse_args()
-    global BEST_JSON, PROGRESS_CSV
+    global BEST_JSON, PROGRESS_CSV, FAMILY_CSV, GAME_CELL_GRAIN
+    GAME_CELL_GRAIN = str(getattr(args, "grouped_game_bands", "class_band")
+                          or "class_band")
+    if GAME_CELL_GRAIN not in ("class_band", "band", "class"):
+        raise SystemExit("--grouped-game-bands must be class_band|band|class, "
+                         f"got {GAME_CELL_GRAIN!r}")
     out_dir = Path(args.out_dir)
     fig_dir = Path(args.fig_dir)
     BEST_JSON = out_dir / "game_day_search_best.json"
     PROGRESS_CSV = out_dir / "game_day_search_progress.csv"
+    FAMILY_CSV = out_dir / FAMILY_CSV_NAME
     if args.pilot:
         args.search_iters = min(args.search_iters, 6)
         args.search_chunk = min(args.search_chunk, 5)
@@ -3486,9 +6928,17 @@ def main():
     # Per-segment mean flow from the WHOLE panel (stable for rare segments);
     # the profile above captures the dow x time-of-day shape from the sample.
     seg_flow = (panel.groupby("road_osmid")["vehicle_count"].mean()).to_dict()
+    # Segment x game telematics: trailing same-DOW anomaly vs a dynamic
+    # baseline (past-only; known before kickoff). Skipped with --no-flow-anom.
+    flow_anom_fx, flow_anom_wk, _fanom_audit = {}, {}, {"estimated": False}
+    if not getattr(args, "no_flow_anom", False):
+        flow_anom_fx, flow_anom_wk, _fanom_audit = estimate_flow_anomaly(
+            panel, cal, train_ids, future_ids, seed=int(args.seed))
+    audit["flow_anomaly"] = _fanom_audit
+    wmap, wstats = load_weather_daily()
     event_cap = 20000 if args.pilot else EVENT_CAP
     bg_cap = 40000 if args.pilot else BG_CAP
-    train_cap = 25000 if args.pilot else TRAIN_CAP
+    train_cap = 25000 if args.pilot else int(getattr(args, "train_cap", 100000))
     train_events = build_game_frame(panel, bin_ns, cal, ctx, seg_flow, profile,
                                      train_ids)
     if train_events.empty:
@@ -3536,6 +6986,9 @@ def main():
           f"sd={audit['seg_event_uplift']['sd']}")
     train_events = apply_temporal_x(train_events, seg_risk_map, clock_prof,
                                     seg_event_uplift_map)
+    train_events = apply_flow_anomaly(train_events, flow_anom_fx, by="fixture",
+                                      disabled=getattr(args, "no_flow_anom", False))
+    train_events = apply_weather(train_events, wmap, wstats)
     print(f"   temporal-x: {len(seg_risk_map)} segment risks, "
           f"clock codes={sorted(clock_prof)})")
     # Stage 2b snapshot: whole-window sample BEFORE row caps break the
@@ -3562,6 +7015,11 @@ def main():
     del bg_sample
     background = apply_temporal_x(background, seg_risk_map, clock_prof,
                                   seg_event_uplift_map)
+    background = apply_flow_anomaly(background, None, flow_anom_wk, by="week",
+                                    disabled=getattr(args, "no_flow_anom", False))
+    background = apply_weather(background, wmap, wstats)
+    del flow_anom_wk
+    gc.collect()
     # Stage 1 (joint model): game-day flow uplift per rel_bin, estimated
     # while both frames are alive. Disabled with --no-flow-uplift.
     flow_uplift_by_hw = {}
@@ -3618,6 +7076,172 @@ def main():
     audit["flow_joint"] = not args.no_flow_uplift
     print(f"   flow uplift rel_bin 0/12/27: {flow_uplift[0]:.2f}/"
           f"{flow_uplift[12]:.2f}/{flow_uplift[27]:.2f}")
+    # Crowd elasticity for the SD demand channel: bigger crowds draw more
+    # traffic (log-log OLS across train fixtures). Anchored at crowd_med so
+    # the median game reproduces the unscaled surface exactly.
+    demand_eta, _eta_rep = estimate_demand_elasticity(train_events)
+    audit["demand_elasticity"] = {"eta": round(demand_eta, 3),
+                                  "att_ref": round(float(crowd_med), 1),
+                                  **{k: v for k, v in _eta_rep.items()
+                                     if k != "eta"}}
+    print(f"   demand elasticity eta={demand_eta:.3f} "
+          f"(raw={_eta_rep.get('eta_raw', float('nan')):.3f} "
+          f"se={_eta_rep.get('eta_se', float('nan')):.3f} "
+          f"p={_eta_rep.get('eta_p', float('nan')):.3g} "
+          f"att_ref={float(crowd_med):.0f})")
+    if _eta_rep.get("by_phase"):
+        print(f"   per-phase eta: " + ", ".join(
+            f"{k}={v['eta']:.2f}(raw {v['eta_raw']:+.2f},p={v['p']:.2g})"
+            for k, v in sorted(_eta_rep["by_phase"].items())))
+    # Per-phase crowd multipliers for the SD demand channel (RAW etas keyed
+    # by phase; missing phase -> overall raw eta). Raw (negative) etas are
+    # used deliberately: the data say bigger crowds draw LESS probe flow
+    # (saturation/diversion), and the multiplier clip [0.25, 4] bounds the
+    # effect. Clipped [0, 1.5] etas are retained for reporting/back-compat.
+    demand_eta_by_phase = {
+        str(k): float(v["eta"])
+        for k, v in (_eta_rep.get("by_phase") or {}).items()
+        if np.isfinite(v.get("eta", float("nan")))}
+    demand_eta_raw_by_phase = {
+        str(k): float(v["eta_raw"])
+        for k, v in (_eta_rep.get("by_phase") or {}).items()
+        if np.isfinite(v.get("eta_raw", float("nan")))}
+    demand_eta_raw = float(_eta_rep.get("eta_raw", 0.0)) \
+        if np.isfinite(_eta_rep.get("eta_raw", float("nan"))) else 0.0
+    # Per-SEGMENT crowd elasticity (estimated, EB-shrunk to the pooled eta)
+    # expressed as a ratio eta_i/eta_pooled. This is the channel that lets a
+    # bigger crowd REORDER segments instead of scaling them all equally.
+    seg_eta_ratio, _seg_eta_diag = estimate_seg_crowd_elasticity(
+        train_events, demand_eta_raw if abs(demand_eta_raw) > 1e-6 else 0.0,
+        pseudo=float(getattr(args, "seg_eta_pseudo", 0.0)))
+    if seg_eta_ratio and abs(demand_eta_raw) > 1e-6:
+        seg_eta_ratio = {k: float(np.clip(v / demand_eta_raw, 0.1, 4.0))
+                         for k, v in seg_eta_ratio.items()}
+        print(f"   per-segment crowd elasticity: "
+              f"{_seg_eta_diag.get('n_segments')} segments, "
+              f"{_seg_eta_diag.get('n_own_estimate')} with own estimate, "
+              f"eta sd {_seg_eta_diag.get('eta_sd')} "
+              f"(pooled {demand_eta_raw:.3f}, "
+              f"pseudo={_seg_eta_diag.get('pseudo')})")
+    else:
+        seg_eta_ratio = {}
+        print("   per-segment crowd elasticity: unavailable "
+              "(pooled eta ~ 0); pooled multiplier only")
+    audit["seg_crowd_elasticity"] = _seg_eta_diag
+    # System-dynamics calibration: speed-density curves per highway class +
+    # speeding-rate lookup on exceedance, from observed (q, v) pairs. The
+    # GAME enters the simulation through q (predicted flow), never through
+    # the curves — so game-vs-not is a pure demand experiment. Train windows
+    # only for the rate lookup (no future leakage); curves use both frames.
+    sd_curves, prop_lookup = None, None
+    if not getattr(args, "no_sd", False):
+        try:
+            _sd_cols = ["highway", "vehicle_count",
+                        "mean_vehicle_speed_kmh"]
+            _sd = pd.concat(
+                [train_events[[c for c in _sd_cols
+                               if c in train_events.columns]],
+                 background[[c for c in _sd_cols
+                             if c in background.columns]]],
+                ignore_index=True)
+            if len(_sd) > 400000:
+                _sd = _sd.sample(400000, random_state=args.seed)
+            sd_curves = fit_speed_density(
+                _sd, penetration=float(getattr(args, "penetration", 0.05)),
+                bin_hours=BINS_PER_HOUR and (60.0 / BINS_PER_HOUR) / 60.0,
+                kj_mode=str(getattr(args, "sd_kj_mode", "theory")))
+            prop_lookup = fit_propensity_lookup(train_events, args.target)
+            del _sd
+            # GP form discovery (bounded, seeded theory): per-class shapes
+            # for v(k) and log-rate(e). Skipped with --sd-form fixed.
+            sd_forms = {}
+            if str(getattr(args, "sd_form", "search")) == "search":
+                try:
+                    sd_forms = fit_sd_forms(
+                        train_events, args.target, sd_curves,
+                        budget_s=float(getattr(args, "sd_gp_budget", 240.0)),
+                        seed=int(args.seed)) or {}
+                except Exception as exc:  # noqa: BLE001 - fixed forms stand
+                    print(f"   WARN: GP form discovery failed ({exc})")
+                    sd_forms = {}
+            audit["sd"] = {
+                "curves": {k: [round(float(v[0]), 2),
+                               (round(float(v[1]), 1)
+                                if np.isfinite(v[1]) else None)]
+                           for k, v in sd_curves.items()
+                           if isinstance(v, tuple) and len(v) == 2},
+                "jam_density": {
+                    "theory_kj_count": round(
+                        float(sd_curves.get("_theory_kj_cnt", float("nan"))), 4),
+                    "theory_kj_veh_km_lane": round(
+                        float(sd_curves.get("_theory_kj_real", float("nan"))), 1),
+                    "density_scale_count_to_real": round(
+                        float(sd_curves.get("_density_scale", float("nan"))), 1),
+                    "per_class": sd_curves.get("_diag", {}),
+                },
+                "lookup_classes": sorted(prop_lookup.keys()),
+                "forms": {k: {
+                    kk: (vv[2] if vv is not None else None)
+                    for kk, vv in v.items() if kk in ("speed", "prop")}
+                    for k, v in (sd_forms or {}).items()},
+            }
+            print(f"   [sd] speed-density classes: "
+                  f"{sorted(sd_curves)} | "
+                  f"propensity classes: {sorted(prop_lookup)}")
+        except Exception as exc:  # noqa: BLE001 - SD is auxiliary
+            print(f"   WARN: SD calibration failed ({exc}); "
+                  "continuing without it")
+            sd_curves, prop_lookup, sd_forms = None, None, {}
+            audit["sd"] = {"error": str(exc)}
+    # SD lift calibration: fit lift_obs = a + b*lift_sd on TRAIN fixtures
+    # (observed window counts vs background expectation; twin rerun on
+    # observed flow) BEFORE train_events/background are merged and freed.
+    # Applied to future SD columns in predict_future_chunked; on any failure
+    # (a,b) = (0,1) i.e. the uncalibrated twin stands.
+    _sd_a, _sd_b, _sd_se, _sd_p, _sd_tab, _sd_note = \
+        (0.0, 1.0, float("nan"), float("nan"), pd.DataFrame(), "skipped")
+    if (sd_curves is not None and prop_lookup is not None
+            and not getattr(args, "no_sd", False)):
+        try:
+            _sd_a, _sd_b, _sd_se, _sd_p, _sd_tab, _sd_note = calibrate_sd_lift(
+                train_events, background, args.target, sd_curves,
+                prop_lookup, sd_forms,
+                flow_uplift, demand_eta_raw_by_phase, crowd_med)
+        except Exception as exc:  # noqa: BLE001
+            _sd_note = f"call failed: {exc}"
+    audit["sd_lift_calibration"] = {
+        "a": round(float(_sd_a), 4), "b": round(float(_sd_b), 4),
+        "se_b": round(float(_sd_se), 4) if np.isfinite(_sd_se) else None,
+        "p_b": round(float(_sd_p), 4) if np.isfinite(_sd_p) else None,
+        "n_fixtures": int(len(_sd_tab)), "note": str(_sd_note)[:200],
+        "train_lift": {str(k): {"obs": round(float(v["lift_obs"]), 4),
+                                "sd": round(float(v["lift_sd"]), 4)}
+                       for k, v in _sd_tab.iterrows()} if len(_sd_tab) else {}}
+    print(f"   SD lift calibration: lift_obs = {_sd_a:.3f} + {_sd_b:.3f}*lift_sd "
+          f"(se={_sd_se:.3f} p={_sd_p:.3g} n={len(_sd_tab)}; {_sd_note})")
+    # A huge |b| is the tell that the twin carries no cross-game signal: we
+    # are regressing observed variation on near-noise, so the intercept eats
+    # the mean and the slope does the work. Report it explicitly and let the
+    # caller decide; do NOT silently apply an amplified slope.
+    if np.isfinite(_sd_se) and np.isfinite(_sd_b) and abs(_sd_se) > 0:
+        _tstat = abs(_sd_b / max(_sd_se, 1e-12))
+        _informative = bool(_tstat >= 2.0 and abs(_sd_b) <= 2.0
+                            and len(_sd_tab) >= 5)
+        audit["sd_lift_calibration"]["slope_t"] = round(float(_tstat), 3)
+        audit["sd_lift_calibration"]["usable"] = _informative
+        if not _informative:
+            print(f"   SD calibration NOT applied (slope { _sd_b:+.2f} on "
+                  f"|t|={_tstat:.1f}: the twin's cross-game lift is "
+                  f"uninformative, so scaling it would inject noise). "
+                  f"Keeping the uncalibrated twin.")
+            audit["sd_lift_calibration"]["applied"] = False
+            _sd_a, _sd_b = 0.0, 1.0
+        else:
+            audit["sd_lift_calibration"]["applied"] = True
+    else:
+        audit["sd_lift_calibration"]["usable"] = False
+        audit["sd_lift_calibration"]["applied"] = False
+        _sd_a, _sd_b = 0.0, 1.0
     train_frame = pd.concat([train_events, background], ignore_index=True)
     del train_events, background
     # Calibrate the flow proxy onto the observed trip denominator BEFORE the
@@ -3673,6 +7297,28 @@ def main():
     audit["n_train_rows"] = int(len(work))
     print(f"   train rows={len(work):,} (panel kept for future frames; "
           "background sampled, never materialised in full)")
+    # The kickoff x flow crosses are the only terms that can reorder segments
+    # between games. A silently all-zero column (the failure mode that once
+    # made evu_x_att dead for a whole search) would look exactly like "the
+    # crossed term did not help", so refuse to run rather than fit zeros.
+    _kx_vars = {"ko_sin_x_flow": "ko_tod_sin * log_flow_z",
+                "ko_cos_x_flow": "ko_tod_cos * log_flow_z"}
+    _kx_stats = {}
+    for _c in _kx_vars:
+        if _c not in work.columns:
+            raise SystemExit(f"reordering term {_c} missing from the search "
+                             "frame; it must be built in add_game_wide and "
+                             "listed in INTERACT_VARS")
+        _v = pd.to_numeric(work[_c], errors="coerce").fillna(0.0)
+        _kx_stats[_c] = {"sd": float(_v.std()), "n_unique": int(_v.nunique())}
+        if _v.nunique() <= 1 or float(_v.std()) <= 0.0:
+            raise SystemExit(f"reordering term {_c} ({_kx_vars[_c]}) is "
+                             "constant on the training frame, so it cannot "
+                             "reorder segments; check that log_flow_z and "
+                             "ko_tod_* are populated in every frame path")
+    audit["reorder_cross"] = _kx_stats
+    print("   [reorder] kickoff x flow: " + ", ".join(
+        f"{k} sd={v['sd']:.3f}" for k, v in _kx_stats.items()))
     _clear_jax_caches()
 
     print("[59/3] metacountregressor structural search...")
@@ -3694,13 +7340,29 @@ def main():
             elif not args.no_force_game:
                 # Pre-forced-game checkpoints (e.g. BIC=18327 static spec)
                 # lack the game block: re-search rather than re-freeze them.
-                _rs_fixed = ((resume_state.get("best_spec") or {})
-                             .get("fixed_terms", []))
-                if not set(force_terms(work, args)) <= set(_rs_fixed):
+                _rs_fixed = list((resume_state.get("best_spec") or {})
+                                 .get("fixed_terms", []))
+                _forced = set(force_terms(work, args))
+                # Two different situations were being conflated here. A
+                # checkpoint with no game block AT ALL is a different model and
+                # must be re-searched. A checkpoint that is merely missing a
+                # newly forced cross (e.g. ko_sin_x_flow, added after the pin
+                # was taken) is the same model plus one forced term, and
+                # discarding it re-runs a 0-iteration search from scratch and
+                # silently un-pins the A/B. Complete the spec in that case.
+                if not set(GAME_FORCE) <= set(_rs_fixed):
                     print("   WARN: checkpoint predates forced game dynamics "
                           f"(fixed={_rs_fixed}); discarding resume so the "
                           "search re-runs with the game block forced")
                     resume_state = None
+                elif _forced - set(_rs_fixed):
+                    _add = sorted(_forced - set(_rs_fixed))
+                    resume_state["best_spec"]["fixed_terms"] = sorted(
+                        set(_rs_fixed) | _forced)
+                    print(f"   [resume] completing pinned spec with forced "
+                          f"term(s) {_add}; the recorded BIC "
+                          f"({resume_state.get('best_bic')}) no longer counts "
+                          "them, and the refit BIC is the one to quote")
                 # --group-temporal changes the ROLE SET a temporal term may
                 # take, so a checkpoint made under the other setting is a
                 # different search space. Reusing it would silently compare
@@ -3794,12 +7456,128 @@ def main():
             f"{len(future_ids)} fixture_ids; label collision persists")
     info = refit_only(work, spec, args, audit)
     _rss_gb("post-refit")
+    # Optional significance pruning. The forced game block guarantees the
+    # model CAN reorder segments by fixture, but it also guarantees that
+    # terms the data does not support stay in. This drops count-model fixed
+    # terms with p > --prune-p (exposure never dropped), refits once, and
+    # the two-stage block below then prunes the propensity on the same rule.
+    # The handoff gate is the arbiter: if pruning removes the game-specific
+    # signal the gate fails and the run reports it.
+    _prune_p = float(getattr(args, "prune_p", 0.0) or 0.0)
+    audit["prune_p"] = _prune_p
+    # The propensity is a DIFFERENT model from the count refit and must be
+    # pruned on its own p-values: collinearity among the game terms means a
+    # term can be insignificant in the count fit and significant in the
+    # propensity (event_x_dist does exactly this). Keep the full design here
+    # and let prune_propensity() backward-eliminate below.
+    _fixed_full = list(spec.get("fixed_terms", []))
+    if _prune_p > 0:
+        try:
+            _dropped_all = []
+            _pvals = {}
+            for _round in range(5):
+                _co = info.get("coef")
+                _pmap = {}
+                if _co is not None and "p_value" in getattr(_co, "columns", []):
+                    _pmap = {str(v): float(p) for v, p in
+                             zip(_co["variable"], _co["p_value"])
+                             if np.isfinite(p)}
+                _fixed = list(spec.get("fixed_terms", []))
+                # GAME_FORCE + the forced reordering interactions + exposure
+                # are never pruned (same reason as in prune_propensity:
+                # rare-event SEs would delete the game block and ship a static
+                # surface).
+                _forced = set(GAME_FORCE) | set(force_terms(work, args))
+                _kept = [c for c in _fixed
+                         if c == "logexp" or c in _forced
+                         or _pmap.get(c) is None
+                         or _pmap.get(c) <= _prune_p]
+                _dropped = [c for c in _fixed if c not in _kept]
+                _pvals.update({c: _pmap.get(c) for c in _fixed})
+                if not _dropped or not _kept:
+                    break
+                if _round == 0:
+                    audit["refit_full"] = audit.get("refit")
+                _dropped_all.extend(_dropped)
+                spec = dict(spec)
+                spec["fixed_terms"] = _kept
+                info = refit_only(work, spec, args, audit)
+            audit["pruned_refit"] = {
+                "dropped": _dropped_all,
+                "kept": list(spec.get("fixed_terms", [])),
+                "p_threshold": _prune_p, "p_values": _pvals}
+            if _dropped_all:
+                print(f"   [prune] count model: dropped "
+                      f"{len(_dropped_all)} insignificant term(s) "
+                      f"{_dropped_all}; kept {len(spec['fixed_terms'])}")
+            else:
+                print("   [prune] count model: nothing to drop")
+        except Exception as exc:  # noqa: BLE001
+            print(f"   WARN: count-model pruning failed ({exc})")
+    # Amplitude calibration of the shipped surface, fitted on TRAIN game rows
+    # from the FINAL count refit (after pruning, so it describes the model
+    # that ships). Applied to the future surface after prediction below.
+    amp_k, amp_m = 1.0, None
+    _amp_mode = str(getattr(args, "surface_amp_cal", "off")).lower()
+    if _amp_mode in ("on", "measure"):
+        amp_k, _amp_m = fit_surface_amplitude(work, info, args, audit)
+        if _amp_mode == "measure":
+            # Measurement only: the shipped surface is NOT reshaped. Write the
+            # number out here rather than at the end, because the metrics json
+            # is only written after prediction -- a run stopped once the
+            # in-sample calibration is known (prediction is ~40 min on these
+            # specs) would otherwise lose the one quantity it was run for.
+            _amp_out = out_dir / "surface_amp_in_sample.json"
+            try:
+                json.dump(audit.get("surface_amp", {}),
+                          open(_amp_out, "w"), indent=1)
+                print(f"   [amp] measure-only: surface NOT rescaled; "
+                      f"recorded -> {_amp_out}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"   WARN: amp measure file not written ({exc})")
+        else:
+            amp_m = _amp_m
+    else:
+        audit["surface_amp"] = {"requested": False}
+    # Per-cell game-day multipliers from the FINAL count refit (after any
+    # pruning, so the table describes the model that ships). Probed on TRAIN
+    # GAME ROWS, not future ones: the future grid only gets clock_prof /
+    # flow_anom / evu_x_att inside the prediction loop (apply_temporal_x), so a
+    # row sampled from it cannot be pushed through the design. Background rows
+    # are excluded -- their log_att is 0 by construction, so doubling their
+    # crowd moves nothing and they would only dilute the ratios.
+    # Diagnostic only: a probe failure must not fail a run whose fit is sound.
+    if str(getattr(args, "grouped_game_grain", "cell")) == "cell":
+        try:
+            _pool = work
+            if "in_event" in work.columns:
+                _ev = work[pd.to_numeric(work["in_event"], errors="coerce")
+                           .fillna(0.0) > 0.5]
+                if len(_ev):
+                    _pool = _ev
+            _probe = _pool.sample(
+                n=int(min(CELL_PROBE_ROWS, len(_pool))),
+                random_state=int(getattr(args, "seed", 7))
+            ).reset_index(drop=True)
+            # Dumped before the probe runs: if the counterfactual fails, the
+            # exact frame can be replayed without paying for another refit.
+            try:
+                _probe.to_csv(out_dir / "game_day_cell_probe.csv.gz",
+                              index=False, compression="gzip")
+            except Exception as _exc:  # noqa: BLE001
+                print(f"   WARN: probe frame dump failed ({_exc})")
+            report_cell_response(_probe, info, spec, args, audit, out_dir)
+            del _probe
+        except Exception as exc:  # noqa: BLE001
+            print(f"   WARN: per-cell response probe failed ({exc})")
+            audit["cell_response"] = {"ok": False, "error": str(exc)}
     # Report the free exposure coefficient with its SE BEFORE the LRT, so the
     # log shows the magnitude of the departure from 1.0 alongside the chi2.
     # In free mode this is the coefficient the LRT is testing; in offset mode
     # logexp is pinned and the report says so explicitly.
     try:
-        report_exposure_coefficient(info, audit, label="shipped refit")
+        report_exposure_coefficient(info, audit, label="shipped refit",
+                                    frame=work)
     except Exception as exc:  # noqa: BLE001 - reporting must not kill a run
         print(f"   WARN: exposure coefficient report failed ({exc})")
     # Binomial refit of the same design under a different likelihood, so the
@@ -3827,8 +7605,9 @@ def main():
     if two_stage_on:
         denom_col = binomial_denominator(args.target)
         flow_info = refit_denominator(work, denom_col, spec, args, audit)
-        _design = [c for c in spec.get("fixed_terms", [])
-                   if c in work.columns]
+        # Full pre-prune design: the propensity has its own significance and
+        # is backward-eliminated on it (see _fixed_full above).
+        _design = [c for c in _fixed_full if c in work.columns]
         prior = None
         if bayes_on:
             selected_sd = None
@@ -3852,6 +7631,20 @@ def main():
         except Exception as exc:  # noqa: BLE001
             print(f"   WARN: propensity fit failed ({exc})")
             prop_fit = None
+        if _prune_p > 0 and prop_fit is not None:
+            try:
+                prop_fit, _pr = prune_propensity(
+                    work, args, spec, _design, prop_fit, _prune_p,
+                    prior_sd=prior)
+                audit["two_stage"]["pruned_propensity"] = _pr
+                if _pr["dropped"]:
+                    print(f"   [prune] propensity: dropped "
+                          f"{len(_pr['dropped'])} term(s) {_pr['dropped']}; "
+                          f"kept {_pr['kept']}")
+                else:
+                    print("   [prune] propensity: nothing to drop")
+            except Exception as exc:  # noqa: BLE001
+                print(f"   WARN: propensity pruning failed ({exc})")
         if bayes_on and prop_fit is not None:
             _S = max(4, int(getattr(args, "bayes_draws", 50)))
             prop_bayes = {"model": prop_fit, "draws": _S,
@@ -3886,11 +7679,28 @@ def main():
     if str(getattr(args, "exposure_lrt", "off") or "off").lower() == "on":
         _exposure_lrt(work, spec, args, audit, info)
         _clear_jax_caches()
-    # Stage 2b: NB2 + AR refit on the contiguous-window snapshot (needs
-    # metacountregressor>=1.0.165; JAX path continues regardless).
-    print("[59/4b] temporal AR refit...")
-    temporal_fit = fit_temporal_stage(temporal_snapshot, spec, work, args,
-                                      audit, args.target)
+    # Stage 2b dynamics source (--temporal-mode). 'ar1': NB2 + AR refit
+    # (needs metacountregressor>=1.0.165; JAX path continues regardless).
+    # 'flow' (default): skip the AR fit -- it adds zero holdout skill to
+    # date -- and use the flow-driven calibrated-SD game surface as the
+    # temporal surface instead. 'off': no temporal surface at all.
+    _tmode = str(getattr(args, "temporal_mode", "flow") or "flow").lower()
+    audit["temporal_mode"] = _tmode
+    print(f"[59/4b] temporal mode: {_tmode}...")
+    temporal_fit = None
+    if _tmode == "ar1":
+        temporal_fit = fit_temporal_stage(temporal_snapshot, spec, work,
+                                          args, audit, args.target)
+    else:
+        audit["temporal_stage"] = {
+            "attempted": False,
+            "disabled": True,
+            "mode": _tmode,
+            "note": ("AR fit skipped: flow-driven calibrated-SD surface "
+                     "used as temporal surface"
+                     if _tmode == "flow" else "no temporal surface"),
+        }
+        print(f"   [temporal] AR refit skipped (mode={_tmode})")
     del temporal_snapshot
     gc.collect()
     out = predict_future_chunked(info, future_cal, segs, ctx, seg_flow,
@@ -3906,9 +7716,25 @@ def main():
                                  prop_fit=prop_fit,
                                  prop_bayes=prop_bayes,
                                  stage_a_bayes=stage_a_bayes,
-                                 seg_event_uplift_map=seg_event_uplift_map)
+                                 seg_event_uplift_map=seg_event_uplift_map,
+                                 flow_anom_by_fixture=flow_anom_fx,
+                                 wmap=wmap, wstats=wstats,
+                                 sd_curves=sd_curves,
+                                 prop_lookup=prop_lookup,
+                                 sd_forms=sd_forms,
+                                 demand_eta=demand_eta,
+                                 demand_att_ref=crowd_med,
+                                 demand_eta_by_phase=demand_eta_by_phase,
+                                 demand_eta_raw_by_phase=demand_eta_raw_by_phase,
+                                 demand_eta_raw=demand_eta_raw,
+                                 sd_lift_cal=(float(_sd_a), float(_sd_b)),
+                                 seg_event_uplift=seg_event_uplift_map,
+                                 seg_eta_ratio=seg_eta_ratio,
+                                 audit=audit)
     if getattr(args, "_bayes_stage_a_cov", None) is not None:
         audit["bayes"]["stage_a_fixed_se_coverage"] = args._bayes_stage_a_cov
+    if amp_m is not None:
+        out = apply_surface_amplitude(out, amp_k, amp_m, audit, obs=obs_light)
     del segs, future_cal
     gc.collect()
     out.to_parquet(out_dir / "game_day_pred_15min.parquet", index=False)
@@ -4052,6 +7878,86 @@ def main():
                   f"{metrics['temporal_segment_top20']:.3f}")
         except Exception as exc:  # noqa: BLE001
             print(f"   WARN: temporal metrics failed ({exc})")
+    if "game_lift" in merged.columns and "pred_nogame" in merged.columns:
+        # Game-vs-not accounting from the counterfactual twin: share of
+        # predicted speeding attributable to the game being on.
+        try:
+            _lift = pd.to_numeric(merged["game_lift"],
+                                  errors="coerce").fillna(0.0)
+            _pred = pd.to_numeric(merged["pred_speeding"],
+                                  errors="coerce").fillna(0.0)
+            metrics["game_lift_share"] = round(
+                float(_lift.sum() / max(_pred.sum(), 1e-12)), 4)
+            _fx = merged.groupby("fixture")[["game_lift",
+                                             "pred_speeding"]].sum()
+            _fx["lift_share"] = (_fx["game_lift"]
+                                 / _fx["pred_speeding"].clip(lower=1e-12))
+            metrics["game_lift_share_by_fixture"] = {
+                str(k): round(float(v), 4)
+                for k, v in _fx["lift_share"].items()}
+            print(f"   game lift: pooled share="
+                  f"{metrics['game_lift_share']:.3f} by-fixture="
+                  f"{metrics['game_lift_share_by_fixture']}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"   WARN: game-lift metrics failed ({exc})")
+    if "sd_lift" in merged.columns:
+        # SD twin head-to-head: same demand experiment, structural
+        # identification (density-mediated) vs regression identification.
+        try:
+            _sl = pd.to_numeric(merged["sd_lift"],
+                                errors="coerce").fillna(0.0)
+            _sp = pd.to_numeric(merged["pred_sd_game"],
+                                errors="coerce").fillna(0.0)
+            metrics["sd_lift_share"] = round(
+                float(_sl.sum() / max(_sp.sum(), 1e-12)), 4)
+            _gl = pd.to_numeric(merged["game_lift"],
+                                errors="coerce").fillna(0.0)
+            _m = np.isfinite(_sl.to_numpy()) & np.isfinite(_gl.to_numpy())
+            metrics["sd_vs_reg_lift_corr"] = round(float(
+                np.corrcoef(_sl.to_numpy()[_m],
+                            _gl.to_numpy()[_m])[0, 1])
+                if _m.sum() > 10 else float("nan"), 4)
+            print(f"   SD lift: pooled share="
+                  f"{metrics['sd_lift_share']:.3f} corr(SD, regression)="
+                  f"{metrics['sd_vs_reg_lift_corr']:.3f}")
+            if "pred_sd_game_cal" in merged.columns:
+                # Calibrated twin head-to-head (same demand experiment).
+                # Only exists when --sd-lift-cal-apply is set; without it
+                # "calibrated" IS the twin and this block would just repeat
+                # the uncalibrated numbers.
+                # Correlation at FIXTURE level (share vs share): row-level
+                # corr mixes within-fixture scale with between-fixture lift.
+                try:
+                    _slc = pd.to_numeric(merged["sd_lift_cal"],
+                                         errors="coerce").fillna(0.0)
+                    _spc = pd.to_numeric(
+                        merged.get("pred_sd_game_cal",
+                                   merged["pred_sd_game"]),
+                        errors="coerce").fillna(0.0)
+                    metrics["sd_lift_share_cal"] = round(
+                        float(_slc.sum() / max(_spc.sum(), 1e-12)), 4)
+                    _fc = merged.groupby("fixture").agg(
+                        _s=("sd_lift_cal", "sum"),
+                        _g=("pred_sd_game_cal"
+                            if "pred_sd_game_cal" in merged.columns
+                            else "pred_sd_game", "sum"),
+                        _r=("game_lift", "sum"),
+                        _p=("pred_speeding", "sum"))
+                    _fsh = (_fc["_s"] / _fc["_g"].clip(lower=1e-12)).to_numpy()
+                    _frh = (_fc["_r"] / _fc["_p"].clip(lower=1e-12)).to_numpy()
+                    _mm = np.isfinite(_fsh) & np.isfinite(_frh)
+                    metrics["corr_sd_cal_vs_reg"] = round(float(
+                        np.corrcoef(_fsh[_mm], _frh[_mm])[0, 1])
+                        if _mm.sum() > 3 else float("nan"), 4)
+                    print(f"   SD lift (calibrated): pooled share="
+                          f"{metrics['sd_lift_share_cal']:.3f} "
+                          f"corr(cal SD, regression)="
+                          f"{metrics['corr_sd_cal_vs_reg']:.3f} "
+                          f"(fixture-level, n={int(_mm.sum())})")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"   WARN: calibrated-SD metrics failed ({exc})")
+        except Exception as exc:  # noqa: BLE001
+            print(f"   WARN: SD metrics failed ({exc})")
     audit["metrics"] = metrics
 
     # ---------------------------------------------------------------- structure
@@ -4096,14 +8002,18 @@ def main():
             {k: _h.get(k) for k in (
                 "n_fixtures", "pearson_min", "pearson_mean",
                 "top20_coverage_mean", "top20_jaccard",
+                "pairwise_surface_spearman_mean", "calibration_slope",
                 "positive_ranking", "game_specific", "calibrated", "pass")},
             default=str))
+        print("   handoff thresholds: %s" % json.dumps(
+            _h.get("thresholds") or {}, default=str))
+        for _f in (_h.get("failures") or []):
+            print(f"   handoff FAIL: {_f}")
         if not _h.get("pass"):
-            print("   WARN: HANDOFF GATE FAILED (positive_ranking="
-                  f"{_h.get('positive_ranking')}, game_specific="
-                  f"{_h.get('game_specific')}, calibrated="
-                  f"{_h.get('calibrated')}); stage 60 refuses this surface "
-                  "unless ALLOW_WEAK_SURFACE=1")
+            print("   WARN: HANDOFF GATE FAILED; the run will exit non-zero "
+                  "unless ALLOW_WEAK_SURFACE=1 (a surface that cannot "
+                  "reorder by game, or is miscalibrated, must not reach "
+                  "the MIP)")
     except Exception as exc:  # noqa: BLE001
         print(f"   WARN: handoff audit failed ({exc})")
         audit["handoff"] = {"error": f"{type(exc).__name__}: {exc}",
@@ -4115,12 +8025,32 @@ def main():
     coefs = info.get("coef")
     if coefs is not None and len(coefs):
         coefs.to_csv(out_dir / "game_day_model_coefs.csv", index=False)
+    # SD showcase figure (loop schematic + fitted forms + produced lift).
+    # Own guard: cosmetic failure must not touch the shipped surface.
+    sd_fig_name = None
+    if not getattr(args, "no_sd", False):
+        try:
+            _sdp = Path(fig_dir) / "game_day_sd_loop.png"
+            make_sd_figure(out, sd_curves, prop_lookup, sd_forms,
+                           flow_uplift, demand_eta, crowd_med, metrics,
+                           _sdp)
+            sd_fig_name = "game_day_sd_loop.png"
+            print(f"   SD showcase -> {sd_fig_name}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"   WARN: SD showcase figure failed ({exc})")
     with open(out_dir / "game_day_predict.tex", "w") as tex:
         tex.write("% game_day_predict.tex - generated by 59_game_day_search_predict.py\n")
         tex.write(f"% best BIC: {best_bic}\n")
         for key, val in metrics.items():
             tex.write(f"% {key}: {val}\n")
         tex.write(f"% refit: {json.dumps(audit.get('refit', {}), default=str)}\n")
+    # Math-programme fragment for the paper (written even when SD is off).
+    try:
+        _mp = write_math_program(out_dir, audit, metrics,
+                                 sd_fig=sd_fig_name)
+        print(f"   math programme -> {_mp.name}")
+    except Exception as exc:  # noqa: BLE001 - paper asset must not kill run
+        print(f"   WARN: math programme fragment failed ({exc})")
 
     try:
         import matplotlib
@@ -4133,27 +8063,108 @@ def main():
             prog = pd.read_csv(PROGRESS_CSV)
             if "timestamp_iso" in prog.columns:
                 prog = prog.sort_values("timestamp_iso").reset_index(drop=True)
-            # Split into runs wherever iters_completed steps back (fresh
-            # restart after rotation missed, or resumed run): only the last
-            # run is the current search; earlier runs plot faint.
-            _breaks = [0] + [i for i in range(1, len(prog))
-                             if prog["iters_completed"].iloc[i]
-                             < prog["iters_completed"].iloc[i - 1]] + [len(prog)]
-            fig, ax = plt.subplots(figsize=(7, 4))
-            for _a, _b in zip(_breaks[:-1], _breaks[1:]):
-                _seg = prog.iloc[_a:_b]
-                _cur = (_b == len(prog))
-                ax.plot(_seg["iters_completed"], _seg["best_bic"],
-                        "o-" if _cur else "o:",
-                        color="#0B6E4F" if _cur else "#9DBEAF",
-                        ms=5 if _cur else 3,
-                        label="current run" if _cur else "prior run")
-            ax.set_xlabel("search iterations")
-            ax.set_ylabel("best BIC")
-            ax.set_title("MetaCount structural search convergence")
-            if len(_breaks) > 2:
-                ax.legend(fontsize=7)
-            fig.tight_layout()
+            # Generation-level traces from the per-chunk SearchOutputConfig
+            # JSONs (finer than chunk bests; also exposes stalls where a
+            # chunk evaluates nothing new).
+            _traces = []
+            try:
+                import glob as _glob
+                _chunk = int(prog["iters_completed"].diff().fillna(
+                    prog["iters_completed"].iloc[:1]).median()
+                    if len(prog) else 20) or 20
+                for _jf in sorted(_glob.glob(str(out_dir / "search59"
+                                                 / "game_day_count_sa_*.json")),
+                                  key=lambda p: Path(p).stat().st_mtime):
+                    try:
+                        _r = json.load(open(_jf))["result"]
+                        _st = _r.get("search_stats") or []
+                        if isinstance(_st, dict):
+                            _st = [ _st ]
+                        _g = [(int(x.get("iter", i)),
+                               float(x.get("best", float("nan"))),
+                               float(x.get("temperature", float("nan"))))
+                              for i, x in enumerate(_st)
+                              if isinstance(x, dict)]
+                        if _g:
+                            _traces.append(_g)
+                    except Exception:
+                        continue
+            except Exception:
+                _traces = []
+            fig, axes = plt.subplots(1, 3, figsize=(18, 4))
+            if _traces:
+                # Snapshot files carry 1 point (stalled chunk) or a full
+                # per-generation trace; x is snapshot order in time, which
+                # is monotone in search effort either way.
+                _off = 0
+                for _k, _g in enumerate(_traces):
+                    _xs = list(range(_off, _off + len(_g)))
+                    _ys = [g[1] for g in _g]
+                    _cur = (_k == len(_traces) - 1)
+                    axes[0].plot(_xs, _ys,
+                                 "o-" if _cur else "o:",
+                                 color="#0B6E4F" if _cur else "#9DBEAF",
+                                 ms=4 if _cur else 2,
+                                 label="latest chunk" if _cur else None)
+                    _off += len(_g)
+                axes[0].set_xlabel("search snapshots in time order")
+                axes[0].set_title("Best BIC per recorded snapshot")
+                axes[0].legend(fontsize=7)
+            else:
+                _breaks = [0] + [i for i in range(1, len(prog))
+                                 if prog["iters_completed"].iloc[i]
+                                 < prog["iters_completed"].iloc[i - 1]] + [len(prog)]
+                for _a, _b in zip(_breaks[:-1], _breaks[1:]):
+                    _seg = prog.iloc[_a:_b]
+                    _cur = (_b == len(prog))
+                    axes[0].plot(_seg["iters_completed"], _seg["best_bic"],
+                                 "o-" if _cur else "o:",
+                                 color="#0B6E4F" if _cur else "#9DBEAF",
+                                 ms=5 if _cur else 3)
+                axes[0].set_xlabel("search iterations")
+                axes[0].set_title("Best BIC per chunk")
+            axes[0].set_ylabel("best BIC")
+            # New evaluator calls per chunk: zeros = stalled chunk (SA
+            # re-walks cached solutions; evidence of premature convergence).
+            try:
+                _ev = pd.to_numeric(prog["n_cache_evals"],
+                                    errors="coerce").fillna(0).to_numpy(float)
+                _new = np.diff(np.concatenate([[0.0], _ev]))
+                _new = np.maximum(_new, 0.0)
+                axes[1].bar(np.arange(len(_new)), _new, color="#7A5195")
+                axes[1].set_xlabel("chunk")
+                axes[1].set_ylabel("new fitness evals")
+                axes[1].set_title("Search effort per chunk "
+                                  "(0 = stalled chunk)")
+            except Exception:
+                axes[1].axis("off")
+            # Characteristic composition of the best spec per chunk:
+            # stacked bars prove WHEN each kind of information
+            # (telematics / weather / game / geometry...) entered.
+            try:
+                _fprog = pd.read_csv(FAMILY_CSV)
+                _fams = [f for f in FAMILY_ORDER
+                         if f"n_{f}" in _fprog.columns]
+                _bot = np.zeros(len(_fprog))
+                _cols = {"telematics": "#0B6E4F", "weather": "#3A86FF",
+                         "game": "#E36414", "temporal": "#7A5195",
+                         "geometry": "#9E9E9E", "calendar": "#FB8C00",
+                         "other": "#D3D3D3"}
+                for _f in _fams:
+                    _v = pd.to_numeric(_fprog[f"n_{_f}"],
+                                       errors="coerce").fillna(0).to_numpy(float)
+                    axes[2].bar(np.arange(len(_v)), _v, bottom=_bot,
+                                color=_cols.get(_f, "#D3D3D3"), label=_f)
+                    _bot = _bot + _v
+                axes[2].set_xlabel("chunk")
+                axes[2].set_ylabel("terms in best spec")
+                axes[2].set_title("Best-spec composition by characteristic")
+                axes[2].legend(fontsize=6, ncols=2)
+            except Exception:
+                axes[2].axis("off")
+            fig.suptitle("MetaCount structural search convergence",
+                         fontsize=10)
+            fig.tight_layout(rect=(0, 0, 1, 0.92))
             fig.savefig(fig_dir / "game_day_search_convergence.png", dpi=120)
             plt.close(fig)
         if len(merged) > 10:
@@ -4369,6 +8380,51 @@ def main():
         except Exception as _mexc:  # noqa: BLE001
             print(f"   WARN: could not write figures manifest ({_mexc})")
     print(f"[59] DONE ({tag}). metrics: {json.dumps(metrics, default=str)}")
+    # ---------------------------------------------------------------- gate
+    # A channel that silently failed to compute must NOT look like success.
+    # o26765725 shipped "59 OK" with no SD columns, no flow-temporal surface
+    # and no regime diagnostic because one NameError was swallowed by a
+    # broad except; a downstream job then consumed a parquet that silently
+    # lacked a whole model. Fail loudly instead.
+    _problems = []
+    if audit.get("sd_simulation_ok") is False:
+        _problems.append(
+            "SD twin produced no columns: "
+            f"{audit.get('sd_simulation_failures')}")
+    if (sd_curves is not None and prop_lookup is not None
+            and not getattr(args, "no_sd", False)
+            and "pred_sd_game" not in out.columns
+            and not args.pilot):
+        _problems.append("SD columns absent from the shipped parquet")
+    if (_tmode == "flow" and not args.pilot
+            and "pred_speeding_temporal" not in out.columns):
+        _problems.append(
+            f"temporal-mode=flow but no temporal surface was written")
+    # A refit that fell down the staged ladder shipped a DIFFERENT model from
+    # the one the search selected -- on T9 that meant a fixed-effects Poisson
+    # surface with the fixture-grouped slopes silently absent while the run
+    # reported success and wagered the whole game-day campaign on it.
+    _deg = refit_fidelity_problem(audit,
+                                  allow_degraded=getattr(
+                                      args, "allow_degraded_fit", False))
+    if _deg:
+        _problems.append(_deg)
+    # The handoff gate is only real if the run fails on it. Until now the
+    # verdict was printed and nothing consumed it: no stage read
+    # audit.handoff.pass, so t9_hier shipped a surface with calibration slope
+    # 4.36 and 16 of 20 top streets shared by both games under a green "GATE
+    # OK". ALLOW_WEAK_SURFACE=1 is the documented escape hatch for exploring
+    # a weak surface; it has to be set deliberately.
+    _hnd = handoff_gate_problem(
+        audit, pilot=getattr(args, "pilot", False),
+        allow_weak=os.environ.get("ALLOW_WEAK_SURFACE") == "1")
+    if _hnd:
+        _problems.append(_hnd)
+    if _problems:
+        for _p in _problems:
+            print(f"[59] GATE FAIL: {_p}")
+        raise SystemExit("FATAL: incomplete surface(s): " + "; ".join(_problems))
+    print("[59] GATE OK: shipped surface channels are present")
 
 
 if __name__ == "__main__":

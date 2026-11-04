@@ -1,0 +1,70 @@
+#!/bin/bash -l
+#PBS -N hb55rebuild
+#PBS -l select=1:ncpus=4:mem=32gb
+#PBS -l walltime=12:00:00
+#PBS -J 0-19
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+#PBS -o logs/hb55_^array_index^.log
+
+# Rebuild hard-braking events from the RAW trip files for the FULL
+# 2025-01-01 .. 2026-03-31 period, as a 20-way PBS array job
+# (each shard handles every 20th raw file => ~250 files/shard).
+# Replaces the inconsistent data/hard_braking_events.csv (which claims
+# EventStart dates out to Dec 2026 although raw trips end 2026-03-31)
+# with data/hard_braking_events_full.csv. Merge afterwards:
+#
+#   python scripts/55b_merge_hb_shards.py
+#
+# Smoke test first (2 files, ~minutes):
+#   python scripts/55_rebuild_hb_full.py --limit 2 --shard 0 --nshards 20 \
+#       --out results/hb_full.smoke.csv.gz
+#
+#   qsub pbs_55_rebuild_hb.pbs
+#   # when all 20 array tasks finish:
+#   python scripts/55b_merge_hb_shards.py
+#   # then refresh downstream:
+#   qsub 01_prepare_data.pbs   # 18_prepare picks up the _full file
+
+cd "$PBS_O_WORKDIR" || exit 1
+mkdir -p logs results data
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export JAX_PLATFORMS=cpu
+
+RAW_DIR="${RAW_DIR:-data/raw_near_miss_2026}"
+
+echo "shard ${PBS_ARRAY_INDEX} on $(hostname) at $(date)"
+python -u scripts/55_rebuild_hb_full.py \
+    --raw-dir "$RAW_DIR" \
+    --out results/hb_full.csv.gz \
+    --date-min 2025-01-01 --date-max 2026-03-31 \
+    --shard "${PBS_ARRAY_INDEX}" --nshards 20 --ckpt 25
+RC=$?
+
+echo "shard ${PBS_ARRAY_INDEX} done at $(date) exit=$RC"
+# Gate: this shard's output must exist, be non-empty, AND be a complete
+# gzip stream. A segfaulted worker (exit 139, seen on faulty node cpu1n022
+# on 2026-10-09) leaves a truncated .gz that passes -s but breaks the merge
+# with EOFError. gzip -t catches that here so the shard fails loudly
+# instead of poisoning the merge.
+SHARD_OUT="results/hb_full.shard$(printf '%03d' ${PBS_ARRAY_INDEX}).csv.gz"
+if [ ! -s "$SHARD_OUT" ]; then
+    echo "MISSING/EMPTY shard output: $SHARD_OUT"
+    exit 1
+fi
+if ! gzip -t "$SHARD_OUT"; then
+    echo "CORRUPT (truncated gzip) shard output: $SHARD_OUT"
+    exit 1
+fi
+echo "shard output OK: $SHARD_OUT ($(stat -c%s "$SHARD_OUT") bytes)"
+exit $RC

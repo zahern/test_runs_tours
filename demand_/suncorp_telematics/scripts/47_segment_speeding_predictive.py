@@ -160,16 +160,16 @@ except ImportError:
 
 def _validate_mcr_version(engine):
     """Require current PyPI MetaCount, or the tested local Numba checkout."""
-    if _TUP >= (1, 0, 159):
+    if _TUP >= (1, 0, 188):
         return
     if (str(engine).lower() == "numba" and _TUP >= (1, 0, 158)
             and _LOCAL_NUMBA_BACKEND):
         print(
             f"   using local MetaCount Numba backend {_MCR_VERSION}; "
-            "PyPI JAX runs require >=1.0.159")
+            "PyPI JAX runs require >=1.0.188")
         return
     raise SystemExit(
-        f"FATAL: metacountregressor {_MCR_VERSION} < 1.0.159. "
+        f"FATAL: metacountregressor {_MCR_VERSION} < 1.0.188. "
         "Install the latest release from PyPI: "
         "python -m pip install --upgrade metacountregressor")
 

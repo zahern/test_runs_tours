@@ -20,7 +20,7 @@ module unload Anaconda3
 mkdir -p /mnt/hpccs01/home/ahernz/test_runs_tours/code
 (
     flock -w 900 9 2>/dev/null || echo "(flock unavailable, proceeding without lock)"
-    pip install --quiet --upgrade --retries 5 --timeout 60 "metacountregressor==1.0.151" 2>&1 | tail -5
+    pip install --quiet --upgrade --retries 5 --timeout 60 metacountregressor 2>&1 | tail -5
 ) 9>/mnt/hpccs01/home/ahernz/test_runs_tours/code/.pkg_upgrade.lock
 # Hard gate (this file has NO `set -e`, so a bare failing assert would NOT stop
 # the job — job 25277158 proved it: assert fired, run continued on stale 1.0.143).
@@ -45,3 +45,5 @@ for f in "$PROJ_DIR/hb_final_spec_fixed_nm.tex" "$PROJ_DIR/hb_final_spec_fixed_c
 done
 echo "Job finished at $(date) exit=$EXIT_CODE"
 exit $EXIT_CODE
+
+

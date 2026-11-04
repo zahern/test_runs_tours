@@ -1093,6 +1093,120 @@ except Exception:
           False, traceback.format_exc(limit=1), "")
 
 # ============================================================================
+# S11 — Stage 3 sign discipline (gates + objective sign-consistency)
+# ============================================================================
+print("\n--- S11: Stage 3 sign discipline ---", flush=True)
+try:
+    import stage3_activity_duration as _s3
+    _nv = _s3.s3_sign_violations(
+        ['B', 'n_mandatory', 'log_dist', 'ptype_FullTimeWorker'],
+        np.array([0.5, 0.3, -0.2, 0.1]), 'work')
+    _nv_edu = _s3.s3_sign_violations(
+        ['B', 'n_mandatory', 'log_dist', 'ptype_FullTimeWorker'],
+        np.array([0.5, 0.3, -0.2, 0.1]), 'edu')
+    _nv_nan = _s3.s3_sign_violations(
+        ['B', 'n_mandatory'], np.array([0.5, np.nan]), 'work')
+    check("S11", "violation counter: prior/scoped/NaN semantics",
+          _nv == 1 and _nv_edu == 1 and _nv_nan == 0,
+          f"work={_nv} edu={_nv_edu} nan-skipped={_nv_nan == 0}",
+          "Counter wrong: only n_mandatory>0 violates (<0 prior); log_dist "
+          "has NO prior; ptype_FullTimeWorker is work-scoped; NaN never counts.")
+    _rows = _s3.check_stage3_signs(
+        {'work': {'B': 0.5, 'n_mandatory': 0.3, 'log_dist': -0.2,
+                  'incp': 0.05}})
+    _by = {r['parameter']: r['pass'] for r in _rows}
+    check("S11", "audit rows cover pass/fail/no-prior",
+          _by.get('B') is True and _by.get('n_mandatory') is False
+          and _by.get('log_dist') is None and _by.get('incp') is None,
+          f"B={_by.get('B')} n_mand={_by.get('n_mandatory')} "
+          f"log_dist={_by.get('log_dist')} incp={_by.get('incp')}",
+          "Audit rows must distinguish pass (B>0), fail (n_mandatory>0), "
+          "and no-prior (log_dist/incp -> None, reported never penalised).")
+
+    class _StubM:
+        pass
+    _sm = _StubM()
+    _sm.coef_ = np.array([0.5, 0.3])
+    _sm.feature_names_ = ['B', 'n_mandatory']
+    _md = {'work': {'model': _sm, 'features': ['B', 'n_mandatory']},
+           'eat': {'model': _StubM(), 'features': ['B']}}
+    _tot = _s3.attach_stage3_sign_audits(_md)
+    check("S11", "attach audits models, tolerates missing coef_",
+          _tot == 1 and 'sign_audit' in _md['work']
+          and 'sign_audit' in _md['eat'],
+          f"total-violations={_tot} (expect 1: work n_mandatory)",
+          "Attach broken: must add sign_audit per purpose, count fails, "
+          "and degrade to a note row (never raise) when coef_ is absent.")
+except Exception:
+    check("S11", "violation counter: prior/scoped/NaN semantics", False,
+          traceback.format_exc(limit=1), "")
+# Objective sign-consistency: every Stage-3 objective level, numerically.
+try:
+    import ga_external_estimators as _ge
+    _s = _ge._bic_per_obs(-100.0, 3, 1000)
+    _s_better_ll = _ge._bic_per_obs(-90.0, 3, 1000)
+    _s_more_k = _ge._bic_per_obs(-100.0, 5, 1000)
+    import math as _mth
+    _expect = -(-2.0 * -100.0 + 3 * _mth.log(1000)) / 1000
+    check("S11", "_bic_per_obs is -BIC/n, higher-is-better",
+          abs(_s - _expect) < 1e-9 and _s_better_ll > _s > -1e8
+          and _s_more_k < _s,
+          f"score={_s:.4f} (expect {_expect:.4f}) better-ll-higher="
+          f"{_s_better_ll > _s} more-k-lower={_s_more_k < _s}",
+          "OBJECTIVE SIGN ERROR: fitness must equal -BIC/n with higher = "
+          "better. If this fails, the GA maximises the WRONG end.")
+    # MLE level: known-sign recovery + analytic-vs-numeric gradient.
+    _srng = np.random.default_rng(7)
+    _Xr = _srng.normal(size=(400, 1))
+    _yr = np.exp(0.5 * _Xr[:, 0] + _srng.normal(scale=0.3, size=400))
+    _bm = _s3.BudgetLognormal(l2=0.0) if '_s3' in dir() else None
+    if _bm is None:
+        import stage3_activity_duration as _s3b
+        _bm = _s3b.BudgetLognormal(l2=0.0)
+    _bm.fit(_Xr, _yr)
+    _rec = float(np.asarray(_bm.coef_).ravel()[0])
+    _Xs1 = np.column_stack([np.ones(len(_Xr)),
+                            (_Xr - _Xr.mean(0)) / _Xr.std(0)])
+    _ly = np.log(_yr)
+    _p0 = np.concatenate([[0.0], [0.5], [np.log(0.3)]])
+    _ga = -_bm._neg_ll_grad(_p0, _Xs1, _ly)
+    _eps, _gn = 1e-6, np.zeros(3)
+    for _i in range(3):
+        _dp = np.zeros(3)
+        _dp[_i] = _eps
+        _gn[_i] = (_bm._neg_ll(_p0 + _dp, _Xs1, _ly)
+                   - _bm._neg_ll(_p0 - _dp, _Xs1, _ly)) / (2 * _eps)
+    _gmatch = bool(np.allclose(_ga, _gn, rtol=1e-4, atol=1e-6))
+    check("S11", "BudgetLognormal MLE: sign recovery + grad exact",
+          _rec > 0.2 and _gmatch,
+          f"recovered beta={_rec:.3f} (true 0.5) grad-match={_gmatch}",
+          "MLE OBJECTIVE ERROR: true-positive beta must recover positive "
+          "and the analytic gradient must match finite differences — a "
+          "transposed sign here inverts every Stage-3 estimate.")
+except Exception:
+    check("S11", "_bic_per_obs is -BIC/n, higher-is-better", False,
+          traceback.format_exc(limit=1), "")
+# Wiring: penalty hook in fitness + audit in final estimation (source).
+try:
+    _ga_src = open(os.path.join(CODE, "ga_hypothesis_testing.py"),
+                   encoding="utf-8").read()
+    _s3_src = open(os.path.join(CODE, "stage3_activity_duration.py"),
+                   encoding="utf-8").read()
+    _wired = ("GA_S3_SIGN_PENALTY" in _ga_src
+              and "s3_sign_violations" in _ga_src
+              and "attach_stage3_sign_audits(models)" in _s3_src
+              and "EXPECTED_S3_SIGNS" in _s3_src)
+    check("S11", "sign gate + audit wired into selection and reporting",
+          _wired, "penalty in _stage3_fitness, audit in estimate path"
+          if _wired else "wiring missing",
+          "Gate not wired: _stage3_fitness must subtract "
+          "GA_S3_SIGN_PENALTY x violations, and estimate_duration_models "
+          "must attach audits to the final models for the paper tables.")
+except Exception:
+    check("S11", "sign gate + audit wired into selection and reporting",
+          False, traceback.format_exc(limit=1), "")
+
+# ============================================================================
 # Summary
 # ============================================================================
 print("\n" + "=" * 72)

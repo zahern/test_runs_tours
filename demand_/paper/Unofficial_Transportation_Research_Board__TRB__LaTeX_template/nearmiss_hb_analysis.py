@@ -238,7 +238,7 @@ def _scipy_hessian_se(obj_fn, params, eps=1e-4):
     return se
 
 def fit_model(df, features, y_col, offset_col, dispersion=1, label="", verbose=False,
-              rdm_terms=None, rdm_cor_terms=None, draws_R=200):
+              rdm_terms=None, rdm_cor_terms=None, draws_R=500):
     """Fit an NB/Poisson count model, optionally with random (random-parameter)
     terms. `rdm_terms`/`rdm_cor_terms` accept entries of the form
     '<feature>:<dist>' (e.g. 'AADT:normal') where <feature> is an ORIGINAL data
@@ -268,10 +268,18 @@ def fit_model(df, features, y_col, offset_col, dispersion=1, label="", verbose=F
     df_m["_id"] = np.arange(len(df_m))
     df_m["_off"] = df_m[offset_col].values.astype(float)
 
+    # Random parameters *replace* their fixed effect: a variable cannot be
+    # both fixed and random — that gives the likelihood two free ways to
+    # shift its mean and the Hessian goes rank-deficient (the double-mean
+    # SE blowout flagged upstream).
+    rdm_bases = {t.split(":")[0] for t in (rdm_terms or []) + (rdm_cor_terms or [])}
+    active_feats = [f for f in features if f not in rdm_bases]
+    fstd_active = [col2f[f] for f in active_feats]
+
     manual_spec = {
-        "fixed_terms": fstd, "rdm_terms": rdm, "rdm_cor_terms": rdm_cor,
+        "fixed_terms": fstd_active, "rdm_terms": rdm, "rdm_cor_terms": rdm_cor,
         "grouped_terms": [], "hetro_in_means": [],
-        "transformations": ["no"]*len(fstd),
+        "transformations": ["no"]*len(fstd_active),
         "dispersion": dispersion, "latent_classes": 1,
     }
 
@@ -285,37 +293,70 @@ def fit_model(df, features, y_col, offset_col, dispersion=1, label="", verbose=F
     init = np.zeros(K)
     init[pi["fixed"][0]:pi["fixed"][1]] = 0.0
     init[pi["fixed"][0]] = np.log(max(y_raw.mean(), 0.01))
+    # SDs and Cholesky diagonals init at 0.0 -> exp(0)=1 SD, 0 corr
     for key in ("ind_mean", "ind_sd", "cor_mean", "chol", "group_mean", "group_sd"):
         if key in pi:
             s, e = pi[key]
-            init[s:e] = -1.0 if "sd" in key or "chol" in key else 0.0
+            init[s:e] = 0.0
     if spec.model == "nb" and "dispersion" in pi:
-        init[pi["dispersion"]] = 0.1
+        init[pi["dispersion"]] = 0.1  # log(alpha) ~ 0.1 -> alpha ~ 1.1
 
     def obj(p):
         return float(mixed_model_loglik(jnp.array(p), data, spec, indivi=False))
 
-    res = scipy_min(obj, init, method="L-BFGS-B", options={"maxiter": 5000})
-    params = res.x; n = len(df_m); k = K
-    ll = -obj(params); aic = 2*k - 2*ll; bic = k*np.log(n) - 2*ll
+    # Multi-start: jitter fixed effects and try a few warm starts around the
+    # base init; keep the best log-likelihood.
+    best_params = None
+    best_ll = -np.inf
+    best_se = None
+    rng = np.random.default_rng(12345)
+    for attempt in range(5):
+        if attempt == 0:
+            start = init
+        else:
+            start = init.copy()
+            # Jitter fixed effects slightly
+            f_start, f_end = pi["fixed"]
+            start[f_start:f_end] += rng.normal(0, 0.1, size=f_end - f_start)
+            # Small perturbation to SD blocks (log-scale)
+            for key in ("ind_sd", "chol", "group_sd"):
+                if key in pi:
+                    s, e = pi[key]
+                    start[s:e] += rng.normal(0, 0.2, size=e - s)
+        res = scipy_min(obj, start, method="L-BFGS-B", options={"maxiter": 5000})
+        if res.success:
+            ll_attempt = -obj(res.x)
+            if ll_attempt > best_ll:
+                best_ll = ll_attempt
+                best_params = res.x
+                # Compute SEs for this attempt
+                try:
+                    se_jax = np.asarray(compute_standard_errors(jnp.array(res.x), obj))
+                    if np.isfinite(se_jax).any() and np.nanmax(np.abs(se_jax)) < 50:
+                        best_se = se_jax
+                except Exception:
+                    pass
+    if best_params is None:
+        # Fallback to last attempt
+        best_params = res.x
+        best_se = None
+    params = best_params
+    n = len(df_m); k = K
+    ll = best_ll
+    aic = 2*k - 2*ll
+    bic = k*np.log(n) - 2*ll
 
-    se = None
-    try:
-        se_jax = np.asarray(compute_standard_errors(jnp.array(params), obj))
-        if np.isfinite(se_jax).any() and np.nanmax(np.abs(se_jax)) < 50:
-            se = se_jax
-    except Exception:
-        pass
-    if se is None:
-        se = _scipy_hessian_se(obj, params)
-    se = np.where(np.abs(se) > 50, np.nan, se)
+    if best_se is None:
+        best_se = _scipy_hessian_se(obj, params)
+    se = np.where(np.abs(best_se) > 50, np.nan, best_se)
 
-    z = np.where(np.isfinite(se) & (se > 1e-12), params/se, np.nan)
-    p = np.where(np.isfinite(z), 2*(1-scipy_stats.norm.cdf(np.abs(z))), np.nan)
+    # z/p on RAW scale initially; will be overridden for SD/chol/disp rows below
+    z_raw = np.where(np.isfinite(se) & (se > 1e-12), params/se, np.nan)
+    p_raw = np.where(np.isfinite(z_raw), 2*(1-scipy_stats.norm.cdf(np.abs(z_raw))), np.nan)
 
-    names = ["(Intercept)"] + [_V(f) for f in features]
+    names = ["(Intercept)"] + [_V(f) for f in active_feats]
     # random independent/correlated mean parameters (labeled in param order)
-    n_fixed = len(features)
+    n_fixed = len(active_feats)
     rdm_mean_names = []
     if "ind_mean" in pi:
         sm, em = pi["ind_mean"]
@@ -341,26 +382,93 @@ def fit_model(df, features, y_col, offset_col, dispersion=1, label="", verbose=F
             for i in range(mcor):
                 for j in range(i + 1):
                     chol_names.append(f"chol({cvars[i]}|{cvars[j]})")
-    # SDs are stored on a log basis (softplus used in likelihood); report exp back
-    sd_slice = params[pi["ind_sd"][0]:pi["ind_sd"][1]] if "ind_sd" in pi else np.array([])
-    sd_reported = np.asarray([np.log1p(np.exp(np.clip(v, -20, 20))) for v in sd_slice])
+    # SDs are stored on a log basis (exp(clip) used in likelihood); report display scale
+    # with delta-method SEs and z/p on the DISPLAYED scale.
+    # For ind_sd: display = exp(clip(raw, -12, 6)), deriv = display.
+    # For chol diagonal: display = exp(clip(raw, -12, 6)), deriv = display.
+    # For off-diagonal chol: display = raw, deriv = 1.
+    # For dispersion: display = exp(clip(raw, -12, 12)), deriv = display.
 
-    # Build full ordered name vector aligned to param layout:
-    # [fixed..., ind_mean..., cor_mean..., ind_sd..., chol..., dispersion]
-    names_full = names[:1] + [_V(f) for f in features] + rdm_mean_names + rdm_sd_names + chol_names
+    def _exp_display(raw, se_raw, clip_lo=-12.0, clip_hi=6.0):
+        raw = np.asarray(raw, dtype=float)
+        se_raw = np.asarray(se_raw, dtype=float)
+        clipped = np.clip(raw, clip_lo, clip_hi)
+        disp = np.exp(clipped)
+        return disp, disp * se_raw
+
+    def _disp_display(raw, se_raw):
+        raw = np.asarray(raw, dtype=float)
+        se_raw = np.asarray(se_raw, dtype=float)
+        clipped = np.clip(raw, -12.0, 12.0)
+        disp = np.exp(clipped)
+        return disp, disp * se_raw
+
+    # Apply transforms and recompute z/p on displayed scale for affected rows
+    est = params[:K].copy()
+    se_disp = se[:K].copy()
+    z_disp = z_raw[:K].copy()
+    p_disp = p_raw[:K].copy()
+
+    if "ind_sd" in pi:
+        ss, es = pi["ind_sd"]
+        sd_disp, sd_se = _exp_display(params[ss:es], se[ss:es])
+        est[ss:es] = sd_disp
+        se_disp[ss:es] = sd_se
+        z_disp[ss:es] = np.where(np.isfinite(sd_se) & (sd_se > 1e-12),
+                                 sd_disp / sd_se, np.nan)
+        p_disp[ss:es] = np.where(np.isfinite(z_disp[ss:es]),
+                                 2*(1-scipy_stats.norm.cdf(np.abs(z_disp[ss:es]))), np.nan)
+
+    if "chol" in pi:
+        s_ch, e_ch = pi["chol"]
+        mcor = len(rdm_cor_terms)
+        if mcor > 0:
+            # Lower-triangular indices: for K x K chol, diagonal positions are
+            # at offsets i*(i+3)//2 for i in 0..K-1 (row-major lower-tri packing).
+            diag_offsets = [i * (i + 3) // 2 for i in range(mcor)]
+            chol_disp = params[s_ch:e_ch].copy()
+            chol_se = se[s_ch:e_ch].copy()
+            chol_z = z_raw[s_ch:e_ch].copy()
+            chol_p = p_raw[s_ch:e_ch].copy()
+            for d_idx in diag_offsets:
+                if d_idx < (e_ch - s_ch):
+                    r = sd_disp[0] if "ind_sd" in pi else 1.0  # unused placeholder
+                    d_raw = params[s_ch + d_idx]
+                    d_se = se[s_ch + d_idx]
+                    d_disp, d_se_disp = _exp_display(d_raw, d_se)
+                    chol_disp[d_idx] = d_disp
+                    chol_se[d_idx] = d_se_disp
+                    chol_z[d_idx] = d_disp / d_se_disp if (np.isfinite(d_se_disp) and d_se_disp > 1e-12) else np.nan
+                    chol_p[d_idx] = 2*(1-scipy_stats.norm.cdf(abs(chol_z[d_idx]))) if np.isfinite(chol_z[d_idx]) else np.nan
+            est[s_ch:e_ch] = chol_disp
+            se_disp[s_ch:e_ch] = chol_se
+            z_disp[s_ch:e_ch] = chol_z
+            p_disp[s_ch:e_ch] = chol_p
+
     if spec.model == "nb" and "dispersion" in pi:
         dpos = pi["dispersion"]
+        dpos = dpos[0] if isinstance(dpos, (tuple, list)) else int(dpos)
+        d_raw = params[dpos]
+        d_se = se[dpos]
+        d_disp, d_se_disp = _disp_display(d_raw, d_se)
+        est[dpos] = d_disp
+        se_disp[dpos] = d_se_disp
+        z_disp[dpos] = d_disp / d_se_disp if (np.isfinite(d_se_disp) and d_se_disp > 1e-12) else np.nan
+        p_disp[dpos] = 2*(1-scipy_stats.norm.cdf(abs(z_disp[dpos]))) if np.isfinite(z_disp[dpos]) else np.nan
+
+    # Build full ordered name vector aligned to param layout:
+    # [fixed(active)..., ind_mean..., cor_mean..., ind_sd..., chol..., dispersion]
+    names_full = names[:1] + [_V(f) for f in active_feats] + rdm_mean_names + rdm_sd_names + chol_names
+    if spec.model == "nb" and "dispersion" in pi:
+        dpos = pi["dispersion"]
+        dpos = dpos[0] if isinstance(dpos, (tuple, list)) else int(dpos)
         for j in range(len(names_full), dpos):
             names_full.append(f"param{j}")
-        names_full.append("ln(overdispersion)")
+        names_full.append("alpha")  # displayed scale alpha, not ln(alpha)
     # dedupe safety: clip to K
     if len(names_full) < K:
         names_full += [f"param{i}" for i in range(len(names_full), K)]
     names_full = names_full[:K]
-
-    est = params[:K].copy()
-    if "ind_sd" in pi:
-        est[pi["ind_sd"][0]:pi["ind_sd"][1]] = sd_reported
 
     # IRR = exp(beta) is only meaningful for mean-type parameters (intercept,
     # fixed effects, random-parameter means). SD / Cholesky / dispersion rows
@@ -368,7 +476,7 @@ def fit_model(df, features, y_col, offset_col, dispersion=1, label="", verbose=F
     # transformed-SD row showed Estimate=+0.268 next to IRR=0.307 (exp of the
     # raw log-scale parameter, not of the displayed estimate).
     irr = np.full(K, np.nan)
-    mean_pos = list(range(0, len(features) + 1))
+    mean_pos = list(range(0, len(active_feats) + 1))
     if "ind_mean" in pi:
         mean_pos += list(range(pi["ind_mean"][0], pi["ind_mean"][1]))
     if "cor_mean" in pi:
@@ -376,8 +484,8 @@ def fit_model(df, features, y_col, offset_col, dispersion=1, label="", verbose=F
     irr[mean_pos] = np.exp(params[mean_pos])
 
     coef_tbl = pd.DataFrame({
-        "Variable": names_full, "Estimate": est, "Std.Err": se[:K],
-        "z": z[:K], "p": p[:K], "IRR": irr,
+        "Variable": names_full, "Estimate": est, "Std.Err": se_disp,
+        "z": z_disp, "p": p_disp, "IRR": irr,
     })
 
     return {"label": label, "ll": ll, "aic": aic, "bic": bic, "k": k, "n": n,
@@ -385,7 +493,116 @@ def fit_model(df, features, y_col, offset_col, dispersion=1, label="", verbose=F
             "se": se, "features": features, "y_col": y_col, "scaler": scaler,
             "rdm_terms": rdm_terms or [], "rdm_cor_terms": rdm_cor_terms or [],
             "_spec": spec, "_pi": pi,
-            "alpha": float(np.exp(params[-1])) if spec.model == "nb" and "dispersion" in pi else np.nan}
+            "alpha": float(est[dpos]) if spec.model == "nb" and "dispersion" in pi else np.nan}
+
+
+def stepwise_rp_search(df, features, y_col, offset_col, dispersion=1,
+                        rdm_candidates=None, rdm_cor_candidates=None,
+                        draws_R=500, label="", verbose=True,
+                        sd_p_threshold=0.10, bic_improvement_tol=0.0):
+    """Forward stepwise one-RP-at-a-time search for random parameters.
+
+    Starts from the fixed-only model, then iteratively adds one random
+    parameter (independent or correlated) at a time, keeping the addition
+    if the SD is significant (p < sd_p_threshold) and BIC improves.
+    The search alternates passes over independent and correlated candidates
+    until no further additions pass the gate.
+
+    Multi-start L-BFGS-B with R=500+ draws is used at each step.
+    Hetro-helpers (if any) are centred/orthogonalised against the fixed block.
+    Dispersion (α) is estimated jointly at each step but the search uses
+    warm starts from the previous best model, avoiding simultaneous cold-start
+    of α + full RP block.
+    """
+    from nearmiss_hb_analysis import fit_model
+
+    # Base fixed-only fit
+    if verbose:
+        print(f"[{label}] Stepwise RP search: fitting fixed-only base...")
+    m_fixed = fit_model(df, features, y_col, offset_col, dispersion=dispersion,
+                        label=f"{label}-fixed", draws_R=draws_R)
+    if verbose:
+        print(f"  fixed BIC={m_fixed['bic']:.2f}, alpha={m_fixed.get('alpha', np.nan):.4f}")
+
+    current_spec = {"rdm": [], "rdm_cor": []}
+    current_bic = m_fixed["bic"]
+    improved = True
+    iteration = 0
+
+    # Combine candidates: list of (term_string, is_correlated)
+    ind_cands = [(t, False) for t in (rdm_candidates or [])]
+    cor_cands = [(t, True) for t in (rdm_cor_candidates or [])]
+    all_cands = ind_cands + cor_cands
+
+    while improved and iteration < 20:
+        improved = False
+        iteration += 1
+        if verbose:
+            print(f"  Pass {iteration}: testing {len(all_cands)} candidates...")
+
+        best_delta_bic = 0.0
+        best_cand = None
+        best_fit = None
+
+        for term, is_cor in all_cands:
+            if term in current_spec["rdm"] or term in current_spec["rdm_cor"]:
+                continue
+            # Test adding this one RP
+            test_rdm = current_spec["rdm"] + ([term] if not is_cor else [])
+            test_rdm_cor = current_spec["rdm_cor"] + ([term] if is_cor else [])
+
+            if verbose:
+                print(f"    testing {term} ({'cor' if is_cor else 'ind'})...", end=" ")
+            m = fit_model(df, features, y_col, offset_col, dispersion=dispersion,
+                          label=f"{label}-test-{term}", rdm_terms=test_rdm,
+                          rdm_cor_terms=test_rdm_cor, draws_R=draws_R)
+
+            if not m["converged"]:
+                if verbose:
+                    print("FAILED convergence")
+                continue
+
+            # Gate: SD p-value < threshold AND BIC improvement
+            ct = m["coef_table"]
+            sd_rows = ct[ct["Variable"].str.startswith("RND sd(")]
+            if len(sd_rows) == 0:
+                sd_rows = ct[ct["Variable"].str.contains("sd", case=False)
+                             & ~ct["Variable"].isin(["(Intercept)", "alpha"])]
+            ok_sd = bool((sd_rows["p"] < sd_p_threshold).all()) if len(sd_rows) else False
+            delta_bic = current_bic - m["bic"]  # positive = improvement
+
+            if verbose:
+                print(f"BICΔ={delta_bic:.2f}, ok_sd={ok_sd}")
+
+            if ok_sd and delta_bic > bic_improvement_tol and delta_bic > best_delta_bic:
+                best_delta_bic = delta_bic
+                best_cand = (term, is_cor)
+                best_fit = m
+
+        if best_cand:
+            term, is_cor = best_cand
+            if verbose:
+                print(f"  ACCEPTED {term} ({'cor' if is_cor else 'ind'}), ΔBIC={best_delta_bic:.2f}")
+            if is_cor:
+                current_spec["rdm_cor"].append(term)
+            else:
+                current_spec["rdm"].append(term)
+            current_bic = best_fit["bic"]
+            improved = True
+        else:
+            if verbose:
+                print("  No further improvements")
+
+    if verbose:
+        print(f"  Final spec: rdm={current_spec['rdm']}, rdm_cor={current_spec['rdm_cor']}")
+        print(f"  Final BIC={current_bic:.2f}")
+
+    # Refit final with free dispersion (already free in each step; this is just
+    # a clean refit from scratch with the final spec)
+    m_final = fit_model(df, features, y_col, offset_col, dispersion=dispersion,
+                        label=f"{label}-final", rdm_terms=current_spec["rdm"],
+                        rdm_cor_terms=current_spec["rdm_cor"], draws_R=draws_R)
+    return m_final, current_spec
 
 
 # ===================================================================
@@ -884,9 +1101,16 @@ def _rebuild_mu(df_sub, model):
     if model.get("rdm_terms") or model.get("rdm_cor_terms"):
         pi = model["_pi"]
         Kf = pi["fixed"][1]
-        eta = params[0] + X_std @ params[1:Kf] + df_sub["log_len"].values
+        # fixed block holds active (non-random) vars only: subset X to match
+        rdm_b = {t.split(":")[0] for t in (model.get("rdm_terms") or [])
+                 + (model.get("rdm_cor_terms") or [])}
+        act = [f for f in feats if f not in rdm_b]
+        Xa = X_std[:, [feats.index(f) for f in act]] if act else np.zeros((len(df_sub), 0))
+        eta = params[0] + (Xa @ params[1:Kf] if act else 0.0) + df_sub["log_len"].values
         mu = np.exp(np.clip(eta, -20, 20))
-        alpha = float(np.exp(params[pi["dispersion"]])) if "dispersion" in pi else 0.0
+        dpos = pi["dispersion"]
+        dpos = dpos[0] if isinstance(dpos, (tuple, list)) else int(dpos)
+        alpha = float(np.exp(params[dpos])) if "dispersion" in pi else 0.0
         return mu, alpha
     eta    = params[0] + X_std @ params[1:len(feats) + 1] + df_sub["log_len"].values
     mu     = np.exp(np.clip(eta, -20, 20))
@@ -1320,7 +1544,7 @@ def _apply_model_ll(df_sub, model):
     """Log-likelihood of df_sub under a fitted source model (transfer evaluation).
 
     Standardizes features with the source model's scaler and evaluates the NB
-    negative log-likelihood using the source model's parameters â€” the core of
+    negative log-likelihood using the source model's parameters — the core of
     any transferability index. Random terms of the source model are preserved
     so the parameter vector aligns with the spec used at fit time.
     """
@@ -1344,12 +1568,16 @@ def _apply_model_ll(df_sub, model):
     rdm = _remap(model.get("rdm_terms"))
     rdm_cor = _remap(model.get("rdm_cor_terms"))
 
+    # Random parameters replace fixed effects
+    rdm_bases = {t.split(":")[0] for t in (model.get("rdm_terms") or []) + (model.get("rdm_cor_terms") or [])}
+    fstd_active = [col2f[f] for f in feats if f not in rdm_bases]
+
     d["_id"] = np.arange(len(d))
     d["_off"] = d["log_len"].values
     manual_spec = {
-        "fixed_terms": fstd, "rdm_terms": rdm, "rdm_cor_terms": rdm_cor,
+        "fixed_terms": fstd_active, "rdm_terms": rdm, "rdm_cor_terms": rdm_cor,
         "grouped_terms": [], "hetro_in_means": [],
-        "transformations": ["no"] * len(fstd),
+        "transformations": ["no"] * len(fstd_active),
         "dispersion": 1, "latent_classes": 1,
     }
     data, spec = build_model_from_manual_spec(

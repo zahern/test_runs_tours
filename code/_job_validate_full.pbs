@@ -1,0 +1,16 @@
+#!/bin/bash -l
+#PBS -N val_full_safety
+#PBS -P FPAXJW8067
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=8:mem=96GB
+#PBS -j oe
+#PBS -m n
+cd $PBS_O_WORKDIR
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+conda activate zigenv
+export PIPELINE_SKIMS_PATH=../demand_/skims_371.omx
+export JAX_PLATFORMS=cpu
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+echo "[$(date)] start"
+python -u validate_safety_arms.py --run-dir runs/safety_baseline__27016405.aqua --out runs/safety_validation_full --split random --frac 0.30 --segments edu,nonmand --skims ../demand_/skims_371.omx
+echo "[$(date)] exit=$?"

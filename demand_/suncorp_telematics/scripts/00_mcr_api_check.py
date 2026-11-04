@@ -9,9 +9,9 @@ try:
 except PackageNotFoundError as exc:
     raise SystemExit("metacountregressor must be installed from PyPI") from exc
 version_tuple = tuple(int(part) for part in distribution_version.split(".")[:3])
-if version_tuple < (1, 0, 159):
+if version_tuple < (1, 0, 188):
     raise SystemExit(
-        f"metacountregressor {distribution_version} is older than PyPI floor 1.0.159"
+        f"metacountregressor {distribution_version} is older than PyPI floor 1.0.188"
     )
 print("distribution version:", distribution_version)
 print("module version:", getattr(mcr, "__version__", "?"))

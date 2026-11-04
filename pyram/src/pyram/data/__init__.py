@@ -504,17 +504,36 @@ def build_synthetic_population(
         expansion_factor = target_population / current_pop
         persons["expansion_factor"] = expansion_factor
     
-    # Expand persons
-    expanded_rows = []
-    for _, person in persons.iterrows():
-        n_copies = max(1, int(round(person["expansion_factor"])))
-        for i in range(n_copies):
-            p = person.copy()
-            p["person_id"] = f"{person['person_id']}_exp{i}"
-            expanded_rows.append(p)
-    
-    synth = pd.DataFrame(expanded_rows)
-    
+    # Expand persons. Repeat the row block by its expansion factor instead of
+    # copying one Series per expanded person: the per-row form builds millions of
+    # mixed-dtype objects, which is the second largest allocation in the pipeline
+    # after the destination alternative tables.
+    factors = (
+        pd.to_numeric(persons["expansion_factor"], errors="coerce")
+        .fillna(1.0)
+        .round()
+        .clip(lower=1)
+        .astype(np.int64)
+        .to_numpy()
+    )
+    total = int(factors.sum())
+    if target_population > 0 and total > 2 * target_population:
+        # Scale before allocating: the trim below would otherwise build a
+        # population several times the size it keeps.
+        factors = np.maximum(
+            1, np.round(factors * (target_population / total)).astype(np.int64)
+        )
+
+    positions = np.repeat(np.arange(len(persons)), factors)
+    synth = persons.iloc[positions].reset_index(drop=True)
+    if len(synth):
+        # within-person copy ordinal: 0, 1, ... n_copies - 1
+        starts = np.repeat(np.cumsum(factors) - factors, factors)
+        copies = np.arange(len(positions), dtype=np.int64) - starts
+        synth["person_id"] = (
+            synth["person_id"].astype(str).to_numpy() + "_exp" + copies.astype(str)
+        )
+
     # Trim to target if overshot
     if len(synth) > target_population:
         synth = synth.sample(n=target_population, random_state=seed).reset_index(drop=True)

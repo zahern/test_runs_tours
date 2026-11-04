@@ -4,7 +4,8 @@ stage3_activity_duration.py
 Stage 3 of the activity-based model pipeline.
 
 Predicts the DURATION (minutes) of each individual activity for every
-person, constrained so durations sum to the day budget B from Stage 2.
+person, constrained so durations fit both the day budget B and the day window
+[start_of_day, end_of_day] predicted by Stage 2.
 
 Pipeline position
 -----------------
@@ -19,11 +20,13 @@ Model structure
 ---------------
     For each purpose a budget-constrained lognormal is fitted:
         log(duration_i) ~ N(X_i @ beta, sigma^2)
-    subject to: sum(duration_i for person p) <= B_p
+    subject to: sum(duration_i for person p) <= min(B_p, day-window room)
 
     Estimation uses the tour_duration_model.py approach (already built).
     Prediction expands each person into one row per activity, runs the
-    lognormal mean, then rescales so the person's total equals B.
+    lognormal draw, then reconciles the person's total with the smaller of B
+    and the time their predicted day window leaves for activities
+    (window minus one placement travel allowance per activity).
 
 Outputs per person
 ------------------
@@ -118,22 +121,14 @@ ACTIVITY_COLS = [f'n_{p}_out' for p in PURPOSES]
 
 # Valid person types per purpose — mirrors Stage 1 VALID_PTYPES_FOR_PURPOSE.
 # Preschool excluded from work; school-age children excluded from adult-only purposes.
-VALID_PTYPES_FOR_DURATION: dict = {
-    'work':     {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent'},
-    'edu':      {'SchoolChild', 'UniversityStudent', 'WorkingStudent', 'Preschool'},
-    'escort':   {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
-                 'UniversityStudent', 'Retired', 'NonWorker'},
-    'shopping': {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
-                 'UniversityStudent', 'Retired', 'NonWorker'},
-    'social':   {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
-                 'UniversityStudent', 'Retired', 'NonWorker'},
-    'othmaint': {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
-                 'UniversityStudent', 'Retired', 'NonWorker'},
-    'othdiscr': {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
-                 'UniversityStudent', 'Retired', 'NonWorker'},
-    'eat':      {'FullTimeWorker', 'PartTimeWorker', 'WorkingStudent',
-                 'UniversityStudent', 'SchoolChild', 'Retired', 'NonWorker'},
-}
+# NOTE: no per-purpose ptype whitelist any more.  Each purpose's duration
+# model used to be fitted only on a hand-listed set of person types, but every
+# activity the pipeline predicts (Stage 1 draws shopping for a child as
+# readily as for a retiree) has to be covered.  Fitting on a truncated
+# population made the model reproduce that population's mean and then
+# undershoot every episode outside it — shopping by ~60%, escort/social/
+# othmaint/eat by ~45% in sample.  Person type enters as a dummy instead, so
+# sub-population differences are estimated rather than assumed away.
 
 # Duration floors / ceilings per purpose (minutes).
 # Upper bounds are SOFT — the model can predict above them (lognormal tail),
@@ -158,6 +153,139 @@ COEF_CLIP_LO = -20.0
 COEF_CLIP_HI = 20.0
 INTERCEPT_CLIP_LO = -1000.0
 INTERCEPT_CLIP_HI = 1000.0
+
+
+# =============================================================================
+# EXPECTED COEFFICIENT SIGNS (behavioural priors for duration models)
+# =============================================================================
+# Positive coefficient = LONGER predicted duration (AFT-lognormal: eta enters
+# log(duration) additively, and z-score standardisation never flips a sign).
+# Convention mirrors stage5 _check_behavioural_signs: each entry is
+#   feature -> (op, purposes-or-None, note)
+# with purposes None = applies to every purpose. ONLY features with a solid
+# behavioural prior are listed — everything else is still REPORTED by
+# check_stage3_signs (pass=None) but never penalised. Deliberately excluded:
+#   start_hr / log_dist (commute-vs-duration is confounded: full-timers both
+#     travel farther and work longer — no clean prior), income / vehicle /
+#     licence / gender / accessibility / industry / WFHDAY / mandatory_role /
+#     *_out counts (ambiguous or purpose-dependent directions).
+EXPECTED_S3_SIGNS = {
+    'B':                      ('>', None, 'Larger day time-budget funds longer spells'),
+    'budget_per_activity_hr': ('>', None, 'Larger per-activity budget funds longer spells'),
+    'day_span_hr':            ('>', None, 'Wider awake span accommodates longer spells'),
+    'n_mandatory':            ('<', None, 'Conditional on B: more mandatory acts dilute each spell'),
+    'n_discretionary':        ('<', None, 'Conditional on B: more discretionary acts dilute each spell'),
+    'ptype_FullTimeWorker':   ('>', ('work',), 'Full-timers work longer spells'),
+    'workstat_parttime':      ('<', ('work',), 'Part-time flag shortens work spells'),
+    'age_retired':            ('<', ('work',), 'Working retirees do shorter spells'),
+}
+
+
+def s3_sign_violations(feats, coef, purpose: str) -> int:
+    """Count fitted coefficients violating EXPECTED_S3_SIGNS for a purpose.
+
+    feats/coef align positionally (BudgetLognormal.coef_ order). NaN
+    coefficients are not counted (unidentified, not wrong-signed).
+    """
+    n_viol = 0
+    coef = np.asarray(coef, dtype=float).ravel()
+    for i, f in enumerate(feats):
+        spec = EXPECTED_S3_SIGNS.get(str(f))
+        if spec is None or i >= len(coef):
+            continue
+        op, scopes, _note = spec
+        if scopes is not None and purpose not in scopes:
+            continue
+        v = float(coef[i])
+        if not np.isfinite(v):
+            continue
+        if op == '>' and v <= 0:
+            n_viol += 1
+        elif op == '<' and v >= 0:
+            n_viol += 1
+    return int(n_viol)
+
+
+def check_stage3_signs(coef_by_purpose: dict) -> list:
+    """Audit fitted duration coefficients against EXPECTED_S3_SIGNS.
+
+    coef_by_purpose: {purpose: {feature: value}}. Returns rows with keys
+    purpose/parameter/value/expected/pass/note — pass None means "no prior
+    asserted" (reported, never penalised). Mirrors the stage-5 sign table.
+    """
+    rows = []
+    for purpose, coefs in (coef_by_purpose or {}).items():
+        for feat, val in (coefs or {}).items():
+            spec = EXPECTED_S3_SIGNS.get(str(feat))
+            try:
+                v = float(val)
+            except Exception:
+                v = float('nan')
+            if spec is None:
+                rows.append({'purpose': purpose, 'parameter': str(feat),
+                             'value': v, 'expected': 'no prior',
+                             'pass': None, 'note': 'reported only'})
+                continue
+            op, scopes, note = spec
+            if scopes is not None and purpose not in scopes:
+                rows.append({'purpose': purpose, 'parameter': str(feat),
+                             'value': v, 'expected': 'no prior (out of scope)',
+                             'pass': None, 'note': note})
+                continue
+            if not np.isfinite(v):
+                ok = None
+            elif op == '>':
+                ok = bool(v > 0)
+            else:
+                ok = bool(v < 0)
+            rows.append({'purpose': purpose, 'parameter': str(feat),
+                         'value': v, 'expected': f'{op} 0',
+                         'pass': ok, 'note': note})
+    return rows
+
+
+def attach_stage3_sign_audits(models: dict) -> int:
+    """Attach per-purpose sign audits to final estimate_duration_models output.
+
+    models: {purpose: {'model': BudgetLognormal, 'features': [...]}}. Adds a
+    'sign_audit' row-list per purpose and logs violations loudly. Never
+    raises (audits must not break estimation). Returns total violations.
+    """
+    total = 0
+    try:
+        for purpose, entry in (models or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            mdl = entry.get('model')
+            feats = entry.get('features') or getattr(mdl, 'feature_names_', None) or []
+            coef = getattr(mdl, 'coef_', None)
+            if coef is None or feats is None:
+                entry['sign_audit'] = [{'purpose': purpose, 'parameter': '(model)',
+                                        'value': float('nan'), 'expected': 'n/a',
+                                        'pass': None,
+                                        'note': 'no coef_ available for audit'}]
+                continue
+            coef = np.asarray(coef, dtype=float).ravel()
+            cmap = {str(f): (float(coef[i]) if i < len(coef) else float('nan'))
+                    for i, f in enumerate(feats)}
+            rows = check_stage3_signs({purpose: cmap})
+            entry['sign_audit'] = rows
+            nv = sum(1 for r in rows if r['pass'] is False)
+            total += nv
+            if nv:
+                bad = ', '.join(f"{r['parameter']}={r['value']:.3f} "
+                                f"(expected {r['expected']})"
+                                for r in rows if r['pass'] is False)
+                logger.warning(f"[{purpose}] {nv} sign violation(s): {bad}")
+        if total:
+            logger.warning(f"Stage 3 sign audit: {total} violation(s) across "
+                           f"{len(models)} purposes — see per-model sign_audit")
+        else:
+            logger.info("Stage 3 sign audit: no violations across "
+                        f"{len(models)} purposes")
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning(f"Stage 3 sign audit failed (non-fatal): {e}")
+    return int(total)
 
 PERSON_FEATURES = ['sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING', 'incp']
 
@@ -237,29 +365,150 @@ def _apply_quantile_profile(values: np.ndarray, profile: dict) -> np.ndarray:
 # ordinal proxy. Prefer a real distance column; otherwise emit an explicit
 # zero (no distance signal) with a loud warning instead of ID arithmetic.
 _DISTANCE_CANDIDATES = (
-    'tour_distance', 'DIST', 'dist', 'distance_km', 'TRIPDIST',
-    'trip_distance',
+    'tour_distance', 'tour_distance_km', 'DIST', 'dist', 'dist_km',
+    'distance_km', 'distance', 'TRIPDIST', 'TRIPDIST_KM', 'trip_distance',
+    'trip_dist_km', 'od_dist', 'od_dist_km', 'skim_dist',
+    # skim-merged auto distance (present when trips carry the OD skim columns)
+    'SOVTOLL_DIST__AM',
 )
 
 _logged_stage3_warnings: set = set()
 
+# ── OD distance lookup from the configured skim ────────────────────────────
+# The HHTS extract carries no distance column. Rather than fall back to a
+# zero signal (or, worse, abs(DTAZ-OTAZ) zone-ID arithmetic), derive the trip
+# distance by joining each origin→destination pair to the auto road-distance
+# matrix (SOVTOLL_DIST / DIST) of the active 371 OD skim. Key-space safe: the
+# lookup is only used when a meaningful share of rows actually match, so a
+# different zone system (SA2 vs ORDER) degrades to the 0-fallback + warning
+# instead of silently returning garbage.
+_OD_DIST_CACHE = None
+_OD_DIST_SIGNATURE = None
 
-def _resolve_log_dist(df: pd.DataFrame) -> pd.Series:
-    """log1p distance for duration features, estimation/prediction-safe.
 
-    Uses the first real distance column present in the frame. Falls back to
-    0.0 with a one-time warning when no distance column exists — never
-    `abs(DTAZ - OTAZ)`.
+def od_distance_lookup(skim_df: Optional[pd.DataFrame] = None):
+    """Return {(otaz, dtaz): dist_km} for the active OD skim (cached), or None.
+
+    Pass ``skim_df`` (a flat OTAZ/DTAZ/…/DIST frame) to build the lookup from
+    an in-memory skim; otherwise the path in STAGE3_SKIMS_PATH /
+    PIPELINE_SKIMS_PATH (or ../demand_/skims_371.omx) is read via read_skims.
+    """
+    global _OD_DIST_CACHE, _OD_DIST_SIGNATURE
+
+    def _build(frame):
+        _dcol = next((c for c in ('DIST', 'SOVTOLL_DIST__AM', 'SOVTOLL_DIST__PM',
+                                  'SOVTOLL_DIST__MD', 'SOVTOLL_DIST__EA',
+                                  'SOVTOLL_DIST__EV')
+                      if c in frame.columns), None)
+        if _dcol is None or 'OTAZ' not in frame.columns or 'DTAZ' not in frame.columns:
+            return None
+        _o = pd.to_numeric(frame['OTAZ'], errors='coerce')
+        _d = pd.to_numeric(frame['DTAZ'], errors='coerce')
+        _v = pd.to_numeric(frame[_dcol], errors='coerce')
+        _m = _o.notna() & _d.notna() & _v.notna()
+        return {(int(a), int(b)): float(c)
+                for a, b, c in zip(_o[_m], _d[_m], _v[_m])}
+
+    if skim_df is not None:
+        try:
+            _lk = _build(skim_df)
+            if _lk:
+                logger.info(f"stage3: OD distance lookup from supplied skim_df "
+                            f"({len(_lk):,} OD pairs)")
+                return _lk
+        except Exception as _e:
+            logger.debug(f"stage3: OD distance lookup from skim_df skipped ({_e!r})")
+        return None
+
+    if _OD_DIST_CACHE is not None:
+        return _OD_DIST_CACHE or None
+    _OD_DIST_CACHE = {}
+    try:
+        _p = (os.environ.get('STAGE3_SKIMS_PATH')
+              or os.environ.get('PIPELINE_SKIMS_PATH') or '').strip()
+        if not _p:
+            _here = os.path.dirname(os.path.abspath(__file__))
+            _cand = os.path.normpath(os.path.join(_here, '..', 'demand_', 'skims_371.omx'))
+            _p = _cand if os.path.isfile(_cand) else ''
+        if _p and os.path.isfile(_p):
+            import read_skims as _rs
+            _df = _rs.read_omx_skims(_p, matrices='all', add_derived=False)
+            _lk = _build(_df)
+            if _lk:
+                _OD_DIST_CACHE = _lk
+                logger.info(f"stage3: OD distance lookup built from "
+                            f"{os.path.basename(_p)} ({len(_lk):,} OD pairs)")
+            else:
+                logger.warning(f"stage3: skim '{os.path.basename(_p)}' has no "
+                               f"DIST/SOVTOLL_DIST column — log_dist stays 0")
+        else:
+            logger.info("stage3: no OD skim configured (PIPELINE_SKIMS_PATH) — "
+                        "log_dist falls back to 0")
+    except Exception as _e:
+        logger.warning(f"stage3: OD distance lookup unavailable ({_e!r}) — "
+                       f"log_dist falls back to 0")
+    return _OD_DIST_CACHE or None
+
+
+# Origin/destination zone columns to try (first present wins).
+_OD_ORIG_COLS = ('OTAZ', 'tour_origin', 'ORIGSA2_2021', 'origin', 'from_zone')
+_OD_DEST_COLS = ('DTAZ', 'tour_destination', 'DESTSA2_2021', 'destination', 'to_zone')
+
+
+def _resolve_log_dist(df: pd.DataFrame, skim_df: Optional[pd.DataFrame] = None) -> pd.Series:
+    """log1p distance (km) for duration features, estimation/prediction-safe.
+
+    Priority:
+      1. a real distance column already on the frame (_DISTANCE_CANDIDATES);
+      2. OTAZ→DTAZ joined to the active OD skim's DIST matrix;
+      3. explicit 0.0 with a one-time warning.
+
+    Never ``abs(DTAZ - OTAZ)`` (zone IDs are not distances).
     """
     for col in _DISTANCE_CANDIDATES:
         if col in df.columns:
             vals = pd.to_numeric(df[col], errors='coerce').fillna(0.0).clip(lower=0.0)
             return np.log1p(vals)
+
+    # ── derive from the OD skim (origin→destination road distance) ────────
+    try:
+        _lk = od_distance_lookup(skim_df)
+        if _lk:
+            _o = next((c for c in _OD_ORIG_COLS if c in df.columns), None)
+            _d = next((c for c in _OD_DEST_COLS if c in df.columns), None)
+            if _o and _d:
+                _oi = pd.to_numeric(df[_o], errors='coerce')
+                _di = pd.to_numeric(df[_d], errors='coerce')
+                _dist = pd.Series(
+                    [(_lk.get((int(a), int(b)), np.nan))
+                     if (pd.notna(a) and pd.notna(b)) else np.nan
+                     for a, b in zip(_oi, _di)],
+                    index=df.index, dtype='float64')
+                _hit = float(_dist.notna().mean()) if len(_dist) else 0.0
+                if _hit > 0.05:
+                    _med = float(_dist.median()) if _dist.notna().any() else 0.0
+                    _dist = _dist.fillna(_med).clip(lower=0.0)
+                    if 'stage3_log_dist' not in _logged_stage3_warnings:
+                        _logged_stage3_warnings.add('stage3_log_dist')
+                        logger.info(
+                            f"prepare_duration_data: log_dist derived from OD skim "
+                            f"({_hit:.0%} of {len(_dist):,} rows matched on {_o}->{_d}; "
+                            f"unmatched filled with median {_med:.1f} km)")
+                    return np.log1p(_dist)
+                if 'stage3_log_dist_keyspace' not in _logged_stage3_warnings:
+                    _logged_stage3_warnings.add('stage3_log_dist_keyspace')
+                    logger.warning(
+                        f"prepare_duration_data: OD-skim distance lookup matched only "
+                        f"{_hit:.1%} of rows on {_o}->{_d} (key-space mismatch: frame "
+                        f"zones vs skim OTAZ/DTAZ) — log_dist stays 0")
+    except Exception as _e:
+        logger.debug(f"stage3 log_dist OD lookup skipped ({_e!r})")
+
     if 'stage3_log_dist' not in _logged_stage3_warnings:
         _logged_stage3_warnings.add('stage3_log_dist')
         logger.warning(
-            "prepare_duration_data: no distance column %s — log_dist=0 "
-            "(zone-ID differencing disabled as invalid)",
+            "prepare_duration_data: no distance column %s and no usable OD skim — "
+            "log_dist=0 (zone-ID differencing disabled as invalid).",
             list(_DISTANCE_CANDIDATES),
         )
     return pd.Series(0.0, index=df.index)
@@ -273,6 +522,7 @@ def prepare_duration_data(
     tours: pd.DataFrame,
     persons: pd.DataFrame,
     trips: Optional[pd.DataFrame] = None,
+    skim_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Build activity-level estimation dataset with purpose, duration,
@@ -286,6 +536,10 @@ def prepare_duration_data(
 
     Each row = one activity instance.
     Duration = time spent at the activity destination (minutes).
+
+    ``skim_df`` (optional): a flat OTAZ/DTAZ/…/DIST frame used to derive
+    ``log_dist`` from the OD skim when the frame carries no distance column.
+    When omitted, the active skim is read from PIPELINE_SKIMS_PATH.
     """
     # ── person attributes ──────────────────────────────────────────
     pers = persons.copy()
@@ -391,7 +645,7 @@ def prepare_duration_data(
                     df[col] = 0
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
             # Never abs(DTAZ - OTAZ): zone IDs are not distances.
-            df['log_dist'] = _resolve_log_dist(df)
+            df['log_dist'] = _resolve_log_dist(df, skim_df=skim_df)
 
             # start hour
             st_col = next((c for c in ['STARTIME', 'start_time', 'depart']
@@ -450,8 +704,9 @@ def prepare_duration_data(
         orig = df.get('tour_origin', pd.Series(0, index=df.index)).fillna(0)
         dest = df.get('tour_destination', pd.Series(0, index=df.index)).fillna(0)
         # tour_origin/_destination are zone IDs, not coordinates — a real
-        # distance column (e.g. tour_distance) is used when present.
-        df['log_dist'] = _resolve_log_dist(df)
+        # distance column (e.g. tour_distance) is used when present, else the
+        # OD skim's OTAZ->DTAZ DIST is joined in.
+        df['log_dist'] = _resolve_log_dist(df, skim_df=skim_df)
         df['start_hr'] = df.get('start_time', pd.Series(480, index=df.index)) / 60
 
         # The tours table carries PER-ROW n_*_out flags; the person-level
@@ -957,15 +1212,69 @@ def _feature_cols(df: pd.DataFrame, ptypes: list,
 def _feature_cols_for_purpose(df: pd.DataFrame, ptypes: list, purpose: str,
                               feature_override=None) -> list:
     person_feats = _duration_person_features(df, purpose, feature_override)
-    # Restrict ptype dummies to ptypes valid for this purpose
-    _valid_set = VALID_PTYPES_FOR_DURATION.get(purpose)
-    _ptypes_for_purpose = [pt for pt in ptypes if _valid_set is None or pt in _valid_set]
     base = (['start_hr', 'log_dist', 'B', 'budget_per_activity_hr', 'day_span_hr',
              'n_mandatory', 'n_discretionary'] +
             ACTIVITY_COLS +
             [c for c in person_feats if c in df.columns] +
-            [f'ptype_{pt}' for pt in _ptypes_for_purpose if f'ptype_{pt}' in df.columns])
+            [f'ptype_{pt}' for pt in ptypes if f'ptype_{pt}' in df.columns])
     return list(dict.fromkeys([c for c in base if c in df.columns]))
+
+
+def duration_design_matrix(
+    frame: pd.DataFrame,
+    features: list,
+    model,
+    label: str = '',
+    log_missing: bool = True,
+) -> tuple:
+    """Build a duration model's design matrix in the fitted column order.
+
+    A fitted feature the frame does not carry is filled with the model's
+    TRAINING MEAN, not zero.  The model is fitted on z-scored columns, so a
+    raw zero is not a neutral value: ``walk_acc`` has mean 5.17 and sd 0.53,
+    so zero-filling it is a z of -9.7 and swung the shopping mean from the
+    fitted 58 min to 11 min — a fifth of the observed length.  Filling with
+    the mean puts an absent column at z = 0 (the average person), which
+    leaves the prediction at the specification's own baseline instead of
+    inventing an extreme covariate value.
+
+    The exception is a person-type dummy (``ptype_*``): if the frame has no
+    such person type, the indicator is genuinely 0 and filling it with the
+    training proportion would invent a fraction of a person.
+
+    Returns ``(X, imputed)`` where ``imputed`` lists the filled features, so
+    callers can report a design matrix that is incomplete rather than let it
+    bias the fit silently.
+    """
+    features = list(features or [])
+    # The copula-hazard variant keeps its lognormal marginal in `marginal_`,
+    # so the standardisation stats live one level down there.
+    _stats = getattr(model, 'mu_', None)
+    if _stats is None:
+        _stats = getattr(getattr(model, 'marginal_', None), 'mu_', None)
+    mu = (np.asarray(_stats, dtype=float) if _stats is not None
+          else np.zeros(len(features)))
+    X = np.zeros((len(frame), len(features)), dtype=float)
+    imputed: list = []
+    for j, name in enumerate(features):
+        default = float(mu[j]) if j < len(mu) else 0.0
+        if name.startswith('ptype_'):
+            default = 0.0
+        if name in frame.columns:
+            X[:, j] = pd.to_numeric(frame[name], errors='coerce') \
+                .fillna(default).to_numpy(dtype=float)
+        else:
+            X[:, j] = default
+            imputed.append(name)
+    if imputed and log_missing:
+        logger.warning(
+            f"Stage 3 {label or 'duration'} design matrix: "
+            f"{len(imputed)}/{len(features)} fitted features absent from the "
+            f"frame ({', '.join(imputed)}) — imputed at the training mean "
+            f"(z=0), so predictions for those rows rest on the specification "
+            f"baseline."
+        )
+    return X, imputed
 
 
 def estimate_duration_models(
@@ -976,6 +1285,7 @@ def estimate_duration_models(
     use_mdcev: bool = False,
     feature_override: list = None,
     duration_model: str = None,
+    skim_df: Optional[pd.DataFrame] = None,
 ) -> dict:
     """
     Fit one BudgetLognormal per activity purpose.
@@ -989,7 +1299,8 @@ def estimate_duration_models(
                         The latter adds an order-linked discrete hazard
                         layer around the lognormal marginal.
     """
-    data    = _augment_duration_features(prepare_duration_data(tours, persons, trips=trips))
+    data    = _augment_duration_features(
+        prepare_duration_data(tours, persons, trips=trips, skim_df=skim_df))
     # ── GA dict override: recreate the engineered search-frame columns ────
     # The GA search frame (see _run_ga_stage3) carries ptype dummies,
     # is_female, income flags, mandatory_role and the _enrich_ga_data
@@ -1121,11 +1432,10 @@ def estimate_duration_models(
     for purpose in PURPOSES:
         lo, hi = DURATION_BOUNDS[purpose]
 
-        # filter to tours whose purpose matches, then to valid ptypes
+        # Fit on every observed episode of the purpose.  Person type is a
+        # feature (dummies below), not a row filter: the prediction population
+        # includes all person types, so the estimation population must too.
         subset = data[data['_purpose_coded'] == purpose].copy()
-        _valid_ptype_set = VALID_PTYPES_FOR_DURATION.get(purpose)
-        if _valid_ptype_set is not None and 'ptype' in subset.columns:
-            subset = subset[subset['ptype'].isin(_valid_ptype_set)].copy()
 
         if len(subset) < min_sample:
             logger.warning(f"  {purpose}: {len(subset)} obs < {min_sample} — skipping")
@@ -1223,6 +1533,13 @@ def estimate_duration_models(
 
     print(f"Stage 3: fitted {len(models)} duration models "
           f"({', '.join(models.keys())})")
+
+    # Behavioural sign audit on the FINAL models (paper tables must be
+    # sign-defensible; the GA penalty only steers selection, this REPORTS it).
+    try:
+        attach_stage3_sign_audits(models)
+    except Exception:
+        pass
 
     if use_mdcev and _MDCEV_AVAILABLE and not data.empty and 'person_id' in data.columns:
         try:
@@ -1324,34 +1641,73 @@ class PlanningOrderModel:
             probs = np.exp(scores)
             return probs / max(float(probs.sum()), 1e-12)
 
+    def plan_order_arrays(self, purpose_arr, duration_arr,
+                          horizon_min: float) -> np.ndarray:
+        """Step assigned to each row of ONE person's activities.
+
+        Pure numpy over the person's narrow columns: no frame copies, no
+        per-step ``.loc`` writes.  This is deliberately separate from the wide
+        activity frame, because the earlier DataFrame-based version copied,
+        sorted and dropped the full 610-column frame once per person and cost
+        320 s of the 415 s a 20k-person prediction chunk took.
+        """
+        n = int(len(purpose_arr))
+        order = np.zeros(n, dtype=np.int64)
+        if n == 0:
+            return order
+        purpose_index = {p: i for i, p in enumerate(PURPOSES)}
+        # rows of an unknown purpose are kept but never planned (step 0)
+        idx = np.array([purpose_index.get(p, -1) for p in purpose_arr],
+                       dtype=np.int64)
+        known = idx >= 0
+        counts = np.bincount(idx[known], minlength=len(PURPOSES)).astype(np.int64)
+        dur_sum = np.bincount(idx[known], weights=np.asarray(duration_arr,
+                                                             dtype=float)[known],
+                              minlength=len(PURPOSES))
+        means = dur_sum / np.maximum(counts, 1)
+        remaining = {p: int(c) for p, c in zip(PURPOSES, counts)}
+        durations = {p: float(m) for p, m in zip(PURPOSES, means)}
+        rows_by_purpose = {p: list(np.flatnonzero(idx == i))
+                           for i, p in enumerate(PURPOSES)}
+
+        for step in range(n):
+            available = np.array([remaining.get(p, 0) > 0 for p in PURPOSES],
+                                 dtype=bool)
+            if not available.any():
+                break
+            features = self._candidate_features(remaining, durations, horizon_min)
+            probs = self._probabilities(features, available)
+            probs = np.where(available & np.isfinite(probs), probs, -np.inf)
+            chosen = PURPOSES[int(np.argmax(probs))]
+            pos = rows_by_purpose[chosen].pop(0)
+            order[pos] = step
+            remaining[chosen] -= 1
+        return order
+
+    def plan_order(self, group: pd.DataFrame) -> np.ndarray:
+        """Step per row for one person's activity slice (see plan_order_arrays)."""
+        if len(group) == 0:
+            return np.zeros(0, dtype=np.int64)
+        if {'start_of_day', 'end_of_day'}.issubset(group.columns):
+            horizon = float(group['end_of_day'].iloc[0] - group['start_of_day'].iloc[0])
+        else:
+            horizon = 480.0
+        return self.plan_order_arrays(
+            group['purpose'].to_numpy(),
+            pd.to_numeric(group['predicted_duration_min'], errors='coerce')
+              .fillna(0.0).to_numpy(dtype=float),
+            horizon,
+        )
+
     def order_group(self, group: pd.DataFrame) -> pd.DataFrame:
+        """Sort one person's activities into planned order (kept for callers)."""
         out = group.copy()
         if out.empty:
             return out
-        out['_planning_order'] = -1
-        remaining = out['purpose'].value_counts().to_dict()
-        durations = out.groupby('purpose')['predicted_duration_min'].mean().to_dict()
-        horizon = float(out['end_of_day'].iloc[0] - out['start_of_day'].iloc[0]) \
-            if {'start_of_day', 'end_of_day'}.issubset(out.columns) else 480.0
-        available_rows = {p: list(out.index[out['purpose'] == p]) for p in PURPOSES}
-
-        for step in range(len(out)):
-            available = np.array([remaining.get(p, 0) > 0 for p in PURPOSES], dtype=bool)
-            if not available.any():
-                break
-            features = self._candidate_features(remaining, durations, horizon)
-            probs = self._probabilities(features, available)
-            probs = np.where(available & np.isfinite(probs), probs, -np.inf)
-            chosen_idx = int(np.argmax(probs))
-            chosen_purpose = PURPOSES[chosen_idx]
-            row_idx = available_rows[chosen_purpose].pop(0)
-            out.loc[row_idx, '_planning_order'] = step
-            remaining[chosen_purpose] -= 1
-
-        out['planning_order'] = out['_planning_order'].clip(lower=0).astype(int)
+        out['planning_order'] = self.plan_order(out)
         out = out.sort_values('planning_order', kind='stable')
         out['activity_seq'] = np.arange(len(out), dtype=int)
-        return out.drop(columns=['_planning_order'], errors='ignore')
+        return out
 
 
 def _planning_purpose_column(data: pd.DataFrame) -> Optional[str]:
@@ -1446,7 +1802,20 @@ def estimate_planning_order_model(data: pd.DataFrame, max_obs: int = 50000):
             if np.isfinite(getattr(rrm, 'loglik', np.nan)):
                 model.rrm = rrm
                 model.estimator = 'searchlibrium_rrm'
-                logger.info(f'  planning/order: fitted SearchLibrium RRM on {len(choices)} choices')
+                # maxiter=300 can cut the fit short; SearchLibrium now
+                # re-polishes and judges convergence on the gradient, so say
+                # when it did not reach a stationary point.
+                _conv = bool(getattr(rrm, 'converged', True))
+                _g = float(getattr(rrm, 'grad_norm_inf', float('nan')))
+                logger.info(
+                    f'  planning/order: fitted SearchLibrium RRM on {len(choices)} choices'
+                    f' (converged={_conv}, max|g|={_g:.1e})'
+                )
+                if not _conv:
+                    logger.warning(
+                        '  planning/order: RRM stopped short of a stationary point: '
+                        f'{getattr(rrm, "fit_message", "")}'
+                    )
         except Exception as exc:
             logger.warning(f'  planning/order RRM fit failed; using empirical order: {exc}')
 
@@ -1458,12 +1827,52 @@ def estimate_planning_order_model(data: pd.DataFrame, max_obs: int = 50000):
 
 
 def apply_planning_order(activities: pd.DataFrame, model: Optional[PlanningOrderModel]) -> pd.DataFrame:
+    """Stamp ``planning_order`` and ``activity_seq`` onto the activity frame.
+
+    The only things the plan changes are those two columns: the old version
+    sorted each person's block and then restored the original row order, so the
+    returned frame is identical row-for-row.  This version therefore runs the
+    order model on per-person numpy slices and writes the two columns back,
+    instead of copying/sorting/dropping the whole activity frame once per
+    person (which dominated runtime on the 610-column frame).
+    """
     if model is None or activities.empty or 'person_id' not in activities.columns:
         return activities
-    ordered = [model.order_group(group) for _, group in activities.groupby('person_id', sort=False)]
-    if not ordered:
-        return activities
-    return pd.concat(ordered, axis=0).sort_index(kind='stable').reset_index(drop=True)
+
+    acts = activities.reset_index(drop=True)
+    n = len(acts)
+    purpose_arr = acts['purpose'].astype(str).to_numpy()
+    duration_arr = pd.to_numeric(acts['predicted_duration_min'], errors='coerce') \
+        .fillna(0.0).to_numpy(dtype=float)
+    if {'start_of_day', 'end_of_day'}.issubset(acts.columns):
+        horizon_arr = (pd.to_numeric(acts['end_of_day'], errors='coerce')
+                       - pd.to_numeric(acts['start_of_day'], errors='coerce')) \
+            .fillna(480.0).to_numpy(dtype=float)
+    else:
+        horizon_arr = np.full(n, 480.0)
+
+    pid_codes, _ = pd.factorize(acts['person_id'], sort=False)
+    order_rows = np.argsort(pid_codes, kind='stable')
+    sizes = np.bincount(pid_codes)
+    offsets = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+
+    planning = np.zeros(n, dtype=np.int64)
+    seq = np.zeros(n, dtype=np.int64)
+    for start, size in zip(offsets, sizes):
+        if size == 0:
+            continue
+        rows = order_rows[start:start + size]
+        step = model.plan_order_arrays(purpose_arr[rows], duration_arr[rows],
+                                       float(horizon_arr[rows[0]]))
+        planning[rows] = step
+        # activity_seq is the row's rank in planned order (stable ties)
+        rank = np.empty(size, dtype=np.int64)
+        rank[np.argsort(step, kind='stable')] = np.arange(size)
+        seq[rows] = rank
+
+    acts['planning_order'] = planning
+    acts['activity_seq'] = seq
+    return acts
 
 
 # ---------------------------------------------------------------------------
@@ -1487,32 +1896,268 @@ def expand_to_activities(synth: pd.DataFrame) -> pd.DataFrame:
     if 'person_id' not in df.columns and 'PERSID' in df.columns:
         df = df.rename(columns={'PERSID': 'person_id'})
 
-    rows = []
-    for _, row in df.iterrows():
-        seq = 0
-        for purpose in PURPOSES:
-            col = f'n_{purpose}_out'
-            n   = int(row.get(col, 0))
-            for _ in range(n):
-                r             = row.to_dict()
-                r['purpose']  = purpose
-                r['activity_seq'] = seq
-                seq += 1
-                rows.append(r)
+    count_cols = [f'n_{p}_out' for p in PURPOSES]
+    present = [c for c in count_cols if c in df.columns]
+    if not present:
+        logger.warning("expand_to_activities: no n_{purpose}_out columns "
+                       "present and no other enumeration available.")
+        return pd.DataFrame()
+    ns = df[present].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+    ns = ns.to_numpy(dtype=np.int64)
+    ns = np.maximum(ns, 0)
 
-    if not rows:
-        logger.warning("expand_to_activities: no activity rows produced. "
-                       "Check that n_{purpose}_out columns exist and are > 0.")
+    total_per_person = ns.sum(axis=1)
+    n_acts = int(total_per_person.sum())
+    if n_acts == 0:
+        logger.warning("expand_to_activities: all n_{purpose}_out counts are "
+                       "zero — returning empty frame")
         return pd.DataFrame()
 
-    activities = pd.DataFrame(rows).reset_index(drop=True)
-    logger.info(f"Expanded {len(df)} persons → {len(activities)} activities")
-    return activities
+    person_idx = np.repeat(np.arange(len(df)), total_per_person)
+    starts = np.repeat(np.cumsum(total_per_person) - total_per_person,
+                       total_per_person)
+    k = np.arange(n_acts, dtype=np.int64) - starts
+    if len(present) == 1:
+        purpose_pos = np.zeros(n_acts, dtype=np.int64)
+    else:
+        # activity k-of-person falls on the first purpose whose cumulative
+        # count exceeds k ( PurposeS order = column order, matches old loop)
+        cum_counts = np.cumsum(ns, axis=1)
+        purpose_pos = np.argmax(k[:, None] < cum_counts[person_idx], axis=1)
+        assert np.all(purpose_pos < len(present))
+    purpose_col_of = [PURPOSES.index(c[len('n_'):-len('_out')])
+                      for c in present]
+    purpose_labels = np.asarray([PURPOSES[i] for i in purpose_col_of],
+                                dtype=object)[purpose_pos]
+
+    acts = df.take(person_idx).reset_index(drop=True)
+    acts['purpose'] = purpose_labels
+    acts['activity_seq'] = k
+    logger.info(f"Expanded {len(df)} persons → {n_acts} activities")
+    return acts
 
 
 # ---------------------------------------------------------------------------
 # 4.  PREDICT DURATIONS WITH BUDGET RESCALING
 # ---------------------------------------------------------------------------
+
+def _placement_link_gap_min() -> float:
+    """Minimum inter-activity travel allowance used by Stage 4 placement.
+
+    Read from the placement module so the two stages cannot drift apart; the
+    literal is only a fallback for running Stage 3 without Stage 4 importable.
+    """
+    try:
+        from stage4_schedule_placement import MIN_TRAVEL_GAP
+        return float(MIN_TRAVEL_GAP)
+    except Exception:
+        return 10.0
+
+
+def reconcile_day_budget(durations, purposes, budget_min: float,
+                         window_min: Optional[float] = None,
+                         link_gap: Optional[float] = None,
+                         budget_tolerance: float = 1.20):
+    """Fit one person's activity durations into the Stage 2 budget AND day window.
+
+    Stage 2 predicts the day window [start_of_day, end_of_day] and an
+    out-of-home budget B; Stage 3 predicts every duration independently of
+    both.  Nothing then stops a chain from asking for more time than the
+    predicted day holds, and Stage 4 can only honour it by pushing activities
+    past end_of_day.
+
+    The activity time actually available is the window minus one minimum
+    travel allowance per activity (placement inserts a gap before every
+    activity, including the first):
+
+        room    = (end_of_day - start_of_day) - n_acts * link_gap
+        ceiling = min(budget_tolerance * B, room)   # compress above this
+
+    B stays a soft budget exactly as before (`budget_tolerance` keeps the
+    +20% band that preserves cross-person variation); the window is the hard
+    one, so nothing is ever allocated more activity time than the day holds.
+    The pass only ever *reduces* time: an episode's duration is a model output
+    about that episode, not a share of the day to be topped up.
+
+    Durations above `ceiling` are compressed on the headroom above their
+    per-purpose floors, so the person's relative pattern survives and the
+    floors cannot push the total back over the ceiling.  When the floors alone
+    exceed `room` they are kept and the chain is reported as floor-bound
+    rather than silently clipped.
+
+    Returns
+    -------
+    (duration_array, info) where info carries `ceiling`, `window_bound`
+    (the window, not B, set the ceiling) and `floor_bound` (floors exceed
+    the room available).
+    """
+    d = np.asarray(durations, dtype=float).copy()
+    n = d.size
+    if link_gap is None:
+        link_gap = _placement_link_gap_min()
+
+    floors = np.array([DURATION_BOUNDS.get(p, (5, 480))[0] for p in purposes],
+                      dtype=float)
+    if n:
+        d = np.maximum(d, floors)
+    floor_sum = float(floors.sum())
+
+    budget_min = float(np.clip(budget_min, 30, 960))
+    room = np.inf
+    floor_bound = False
+    if window_min is not None and np.isfinite(window_min):
+        room = float(window_min) - n * float(link_gap)
+        if room < floor_sum:
+            # Floors are the practical minimum for this activity list; the
+            # window cannot absorb them, so report it and keep them.
+            room = floor_sum
+            floor_bound = True
+
+    budget_ceiling = budget_min * float(budget_tolerance)
+    ceiling = min(budget_ceiling, room)
+    # Only a compression that the window forced counts as window-bound; a chain
+    # that stays under both ceilings is untouched whatever the ceiling was.
+    window_bound = bool(np.isfinite(room) and room < budget_ceiling
+                        and float(d.sum()) > ceiling)
+
+    total = float(d.sum()) if n else 0.0
+    if n and total > ceiling:
+        # Compress the headroom above the floors rather than the totals: plain
+        # proportional scaling followed by a floor pass can push the sum back
+        # above the ceiling, which is exactly the inconsistency being removed.
+        headroom = total - floor_sum
+        allowed  = max(ceiling - floor_sum, 0.0)
+        if headroom > 1e-9:
+            d = floors + (d - floors) * (allowed / headroom)
+        else:
+            d = floors.copy()
+
+    return d, {
+        'ceiling': float(ceiling),
+        'window_bound': window_bound,
+        'floor_bound': bool(floor_bound),
+        'total': float(d.sum()) if n else 0.0,
+    }
+
+
+def reconcile_predicted_durations(
+    acts: pd.DataFrame,
+    dur_col: str = 'predicted_duration_min',
+    pid_col: str = 'person_id',
+    purpose_col: str = 'purpose',
+    budget_col: str = 'B',
+    link_gap: Optional[float] = None,
+    log_audit: bool = True,
+) -> pd.DataFrame:
+    """Fit each person's predicted durations into the predicted day.
+
+    This is the post-pass every set of Stage 3 durations goes through before
+    Stage 4 sees it, kept in one function so validation measures the durations
+    the pipeline actually emits rather than the raw model draws.  In order:
+
+      1. enforce the per-purpose floors;
+      2. reconcile the chain with the smaller of the soft budget (``B`` plus
+         its tolerance band) and the day window's room, via
+         :func:`reconcile_day_budget`;
+      3. clip extreme outliers at the soft ceiling (1.5x the purpose bound).
+
+    Nothing here scales a chain *up*.  An earlier version topped thin days up
+    towards ``B`` (discretionary durations x1-2 whenever the chain sat under
+    half the budget), which was really a calibration patch for draws that
+    undershot: it lifted shopping from 11 to 20 min and escort from 13 to 24,
+    but once the draws were fixed it inflated shopping by +29%, escort by
+    +59% and the whole panel's mean |bias| from 7% to 25%.  ``B`` is a soft
+    guide for how much time the day holds, not a target each episode has to
+    fill.
+
+    The frame needs ``person_id``, ``purpose``, ``B`` and the duration column;
+    ``start_of_day``/``end_of_day`` are used as the window when present, and
+    their absence only disables the window constraint (budget-only rescaling).
+
+    Returns the frame with ``dur_col`` rewritten (same index, same rows).
+    """
+    n_rows = len(acts)
+    if n_rows == 0:
+        return acts
+
+    dur_col_orig = pd.to_numeric(acts[dur_col], errors='coerce').to_numpy(dtype=float)
+    _dur_before = float(np.nanmean(dur_col_orig))
+
+    # ── per-purpose floors, computed once on the duration column ──────────────
+    # Do NOT clip the upper bound here — hard upper-bound clipping before the
+    # budget rescaling creates a spike (pile-up) at the ceiling when many
+    # lognormal draws fall above the bound.  The budget rescaling pulls
+    # over-long activities back proportionally, which is smoother; the soft
+    # ceiling is applied after it.
+    lo_map = {p: DURATION_BOUNDS.get(p, (5, 480))[0] for p in PURPOSES}
+    hi_map = {p: DURATION_BOUNDS.get(p, (5, 480))[1] for p in PURPOSES}
+    floor_arr = acts[purpose_col].map(lo_map).fillna(5.0).to_numpy(dtype=float)
+    dur_arr = np.maximum(np.where(np.isfinite(dur_col_orig), dur_col_orig, 0.0),
+                         floor_arr)
+
+    purpose_arr = acts[purpose_col].astype(str).to_numpy()
+    b_arr = (pd.to_numeric(acts[budget_col], errors='coerce').fillna(8.0)
+             .to_numpy(dtype=float)
+             if budget_col in acts.columns else np.full(n_rows, 8.0))
+    has_window = {'start_of_day', 'end_of_day'}.issubset(acts.columns)
+    if has_window:
+        sod = pd.to_numeric(acts['start_of_day'], errors='coerce').to_numpy(dtype=float)
+        eod = pd.to_numeric(acts['end_of_day'], errors='coerce').to_numpy(dtype=float)
+
+    # The reconciliation is per person and reads only person_id, purpose,
+    # duration, B and the window.  Grouping the WIDE activity frame (610
+    # columns) once per person cost 45 s of every 20k-person chunk; the same
+    # logic over position arrays costs a fraction of a second.
+    _link_gap = _placement_link_gap_min() if link_gap is None else float(link_gap)
+    n_window_bound = 0
+    n_floor_bound  = 0
+    pid_codes, _ = pd.factorize(acts[pid_col], sort=False)
+    order_rows = np.argsort(pid_codes, kind='stable')
+    sizes = np.bincount(pid_codes)
+    offsets = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+
+    for start, size in zip(offsets, sizes):
+        if size == 0:
+            continue
+        rows = order_rows[start:start + size]
+        B_hrs = float(b_arr[rows[0]])
+        # B is in hours from Stage 2 — convert to minutes, and guard against B
+        # already being in minutes (if > 24 hrs it's minutes)
+        B_min = B_hrs * 60 if B_hrs <= 24 else B_hrs
+        # cap at a realistic day length for this model (up to 16 hours = 960 min)
+        B_min = float(np.clip(B_min, 30, 960))
+        window_min = (float(eod[rows[0]] - sod[rows[0]]) if has_window else None)
+        arr, info = reconcile_day_budget(dur_arr[rows], purpose_arr[rows], B_min,
+                                         window_min=window_min,
+                                         link_gap=_link_gap)
+        # No upward scaling: the durations are the model's estimate of each
+        # episode, and the pass only has to make the chain fit the day.
+        dur_arr[rows] = arr
+        n_window_bound += int(info['window_bound'])
+        n_floor_bound  += int(info['floor_bound'])
+
+    # ── Final soft ceiling: only clip extreme outliers (> 1.5x upper bound) ──
+    # This prevents genuinely unrealistic values (e.g. 20-hour work activity)
+    # while not creating a spike at the nominal upper bound (480, 420, etc).
+    soft_hi_arr = acts[purpose_col].map(
+        {p: h * 1.5 for p, h in hi_map.items()}).fillna(720.0).to_numpy(dtype=float)
+    acts[dur_col] = np.clip(dur_arr, floor_arr, soft_hi_arr)
+
+    # ── reconciliation audit ─────────────────────────────────────────────────
+    if log_audit:
+        _n_p   = max(int(len(sizes)), 1)
+        _mean  = float(acts[dur_col].mean())
+        logger.info(
+            f"Stage 3 day-window reconciliation: {n_window_bound:,}/{_n_p:,} persons "
+            f"({100.0 * n_window_bound / _n_p:.1f}%) had their activity time capped "
+            f"by the day window rather than by B; {n_floor_bound:,} "
+            f"({100.0 * n_floor_bound / _n_p:.1f}%) are floor-bound (minimum "
+            f"durations already exceed the window). Mean duration "
+            f"{_dur_before:.0f} → {_mean:.0f} min."
+        )
+
+    return acts
+
 
 def predict_activity_durations(
     synth_s2: pd.DataFrame,
@@ -1522,8 +2167,10 @@ def predict_activity_durations(
     use_mdcev: bool = False,
 ) -> pd.DataFrame:
     """
-    Predict duration for every activity instance, then rescale per person
-    so that sum(durations) == B.
+    Predict duration for every activity instance, then reconcile each
+    person's total with both the day budget B and the day window room
+    (see reconcile_day_budget), so Stage 4 can place the chain inside
+    [start_of_day, end_of_day].
 
     Parameters
     ----------
@@ -1594,6 +2241,7 @@ def predict_activity_durations(
     except Exception as _e:
         logger.warning(f"prediction feature enrichment skipped: {_e}")
     acts['predicted_duration_min'] = np.nan
+    _imputed_features: dict = {}
 
     # predict per purpose
     for purpose in PURPOSES:
@@ -1614,13 +2262,11 @@ def predict_activity_durations(
         model    = entry['model']
 
         subset = acts.loc[mask]
-        X_cols = [c for c in feats if c in subset.columns]
-
-        # pad any missing feature columns with 0
-        X = np.zeros((mask.sum(), len(feats)))
-        for j, col in enumerate(feats):
-            if col in subset.columns:
-                X[:, j] = subset[col].fillna(0).values.astype(float)
+        # Absent features are imputed at the training mean (z=0); a raw 0 on a
+        # z-scored column would fabricate an extreme covariate value.
+        X, _imputed = duration_design_matrix(subset, feats, model, purpose)
+        if _imputed:
+            _imputed_features.setdefault(purpose, list(_imputed))
 
         _order_signal = subset['_copula_order_u'].to_numpy(dtype=float) \
             if '_copula_order_u' in subset.columns else None
@@ -1653,9 +2299,14 @@ def predict_activity_durations(
             # across different purpose rows.
             person_ids = subset['person_id'].values if 'person_id' in subset.columns else None
             if person_ids is not None:
-                unique_pids = np.unique(person_ids)
-                pid_offset  = {pid: rng.normal(0, 0.15) for pid in unique_pids}
-                person_offsets = np.array([pid_offset[p] for p in person_ids], dtype=float)
+                # Vectorised per-person random intercept (no dict allocation):
+                # np.unique returns sorted ids, so the draw sequence matches
+                # the legacy {pid: rng.normal(...)} comprehension over
+                # unique_pids — same values, ~90 MB per million persons
+                # and several minutes of dict building saved.
+                unique_pids, pid_codes = np.unique(person_ids, return_inverse=True)
+                pid_offsets = rng.normal(0, 0.15, size=len(unique_pids))
+                person_offsets = pid_offsets[pid_codes]
             else:
                 person_offsets = rng.normal(0, 0.15, size=len(eta))
 
@@ -1674,6 +2325,11 @@ def predict_activity_durations(
         lo, hi = DURATION_BOUNDS[purpose]
         mask = (acts['purpose'] == purpose) & acts['predicted_duration_min'].isna()
         acts.loc[mask, 'predicted_duration_min'] = (lo + hi) / 2
+
+    # carry the design-matrix completeness audit out to Stage 4 callers
+    acts.attrs['imputed_features'] = {
+        p: list(v) for p, v in _imputed_features.items()
+    }
 
     pid_col = 'person_id'
 
@@ -1714,101 +2370,17 @@ def predict_activity_durations(
             logger.warning(f"Stage 3 MDCEV predict failed, using legacy rescaling: {_mdcev_pred_e}")
 
     # ── budget rescaling per person ──────────────────────────────────────────
-    # ActivitySim approach: treat B as a SOFT guide, not a hard constraint.
-    # Only scale down when significantly over-budget (>20%), and apply a
-    # proportional scale that preserves the RELATIVE duration pattern of each
-    # person.  Do NOT force every person's total to equal B — that collapses
-    # cross-person variation and makes all plans look identical.
+    # ActivitySim approach: treat the budget as a SOFT guide, not a hard
+    # constraint — do NOT force every person's total to equal it, because that
+    # collapses cross-person variation and makes all plans look identical.
     #
-    # Strategy:
-    #  1. Enforce per-purpose floors and ceilings.
-    #  2. If total > 1.20 × B_min, scale proportionally (preserves ratios).
-    #  3. If total < 0.50 × B_min, scale up discretionary durations only
-    #     (mandatory activities are kept as-is to reflect real constraints).
-    #  4. A ±10% tolerance band around B is accepted without any rescaling,
-    #     letting the lognormal draws create natural person-to-person variation.
-    acts['predicted_duration_min'] = acts['predicted_duration_min'].astype(float)
-
-    # ── Enforce FLOORS only before rescaling ─────────────────────────────────
-    # Do NOT clip the upper bound here — hard upper-bound clipping before the
-    # budget rescaling creates a spike (pile-up) at the ceiling when many
-    # lognormal draws fall above the bound.  The budget rescaling will pull
-    # over-long activities back proportionally, which is smoother.
-    for purpose in PURPOSES:
-        lo, _ = DURATION_BOUNDS[purpose]
-        pmask = acts['purpose'] == purpose
-        acts.loc[pmask, 'predicted_duration_min'] = (
-            acts.loc[pmask, 'predicted_duration_min'].clip(lower=lo)
-        )
-
-    rescaled = []
-    _mandatory = {'work', 'edu'}
-    for pid, grp in acts.groupby(pid_col):
-        B_hrs = float(grp['B'].iloc[0])
-        # B is in hours from Stage 2 — convert to minutes
-        # guard against B already being in minutes (if > 24 hrs it's minutes)
-        B_min = B_hrs * 60 if B_hrs <= 24 else B_hrs
-        # cap at a realistic day length for this model (up to 16 hours = 960 min)
-        B_min = float(np.clip(B_min, 30, 960))
-
-        durations = grp['predicted_duration_min'].copy().astype(float)
-        purposes  = grp['purpose'].values
-
-        # Step 1: enforce floors only (no ceiling here — prevents boundary spike)
-        for i, p in enumerate(purposes):
-            lo_p, _ = DURATION_BOUNDS.get(p, (5, 480))
-            durations.iloc[i] = float(max(durations.iloc[i], lo_p))
-
-        total = durations.sum()
-        if total <= 0:
-            rescaled.append(durations)
-            continue
-
-        ratio = total / max(B_min, 1.0)
-
-        if ratio > 1.20:
-            # Over budget by more than 20% — scale everything proportionally.
-            # Preserves each activity's RELATIVE share of the day.
-            scale = B_min / total
-            durations = durations * scale
-            # Re-enforce floors ONLY after scaling (no ceiling to avoid spike)
-            for i, p in enumerate(purposes):
-                lo_p, _ = DURATION_BOUNDS.get(p, (5, 480))
-                durations.iloc[i] = float(max(durations.iloc[i], lo_p))
-
-        elif ratio < 0.50:
-            # Under budget by more than half — scale up DISCRETIONARY only.
-            # Mandatory (work/edu) durations are respected as sampled.
-            discr_idx = [i for i, p in enumerate(purposes) if p not in _mandatory]
-            if discr_idx:
-                mandatory_total = sum(
-                    durations.iloc[i] for i, p in enumerate(purposes)
-                    if p in _mandatory
-                )
-                remaining_budget = max(B_min - mandatory_total, 0)
-                discr_total = sum(durations.iloc[i] for i in discr_idx)
-                if discr_total > 0 and remaining_budget > discr_total:
-                    scale_d = min(remaining_budget / discr_total, 2.0)  # cap 2×
-                    for i in discr_idx:
-                        p = purposes[i]
-                        lo_p, _ = DURATION_BOUNDS.get(p, (5, 480))
-                        durations.iloc[i] = float(max(durations.iloc[i] * scale_d, lo_p))
-        # else: within ±20% / ±50% band — leave as-is (preserves variation)
-
-        rescaled.append(durations)
-
-    acts['predicted_duration_min'] = pd.concat(rescaled).sort_index()
-
-    # ── Final soft ceiling: only clip extreme outliers (> 1.5× upper bound) ──
-    # This prevents genuinely unrealistic values (e.g. 20-hour work activity)
-    # while not creating a spike at the nominal upper bound (480, 420, etc).
-    for purpose in PURPOSES:
-        lo, hi = DURATION_BOUNDS[purpose]
-        soft_hi = hi * 1.5   # allow up to 1.5× before hard-stopping
-        pmask = acts['purpose'] == purpose
-        acts.loc[pmask, 'predicted_duration_min'] = (
-            acts.loc[pmask, 'predicted_duration_min'].clip(lower=lo, upper=soft_hi)
-        )
+    # The budget is not the only constraint, though.  The day window from
+    # Stage 2 has to hold the durations plus one placement travel allowance per
+    # activity, or Stage 4 cannot honour end_of_day, so each chain is
+    # reconciled against the smaller of the two.  That pass lives in
+    # reconcile_predicted_durations so validation can measure the very same
+    # durations the pipeline emits.
+    acts = reconcile_predicted_durations(acts, pid_col=pid_col)
 
     planning_model = models.get('_planning_order') if isinstance(models, dict) else None
     if isinstance(planning_model, PlanningOrderModel):
@@ -2005,9 +2577,33 @@ def run_stage3(
         save_models(models, save_path)
 
     print("\n[2/2] Predicting activity durations for synthetic population...")
-    activities = predict_activity_durations(synth_s2, models,
-                                            sample=sample, seed=seed,
-                                            use_mdcev=use_mdcev)
+    # Chunked by person to bound peak memory (same knob as predict_stage3 in
+    # pipeline_logger.py): expand_to_activities / per-purpose feature builds
+    # scale with rows, and a single 3.8M-person pass pushed 194 GB nodes
+    # OOM (16/10 exit-137).  STAGE3_PREDICT_CHUNK=0 restores single-shot.
+    try:
+        _chunk = int(os.environ.get('STAGE3_PREDICT_CHUNK', '500000') or '500000')
+    except ValueError:
+        _chunk = 500000
+    import gc as _gc
+    if _chunk > 0 and len(synth_s2) > _chunk:
+        _parts = []
+        for _i, _start in enumerate(range(0, len(synth_s2), _chunk)):
+            _sub = synth_s2.iloc[_start:_start + _chunk]
+            print(f"  chunk {_i + 1}: persons {_start:,}..{_start + len(_sub) - 1:,} "
+                  f"({len(_sub):,})")
+            _parts.append(predict_activity_durations(_sub, models,
+                                                     sample=sample, seed=seed,
+                                                     use_mdcev=use_mdcev))
+            del _sub
+            _gc.collect()
+        activities = pd.concat(_parts, ignore_index=True)
+        del _parts
+        _gc.collect()
+    else:
+        activities = predict_activity_durations(synth_s2, models,
+                                                sample=sample, seed=seed,
+                                                use_mdcev=use_mdcev)
 
     print("\nStage 3 complete. Pass activities to run_stage4().")
     return activities, models

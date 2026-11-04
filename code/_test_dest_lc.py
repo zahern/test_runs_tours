@@ -39,7 +39,8 @@ for n in range(N):
 df = pd.DataFrame(rows)
 t0 = time.time()
 res = estimate_dest_choice_lc(df, ["x1", "x2", "x3"], n_classes=2,
-                              maxiter=60, seed=3, n_init=2)
+                              maxiter=60, seed=3, n_init=2,
+                              require_crash=False)
 print(f"[synthetic] method={res['method']} conv={res['converged']} "
       f"iters={res['iterations']} ll={res['loglike']:.1f} "
       f"bic={res['bic']:.1f} ({time.time()-t0:.0f}s)")
@@ -53,7 +54,7 @@ for c, beta in enumerate(res["betas"]):
 # ── B. observed-group mode on the same synthetic frame ────────────────────
 df["grp"] = (df["case_id"] % 2).map({0: "even", 1: "odd"})
 res_g = estimate_dest_choice_lc(df, ["x1", "x2", "x3"], group_col="grp",
-                                maxiter=1)
+                                maxiter=1, require_crash=False)
 print(f"\n[grouped] groups={res_g['group_labels']} "
       f"shares={[round(s,2) for s in res_g['shares']]} ll={res_g['loglike']:.1f}")
 

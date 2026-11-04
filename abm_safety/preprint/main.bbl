@@ -1,265 +1,738 @@
-\begin{thebibliography}{10}
+\begin{thebibliography}{85}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
 
-\bibitem{Bhat1993ActivityProgram}
-C~R Bhat and F~S Koppelman.
-\newblock {A conceptual framework of individual activity program generation}.
-\newblock {\em Transportation Research Part A}, 1993.
-
-\bibitem{Recker1986ComplexTravel}
-W~W Recker, M~G McNally, and G~S Root.
-\newblock {A model of complex travel behavior: Part I-Theoretical development}.
-\newblock {\em Transportation Research Part A: General}, 1986.
-
-\bibitem{Bowman2001Activity-BasedSchedules}
-J~L Bowman and M~E Ben-Akiva.
-\newblock {Activity-Based Disaggregate Travel Demand Model System with Activity
-  Schedules}, 2001.
-
-\bibitem{BekkerGrobRyanGerard2012Review}
-Esther~W de~Bekker-Grob, Mandy Ryan, and Karen Gerard.
-\newblock {Discrete choice experiments in health economics: a review of the
-  literature}.
-\newblock {\em Health Economics}, 21(2):145--172, 2012.
-
-\bibitem{Gossling2024ChildrensSpace}
-Stefan G{\"{o}}ssling, Jessica Kees, Rafael Hologa, Nils Riach, and Rul von
-  St{\"{u}}lpnagel.
-\newblock {Childrenâ€™s safe routes to school: Real and perceived risks,
-  and evidence of an incapacity-incapability space}.
-\newblock {\em Journal of Cycling and Micromobility Research}, 2:100019, 2024.
-
-\bibitem{Swain2024ChildrensTravel}
-Ritwik Swain, Prue Oswin, Verity Truelove, and GrÃ©goire~S Larue.
-\newblock {Childrenâ€™s and parentsâ€™ perceptions on safe routes to
-  schools: a mixed-methods study investigating factors influencing active
-  school travel}.
-\newblock {\em Journal of Urban Design}, 29(2):208--230, 2024.
-
-\bibitem{Duren2023IdentifyingComponents}
-Michelle Duren, Bryce Corrigan, Ryan~David Kennedy, Keshia~M Pollack~Porter,
-  and Johnathon Ehsani.
-\newblock {Identifying and Assessing Perceived Cycling Safety Components}.
-\newblock {\em Safety}, 9(4), 2023.
-
-\bibitem{Huang2025YoungApproach}
-Yue Huang, Hongcheng Gan, Maria~Nadia Postorino, Ke~Wang, and Xuelian Wu.
-\newblock {Young people preferences about enhanced transportation services for
-  intercity trips: An integrated choice and latent variable approach}.
-\newblock {\em Research in Transportation Economics}, 114, 12 2025.
-
-\bibitem{Tzouras2025ExploringChoices}
-Panagiotis~G. Tzouras, Valentina Pastia, Ioannis Kaparias, and Konstantinos
-  Kepaptsoglou.
-\newblock {Exploring the effect of perceived safety in first/last mile mode
-  choices}.
-\newblock {\em Transportation}, 52(5):2145--2183, 10 2025.
-
-\bibitem{Perera2026Data}
-Supun Perera and Michael Bell.
-\newblock Beyond the four-step model: Structural differences and a data
-  integration framework for activity-based transport modelling.
-\newblock In {\em Australasian Transport Research Forum 2026 Proceedings},
-  Sydney, Australia, November 2026.
-
-\bibitem{SwaitBenAkiva1987PLC}
-J~Swait and M~Ben-Akiva.
-\newblock {Empirical test of a constrained choice discrete model: mode choice
-  in Sao Paulo, Brazil}.
-\newblock {\em Transportation Research Part B: Methodological}, 21(2):103--115,
-  1987.
-
-\bibitem{Auld2011PlanningConstrained}
-J~Auld and A~Mohammadian.
-\newblock {Planning-constrained destination choice in activity-based model:
-  agent-based dynamic activity planning and travel scheduling}.
-\newblock {\em Transportation Research Record}, 2254(1):170--179, 2011.
-
-\bibitem{Volakakis2025IntegratingChoice}
-V~Volakakis, M~Said, Y~Chen, and H~S Mahmassani.
-\newblock {Integrating choice and predictive theories: a comparative study of
-  set generation and machine learning in consideration set modeling}.
-\newblock {\em Data Science for Transportation}, 7:21, 2025.
-
-\bibitem{Yao2022VAE}
-R~Yao and S~Bekhor.
-\newblock {A variational autoencoder approach for choice set generation and
-  implicit perception of alternatives in choice modeling}.
-\newblock {\em Transportation Research Part B: Methodological}, 158:273--294,
-  2022.
-
-\bibitem{Phan2022NewApproach}
-D~T Phan, H~L Vu, and E~J Miller.
-\newblock {A new approach to improve destination choice by ranking personal
-  preferences}.
-\newblock {\em Transportation Research Part C: Emerging Technologies}, 143,
-  2022.
-
-\bibitem{Golshani2018ActivityModels}
-N~Golshani, S~Ramin, A~Joshua, and A~Mohammadian.
-\newblock {Activity Start Time and Duration: Incorporating Regret Theory into
-  Joint Discreteâ€"Continuous Models}.
-\newblock {\em Transportmetrica A: Transport Science}, 14(9):809--827, 2018.
-
-\bibitem{Hess2026Significance}
-Stephane Hess, Andrew Daly, Michiel Bliemer, Angelo Guevara, Ricardo Daziano,
-  and Thijs Dekker.
-\newblock {Statistical significance in choice modelling: computation, usage and
-  reporting}.
-\newblock {\em Journal of Choice Modelling}, 60:100611, 2026.
-
-\bibitem{AllenbyRossi1998Heterogeneity}
-Greg~M Allenby and Peter~E Rossi.
-\newblock {Marketing models of consumer heterogeneity}.
-\newblock {\em Journal of Econometrics}, 89(1-2):57--78, 1998.
-
-\bibitem{HessRose2009Intra}
-Stephane Hess and John~M Rose.
-\newblock {Allowing for intra-respondent variations in coefficients estimated
-  on repeated choice data}.
-\newblock {\em Transportation Research Part B: Methodological}, 43(6):708--719,
-  2009.
-
-\bibitem{BliemerRoseHess2008Approx}
-Michiel C~J Bliemer, John~M Rose, and Stephane Hess.
-\newblock {Approximation of {Bayesian} efficiency in experimental choice
-  designs}.
-\newblock {\em Journal of Choice Modelling}, 1(1):98--127, 2008.
-
-\bibitem{RoseBliemerHensherCollins2008Designing}
-John~M Rose, Michiel C~J Bliemer, David~A Hensher, and Andrew~T Collins.
-\newblock {Designing efficient stated choice experiments in the presence of
-  reference alternatives}.
-\newblock {\em Transportation Research Part B: Methodological}, 42(4):395--406,
-  2008.
-
-\bibitem{BekkerGrobRoseBliemer2013Closer}
-Esther~W de~Bekker-Grob, John~M Rose, and Michiel C~J Bliemer.
-\newblock {A closer look at decision and analyst error by including
-  nonlinearities in discrete choice models: implications on willingness-to-pay
-  estimates derived from discrete choice data in healthcare}.
-\newblock {\em PharmacoEconomics}, 31(12):1169--1183, 2013.
-
-\bibitem{BekkerGrobHole2024Editorial}
-Esther~W de~Bekker-Grob and Arne~Risa Hole.
-\newblock {Special issue on choice modelling in health - Editorial}.
-\newblock {\em Journal of Choice Modelling}, 2024.
-
-\bibitem{LarchExampvilleDocs}
-J~Newman.
-\newblock {Exampville simulator (Larch v5.7.0 travel-model example: simulated
-  data, mode choice, logsums, destination choice)}.
-\newblock \url{https://larch.newman.me/v5.7.0/example/exampville.html}, 2021.
-
-\bibitem{ActivitySimConsortium}
-{ActivitySim Consortium}.
-\newblock {ActivitySim: an open platform for activity-based travel modeling}.
-\newblock \url{https://github.com/ActivitySim/activitysim}.
-\newblock {Accessed 2026}.
-
-\bibitem{ActivitySimPrototypeMTC}
-{ActivitySim Consortium}.
-\newblock {prototype\_mtc: canonical Bay Area prototype example (regress test
-  fixtures, TAZ skims, land use) shipped with ActivitySim}.
-\newblock
-  \url{https://github.com/ActivitySim/activitysim/tree/main/activitysim/examples/prototype_mtc}.
-\newblock {Accessed 2026; provides the \texttt{test/regress/final\_trips.csv}
-  reference outputs used as the M0 arm}.
-
-\bibitem{ABMDTAConvergence2024}
+\bibitem[ABM(2024)]{ABMDTAConvergence2024}
 {Faster convergence of integrated activity-based models in dynamic multimodal
   transit assignment using macroscopic road congestion estimation}, 2024.
 
-\bibitem{Arentze2013MultiDay}
-T~A Arentze, D~Ettema, and H~J~P Timmermans.
-\newblock {Location choice in the context of multi-day activity-travel
-  patterns: model development and empirical results}.
-\newblock {\em Transportmetrica A: Transport Science}, 2013.
-
-\bibitem{Xu2018RandomUtility}
-Z~Xu, J~E Kang, and R~Chen.
-\newblock {A random utility based estimation framework for the household
-  activity pattern problem}.
-\newblock {\em Transportation Research Part A: Policy and Practice}, 2018.
-
-\bibitem{Palma2021MDCEV}
-David Palma, Annesha Enam, Stephane Hess, Chiara Calastri, and Romain
-  Crastes~dit Sourd.
-\newblock {Modelling multiple occurrences of activities during a day: an
-  extension of the MDCEV model}.
-\newblock {\em Transportmetrica B: Transport Dynamics}, 9(1):456--478, 2021.
-
-\bibitem{Kim2017Duration}
-K~Kim and L~Wang.
-\newblock {Activity duration analysis: discrete-time approach for recurrent
-  events, competing risks, and multiple states}.
-\newblock {\em Transportation Research Record}, 2017.
-
-\bibitem{Khaddar2023Episode}
-S~Khaddar, S~Saxena, M~R Fatmi, and A~R Pinjari.
-\newblock {An episode-level joint model for activity engagement, duration, and
-  destination location choice decisions}.
-\newblock {\em Transportation Letters}, 2023.
-
-\bibitem{Telework2026Timing}
+\bibitem[Tel(2026)]{Telework2026Timing}
 {Telework reshapes non-work activity timing and duration}, 2026.
 \newblock {Cited for the finding that telework redistributes non-work
   activities toward late morning and early afternoon, with distinct evening
   peaks under hybrid work}.
 
-\bibitem{Ben-Akiva1985DiscreteDemand}
-M~E Ben-Akiva and S~R Lerman.
-\newblock {\em {Discrete choice analysis: Theory and application to travel
+\bibitem[{AASHTO}(2010)]{AASHTO2010HighwayManual}
+{AASHTO}.
+\newblock \emph{{Highway Safety Manual}}, volume~2.
+\newblock Washington, D.C., 2010.
+
+\bibitem[{ActivitySim Consortium}({\natexlab{a}})]{ActivitySimConsortium}
+{ActivitySim Consortium}.
+\newblock {ActivitySim: an open platform for activity-based travel modeling}.
+\newblock \url{https://github.com/ActivitySim/activitysim}, {\natexlab{a}}.
+\newblock {Accessed 2026}.
+
+\bibitem[{ActivitySim Consortium}({\natexlab{b}})]{ActivitySimPrototypeMTC}
+{ActivitySim Consortium}.
+\newblock {prototype\_mtc: canonical Bay Area prototype example (regress test
+  fixtures, TAZ skims, land use) shipped with ActivitySim}.
+\newblock
+  \url{https://github.com/ActivitySim/activitysim/tree/main/activitysim/examples/prototype_mtc},
+  {\natexlab{b}}.
+\newblock {Accessed 2026; provides the \texttt{test/regress/final\_trips.csv}
+  reference outputs used as the M0 arm}.
+
+\bibitem[Ahern et~al.(2023)Ahern, Corry, and
+  Paz]{Ahern2023MetacountregressorPyPI}
+Z.~Ahern, P.~Corry, and A.~Paz.
+\newblock {metacountregressor {\textperiodcentered} PyPI}, 2023.
+\newblock URL \url{https://pypi.org/project/metacountregressor/0.1.28/}.
+
+\bibitem[Ahern et~al.(2024)Ahern, Corry, and Rabbani]{Ahern2024ExtensiveModels}
+Z.~Ahern, P.~Corry, and W.~Rabbani.
+\newblock {Extensive hypothesis testing for estimation of crash frequency
+  models}.
+\newblock \emph{Heliyon}, 10, 2024.
+\newblock \doi{10.1016/j.heliyon.2024.e26634}.
+\newblock URL \url{http://creativecommons.org/licenses/by/4.0/}.
+
+\bibitem[Ahmad et~al.(2023)Ahmad, Shah, and
+  Al-Fagih]{Ahmad2023ApplicationsReview}
+F.~Ahmad, Z.~Shah, and L.~Al-Fagih.
+\newblock {Applications of evolutionary game theory in urban road transport
+  network: A state of the art review}.
+\newblock \emph{Sustainable Cities and Society}, 98, 11 2023.
+\newblock ISSN 22106707.
+\newblock \doi{10.1016/j.scs.2023.104791}.
+\newblock URL
+  \url{https://www.scopus.com/pages/publications/85168001204?origin=resultslist}.
+
+\bibitem[Alimo and Agyeman(2026)]{Alimo2026TransactionalSatisfaction}
+P.~K. Alimo and S.~Agyeman.
+\newblock {Transactional stress model of annoyance provocation among women
+  onboard paratransit buses: Travel safety and satisfaction}.
+\newblock \emph{African Transport Studies}, 4, 12 2026.
+\newblock ISSN 29501962.
+\newblock \doi{10.1016/j.aftran.2025.100070}.
+\newblock URL
+  \url{https://www.scopus.com/pages/publications/105021862473?origin=resultslist}.
+
+\bibitem[Allenby and Rossi(1998)]{AllenbyRossi1998Heterogeneity}
+G.~M. Allenby and P.~E. Rossi.
+\newblock {Marketing models of consumer heterogeneity}.
+\newblock \emph{Journal of Econometrics}, 89\penalty0 (1-2):\penalty0 57--78,
+  1998.
+\newblock \doi{10.1016/S0304-4076(98)00055-4}.
+
+\bibitem[Arentze et~al.(2013)Arentze, Ettema, and
+  Timmermans]{Arentze2013MultiDay}
+T.~A. Arentze, D.~Ettema, and H.~J.~P. Timmermans.
+\newblock {Location choice in the context of multi-day activity-travel
+  patterns: model development and empirical results}.
+\newblock \emph{Transportmetrica A: Transport Science}, 2013.
+\newblock \doi{10.1080/18128602.2010.538870}.
+
+\bibitem[Auld and Mohammadian(2011)]{Auld2011PlanningConstrained}
+J.~Auld and A.~Mohammadian.
+\newblock {Planning-constrained destination choice in activity-based model:
+  agent-based dynamic activity planning and travel scheduling}.
+\newblock \emph{Transportation Research Record}, 2254\penalty0 (1):\penalty0
+  170--179, 2011.
+\newblock \doi{10.3141/2254-18}.
+
+\bibitem[{Australian Bureau of Statistics}(2021)]{ABS2021_ASGS}
+{Australian Bureau of Statistics}.
+\newblock Australian statistical geography standard (asgs): Volume 1 -- main
+  structure and greater capital city statistical areas.
+\newblock Technical Report Cat. no. 1270.0.55.001, Australian Bureau of
+  Statistics, 2021.
+
+\bibitem[Bartin et~al.(2023)Bartin, Ozbay, and Xu]{Bartin2023SafetySegments}
+B.~Bartin, K.~Ozbay, and C.~Xu.
+\newblock {Safety performance functions for Two-Lane urban arterial segments}.
+\newblock \emph{Safety Science}, 167:\penalty0 106284, 11 2023.
+\newblock ISSN 0925-7535.
+\newblock \doi{10.1016/J.SSCI.2023.106284}.
+
+\bibitem[Beeramole(2024)]{Beeramole2024SearchlogitPyPI}
+P.~Beeramole.
+\newblock {searchlogit {\textperiodcentered} PyPI}, 2024.
+\newblock URL \url{https://pypi.org/project/searchlogit/}.
+
+\bibitem[Behara et~al.(2021)Behara, Paz, Arndt, and
+  Baker]{Behara2021AQueensland}
+K.~N. Behara, A.~Paz, O.~Arndt, and D.~Baker.
+\newblock {A random parameters with heterogeneity in means and Lindley approach
+  to analyze crash data with excessive zeros: A case study of head-on heavy
+  vehicle crashes in Queensland}.
+\newblock \emph{Accident Analysis {\&} Prevention}, 160:\penalty0 106308, 9
+  2021.
+\newblock ISSN 0001-4575.
+\newblock \doi{10.1016/J.AAP.2021.106308}.
+
+\bibitem[Ben-Akiva and Lerman(1985)]{Ben-Akiva1985DiscreteDemand}
+M.~E. Ben-Akiva and S.~R. Lerman.
+\newblock \emph{{Discrete choice analysis: Theory and application to travel
   demand}}, volume~9.
 \newblock MIT Press, 1985.
 
-\bibitem{Nerella2004Sampling}
-S~Nerella and C~R Bhat.
-\newblock {Numerical analysis of effect of sampling of alternatives in discrete
-  choice models}.
-\newblock {\em Transportation Research Record}, 2004.
+\bibitem[Bernardin et~al.(2009)Bernardin, Koppelman, and
+  Boyce]{Bernardin2009EnhancedCompetition}
+V.~L. Bernardin, F.~Koppelman, and D.~Boyce.
+\newblock {Enhanced Destination Choice Models Incorporating Agglomeration
+  Related to Trip Chaining While Controlling for Spatial Competition}.
+\newblock \emph{Transportation Research Record}, 2132\penalty0 (1):\penalty0
+  143--151, 2009.
+\newblock \doi{10.3141/2132-16}.
 
-\bibitem{Swait1987RandomConstraints}
-J~Swait.
-\newblock {Incorporating random constraints in discrete models of choice set
-  generation}.
-\newblock {\em Transportation Research Part B: Methodological}, 1987.
+\bibitem[Bhat and Koppelman(1993)]{Bhat1993ActivityProgram}
+C.~R. Bhat and F.~S. Koppelman.
+\newblock {A conceptual framework of individual activity program generation}.
+\newblock \emph{Transportation Research Part A}, 1993.
+\newblock \doi{10.1016/0965-8564(93)90050-U}.
 
-\bibitem{Mariante2018Detour}
-G~Leite~Mariante, T-Y Ma, and V~Van~Acker.
-\newblock {Modeling discretionary activity location choice using detour factors
-  and sampling of alternatives for mixed logit models}.
-\newblock {\em Journal of Transport Geography}, 2018.
+\bibitem[Bian et~al.(2025)Bian, Tolford, and Rana~Bhat]{Bian2025DevelopingData}
+R.~Bian, T.~Tolford, and M.~Rana~Bhat.
+\newblock {Developing a statewide active transportation planning dashboard with
+  mobility data}.
+\newblock \emph{Transportation Planning and Technology}, 48\penalty0
+  (1):\penalty0 67--89, 1 2025.
+\newblock ISSN 10290354.
+\newblock \doi{10.1080/03081060.2024.2343901}.
+\newblock URL
+  \url{https://www.tandfonline.com/doi/abs/10.1080/03081060.2024.2343901}.
 
-\bibitem{Board2014Activity-BasedPrimer}
-Transportation~Research Board, {of Sciences Engineering}, and {Medicine}.
-\newblock {\em {Activity-Based Travel Demand Models: A Primer}}.
+\bibitem[Bliemer et~al.(2008)Bliemer, Rose, and
+  Hess]{BliemerRoseHess2008Approx}
+M.~C.~J. Bliemer, J.~M. Rose, and S.~Hess.
+\newblock {Approximation of {Bayesian} efficiency in experimental choice
+  designs}.
+\newblock \emph{Journal of Choice Modelling}, 1\penalty0 (1):\penalty0 98--127,
+  2008.
+
+\bibitem[Board et~al.(2014)Board, {of Sciences Engineering}, and
+  {Medicine}]{Board2014Activity-BasedPrimer}
+T.~R. Board, {of Sciences Engineering}, and {Medicine}.
+\newblock \emph{{Activity-Based Travel Demand Models: A Primer}}.
 \newblock The National Academies Press, 2014.
+\newblock \doi{10.17226/22357}.
 
-\bibitem{Yao2020DataDriven}
-R~Yao and S~Bekhor.
-\newblock {Data-driven choice set generation and estimation of route choice
-  models}.
-\newblock {\em Transportation Research Part C: Emerging Technologies}, 2020.
+\bibitem[Bowman and Ben-Akiva(2001)]{Bowman2001Activity-BasedSchedules}
+J.~L. Bowman and M.~E. Ben-Akiva.
+\newblock {Activity-Based Disaggregate Travel Demand Model System with Activity
+  Schedules}, 2001.
 
-\bibitem{Haghi2026VAEWork}
-H~Haghi, Z~Patterson, and B~Farooq.
+\bibitem[Calastri et~al.(2017)Calastri, Hess, Daly, and
+  Carrasco]{Calastri2017MDCNEV}
+C.~Calastri, S.~Hess, A.~Daly, and J.~A. Carrasco.
+\newblock {Does the social context help with understanding and predicting the
+  choice of activity type and duration? An application of the Multiple
+  Discrete-Continuous Nested Extreme Value model to activity diary data}.
+\newblock \emph{Transportation Research Part A: Policy and Practice},
+  104:\penalty0 1--20, 2017.
+\newblock \doi{10.1016/j.tra.2017.07.003}.
+
+\bibitem[Calastri et~al.(2019)Calastri, Hess, Choudhury, Daly, and
+  Gabrielli]{Calastri2019Mode}
+C.~Calastri, S.~Hess, C.~Choudhury, A.~Daly, and L.~Gabrielli.
+\newblock {Mode choice with latent availability and consideration: Theory and a
+  case study}.
+\newblock \emph{Transportation Research Part B: Methodological}, 123:\penalty0
+  374--385, 2019.
+\newblock \doi{10.1016/j.trb.2017.06.016}.
+
+\bibitem[Chen and Zhou(2016)]{Chen2016EffectsRisk}
+P.~Chen and J.~Zhou.
+\newblock {Effects of the built environment on automobile-involved pedestrian
+  crash frequency and risk}.
+\newblock \emph{Journal of Transport {\&} Health}, 3\penalty0 (4):\penalty0
+  448--456, 12 2016.
+\newblock ISSN 22141405.
+\newblock \doi{10.1016/j.jth.2016.06.008}.
+\newblock URL \url{https://doi.org/10.1016/j.jth.2016.06.008}.
+
+\bibitem[Chen and Lym(2021)]{Chen2021TheOhio}
+Z.~Chen and Y.~Lym.
+\newblock {The influence of built environment on distracted driving related
+  crashes in Ohio}.
+\newblock \emph{Transport Policy}, 101:\penalty0 34--45, 2 2021.
+\newblock ISSN 0967-070X.
+\newblock \doi{10.1016/J.TRANPOL.2020.11.011}.
+
+\bibitem[Cho et~al.(2023)Cho, Chung, and Kim]{Cho2023NeedBased}
+W.~Cho, J.-H. Chung, and J.~Kim.
+\newblock Need-based approach for modeling multiday activity participation
+  patterns and identifying the impact of activity/travel conditions.
+\newblock \emph{Transportation Research Part A: Policy and Practice},
+  172:\penalty0 103665, 2023.
+\newblock \doi{10.1016/j.tra.2023.103665}.
+
+\bibitem[Daly and Hess(2020)]{Daly2020VTT}
+A.~Daly and S.~Hess.
+\newblock {VTT or VTTS: a note on terminology for value of travel time work}.
+\newblock \emph{Transportation}, 47\penalty0 (3):\penalty0 1359--1364, 2020.
+\newblock \doi{10.1007/s11116-018-9966-4}.
+
+\bibitem[de~Bekker-Grob and Hole(2024)]{BekkerGrobHole2024Editorial}
+E.~W. de~Bekker-Grob and A.~R. Hole.
+\newblock {Special issue on choice modelling in health - Editorial}.
+\newblock \emph{Journal of Choice Modelling}, 2024.
+\newblock \doi{10.1016/j.jocm.2024.100492}.
+
+\bibitem[de~Bekker-Grob et~al.(2012)de~Bekker-Grob, Ryan, and
+  Gerard]{BekkerGrobRyanGerard2012Review}
+E.~W. de~Bekker-Grob, M.~Ryan, and K.~Gerard.
+\newblock {Discrete choice experiments in health economics: a review of the
+  literature}.
+\newblock \emph{Health Economics}, 21\penalty0 (2):\penalty0 145--172, 2012.
+\newblock \doi{10.1002/hec.1697}.
+
+\bibitem[de~Bekker-Grob et~al.(2013)de~Bekker-Grob, Rose, and
+  Bliemer]{BekkerGrobRoseBliemer2013Closer}
+E.~W. de~Bekker-Grob, J.~M. Rose, and M.~C.~J. Bliemer.
+\newblock {A closer look at decision and analyst error by including
+  nonlinearities in discrete choice models: implications on willingness-to-pay
+  estimates derived from discrete choice data in healthcare}.
+\newblock \emph{PharmacoEconomics}, 31\penalty0 (12):\penalty0 1169--1183,
+  2013.
+
+\bibitem[Dharmowijoyo et~al.(2014)Dharmowijoyo, Susilo, and
+  Karlstr{\"{o}}m]{Dharmowijoyo2014Day-To-DayCountry}
+D.~B. Dharmowijoyo, Y.~O. Susilo, and A.~Karlstr{\"{o}}m.
+\newblock {Day-To-Day interpersonal and intrapersonal variability of
+  individualsâ€™ activity spaces in a developing country}.
+\newblock \emph{Environment and Planning B: Planning and Design}, 41\penalty0
+  (6):\penalty0 1063--1076, 2014.
+\newblock ISSN 14723417.
+\newblock \doi{10.1068/b130067p}.
+\newblock URL \url{/doi/pdf/10.1068/b130067p?download=true}.
+
+\bibitem[Dick et~al.(1995)Dick, Aloys, and Harry]{Dick1995CompetingDuration}
+E.~Dick, B.~Aloys, and T.~Harry.
+\newblock {Competing risk hazard model of activity choice, timing, sequencing,
+  and duration}.
+\newblock \emph{Transportation Research Record}, 1995.
+\newblock URL
+  \url{https://www.scopus.com/pages/publications/0029333547?origin=resultslist}.
+
+\bibitem[Duren et~al.(2023)Duren, Corrigan, Kennedy, Pollack~Porter, and
+  Ehsani]{Duren2023IdentifyingComponents}
+M.~Duren, B.~Corrigan, R.~D. Kennedy, K.~M. Pollack~Porter, and J.~Ehsani.
+\newblock {Identifying and Assessing Perceived Cycling Safety Components}.
+\newblock \emph{Safety}, 9\penalty0 (4), 2023.
+\newblock ISSN 2313-576X.
+\newblock \doi{10.3390/safety9040075}.
+\newblock URL \url{https://www.mdpi.com/2313-576X/9/4/75}.
+
+\bibitem[Fang et~al.(2024)Fang, Fan, and Yu]{Fang2024APrediction}
+K.~Fang, J.~Fan, and B.~Yu.
+\newblock {A trip-based network travel risk: definition and prediction}.
+\newblock \emph{Annals of Operations Research}, 343:\penalty0 1069--1094, 2024.
+\newblock \doi{10.1007/s10479-022-04630-6}.
+\newblock URL \url{https://doi.org/10.1007/s10479-022-04630-6}.
+
+\bibitem[Gemma et~al.(2022)Gemma, Mannini, Busillo, Cipriani, and
+  Crisalli]{Gemma2022CaseAssignment}
+A.~Gemma, L.~Mannini, V.~Busillo, E.~Cipriani, and U.~Crisalli.
+\newblock {Case studies of integration between activity-based demand models and
+  multimodal assignment}.
+\newblock \emph{Research in Transportation Economics}, 92:\penalty0 101119, 5
+  2022.
+\newblock ISSN 0739-8859.
+\newblock \doi{10.1016/J.RETREC.2021.101119}.
+\newblock URL
+  \url{https://www.sciencedirect.com/science/article/abs/pii/S0739885921000913?utm_source=openai}.
+
+\bibitem[Gibbons and Macfarlane(2025)]{Gibbons2025EvaluatingModel}
+N.~Gibbons and G.~S. Macfarlane.
+\newblock {Evaluating the Impacts of Parameter Uncertainty in a Practical
+  Transportation Demand Model}.
+\newblock \emph{Future Transportation 2025, Vol. 5, Page 15}, 5\penalty0
+  (1):\penalty0 15, 2 2025.
+\newblock ISSN 2673-7590.
+\newblock \doi{10.3390/FUTURETRANSP5010015}.
+\newblock URL \url{https://www.mdpi.com/2673-7590/5/1/15/htm
+  https://www.mdpi.com/2673-7590/5/1/15}.
+
+\bibitem[Golshani et~al.(2018)Golshani, Ramin, Joshua, and
+  Mohammadian]{Golshani2018ActivityModels}
+N.~Golshani, S.~Ramin, A.~Joshua, and A.~Mohammadian.
+\newblock {Activity Start Time and Duration: Incorporating Regret Theory into
+  Joint Discreteâ€"Continuous Models}.
+\newblock \emph{Transportmetrica A: Transport Science}, 14\penalty0
+  (9):\penalty0 809--827, 2018.
+\newblock \doi{10.1080/23249935.2018.1440261}.
+
+\bibitem[G{\"{o}}ssling et~al.(2024)G{\"{o}}ssling, Kees, Hologa, Riach, and
+  von St{\"{u}}lpnagel]{Gossling2024ChildrensSpace}
+S.~G{\"{o}}ssling, J.~Kees, R.~Hologa, N.~Riach, and R.~von St{\"{u}}lpnagel.
+\newblock {Childrenâ€™s safe routes to school: Real and perceived risks,
+  and evidence of an incapacity-incapability space}.
+\newblock \emph{Journal of Cycling and Micromobility Research}, 2:\penalty0
+  100019, 2024.
+\newblock ISSN 2950-1059.
+\newblock \doi{https://doi.org/10.1016/j.jcmr.2024.100019}.
+\newblock URL
+  \url{https://www.sciencedirect.com/science/article/pii/S295010592400010X}.
+
+\bibitem[Haghi et~al.(2026)Haghi, Patterson, and Farooq]{Haghi2026VAEWork}
+H.~Haghi, Z.~Patterson, and B.~Farooq.
 \newblock {Choice Set Generation in Work Destination Choice Modeling with
   Variational Autoencoders}.
-\newblock {\em Transportation Research Record}, 2026.
+\newblock \emph{Transportation Research Record}, 2026.
+\newblock \doi{10.1177/03611981251409202}.
 
-\bibitem{AASHTO2010HighwayManual}
-{AASHTO}.
-\newblock {\em {Highway Safety Manual}}, volume~2.
-\newblock Washington, D.C., 2010.
+\bibitem[Hansen(1959)]{Hansen1959HowManyTrips}
+K.~J. Hansen.
+\newblock How many trips does a traveler make?
+\newblock \emph{Journal of Transport Economics and Policy}, 31\penalty0
+  (3):\penalty0 240--246, 1959.
+\newblock \doi{10.2307/3807205}.
 
-\bibitem{hartley2003multiple}
-Richard Hartley and Andrew Zisserman.
-\newblock {\em Multiple view geometry in computer vision}.
+\bibitem[Haque et~al.(2019)Haque, Choudhury, and Hess]{Haque2019ICMNL}
+M.~B. Haque, C.~Choudhury, and S.~Hess.
+\newblock {Modelling residential location choices with implicit availability of
+  alternatives}.
+\newblock \emph{Journal of Transport and Land Use}, 12\penalty0 (1):\penalty0
+  597--618, 2019.
+\newblock \doi{10.5198/jtlu.2019.1450}.
+
+\bibitem[Hartley and Zisserman(2003)]{hartley2003multiple}
+R.~Hartley and A.~Zisserman.
+\newblock \emph{Multiple view geometry in computer vision}.
 \newblock Cambridge university press, 2003.
 
-\bibitem{dijkstra_algorithm}
-Donald~B. Johnson.
+\bibitem[Hess and Rose(2009)]{HessRose2009Intra}
+S.~Hess and J.~M. Rose.
+\newblock {Allowing for intra-respondent variations in coefficients estimated
+  on repeated choice data}.
+\newblock \emph{Transportation Research Part B: Methodological}, 43\penalty0
+  (6):\penalty0 708--719, 2009.
+\newblock \doi{10.1016/j.trb.2009.01.004}.
+
+\bibitem[Hess et~al.(2026)Hess, Daly, Bliemer, Guevara, Daziano, and
+  Dekker]{Hess2026Significance}
+S.~Hess, A.~Daly, M.~Bliemer, A.~Guevara, R.~Daziano, and T.~Dekker.
+\newblock {Statistical significance in choice modelling: computation, usage and
+  reporting}.
+\newblock \emph{Journal of Choice Modelling}, 60:\penalty0 100611, 2026.
+\newblock \doi{10.1016/j.jocm.2026.100611}.
+
+\bibitem[Huang et~al.(2025)Huang, Gan, Postorino, Wang, and
+  Wu]{Huang2025YoungApproach}
+Y.~Huang, H.~Gan, M.~N. Postorino, K.~Wang, and X.~Wu.
+\newblock {Young people preferences about enhanced transportation services for
+  intercity trips: An integrated choice and latent variable approach}.
+\newblock \emph{Research in Transportation Economics}, 114, 12 2025.
+\newblock ISSN 07398859.
+\newblock \doi{10.1016/j.retrec.2025.101660}.
+\newblock URL
+  \url{https://www.scopus.com/pages/publications/105021128010?origin=resultslist}.
+
+\bibitem[Johnson(1977)]{dijkstra_algorithm}
+D.~B. Johnson.
 \newblock Efficient algorithms for shortest paths in sparse networks.
-\newblock {\em J. ACM}, 24(1):1â€"13, 1977.
+\newblock \emph{J. ACM}, 24\penalty0 (1):\penalty0 1â€"13, 1977.
+\newblock ISSN 0004-5411.
+\newblock \doi{10.1145/321992.321993}.
+
+\bibitem[Khaddar et~al.(2023)Khaddar, Saxena, Fatmi, and
+  Pinjari]{Khaddar2023Episode}
+S.~Khaddar, S.~Saxena, M.~R. Fatmi, and A.~R. Pinjari.
+\newblock {An episode-level joint model for activity engagement, duration, and
+  destination location choice decisions}.
+\newblock \emph{Transportation Letters}, 2023.
+\newblock \doi{10.1080/19427867.2022.2102347}.
+
+\bibitem[Kim et~al.(2016)Kim, Rasouli, and Timmermans]{Kim2016ACars}
+J.~Kim, S.~Rasouli, and H.~Timmermans.
+\newblock {A hybrid choice model with a nonlinear utility function and bounded
+  distribution for latent variables: application to purchase intention
+  decisions of electric cars}.
+\newblock \emph{Transportmetrica A: Transport Science}, 12\penalty0
+  (10):\penalty0 909--932, 2016.
+\newblock ISSN 2324-9935.
+\newblock \doi{10.1080/23249935.2016.1193567}.
+\newblock URL \url{http://dx.doi.org/10.1080/23249935.2016.1193567}.
+
+\bibitem[Kim and Wang(2017)]{Kim2017Duration}
+K.~Kim and L.~Wang.
+\newblock {Activity duration analysis: discrete-time approach for recurrent
+  events, competing risks, and multiple states}.
+\newblock \emph{Transportation Research Record}, 2017.
+\newblock \doi{10.3141/2664-05}.
+
+\bibitem[Leite~Mariante et~al.(2018)Leite~Mariante, Ma, and
+  Van~Acker]{Mariante2018Detour}
+G.~Leite~Mariante, T.-Y. Ma, and V.~Van~Acker.
+\newblock {Modeling discretionary activity location choice using detour factors
+  and sampling of alternatives for mixed logit models}.
+\newblock \emph{Journal of Transport Geography}, 2018.
+\newblock \doi{10.1016/j.jtrangeo.2018.09.003}.
+
+\bibitem[Luan et~al.(2025)Luan, Yang, Shu, Jia, Zheng, and
+  Meng]{Luan2025AnalyzingModel}
+S.~Luan, X.~Yang, W.~Shu, S.~Jia, X.~Zheng, and F.~Meng.
+\newblock {Analyzing the Influence of Risk Perception on Commutersâ€™
+  Travel Mode Choice in Heavy Rainfall: Evidence from Qingdao, China, Using the
+  RGWRR Model}.
+\newblock \emph{Sustainability}, 17\penalty0 (9), 2025.
+\newblock ISSN 2071-1050.
+\newblock \doi{10.3390/su17094188}.
+\newblock URL \url{https://www.mdpi.com/2071-1050/17/9/4188}.
+
+\bibitem[Mishra et~al.(2018)Mishra, Tang, Ghader, Mahapatra, and
+  Zhang]{Mishra2018EstimationApplications}
+S.~Mishra, L.~Tang, S.~Ghader, S.~Mahapatra, and L.~Zhang.
+\newblock {Estimation and valuation of travel time reliability for
+  transportation planning applications}.
+\newblock \emph{Case Studies on Transport Policy}, 6\penalty0 (1):\penalty0
+  51--62, 2018.
+\newblock ISSN 2213-624X.
+\newblock \doi{https://doi.org/10.1016/j.cstp.2017.11.005}.
+\newblock URL
+  \url{https://www.sciencedirect.com/science/article/pii/S2213624X17300263}.
+
+\bibitem[Mladenovic and Trifunovic(2014)]{Mladenovic2014TheProcess}
+M.~Mladenovic and A.~Trifunovic.
+\newblock {The shortcomings of the conventional four step travel demand
+  forecasting process}.
+\newblock \emph{Journal of Road and Traffic Engineering}, 60\penalty0
+  (1):\penalty0 5--12, 2014.
+
+\bibitem[Nayak and Pandit(2023)]{Nayak2023ANetworks}
+S.~Nayak and D.~Pandit.
+\newblock {A joint and simultaneous prediction framework of weekday and weekend
+  daily-activity travel pattern using conditional dependency networks}.
+\newblock \emph{Travel Behaviour and Society}, 32:\penalty0 100595, 7 2023.
+\newblock ISSN 2214-367X.
+\newblock \doi{10.1016/J.TBS.2023.100595}.
+\newblock URL
+  \url{https://www.sciencedirect.com/science/article/abs/pii/S2214367X23000467?utm_source=openai}.
+
+\bibitem[Nerella and Bhat(2004)]{Nerella2004Sampling}
+S.~Nerella and C.~R. Bhat.
+\newblock {Numerical analysis of effect of sampling of alternatives in discrete
+  choice models}.
+\newblock \emph{Transportation Research Record}, 2004.
+\newblock \doi{10.3141/1894-02}.
+
+\bibitem[Newman(2021)]{LarchExampvilleDocs}
+J.~Newman.
+\newblock {Exampville simulator (Larch v5.7.0 travel-model example: simulated
+  data, mode choice, logsums, destination choice)}.
+\newblock \url{https://larch.newman.me/v5.7.0/example/exampville.html}, 2021.
+
+\bibitem[Nurul~Habib et~al.(2009)Nurul~Habib, Day, and
+  Miller]{NurulHabib2009AnModel}
+K.~M. Nurul~Habib, N.~Day, and E.~J. Miller.
+\newblock {An investigation of commuting trip timing and mode choice in the
+  Greater Toronto Area: Application of a joint discrete-continuous model}.
+\newblock \emph{Transportation Research Part A: Policy and Practice},
+  43\penalty0 (7):\penalty0 639--653, 2009.
+\newblock ISSN 09658564.
+\newblock \doi{10.1016/j.tra.2009.05.001}.
+\newblock URL
+  \url{https://www.scopus.com/pages/publications/67650708018?origin=resultslist}.
+
+\bibitem[Palma et~al.(2021)Palma, Enam, Hess, Calastri, and Crastes~dit
+  Sourd]{Palma2021MDCEV}
+D.~Palma, A.~Enam, S.~Hess, C.~Calastri, and R.~Crastes~dit Sourd.
+\newblock {Modelling multiple occurrences of activities during a day: an
+  extension of the MDCEV model}.
+\newblock \emph{Transportmetrica B: Transport Dynamics}, 9\penalty0
+  (1):\penalty0 456--478, 2021.
+\newblock \doi{10.1080/21680566.2021.1900755}.
+
+\bibitem[Paz et~al.(2015)Paz, Molano, Martinez, Gaviria, and
+  Arteaga]{Paz2015CalibrationAlgorithm}
+A.~Paz, V.~Molano, E.~Martinez, C.~Gaviria, and C.~Arteaga.
+\newblock {Calibration of traffic flow models using a memetic algorithm}.
+\newblock \emph{Transportation Research Part C: Emerging Technologies},
+  55:\penalty0 432--443, 6 2015.
+\newblock ISSN 0968090X.
+\newblock \doi{10.1016/j.trc.2015.03.001}.
+\newblock URL
+  \url{https://linkinghub.elsevier.com/retrieve/pii/S0968090X15000807}.
+
+\bibitem[Perera and Bell(2026)]{Perera2026Data}
+S.~Perera and M.~Bell.
+\newblock Beyond the four-step model: Structural differences and a data
+  integration framework for activity-based transport modelling.
+\newblock In \emph{Australasian Transport Research Forum 2026 Proceedings},
+  Sydney, Australia, November 2026.
+
+\bibitem[Phan et~al.(2022)Phan, Vu, and Miller]{Phan2022NewApproach}
+D.~T. Phan, H.~L. Vu, and E.~J. Miller.
+\newblock {A new approach to improve destination choice by ranking personal
+  preferences}.
+\newblock \emph{Transportation Research Part C: Emerging Technologies}, 143,
+  2022.
+\newblock \doi{10.1016/j.trc.2022.103817}.
+
+\bibitem[Pulugurtha et~al.(2013)Pulugurtha, Duddu, and
+  Kotagiri]{Pulugurtha2013TrafficCharacteristics}
+S.~S. Pulugurtha, V.~R. Duddu, and Y.~Kotagiri.
+\newblock {Traffic analysis zone level crash estimation models based on land
+  use characteristics}.
+\newblock \emph{Accident Analysis and Prevention}, 50:\penalty0 678--687, 1
+  2013.
+\newblock ISSN 00014575.
+\newblock \doi{10.1016/j.aap.2012.06.016}.
+\newblock URL \url{https://www.scopus.com/pages/publications/84870290120}.
+
+\bibitem[Qin et~al.(2025)Qin, Van~de Weghe, and Huang]{Qin2025TheReview}
+T.~Qin, N.~Van~de Weghe, and H.~Huang.
+\newblock {The role of urban built environments in the perception of safety: A
+  systematic review}.
+\newblock \emph{Environmental Impact Assessment Review}, 114:\penalty0 107915,
+  7 2025.
+\newblock ISSN 0195-9255.
+\newblock \doi{10.1016/J.EIAR.2025.107915}.
+\newblock URL
+  \url{https://www.sciencedirect.com/science/article/pii/S019592552500112X}.
+
+\bibitem[Rahnasto and Hollestelle(2024)]{Rahnasto2024ComparingChoice}
+I.~Rahnasto and M.~Hollestelle.
+\newblock {Comparing discrete choice and machine learning models in predicting
+  destination choice}.
+\newblock \emph{European Transport Research Review 2024 16:1}, 16\penalty0
+  (1):\penalty0 43--, 8 2024.
+\newblock ISSN 1866-8887.
+\newblock \doi{10.1186/S12544-024-00667-9}.
+\newblock URL
+  \url{https://link.springer.com/article/10.1186/s12544-024-00667-9}.
+
+\bibitem[Recker et~al.(1986)Recker, McNally, and Root]{Recker1986ComplexTravel}
+W.~W. Recker, M.~G. McNally, and G.~S. Root.
+\newblock {A model of complex travel behavior: Part I-Theoretical development}.
+\newblock \emph{Transportation Research Part A: General}, 1986.
+\newblock \doi{10.1016/0191-2607(86)90089-0}.
+
+\bibitem[Ren and Chow(2022)]{Ren2022ASet}
+X.~Ren and J.~Y. Chow.
+\newblock {A random-utility-consistent machine learning method to estimate
+  agentsâ€™ joint activity scheduling choice from a ubiquitous data set}.
+\newblock \emph{Transportation Research Part B: Methodological}, 166:\penalty0
+  396--418, 12 2022.
+\newblock ISSN 0191-2615.
+\newblock \doi{10.1016/J.TRB.2022.11.005}.
+\newblock URL
+  \url{https://www.sciencedirect.com/science/article/pii/S0191261522001862?utm_source=openai}.
+
+\bibitem[Roorda et~al.(2008)Roorda, Miller, and
+  Habib]{Roorda2008ValidationModel}
+M.~J. Roorda, E.~J. Miller, and K.~M.~N. Habib.
+\newblock {Validation of TASHA: A 24-h activity scheduling microsimulation
+  model}.
+\newblock \emph{Transportation Research Part A: Policy and Practice},
+  42\penalty0 (2):\penalty0 360--375, 2008.
+\newblock ISSN 0965-8564.
+\newblock \doi{https://doi.org/10.1016/j.tra.2007.10.004}.
+\newblock URL
+  \url{https://www.sciencedirect.com/science/article/pii/S0965856407000924}.
+
+\bibitem[Rose et~al.(2008)Rose, Bliemer, Hensher, and
+  Collins]{RoseBliemerHensherCollins2008Designing}
+J.~M. Rose, M.~C.~J. Bliemer, D.~A. Hensher, and A.~T. Collins.
+\newblock {Designing efficient stated choice experiments in the presence of
+  reference alternatives}.
+\newblock \emph{Transportation Research Part B: Methodological}, 42\penalty0
+  (4):\penalty0 395--406, 2008.
+\newblock \doi{10.1016/j.trb.2007.09.002}.
+
+\bibitem[Srinivasan and Bhat(2005)]{Srinivasan2005ModelingParticipation}
+S.~Srinivasan and C.~R. Bhat.
+\newblock {Modeling household interactions in daily in-home and out-of-home
+  maintenance activity participation}.
+\newblock \emph{Transportation}, 32\penalty0 (5):\penalty0 523--544, 9 2005.
+\newblock ISSN 00494488.
+\newblock \doi{10.1007/s11116-005-5329-z}.
+\newblock URL
+  \url{https://www.scopus.com/pages/publications/23144439236?origin=resultslist}.
+
+\bibitem[Swain et~al.(2024)Swain, Oswin, Truelove, and
+  Larue]{Swain2024ChildrensTravel}
+R.~Swain, P.~Oswin, V.~Truelove, and G.~S. Larue.
+\newblock {Childrenâ€™s and parentsâ€™ perceptions on safe routes to
+  schools: a mixed-methods study investigating factors influencing active
+  school travel}.
+\newblock \emph{Journal of Urban Design}, 29\penalty0 (2):\penalty0 208--230,
+  2024.
+\newblock \doi{10.1080/13574809.2023.2223517}.
+\newblock URL \url{https://doi.org/10.1080/13574809.2023.2223517}.
+
+\bibitem[Swait(1987)]{Swait1987RandomConstraints}
+J.~Swait.
+\newblock {Incorporating random constraints in discrete models of choice set
+  generation}.
+\newblock \emph{Transportation Research Part B: Methodological}, 1987.
+\newblock \doi{10.1016/0191-2615(87)90009-9}.
+
+\bibitem[Swait and Ben-Akiva(1987)]{SwaitBenAkiva1987PLC}
+J.~Swait and M.~Ben-Akiva.
+\newblock {Empirical test of a constrained choice discrete model: mode choice
+  in Sao Paulo, Brazil}.
+\newblock \emph{Transportation Research Part B: Methodological}, 21\penalty0
+  (2):\penalty0 103--115, 1987.
+\newblock \doi{10.1016/0191-2615(87)90010-5}.
+
+\bibitem[Tokat et~al.(2026)Tokat, Tommasi, Ceschi, Oviedo-Trespalacios, and
+  Sartori]{Tokat2026FromSafety}
+T.~Tokat, F.~Tommasi, A.~Ceschi, O.~Oviedo-Trespalacios, and R.~Sartori.
+\newblock {From work environment to roadway: A narrative review on
+  organizational psychologyâ€™s role in road safety}.
+\newblock \emph{Transportation Research Interdisciplinary Perspectives},
+  36:\penalty0 101867, 3 2026.
+\newblock ISSN 2590-1982.
+\newblock \doi{10.1016/J.TRIP.2026.101867}.
+\newblock URL
+  \url{https://www.sciencedirect.com/science/article/pii/S2590198226000321}.
+
+\bibitem[Tzouras et~al.(2025)Tzouras, Pastia, Kaparias, and
+  Kepaptsoglou]{Tzouras2025ExploringChoices}
+P.~G. Tzouras, V.~Pastia, I.~Kaparias, and K.~Kepaptsoglou.
+\newblock {Exploring the effect of perceived safety in first/last mile mode
+  choices}.
+\newblock \emph{Transportation}, 52\penalty0 (5):\penalty0 2145--2183, 10 2025.
+\newblock ISSN 15729435.
+\newblock \doi{10.1007/s11116-024-10487-4}.
+
+\bibitem[Ukkusuri et~al.(2012)Ukkusuri, Miranda-Moreno, Ramadurai, and
+  Isa-Tavarez]{Ukkusuri2012TheFrequency}
+S.~Ukkusuri, L.~F. Miranda-Moreno, G.~Ramadurai, and J.~Isa-Tavarez.
+\newblock {The role of built environment on pedestrian crash frequency}.
+\newblock \emph{Safety Science}, 50\penalty0 (4):\penalty0 1141--1151, 4 2012.
+\newblock ISSN 0925-7535.
+\newblock \doi{10.1016/J.SSCI.2011.09.012}.
+
+\bibitem[Van~den Berg et~al.(2012)Van~den Berg, Arentze, and
+  Timmermans]{VandenBerg2012ADuration}
+P.~Van~den Berg, T.~Arentze, and H.~Timmermans.
+\newblock {A latent class accelerated hazard model of social activity
+  duration}.
+\newblock \emph{Transportation Research Part A: Policy and Practice},
+  46\penalty0 (1):\penalty0 12--21, 2012.
+\newblock ISSN 09658564.
+\newblock \doi{10.1016/j.tra.2011.09.015}.
+\newblock URL
+  \url{https://www.scopus.com/pages/publications/80053447781?origin=resultslist}.
+
+\bibitem[Volakakis et~al.(2025)Volakakis, Said, Chen, and
+  Mahmassani]{Volakakis2025IntegratingChoice}
+V.~Volakakis, M.~Said, Y.~Chen, and H.~S. Mahmassani.
+\newblock {Integrating choice and predictive theories: a comparative study of
+  set generation and machine learning in consideration set modeling}.
+\newblock \emph{Data Science for Transportation}, 7:\penalty0 21, 2025.
+\newblock \doi{10.1007/s42421-025-00138-0}.
+
+\bibitem[Walker and Ben-Akiva(2002)]{Walker2002GeneralizedModel}
+J.~Walker and M.~Ben-Akiva.
+\newblock {Generalized random utility model}.
+\newblock \emph{Mathematical Social Sciences}, 43\penalty0 (3):\penalty0
+  303--343, 2002.
+\newblock ISSN 0165-4896.
+\newblock \doi{10.1016/s0165-4896(02)00023-9}.
+\newblock URL \url{http://dx.doi.org/10.1016/s0165-4896(02)00023-9}.
+
+\bibitem[Wang et~al.(2016)Wang, Yang, Lee, Ji, and
+  You]{Wang2016Macro-levelChina}
+X.~Wang, J.~Yang, C.~Lee, Z.~Ji, and S.~You.
+\newblock {Macro-level safety analysis of pedestrian crashes in Shanghai,
+  China}.
+\newblock \emph{Accident Analysis {\&} Prevention}, 96\penalty0 (1):\penalty0
+  12--21, 11 2016.
+\newblock ISSN 00014575.
+\newblock \doi{10.1016/j.aap.2016.07.028}.
+\newblock URL \url{https://doi.org/10.3141/2432-06}.
+
+\bibitem[Xu et~al.(2018)Xu, Kang, and Chen]{Xu2018RandomUtility}
+Z.~Xu, J.~E. Kang, and R.~Chen.
+\newblock {A random utility based estimation framework for the household
+  activity pattern problem}.
+\newblock \emph{Transportation Research Part A: Policy and Practice}, 2018.
+\newblock \doi{10.1016/j.tra.2018.01.036}.
+
+\bibitem[Yao and Bekhor(2020)]{Yao2020DataDriven}
+R.~Yao and S.~Bekhor.
+\newblock {Data-driven choice set generation and estimation of route choice
+  models}.
+\newblock \emph{Transportation Research Part C: Emerging Technologies}, 2020.
+\newblock \doi{10.1016/j.trc.2020.102832}.
+
+\bibitem[Yao and Bekhor(2022)]{Yao2022VAE}
+R.~Yao and S.~Bekhor.
+\newblock {A variational autoencoder approach for choice set generation and
+  implicit perception of alternatives in choice modeling}.
+\newblock \emph{Transportation Research Part B: Methodological}, 158:\penalty0
+  273--294, 2022.
+\newblock \doi{10.1016/j.trb.2022.02.015}.
+
+\bibitem[Zong et~al.(2016)Zong, Wang, Jia, Jiao, and
+  Wu]{Zong2016PredictionRegression}
+F.~Zong, Z.~Z. Wang, H.~F. Jia, Y.~L. Jiao, and Y.~Wu.
+\newblock {Prediction of commuter's daily activity-travel duration time with
+  support vector regression}.
+\newblock \emph{Jilin Daxue Xuebao (Gongxueban)/Journal of Jilin University
+  (Engineering and Technology Edition)}, 46\penalty0 (2):\penalty0 406--411, 3
+  2016.
+\newblock ISSN 16715497.
+\newblock \doi{10.13229/j.cnki.jdxbgxb201602011}.
+\newblock URL
+  \url{https://www.scopus.com/pages/publications/84964007924?origin=resultslist}.
 
 \end{thebibliography}

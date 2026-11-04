@@ -1,0 +1,90 @@
+#!/bin/bash -l
+#PBS -N paper_assets
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ncpus=2:mem=16gb
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# Refuse to run outside PBS: keep all compute off the login/head node.
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+
+# Regenerate the paper assets from the 61b (segment-grouped) run and copy
+# them into the manuscript tree. Submit with a dependency so it only runs
+# after the model job succeeds:
+#   qsub -W depend=afterok:<61b jobid> 63_paper_assets.pbs
+#
+# Why a separate job: the model run takes hours, and regenerating from a
+# partial run would put the wrong numbers in the paper. This job reads the
+# COMPLETED results_seg/ artefacts, rebuilds the movement figure and the
+# coefficient/prediction tables (scripts/63), and copies every figure the
+# manuscript references into manuscript/figures and manuscript/results.
+set -u
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+cd "$PROJ_DIR" || exit 1
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export PYTHONIOENCODING=utf-8
+
+echo "paper assets on $(hostname) at $(date)"
+
+# Inputs must exist and the handoff gate must have passed: a failed gate
+# means the surface is not shippable and the paper must not use it.
+for f in results_seg/game_day_model_coefs.csv \
+         results_seg/game_day_holdout_metrics.json \
+         results_seg/game_day_mip_plans.csv \
+         results_seg/game_day_mip.tex; do
+  [ -s "$f" ] || { echo "FATAL: missing $f"; exit 1; }
+done
+python - <<'PY'
+import json, sys
+a = json.load(open("results_seg/game_day_holdout_metrics.json"))["audit"]
+h = a.get("handoff") or {}
+print("handoff:", {k: h.get(k) for k in
+                   ("pass", "pearson_min", "top20_coverage_mean",
+                    "top20_jaccard")})
+if not h.get("pass"):
+    print("FATAL: handoff gate did not pass; refusing to update the paper")
+    sys.exit(1)
+PY
+[ $? -ne 0 ] && exit 1
+
+python -u scripts/63_paper_game_day_assets.py \
+  --plans results_seg/game_day_mip_plans.csv \
+  --coefs results_seg/game_day_model_coefs.csv \
+  --metrics results_seg/game_day_holdout_metrics.json \
+  --fig-out figures/game_day_movement.png \
+  --tex-out results_seg/game_day_model_coefs.tex \
+  --pred-tex-out results_seg/game_day_predict.tex || exit 1
+
+# Copy every asset the manuscript references (61b figures live in
+# figures_seg/, the generated movement figure in figures/).
+for f in game_day_search_convergence.png game_day_calibration.png \
+         game_day_pred_vs_actual.png game_day_surfaces.png \
+         game_day_sd_loop.png \
+         game_day_coefs.png game_day_mip_coverage.png game_day_mip_map.png \
+         game_day_mip_summary.png; do
+  if [ -s "figures_seg/$f" ]; then
+    cp -f "figures_seg/$f" "manuscript/figures/$f"
+    cp -f "figures_seg/$f" "figures/$f"
+  else
+    echo "WARN: figures_seg/$f missing"
+  fi
+done
+cp -f figures/game_day_movement.png manuscript/figures/game_day_movement.png
+cp -f results_seg/game_day_model_coefs.tex manuscript/results/game_day_model_coefs.tex
+cp -f results_seg/game_day_predict.tex manuscript/results/game_day_predict.tex
+cp -f results_seg/game_day_mip.tex manuscript/results/game_day_mip.tex
+cp -f results_seg/game_day_mathprog.tex manuscript/results/game_day_mathprog.tex
+
+echo "copied assets into manuscript/; run 63 locally or update prose next"
+echo "done at $(date)"

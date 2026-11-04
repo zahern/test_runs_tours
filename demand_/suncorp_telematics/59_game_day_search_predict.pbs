@@ -1,10 +1,16 @@
 #!/bin/bash -l
 #PBS -N suncorp_gameday
 #PBS -l walltime=08:00:00
-#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -l select=1:ncpus=4:mem=96GB
 #PBS -j oe
 #PBS -m abe
 #PBS -r y
+
+# Refuse to run outside PBS: keep all compute off the login/head node.
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
 
 set -euo pipefail
 
@@ -22,17 +28,21 @@ conda activate zigenv
 module unload Anaconda3
 
 export PYTHONWARNINGS="ignore::RuntimeWarning"
-export OMP_NUM_THREADS=8
-export OPENBLAS_NUM_THREADS=8
-export MKL_NUM_THREADS=8
+export OMP_NUM_THREADS=2
+export OPENBLAS_NUM_THREADS=2
+export MKL_NUM_THREADS=2
 export JAX_PLATFORMS=cpu
 
 cd "$SCRIPT_DIR"
 
-python -m pip install --upgrade metacountregressor \
-  || { echo "FATAL: latest metacountregressor install from PyPI failed"; exit 1; }
-python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,159), v" \
-  || { echo "FATAL: metacountregressor older than 1.0.159 or import failed (chunked search needs run(max_time=, refit=) + SearchOutputConfig checkpointing)"; exit 1; }
+# PyPI first; compute-node DNS to PyPI has been observed to fail, so fall
+# back to the latest wheel staged on the shared filesystem (offline-proof).
+python -m pip install --upgrade --retries 2 --timeout 20 metacountregressor \
+  || python -m pip install --upgrade --no-index \
+       --find-links /home/ahernz/suncorp_wheels metacountregressor \
+  || { echo "FATAL: metacountregressor install failed (PyPI and staged wheel)"; exit 1; }
+python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,188), v; assert v==getattr(m,'__version__','?'), 'torn install: dist '+v+' != module '+str(getattr(m,'__version__','?'))" \
+  || { echo "FATAL: metacountregressor older than 1.0.188 or import failed (chunked search needs run(max_time=, refit=) + SearchOutputConfig checkpointing)"; exit 1; }
 
 echo "=================================================================="
 echo "Job $PBS_JOBID started on $(hostname) at $(date)"
@@ -48,8 +58,9 @@ echo "=================================================================="
 SEARCH_ARGS=(
   --search-iters 120 --search-chunk 25 --chunk-time 3600
   --wall-budget 18000 --n-starts 2
-  --search-R 40 --refit-R 200 --search-vars slim
+  --search-R 40 --refit-R 100 --search-vars slim
   --target trips_mean_gt_10
+  --prune-p 0.05
 )
 [ -s "$RESULTS_DIR/game_day_search_best.json" ] && SEARCH_ARGS+=(--resume)
 echo "Search resume: $([ -s "$RESULTS_DIR/game_day_search_best.json" ] && echo on || echo off)"
@@ -62,6 +73,19 @@ echo "Search resume: $([ -s "$RESULTS_DIR/game_day_search_best.json" ] && echo o
 # --search-iters total iterations are reached. R=40 on the <=100k-row sampled
 # train frame keeps each fit ~4x cheaper than the old 200k-row/R=80 run that
 # OOM'd at 66.7GB.
+#
+# Refit envelope (2026-10-16 OOM post-mortem): the step-4 JAX refit allocates
+# ~N x R x draws and OOM'd this script at 64GB with --refit-R 200 and 8 BLAS
+# threads on the newly searched (heavier) spec. The 61 job refit the SAME spec
+# in 96GB at R=100/OMP=2 (peak 72.5GB). Keep mem=96GB, OMP=2, refit-R<=100;
+# refit_only now also honours the N*R>12M low-mem guard instead of pinning
+# DE-vmap+SLSQP on unconditionally.
+#
+# --prune-p 0.05 mirrors the 61-launched shipped run (log o26809162 lines
+# 424/449: count model nothing to drop; propensity drops logexp + evu_x_att).
+# The 2026-10-16 14:31 rerun WITHOUT it shipped the unpruned propensity and
+# drifted from the shipped metrics (calibration_slope 1.022 vs 1.059), so the
+# flag belongs in the standalone script too.
 python -u 59_game_day_search_predict.py "${SEARCH_ARGS[@]}" 2>&1
 
 for f in game_day_pred_15min.parquet game_day_holdout_metrics.json \

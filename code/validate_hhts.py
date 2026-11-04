@@ -32,6 +32,102 @@ PURPOSES = ['work','edu','social','escort','shopping','othmaint','othdiscr','eat
 MODE_NAMES  = {1:'DA', 2:'SR', 3:'Walk', 4:'Bike', 5:'Transit'}
 TIME_LABELS = ['early','am_peak','midday','pm_peak','evening','late']
 
+# Profile panels (ActivitySim-style): the HHTS day opens at 04:00 and the
+# tour-length distribution is reported in fixed distance bands.
+PROFILE_HOUR_LO, PROFILE_HOUR_HI = 4, 24
+PROFILE_HOUR_LABELS = [f'{h:02d}' for h in range(PROFILE_HOUR_LO, PROFILE_HOUR_HI)]
+LENGTH_EDGES_KM = [0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, np.inf]
+LENGTH_BIN_LABELS = ['0-1 km', '1-2 km', '2-5 km', '5-10 km',
+                     '10-20 km', '20-40 km', '40+ km']
+
+
+def _stage_title(stage) -> str:
+    """Readable heading for numeric and named validation results."""
+    named = {'5b': 'Stage 5b',
+             'profiles': 'Time-of-day and trip-length profiles'}
+    return named.get(str(stage), f'Stage {stage}')
+
+
+def _hour_shares(minutes, time_col: str = 'STARTIME'):
+    """Share of records departing in each hourly bin, in percent."""
+    vals = pd.to_numeric(pd.Series(minutes), errors='coerce').dropna()
+    vals = vals.to_numpy(dtype=float)
+    n_bins = len(PROFILE_HOUR_LABELS)
+    if vals.size == 0:
+        return np.zeros(n_bins), PROFILE_HOUR_LABELS
+    vals = np.clip(vals, PROFILE_HOUR_LO * 60.0, PROFILE_HOUR_HI * 60.0 - 1e-6)
+    idx = np.floor(vals / 60.0).astype(int) - PROFILE_HOUR_LO
+    counts = np.bincount(idx, minlength=n_bins)[:n_bins]
+    return counts / vals.size * 100.0, PROFILE_HOUR_LABELS
+
+
+def _length_bin_shares(values) -> np.ndarray:
+    """Share of records in each fixed distance band, in percent."""
+    vals = pd.to_numeric(pd.Series(values), errors='coerce').dropna()
+    vals = np.clip(vals.to_numpy(dtype=float), 0.0, None)
+    if vals.size == 0:
+        return np.zeros(len(LENGTH_BIN_LABELS))
+    counts, _ = np.histogram(vals, bins=np.asarray(LENGTH_EDGES_KM, dtype=float))
+    return counts / vals.size * 100.0
+
+
+def _js_divergence(p, q) -> float:
+    """Jensen-Shannon divergence (natural log) between two distributions."""
+    p = np.asarray(p, dtype=float)
+    q = np.asarray(q, dtype=float)
+    p = p / p.sum() if p.sum() > 0 else p
+    q = q / q.sum() if q.sum() > 0 else q
+    m = 0.5 * (p + q)
+
+    def _kl(a, b):
+        mask = a > 0
+        if not mask.any():
+            return 0.0
+        return float(np.sum(a[mask] * np.log(a[mask] /
+                                            np.where(b[mask] > 0, b[mask], 1e-12))))
+
+    return 0.5 * (_kl(p, m) + _kl(q, m))
+
+
+def _json_safe(value):
+    """Coerce numpy/pandas scalars and containers to JSON-safe values."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.ndarray):
+        return [_json_safe(v) for v in value.tolist()]
+    if isinstance(value, (float, np.floating)):
+        return float(value) if np.isfinite(value) else None
+    return value
+
+
+def write_metrics_json(results: list, out_dir: str) -> str:
+    """Persist the per-stage validation metrics for the dashboard build.
+
+    The observed-versus-predicted figures are only readable by a human; the
+    same numbers are written here so the SimWrapper validation dashboard
+    (build_validation_dashboard.py) can chart and tabulate them.
+    """
+    payload = {'stages': []}
+    for res in results or []:
+        if not isinstance(res, dict):
+            continue
+        metrics = {k: v for k, v in (res.get('metrics') or {}).items()
+                   if not isinstance(v, (pd.DataFrame, pd.Series))}
+        payload['stages'].append({
+            'stage': _json_safe(res.get('stage')),
+            'metrics': _json_safe(metrics),
+            'plots': [os.path.relpath(p, out_dir)
+                      for p in (res.get('plots') or []) if isinstance(p, str)],
+        })
+    path = os.path.join(out_dir, 'validation_metrics.json')
+    with open(path, 'w', encoding='utf-8') as fh:
+        json.dump(payload, fh, indent=2)
+    return path
+
 
 # ---------------------------------------------------------------------------
 # STAGE 1 — activity frequency
@@ -145,6 +241,23 @@ def validate_stage1(out: dict, models: dict, save_dir: str) -> dict:
         'n_ptypes': len(data['ptype'].unique()),
     }
 
+    # Per-purpose observed and predicted means, for the validation dashboard
+    try:
+        _pm = []
+        for _p in S1_PURPS:
+            _col = f'n_{_p}_out'
+            if _col in data.columns and _col in pred.columns:
+                _pm.append({
+                    'purpose': _p,
+                    'observed': float(pd.to_numeric(
+                        data[_col], errors='coerce').mean()),
+                    'predicted': float(pd.to_numeric(
+                        pred[_col], errors='coerce').mean()),
+                })
+        metrics['purpose_means'] = _pm
+    except Exception as _pme:
+        logger.debug(f"  Stage 1 purpose-mean export failed: {_pme}")
+
     return {'stage': 1, 'plots': figs, 'metrics': metrics}
 
 
@@ -238,22 +351,59 @@ def validate_stage3(out: dict, models: dict, save_dir: str) -> dict:
     """
     Compare predicted activity durations to observed.
 
-    In-sample validation: the fitted BudgetLognormal models are applied DIRECTLY
-    to the same HHTS activity records used for estimation (not re-generated from
+    In-sample validation: the fitted duration models are applied DIRECTLY to
+    the same HHTS activity records used for estimation (not re-generated from
     person-day expansion, which introduces activity-count mismatch errors).
-    This gives the true in-sample fit — any residual differences are from the
-    model's functional form, not from activity-count generation noise.
+
+    The draws then go through the reconciliation the pipeline itself runs
+    before Stage 4 (``reconcile_predicted_durations``: floors, the day-window
+    and budget ceiling, discretionary growth, soft ceiling), using each
+    person's observed day window.  The panel therefore reports the durations a
+    run emits rather than the raw model draws; the raw draw stays plotted
+    alongside so the effect of the reconciliation is visible.
+
+    Two conditions decide whether a bias here is model error at all, and both
+    are reported: the design matrix is rebuilt from the same GA columns the
+    models were fitted on (anything still absent is imputed at the training
+    mean and named in the summary CSV), and the observed comparator is capped
+    to the purpose's legal band, the support the model was fitted on and the
+    pipeline clips to.
     """
     from stage3_activity_duration import (
         prepare_duration_data as prep_s3,
         _augment_duration_features,
         _feature_cols,
+        duration_design_matrix,
+        reconcile_predicted_durations,
+        DURATION_BOUNDS,
     )
 
-    logger.info("  [validate] Stage 3 — activity duration (direct in-sample)")
+    logger.info("  [validate] Stage 3 — activity duration "
+                "(in-sample draws, production reconciliation)")
     data = _augment_duration_features(
         prep_s3(out["tours"], out["persons"], trips=out.get("trips"))
     )
+    # Rebuild the GA-search columns the models were fitted on (is_female,
+    # vehicle/age flags, *_acc accessibility, ...).  Estimation calls this
+    # before fitting; without it every such feature is absent here and the
+    # design matrix has to impute it, which is the one difference between the
+    # estimation and validation frames.
+    _feat_by_purpose = {
+        p: list(e.get('features') or [])
+        for p, e in (models or {}).items() if isinstance(e, dict)
+    }
+    try:
+        from ga_hypothesis_testing import ensure_ga_search_columns
+        _pt = {str(f) for fs in _feat_by_purpose.values() for f in fs
+               if str(f).startswith('ptype_')}
+        _attrs = dict(data.attrs)
+        data = ensure_ga_search_columns(
+            data, out.get('persons'), ptype_subset=_pt or None,
+            stage_id=3, zone_col='DESTSA2_2021')
+        data.attrs.update(_attrs)
+    except Exception as _enr_exc:
+        logger.warning(f"  Stage 3: GA column enrichment unavailable "
+                       f"({_enr_exc}); absent features are imputed")
 
     figs    = []
     metrics = {}
@@ -280,88 +430,142 @@ def validate_stage3(out: dict, models: dict, save_dir: str) -> dict:
             data[f'ptype_{pt}'] = (data['ptype'] == pt).astype(float)
 
     # ── per-purpose direct model application ──────────────────────────────
-    # Root cause of prior obs-vs-pred gap: validation used activity re-generation
-    # (predict_activity_durations) which synthesises activities from person-day
-    # counts — the number and mix of activities can differ from the HHTS.
-    # Fix: apply each fitted BudgetLognormal directly to the HHTS rows.
+    # Root cause of the prior obs-vs-pred gap: validation used activity
+    # re-generation (predict_activity_durations), which synthesises activities
+    # from person-day counts — the number and mix of activities can differ
+    # from the HHTS.  Fix: apply each fitted duration model directly to the
+    # HHTS rows, then reconcile exactly as prediction does.
+    pred_raw = np.full(len(data), np.nan, dtype=float)
+    imputed_by_purpose = {}
+    for purp in purposes:
+        mask = (data[purpose_col] == purp).to_numpy()
+        if not mask.any() or purp not in models:
+            continue
+        subset = data[mask].copy()
+        entry  = models[purp]
+        # models[purp] is a dict {'model': ..., 'features': [...], ...}
+        m = entry.get('model') if isinstance(entry, dict) else entry
+        if m is None:
+            continue
+        try:
+            ptypes = sorted(data['ptype'].dropna().unique().tolist()) \
+                if 'ptype' in data.columns else []
+            # Prefer stored feature names (set during fit) so ordering/count
+            # exactly matches what the model was trained on.  Also fall back
+            # to the 'features' list stored alongside the model in the dict.
+            model_feats = (getattr(m, 'feature_names_', None)
+                           or (entry.get('features') if isinstance(entry, dict) else None))
+            if model_feats is None:
+                feats  = _feature_cols(data, ptypes, feature_override=None)
+                model_feats = [f for f in feats if f in subset.columns][:len(m.mu_)]
+            # Absent features are imputed at the training mean, never zero:
+            # the columns are z-scored, so a raw 0 is an extreme value.
+            X, _imp = duration_design_matrix(
+                subset, list(model_feats), m, purp)
+            imputed_by_purpose[purp] = list(_imp)
+            if X.shape[1] == len(m.mu_):
+                pred_raw[np.flatnonzero(mask)] = np.clip(
+                    m.predict_sampled(X, rng), 1, 1440)
+        except Exception as e:
+            logger.debug(f"  Stage 3 validate {purp}: {e}")
+
+    # ── production reconciliation of those draws ──────────────────────────
+    # Every duration Stage 4 receives has been through this pass, so the panel
+    # compares observed against THAT.  The window is the observed one: the
+    # question here is whether the duration model reproduces the survey, not
+    # whether Stage 2 reproduces the survey's day window.
+    rec = pd.DataFrame({
+        'person_id': (data['person_id'].values
+                      if 'person_id' in data.columns else np.arange(len(data))),
+        'purpose':   data[purpose_col].astype(str).values,
+        'predicted_duration_min': pred_raw,
+    })
+    # Rows whose purpose has no fitted model keep the purpose midpoint, as
+    # prediction does, so they consume their share of the day too.
+    for purp in purposes:
+        lo, hi = DURATION_BOUNDS.get(purp, (5, 480))
+        pmask = (rec['purpose'] == purp) & rec['predicted_duration_min'].isna()
+        rec.loc[pmask, 'predicted_duration_min'] = (lo + hi) / 2
+    rec['predicted_duration_min'] = rec['predicted_duration_min'].fillna(30.0)
+    rec['B'] = (pd.to_numeric(data['B'], errors='coerce').fillna(8.0).values
+                if 'B' in data.columns else 8.0)
+
+    if 'start_of_day' not in data.columns or 'end_of_day' not in data.columns:
+        try:
+            from stage2_day_duration import aggregate_person_day as _prep_s2
+            _day = _prep_s2(out['tours'], out['persons'])[
+                ['person_id', 'start_of_day', 'end_of_day']]
+            rec = rec.merge(_day, on='person_id', how='left')
+        except Exception as exc:
+            # Budget-only reconciliation: the panel is then missing the window
+            # constraint, which is reported rather than hidden.
+            logger.warning(f"  Stage 3: observed day window unavailable ({exc}); "
+                           "reconciling against the budget only")
+
+    rec = reconcile_predicted_durations(rec, log_audit=True)
+    pred_prod = rec['predicted_duration_min'].to_numpy(dtype=float)
+    metrics['reconciled_mean_shift_min'] = float(
+        np.nanmean(pred_prod) - np.nanmean(pred_raw))
+
+    # ── figure: observed vs raw draw vs pipeline durations ────────────────
     fig, axes = plt.subplots(2, 4, figsize=(18, 9))
-    fig.suptitle('Stage 3 — Activity Duration: Observed vs Predicted (In-Sample)',
+    fig.suptitle('Stage 3 — Activity Duration: Observed vs Predicted '
+                 '(in-sample draws, pipeline reconciliation)',
                  fontsize=13, fontweight='bold')
     axes = axes.flatten()
 
     for ax_i, purp in enumerate(purposes):
-        ax     = axes[ax_i]
-        mask   = data[purpose_col] == purp
-        subset = data[mask].copy()
-        if subset.empty:
-            ax.set_visible(False); continue
-        dur = pd.to_numeric(subset['duration'], errors='coerce').dropna()
+        ax   = axes[ax_i]
+        mask = (data[purpose_col] == purp).to_numpy()
+        dur  = pd.to_numeric(data.loc[mask, 'duration'], errors='coerce').dropna()
         if dur.empty:
             ax.set_visible(False); continue
 
-        obs_mean = float(dur.mean())
-        obs_p50  = float(dur.quantile(0.5))
-        obs_p90  = float(dur.quantile(0.9))
+        # The duration models are estimated on durations clipped to the
+        # purpose's legal band, and prediction clips its draws the same way
+        # (np.clip(preds, lo, hi)).  The comparable observed mean is therefore
+        # the capped one; the unclipped survey mean stays in the table because
+        # the cap is a modelling decision, not a measurement.
+        lo_p, hi_p = DURATION_BOUNDS.get(purp, (5, 480))
+        dur_capped = dur.clip(lo_p, hi_p)
+        obs_mean        = float(dur.mean())
+        obs_mean_capped = float(dur_capped.mean())
+        obs_p50  = float(dur_capped.quantile(0.5))
+        obs_p90  = float(dur_capped.quantile(0.9))
 
-        pred_mean = pred_p50 = pred_p90 = float('nan')
-        pred_vals  = None
+        raw_vals  = pd.Series(pred_raw[mask]).dropna()
+        prod_vals = pd.Series(pred_prod[mask]).dropna()
 
-        if purp in models:
-            entry = models[purp]
-            # models[purp] is a dict {'model': BudgetLognormal, 'features': [...], ...}
-            # unwrap to get the actual BudgetLognormal object
-            if isinstance(entry, dict):
-                m = entry.get('model')
-            else:
-                m = entry
-            if m is not None:
-                # Build the same feature matrix used during estimation
-                try:
-                    ptypes = sorted(data['ptype'].dropna().unique().tolist()) if 'ptype' in data.columns else []
-                    # Prefer stored feature names (set during fit) so ordering/count
-                    # exactly matches what the model was trained on.  Also fall back
-                    # to the 'features' list stored alongside the model in the dict.
-                    model_feats = (getattr(m, 'feature_names_', None)
-                                   or (entry.get('features') if isinstance(entry, dict) else None))
-                    if model_feats is not None:
-                        X = np.zeros((len(subset), len(model_feats)), dtype=float)
-                        for _j, _f in enumerate(model_feats):
-                            if _f in subset.columns:
-                                X[:, _j] = pd.to_numeric(subset[_f], errors='coerce').fillna(0).values
-                    else:
-                        feats  = _feature_cols(data, ptypes, feature_override=None)
-                        feats_model = [f for f in feats if f in subset.columns][:len(m.mu_)]
-                        X = subset[feats_model].fillna(0).values.astype(float)
-                    if X.shape[1] == len(m.mu_):
-                        pred_arr  = m.predict_sampled(X, rng)
-                        pred_arr  = np.clip(pred_arr, 1, 1440)
-                        pred_vals = pd.Series(pred_arr)
-                        pred_mean = float(pred_vals.mean())
-                        pred_p50  = float(pred_vals.quantile(0.5))
-                        pred_p90  = float(pred_vals.quantile(0.9))
-                except Exception as e:
-                    logger.debug(f"  Stage 3 validate {purp}: {e}")
+        pred_mean = float(prod_vals.mean()) if len(prod_vals) else float('nan')
+        pred_p50  = float(prod_vals.quantile(0.5)) if len(prod_vals) else float('nan')
+        pred_p90  = float(prod_vals.quantile(0.9)) if len(prod_vals) else float('nan')
+        raw_mean  = float(raw_vals.mean()) if len(raw_vals) else float('nan')
 
-        # ── plot ─────────────────────────────────────────────────────────
-        bins = np.linspace(0, min(dur.quantile(0.99) * 1.2, 720), 30)
-
-        # ── plot ─────────────────────────────────────────────────────────
         bins = np.linspace(0, min(dur.quantile(0.99) * 1.2, 720), 30)
         ax.hist(dur.clip(0, 720), bins=bins, density=True,
                 alpha=0.55, color='#5B9E2B', label='Observed', zorder=3)
-        if pred_vals is not None and len(pred_vals) > 0:
-            ax.hist(pred_vals.clip(0, 720), bins=bins, density=True,
-                    alpha=0.45, color='#E84855', label='Predicted (in-sample)', zorder=2)
+        if len(raw_vals):
+            ax.hist(raw_vals.clip(0, 720), bins=bins, density=True,
+                    alpha=0.30, color='#9aa0a6', zorder=2,
+                    label='Raw draw (in-sample)')
+        if len(prod_vals):
+            ax.hist(prod_vals.clip(0, 720), bins=bins, density=True,
+                    histtype='step', linewidth=1.8, color='#E84855', zorder=4,
+                    label='Pipeline (reconciled)')
 
-        ax.axvline(obs_mean, color='#5B9E2B', linewidth=1.5, linestyle='--',
-                   label=f'Obs mean={obs_mean:.0f}m')
+        ax.axvline(obs_mean_capped, color='#5B9E2B', linewidth=1.5, linestyle='--',
+                   label=f'Obs mean={obs_mean_capped:.0f}m (cap {hi_p:.0f})')
         if np.isfinite(pred_mean):
             ax.axvline(pred_mean, color='#E84855', linewidth=1.5, linestyle='--',
                        label=f'Pred mean={pred_mean:.0f}m')
 
-        bias_pct = (pred_mean - obs_mean) / obs_mean * 100 if obs_mean > 0 and np.isfinite(pred_mean) else float('nan')
-        title_line2 = (f"obs={obs_mean:.0f}m pred={pred_mean:.0f}m ({bias_pct:+.0f}%)"
-                       if np.isfinite(pred_mean) else f"obs={obs_mean:.0f}m  (no model)")
+        bias_pct = ((pred_mean - obs_mean_capped) / obs_mean_capped * 100
+                    if obs_mean_capped > 0 and np.isfinite(pred_mean)
+                    else float('nan'))
+        title_line2 = (f"obs={obs_mean_capped:.0f}m (raw {obs_mean:.0f}) "
+                       f"pred={pred_mean:.0f}m ({bias_pct:+.0f}%)"
+                       if np.isfinite(pred_mean)
+                       else f"obs={obs_mean_capped:.0f}m  (no model)")
         ax.set_title(f'{purp.title()}  n={len(dur)}\n{title_line2}', fontsize=8)
         ax.set_xlabel('Duration (min)', fontsize=8)
         ax.set_ylabel('Density', fontsize=8)
@@ -375,12 +579,22 @@ def validate_stage3(out: dict, models: dict, save_dir: str) -> dict:
                 'purpose':       purp,
                 'n_obs':         int(len(dur)),
                 'obs_mean_min':  obs_mean,
+                'obs_mean_capped_min': obs_mean_capped,
                 'pred_mean_min': pred_mean,
+                'raw_mean_min':  raw_mean,
                 'obs_p50_min':   obs_p50,
                 'pred_p50_min':  pred_p50,
                 'obs_p90_min':   obs_p90,
                 'pred_p90_min':  pred_p90,
                 'mean_bias_pct': bias_pct,
+                'mean_bias_vs_unclipped_pct':
+                    ((pred_mean - obs_mean) / obs_mean * 100
+                     if obs_mean > 0 and np.isfinite(pred_mean)
+                     else float('nan')),
+                'raw_bias_pct':  ((raw_mean - obs_mean_capped) / obs_mean_capped * 100
+                                  if obs_mean_capped > 0 and np.isfinite(raw_mean)
+                                  else float('nan')),
+                'imputed_features': ';'.join(imputed_by_purpose.get(purp, [])),
             })
 
     plt.tight_layout()
@@ -395,26 +609,42 @@ def validate_stage3(out: dict, models: dict, save_dir: str) -> dict:
         summary_path = os.path.join(save_dir, 'val_stage3_duration_summary.csv')
         summary_df.to_csv(summary_path, index=False)
         metrics['mean_abs_bias_pct'] = float(summary_df['mean_bias_pct'].abs().mean())
+        metrics['mean_abs_bias_raw_pct'] = float(
+            summary_df['raw_bias_pct'].abs().mean())
+        metrics['mean_abs_bias_vs_unclipped_pct'] = float(
+            summary_df['mean_bias_vs_unclipped_pct'].abs().mean())
         metrics['p90_abs_error_min'] = float(
             (summary_df['pred_p90_min'] - summary_df['obs_p90_min']).abs().mean())
+        # A complete design matrix is a precondition for reading the bias as
+        # model error rather than as a missing covariate.
+        metrics['imputed_features'] = {
+            p: v for p, v in imputed_by_purpose.items() if v}
+        metrics['n_imputed_features'] = int(
+            sum(len(v) for v in imputed_by_purpose.values()))
         figs.append(summary_path)
 
-        # Scatter: obs vs pred mean per purpose
+        # Scatter: obs vs pred mean per purpose (solid = pipeline, hollow =
+        # raw draw) — the gap between the two is what the reconciliation did.
         fig2, ax2 = plt.subplots(figsize=(6, 5), facecolor='white')
-        ax2.scatter(summary_df['obs_mean_min'], summary_df['pred_mean_min'],
-                    s=80, color='#534AB7', zorder=5)
+        ax2.scatter(summary_df['obs_mean_capped_min'], summary_df['raw_mean_min'],
+                    s=70, facecolors='none', edgecolors='#9aa0a6', zorder=4,
+                    label='raw draw')
+        ax2.scatter(summary_df['obs_mean_capped_min'], summary_df['pred_mean_min'],
+                    s=80, color='#534AB7', zorder=5, label='pipeline')
         for _, row in summary_df.iterrows():
             ax2.annotate(
-                row['purpose'], (row['obs_mean_min'], row['pred_mean_min']),
+                row['purpose'],
+                (row['obs_mean_capped_min'], row['pred_mean_min']),
                 fontsize=8, xytext=(4, 4), textcoords='offset points',
             )
-        lo = min(summary_df['obs_mean_min'].min(), summary_df['pred_mean_min'].min()) * 0.9
-        hi = max(summary_df['obs_mean_min'].max(), summary_df['pred_mean_min'].max()) * 1.1
+        lo = min(summary_df['obs_mean_capped_min'].min(), summary_df['pred_mean_min'].min()) * 0.9
+        hi = max(summary_df['obs_mean_capped_min'].max(), summary_df['pred_mean_min'].max()) * 1.1
         ax2.plot([lo, hi], [lo, hi], 'k--', linewidth=1, alpha=0.5, label='1:1 line')
-        ax2.set_xlabel('Observed mean duration (min)', fontsize=10)
+        ax2.set_xlabel('Observed mean duration (min, capped to bounds)', fontsize=10)
         ax2.set_ylabel('Predicted mean duration (min)', fontsize=10)
         ax2.set_title('Stage 3 — Obs vs Pred Mean Duration by Purpose\n'
-                      f'(in-sample: mean|bias|={metrics["mean_abs_bias_pct"]:.1f}%)',
+                      f'(pipeline: mean|bias|={metrics["mean_abs_bias_pct"]:.1f}%, '
+                      f'raw draw: {metrics["mean_abs_bias_raw_pct"]:.1f}%)',
                       fontsize=10, fontweight='bold')
         ax2.legend(fontsize=8); ax2.grid(alpha=0.3)
         ax2.spines[['top', 'right']].set_visible(False)
@@ -428,6 +658,121 @@ def validate_stage3(out: dict, models: dict, save_dir: str) -> dict:
 
 # ---------------------------------------------------------------------------# STAGE 4 — schedule placement
 # ---------------------------------------------------------------------------
+
+def _blend_period_shares(model, proba: np.ndarray) -> np.ndarray:
+    """Mix period probabilities with the fitted observed period shares.
+
+    The schedule builder blends each model's probabilities with the fitted
+    observed period shares (:attr:`period_blend_alpha_`) before drawing a
+    period; validation draws from the same mixture, otherwise the predicted
+    period mix is not the mix the pipeline produces.
+    """
+    proba = np.asarray(proba, dtype=float)
+    alpha = float(getattr(model, 'period_blend_alpha_', 0.0) or 0.0)
+    target = getattr(model, 'observed_period_shares_', None)
+    if alpha <= 0.0 or target is None:
+        return proba
+    target = np.asarray(target, dtype=float)
+    if (target.ndim != 1 or len(target) != proba.shape[-1]
+            or not np.isfinite(target).all() or target.sum() <= 0):
+        return proba
+    target = target / target.sum()
+    blended = (1.0 - alpha) * proba + alpha * target
+    return blended / np.clip(blended.sum(axis=-1, keepdims=True), 1e-12, None)
+
+
+def _predict_period_proba(data: pd.DataFrame, models: dict) -> np.ndarray:
+    """Blended period probabilities for every activity record in ``data``.
+
+    Uses each purpose model's design matrix and the same observed-share blend
+    the schedule builder applies, so validation and production draw from one
+    distribution.  Records whose purpose has no model keep the builder's
+    AM_PEAK default as a point mass.
+    """
+    n = len(data)
+    proba_all = np.zeros((n, len(TIME_LABELS)))
+    proba_all[:, 2] = 1.0                       # default AM_PEAK
+    for purpose, model in (models or {}).items():
+        mask = (data['purpose'] == purpose).values
+        if not mask.any():
+            continue
+        sub = data[mask].copy()
+        # Add required columns for _build_X
+        sub['day_position'] = sub.get('day_position', 0.5)
+        sub['time_consumed'] = sub.get('time_consumed', 0.0)
+        sub['time_remaining'] = sub.get('time_remaining', sub['day_end'] - sub['STARTIME'])
+        sub['duration_min'] = sub.get('duration_min', 30.0)
+        # Add person features
+        for col in ['sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING', 'incp']:
+            if col not in sub.columns:
+                sub[col] = 0
+        try:
+            X = model._build_X(sub)
+            proba_all[mask] = _blend_period_shares(model, model.predict_proba(X))
+        except Exception as e:
+            logger.warning(f"Stage 4 validation predict failed for '{purpose}': {e}")
+    return proba_all
+
+
+def _predict_periods(data: pd.DataFrame, models: dict, sample: bool = False,
+                     rng: np.random.Generator | None = None,
+                     proba: np.ndarray | None = None) -> np.ndarray:
+    """Stage 4 period index for every activity record in ``data``.
+
+    ``sample=False`` returns the modal period (used by the Stage 4 period /
+    confusion panels).  ``sample=True`` draws from the blended probability,
+    which is what the schedule builder does at run time.
+    """
+    if proba is None:
+        proba = _predict_period_proba(data, models)
+    if sample and rng is not None:
+        u = rng.random(len(proba))
+        return (np.cumsum(proba, axis=1) > u[:, None]).argmax(axis=1)
+    return np.argmax(proba, axis=1)
+
+
+def _predict_start_minutes(data: pd.DataFrame, pred_period: np.ndarray,
+                           models: dict, rng: np.random.Generator):
+    """Departure minute for every activity, inside its predicted period.
+
+    Each departure is drawn from its purpose model's fitted within-period
+    start-time distribution (empirical fractions from the estimation data); the
+    builder's triangular draw is used only where no fitted distribution exists.
+    The schedule builder's sequence arithmetic is deliberately not replayed:
+    it needs Stage 3 activity durations and predicted day windows that do not
+    exist on the survey frame, and its feasibility clamps pile mass on period
+    boundaries, which would put artefacts into a marginal profile comparison.
+
+    Returns ``(start_minutes, effective_period)``.
+    """
+    from stage4_schedule_placement import (
+        _sample_within_period_fraction, PERIOD_STARTS, PERIOD_ENDS)
+
+    n = len(data)
+    pidx = np.clip(np.asarray(pred_period, dtype=int), 0, len(PERIOD_STARTS) - 1)
+    purposes = data['purpose'].astype(str).to_numpy()
+    starts = np.full(n, np.nan)
+    for j in range(n):
+        p = int(pidx[j])
+        model = (models or {}).get(purposes[j])
+        width = max(float(PERIOD_ENDS[p] - PERIOD_STARTS[p]), 1.0)
+        frac = _sample_within_period_fraction(model, p, rng)
+        starts[j] = float(PERIOD_STARTS[p]) + frac * width
+    return starts, pidx
+
+
+def _within_period_draw_coverage(purposes, pidx, models: dict) -> float:
+    """Share of activities placed with a fitted within-period distribution."""
+    if not len(purposes):
+        return 0.0
+    hit = 0
+    for purpose, period in zip(purposes, pidx):
+        draws = getattr((models or {}).get(purpose), 'within_period_draws_', None) or {}
+        arr = draws.get(int(period))
+        if arr is not None and len(arr) > 0:
+            hit += 1
+    return 100.0 * hit / len(purposes)
+
 
 def validate_stage4(out: dict, models: dict, save_dir: str) -> dict:
     from stage4_schedule_placement import (
@@ -456,26 +801,7 @@ def validate_stage4(out: dict, models: dict, save_dir: str) -> dict:
         return {'stage': 4, 'plots': [], 'metrics': {}}
 
     # Predict periods using models directly
-    pred_period = np.full(len(data), 2, dtype=int)  # default AM_PEAK
-    for purpose, model in models.items():
-        mask = (data['purpose'] == purpose).values
-        if not mask.any():
-            continue
-        sub = data[mask].copy()
-        # Add required columns for _build_X
-        sub['day_position'] = sub.get('day_position', 0.5)
-        sub['time_consumed'] = sub.get('time_consumed', 0.0)
-        sub['time_remaining'] = sub.get('time_remaining', sub['day_end'] - sub['STARTIME'])
-        sub['duration_min'] = sub.get('duration_min', 30.0)
-        # Add person features
-        for col in ['sexp', 'vehrd', 'nprd', 'WORKSTAT', 'STUDYING', 'incp']:
-            if col not in sub.columns:
-                sub[col] = 0
-        try:
-            X = model._build_X(sub)
-            pred_period[mask] = np.argmax(model.predict_proba(X), axis=1)  # modal prediction
-        except Exception as e:
-            logger.warning(f"Stage 4 validation predict failed for '{purpose}': {e}")
+    pred_period = _predict_periods(data, models)
 
     obs_lbl = np.array([period_labels[i] for i in obs_period])
     pred_lbl = np.array([period_labels[i] for i in pred_period])
@@ -1235,7 +1561,10 @@ def validate_stage5(out: dict, s5_models: dict, save_dir: str) -> dict:
         except Exception as _t5e:
             logger.debug(f"  Stage 5 trip-level validation failed: {_t5e}")
 
-    return {'stage': 5, 'plots': figs, 'metrics': metrics}
+    # Distances stay out of the metrics dict (too many rows for JSON); the
+    # profile panels consume them directly.
+    return {'stage': 5, 'plots': figs, 'metrics': metrics,
+            '_dist_rows': pd.DataFrame(dist_rows)}
 
 
 # ---------------------------------------------------------------------------
@@ -1243,12 +1572,18 @@ def validate_stage5(out: dict, s5_models: dict, save_dir: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def validate_stage5_holdout(out: dict, s5_models: dict, save_dir: str,
-                            frac: float = 0.2, seed: int = 42) -> dict:
+                            frac: float = 0.3, seed: int = 42,
+                            _split: str | None = None) -> dict:
     """Out-of-sample validation for Stage 5 on a person-level HHTS hold-out.
 
-    Splits HHTS persons 80/20 (seeded; HOLDOUT_FRAC/HOLDOUT_SEED env override),
-    rebuilds the mode/dest choice sets on the 20% holdout tours, applies the
-    FITTED coefficients (no refit), and compares predicted vs observed shares.
+    Splits HHTS persons 70/30 by default (seeded; HOLDOUT_FRAC/HOLDOUT_SEED env
+    override), rebuilds the mode/dest choice sets on the 30% holdout tours,
+    applies the FITTED coefficients (no refit), and compares predicted vs
+    observed shares. Two hold-out definitions are produced by default
+    (HOLDOUT_SPLIT=both): a random person-level split (in-population
+    generalisation) and a temporal split keyed on the diary date
+    (TRAVDATE/TRAVYEAR/SURVEYWEEK), which holds out the latest diary wave for
+    temporal-transfer evaluation --- the harder test for a forecasting model.
     Person-level splitting avoids within-person leakage (a person's tours never
     appear on both sides).
 
@@ -1263,7 +1598,9 @@ def validate_stage5_holdout(out: dict, s5_models: dict, save_dir: str,
         prediction) degrades to observed-holdout aggregates with an explicit
         note, and the function never raises.
     Env:
-      HOLDOUT_ENABLE=0 disables (default 1); HOLDOUT_FRAC, HOLDOUT_SEED.
+      HOLDOUT_ENABLE=0 disables (default 1); HOLDOUT_FRAC (default 0.3),
+      HOLDOUT_SEED, HOLDOUT_SPLIT (random|temporal|both, default both),
+      HOLDOUT_TEMPORAL_COL (default auto: TRAVDATE/TRAVYEAR/SURVEYWEEK).
     """
     import os as _os
     _enable = _os.environ.get('HOLDOUT_ENABLE', '1').strip() != '0'
@@ -1276,11 +1613,29 @@ def validate_stage5_holdout(out: dict, s5_models: dict, save_dir: str,
     try:
         frac = float(_os.environ.get('HOLDOUT_FRAC', frac))
     except Exception:
-        frac = 0.2
+        frac = 0.3
     try:
         seed = int(_os.environ.get('HOLDOUT_SEED', seed))
     except Exception:
         seed = 42
+
+    # ── split dispatch: 'both' produces the random and temporal hold-outs ──
+    if _split is None:
+        _split = (_os.environ.get('HOLDOUT_SPLIT', 'both').strip().lower()
+                  or 'both')
+        if _split in ('both', 'all'):
+            _merged, _all_figs = {}, []
+            for _sm in ('random', 'temporal'):
+                _rr = validate_stage5_holdout(out, s5_models, save_dir,
+                                              frac=frac, seed=seed, _split=_sm)
+                _all_figs.extend(_rr.get('plots', []))
+                for _k, _v in _rr.get('metrics', {}).items():
+                    _merged[f'{_sm}_{_k}'] = _v
+            _merged['splits'] = 'random,temporal'
+            return {'stage': '5-holdout', 'plots': _all_figs,
+                    'metrics': _merged}
+        if _split not in ('random', 'temporal'):
+            _split = 'random'
     try:
         from stage5_destination_choice import (
             _prep_hhts_tours, _filter_seg, _mode_tree, _build_mode_model,
@@ -1295,7 +1650,69 @@ def validate_stage5_holdout(out: dict, s5_models: dict, save_dir: str,
         _rng = np.random.default_rng(seed)
         _pids = pd.unique(persons['person_id'].dropna().astype(str))
         _n_ho = max(1, int(round(len(_pids) * frac)))
-        _ho_pids = set(_rng.choice(_pids, size=_n_ho, replace=False).tolist())
+        _ho_pids = set()
+        if _split == 'temporal':
+            _tcol = _os.environ.get('HOLDOUT_TEMPORAL_COL', '').strip()
+
+            def _temporal_key(df):
+                """(numeric key, column label). Prefers a YYYYMMDD composite
+                because QTS TRAVDATE is day-of-month (1--31) on its own."""
+                if all(c in df.columns
+                       for c in ('TRAVYEAR', 'TRAVMONTH', 'TRAVDATE')):
+                    _y = pd.to_numeric(df['TRAVYEAR'], errors='coerce')
+                    _m = pd.to_numeric(df['TRAVMONTH'], errors='coerce')
+                    _d = pd.to_numeric(df['TRAVDATE'], errors='coerce')
+                    _k = _y * 10000 + _m * 100 + _d
+                    if _k.notna().mean() >= 0.5:
+                        return _k, 'TRAVYEAR/TRAVMONTH/TRAVDATE'
+                _cols = ([_tcol] if _tcol else
+                         ['TRAVDATE', 'TRAVYEAR', 'SURVEYWEEK',
+                          'TRAVMONTH', 'TRAVDOW'])
+                for _c in _cols:
+                    if not _c or _c not in df.columns:
+                        continue
+                    _num = pd.to_numeric(df[_c], errors='coerce')
+                    if _num.notna().mean() >= 0.5:
+                        return _num, _c
+                    _dts = pd.to_datetime(df[_c], errors='coerce', dayfirst=True)
+                    if _dts.notna().any():
+                        return (_dts.map(lambda x: x.toordinal()
+                                         if pd.notna(x) else np.nan), _c)
+                return None, None
+
+            _key = None
+            try:
+                _rawk, _kname = _temporal_key(persons)
+                if _rawk is not None:
+                    _kd = pd.DataFrame({
+                        'person_id': persons['person_id'].astype(str),
+                        '_key': _rawk}).dropna(subset=['_key'])
+                    if not _kd.empty:
+                        _key = _kd.groupby('person_id')['_key'].max()
+                        _tcol = _kname
+            except Exception as _te:
+                _note.append(f'temporal key failed: {_te}')
+                _key = None
+            if _key is not None and not _key.empty:
+                _ordered = _key.sort_values().index.tolist()
+                _cut = max(0, len(_ordered) - _n_ho)
+                _ho_pids = set(_ordered[_cut:])
+                metrics['holdout_split'] = 'temporal'
+                metrics['holdout_temporal_col'] = _tcol
+                if _cut < len(_ordered):
+                    metrics['holdout_temporal_from'] = float(
+                        _key.loc[_ordered[_cut]])
+                    metrics['holdout_temporal_max'] = float(_key.max())
+            else:
+                _note.append('temporal split unavailable (no usable diary-date '
+                             'column); falling back to random')
+                _ho_pids = set(_rng.choice(_pids, size=_n_ho,
+                                           replace=False).tolist())
+                metrics['holdout_split'] = 'random(fallback)'
+        else:
+            _ho_pids = set(_rng.choice(_pids, size=_n_ho,
+                                       replace=False).tolist())
+            metrics['holdout_split'] = 'random'
         _ho_mask_t = tours['person_id'].astype(str).isin(_ho_pids)
         ho_tours = tours[_ho_mask_t].copy()
         ho_persons = persons[persons['person_id'].astype(str).isin(_ho_pids)].copy()
@@ -1487,7 +1904,9 @@ def validate_stage5_holdout(out: dict, s5_models: dict, save_dir: str,
 
         if _rows:
             _hdf = pd.DataFrame(_rows)
-            _hp = os.path.join(save_dir, 'stage5_holdout_metrics.csv')
+            _hf_name = ('stage5_holdout_metrics.csv' if _split == 'random'
+                        else f'stage5_holdout_metrics_{_split}.csv')
+            _hp = os.path.join(save_dir, _hf_name)
             _hdf.to_csv(_hp, index=False)
             metrics['holdout_metrics_csv'] = _hp
             metrics['holdout_segments'] = int(len(_rows))
@@ -1513,7 +1932,9 @@ def validate_stage5_holdout(out: dict, s5_models: dict, save_dir: str,
                 fig.suptitle('Stage 5 HOLD-OUT — mode shares: observed vs predicted '
                              '(fitted models, unseen persons)', fontweight='bold', fontsize=12)
                 fig.tight_layout(rect=[0, 0, 1, 0.96])
-                _pp = os.path.join(save_dir, 'val_stage5_holdout.png')
+                _pp = os.path.join(save_dir, 'val_stage5_holdout.png'
+                                   if _split == 'random'
+                                   else f'val_stage5_holdout_{_split}.png')
                 fig.savefig(_pp, dpi=130, bbox_inches='tight'); plt.close(fig)
                 figs.append(_pp)
             except Exception as _fe:
@@ -1638,6 +2059,244 @@ def validate_stage5b(out: dict, dest_models: dict, mode_models: dict,
 # SUMMARY PLOT — model fit metrics in one dashboard
 # ---------------------------------------------------------------------------
 
+def validate_profiles(out: dict, s4_models: dict, dist_rows=None,
+                      save_dir: str = '.') -> dict:
+    """Observed versus predicted time-of-day and trip-length profiles.
+
+    The two comparisons ActivitySim reports on every run, rebuilt from the
+    in-sample re-prediction:
+
+      * hourly departure profiles — every trip, and the first departure of
+        each person's day.  Predicted departures come from the Stage 4 timing
+        model at minute resolution: a period sampled from the fitted
+        probability (blended with the fitted observed period shares), then a
+        start minute drawn from that purpose's fitted within-period start-time
+        distribution.  Each departure is placed independently, so the panel
+        compares the timing model's own departure distribution; it does not
+        replay the schedule builder's sequence clamps.
+      * tour-length distribution in fixed distance bands plus the cumulative
+        curve.  Distances are OD skim distances between the observed origin
+        and the observed/predicted tour destination reported by Stage 5; when
+        those are unavailable the panel falls back to any distance column on
+        the HHTS trips and shows observed only.
+    """
+    figs, metrics = [], {}
+    logger.info("  [validate] Profiles — time of day and trip length")
+
+    tod_rows = []
+    try:
+        from stage4_schedule_placement import prepare_timing_data
+
+        data = prepare_timing_data(out["trips"], out["tours"], out["persons"])
+        if 'STARTIME' not in data.columns or data.empty:
+            raise KeyError('STARTIME')
+
+        obs_min = pd.to_numeric(data['STARTIME'], errors='coerce')
+        person_key = 'person_id' if 'person_id' in data.columns else None
+
+        pred_min = None
+        draw_coverage = None
+        if s4_models:
+            rng = np.random.default_rng(11)
+            period_proba = _predict_period_proba(data, s4_models)
+            pred_period = _predict_periods(
+                data, s4_models, sample=True, rng=rng, proba=period_proba)
+            pred_min, eff_period = _predict_start_minutes(
+                data, pred_period, s4_models, rng)
+            draw_coverage = _within_period_draw_coverage(
+                data['purpose'].astype(str).to_numpy(), eff_period, s4_models)
+            metrics['tod_within_period_fitted_pct'] = float(draw_coverage)
+            logger.info(
+                "    predicted departures: sampled periods, fitted within-period "
+                f"draws on {draw_coverage:.1f}% of activities")
+        else:
+            logger.info("    no Stage 4 models -> observed profiles only")
+
+        obs_all, _ = _hour_shares(obs_min)
+        profiles = [('All trip departures', obs_all,
+                     _hour_shares(pred_min)[0] if pred_min is not None else None)]
+
+        if person_key:
+            firsts = pd.DataFrame({'p': data[person_key], 't': obs_min}).dropna()
+            if not firsts.empty:
+                obs_first, _ = _hour_shares(firsts.groupby('p')['t'].min())
+                pred_first = None
+                if pred_min is not None:
+                    pf = pd.DataFrame({'p': data[person_key],
+                                       't': pd.Series(pred_min)}).dropna()
+                    if not pf.empty:
+                        pred_first, _ = _hour_shares(pf.groupby('p')['t'].min())
+                profiles.append(('First departure of the day', obs_first, pred_first))
+
+        metrics['tod_n_records'] = int(obs_min.notna().sum())
+
+        fig, axes = plt.subplots(1, len(profiles), figsize=(8.2 * len(profiles), 4.4),
+                                 squeeze=False)
+        fig.suptitle('Time-of-day profile — observed vs predicted departures '
+                     '(in-sample)', fontsize=12, fontweight='bold')
+        for ax, (title, obs_share, pred_share) in zip(axes[0], profiles):
+            x = np.arange(len(PROFILE_HOUR_LABELS)); w = 0.4
+            ax.bar(x - w / 2, obs_share, w, color='#2E86AB', alpha=.85,
+                   label='Observed')
+            if pred_share is not None:
+                ax.bar(x + w / 2, pred_share, w, color='#E84855', alpha=.75,
+                       label='Predicted')
+            ax.set_xticks(x)
+            ax.set_xticklabels([f'{h}' for h in PROFILE_HOUR_LABELS], fontsize=8)
+            ax.set_xlabel('Hour of departure (24 h)', fontsize=9)
+            ax.set_ylabel('Share of departures (%)', fontsize=9)
+            ax.grid(axis='y', alpha=.3)
+            ax.spines[['top', 'right']].set_visible(False)
+
+            note = ''
+            slug = 'all' if title.startswith('All') else 'first'
+            if pred_share is not None:
+                corr = (float(np.corrcoef(obs_share, pred_share)[0, 1])
+                        if np.std(obs_share) > 0 and np.std(pred_share) > 0
+                        else float('nan'))
+                gap = float(np.max(np.abs(obs_share - pred_share)))
+                peak_obs = PROFILE_HOUR_LABELS[int(np.argmax(obs_share))]
+                peak_pred = PROFILE_HOUR_LABELS[int(np.argmax(pred_share))]
+                metrics[f'tod_{slug}_corr'] = corr
+                metrics[f'tod_{slug}_max_gap_pct_points'] = gap
+                metrics[f'tod_{slug}_peak_hour_obs'] = f'{peak_obs}:00'
+                metrics[f'tod_{slug}_peak_hour_pred'] = f'{peak_pred}:00'
+                note = (f'peak {peak_obs}:00 vs {peak_pred}:00 · '
+                        f'r={corr:.3f} · max gap {gap:.2f} pp')
+                ax.legend(fontsize=8)
+            ax.set_title(f'{title}\n{note}'.strip(), fontsize=9)
+
+            for hour, o, p in zip(PROFILE_HOUR_LABELS, obs_share,
+                                  pred_share if pred_share is not None
+                                  else [None] * len(obs_share)):
+                tod_rows.append({
+                    'profile': title,
+                    'hour': f'{hour}:00',
+                    'observed_pct': float(o),
+                    'predicted_pct': None if p is None else float(p),
+                })
+
+        if draw_coverage is None:
+            placement_note = ('Predicted departures: no Stage 4 timing models '
+                              'were available for this run.')
+        else:
+            placement_note = (
+                'Predicted departures: period sampled from the fitted Stage 4 '
+                'probability (blended with the fitted observed shares), then a '
+                'start minute drawn from the fitted within-period '
+                f'distribution ({draw_coverage:.0f}% of activities; the '
+                'remainder use the triangular fallback), fitted on this same '
+                'HHTS sample. Each activity is placed independently of the '
+                'others in its person-day.')
+        fig.text(0.01, 0.005, placement_note, fontsize=7, color='#555555')
+        plt.tight_layout(rect=(0, 0.045, 1, 1))
+        p_tod = os.path.join(save_dir, 'val_profiles_time_of_day.png')
+        fig.savefig(p_tod, dpi=140, bbox_inches='tight'); plt.close(fig)
+        figs.append(p_tod)
+        logger.info(f"    saved -> {os.path.basename(p_tod)}")
+        metrics['tod_profile'] = tod_rows
+    except Exception as exc:
+        logger.warning(f"  Profiles: time-of-day panel skipped: {exc}")
+
+    length_rows = []
+    try:
+        rows_df = dist_rows if isinstance(dist_rows, pd.DataFrame) else pd.DataFrame()
+        obs_d = pred_d = None
+        if not rows_df.empty and {'source', 'dist'} <= set(rows_df.columns):
+            obs_d = pd.to_numeric(
+                rows_df.loc[rows_df['source'] == 'Observed', 'dist'],
+                errors='coerce').dropna()
+            pred_d = pd.to_numeric(
+                rows_df.loc[rows_df['source'] == 'Predicted', 'dist'],
+                errors='coerce').dropna()
+        else:
+            trips = out.get('trips', pd.DataFrame())
+            col = next((c for c in ('TRIPDIST', 'trip_distance', 'DIST', 'distance')
+                        if c in trips.columns), None)
+            if col is not None:
+                obs_d = pd.to_numeric(trips[col], errors='coerce').dropna()
+                logger.info(f"    no Stage 5 distances -> observed trips['{col}'] only")
+
+        if obs_d is None or len(obs_d) < 10:
+            logger.info("    no distances available -> trip-length panel skipped")
+            raise ValueError('no distance data')
+
+        obs_sh = _length_bin_shares(obs_d)
+        pred_sh = _length_bin_shares(pred_d) if pred_d is not None and len(pred_d) >= 10 else None
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13.5, 4.6))
+        fig.suptitle('Tour length — observed vs predicted OD distance '
+                     '(in-sample, fixed bands)', fontsize=12, fontweight='bold')
+
+        x = np.arange(len(LENGTH_BIN_LABELS)); w = 0.4
+        ax1.bar(x - w / 2, obs_sh, w, color='#2E86AB', alpha=.85, label='Observed')
+        if pred_sh is not None:
+            ax1.bar(x + w / 2, pred_sh, w, color='#E84855', alpha=.75,
+                    label='Predicted')
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(LENGTH_BIN_LABELS, rotation=25, ha='right', fontsize=8)
+        ax1.set_xlabel('OD distance band', fontsize=9)
+        ax1.set_ylabel('Share of tours (%)', fontsize=9)
+        ax1.grid(axis='y', alpha=.3)
+        ax1.spines[['top', 'right']].set_visible(False)
+        ax1.legend(fontsize=8)
+
+        note = ''
+        obs_vals = pd.to_numeric(obs_d, errors='coerce').dropna()
+        metrics['length_mean_km_obs'] = float(obs_vals.mean())
+        metrics['length_median_km_obs'] = float(obs_vals.median())
+        note += (f'obs mean {obs_vals.mean():.1f} km / median '
+                 f'{obs_vals.median():.1f} km')
+        if pred_sh is not None:
+            pv = pd.to_numeric(pred_d, errors='coerce').dropna()
+            gap = float(np.max(np.abs(obs_sh - pred_sh)))
+            js = _js_divergence(obs_sh, pred_sh)
+            metrics['length_mean_km_pred'] = float(pv.mean())
+            metrics['length_median_km_pred'] = float(pv.median())
+            metrics['length_max_gap_pct_points'] = gap
+            metrics['length_js'] = js
+            note += (f' · pred mean {pv.mean():.1f} km / median {pv.median():.1f} km'
+                     f' · max gap {gap:.2f} pp · JS={js:.4f}')
+        ax1.set_title(note, fontsize=8)
+
+        # Cumulative curve: the readable way to compare a long right tail.
+        edges = np.asarray(LENGTH_EDGES_KM, dtype=float)
+        finite = edges[np.isfinite(edges) & (edges > 0)]
+        ax2.plot(finite, np.cumsum(obs_sh[:len(finite)]), 'o-', color='#2E86AB',
+                 linewidth=2, label='Observed')
+        if pred_sh is not None:
+            ax2.plot(finite, np.cumsum(pred_sh[:len(finite)]), 's--',
+                     color='#E84855', linewidth=2, label='Predicted')
+        ax2.set_xscale('log')
+        ax2.set_xlabel('OD distance (km, log scale)', fontsize=9)
+        ax2.set_ylabel('Cumulative share of tours (%)', fontsize=9)
+        ax2.set_title('Cumulative distance distribution (to 40 km)', fontsize=9)
+        ax2.set_ylim(0, 105); ax2.grid(alpha=.3)
+        ax2.spines[['top', 'right']].set_visible(False)
+        ax2.legend(fontsize=8)
+
+        plt.tight_layout()
+        p_len = os.path.join(save_dir, 'val_profiles_trip_length.png')
+        fig.savefig(p_len, dpi=140, bbox_inches='tight'); plt.close(fig)
+        figs.append(p_len)
+        logger.info(f"    saved -> {os.path.basename(p_len)}")
+
+        for label, o, p in zip(LENGTH_BIN_LABELS, obs_sh,
+                               pred_sh if pred_sh is not None
+                               else [None] * len(obs_sh)):
+            length_rows.append({
+                'bin': label,
+                'observed_pct': float(o),
+                'predicted_pct': None if p is None else float(p),
+            })
+        metrics['trip_length_bins'] = length_rows
+    except Exception as exc:
+        if str(exc) != 'no distance data':
+            logger.warning(f"  Profiles: trip-length panel skipped: {exc}")
+
+    return {'stage': 'profiles', 'plots': figs, 'metrics': metrics}
+
+
 def plot_fit_summary(results: list, save_dir: str) -> str:
     """One-page dashboard: ρ² / RMSE / accuracy for all stages."""
     fig = plt.figure(figsize=(14, 8))
@@ -1654,7 +2313,7 @@ def plot_fit_summary(results: list, save_dir: str) -> str:
     for r in results:
         s = r['stage']
         m = r['metrics']
-        lbl = f"Stage {s}"
+        lbl = _stage_title(s)
         stage_labels.append(lbl)
 
         if s == 1:
@@ -1758,7 +2417,7 @@ def write_html_report(results: list, summary_plot: str, save_dir: str,
     plots_html = ''
     for r in results:
         s = r['stage']
-        plots_html += f'<h2>Stage {s}</h2>\n'
+        plots_html += f'<h2>{_stage_title(s)}</h2>\n'
         for p in r.get('plots', []):
             if os.path.exists(p):
                 rel = os.path.relpath(p, out_dir)
@@ -1870,7 +2529,9 @@ Generated by validate_hhts.py | Training data: HHTS</p>
 </body></html>"""
 
     path = os.path.join(out_dir, 'validation_report.html')
-    with open(path, 'w') as f:
+    # Explicit UTF-8: the report carries figure glyphs that a Windows default
+    # codec (cp1252) cannot encode.
+    with open(path, 'w', encoding='utf-8') as f:
         f.write(html)
     logger.info(f"  [validate] HTML report → {path}")
     return path
@@ -1929,8 +2590,10 @@ def run_validation(out: dict,
         logger.warning(f"  Stage 4 validation failed: {e}")
 
     # Stage 5
+    s5_result = None
     try:
-        results.append(validate_stage5(out, s5_models, val_dir))
+        s5_result = validate_stage5(out, s5_models, val_dir)
+        results.append(s5_result)
     except Exception as e:
         logger.warning(f"  Stage 5 validation failed: {e}")
 
@@ -1952,6 +2615,16 @@ def run_validation(out: dict,
         except Exception as e:
             logger.warning(f"  Stage 5b validation failed: {e}")
 
+    # Time-of-day and trip-length profiles (ActivitySim-style panels)
+    try:
+        results.append(validate_profiles(
+            out, s4_models,
+            dist_rows=(s5_result or {}).get('_dist_rows'),
+            save_dir=val_dir,
+        ))
+    except Exception as e:
+        logger.warning(f"  Profile validation failed: {e}")
+
     # Summary dashboard + report
     summary_plot = ''
     try:
@@ -1963,6 +2636,13 @@ def run_validation(out: dict,
         write_html_report(results, summary_plot, val_dir, out_dir)
     except Exception as e:
         logger.warning(f"  HTML report failed: {e}")
+
+    # Machine-readable metrics for the SimWrapper validation dashboard
+    try:
+        _mp = write_metrics_json(results, out_dir)
+        logger.info(f"  Metrics → {_mp}")
+    except Exception as e:
+        logger.warning(f"  Metrics JSON failed: {e}")
 
     logger.info("VALIDATION COMPLETE")
     logger.info(f"  Plots  → {val_dir}/")

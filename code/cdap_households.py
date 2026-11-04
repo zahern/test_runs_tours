@@ -725,23 +725,36 @@ def tag_joint_activities(activities: pd.DataFrame,
     df['joint_tour_id'] = ''
     df['joint_participants'] = ''
 
-    seen = set()
-    for _, jt in person_joint_map.iterrows():
-        pid = jt.get('person_id')
-        purpose = str(jt.get('purpose', 'othdiscr')).lower().strip()
-        key = (str(pid), purpose)
-        if key in seen:
-            continue
-        seen.add(key)
-        m = ((df['person_id'].astype(str) == str(pid)) & (df['purpose'] == purpose)
-             & (df['is_joint'] == 0))
-        idx = df.index[m]
-        if len(idx) == 0:
-            continue
-        parts = _parse_participants(jt.get('participants', []))
-        df.at[idx[0], 'is_joint'] = 1
-        df.at[idx[0], 'joint_tour_id'] = str(jt.get('joint_tour_id', ''))
-        df.at[idx[0], 'joint_participants'] = ','.join(str(x) for x in parts)
+    # Vectorised: the row-wise loop rebuilt df['person_id'].astype(str) and the
+    # full boolean mask on EVERY joint-tour row — O(jmap_rows x len(activities)),
+    # catastrophic on the 4.45M-row Stage-3 frame. Precompute the string keys
+    # once, take the first activity row per (person, purpose), then assign by
+    # index. Same semantics: first activity row per unique (person, purpose).
+    df['_jt_pid'] = df['person_id'].astype(str)
+    df['_jt_pur'] = df['purpose'].astype(str).str.lower().str.strip()
+
+    jm = person_joint_map.copy()
+    jm['_jt_pid'] = jm['person_id'].astype(str)
+    jm['_jt_pur'] = (jm['purpose'].astype(str).str.lower().str.strip()
+                     if 'purpose' in jm.columns else 'othdiscr')
+    jm = jm.drop_duplicates(subset=['_jt_pid', '_jt_pur'], keep='first')
+    jm['_jt_key'] = list(zip(jm['_jt_pid'], jm['_jt_pur']))
+
+    first = df.groupby(['_jt_pid', '_jt_pur'], sort=False).head(1)
+    key_to_idx = dict(zip(zip(first['_jt_pid'], first['_jt_pur']), first.index))
+    jm = jm[jm['_jt_key'].isin(key_to_idx)]
+    if len(jm):
+        idx = jm['_jt_key'].map(key_to_idx)
+        _parts_col = (jm['participants'] if 'participants' in jm.columns
+                      else pd.Series([[]] * len(jm), index=jm.index))
+        _jtid_col = (jm['joint_tour_id'] if 'joint_tour_id' in jm.columns
+                     else pd.Series([''] * len(jm), index=jm.index))
+        parts = _parts_col.map(
+            lambda p: ','.join(str(x) for x in _parse_participants(p)))
+        df.loc[idx, 'is_joint'] = 1
+        df.loc[idx, 'joint_tour_id'] = _jtid_col.astype(str).values
+        df.loc[idx, 'joint_participants'] = parts.values
+    df = df.drop(columns=['_jt_pid', '_jt_pur'])
     return df
 
 

@@ -92,7 +92,7 @@ while read -r line; do
   fi
   cmd=(qsub "${_P_FLAG[@]}" -N "ga_pred_${phase}_${RUN_TAG}" \
     "${dep_flag[@]}" \
-    -l "select=1:ncpus=${ncpus}:mem=${mem}" -l place=excl -l "walltime=${wt}" \
+    -l "select=1:ncpus=${ncpus}:mem=${mem}" -l "walltime=${wt}" \
     -v "${COMMON_VARS},PREDICT_PHASE=${phase}" \
     job_predict_phase.pbs)
   if [ "${DRY_RUN}" = "1" ]; then

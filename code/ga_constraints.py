@@ -78,10 +78,10 @@ except Exception:                                     # pragma: no cover
 #
 # Family = (continuous/redundant forms, category-band dummies).
 _ENCODING_FAMILIES = {
-    'income':    (['incp', 'incp_generic'],
+    'income':    (['incp', 'incp_generic', 'incp_motref', 'incp_active'],
                   ['income_verylo', 'income_lo', 'income_mid', 'income_midplus',
                    'income_midhi', 'income_hi', 'income_veryhi']),
-    'vehicle':   (['vehrd', 'veh_generic', 'hh_vehicles_pred'],
+    'vehicle':   (['vehrd', 'veh_generic', 'veh_active', 'hh_vehicles_pred'],
                   ['no_vehicle', 'one_vehicle', 'has_vehicle', 'multi_vehicle']),
     'household': (['nprd', 'HHSIZE'],
                   ['hh_alone', 'hh_couple', 'hh_medium', 'hh_size_large']),
@@ -224,13 +224,14 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             # every non-DA alternative) OR the per-mode alternative-specific
             # block — never both. This lets the search literally swap between
             # "one income slope for all modes" and "a slope per mode".
-            ['incp_generic', 'incp', 'income_verylo', 'income_lo', 'income_mid',
+            ['incp_generic', 'incp_motref', 'incp_active', 'incp',
+             'income_verylo', 'income_lo', 'income_mid',
              'income_midplus', 'income_midhi', 'income_hi', 'income_veryhi'],
-            ['veh_generic', 'vehrd', 'no_vehicle', 'one_vehicle',
+            ['veh_generic', 'veh_active', 'vehrd', 'no_vehicle', 'one_vehicle',
              'has_vehicle', 'multi_vehicle'],
             ['crash_generic', 'CRASH'],
-            ['age_active_generic', 'age_child', 'age_teen', 'age_working',
-             'age_older', 'age_senior'],
+            ['age_active_generic', 'age_nonauto', 'age_child', 'age_teen',
+             'age_working', 'age_older', 'age_senior'],
             # In-vehicle-time period: at most ONE auto IVT period in a model
             # (AM is the backbone; PM/MD/EV are alternative representations).
             ['SOVTOLL_TIME__AM', 'SOVTOLL_TIME__PM',
@@ -284,6 +285,41 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
                 'coeff': 'c_age_active_gen',
                 'expr':  'person.age5p',
                 'modes': ['Walk', 'Bike'],
+                'asv':   ['c_age_walk', 'c_age_bike'],
+            },
+            # ── Intermediate grouped-reference encodings (larch MTC 017) ──────
+            # Beyond "all non-DA" vs "per-mode", let the search apply a person
+            # characteristic to an alternative GROUP, leaving the complement as a
+            # joint reference by omission (e.g. income on {Transit,Walk,Bike}
+            # with {DA,SR} as the grouped auto reference — the canonical 017
+            # "omit these alternatives from the block that applies to hhinc").
+            # Each is mutually exclusive with the other income/veh/age encodings
+            # (see _build_encoding_mutex); the reference group is non-empty by
+            # construction (validate_generic_groups guards this).
+            'incp_motref': {   # income on non-auto; {DA,SR} joint reference
+                'coeff': 'c_incp_motref',
+                'expr':  'person.incp',
+                'modes': ['Transit', 'Walk', 'Bike'],
+                'asv':   ['c_incp_da', 'c_incp_sr', 'c_incp_transit',
+                          'c_incp_active'],
+            },
+            'incp_active': {   # income on active only; {DA,SR,Transit} reference
+                'coeff': 'c_incp_active_grp',
+                'expr':  'person.incp',
+                'modes': ['Walk', 'Bike'],
+                'asv':   ['c_incp_da', 'c_incp_sr', 'c_incp_transit',
+                          'c_incp_active'],
+            },
+            'veh_active': {    # vehicles deter active; motor+transit reference
+                'coeff': 'c_veh_active',
+                'expr':  'person.vehrd',
+                'modes': ['Walk', 'Bike'],
+                'asv':   ['c_veh_da', 'c_veh_sr'],
+            },
+            'age_nonauto': {   # age on non-auto; {DA,SR} joint reference
+                'coeff': 'c_age_nonauto',
+                'expr':  'person.age5p',
+                'modes': ['Transit', 'Walk', 'Bike'],
                 'asv':   ['c_age_walk', 'c_age_bike'],
             },
         },
@@ -765,7 +801,21 @@ def generic_groups(stage: Optional[str]) -> Dict[str, dict]:
     better-BIC form). Empty dict when the stage declares none.
     """
     c = get_constraints(stage) if stage else {}
-    return {k: dict(v) for k, v in c.get('generic_groups', {}).items()}
+    gg = {k: dict(v) for k, v in c.get('generic_groups', {}).items()}
+    # Identification guard: a grouped-reference encoding must leave a NON-EMPTY
+    # reference set (at least one alternative with no term), else the shared
+    # coefficient is confounded with the ASCs and is unidentified. Drop any
+    # entry whose 'modes' cover every alternative, loudly.
+    _ALL_MODES = {'DA', 'SR', 'Transit', 'Walk', 'Bike'}
+    bad = [k for k, v in gg.items()
+           if set(v.get('modes') or []) >= _ALL_MODES]
+    for k in bad:
+        import logging as _lg
+        _lg.getLogger(__name__).error(
+            "generic_groups[%r] applies to every alternative -> empty "
+            "reference (unidentified); dropped. Leave >=1 alt out.", k)
+        gg.pop(k, None)
+    return gg
 
 
 def sign_constraints(stage: Optional[str]) -> Dict[str, str]:

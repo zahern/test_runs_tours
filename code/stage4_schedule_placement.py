@@ -28,8 +28,15 @@ in, conditional on:
   - position in day (first, middle, last)
   - time already consumed
 
-After period choice, exact STARTIME is sampled uniformly within the
-chosen period. ENDTIME = STARTIME + predicted_duration_min.
+After period choice, exact STARTIME is sampled from the empirical
+within-period start-time distribution when available, with a bounded
+fallback draw. ENDTIME = STARTIME + predicted_duration_min.
+
+A period is only admissible if the rest of the person's chain still fits
+before end_of_day (each remaining activity keeps its duration plus one
+travel gap). When the sampled period is not admissible the period is
+therefore re-drawn among the ones that are, weighted by the model's
+probabilities, instead of clamping the activity onto a period boundary.
 
 Activities are ordered by purpose priority before placement:
     work → edu → escort → shopping → othmaint → othdiscr → eat → social
@@ -126,6 +133,10 @@ PERIOD_ENDS    = np.array([p[2] for p in TIME_PERIODS])
 
 # Minimum gap between activities (minutes)
 MIN_TRAVEL_GAP = 10
+
+# A placement window this narrow (minutes) is an exact fit, not infeasible: a
+# chain that fills the day to the minute is still placeable.
+_EXACT_FIT_MIN = 1e-6
 
 # ── Joint time-of-day-departure (tdd) alternative set ───────────────────────
 # ActivitySim mandatory_tour_scheduling models a JOINT (start, end, duration)
@@ -1314,7 +1325,17 @@ class RRMTimeModel:
         counts = np.bincount(y, minlength=self.n_periods_).astype(float)
         self.observed_period_shares_ = counts / max(float(counts.sum()), 1.0)
         self.converged_ = bool(getattr(rrm, 'converged', True))
+        # SearchLibrium judges this on the log-likelihood gradient (and re-polishes
+        # a fit that stopped early); record the evidence so a 'stopped' label can
+        # be traced to the fit rather than guessed at.
+        self.grad_inf_ = float(getattr(rrm, 'grad_norm_inf', float('nan')))
+        self.fit_message_ = str(getattr(rrm, 'fit_message', ''))
         self.fit_status_ = 'ok' if self.converged_ else 'optimizer_stopped'
+        if not self.converged_:
+            logger.warning(
+                f'  timing/{self.purpose_}: RRM stopped short of a stationary point '
+                f'(max|g|={self.grad_inf_:.2e}, n={self.n_obs_}): {self.fit_message_}'
+            )
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         if self.rrm_ is None:
@@ -1697,6 +1718,7 @@ def estimate_timing_models(
                 logger.info(
                     f"  timing/{purpose}: SearchLibrium RRM, n={rrm_model.n_obs_}, "
                     f"status={rrm_model.fit_status_}, "
+                    f"max|g|={getattr(rrm_model, 'grad_inf_', float('nan')):.1e}, "
                     f"blend_alpha={rrm_model.period_blend_alpha_:.2f}"
                 )
                 continue
@@ -1847,18 +1869,22 @@ def _sample_startime_in_period(
     end_of_day: float,
     rng: np.random.Generator,
     model: Optional[MNLTimingModel] = None,
+    latest_start: Optional[float] = None,
 ) -> float:
     """
     Sample a start time uniformly within the chosen period,
     subject to:
       - start >= current_time + MIN_TRAVEL_GAP
       - start + duration_min <= end_of_day
+      - start <= latest_start (rest of the chain must still fit the day)
     """
     p_start = PERIOD_STARTS[period_idx]
     p_end   = PERIOD_ENDS[period_idx]
 
     lo = max(p_start, current_time + MIN_TRAVEL_GAP)
     hi = min(p_end,   end_of_day   - duration_min)
+    if latest_start is not None:
+        hi = min(hi, float(latest_start))
 
     if lo >= hi:
         # period doesn't fit — just use lo
@@ -1902,10 +1928,20 @@ def build_schedule(
     periods   = []
     current_time = start_of_day
 
+    # Time the rest of the chain still needs (durations + one travel gap each):
+    # an activity may not start so late that the activities after it can no
+    # longer finish by end_of_day.
+    if n > 1:
+        _step = durations + MIN_TRAVEL_GAP
+        chain_tail = np.cumsum(_step[::-1])[::-1] - _step
+    else:
+        chain_tail = np.zeros(1)
+
     for i in range(n):
         purpose      = purposes[i]
         duration_min = durations[i]
         model        = timing_models.get(purpose)
+        latest_start = end_of_day - duration_min - float(chain_tail[i])
 
         if isinstance(model, TDDChoiceModel):
             # Full joint (start, end, duration) choice: the model sets BOTH the
@@ -1942,7 +1978,8 @@ def build_schedule(
                 period_idx = _period_of(current_time)
 
             startime = _sample_startime_in_period(
-                period_idx, duration_min, current_time, end_of_day, rng, model=model)
+                period_idx, duration_min, current_time, end_of_day, rng,
+                model=model, latest_start=latest_start)
             startime = max(startime, current_time + MIN_TRAVEL_GAP)
             endtime  = startime + duration_min
 
@@ -2109,6 +2146,11 @@ def predict_schedule(
     df['_t_remaining']  = budget_min * (1 - df['_day_pos'])    # proxy
 
     period_col = np.full(n_acts, 2, dtype=int)   # default AM_PEAK
+    n_period_alts = len(PERIOD_LABELS)
+    # Blended period probabilities, kept per activity so Phase B can re-draw a
+    # period that still fits without a second model call.
+    period_proba = np.zeros((n_acts, n_period_alts), dtype=np.float32)
+    period_proba[:, 2] = 1.0
 
     for purpose, model in timing_models.items():
         mask = (df['purpose'] == purpose).values
@@ -2137,6 +2179,8 @@ def predict_schedule(
                     _target = _target / _target.sum()
                     proba = (1.0 - _alpha) * proba + _alpha * _target.reshape(1, -1)
                     proba = proba / np.clip(proba.sum(axis=1, keepdims=True), 1e-12, None)
+            if proba.shape[1] == n_period_alts:
+                period_proba[mask] = proba.astype(np.float32, copy=False)
             idxs = np.empty(len(proba), dtype=int)
             # Vectorized categorical sampling: (cumsum > u).argmax(1)
             u = rng.random((len(proba), 1))
@@ -2180,10 +2224,13 @@ def predict_schedule(
     dur_arr     = df['predicted_duration_min'].to_numpy(dtype=float)
     pidx_arr    = df['_period_idx'].to_numpy(dtype=int)
     purpose_arr = df['purpose'].astype(str).to_numpy()
+    proba_arr   = period_proba
 
     startimes = np.empty(n_acts, dtype=float)
     endtimes  = np.empty(n_acts, dtype=float)
     period_labels = []
+    n_redrawn     = 0   # sampled period no longer fit — re-drawn among periods that did
+    n_out_of_room = 0   # no period fit at all — day window exhausted
 
     # Process each person's block with pure numpy — no DataFrames
     pid_changes = np.where(np.diff(pids_arr, prepend=pids_arr[0]-1) != 0)[0]
@@ -2201,26 +2248,88 @@ def predict_schedule(
         current_time = float(sod_arr[p_start])
         eod          = float(eod_arr[p_start])
 
+        # Time the rest of this person's chain still needs (durations + one
+        # travel gap each).  An activity may not start so late that the
+        # activities after it can no longer finish by end_of_day, however
+        # attractive its sampled period looked.
+        _m = p_end - p_start
+        if _m > 1:
+            _step = dur_arr[p_start:p_end] + MIN_TRAVEL_GAP
+            _tail = np.cumsum(_step[::-1])[::-1] - _step
+        else:
+            _tail = np.zeros(1)
+
         for j in range(p_start, p_end):
             pidx     = int(pidx_arr[j])
             dur      = float(dur_arr[j])
             model    = timing_models.get(purpose_arr[j])
-            p_start_min = float(PERIOD_STARTS[pidx]) if pidx < len(PERIOD_STARTS) else current_time
-            p_end_min   = float(PERIOD_ENDS[pidx]) if pidx < len(PERIOD_ENDS) else eod
-            lo = max(p_start_min, current_time + MIN_TRAVEL_GAP)
-            hi = min(p_end_min, eod - dur)
-            if lo >= hi:
-                startime = lo
-            else:
+            arrive   = current_time + MIN_TRAVEL_GAP
+            deadline = eod - dur - float(_tail[j - p_start])
+            in_range = 0 <= pidx < n_period_alts
+            p_start_min = float(PERIOD_STARTS[pidx]) if in_range else arrive
+            p_end_min   = float(PERIOD_ENDS[pidx]) if in_range else eod
+            lo = max(p_start_min, arrive)
+            hi = min(p_end_min, deadline)
+
+            no_room = False
+            if hi > lo:
                 frac = _sample_within_period_fraction(model, pidx, rng)
                 startime = lo + frac * (hi - lo)
+            elif hi >= lo - _EXACT_FIT_MIN:
+                # Chain exactly fills the remaining day: no window left to
+                # sample in, but the activity is still placeable here.  Without
+                # this the equality `arrive == deadline` on the last activities
+                # of a full day would be reported as having no room at all.
+                startime = lo
+            else:
+                # The sampled period no longer fits at this point in the day (the
+                # chain has moved past it, too little of it is left, or waiting
+                # for it would push the rest of the chain past end_of_day).
+                # Re-draw the period among those that still fit, keeping the
+                # model's blended probabilities inside the feasible set.
+                # Clamping on the period boundary instead piles mass on the
+                # boundary hour.
+                lo_all = np.maximum(PERIOD_STARTS, arrive)
+                hi_all = np.minimum(PERIOD_ENDS, deadline)
+                feas   = np.flatnonzero(lo_all <= hi_all + _EXACT_FIT_MIN)
+                if feas.size:
+                    wts = np.asarray(proba_arr[j][feas], dtype=float)
+                    wts = np.where(np.isfinite(wts) & (wts > 0), wts, 0.0)
+                    if wts.sum() <= 0:
+                        wts = np.ones(feas.size)
+                    pidx     = int(rng.choice(feas, p=wts / wts.sum()))
+                    span     = hi_all[pidx] - lo_all[pidx]
+                    if span > _EXACT_FIT_MIN:
+                        frac     = _sample_within_period_fraction(model, pidx, rng)
+                        startime = lo_all[pidx] + frac * span
+                    else:
+                        startime = lo_all[pidx]
+                    n_redrawn += 1
+                else:
+                    # No period fits anywhere: even at the earliest possible
+                    # arrival this activity plus the rest of the chain runs past
+                    # the predicted end of day.  Keep the activity in its
+                    # chronological place with its duration intact — the person
+                    # returns later than predicted — rather than pulling it back
+                    # over the activity before it.  Stage 6 repairs any chain
+                    # that runs past midnight.
+                    sod      = float(sod_arr[p_start])
+                    startime = max(arrive, sod)
+                    pidx     = _period_of(startime)
+                    no_room  = True
+                    n_out_of_room += 1
             endtime  = startime + dur
 
-            if startime >= eod:
-                startime = max(eod - dur, float(sod_arr[p_start]))
-                endtime  = eod
-            startime = max(startime, float(sod_arr[p_start]))
-            endtime  = max(endtime,  startime + 1.0)
+            if no_room:
+                # Day window was already exhausted for this activity; nothing to
+                # correct without breaking the chain order.
+                endtime = max(endtime, startime + 1.0)
+            else:
+                if startime >= eod:
+                    startime = max(eod - dur, float(sod_arr[p_start]))
+                    endtime  = eod
+                startime = max(startime, float(sod_arr[p_start]))
+                endtime  = max(endtime,  startime + 1.0)
 
             startimes[j] = round(startime)
             endtimes[j]  = round(endtime)
@@ -2228,6 +2337,12 @@ def predict_schedule(
             current_time = endtime
 
     logger.info(f"  Stage 4 done: {n_persons:,}/{n_persons:,} persons (100%)")
+    logger.info(
+        f"  Period feasibility: {n_redrawn:,}/{n_acts:,} activities "
+        f"({100.0 * n_redrawn / max(n_acts, 1):.1f}%) re-drawn into a period that still "
+        f"fitted; {n_out_of_room:,} ({100.0 * n_out_of_room / max(n_acts, 1):.1f}%) "
+        f"had no room left before end of day"
+    )
 
     df['STARTIME']    = startimes.astype(int)
     df['ENDTIME']     = endtimes.astype(int)
@@ -2480,5 +2595,4 @@ if __name__ == '__main__':
     log.info(f"Stage 4 output saved → {_OUT}/stage4_output.csv")
     log.info(f"  {len(scheduled):,} scheduled activities")
     log.info(f"Pass {_OUT}/stage4_output.csv to stage5_destination_choice.py")
-
 

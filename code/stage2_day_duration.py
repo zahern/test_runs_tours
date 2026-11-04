@@ -159,23 +159,34 @@ def aggregate_person_day(
 
     # â”€â”€ resolve time columns to MINUTES from midnight â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # build_as_tours produces two sets of time columns:
-#   start_time / end_time  : raw HHTS minutes (e.g. 480 = 8:00am)
-#   STARTIME   / ENDTIME   : (start_time / 60) stored as integer hours
+#   start_time / end_time  : minutes from midnight (e.g. 480 = 8:00am)
+#   STARTIME   / ENDTIME   : legacy columns that may be hours or minutes
     # We prefer start_time/end_time (minutes). If absent, derive from
-    # STARTIME/ENDTIME by multiplying by 60.
+    # STARTIME/ENDTIME after resolving whether the legacy columns are hours
+    # or minutes.
 
     if 'start_time' not in df.columns:
         if 'STARTIME' in df.columns:
-            # STARTIME is hours (e.g. 8 means 8:00am = 480 min)
-            df['start_time'] = df['STARTIME'] * 60
-            logger.info('Derived start_time from STARTIME*60')
+            raw = pd.to_numeric(df['STARTIME'], errors='coerce')
+            # Legacy tour tables use hours, while Stage 4 emits minutes.
+            # Resolve the unit before conversion rather than relying on the
+            # later sanity check to undo an oversized intermediate value.
+            scale = 60.0 if raw.dropna().median() <= 24.0 else 1.0
+            df['start_time'] = raw * scale
+            logger.info(
+                'Derived start_time from STARTIME (%s)',
+                'hours' if scale == 60.0 else 'minutes')
         else:
             raise KeyError('tours table has neither start_time nor STARTIME')
 
     if 'end_time' not in df.columns:
         if 'ENDTIME' in df.columns:
-            df['end_time'] = df['ENDTIME'] * 60
-            logger.info('Derived end_time from ENDTIME*60')
+            raw = pd.to_numeric(df['ENDTIME'], errors='coerce')
+            scale = 60.0 if raw.dropna().median() <= 24.0 else 1.0
+            df['end_time'] = raw * scale
+            logger.info(
+                'Derived end_time from ENDTIME (%s)',
+                'hours' if scale == 60.0 else 'minutes')
         else:
             raise KeyError('tours table has neither end_time nor ENDTIME')
 
@@ -1345,7 +1356,5 @@ if __name__ == '__main__':
     synth_s2.to_csv('saved_data/stage2_output.csv', index=False)
     log.info(f"Stage 2 output saved â†’ {_OUT}/stage2_output.csv")
     log.info(f"Pass {_OUT}/stage2_output.csv to stage3_activity_duration.py")
-
-
 
 

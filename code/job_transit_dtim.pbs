@@ -2,12 +2,13 @@
 # Build EXACT drive-egress time + transfer-wait skims (r5py DetailedItineraries)
 # and embed them into the 371-zone OMX.
 #
-# Fills the two transit-LOS matrices missing from ../demand_/skims_371.omx:
-#   WLK_LOC_DRV_DTIM__AM   drive-egress leg minutes (park-and-ride egress)
-#   WLK_LOC_WLK_XWAIT__AM  transfer-wait minutes (replaces the WAIT/BOARDS
-#                          approximation the pipeline currently derives)
+# Fills the three transit-LOS matrices missing from ../demand_/skims_371.omx:
+#   WLK_LOC_DRV_DTIM__AM    drive-egress leg minutes (park-and-ride egress)
+#   WLK_LOC_DRV_DDIST__AM   drive-egress leg distance (km, same CAR legs)
+#   WLK_LOC_WLK_XWAIT__AM   transfer-wait minutes (replaces the WAIT/BOARDS
+#                           approximation the pipeline currently derives)
 # The pipeline consumes real matrices automatically when present (DTIM over
-# its TOTIVT proxy; derived XWAIT is skipped).
+# its TOTIVT proxy, DDIST over its flat 8 km fallback; derived XWAIT skipped).
 #
 # Runtime: itineraries cost ~1 s+/OD over the 137k grid — this does NOT fit one
 # slot. Origins run in batches with per-batch parquet checkpoints
@@ -15,20 +16,28 @@
 # command to resume (completed origins are skipped). Expect ~2 chained 48 h
 # slots for the full build.
 # Smoke test first (recommended): qsub -v ORIGIN_STEP=20 job_transit_dtim.pbs
+# (validates JVM heap + routing path on a small sample; writes checkpoints but
+#  deliberately publishes NO OMX — exits 3 and the verify step then reports the
+#  matrices missing. That is the expected smoke outcome, not a bug.)
 #
 # Submit from the code dir:
 #   qsub job_transit_dtim.pbs
-# DTIM only:  qsub -v DTIM_ONLY=1 job_transit_dtim.pbs
+# DTIM only (incl. DDIST): qsub -v DTIM_ONLY=1 job_transit_dtim.pbs
 # XWAIT only: qsub -v XWAIT_ONLY=1 job_transit_dtim.pbs
 #PBS -N transit_dtim_xwait
 #PBS -m n
 #PBS -r y
-# 128 GB + exclusive placement: 19-origin DetailedItineraries frames OOMed a
-# 64 GB slot in 5 min (job 25329147: 65.4 GB RSS during the probe). Batches are
-# smaller now (BATCH_ORIGINS=6) but the 4 h-window SEQ+GTFS network is heavy;
-# place=excl also keeps the cgroup contiguous (no split-slice OOM).
+# 128 GB + exclusive placement: the R5 search itself OOMed a 64 GB slot in 5 min
+# (job 25329147: 65.4 GB RSS during the probe) and later cgroup-OOM-killed this
+# slot at 125 GB (job 25395626). Cause: r5py starts the JVM with -Xmx = 80% of
+# node RAM (its own default) and JAVA_TOOL_OPTIONS does not override it, while
+# RegionalTask defaults max_time_walking/max_time_driving to the 4 h total
+# budget. The builder now pins the heap via r5py's --max-memory and bounds the
+# access/egress legs; batches stay small (BATCH_ORIGINS=6).
+# NOTE: node-exclusive placement removed per HPC admin directive. The job now
+# takes the default (free) placement, so the 128 GB may be split across slices
+# -- the r5py heap pin above is the guard against a split-slice OOM.
 #PBS -l select=1:ncpus=8:mem=128GB
-#PBS -l place=excl
 #PBS -l walltime=48:00:00
 
 set -euo pipefail
@@ -61,13 +70,21 @@ export OMP_NUM_THREADS=2
 export OPENBLAS_NUM_THREADS=2
 export MKL_NUM_THREADS=2
 
-# Set Java heap for r5py
-export JAVA_TOOL_OPTIONS="-Xmx12G"
+# Java heap for r5py. NOTE: JAVA_TOOL_OPTIONS alone does NOT set r5py's heap —
+# r5py passes its own -Xmx (80% of node RAM by default) to jpype.startJVM. The
+# builder injects --max-memory=$JVM_MEMORY into r5py's arg parser and aborts if
+# r5py did not honour it. Keep java-app.options in sync for other JVMs.
+export JVM_MEMORY=${JVM_MEMORY:-48G}
+export JAVA_TOOL_OPTIONS="-Xmx${JVM_MEMORY}"
 
-# Batched resume build (ORIGIN_STEP/BATCH_ORIGINS/DTIM_ONLY/XWAIT_ONLY
-# honoured by the builder; defaults = full grid, 19 origins per checkpoint)
+# Batched resume build (ORIGIN_STEP/BATCH_ORIGINS/PROBE_ORIGINS/MAX_TIME_*_MIN/
+# DTIM_ONLY/XWAIT_ONLY honoured by the builder; defaults = full grid, 6 origins
+# per checkpoint — 19 was the value that OOMed twice).
 export ORIGIN_STEP=${ORIGIN_STEP:-1}
-export BATCH_ORIGINS=${BATCH_ORIGINS:-19}
+export BATCH_ORIGINS=${BATCH_ORIGINS:-6}
+# Stop cleanly at a batch boundary before the cgroup limit kills the batch in
+# flight; resubmitting the same command resumes from checkpoints.
+export MAX_RSS_GB=${MAX_RSS_GB:-100}
 
 echo "=== Verify r5py/geopandas imports ==="
 python -c "
@@ -80,23 +97,49 @@ except ImportError:
     print('pyarrow MISSING (pickle checkpoints will be used instead)')
 "
 
-echo "=== Build DTIM + XWAIT skims (resumable) ==="
+echo "=== Build DTIM + DDIST + XWAIT skims (resumable) ==="
+# set -e would abort on the first non-zero exit before EXIT_CODE could be
+# captured (and would skip verification entirely), so both steps run with
+# errexit temporarily off and the code is propagated explicitly at the end.
+set +e
 python -u build_transit_dtim_xwait.py 2>&1
 EXIT_CODE=$?
+set -e
 
 echo "=== Verify OMX ==="
+set +e
 python -c "
+import os, sys
 import openmatrix as omx
 import numpy as np
+want = []
+if os.environ.get('XWAIT_ONLY', '0') != '1':
+    want += ['WLK_LOC_DRV_DTIM__AM', 'WLK_LOC_DRV_DDIST__AM']
+if os.environ.get('DTIM_ONLY', '0') != '1':
+    want.append('WLK_LOC_WLK_XWAIT__AM')
 f = omx.open_file('../demand_/skims_371.omx', 'r')
-for name in ['WLK_LOC_DRV_DTIM__AM', 'WLK_LOC_WLK_XWAIT__AM']:
+missing = []
+for name in ['WLK_LOC_DRV_DTIM__AM', 'WLK_LOC_DRV_DDIST__AM', 'WLK_LOC_WLK_XWAIT__AM']:
     if name in f:
         a = np.asarray(f[name][:], dtype=float)
         print(f'{name}: mean={np.nanmean(a):.1f} nonzero={(a > 0).mean():.1%} nan={np.isnan(a).sum()}')
     else:
         print(f'{name}: MISSING')
+        missing.append(name)
 f.close()
+unexpected = [m for m in missing if m in want]
+if unexpected:
+    print(f'FAIL: required matrices still missing: {unexpected}')
+    sys.exit(2)
+print('OK: all requested matrices present')
 "
+VERIFY_CODE=$?
+set -e
 
 echo "=== Done (exit_code=${EXIT_CODE}; resubmit same command to continue if batches remain) ==="
+# Propagate a verification failure: a build can exit 0 yet skip a matrix (e.g.
+# the DTIM probe finding no CAR-egress legs), which must not look like success.
+if [ "${VERIFY_CODE}" -ne 0 ] && [ "${EXIT_CODE}" -eq 0 ]; then
+    EXIT_CODE="${VERIFY_CODE}"
+fi
 exit "${EXIT_CODE}"

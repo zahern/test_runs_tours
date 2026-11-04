@@ -1,0 +1,67 @@
+#!/bin/bash -l
+# Verify the vmap logsum rewrite end-to-end on 371-zone HHTS data.
+# Runs _smoke_s5_only.py in SMOKE_DATA=hhts mode: the real pipeline
+# load_data() estimation frame + real 371 skims (same inputs the GA shards
+# estimate on), work-segment stage-5 estimation -> _logsums -> vmap attempt
+# with self-verify vs numpy. Legacy 330-zone synth smoke is retired for this
+# job (degenerate: 6895/6909 tours quarantined, 14 surviving cases prove
+# nothing) but kept in the script behind SMOKE_DATA=legacy.
+# With STAGE5_LARCH_LOGSUM=1 / STAGE5_VMAP_LOGSUM=1, _logsums attempts
+# _logsums_vmap first (compile + self-verify vs numpy), then numpy fallback.
+# Success = "self-verify passed" in the log; any failure falls back safely.
+#   qsub -P FPAXJW8067 -N vmap_verify_371 job_vmap_verify.pbs
+#PBS -m n
+#PBS -r y
+#PBS -P FPAXJW8067
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=4:mem=64GB
+
+set -euo pipefail
+
+cd "$PBS_O_WORKDIR"
+CONDA_BASE=${CONDA_BASE:-/mnt/hpccs01/home/ahernz/miniconda3}
+CONDA_ENV=${CONDA_ENV:-zigenv}
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_BASE}/envs/${CONDA_ENV}"
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+hash -r
+echo "python: $(which python) ($(python --version 2>&1))"
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-false}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+# vmap test gates: Larch per-zone loop OFF (skip straight to vmap attempt),
+# vmap attempt ON, self-verify ON (fail-closed: any breach exits nonzero).
+export STAGE5_LARCH_LOGSUM=0
+export STAGE5_VMAP_LOGSUM=1
+export STAGE5_VMAP_VERIFY=1
+# Force the vmap kernel onto the full 371-zone system (never the retired
+# 330-zone skim), regardless of what the smoke frame reports.
+export STAGE5_VMAP_FORCE_371=1
+# 371-zone HHTS verification data (same frame + skims the GA shards use).
+# Legacy synth/330 smoke available via SMOKE_DATA=legacy (not used here).
+export SMOKE_DATA=${SMOKE_DATA:-hhts}
+export NEW_POP=${NEW_POP:-1}
+export NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+export NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+export PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+export SMOKE_N_TOURS=${SMOKE_N_TOURS:-1500}
+export SMOKE_SEGMENTS=${SMOKE_SEGMENTS:-work}
+export SMOKE_OUT=${SMOKE_OUT:-runs/vmap_verify_371/stage5_smoke_models.pkl}
+export SMOKE_REPORT=${SMOKE_REPORT:-runs/vmap_verify_371_smoke_report.txt}
+
+echo "=========================================="
+echo "vmap verify job : ${PBS_JOBID:-unknown}"
+echo "Started         : $(date)"
+echo "=========================================="
+
+python -u -X utf8 _smoke_s5_only.py
+EXIT_CODE=$?
+echo "Finished: $(date) exit_code=${EXIT_CODE}"
+cat "${SMOKE_REPORT}" 2>/dev/null || true
+exit "${EXIT_CODE}"

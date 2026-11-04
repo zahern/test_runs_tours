@@ -139,7 +139,10 @@ def main():
             try:
                 df = pd.read_csv(f, usecols=usecols)
             except Exception as e:
-                print(f"  !! {os.path.basename(f)}: {e}"); continue
+                print(f"  !! {os.path.basename(f)}: {e} (SKIPPING)", flush=True)
+                with open(done_marker, "a") as dm:
+                    dm.write(os.path.basename(f) + "\n")
+                continue
             df = df[(df.StartDate >= args.date_min) & (df.StartDate <= args.date_max)]
             rows = []
             for t in df.itertuples(index=False):

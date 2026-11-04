@@ -1,7 +1,7 @@
 """Significance pruning for the Gumbel joint-searched masks.
 
-Reads the promoted eb_search_joint_best.csv (Gumbel s45 winner: HB 25 /
-crash 16 vars), refits each mask as a fixed-effect NB on the full N=10,780
+Reads the promoted eb_search_joint_best.csv (Gumbel s44 winner, mcr 1.0.177, joint-BIC
+132,297.6: HB 17 / crash 13 vars), refits each mask as a fixed-effect NB on the full N=10,780
 sample under the VMT-years exposure offset, and backward-eliminates to
 p<0.10 -- the paper's best-models-only rule. The joint search scores raw
 joint BIC (no per-coefficient penalty), so its masks are large; this job

@@ -47,6 +47,17 @@ echo "Updating paths for HPC environment..."
 sed -i "s|PROJ = r\"C:\\\\Users\\\\ahernz.*\"|PROJ = \"$PROJ_DIR\"|g" 18_prepare_eb_dataset.py
 sed -i "s|ROOT = r\"C:\\\\Users\\\\ahernz.*\"|ROOT = \"$DATA_DIR\"|g" 18_prepare_eb_dataset.py
 
+# ── Which HB source will 18_prepare use? ─────────────────────────────────────
+if [ -f "$DATA_DIR/hard_braking_events_full.csv" ]; then
+    echo "HB source: hard_braking_events_full.csv (full-period rebuild)"
+else
+    echo "WARNING: hard_braking_events_full.csv not found."
+    echo "  18_prepare will fall back to legacy hard_braking_events.csv,"
+    echo "  whose dates (out to Dec 2026) are inconsistent with raw trips"
+    echo "  (end 2026-03-31). To fix: run pbs_55_rebuild_hb.pbs, then"
+    echo "  scripts/55b_merge_hb_shards.py, then re-submit this job."
+fi
+
 # ── Run data preparation ──────────────────────────────────────────────────────
 echo ""
 echo "Running 18_prepare_eb_dataset.py..."

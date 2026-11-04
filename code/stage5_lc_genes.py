@@ -166,7 +166,7 @@ def decode_lc_spec(genes: np.ndarray,
         "gap_min": (1.0 if bits.get("lc_gap_hi", 0)
                     else 0.5 if bits.get("lc_gap_mid", 0) else 0.0),
         "share_floor": 0.15 if bits.get("lc_floor_hi", 0) else 0.10,
-        "n_init": int(os.environ.get("STAGE5_LC_N_INIT", "2")),
+        "n_init": int(os.environ.get("STAGE5_LC_N_INIT", "4")),
         "perturb_sigma": float(os.environ.get("STAGE5_LC_SIGMA", "0.5")),
         "maxiter": int(os.environ.get("STAGE5_LC_MAXITER", "150")),
         "membership_l2": float(os.environ.get("STAGE5_LC_MEMB_L2", "0.1")),
@@ -192,8 +192,6 @@ def doctor_gate(frame, feature_cols: Sequence[str], *,
     nothing actionable can be pruned).  Returns
     (kept_feature_cols, doctor_info, reject_reason_or_None).
     """
-    from SearchLibrium.mh_choice_estimator import identify_weak_features
-
     mode = (mode if mode is not None
             else os.environ.get("STAGE5_LC_DOCTOR", "0")).strip().lower()
     info: dict = {"doctor_mode": mode}
@@ -201,6 +199,15 @@ def doctor_gate(frame, feature_cols: Sequence[str], *,
         return list(feature_cols), info, None
     if mode not in ("reject", "prune"):
         raise ValueError(f"STAGE5_LC_DOCTOR must be 0|reject|prune, got {mode!r}")
+    try:
+        from SearchLibrium.mh_choice_estimator import identify_weak_features
+    except Exception as exc:
+        # The identification doctor is optional; recent SearchLibrium
+        # (>=0.0.256) dropped identify_weak_features.  Disable the doctor
+        # rather than failing every latent-class genome fit.
+        info["doctor_error"] = f"{type(exc).__name__}: {exc}"
+        info["doctor_disabled"] = True
+        return list(feature_cols), info, None
     if tol is None:
         tol = float(os.environ.get("STAGE5_LC_DOCTOR_TOL", "1e-8"))
     if max_weak is None:
@@ -306,8 +313,17 @@ def fit_lc_genome(frame, coef_to_col: dict, spec: dict, *,
         return -1e9, info
     d = len(feature_cols)
     n = int(res["n_cases"])
-    k = (int(spec["n_classes"]) * d
-         + (int(spec["n_classes"]) - 1) * (len(memb) + 1 if memb else 0))
+    K = int(spec["n_classes"])
+    # Must match _lc_result's k_params EXACTLY. With a membership equation the
+    # shares are implied by the gammas, so each non-reference class costs an
+    # intercept + one slope per covariate; with NO membership equation the
+    # (K-1) class shares are themselves free parameters and must be paid for.
+    # Omitting them made an LC genome score K-1 parameters cheaper than the
+    # pooled larch genome it competes against inside the same GA — the identical
+    # under-penalisation bug already fixed for the mode LCCM
+    # (ga_hypothesis_testing._free_param_count), and it would let the LC arm
+    # win a BIC/n comparison it never earned.
+    k = K * d + ((K - 1) * (len(memb) + 1) if memb else (K - 1))
     score = -(-2.0 * info["ll"]
               + float(complexity_penalty) * k * np.log(max(n, 2))) / max(n, 1)
     info["k"] = k

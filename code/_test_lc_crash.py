@@ -10,8 +10,17 @@ os.environ.setdefault("NEW_POP_DIR", r"Z:\test_runs_tours\new_pop")
 os.environ.setdefault("NEW_POP_MAPPED", "0")
 os.environ.setdefault("PIPELINE_SKIMS_PATH",
                       r"Z:\test_runs_tours\demand_\skims_371.omx")
+os.environ.setdefault("SEARCHLIBRIUM_SRC", r"Z:\test_runs_tours\code\_patches")
+_src = os.environ.get("SEARCHLIBRIUM_SRC")
+if _src and os.path.isdir(_src) and _src not in sys.path:
+    sys.path.insert(0, _src)
 CODE = r"Z:\test_runs_tours\code"
-sys.path.insert(0, CODE); os.chdir(CODE)
+sys.path.insert(0, CODE)
+os.chdir(CODE)
+
+# Now import SearchLibrium from the patched path
+from SearchLibrium.mh_choice_estimator import estimate_dest_choice_lc
+
 import numpy as np
 import pandas as pd
 import cloudpickle
@@ -34,7 +43,6 @@ def patch():
 
 patch()
 import stage5_destination_choice as S5
-from SearchLibrium.mh_choice_estimator import estimate_dest_choice_lc
 
 N_CASES = int(os.environ.get("LC_N_CASES", "1200"))
 cache = cloudpickle.load(open(
@@ -62,11 +70,19 @@ covs = [c for c in MEMB if c in frame.columns]
 print(f"[lc-crash] cases={frame['case_id'].nunique()} features={len(fmap)} "
       f"membership_vars={covs}", flush=True)
 
+# Diagnostics: check membership covariate values
+if covs:
+    case_covs = frame.groupby('case_id')[covs].first()
+    print("Membership covariate stats:")
+    print(case_covs.describe())
+    print("Covariate correlations:")
+    print(case_covs.corr())
+
 t0 = time.time()
 res = estimate_dest_choice_lc(
     frame, list(fmap), n_classes=2,
     membership_vars=covs,
-    n_init=2, perturb_sigma=0.5, maxiter=60, share_floor=0.10, membership_l2=0.1, seed=7,
+    n_init=5, perturb_sigma=0.5, maxiter=200, share_floor=0.05, membership_l2=0.001, seed=7,
     require_crash=True)
 print(f"done {time.time()-t0:.0f}s  ll={res['loglike']:.1f} bic={res['bic']:.1f} "
       f"conv={res['converged']} iters={res['iterations']}")
@@ -75,6 +91,20 @@ print("restart LLs:", [round(v, 1) for v in res.get("restart_lls", [])],
       "span=", round(res.get("restart_ll_span", 0.0), 2))
 print("class_crash:", res.get("class_crash"),
       "gap=", res.get("crash_class_gap"), "cols=", res.get("crash_cols"))
+
+# Diagnostics: check posterior responsibilities vs covariates
+if 'responsibilities' in res and covs:
+    resp = res['responsibilities']  # shape (n_cases, n_classes)
+    case_covs = frame.groupby('case_id')[covs].first()
+    case_covs = case_covs.reindex([str(c) for c in res.get('case_ids', case_covs.index)])
+    if len(case_covs) == len(resp):
+        print("\nPosterior class 1 mean by covariate tertile:")
+        for col in covs:
+            tertiles = pd.qcut(case_covs[col], 3, labels=['low', 'med', 'high'], duplicates='drop')
+            for t, mask in case_covs.groupby(tertiles).groups.items():
+                mean_resp = resp[list(mask), 1].mean() if hasattr(mask, '__iter__') else np.nan
+                print(f"  {col} {t}: class1_resp={mean_resp:.3f}, n={len(mask)}")
+
 print("membership_coefs:")
 for k, v in (res.get("membership_coefs") or {}).items():
     print(f"  {k:28s} {v:+.4f}")

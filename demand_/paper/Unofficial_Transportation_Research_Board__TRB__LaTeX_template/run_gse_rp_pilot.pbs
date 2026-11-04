@@ -4,7 +4,7 @@
 #PBS -l select=1:ncpus=4:mem=64GB
 #PBS -j oe
 #PBS -r n
-# GSE structured random-parameter pilot (metacountregressor==1.0.151):
+# GSE structured random-parameter pilot (always-latest metacountregressor):
 # unstructured vs hetro_in_means vs +hetro_in_variances vs GSE scores,
 # same verdict gate as the refit jobs (SD p<0.10, |mean|<5, disp p<0.10).
 # Arms report ACCEPT/REJECT/SKIP -- the pilot never fails on API mismatch.
@@ -17,7 +17,7 @@ module unload Anaconda3
 mkdir -p /mnt/hpccs01/home/ahernz/test_runs_tours/code
 (
     flock -w 900 9 2>/dev/null || echo "(flock unavailable, proceeding without lock)"
-    pip install --quiet --upgrade --retries 5 --timeout 60 "metacountregressor==1.0.165" 2>&1 | tail -5
+    pip install --quiet --upgrade --retries 5 --timeout 60 metacountregressor 2>&1 | tail -5
 ) 9>/mnt/hpccs01/home/ahernz/test_runs_tours/code/.pkg_upgrade.lock
 python -c "from importlib.metadata import version as _v; v=tuple(map(int, _v('metacountregressor').split('.')[:3])); assert v>=(1,0,165), f\"stale mcr {_v('metacountregressor')} — aborting\"; print('mcr', _v('metacountregressor'), 'OK')" || exit 1
 export PYTHONWARNINGS="ignore::RuntimeWarning"
@@ -34,3 +34,5 @@ for f in "$PROJ_DIR/gse_rp_pilot.csv" "$PROJ_DIR/gse_rp_pilot_verdict.csv" "$PRO
 done
 echo "Job finished at $(date) exit=$EXIT_CODE"
 exit $EXIT_CODE
+
+

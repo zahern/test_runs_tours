@@ -420,6 +420,16 @@ def main():
             pass
         return None
 
+    def _require_valid_search_fitness(ga, label):
+        try:
+            fitness = float(getattr(ga, 'best_fitness', float('nan')))
+        except Exception:
+            fitness = float('nan')
+        if not np.isfinite(fitness) or fitness <= -1e8:
+            raise RuntimeError(
+                f'{label} failed: invalid best_fitness={fitness!r}')
+        return fitness
+
     try:
         print('=== arm M1_s0 (CDAP defaults) ===', flush=True)
         from cdap import estimate_cdap
@@ -442,6 +452,7 @@ def main():
         _ga0 = run_ga_stage(stage=0, persons=pp, pop_size=_M2_POP,
                             n_generations=_M2_GENS, n_restarts=_M2_RESTARTS,
                             verbose=True)
+        _fit0 = _require_valid_search_fitness(_ga0, 'M2_s0 search')
         _best0 = list(_ga0.best_features or [])
         _m2s0 = estimate_cdap(
             pp, save_path=mtc.guard_path(root, 'stage0_models_M2.pkl'),
@@ -452,8 +463,7 @@ def main():
                 'features': list((_m2s0 or {}).get('features', [])),
                 'n_features': len(_best0)}
         try:
-            m2s0['best_fitness'] = float(getattr(_ga0, 'best_fitness',
-                                                 float('nan')))
+            m2s0['best_fitness'] = _fit0
         except Exception:
             m2s0['best_fitness'] = None
     except Exception as e:
@@ -530,6 +540,7 @@ def main():
         _ga1 = _rgs1(stage=1, tours=tours, persons=pp, landuse=lu,
                      pop_size=_M2_POP, n_generations=_M2_GENS,
                      n_restarts=_M2_RESTARTS, verbose=True)
+        _fit1 = _require_valid_search_fitness(_ga1, 'M2_s1 search')
         _bf1 = _ga1.best_features
         _ov1 = None
         if isinstance(_bf1, dict):
@@ -556,8 +567,7 @@ def main():
                                      and _obs_means['nonmand'] is not None
                                      else None)}
         try:
-            m2s1['best_fitness'] = float(getattr(_ga1, 'best_fitness',
-                                                 float('nan')))
+            m2s1['best_fitness'] = _fit1
         except Exception:
             m2s1['best_fitness'] = None
     except Exception as e:
@@ -651,12 +661,9 @@ def main():
                                  'n_generations': _M2_S5_GENS,
                                  'n_restarts': _M2_RESTARTS}},
         )
+        e2fit = _require_valid_search_fitness(ga, 'M2 stage-5 search')
         best_mode = (ga.best_features or {}).get('mode', None)
         best_dest = (ga.best_features or {}).get('dest', None)
-        try:
-            e2fit = float(getattr(ga, 'best_fitness', float('nan')))
-        except Exception:
-            e2fit = None
         plan2, models2 = run_stage5(
             save_path=mtc.guard_path(root, 'stage5_models_M2.pkl'),
             mode_feature_override=best_mode,

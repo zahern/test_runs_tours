@@ -20,11 +20,11 @@
 \definecolor{QUTBlue}{HTML}{003B71}
 \definecolor{QUTSky}{HTML}{0077C8}
 
-% Paper status tags: \StatusDone / \StatusTodo mark each exhibit as refreshed
-% or still awaiting the new run. Pass [disable] to todonotes for submission.
-\usepackage[textsize=scriptsize]{todonotes}
-\newcommand{\StatusDone}[1]{\todo[inline,color=QUTSky!10,bordercolor=QUTSky]{DONE --- #1}}
-\newcommand{\StatusTodo}[1]{\todo[inline,color=orange!10,bordercolor=orange]{TODO --- #1}}
+% Working-draft status markers. They are text rather than margin notes so
+% long experiment instructions wrap inside the text block.
+\newcommand{\StatusDone}[1]{\par\smallskip\noindent\textcolor{QUTSky}{\textbf{DONE ---} #1}\par\smallskip}
+\newcommand{\StatusTodo}[1]{\par\smallskip\noindent\textcolor{orange}{\textbf{TODO ---} #1}\par\smallskip}
+\newcommand{\StatusBlocked}[1]{\par\smallskip\noindent\textcolor{red}{\textbf{BLOCKED ---} #1}\par\smallskip}
 
 %%%%%%%%%%%%% figures and tables and captions %%%%%%%%%%%%%%%%
 \usepackage{graphicx} 
@@ -45,6 +45,9 @@
 \usepackage{placeins} % \FloatBarrier (used in main.tex)
 \usepackage{longtable} % also nice tables 
 \usepackage{array} % allows you to center text in a table with columns of defined width
+\makeatletter
+\@ifundefined{insert@pcolumn}{\let\insert@pcolumn\insert@column}{}
+\makeatother
 \newcolumntype{P}[1]{>{\centering\arraybackslash}p{#1}}  
 \newcolumntype{M}[1]{>{\centering\arraybackslash}m{#1}}
 
@@ -67,10 +70,14 @@
 %%%%%%%%%%%%% spacing %%%%%%%%%%%%%
 \setlength{\parskip}{.75ex plus 0.25ex minus 0.25ex} % slight space b/w paragraphs
 \setlength{\parindent}{0em} % smaller indent of paragraphs
+\setlength{\emergencystretch}{3em} % allow long prose to wrap without overfull lines
+\setlength{\tabcolsep}{3pt} % keep dense manuscript tables within the text block
 
 
 %%%%%%%%%%%%% symbols %%%%%%%%%%%%%
 \usepackage{amsmath}
+\allowdisplaybreaks[2]
+\usepackage{amssymb}
 \usepackage{textcomp} % some control quote sequences and other symbols
 \usepackage{mathtools} % symbols
 \usepackage{mathrsfs} %allows the /mathscr command for in-line math
@@ -106,21 +113,26 @@
 
 \begin{flushleft}
     \begin{adjustwidth}{0in}{.5in} % a bit more margin for the title
-        \begin{Huge} 
+        \begin{large}
             \begin{spacing}{.9} 
             \textbf{\@title}
             \end{spacing}
-        \end{Huge}
+        \end{large}
     \end{adjustwidth}
     \bigskip
     \linespread{1}
-    \@author 
+    \begin{minipage}{\linewidth}
+        \@author
+    \end{minipage}
 \end{flushleft}\egroup
 }
 \makeatother
 
 %%%%%%%%%%%%%% bibliography %%%%%%%%%%%%%%%%%
-\usepackage[numbers,super,sort&compress]{natbib} % superscript numbers for references
+\usepackage[authoryear,round,sort&compress]{natbib} % author/year for references
+\setcitestyle{authoryear,round,sort&compress} % narrative "Author (year)", parenthetical "(Author, year)"
+
+%\usepackage[numbers,super,sort&compress]{natbib} % superscript numbers for references
 %\setcitestyle{numbers,open={[},close={]}} % uncomment for [] bracket citations
 
 %\usepackage[authoryear,sort&compress]{natbib} % author/year for references
@@ -140,5 +152,3 @@
     \renewcommand{\thefigure}{S\arabic{figure}}%
     \renewcommand{\theequation}{S\arabic{equation}} 
 }
-
-

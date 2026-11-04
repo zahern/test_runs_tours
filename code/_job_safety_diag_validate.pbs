@@ -1,0 +1,25 @@
+#!/bin/bash -l
+#PBS -N safety_diag_val
+#PBS -P FPAXJW8067
+#PBS -l walltime=06:00:00
+#PBS -l select=1:ncpus=8:mem=96GB
+#PBS -j oe
+#PBS -m n
+cd $PBS_O_WORKDIR
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+conda activate zigenv
+export PIPELINE_SKIMS_PATH=../demand_/skims_371.omx
+export JAX_PLATFORMS=cpu
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export STAGE5_ZONE_BRIDGE=1
+export STAGE5_STRICT_ZONES=0
+export STAGE5_REQUIRE_LOGSUM_VARIANCE=1
+echo "[$(date)] diagnostic safety validation starting"
+python -u validate_safety_arms.py \
+  --run-dir runs/safety_baseline__27074297.aqua \
+  --out runs/safety_validation_diag \
+  --split random --frac 0.30 --segments work,edu,nonmand \
+  --skims ../demand_/skims_371.omx
+RC=$?
+echo "[$(date)] diagnostic safety validation exit=$RC"
+exit $RC

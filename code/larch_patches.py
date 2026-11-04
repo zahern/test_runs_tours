@@ -157,6 +157,47 @@ def apply() -> None:
         JaxModel.jax_param_cov = _jax_param_cov_ridge
         logger.info("larch_patches: jax_param_cov → ridge-aware")
 
+    # ── jax engine: graph-tolerant dataset assignment ─────────────────────
+    # Larch 6.0.x LatentClass.reflow_data_arrays assigns
+    # `classmodel.dataset = <derived>` on the datatreeless class-membership
+    # model. The JAX dataset setter eagerly calls _rebuild_fixed_arrays(),
+    # which needs self.graph — None here — so EVERY LCCM refit dies with
+    # AttributeError 'NoneType' has no 'node_slot_arrays' (stage-5 lccm arm:
+    # "family refit failed (sentinel)"). The numba setter merely stores +
+    # nulls arrays (and both engines' reflow_data_arrays early-return on
+    # graph None), so mirroring that when graph is None makes JAX membership
+    # behave exactly like numba membership. Graph present ⇒ call through
+    # untouched. Never raises.
+    try:
+        from larch.model.jaxmodel import Model as _JaxModel2
+    except Exception as _e:                                     # noqa: BLE001
+        _JaxModel2 = None
+        logger.debug(f"larch_patches: JaxModel unavailable ({_e})")
+
+    if _JaxModel2 is not None and isinstance(
+            getattr(_JaxModel2, 'dataset', None), property) \
+            and not getattr(_JaxModel2.dataset.fset, '_graph_tolerant', False):
+        _orig_ds_fset = _JaxModel2.dataset.fset
+
+        def _dataset_graph_tolerant(self, dataset):
+            if getattr(self, 'graph', None) is None:
+                try:
+                    object.__setattr__(self, '_dataset', dataset)
+                except Exception:                              # noqa: BLE001
+                    self.__dict__['_dataset'] = dataset
+                try:
+                    object.__setattr__(self, '_data_arrays', None)
+                except Exception:                              # noqa: BLE001
+                    pass
+                return
+            _orig_ds_fset(self, dataset)
+
+        _dataset_graph_tolerant._graph_tolerant = True
+        _JaxModel2.dataset = property(
+            _JaxModel2.dataset.fget, _dataset_graph_tolerant,
+            _JaxModel2.dataset.fdel, _JaxModel2.dataset.__doc__)
+        logger.info("larch_patches: JaxModel.dataset → graph-tolerant")
+
     # ── logsums signature shim (Larch 5 → 6 API change) ──────────────────
     # Larch 5.x: Model.logsums(datatree=...).  Larch 6.x: logsums(x=None)
     # evaluates against the model's attached `.datatree`.  Wrap both model

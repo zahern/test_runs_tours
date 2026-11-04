@@ -1,0 +1,23 @@
+#!/bin/bash -l
+#PBS -N poster_nosa2
+#PBS -P FPAXJW8067
+#PBS -l walltime=36:00:00
+#PBS -l select=1:ncpus=8:mem=250GB
+#PBS -j oe
+#PBS -m n
+cd $PBS_O_WORKDIR
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+conda activate zigenv
+export PIPELINE_SKIMS_PATH=../demand_/skims_371.omx
+export PIPELINE_RUN_TAG=poster_fix_v2
+export SAFETY_EXPERIMENT_MODE=nosafety
+export STAGE5_ZONE_BRIDGE=1
+export STAGE5_STRICT_ZONES=1
+export STAGE5_REQUIRE_LOGSUM_VARIANCE=1
+export JAX_PLATFORMS=cpu
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+echo "[$(date)] M0 v2 starting"
+python -u pipeline_logger.py safety_nosafety > log_poster_nosafety_v2.out 2> log_poster_nosafety_v2.err
+RC=$?
+echo "[$(date)] M0 v2 exit=$RC"
+exit $RC

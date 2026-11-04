@@ -66,6 +66,12 @@ STAGE_NAMES = {
     5: 'Tour mode and destination',
 }
 
+# Stage 5 is reported from the headline merged run.  Its coefficients are the
+# ones the main text cites in Table ga_shard2; the primary tag's stage-5 refit
+# is a different fit with different likelihoods, so mixing the two made the
+# appendix and the main text disagree on the crash coefficients.
+S5_TAG = os.environ.get('APPENDIX_S5_TAG', 'qld_shard4_retry_20260924')
+
 EXPECTED = {
     0: ['all'],
     1: ['work', 'edu', 'nonmand'],
@@ -200,6 +206,15 @@ def _coef_table(sdir, sid, seg):
                          'name': str(r.get(paramc, ''))})
     if not seg_rows:
         return []
+    # Collapse duplicate exports of the same parameter in the same slot.  Some
+    # stage 2/3 CSVs contain the pre-prune fit and a later refit under the same
+    # segment key, which printed the same coefficient twice and pushed real
+    # terms out of the |t| cap.  Later rows supersede earlier ones.
+    dedup = {}
+    for x in seg_rows:
+        key = (str(x['r'].get(modelc, '')), str(x['r'].get(segc, '')), x['name'])
+        dedup[key] = x
+    seg_rows = list(dedup.values())
     # Select rows: always-show (crash/safety/logsum/size) + top-|t| of the rest.
     pinned = [x for x in seg_rows if _matches_any(x['name'], _ALWAYS_SHOW)]
     rest = [x for x in seg_rows
@@ -364,8 +379,13 @@ def main():
         elif not a.startswith('-'):
             tag = a
     tags = [tag] + [t for t in fallbacks if t != tag]
+    s5_tags = [S5_TAG] + [t for t in tags if t != S5_TAG]
     here = os.path.dirname(os.path.abspath(__file__))
-    based = {t: os.path.join(here, 'runs', 'ga_parallel', t) for t in tags}
+    based = {t: os.path.join(here, 'runs', 'ga_parallel', t)
+             for t in dict.fromkeys(tags + s5_tags)}
+    verdicts = _read_json(os.path.join(
+        os.path.abspath(os.path.join(here, '..', 'abm_safety', 'preprint')),
+        'convergence_verdicts.json')) or {}
     # abm_safety/ is a sibling of code/, not a child.
     pre = os.path.abspath(os.path.join(here, '..', 'abm_safety', 'preprint'))
     figdir = os.path.join(pre, 'figures', 'appendix')
@@ -381,8 +401,17 @@ def main():
     out.append('One subsection per estimation stage. Each segment table lists the '
                'searched best-feature set; fitness is mean $-\\mathrm{BIC}/n$ '
                '(higher is better) with the completed search-generation count. '
-               'Each convergence panel is that segment\'s own BIC trajectory '
-               '--- there is no pooled convergence plot. '
+               'Each panel is that segment\'s own trajectory --- there is no '
+               'pooled convergence plot. The top panel shows best-so-far BIC/n, '
+               'the population mean and the mean--worst spread; the bottom panel '
+               'shows population diversity. The verdict printed above each '
+               'panel is computed from the search\'s own stagnation counter: a '
+               'run that ended at its generation cap is reported as a '
+               'budget-limited plateau, not as converged, and a smoke-budget '
+               'run is labelled as not a convergence result. Stage~5 carries no '
+               'convergence panel: that search wrote a salvaged-partial history, '
+               'so its tables are refits of the best-so-far genome, not a '
+               'completed trajectory. '
                'Estimated-coefficient tables are grouped by model component '
                '(structural / level-of-service / safety / land-use / person '
                'interactions); the force-included safety and structural terms '
@@ -404,7 +433,9 @@ def main():
         for seg in EXPECTED[sid]:
             sdir, used = None, None
             info, summ, feats = {}, [], []
-            for t in tags:
+            # Stage 5 is handled by the coefficient block below so every
+            # segment comes from the same headline run.
+            for t in ([] if sid == 5 else tags):
                 cand = os.path.join(based[t], 'stage%d' % sid, 'shards', seg)
                 pkl = os.path.join(cand, 'ga_results.pkl')
                 if not (os.path.isfile(pkl) and os.path.getsize(pkl) > 0):
@@ -433,9 +464,9 @@ def main():
                 # the shard). Emit the coefficient table from those so the
                 # estimated model -- including the force-included CRASH terms --
                 # is reported instead of a "pending rerun" stub.
-                for t in tags:
-                    for sub in (os.path.join('stage5', 'promoted', 'refit', seg),
-                                os.path.join('stage5', 'shards', seg)):
+                for t in s5_tags:
+                    for sub in (os.path.join('stage5', 'shards', seg),
+                                os.path.join('stage5', 'promoted', 'refit', seg)):
                         cdir = os.path.join(based[t], sub)
                         if (os.path.isfile(os.path.join(
                                 cdir, 'stage5_models_coefficients.csv'))
@@ -450,11 +481,28 @@ def main():
                     if _cl:
                         out.append('')
                         out.append('\\paragraph{%s.}' % title)
-                        out.append('Estimated coefficients from the promoted '
-                                   'Stage-5 fit (source run %s%s); the GA search '
-                                   'trace was not retained for this segment.'
+                        out.append('Estimated coefficients from the final refit '
+                                   'of the Stage-5 best-so-far genome (source '
+                                   'run %s%s). The Stage-5 search wrote a '
+                                   'salvaged-partial history, so no convergence '
+                                   'panel is claimed for this segment.'
                                    % (_esc(used),
                                       ' (fallback)' if used != tag else ''))
+                        _feat = _read_csv_rows(os.path.join(
+                            sdir, 'ga_reports', 'ga_stage5_best_features.csv'))
+                        if _feat:
+                            _groups = {}
+                            for _r in _feat:
+                                _groups.setdefault(_r.get('group', ''), []).append(
+                                    _r.get('feature', ''))
+                            out.append('\\begin{center}\\begin{tabular}{l p{10cm}}'
+                                       '\\toprule')
+                            out.append('Slot & Best features \\\\ \\midrule')
+                            for _g in sorted(_groups):
+                                out.append('%s & %s \\\\'
+                                           % (_esc(_g), ', '.join(
+                                               _esc(_f) for _f in _groups[_g])))
+                            out.append('\\bottomrule\\end{tabular}\\end{center}')
                         for _l in _cl:
                             out.append(_l)
                         continue
@@ -499,6 +547,12 @@ def main():
             for r in feats:
                 groups.setdefault(r.get('group', ''), []).append(
                     r.get('feature', ''))
+            # A pooled non-mandatory search returns one feature set replicated
+            # under every purpose group.  Six identical rows would imply six
+            # purpose-specific searches that never happened; collapse them.
+            _uniq = {tuple(v) for v in groups.values()}
+            if sid in (1, 3) and seg == 'nonmand' and len(_uniq) == 1:
+                groups = {'nonmand (combined)': next(iter(groups.values()))}
             out.append('\\begin{center}\\begin{tabular}{l p{10cm}}\\toprule')
             out.append('Slot & Best features \\\\ \\midrule')
             for g in sorted(groups):
@@ -509,17 +563,38 @@ def main():
             for _cl in _coef_table(sdir, sid, seg):
                 out.append(_cl)
             # convergence figure
-            src = os.path.join(sdir, 'plots', 'ga_stage%d.png' % sid)
-            if not os.path.isfile(src):
-                src = os.path.join(sdir, 'plots', 'ga_all_stages.png')
-            if os.path.isfile(src):
-                dst = os.path.join(figdir, 'conv_s%d_%s.png' % (sid, seg))
-                shutil.copy2(src, dst)
+            # The panels are produced by build_convergence_panels.py from each
+            # shard's own per-generation history, with the verdict copied from
+            # convergence_verdicts.json.  They must never be overwritten by the
+            # legacy plots/ga_stageN.png: that plot swaps the population mean
+            # for a band of every proposed chromosome, so a converged run can
+            # look like a search that never settles.  Only fall back to the
+            # legacy plot when no rebuilt panel exists for this segment.
+            dst = os.path.join(figdir, 'conv_s%d_%s.png' % (sid, seg))
+            _v = (verdicts.get('s%d_%s' % (sid, seg), {}) or {}).get('verdict', '')
+            rebuilt = bool(_v) and os.path.isfile(dst)
+            if not rebuilt:
+                src = os.path.join(sdir, 'plots', 'ga_stage%d.png' % sid)
+                if not os.path.isfile(src):
+                    src = os.path.join(sdir, 'plots', 'ga_all_stages.png')
+                if os.path.isfile(src):
+                    shutil.copy2(src, dst)
+            if os.path.isfile(dst):
                 out.append('\\begin{figure}[h!]\\centering')
                 out.append('\\includegraphics[width=0.85\\linewidth]'
                            '{figures/appendix/conv_s%d_%s.png}' % (sid, seg))
-                out.append('\\caption{Stage~%d / %s: searched BIC trajectory.}'
-                           % (sid, _esc(seg)))
+                if rebuilt:
+                    _cap = ('Stage~%d / %s: searched BIC trajectory (top: '
+                            'best-so-far, population mean and mean--worst spread) '
+                            'and population diversity (bottom).'
+                            % (sid, _esc(seg)))
+                    _cap += ' ' + _esc(_v) + '.'
+                else:
+                    _cap = ('Stage~%d / %s: legacy proposal-range plot '
+                            '(best-so-far and the range of proposed '
+                            'chromosomes; no population mean or verdict).'
+                            % (sid, _esc(seg)))
+                out.append('\\caption{%s}' % _cap)
                 out.append('\\label{fig:conv-s%d-%s}' % (sid, seg))
                 out.append('\\end{figure}')
                 n_fig += 1

@@ -23,11 +23,13 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")
 
 import argparse
+import re
 import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from exposure import OFF, add_exposure_offsets
+from nearmiss_hb_analysis import VLABEL  # verbose covariate labels (tables)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "near_miss_hb_ecf.csv")
@@ -122,6 +124,20 @@ def run_one(df, feats, y_col, tag, label, a):
     summ = az.summary(idata, var_names=[v for v, _ in coef_vars],
                       hdi_prob=0.94)
     summ = summ.reset_index().rename(columns={"index": "Variable"})
+    # Name the beta[i] rows: beta[0] is the intercept, beta[1:] follow the
+    # spec feat order (15 terms for 14 feats / 11 for 10 confirms this).
+    # Verbose VLABEL names match the MLE tables (and are LaTeX-safe).
+    _names = ["(Intercept)"] + [VLABEL.get(f, f) for f in feats]
+
+    def _rename(v):
+        m = re.match(r"^beta\[(\d+)\]$", str(v))
+        if m and int(m.group(1)) < len(_names):
+            return _names[int(m.group(1))]
+        return v
+
+    summ["Variable"] = summ["Variable"].map(_rename)
+    print(f"[{tag}] term map: " + ", ".join(
+        f"beta[{i}]={n}" for i, n in enumerate(_names)), flush=True)
     keep = [c for c in ["Variable", "mean", "sd", "hdi_3%", "hdi_97%",
                         "ess_bulk", "r_hat"] if c in summ.columns]
     summ = summ[keep]

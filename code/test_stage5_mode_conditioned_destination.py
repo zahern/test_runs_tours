@@ -54,8 +54,13 @@ def _load_transit_helpers():
         'logger': logging.getLogger('stage5-transit-test'),
         'TRANSIT_SUBMODE_MAP': {'Bus': 1, 'Train': 2},
         'TRANSIT_SUBMODE_NAMES': {1: 'Bus', 2: 'Train'},
-        'TRANSIT_ACCESS_MAP': {'Walk': 1, 'Drive': 2},
-        'TRANSIT_ACCESS_NAMES': {1: 'Walk', 2: 'Drive'},
+        'TRANSIT_ACCESS_MAP': {'Walk': 1, 'Drive': 2, 'Bike': 3},
+        'TRANSIT_ACCESS_NAMES': {1: 'Walk', 2: 'Drive', 3: 'Bike'},
+        # The real module reads STAGE5_PT_MODES at import; the legacy binary
+        # walk/drive access path (exercised by these tests) runs when it is
+        # False. PT_BIKE_FROM_WALK is referenced only in the PT-on branch.
+        'STAGE5_PT_MODES': False,
+        'PT_BIKE_FROM_WALK': 2.4,
         'MODE_TT_COL': {5: 'WLK_LOC_WLK_TOTIVT__AM'},
         'MODE_TT_CAP': {5: 150.0},
         'MODE_TT_DEFAULT': {5: 25.0},

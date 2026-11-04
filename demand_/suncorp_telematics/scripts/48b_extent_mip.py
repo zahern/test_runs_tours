@@ -41,7 +41,8 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 
-PROJ = "/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics"
+PROJ = os.environ.get(
+    "SUNCORP_PROJ", "/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics")
 DATA = os.path.join(PROJ, "data")
 RES = os.path.join(PROJ, "results")
 FIG = os.path.join(PROJ, "figures")
@@ -284,8 +285,14 @@ def main():
         + rows +
         "\n\\bottomrule\n\\end{tabular}\n\\end{small}\n"
         "\\captionsetup{margin={0.5in,0in}}\n"
+        # Tags carry underscores (e.g. "precinct_1km"); inside
+        # \textcolor{...}{...} they are TEXT mode, so an unescaped "_"
+        # makes TeX emit "Missing $ inserted" and then derails math mode
+        # for the rest of the document. Escape for the caption only -- the
+        # label and the filenames must keep the raw tag.
         "\\caption{\\textcolor{Highlight}{Pure-speeding P4 posts at extent "
-        f"{args.tag}}} (radius {args.radius_m:.0f} m, $K={int(K_used)}$, "
+        f"{str(args.tag).replace('_', chr(92) + '_')}}} "
+        f"(radius {args.radius_m:.0f} m, $K={int(K_used)}$, "
         "$\\delta=0.8$~km; exact MIP, zero weights).}\n"
         f"\\label{{tab:extent{args.tag}}}\n\\end{{table}}\n")
     with open(os.path.join(RES, f"extent_posts_{args.tag}.tex"), "w") as f:

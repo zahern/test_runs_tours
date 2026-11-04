@@ -1542,12 +1542,17 @@ def fit_random_params_nb(df, fixed_feats, rdm_feats, y_col, offset_col, label="R
     df_m["_off"] = df_m[offset_col].values.astype(float)
 
     # parse_manual_spec expects rdm_terms as "varname:distribution" strings
+    # Roles are mutually exclusive: random wins any overlap with fixed.
+    fstd_fixed_all = [f"__f{i}__" for i in range(len(all_feats)) if all_feats[i] in fixed_feats]
+    fstd_rdm   = [f"__f{i}__" for i in range(len(all_feats)) if all_feats[i] in rdm_feats]
+    _rdm_set = set(fstd_rdm)
+    fstd_fixed = [c for c in fstd_fixed_all if c not in _rdm_set]
     manual_spec = {
         "fixed_terms": fstd_fixed,
         "rdm_terms": [f"{c}:normal" for c in fstd_rdm],
         "rdm_cor_terms": [],
         "grouped_terms": [], "hetro_in_means": [],
-        "transformations": ["no"] * len(all_feats),
+        "transformations": ["no"] * len(fstd_fixed),
         "dispersion": 1, "latent_classes": 1,
     }
 
@@ -1628,7 +1633,8 @@ def random_params_analysis(df, nm_col, sel_nm_feats, sel_crash_feats, full_nm, f
             # (exclude intercept and dispersion row).
             print(f"  [{tag}] MCR roles unavailable; falling back to top-4-|coef| heuristic")
             feat_rows = full_model["coef_table"].copy()
-            if feat_rows["Variable"].iloc[-1].startswith("ln("):
+            _last = str(feat_rows["Variable"].iloc[-1])
+            if _last.startswith("ln(") or _last == "alpha":
                 feat_rows = feat_rows.iloc[:-1]
             feat_rows  = feat_rows[feat_rows["Variable"].isin([_V(f) for f in sel_feats])]
             feat_rows  = feat_rows.reindex(feat_rows["Estimate"].abs().sort_values(ascending=False).index)

@@ -1,0 +1,298 @@
+\begin{thebibliography}{10}
+
+\bibitem{Guillen2020}
+Montserrat Guillen, Jens~Perch Nielsen, Mercedes Ayuso, and Ana~M.
+  Pérez-Marín.
+\newblock The use of telematics devices to improve automobile insurance rates.
+\newblock {\em Risk Analysis}, 40(4):662--672, 2020.
+
+\bibitem{Boylan2024}
+Sean Boylan et~al.
+\newblock Systematic review of telematics-based safety modeling.
+\newblock {\em Accident Analysis \& Prevention}, 186:107045, 2024.
+
+\bibitem{Tarko2018}
+Andrew~P. Tarko.
+\newblock Surrogate measures of safety.
+\newblock In Dominique Lord and Simon Washington, editors, {\em Safe Mobility:
+  Challenges, Methodology and Solutions}, pages 383--405. Emerald Publishing,
+  2018.
+
+\bibitem{Gettman2008}
+Douglas Gettman, Lili Pu, Tarek Sayed, and Steve Shelby.
+\newblock Surrogate safety assessment model and validation.
+\newblock {\em Transportation Research Record}, 2083:82--89, 2008.
+
+\bibitem{Stipancic2018}
+Joshua Stipancic, Luis Miranda-Moreno, Nicolas Saunier, and Aurélie Labbe.
+\newblock Surrogate safety and network screening: Modelling crash frequency
+  using {GPS} travel data and latent {Gaussian} spatial models.
+\newblock {\em Accident Analysis \& Prevention}, 120:174--187, 2018.
+
+\bibitem{Siegel2017A}
+Joshua~E. Siegel, Dylan~C. Erb, and Sanjay~E. Sarma.
+\newblock A survey of the connected vehicle landscape---architectures, enabling
+  technologies, applications, and development areas.
+\newblock {\em IEEE Transactions on Intelligent Transportation Systems},
+  19:2391--2406, 2017.
+
+\bibitem{Ghaffarpasand2022Vehicle}
+Omid Ghaffarpasand, Michael Burke, Louisa~K. Osei, Helen Ursell, Sarah Chapman,
+  and Francis~D. Pope.
+\newblock Vehicle telematics for safer, cleaner and more sustainable urban
+  transport: A review.
+\newblock {\em Sustainability}, 14:16386, 2022.
+
+\bibitem{Zhou2020Review}
+Yun Zhou and Rajesh Bridgelall.
+\newblock Review of usage of real-world connected vehicle data.
+\newblock {\em Transportation Research Record}, 2674:939--950, 2020.
+
+\bibitem{Lim2021State}
+Kai~Li Lim, Jake Whitehead, Dongyao Jia, and Zuduo Zheng.
+\newblock State of data platforms for connected vehicles and infrastructures.
+\newblock {\em Communications in Transportation Research}, 1:100013, 2021.
+
+\bibitem{Zhu2019Big}
+Liang Zhu, F.~Richard Yu, Yige Wang, Bin Ning, and Tao Tang.
+\newblock Big data analytics in intelligent transportation systems: A survey.
+\newblock {\em IEEE Transactions on Intelligent Transportation Systems},
+  20:383--398, 2019.
+
+\bibitem{Kaffash2021Big}
+Sepideh Kaffash, An~T. Nguyen, and Joe Zhu.
+\newblock Big data algorithms and applications in intelligent transportation
+  system: A review and bibliometric analysis.
+\newblock {\em International Journal of Production Economics}, 231:107868,
+  2021.
+
+\bibitem{Wang2020Big}
+Di~Wang, Takayuki Miwa, and Takayoshi Morikawa.
+\newblock Big trajectory data mining: A survey of methods, applications, and
+  services.
+\newblock {\em Sensors}, 20:4571, 2020.
+
+\bibitem{Torre-Bastida2018Big}
+Ana~I. Torre-Bastida, Javier Del~Ser, Ibai La{\~n}a, Miren~Nekane Ilardia,
+  Miren~Nekane Bilbao, and Sergio Campos-Cordobes.
+\newblock Big data for transportation and mobility: recent advances, trends and
+  challenges.
+\newblock {\em IET Intelligent Transport Systems}, 12:742--755, 2018.
+
+\bibitem{Faouzi2010Data}
+Nour-Eddin El~Faouzi, Henry Leung, and Ajith Kurian.
+\newblock Data fusion in intelligent transportation systems: Progress and
+  challenges---a survey.
+\newblock {\em Information Fusion}, 12:4--10, 2010.
+
+\bibitem{Kashinath2021Review}
+Shafiza~Ariffin Kashinath, Salama~A. Mostafa, Aida Mustapha, Hairul Mahdin,
+  David Lim, Moatsum Mahmoud, Mohd~Fadzil Al-rimy, Mohd~Faizal Fudzee, and Tan
+  Yang.
+\newblock Review of data fusion methods for real-time and multi-sensor traffic
+  flow analysis.
+\newblock {\em IEEE Access}, 9:51258--51276, 2021.
+
+\bibitem{Kasznar2021Multiple}
+Angelo P.~P. Kasznar, Ali W.~A. Hammad, Mohammad Najjar, Eduardo~L. Qualharini,
+  Karoline~V. Figueiredo, Carlos~A. Soares, and Assed Haddad.
+\newblock Multiple dimensions of smart cities' infrastructure: A review.
+\newblock {\em Buildings}, 11:73, 2021.
+
+\bibitem{Jin2023Spatio-Temporal}
+Guangyin Jin, Yuxuan Liang, Yuchen Fang, Zezhi Shao, Jincai Huang, Junbo Zhang,
+  and Yu~Zheng.
+\newblock Spatio-temporal graph neural networks for predictive learning in
+  urban computing: A survey.
+\newblock {\em IEEE Transactions on Knowledge and Data Engineering},
+  36:5388--5408, 2023.
+
+\bibitem{Rahmani2023Graph}
+Saeed Rahmani, Asiye Baghbani, Nizar Bouguila, and Zachary Patterson.
+\newblock Graph neural networks for intelligent transportation systems: A
+  survey.
+\newblock {\em IEEE Transactions on Intelligent Transportation Systems},
+  24:8846--8885, 2023.
+
+\bibitem{Zhang2020Urban}
+Mingyang Zhang, Tong Li, Yue Yu, Yong Li, Pan Hui, and Yu~Zheng.
+\newblock Urban anomaly analytics: Description, detection, and prediction.
+\newblock {\em IEEE Transactions on Big Data}, 8:809--826, 2020.
+
+\bibitem{Xu2017Internet}
+Wenchao Xu, Haibo Zhou, Nan Cheng, Feng Lyu, Weisen Shi, Jiayin Chen, and
+  Xuemin Shen.
+\newblock Internet of vehicles in big data era.
+\newblock {\em IEEE/CAA Journal of Automatica Sinica}, 5:19--35, 2017.
+
+\bibitem{Ji2020Survey}
+Baofeng Ji, Xueru Zhang, Shahid Mumtaz, Congzheng Han, Chunguo Li, Hong Wen,
+  and Dan Wang.
+\newblock Survey on the internet of vehicles: Network architectures and
+  applications.
+\newblock {\em IEEE Communications Standards Magazine}, 4:34--41, 2020.
+
+\bibitem{Arthurs2021A}
+Peter Arthurs, Lee Gillam, Paul Krause, Ning Wang, Kaushik Halder, and Andreas
+  Mouzakitis.
+\newblock A taxonomy and survey of edge cloud computing for intelligent
+  transportation systems and connected vehicles.
+\newblock {\em IEEE Transactions on Intelligent Transportation Systems},
+  23:6206--6221, 2021.
+
+\bibitem{Gong2023Edge}
+Taiyuan Gong, Li~Zhu, Fei Yu, and Tao Tang.
+\newblock Edge intelligence in intelligent transportation systems: A survey.
+\newblock {\em IEEE Transactions on Intelligent Transportation Systems},
+  24:8919--8944, 2023.
+
+\bibitem{Yan2024Edge}
+Guozhi Yan, Kai Liu, Chunhui Liu, and Jie Zhang.
+\newblock Edge intelligence for internet of vehicles: A survey.
+\newblock {\em IEEE Transactions on Consumer Electronics}, 70:4858--4877, 2024.
+
+\bibitem{Mehta2024Smart}
+Shiva Mehta and Sunila Choudhary.
+\newblock Smart vehicle control systems for traffic law enforcement: Harnessing
+  {IoT} technologies.
+\newblock {\em 2024 5th IEEE Global Conference for Advancement in Technology
+  (GCAT)}, pages 1--5, 2024.
+
+\bibitem{Nama2021Machine}
+Manik Nama, Amlan Nath, Nancy Bechra, Jitendra Bhatia, Sudeep Tanwar, Manish
+  Chaturvedi, and Balakrishna Sadoun.
+\newblock Machine learning-based traffic scheduling techniques for intelligent
+  transportation system: Opportunities and challenges.
+\newblock {\em International Journal of Communication Systems}, 34:e4814, 2021.
+
+\bibitem{Albinhamad2025Vehicular}
+Haitham Albinhamad, A.~Alotibi, Ali Alagnam, Mohammed~Amin Almaiah, and Said~A.
+  Salloum.
+\newblock Vehicular ad-hoc networks ({VANETs}): A key enabler for smart
+  transportation systems and challenges.
+\newblock {\em Jordanian Journal of Informatics and Computing}, 2025.
+
+\bibitem{Zantalis2019A}
+Fotios Zantalis, Grigorios Koulouras, Sotiris Karabetsos, and Dionisis Kandris.
+\newblock A review of machine learning and {IoT} in smart transportation.
+\newblock {\em Future Internet}, 11:94, 2019.
+
+\bibitem{Zohir2025Advancements}
+Hossam~M. Zohir, Islam~M. Ismael, Eman Elgendy, and Mahmoud~M. Saafan.
+\newblock Advancements in accident-aware traffic management: a comprehensive
+  review of {V2X}-based route optimization.
+\newblock {\em Scientific Reports}, 15, 2025.
+
+\bibitem{Dewi2021LAW}
+N.~Dewi and Arman Syah~Putra.
+\newblock Law enforcement in smart transportation systems on highway.
+\newblock {\em Cybernetics}, 2021.
+
+\bibitem{Goumiri2023Smart}
+Soumia Goumiri, Sa{\"i}d Yahiaoui, and Soufiene Djahel.
+\newblock Smart mobility in smart cities: Emerging challenges, recent advances
+  and future directions.
+\newblock {\em Journal of Intelligent Transportation Systems}, 29:81--117,
+  2023.
+
+\bibitem{Jacintha2025Fleet}
+Lavanya Jacintha and V{\'i}ctor.
+\newblock Fleet telematics: Transforming transportation through data-driven
+  solutions.
+\newblock {\em World Journal of Advanced Research and Reviews}, 26:1568, 2025.
+
+\bibitem{Theissler2021Predictive}
+Andreas Theissler, Judith P{\'e}rez-Vel{\'a}zquez, Matthias Kettelgerdes, and
+  Gordon Elger.
+\newblock Predictive maintenance enabled by machine learning: Use cases and
+  challenges in the automotive industry.
+\newblock {\em Reliability Engineering \& System Safety}, 215:107864, 2021.
+
+\bibitem{Khodukin2025Methods}
+R.~A. Khodukin, R.~Tomakova, and A.~Malyshev.
+\newblock Methods of telematics data analysis for decision support systems for
+  optimal unmanned vehicle control.
+\newblock {\em Proceedings of the Southwest State University. Series: IT
+  Management, Computer Science, Computer Engineering}, 2025.
+
+\bibitem{Chang2024Digital}
+Xiangyu Chang, Rui Zhang, Jianxiao Mao, and Yugang Fu.
+\newblock Digital twins in transportation infrastructure: An investigation of
+  the key enabling technologies, applications, and challenges.
+\newblock {\em IEEE Transactions on Intelligent Transportation Systems},
+  25:6449--6471, 2024.
+
+\bibitem{Wu2025Digital}
+Di~Wu, Ao~Zheng, Wenshuai Yu, Hongbing Cao, Qiuyuan Ling, Jiawen Liu, and
+  Dandan Zhou.
+\newblock Digital twin technology in transportation infrastructure: A
+  comprehensive survey of current applications, challenges, and future
+  directions.
+\newblock {\em Applied Sciences}, 15:1911, 2025.
+
+\bibitem{Hodge2015Wireless}
+Victoria~J. Hodge, Simon E.~M. O'Keefe, Michael Weeks, and Anthony Moulds.
+\newblock Wireless sensor networks for condition monitoring in the railway
+  industry: A survey.
+\newblock {\em IEEE Transactions on Intelligent Transportation Systems},
+  16:1088--1106, 2015.
+
+\bibitem{Kapileswar2016A}
+Nellore Kapileswar and Gerhard Hancke.
+\newblock A survey on urban traffic management system using wireless sensor
+  networks.
+\newblock {\em Sensors}, 16:157, 2016.
+
+\bibitem{AgueroValverde2017}
+Jonathan Aguero-Valverde and Paul~P. Jovanis.
+\newblock Spatial correlation in multilevel crash frequency models.
+\newblock {\em Accident Analysis \& Prevention}, 43(3):1059--1066, 2017.
+
+\bibitem{Hauer1997}
+Ezra Hauer.
+\newblock {\em Observational Before-After Studies in Road Safety: Estimating
+  the Effect of Highway and Traffic Engineering Measures on Road Safety}.
+\newblock Pergamon, Oxford, 1997.
+
+\bibitem{Persaud2010}
+Bhagwant Persaud, Craig Lyon, and Tham Nguyen.
+\newblock Empirical bayes procedure for ranking sites for safety investigation
+  by potential for safety improvement.
+\newblock {\em Transportation Research Record}, 1784:7--16, 2010.
+
+\bibitem{Tipping2001}
+Michael~E. Tipping.
+\newblock Sparse {B}ayesian learning and the relevance vector machine.
+\newblock {\em Journal of Machine Learning Research}, 1:211--244, 2001.
+
+\bibitem{ChurchRevelle1974}
+Richard Church and Charles ReVelle.
+\newblock The maximal covering location problem.
+\newblock {\em Papers of the Regional Science Association}, 32(1):101--118,
+  1974.
+
+\bibitem{BurdettCorry2026}
+Robert~L. Burdett and Paul Corry.
+\newblock A mathematical framework and optimization approach for strategically
+  configuring hospitals to accommodate diverse patient caseloads.
+\newblock {\em Annals of Operations Research}, 2026.
+
+\bibitem{MaDemeulemeester2013}
+Gang Ma and Erik Demeulemeester.
+\newblock A multilevel integrative approach to hospital case mix and capacity
+  planning.
+\newblock {\em Computers \& Operations Research}, 40(9):2198--2207, 2013.
+
+\bibitem{SahaRathore2022}
+Enakshi Saha and Pradeep Rathore.
+\newblock Case mix-based resource allocation under uncertainty in hospitals:
+  Physicians being the scarce resource.
+\newblock {\em Computers \& Industrial Engineering}, 174:108767, 2022.
+
+\bibitem{NeyshabouriBerg2017}
+Saba Neyshabouri and Bjorn~P. Berg.
+\newblock Two-stage robust optimization approach to elective surgery and
+  downstream capacity planning.
+\newblock {\em European Journal of Operational Research}, 260(1):21--40, 2017.
+
+\end{thebibliography}

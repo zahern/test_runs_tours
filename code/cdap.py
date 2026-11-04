@@ -635,6 +635,52 @@ MXL random coefficients (s_*) show taste heterogeneity — significant std dev m
     print(f"  CDAP HTML → {path}")
 
 
+def _fit_cdap_mnl(dt, active, n):
+    """Fit the CDAP MNL on a subset of (alt, feat) utility terms.
+
+    active: set of (alt, feat) with alt 1=N, 2=M; ASCs always included.
+    Returns (model, bic_per_n) with k = 2 ASCs + len(active).
+
+    Bit-identical to the legacy inline fit when active covers every feature
+    on both alts (same engine, options, cap, weights, elastic-net context).
+    """
+    import larch as lx
+    from larch_regularization import elasticnet_objective
+    m = lx.Model(dt, compute_engine='jax')
+    m.choice_ca_var = 'chosen'
+    m.utility_co[1] = lx.P('ASC_N')
+    m.utility_co[2] = lx.P('ASC_M')
+    for _alt, _feat in sorted(active):
+        if _alt == 1:
+            m.utility_co[1] += lx.P(f'b_N_{_feat}') * lx.X(f'person.{_feat}')
+        elif _alt == 2:
+            m.utility_co[2] += lx.P(f'b_M_{_feat}') * lx.X(f'person.{_feat}')
+    try:
+        m.weight_co_var = 'weight'
+    except (TypeError, AttributeError):
+        pass
+    m.set_cap(_CDAP_COEF_CAP)
+    # Elastic-net (L1+L2) penalty on the objective, mirroring
+    # metacountregressor's penalized-likelihood estimation - see
+    # larch_regularization.py. The covariance is computed INSIDE the context so
+    # the Hessian includes the SAME penalty that was fitted: the ≈α eigenvalue
+    # lift keeps collinear/flat directions invertible → std_err/p_value are
+    # always finite (a genuinely flat direction gets a large-but-finite SE and
+    # correctly shows as insignificant). _cached_ll still stores the pure LL
+    # for reporting.
+    with elasticnet_objective(m):
+        r = m.maximize_loglike(options={'ftol': 1e-8}, quiet=True)
+        try:
+            m.calculate_parameter_covariance()
+        except Exception as e:
+            logger.warning(f"MNL covariance failed: {e}")
+    m._cached_ll = float(r.loglike)
+    _fill_larch_inference(m)
+    _k = 2 + len(active)
+    _bicn = (-2.0 * float(r.loglike) + _k * np.log(max(n, 2))) / max(n, 1)
+    return m, _bicn
+
+
 def estimate_cdap(persons: pd.DataFrame,
                   save_path: str = 'saved_data/cdap_model.pkl',
                   feature_override: list = None) -> dict:
@@ -657,6 +703,49 @@ def estimate_cdap(persons: pd.DataFrame,
     data = prepare_cdap_data(persons)
     _candidates = feature_override if feature_override else MNL_FEATURES
     feat_cols = _nonconstant_features(data, [c for c in _candidates if c in data.columns])
+    # ── Separation screen ─────────────────────────────────────────────
+    # A binary feature that (quasi-)perfectly predicts an alternative sends
+    # its coefficients to the +-cap with meaningless SEs (observed:
+    # b_M_ptype_* ~ +24 at cap 25, b_N_ptype_* SEs in the hundreds) while
+    # leaving saturated predicted probabilities unchanged. Drop such
+    # features before fitting (env CDAP_SEP_THRESH, default 0.995;
+    # CDAP_SEP_SCREEN=0 disables). Never raises.
+    try:
+        _sep_on = os.environ.get('CDAP_SEP_SCREEN', '1').strip() != '0'
+        try:
+            _sep_th = float(os.environ.get('CDAP_SEP_THRESH', '0.995'))
+        except ValueError:
+            _sep_th = 0.995
+        if _sep_on and 'cdap_obs' in data.columns:
+            _sep_dropped = []
+            _obs_arr = data['cdap_obs'].to_numpy()
+            for _fc in list(feat_cols):
+                try:
+                    _vv = pd.to_numeric(data[_fc], errors='coerce')
+                    if set(pd.unique(_vv.dropna())) - {0.0, 1.0}:
+                        continue
+                    _xa = _vv.to_numpy()
+                    for _alt in (0, 1, 2):
+                        _m = _obs_arr == _alt
+                        if int(_m.sum()) < 30:
+                            continue
+                        _rate = float(np.nanmean(_xa[_m]))
+                        if _rate >= _sep_th or _rate <= 1.0 - _sep_th:
+                            _sep_dropped.append((_fc, _alt, _rate))
+                            break
+                except Exception:
+                    continue
+            if _sep_dropped:
+                feat_cols = [c for c in feat_cols
+                             if c not in {d[0] for d in _sep_dropped}]
+                logger.warning(
+                    "CDAP separation screen dropped %d feature(s) "
+                    "(>=%.3f pure for one alternative; saturated probs "
+                    "unchanged): %s",
+                    len(_sep_dropped), _sep_th,
+                    ", ".join(f"{c} (alt {a}: {r:.4f})" for c, a, r in _sep_dropped))
+    except Exception as _e_sep:
+        logger.warning(f"CDAP separation screen skipped ({_e_sep})")
     print(f"  Features ({len(feat_cols)}){' [GA-selected]' if feature_override else ''}: {feat_cols}")
 
     import larch as lx
@@ -684,34 +773,62 @@ def estimate_cdap(persons: pd.DataFrame,
 
     # ── MNL (JAX engine — GPU-accelerated) ──────────────────────────────────
     print("  Estimating MNL (JAX engine)...")
-    mnl = lx.Model(dt, compute_engine='jax')
-    mnl.choice_ca_var = 'chosen'
-    mnl.utility_co[1] = lx.P('ASC_N')
-    mnl.utility_co[2] = lx.P('ASC_M')
-    for feat in feat_cols:
-        mnl.utility_co[1] += lx.P(f'b_N_{feat}') * lx.X(f'person.{feat}')
-        mnl.utility_co[2] += lx.P(f'b_M_{feat}') * lx.X(f'person.{feat}')
+    _active = {(1, f) for f in feat_cols} | {(2, f) for f in feat_cols}
+    mnl, _mnl_bicn = _fit_cdap_mnl(dt, _active, len(data))
+    # ── Post-fit significance prune ─────────────────────────────────────
+    # Multivariate quasi-separation survives the pre-screen (no single dummy
+    # is pure, but combos are): N-side study/ptype dummies blew to SE 73-1190
+    # with p≈1 while the GA's BIC/n kept them (BIC penalises count, not
+    # significance). Drop the worst insignificant free term (p>0.05, finite
+    # SE; ASCs never dropped), refit, keep iff BIC/n improves; repeat ≤10.
+    # Strictly keep-or-improve on the GA's own criterion, so prediction can
+    # only gain. CDAP_PRUNE_INSIGNIF=0 disables (legacy spec preserved).
     try:
-        mnl.weight_co_var = 'weight'
-    except (TypeError, AttributeError):
-        pass
-    mnl.set_cap(_CDAP_COEF_CAP)
-    # Elastic-net (L1+L2) penalty on the objective, mirroring
-    # metacountregressor's penalized-likelihood estimation - see
-    # larch_regularization.py. The covariance is computed INSIDE the context so
-    # the Hessian includes the SAME penalty that was fitted: the ≈α eigenvalue
-    # lift keeps collinear/flat directions invertible → std_err/p_value are
-    # always finite (a genuinely flat direction gets a large-but-finite SE and
-    # correctly shows as insignificant). _cached_ll still stores the pure LL
-    # for reporting.
-    with elasticnet_objective(mnl):
-        r = mnl.maximize_loglike(options={'ftol': 1e-8}, quiet=True)
-        try:
-            mnl.calculate_parameter_covariance()
-        except Exception as e:
-            logger.warning(f"MNL covariance failed: {e}")
-    mnl._cached_ll = float(r.loglike)
-    _fill_larch_inference(mnl)
+        _prune_on = os.environ.get('CDAP_PRUNE_INSIGNIF', '1').strip() != '0'
+    except Exception:
+        _prune_on = True
+    if _prune_on and len(_active) > 2:
+        for _pr in range(10):
+            try:
+                _pf = _inf_pf(mnl)
+            except Exception:
+                break
+            _worst, _worst_p = None, 0.05
+            for _pn in _pf.index:
+                try:
+                    if _pn in ('ASC_N', 'ASC_M'):
+                        continue
+                    _s = float(_pf.loc[_pn].get('std_err', 0.0))
+                    if not np.isfinite(_s) or _s <= 0:
+                        continue
+                    if 'p_value' in _pf.columns:
+                        _p = float(_pf.loc[_pn].get('p_value', 0.0))
+                    else:
+                        _t = float(_pf.loc[_pn].get('t_stat', 99.0))
+                        _p = 0.0 if abs(_t) > 1.96 else 1.0
+                    if _p > _worst_p:
+                        _worst, _worst_p = str(_pn), _p
+                except Exception:
+                    continue
+            if _worst is None:
+                break
+            _alt = 1 if _worst.startswith('b_N_') else 2
+            _trial = set(_active) - {(_alt, _worst[4:])}
+            if len(_trial) < 2:
+                break
+            try:
+                _m2, _b2 = _fit_cdap_mnl(dt, _trial, len(data))
+            except Exception as _e2:
+                logger.warning(f"CDAP prune refit failed ({_e2}) — "
+                               "keeping current spec")
+                break
+            if _b2 < _mnl_bicn - 1e-9:
+                print(f"  CDAP prune: dropped {_worst} (p={_worst_p:.3f}) "
+                      f"BIC/n {_mnl_bicn:.4f} -> {_b2:.4f}")
+                mnl, _mnl_bicn, _active = _m2, _b2, _trial
+            else:
+                break
+        feat_cols = sorted({f for _, f in _active})
     _print_larch_table(mnl, "CDAP MNL")
 
     # ── MXL / heterogeneity reporting (bounded sample) ─────────────────────
@@ -997,9 +1114,14 @@ def _estimate_cdap_mh(mxl_sub: pd.DataFrame,
     ess = np.asarray(fit['ess'], dtype=float)
 
     pf = pd.DataFrame({'value': mu, 'std_err': sd, 't_stat': t}, index=names)
+    # McFadden rho-sq against the uniform-1/3 null (3 CDAP alternatives).
+    # Previously hardcoded nan, so every MH report printed rho2=nan.
+    # _print_larch_table/_save_cdap_html print rho_sq_null() AS rho-sq.
+    _ll0_mh = float(-len(yidx) * np.log(3.0))
+    _rho2_mh = float(1.0 - float(ll_mean) / _ll0_mh) if _ll0_mh else float('nan')
     model = SimpleNamespace(
         pf=pf, _inference_pf=pf, _cached_ll=float(ll_mean),
-        rho_sq_null=lambda: float('nan'),
+        rho_sq_null=lambda: _rho2_mh,
         mh_accept_rate=float(fit['accept_rate']),
         mh_ess_min=float(np.nanmin(ess)) if ess.size else float('nan'),
         mh_ess_mean=float(np.nanmean(ess)) if ess.size else float('nan'),

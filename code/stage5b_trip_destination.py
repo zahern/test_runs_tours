@@ -2079,6 +2079,453 @@ def estimate_trip_mode_models(
 
 
 # ---------------------------------------------------------------------------
+# Trip-level transit access choice (access + submode constrained)
+# ---------------------------------------------------------------------------
+# Gated by STAGE5B_TRANSIT_ACCESS=1 (default 0: none of this runs, no new
+# columns, byte-identical runs). With the flag on, Transit trip legs get:
+#   1. an access label from HHTS MODE1 (Walk/Drive/Ride/Bike) for estimation,
+#   2. hard availability constraints (drive needs licence+vehicle+PnR supply;
+#      walk needs stop proximity; bike needs ownership; ride needs a driver),
+#   3. an estimated access MNL (Larch; heuristic-share fallback), and
+#   4. predicted access + submode columns at prediction time, with drive-access
+#      trips flagged pnr_trip=1 for the stage-7 park-and-ride link.
+# Tour level already predicts access (_predict_transit_access in stage5);
+# this is the trip-leg counterpart using observed MODE1 access labels.
+
+#: trip-level access codes (superset of the tour TRANSIT_ACCESS_MAP, + Ride)
+TRIP_TRANSIT_ACCESS = {'Walk': 1, 'Drive': 2, 'Bike': 3, 'Ride': 4}
+TRIP_TRANSIT_ACCESS_INV = {v: k for k, v in TRIP_TRANSIT_ACCESS.items()}
+
+#: raw MODE1 strings that imply each access mode (pre-MODES-mapping values)
+_TRIP_ACCESS_RAW = {
+    'Walk': {'Walking', 'Mobility scooter'},
+    'Drive': {'Car driver', 'Truck driver', 'Motorcycle driver'},
+    'Ride': {'Car passenger', 'Taxi', 'Uber / Other Ride Share',
+             'Truck passenger', 'Motorcycle passenger'},
+    'Bike': {'Bicycle', 'E-bike or E-scooter'},
+}
+_TRIP_ACCESS_WALK_KM = 6.0   # walk-access feasibility cap (mirrors tour aval)
+
+
+def _trip_transit_access_enabled() -> bool:
+    return os.environ.get('STAGE5B_TRANSIT_ACCESS', '0').strip() == '1'
+
+
+def trip_transit_access_labels(trips: pd.DataFrame) -> pd.Series:
+    """Normalise trip-level transit access labels to TRIP_TRANSIT_ACCESS codes.
+
+    Prefers the data_connect `transit_access` column (raw MODE1 mapping, built
+    with STAGE5B_TRANSIT_ACCESS=1); falls back to deriving from raw MODE1
+    strings when present; 0 = non-transit leg or unknown access.
+    """
+    out = pd.Series(0, index=trips.index, dtype=int)
+    try:
+        if 'transit_access' in trips.columns:
+            _m = {'Walk': 1, 'Drive': 2, 'Bike': 3, 'Ride': 4}
+            out = trips['transit_access'].map(_m).fillna(0).astype(int)
+            if int((out > 0).sum()) > 0:
+                return out
+        if 'MODE1' in trips.columns:
+            _raw = trips['MODE1'].astype(str)
+            for _name, _vals in _TRIP_ACCESS_RAW.items():
+                _mask = _raw.isin(_vals)
+                if _mask.any():
+                    out.loc[_mask] = TRIP_TRANSIT_ACCESS[_name]
+    except Exception as exc:
+        logger.debug(f"trip_transit_access_labels skipped ({exc})")
+    return out.fillna(0).astype(int)
+
+
+def trip_transit_availability(
+    trip_rows: pd.DataFrame,
+    persons: pd.DataFrame,
+    landuse: pd.DataFrame,
+    skim_lookup: dict = None,
+) -> pd.DataFrame:
+    """Hard availability (0/1) per trip leg × access mode.
+
+    Drive: licence + household vehicle + PnR supply (landuse parking_capacity
+        in the origin zone when available; without the column, drive stays
+        available but a one-time warning is logged).
+    Walk: DISTWALK short (< 6 km) when a skim lookup resolves, else allowed.
+    Bike: micromobility ownership when observed, else allowed.
+    Ride: multi-person household (needs a driver) when observed, else allowed.
+    Columns: allow_Walk/allow_Drive/allow_Bike/allow_Ride, index = trip_rows.
+    Never raises; unknown inputs degrade to allowed (soft), never to blocked.
+    """
+    n = len(trip_rows)
+    allow = pd.DataFrame(
+        {'allow_Walk': np.ones(n, dtype=int),
+         'allow_Drive': np.ones(n, dtype=int),
+         'allow_Bike': np.ones(n, dtype=int),
+         'allow_Ride': np.ones(n, dtype=int)}, index=trip_rows.index)
+    if n == 0:
+        return allow
+    try:
+        pp = persons.copy()
+        if 'person_id' not in pp.columns and 'PERSID' in pp.columns:
+            pp = pp.rename(columns={'PERSID': 'person_id'})
+        _pid = next((c for c in ('person_id', 'PERSID')
+                     if c in trip_rows.columns), None)
+        _pidx = None
+        if _pid is not None and 'person_id' in pp.columns:
+            try:
+                _pidx = pp.drop_duplicates('person_id').set_index('person_id')
+            except Exception:
+                _pidx = None
+
+        def _pcol(col, default=np.nan):
+            if _pidx is None or _pid is None or col not in _pidx.columns:
+                return pd.Series(default, index=trip_rows.index)
+            try:
+                return pd.to_numeric(
+                    trip_rows[_pid].astype(str).map(_pidx[col]),
+                    errors='coerce')
+            except Exception:
+                return pd.Series(default, index=trip_rows.index)
+
+        lic = _pcol('CARLICENCE', 1.0).fillna(1.0)
+        veh = _pcol('vehrd', 1.0).fillna(1.0)
+        nprd = _pcol('nprd', 2.0).fillna(2.0)
+        # Drive: licence + vehicle + PnR supply at origin
+        _drive_ok = ((lic > 0) & (veh > 0)).astype(int)
+        try:
+            _zcol = next((c for c in ('ORDER', 'DTAZ', 'SA2_MAIN16', 'zone_id')
+                          if c in landuse.columns), None)
+            _ocol = next((c for c in ('origin_taz', 'OTAZ')
+                          if c in trip_rows.columns), None)
+            if (_zcol is not None and _ocol is not None
+                    and 'parking_capacity' in landuse.columns):
+                _cap = pd.to_numeric(
+                    landuse.set_index(_zcol)['parking_capacity'],
+                    errors='coerce').fillna(0.0)
+                _oz = pd.to_numeric(trip_rows[_ocol], errors='coerce')
+                _has_pnr = _oz.map(_cap).fillna(0.0) > 0
+                _drive_ok = (_drive_ok & _has_pnr.fillna(True)).astype(int)
+            else:
+                logger.warning(
+                    "trip_transit_availability: no parking_capacity landuse "
+                    "column — drive access unconstrained by PnR supply")
+        except Exception as _pnr_e:
+            logger.debug(f"trip_transit_availability PnR check skipped ({_pnr_e})")
+        allow['allow_Drive'] = _drive_ok.values.astype(int)
+        # Walk: short access distance when a skim resolves
+        try:
+            _o2 = next((c for c in ('origin_taz', 'OTAZ')
+                        if c in trip_rows.columns), None)
+            _d2 = next((c for c in ('dest_taz', 'DTAZ')
+                        if c in trip_rows.columns), None)
+            if skim_lookup and _o2 is not None and _d2 is not None:
+                _wd = []
+                for _o, _d in zip(
+                        pd.to_numeric(trip_rows[_o2], errors='coerce'),
+                        pd.to_numeric(trip_rows[_d2], errors='coerce')):
+                    try:
+                        _sk = skim_lookup.get((int(_o), int(_d)), {})
+                        _wd.append(float(_sk.get('DISTWALK', 0.0) or 0.0))
+                    except Exception:
+                        _wd.append(0.0)
+                _wd = np.asarray(_wd, dtype=float)
+                _known = _wd > 0
+                allow.loc[_known, 'allow_Walk'] = (
+                    _wd[_known] < _TRIP_ACCESS_WALK_KM).astype(int).values
+        except Exception as _w_e:
+            logger.debug(f"trip_transit_availability walk check skipped ({_w_e})")
+        # Bike: ownership-gated when observed
+        try:
+            _owned = None
+            for _bc in ('bikes', 'ebikes', 'escooter'):
+                _bv = _pcol(_bc, np.nan)
+                if _bv.notna().any():
+                    _owned = (_bv.fillna(0) > 0) if _owned is None \
+                        else (_owned | (_bv.fillna(0) > 0))
+            if _owned is not None:
+                allow['allow_Bike'] = _owned.astype(int).values
+        except Exception as _b_e:
+            logger.debug(f"trip_transit_availability bike check skipped ({_b_e})")
+        # Ride: needs a potential driver in the household
+        try:
+            if nprd.notna().any():
+                allow['allow_Ride'] = (nprd.fillna(2.0) > 1).astype(int).values
+        except Exception as _r_e:
+            logger.debug(f"trip_transit_availability ride check skipped ({_r_e})")
+    except Exception as exc:
+        logger.debug(f"trip_transit_availability failed open ({exc})")
+    return allow
+
+
+def estimate_trip_transit_access(
+    trips: pd.DataFrame,
+    persons: pd.DataFrame,
+    landuse: pd.DataFrame,
+    skim_lookup: dict = None,
+    output_dir: str = "saved_data",
+) -> dict:
+    """Estimate a trip-leg transit access MNL (Walk/Drive/Bike/Ride).
+
+    Uses HHTS MODE1-derived labels; unavailable alternatives are masked.
+    Returns {'coefs': {alt: {var: val}}, 'features': [...], 'n_obs': int,
+    'method': 'larch_mnl'|'shares'} and saves pkl + CSV (best-effort).
+    Falls back to observed access shares (heuristic) when Larch is missing
+    or the choice is degenerate — never raises.
+    """
+    out = {"coefs": {}, "features": [], "n_obs": 0, "method": "shares",
+           "shares": {}}
+    try:
+        _lab = trip_transit_access_labels(trips)
+        # access choice is conditional on the leg being a Transit trip —
+        # drop labelled non-transit legs (their MODE1 is not access).
+        try:
+            _mc = next((c for c in ('mode', 'chosen_mode', 'MAINMODE')
+                        if c in trips.columns), None)
+            if _mc is not None:
+                _is_tr = trips[_mc].astype(str).isin(
+                    ['Transit', '5', 'transit'])
+                _lab = _lab.where(_is_tr, 0)
+        except Exception:
+            pass
+        _tt = trips[_lab.isin(list(TRIP_TRANSIT_ACCESS.values()))].copy()
+        _tt['_access'] = _lab[_lab.isin(list(TRIP_TRANSIT_ACCESS.values()))].values
+        out["n_obs"] = int(len(_tt))
+        _shares = (_tt['_access'].value_counts(normalize=True).to_dict()
+                   if len(_tt) else {})
+        out["shares"] = {int(k): float(v) for k, v in _shares.items()}
+        if len(_tt) < 30 or _tt['_access'].nunique() < 2:
+            logger.warning(
+                "estimate_trip_transit_access: only %d labelled legs "
+                "(%d alts) — heuristic shares", len(_tt),
+                _tt['_access'].nunique() if len(_tt) else 0)
+            return out
+        # skim-fed time features per leg
+        try:
+            _o = next((c for c in ('origin_taz', 'OTAZ') if c in _tt.columns), None)
+            _d = next((c for c in ('dest_taz', 'DTAZ') if c in _tt.columns), None)
+            _wt, _dt, _ivt = [], [], []
+            for _ro, _rd in zip(
+                    pd.to_numeric(_tt[_o], errors='coerce') if _o else [np.nan] * len(_tt),
+                    pd.to_numeric(_tt[_d], errors='coerce') if _d else [np.nan] * len(_tt)):
+                try:
+                    _sk = (skim_lookup or {}).get((int(_ro), int(_rd)), {})
+                    _wt.append(float(_sk.get('DISTWALK', 1.0) or 1.0) * 12.0)
+                    _dt.append(float(_sk.get('SOVTOLL_TIME__AM', 30.0) or 30.0))
+                    _ivt.append(float(_sk.get('WLK_LOC_WLK_TOTIVT__AM', 45.0) or 45.0))
+                except Exception:
+                    _wt.append(12.0)
+                    _dt.append(30.0)
+                    _ivt.append(45.0)
+            _tt['_walk_min'] = np.asarray(_wt, dtype=float)
+            _tt['_drive_min'] = np.asarray(_dt, dtype=float)
+            _tt['_ivt_min'] = np.asarray(_ivt, dtype=float)
+        except Exception:
+            _tt['_walk_min'] = 12.0
+            _tt['_drive_min'] = 30.0
+            _tt['_ivt_min'] = 45.0
+        _pp = persons.copy()
+        if 'person_id' not in _pp.columns and 'PERSID' in _pp.columns:
+            _pp = _pp.rename(columns={'PERSID': 'person_id'})
+        _pid = next((c for c in ('person_id', 'PERSID') if c in _tt.columns), None)
+        try:
+            _pidx = _pp.drop_duplicates('person_id').set_index('person_id')
+            _tt['_veh'] = pd.to_numeric(
+                _tt[_pid].astype(str).map(_pidx.get('vehrd', pd.Series(dtype=float))),
+                errors='coerce').fillna(1.0).values if _pid else 1.0
+            _tt['_incp'] = pd.to_numeric(
+                _tt[_pid].astype(str).map(_pidx.get('incp', pd.Series(dtype=float))),
+                errors='coerce').fillna(8.0).values if _pid else 8.0
+        except Exception:
+            _tt['_veh'] = 1.0
+            _tt['_incp'] = 8.0
+        # availability mask (hard)
+        try:
+            _av = trip_transit_availability(_tt, persons, landuse, skim_lookup)
+        except Exception:
+            _av = None
+        # Larch MNL over access alts present in the data
+        try:
+            import larch as lx
+            from larch import P as _P, X as _X
+            _alts = sorted(int(v) for v in _tt['_access'].unique())
+            _ca_rows = []
+            for _i, _row in _tt.iterrows():
+                for _a in _alts:
+                    _ca_rows.append({
+                        'case_id': _i, 'alt_id': _a,
+                        'chosen': int(_row['_access'] == _a),
+                        'walk_min': float(_row['_walk_min']),
+                        'drive_min': float(_row['_drive_min']),
+                        'ivt_min': float(_row['_ivt_min']),
+                        'veh': float(_row['_veh']),
+                        'incp': float(_row['_incp']),
+                        'is_walk': int(_a == 1), 'is_drive': int(_a == 2),
+                        'is_bike': int(_a == 3), 'is_ride': int(_a == 4),
+                    })
+            _ca = pd.DataFrame(_ca_rows).set_index(['case_id', 'alt_id'])
+            # hard availability: drop unavailable non-chosen alts BEFORE the
+            # model is built (keeps every chosen row so the likelihood stays
+            # well-defined). Falls back to the full CA on any failure.
+            if _av is not None:
+                try:
+                    _keep = pd.Series(True, index=_ca.index)
+                    for _a, _col in ((1, 'allow_Walk'), (2, 'allow_Drive'),
+                                     (3, 'allow_Bike'), (4, 'allow_Ride')):
+                        if _a in _alts and _col in _av.columns:
+                            _ok = _av[_col].reindex(
+                                _ca.index.get_level_values(0)).fillna(1).values
+                            _rows_a = (_ca.index.get_level_values(1)
+                                       == int(_a)).values
+                            _keep = _keep & ~(_rows_a & (_ok == 0))
+                    _chosen = _ca['chosen'].values.astype(bool)
+                    _keep = (_keep | _chosen)
+                    if float(np.asarray(_keep).mean()) < 1.0:
+                        logger.info(
+                            "estimate_trip_transit_access: availability drops "
+                            f"{int((~np.asarray(_keep)).sum())}/{len(_ca)} CA rows")
+                    _ca = _ca[np.asarray(_keep)]
+                except Exception as _av_e:
+                    logger.debug(f"access availability mask skipped ({_av_e})")
+            _m = lx.Model(lx.Dataset.construct.from_idca(_ca, crack=False))
+            _m.utility_ca = (
+                _P('asc_drive') * _X('is_drive') + _P('asc_bike') * _X('is_bike')
+                + _P('asc_ride') * _X('is_ride')
+                + _P('c_walk_time') * _X('walk_min') * _X('is_walk')
+                + _P('c_drive_time') * _X('drive_min') * _X('is_drive')
+                + _P('c_ivt') * _X('ivt_min')
+                + _P('c_veh_drive') * _X('veh') * _X('is_drive')
+                + _P('c_incp_drive') * _X('incp') * _X('is_drive'))
+            _m.choice_ca_var = 'chosen'
+            _m.maximize_loglike(method='slsqp')
+            _pf = _m.pf
+            for _a in _alts:
+                _nm = TRIP_TRANSIT_ACCESS_INV.get(_a, str(_a))
+                out["coefs"][_nm] = {
+                    str(_p): float(_pf.loc[_p, 'value'])
+                    for _p in _pf.index if 'value' in _pf.columns}
+            out["features"] = ['walk_min', 'drive_min', 'ivt_min',
+                               'veh', 'incp']
+            out["method"] = "larch_mnl"
+            logger.info(f"estimate_trip_transit_access: Larch MNL fitted "
+                        f"(n={len(_tt)}, alts={_alts})")
+        except Exception as _lx_e:
+            logger.warning(f"estimate_trip_transit_access: Larch fit failed "
+                           f"({_lx_e}) — heuristic shares")
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            with open(os.path.join(output_dir, "stage5b_transit_access.pkl"),
+                      "wb") as _fh:
+                pickle.dump(out, _fh)
+            pd.DataFrame(
+                [{"alt": _a, "share": out["shares"].get(_a, 0.0)}
+                 for _a in sorted(TRIP_TRANSIT_ACCESS.values())]
+            ).to_csv(os.path.join(output_dir, "stage5b_transit_access.csv"),
+                     index=False)
+        except Exception as _sv_e:
+            logger.debug(f"transit-access artifact save skipped ({_sv_e})")
+    except Exception as exc:
+        logger.warning(f"estimate_trip_transit_access failed ({exc})")
+    return out
+
+
+def predict_trip_transit_access(
+    trip_rows: pd.DataFrame,
+    persons: pd.DataFrame,
+    landuse: pd.DataFrame,
+    access_model: dict,
+    skim_lookup: dict = None,
+    seed: int = 42,
+    sample: bool = True,
+) -> pd.DataFrame:
+    """Assign access (+PnR marker) to Transit trip legs.
+
+    Constrains by trip_transit_availability, then scores with the estimated
+    MNL (or heuristic shares). Attaches `transit_access` (codes),
+    `transit_access_name`, and `pnr_trip` (1 = drive access → park-and-ride
+    demand for the stage-7 link). Non-transit rows get 0/''/0. Never raises.
+    """
+    out = trip_rows.copy()
+    out['transit_access'] = 0
+    out['transit_access_name'] = ''
+    out['pnr_trip'] = 0
+    try:
+        _mode_col = next((c for c in ('mode', 'chosen_mode', 'MAINMODE')
+                          if c in out.columns), None)
+        if _mode_col is None:
+            return out
+        _is_tr = out[_mode_col].astype(str).isin(
+            ['Transit', '5', 'transit'])
+        if not _is_tr.any():
+            return out
+        _tr = out.loc[_is_tr].copy()
+        _av = trip_transit_availability(_tr, persons, landuse, skim_lookup)
+        _alts = [1, 2, 3, 4]
+        _names = {1: 'Walk', 2: 'Drive', 3: 'Bike', 4: 'Ride'}
+        # utility from estimated coefs (alt-specific constants + time terms)
+        _coefs = (access_model or {}).get('coefs', {})
+        _V = np.zeros((len(_tr), len(_alts)), dtype=float)
+        try:
+            _o = next((c for c in ('origin_taz', 'OTAZ') if c in _tr.columns),
+                      None)
+            _d = next((c for c in ('dest_taz', 'DTAZ') if c in _tr.columns),
+                      None)
+            _wt = np.full(len(_tr), 12.0)
+            _dt = np.full(len(_tr), 30.0)
+            _ivt = np.full(len(_tr), 45.0)
+            if skim_lookup and _o is not None and _d is not None:
+                for _i, (_ro, _rd) in enumerate(zip(
+                        pd.to_numeric(_tr[_o], errors='coerce'),
+                        pd.to_numeric(_tr[_d], errors='coerce'))):
+                    try:
+                        _sk = skim_lookup.get((int(_ro), int(_rd)), {})
+                        _wt[_i] = float(_sk.get('DISTWALK', 1.0) or 1.0) * 12.0
+                        _dt[_i] = float(_sk.get('SOVTOLL_TIME__AM', 30.0) or 30.0)
+                        _ivt[_i] = float(_sk.get('WLK_LOC_WLK_TOTIVT__AM', 45.0)
+                                         or 45.0)
+                    except Exception:
+                        pass
+        except Exception:
+            _wt = np.full(len(_tr), 12.0)
+            _dt = np.full(len(_tr), 30.0)
+            _ivt = np.full(len(_tr), 45.0)
+        for _j, _a in enumerate(_alts):
+            _cc = _coefs.get(_names[_a], {})
+            _g = (lambda n, d=0.0: float(_cc.get(n, d))
+                  if _cc else d)
+            if _a == 1:
+                _V[:, _j] = (_g('asc_walk', 0.0) + _g('c_walk_time', -0.1) * _wt)
+            elif _a == 2:
+                _V[:, _j] = (_g('asc_drive', 0.0) + _g('c_drive_time', -0.1) * _dt
+                             + _g('c_veh_drive', 0.0) * 1.0
+                             + _g('c_incp_drive', 0.0) * 8.0)
+            elif _a == 3:
+                _V[:, _j] = _g('asc_bike', 0.0) + _g('c_bike_time', -0.1) * _wt
+            else:
+                _V[:, _j] = _g('asc_ride', 0.0) + _g('c_ivt', -0.05) * _ivt
+        # hard availability: -inf unavailable (softmax-safe sentinel)
+        for _j, _a in enumerate(_alts):
+            _col = {1: 'allow_Walk', 2: 'allow_Drive',
+                    3: 'allow_Bike', 4: 'allow_Ride'}[_a]
+            if _col in _av.columns:
+                _ok = _av[_col].reindex(_tr.index).fillna(1).values.astype(bool)
+                _V[~_ok, _j] = -1e20
+        _V = _V - _V.max(axis=1, keepdims=True)
+        _P = np.exp(np.clip(_V, -500, 0))
+        _P = _P / _P.sum(axis=1, keepdims=True)
+        _rng = np.random.default_rng(seed)
+        if sample:
+            _draw = np.array([_rng.choice(len(_alts), p=_P[i] / _P[i].sum())
+                              for i in range(len(_tr))])
+        else:
+            _draw = _P.argmax(axis=1)
+        _chosen = np.array(_alts)[_draw]
+        out.loc[_is_tr, 'transit_access'] = _chosen
+        out.loc[_is_tr, 'transit_access_name'] = [
+            _names[int(v)] for v in _chosen]
+        out.loc[_is_tr, 'pnr_trip'] = (_chosen == 2).astype(int)
+    except Exception as exc:
+        logger.debug(f"predict_trip_transit_access skipped ({exc})")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Stage 5b HTML coefficient report (destination + mode)
 # ---------------------------------------------------------------------------
 
@@ -2261,6 +2708,20 @@ def run_stage5b_pipeline(
         save_models = True,
     )
 
+    # ── Step 2b: trip-level transit access (constrained) ───────────────
+    # Gated by STAGE5B_TRANSIT_ACCESS=1. Estimates access choice on Transit
+    # legs with MODE1 labels, then assigns access + pnr_trip markers.
+    access_model = {}
+    try:
+        import os as _os2b
+        if _os2b.environ.get('STAGE5B_TRANSIT_ACCESS', '0').strip() == '1':
+            access_model = estimate_trip_transit_access(
+                trips, persons, landuse, skim_lookup=None,
+                output_dir=output_dir)
+    except Exception as _acc_e:
+        logger.warning(f"Stage 5b transit-access estimation skipped ({_acc_e})")
+        access_model = {}
+
     # ── Step 3: HTML coefficient reports ─────────────────────────────────
     try:
         _write_stage5b_html(dest_models, mode_models, output_dir)
@@ -2271,6 +2732,7 @@ def run_stage5b_pipeline(
         "trips":       dest_result["trips"],
         "dest_models": dest_models,
         "mode_models": mode_models,
+        "access_model": access_model,
         "validation":  dest_result.get("validation", pd.DataFrame()),
         "bic_total":   dest_result.get("bic_total", float("inf")),
         "metadata":    dest_result.get("metadata", {}),

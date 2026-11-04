@@ -251,11 +251,23 @@ def run(tag, dt, terms, covs, case_df, base_pvals=None):
             print("  pvals set failed:", e)
     ok, msg, ll, g, secs = fit_once(b)
     pf = b.pf
+    try:
+        _rail_reasons, _rail_warns, _rail_info = S5._lccm_rail_scan(b)
+    except Exception as _e_rail:
+        _rail_reasons = [f"rail scan failed: {_e_rail!r}"]
+        _rail_warns = []
+        _rail_info = {}
+    if _rail_reasons:
+        ok = False
     row = {"tag": tag, "success": bool(ok), "message": str(msg)[:120],
            "ll": ll, "grad_norm": g, "seconds": round(secs, 1),
+           "railed": bool(_rail_reasons),
+           "rail": list(_rail_reasons),
+           "rail_warnings": list(_rail_warns),
            "shares": shares(b, case_df),
            "membership": membership_coefs(b)}
-    print(f"[{tag}] success={ok} LL={ll:.1f} |grad|={g:.3g} "
+    print(f"[{tag}] success={ok} railed={bool(_rail_reasons)} "
+          f"LL={ll:.1f} |grad|={g:.3g} "
           f"shares={row['shares']} ({secs:.0f}s)", flush=True)
     try:
         coefs = {str(n): float(pf.loc[n, "value"]) for n in pf.index}

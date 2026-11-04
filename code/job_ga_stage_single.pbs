@@ -9,7 +9,7 @@
 # stage in minutes (observed: stage-1 job 25374014 cgroup-OOMed at 1 GB after
 # 58 min). The chain always passes -l select=... explicitly (command-line -l
 # overrides these directives), so this only affects manual submits.
-# NOTE: a full Stage 5 still needs 1:ncpus=4:mem=256GB:place=excl passed
+# NOTE: a full Stage 5 still needs 1:ncpus=4:mem=256GB passed
 # explicitly — 64 GB is not enough for the skim-heavy stage-5 build.
 #PBS -l select=1:ncpus=4:mem=64GB
 

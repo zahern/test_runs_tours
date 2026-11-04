@@ -144,6 +144,15 @@ def _exposure_name(fixed_terms):
 
 def _refit_sane(parsed, alpha, expected, model):
     """Reject diverged/degenerate fits (e.g. |b|~1e5, all preds at floor)."""
+    # A dispersion sitting ON the package clip is not a large dispersion: the
+    # optimiser is optimising log_alpha unclipped, print_summary reports
+    # exp(clip(theta, -12, 12)), and alpha == e^12 therefore means the NB2
+    # likelihood wants infinite dispersion. Coefficients from such a fit are
+    # not estimable, so the stage is rejected and the ladder moves on to the
+    # SAME structure at the other family.
+    if model == "nb" and np.isfinite(alpha) and alpha >= 0.999 * ALPHA_MAX:
+        return False, (f"dispersion at clip (alpha={alpha:.3g}): NB2 "
+                       "unbounded on this panel")
     vals = [float(v) for k, v in parsed.get("mle", {}).items()
             if "dispersion" not in str(k).lower()]
     if not vals or not all(np.isfinite(vals)):
@@ -163,13 +172,137 @@ def _refit_sane(parsed, alpha, expected, model):
     return True, ""
 
 
+def _screen_design(work, y_col, terms):
+    """Drop design columns whose coefficient has no finite MLE.
+
+    An MLE only exists if the likelihood is bounded in every direction. Three
+    cheap cases break that on sparse count panels, and all three occur in the
+    T9 refit design:
+
+      constant        sd == 0 (e.g. in_event on an event-window frame): the
+                      column duplicates the intercept, so (b, b0 - b) traces a
+                      flat ridge and MLE drifts along it.
+      separated       binary, and every row where it is 1 has Y == 0. Its
+                      MLE is at -inf: the optimiser walks the coefficient
+                      down while the log-likelihood merely approaches its
+                      supremum, never attaining it. Poisson stalls early
+                      (the curvature dies), NB2 does not -- alpha absorbs the
+                      zeros -- so NB2 is precisely where |b| reaches 1e5.
+      duplicate       byte-identical to a column already kept.
+
+    Returned as (kept_terms, drops) with one {term, reason, stat} record per
+    drop so the run can report what it removed and why. This is the same
+    screening _glm_fallback_fit already performs; the JAX path previously had
+    none, so a separated dummy that statsmodels would drop was handed to the
+    optimiser, diverged, and cost the whole searched specification.
+    """
+    y = pd.to_numeric(work[y_col], errors="coerce").fillna(0.0).to_numpy(float)
+    pos = y > 0
+    kept, drops = [], []
+    seen = {}
+    for t in terms or []:
+        base = str(t).split(":")[0]
+        if base not in work.columns:
+            continue
+        v = pd.to_numeric(work[base], errors="coerce").to_numpy(float)
+        v = np.where(np.isfinite(v), v, 0.0)
+        sd = float(np.std(v))
+        if sd <= 0.0:
+            drops.append({"term": base, "reason": "constant",
+                          "stat": float(v[0]) if len(v) else None})
+            continue
+        u = np.unique(v)
+        if len(u) <= 2 and set(u.tolist()) <= {0.0, 1.0}:
+            on = v > 0.5
+            n_on = int(on.sum())
+            ev_on = float(y[on].sum())
+            if n_on and ev_on <= 0.0:
+                drops.append({"term": base, "reason": "separated",
+                              "stat": {"rows_on": n_on, "events_on": 0}})
+                continue
+        key = v.tobytes()
+        if key in seen:
+            drops.append({"term": base, "reason": "duplicate",
+                          "stat": seen[key]})
+            continue
+        seen[key] = base
+        kept.append(t)
+    return kept, drops
+
+
+def _drift_bases(parsed, att, limit=500.0):
+    """Named design bases whose coefficient has run away (|b| > limit).
+
+    A single drifting coefficient is not evidence that the whole
+    specification is wrong: it is evidence that one column has no finite
+    MLE. Naming it lets the caller drop that column and refit the SAME stage
+    instead of throwing away the hierarchy with it.
+    """
+    bases = {str(t).split(":")[0] for t in
+             list(att.get("fixed") or []) + list(att.get("rdm") or []) +
+             list(att.get("rdm_cor") or []) + list(att.get("grouped") or []) +
+             list(att.get("hetero") or []) + list(att.get("hetero_var") or [])}
+    out = {}
+    for name, b in (parsed.get("mle") or {}).items():
+        s = str(name)
+        if "dispersion" in s.lower():
+            continue
+        try:
+            bv = float(b)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(bv) or abs(bv) <= limit:
+            continue
+        for cand in bases:
+            if s == cand or s.endswith(f"({cand})") or s.endswith(f"_{cand}"):
+                out[cand] = bv
+                break
+    return out
+
+
+def _staged_attempts(model, fixed_terms, rdm_terms, rdm_cor_terms,
+                     grouped_terms, hetro_in_means, hetro_in_variances):
+    """The fallback ladder, structure-first and family-second.
+
+    Every structure (full / nohetero / ind) is tried at the requested family
+    before the other family's structures, and the no-random-structure stages
+    come last. A family swap therefore no longer costs the searched random
+    and grouped terms -- the defect that turned one diverged NB2 refit into a
+    fixed-effects Poisson surface (T9 job 27247312).
+    """
+    _families = [model] + [m for m in ("nb", "poisson") if m != model]
+
+    def _mk_stage(fam, kind):
+        st = {"fixed": fixed_terms, "model": fam,
+              "disp": 1 if fam == "nb" else 0, "label": f"{fam}-{kind}"}
+        if kind == "full":
+            st.update(rdm=rdm_terms, rdm_cor=rdm_cor_terms,
+                      grouped=grouped_terms, hetero=hetro_in_means,
+                      hetero_var=hetro_in_variances)
+        elif kind == "nohetero":
+            st.update(rdm=rdm_terms, rdm_cor=rdm_cor_terms,
+                      grouped=grouped_terms, hetero=[], hetero_var=[])
+        elif kind == "ind":
+            st.update(rdm=rdm_terms + rdm_cor_terms, rdm_cor=[],
+                      grouped=[], hetero=[], hetero_var=[])
+        else:
+            st.update(rdm=[], rdm_cor=[], grouped=[], hetero=[],
+                      hetero_var=[])
+        return st
+
+    out = [_mk_stage(f, k) for f in _families
+           for k in ("full", "nohetero", "ind")]
+    out += [_mk_stage(f, "fixed") for f in _families]
+    return out
+
+
 def fit_metacount_nb(df, y_col, id_col, fixed_terms, rdm_terms,
                      model="nb", R=200, de_maxiter=8, de_popsize=8,
                      seed=0, verbose=False, continuous_de_warm_start=None,
                      use_slsqp=None, rdm_cor_terms=None, grouped_terms=None,
                      hetro_in_means=None, hetro_in_variances=None,
                      group_id_col=None, use_prefit_start=False,
-                     offset_col=None):
+                     offset_col=None, screen_design=True):
     """Fit NB (or Poisson) random-parameters count model.
 
     fixed_terms: list of column names (must exist, numeric)
@@ -177,9 +310,11 @@ def fit_metacount_nb(df, y_col, id_col, fixed_terms, rdm_terms,
     rdm_cor_terms / grouped_terms / hetro_in_means: full searched structure
       (correlated RP, highway-grouped RP, heterogeneity-in-means). These were
       previously dropped at refit, silently reducing the searched model to
-      fixed-only. Staged fallback: full -> no-hetero -> ind-only ->
-      fixed-only -> poisson-fixed; each stage is sanity-gated so a diverged
-      fit (|b|>500, zero-variance predictions) is never accepted.
+      fixed-only. Staged fallback (structure first, family second):
+      <model>-full -> -nohetero -> -ind -> <other>-full -> -nohetero -> -ind
+      -> -fixed (both families); each stage is sanity-gated so a diverged fit
+      (|b|>500, zero-variance predictions) is never accepted, and landing on
+      any stage but the first is reported as ``degraded``.
     Returns dict with expected, alpha, aic, bic, loglik, coef table, fit, builder.
 
     Memory trick: the DE warm-start evaluates a whole population with
@@ -269,9 +404,70 @@ def fit_metacount_nb(df, y_col, id_col, fixed_terms, rdm_terms,
         print("  [metacount] NOTE: heterogeneity-in-variances passed through "
               "as spec key (backend support varies; falls back if rejected)")
 
+    # What the caller asked for, before any screening, so the fidelity flag
+    # reports a model that lost structure rather than comparing a screened
+    # spec against itself.
+    requested = {"fixed": list(fixed_terms), "rdm": list(rdm_terms) +
+                 list(rdm_cor_terms), "grouped": list(grouped_terms),
+                 "hetero": list(hetro_in_means)}
+    # Design screening (see _screen_design). Applied to every role, because a
+    # separated or constant base is unidentifiable whichever way it enters;
+    # a grouped slope on such a column has no finite MLE either.
+    design_drops = []
+    if screen_design:
+        if fixed_terms:
+            fixed_terms, _d = _screen_design(work, y_col, fixed_terms)
+            design_drops += _d
+        if rdm_terms:
+            rdm_terms, _d = _screen_design(work, y_col, rdm_terms)
+            design_drops += _d
+        if rdm_cor_terms:
+            rdm_cor_terms, _d = _screen_design(work, y_col, rdm_cor_terms)
+            design_drops += _d
+        if grouped_terms:
+            grouped_terms, _d = _screen_design(work, y_col, grouped_terms)
+            design_drops += _d
+        if hetro_in_means:
+            _h, _d = _screen_design(work, y_col, hetro_in_means)
+            design_drops += _d
+            hetro_in_means = [str(t).split(":")[0] for t in _h]
+        if not grouped_terms:
+            gid = None
+        # Heterogeneity-in-means is only defined for a coefficient that is
+        # still random; if screening removed its random block, the term would
+        # make make_manual_spec fail and take the whole stage (and, by
+        # cascade, the hierarchy) down with it.
+        if hetro_in_means:
+            _rand_now = {str(t).split(":")[0] for t in
+                         list(rdm_terms) + list(rdm_cor_terms)
+                         + list(grouped_terms)}
+            _h_lost = [t for t in hetro_in_means if t not in _rand_now]
+            if _h_lost:
+                hetro_in_means = [t for t in hetro_in_means
+                                  if t in _rand_now]
+                if verbose:
+                    print("  [metacount] design screen: hetro_in_means "
+                          f"dropped {_h_lost} (no longer a random term)")
+        if design_drops and verbose:
+            for _dr in design_drops:
+                print(f"  [metacount] design screen: dropped {_dr['term']!r} "
+                      f"({_dr['reason']})")
+
+    # Number of groups the FIT saw. Stored so prediction can size the grouped
+    # draw tensor identically even when the prediction frame happens to
+    # contain fewer cells: a shorter tensor shifts every group's draws.
+    _n_groups = None
+    _group_cats = None
+    if gid is not None and gid in work.columns:
+        _gc = work[gid]
+        if isinstance(_gc.dtype, pd.CategoricalDtype):
+            _n_groups = int(len(_gc.cat.categories))
+            _group_cats = [str(c) for c in _gc.cat.categories]
+        else:
+            _n_groups = int(_gc.astype(str).nunique())
+
     builder = ExperimentBuilder(work, id_col=id_col, y_col=y_col,
                                 group_id_col=gid, offset_col=offset_col)
-    dispersion = 1 if model == "nb" else 0
     # Auto low-mem guard: N*R large => skip vmap DE warm-start by default.
     _n, _r = int(len(work)), int(R)
     if continuous_de_warm_start is None:
@@ -282,27 +478,33 @@ def fit_metacount_nb(df, y_col, id_col, fixed_terms, rdm_terms,
     if use_slsqp is None:
         use_slsqp = bool(_n * _r <= 12_000_000)
 
-    attempts = [
-        {"fixed": fixed_terms, "rdm": rdm_terms, "rdm_cor": rdm_cor_terms,
-         "grouped": grouped_terms, "hetero": hetro_in_means,
-         "hetero_var": hetro_in_variances, "model": model,
-         "disp": dispersion, "label": f"{model}-full"},
-        {"fixed": fixed_terms, "rdm": rdm_terms, "rdm_cor": rdm_cor_terms,
-         "grouped": grouped_terms, "hetero": [], "hetero_var": [],
-         "model": model, "disp": dispersion, "label": f"{model}-nohetero"},
-        {"fixed": fixed_terms, "rdm": rdm_terms + rdm_cor_terms,
-         "rdm_cor": [], "grouped": [], "hetero": [], "hetero_var": [],
-         "model": model, "disp": dispersion, "label": f"{model}-ind"},
-        {"fixed": fixed_terms, "rdm": [], "rdm_cor": [], "grouped": [],
-         "hetero": [], "hetero_var": [], "model": model,
-         "disp": dispersion, "label": f"{model}-fixed"},
-        {"fixed": fixed_terms, "rdm": [], "rdm_cor": [], "grouped": [],
-         "hetero": [], "hetero_var": [], "model": "poisson",
-         "disp": 0, "label": "poisson-fixed"},
-    ]
+    # STAGED LADDER, ordered so that STRUCTURE is given up before FAMILY.
+    #
+    # The old ladder was nb-full -> nb-nohetero -> nb-ind -> nb-fixed ->
+    # poisson-fixed: the only Poisson stage was also the only stage with no
+    # random or grouped terms. So whenever NB2 was not estimable -- which on
+    # a 1.5%-positive panel it is not, because the dispersion has no finite
+    # MLE and log_alpha runs to its clip -- the ladder necessarily shipped a
+    # FIXED-EFFECTS Poisson model and the searched fixture-grouped slopes
+    # were dropped as collateral damage (T9 job 27247312).
+    #
+    # A family swap and a structure cut are independent decisions; collapsing
+    # them means the cheap one costs the expensive one. The ladder now tries
+    # every structure at the requested family, then the same structures at the
+    # other family, and only then the no-random-structure stages -- so a
+    # diverged NB2 fits the SAME hierarchy as Poisson instead of discarding
+    # it. Landing anywhere but the first entry is still reported as degraded.
+    attempts = _staged_attempts(model, fixed_terms, rdm_terms, rdm_cor_terms,
+                                grouped_terms, hetro_in_means,
+                                hetro_in_variances)
     last_err = None
     last_reject = None
-    for att in attempts:
+    drift_retries = []
+    rejected_stages = []
+    _max_drift_retries = 2
+    _queue = list(attempts)
+    while _queue:
+        att = _queue.pop(0)
         try:
             spec = builder.make_manual_spec(
                 fixed_terms=att["fixed"], rdm_terms=att["rdm"],
@@ -362,8 +564,44 @@ def fit_metacount_nb(df, y_col, id_col, fixed_terms, rdm_terms,
             if not _sane:
                 if verbose:
                     print(f"  [metacount] {att['label']} rejected "
-                          f"({_sane_reason}); trying simpler spec")
+                          f"({_sane_reason})")
                 last_reject = f"{att['label']}: {_sane_reason}"
+                rejected_stages.append(last_reject)
+                # Drift is a property of a COLUMN, not of the stage: drop the
+                # runaway columns and refit this same stage before giving up
+                # on its random/grouped structure. Without this, one
+                # separated dummy walked the ladder from nb-full all the way
+                # to poisson-fixed (T9 job 27247312) and the searched
+                # hierarchy was lost with it.
+                _drift = _drift_bases(parsed, att)
+                # Only a LOCALISED runaway is worth a retry: if a third of the
+                # design is drifting the problem is the start/scale, not one
+                # column, and refitting without it just burns another fit.
+                _n_fixed = max(len(att.get("fixed") or []), 1)
+                if len(_drift) > max(2, int(0.34 * _n_fixed)):
+                    _drift = {}
+                if _drift and len(drift_retries) < _max_drift_retries:
+                    _new = dict(att)
+                    for _k in ("fixed", "rdm", "rdm_cor", "grouped",
+                               "hetero", "hetero_var"):
+                        _new[_k] = [t for t in (att.get(_k) or [])
+                                    if str(t).split(":")[0] not in _drift]
+                    _new["label"] = (f"{att['label']}-nodrift"
+                                     f"{len(drift_retries) + 1}")
+                    drift_retries.append({"from": att["label"],
+                                          "to": _new["label"],
+                                          "dropped": sorted(_drift)})
+                    if verbose:
+                        print("  [metacount] drift in %s (|b| up to %.0f); "
+                              "dropping those columns and refitting %s"
+                              % (", ".join(sorted(_drift)),
+                                 max(abs(v) for v in _drift.values()),
+                                 att["label"]))
+                    _queue.insert(0, _new)
+                    continue
+                if verbose:
+                    print("  [metacount] no localised drift; trying a "
+                          "simpler spec")
                 try:
                     import gc as _gc
                     _gc.collect()
@@ -410,9 +648,11 @@ def fit_metacount_nb(df, y_col, id_col, fixed_terms, rdm_terms,
                 if key in parsed["parte"]:
                     beta[f"__mean__{base}"] = float(parsed["parte"][key])
             if verbose:
+                _src = ("n/a (poisson)" if att["model"] != "nb"
+                        else alpha_src)
                 print(f"  [metacount] {att['label']}: "
                       f"n={len(work)} AIC={summ.get('aic', np.nan):.1f} "
-                      f"alpha={alpha:.4f} ({alpha_src})")
+                      f"alpha={alpha:.4f} ({_src})")
             try:
                 import gc as _gc
                 _gc.collect()
@@ -453,6 +693,22 @@ def fit_metacount_nb(df, y_col, id_col, fixed_terms, rdm_terms,
                 # read off the fit; with no offset the free coefficient is
                 # reported so the hazard-vs-free LRT is possible.
                 "offset_col": offset_col,
+                # FIT FIDELITY. A staged ladder that lands on a simpler
+                # stage than the top one has shipped a different model from
+                # the one requested; the caller must be able to see that
+                # rather than infer it from a label string.
+                "design_drops": design_drops,
+                "drift_retries": drift_retries,
+                "rejected_stages": rejected_stages,
+                "requested": requested,
+                "group_id_col": gid,
+                "n_groups": _n_groups,
+                "group_categories": _group_cats,
+                "degraded": bool(
+                    att["label"] != attempts[0]["label"]
+                    or len(att.get("grouped") or []) < len(requested["grouped"])
+                    or len(att.get("rdm") or []) + len(att.get("rdm_cor") or [])
+                    < len(requested["rdm"])),
                 "exposure_mode": ("offset-pinned" if offset_col
                                   else "free-coefficient"),
                 "exposure_coef": (None if offset_col
@@ -561,7 +817,15 @@ def _glm_fallback_fit(work, y_col, fixed_terms, verbose=False):
                     "parsed": parsed, "beta": beta, "fit": None, "spec": None,
                     "builder": None, "manual_spec": None, "spec_label": label,
                     "fixed_terms": list(cols), "rdm_terms": [],
-                    "rdm_cor_terms": [], "grouped_terms": [], "model": model}
+                    "rdm_cor_terms": [], "grouped_terms": [], "model": model,
+                    # Every JAX stage diverged: the shipped fit carries none of
+                    # the requested random/hierarchical structure, so it is
+                    # degraded by construction.
+                    "design_drops": [],
+                    "drift_retries": [],
+                    "rejected_stages": [], "requested": {},
+                    "group_id_col": None, "n_groups": None,
+                    "group_categories": None, "degraded": True}
         except Exception as e:  # noqa: BLE001 - try next simpler stage
             last_reject = f"{label}: {e}"
             continue
@@ -584,6 +848,21 @@ def predict_metacount(df_new, fit_info):
     parte = parsed.get("parte", {}) if isinstance(parsed, dict) else {}
     intercept = float(beta.get("__INTERCEPT__", parte.get("__INTERCEPT__", 0.0)))
     lin = np.full(len(df_new), intercept)
+    # A PINNED exposure (offset_col) is not a design column: fit() removed it
+    # from fixed/rdm/grouped/hetero terms so the coefficients cannot fit it
+    # twice. Predicting from fixed_terms alone therefore returns exp(Xb), i.e.
+    # a RATE per unit exposure, not the expected count -- silent, and it looks
+    # like a 1/E-level under-prediction rather than a units error. Add it back.
+    _off = fit_info.get("offset_col")
+    if _off:
+        if _off not in df_new.columns:
+            raise ValueError(
+                f"predict_metacount: the model was fitted with {_off!r} pinned "
+                "as its exposure offset, but the prediction frame does not "
+                "carry that column. Predicting without it would ship rates "
+                "instead of counts.")
+        lin = lin + pd.to_numeric(df_new[_off], errors="coerce") \
+            .fillna(0.0).values
     # fixed dummies + numeric
     for c in fit_info.get("fixed_terms", []):
         base = c.split(":")[0]
@@ -611,7 +890,9 @@ def predict_metacount_sim(df_new, fit_info, id_col="row_id", y_col="Y",
 
     Rebuilds model data for ``df_new`` through the SAME package code path as
     the fit (``build_model_from_manual_spec`` + ``CountModel.predict``), but
-    with the FIT's scaler so the fitted parameters apply unchanged, then
+    with the FIT's scaler so the fitted parameters apply unchanged, and with
+    the FIT's ``offset_col`` re-attached (a pinned exposure was removed from
+    the design by fit(), so it has to be passed back explicitly), then
     averages ``exp(eta)`` over R fresh Halton draws. This reproduces the
     in-sample ``expected`` (mean over draws) instead of the plug-in at the
     mean random coefficients, which under-predicts by the log-normal
@@ -657,8 +938,16 @@ def predict_metacount_sim(df_new, fit_info, id_col="row_id", y_col="Y",
     if _kr_cor:
         base_draws["draws_cor"] = mh.generate_halton_normal(1, _kr_cor, int(R), seed=43)
     if _kg:
-        if _gid_col and _gid_col in df_new.columns:
-            n_groups = int(pd.Series(df_new[_gid_col]).astype(str).nunique())
+        # Prefer the group count the FIT used. Sizing this from the prediction
+        # frame gave a shorter draw tensor whenever a frame was missing a
+        # cell, which silently applied another cell's coefficients.
+        if fit_info.get("n_groups"):
+            n_groups = int(fit_info["n_groups"])
+        elif _gid_col and _gid_col in df_new.columns:
+            _gc = df_new[_gid_col]
+            n_groups = (int(len(_gc.cat.categories))
+                        if isinstance(_gc.dtype, pd.CategoricalDtype)
+                        else int(pd.Series(_gc).astype(str).nunique()))
         else:
             n_groups = len(df_new)
         base_draws["draws_g"] = mh.generate_halton_normal(
@@ -678,8 +967,34 @@ def predict_metacount_sim(df_new, fit_info, id_col="row_id", y_col="Y",
                 else:
                     draws_kwargs[k] = np.broadcast_to(
                         v, (len(sub),) + v.shape[1:])
+            # Re-impose the FIT's group categories. The package codes groups
+            # with astype("category").cat.codes, which re-derives categories
+            # from whatever frame it is given: a prediction frame missing one
+            # cell would shift every later code and apply another cell's
+            # coefficients. Declaring the fit's categories makes the coding
+            # identical by construction.
+            _fit_cats = fit_info.get("group_categories")
+            if _fit_cats and _gid_col and _gid_col in sub.columns:
+                sub[_gid_col] = pd.Categorical(
+                    sub[_gid_col].astype(str), categories=_fit_cats)
+            # offset_col MUST travel with the spec. make_manual_spec() does
+            # not record it (it lives on the builder instance, and the fit
+            # gets it as a separate argument to build_model_from_manual_spec),
+            # so re-building here without it dropped a pinned exposure from
+            # eta entirely: every pinned-offset arm shipped exp(Xb), the
+            # exposure-normalised rate, and the "3-4x holdout level deficit"
+            # was that missing factor (obs/pred 2.81 vs the observed-weighted
+            # harmonic mean of E, 3.00).
+            _offset_col = fit_info.get("offset_col")
+            if _offset_col and _offset_col not in sub.columns:
+                raise ValueError(
+                    f"predict_metacount_sim: the model was fitted with "
+                    f"{_offset_col!r} pinned as its exposure offset, but the "
+                    "prediction frame does not carry that column. Predicting "
+                    "without it would ship rates instead of counts.")
             data_new, spec_new = mh.build_model_from_manual_spec(
                 df=sub, manual_spec=manual_spec, id_col=id_col, y_col=y_col,
+                offset_col=_offset_col,
                 R=int(R), **draws_kwargs)
             model = mh.CountModel(spec_new, data_new)
             model.params = params

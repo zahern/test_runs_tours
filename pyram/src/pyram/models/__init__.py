@@ -45,6 +45,117 @@ except ImportError:
     ACTIVITY_GEN_AVAILABLE = False
     warnings.warn("activity_generation module not available")
 
+from pyram.models.stages import (
+    CDAPModel,
+    PurposeTimingModel,
+    build_trip_chains,
+    create_cdap_model,
+    create_purpose_timing_model,
+    expand_daily_patterns,
+    normalise_purpose,
+)
+
+
+# ── Case-Alternative Construction Helpers ────────────────────────────────────
+
+#: Land-use attributes carried into the destination choice alternative table.
+_DEST_LANDUSE_COLUMNS = ("TOTEMP", "RETEMPN", "FPSEMPN", "HEREMPN", "TOTPOP", "is_cbd")
+
+
+def _zone_attributes(landuse: pd.DataFrame) -> pd.DataFrame:
+    """Return land use indexed by zone id, with one row per zone.
+
+    Lets the alternative tables look attributes up by position, instead of the
+    per-alternative ``landuse[landuse["zone_id"] == zone]`` scan that used to run
+    inside the inner loop.
+    """
+    if "zone_id" not in landuse.columns:
+        return landuse
+
+    zones = pd.to_numeric(landuse["zone_id"], errors="coerce")
+    frame = landuse.loc[zones.notna()].copy()
+    frame["zone_id"] = zones.loc[zones.notna()].to_numpy()
+    return frame.drop_duplicates(subset=["zone_id"]).set_index("zone_id")
+
+
+def _numeric_column(values: pd.Series) -> np.ndarray:
+    """Coerce a land-use column to an array, keeping non-numeric values as-is."""
+    if values.dtype == bool:
+        return values.to_numpy(dtype=np.int64)
+    if values.dtype == object:
+        numeric = pd.to_numeric(values, errors="coerce")
+        if bool(numeric.notna().all()):
+            return numeric.to_numpy(dtype=float)
+    return values.to_numpy()
+
+
+def _skim_matrices(
+    skims: Optional[Dict],
+    zone_ids: np.ndarray,
+    fields: Tuple[str, ...],
+) -> Tuple[Dict[str, np.ndarray], Dict[Any, int]]:
+    """Materialise OD skims as dense zone-position matrices plus a zone index.
+
+    ``skims`` is normally the ``{(otaz, dtaz): {matrix: value}}`` lookup built by
+    :func:`pyram.data.build_skim_lookup`. Walking it once costs n_zones**2 dict
+    probes; every later lookup is then a single array index rather than one dict
+    probe per (trip, zone) pair.
+    """
+    zone_ids = np.asarray(list(zone_ids))
+    n_zones = len(zone_ids)
+    position = {zone: i for i, zone in enumerate(zone_ids)}
+    matrices = {name: np.zeros((n_zones, n_zones), dtype=float) for name in fields}
+
+    if not skims:
+        return matrices, position
+
+    sample = next(iter(skims.values()), None)
+    if isinstance(sample, np.ndarray):
+        # Already {matrix: 2-D array}; assume it shares the zone ordering.
+        for name in fields:
+            matrix = skims.get(name)
+            if matrix is not None and np.shape(matrix) == (n_zones, n_zones):
+                matrices[name] = np.asarray(matrix, dtype=float)
+        return matrices, position
+
+    for (origin, dest), values in skims.items():
+        if not values:
+            continue
+        i = position.get(origin)
+        j = position.get(dest)
+        if i is None or j is None:
+            continue
+        for name in fields:
+            if name in values:
+                matrices[name][i, j] = values[name]
+    return matrices, position
+
+
+def _zone_positions(zone_values: np.ndarray, position: Dict[Any, int]) -> np.ndarray:
+    """Map zone ids to matrix positions, -1 where the zone is unknown."""
+    codes, uniques = pd.factorize(pd.Series(zone_values), sort=False)
+    lookup = np.array([position.get(zone, -1) for zone in uniques], dtype=np.int64)
+    positions = np.full(len(zone_values), -1, dtype=np.int64)
+    known = codes >= 0
+    if known.any():
+        positions[known] = lookup[codes[known]]
+    return positions
+
+
+def _release_model_dataset(model: Any) -> None:
+    """Drop a fitted model's reference to its (very large) dataset.
+
+    larch keeps the estimation dataset on ``Model.data``. Holding it on every
+    segment model pins gigabytes for the life of the process and serialises the
+    whole alternative table into the saved model file, so it is released once the
+    parameters have been read off. Simulation re-attaches a dataset.
+    """
+    if model is None:
+        return
+    try:
+        model.data = None
+    except Exception as exc:  # pragma: no cover - depends on the larch version
+        warnings.warn(f"Could not release the fitted dataset: {exc}")
 
 # ── Base Model Class ─────────────────────────────────────────────────────────
 
@@ -68,6 +179,8 @@ class BaseChoiceModel:
     def save(self, path: Union[str, Path]):
         """Save model to file."""
         import pickle
+        # The fitted dataset dominates both the pickle and resident memory.
+        _release_model_dataset(self.model)
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
@@ -76,6 +189,9 @@ class BaseChoiceModel:
                 "coefficients": self.coefficients,
                 "config": self.config,
                 "fitted": self.fitted,
+                # Segment models / zone ids are needed to predict after a reload.
+                "segment_models": getattr(self, "segment_models", None),
+                "zone_ids": getattr(self, "zone_ids", None),
             }, f)
     
     @classmethod
@@ -88,6 +204,10 @@ class BaseChoiceModel:
         obj.model = data.get("model")
         obj.coefficients = data.get("coefficients", {})
         obj.fitted = data.get("fitted", False)
+        if data.get("segment_models") is not None:
+            obj.segment_models = data["segment_models"]
+        if data.get("zone_ids") is not None:
+            obj.zone_ids = data["zone_ids"]
         return obj
 
 
@@ -235,88 +355,169 @@ class DestinationChoiceModel(BaseChoiceModel):
         return self
     
     def _build_ca_dataset(self, trips: pd.DataFrame, landuse: pd.DataFrame, skims: Dict) -> pd.DataFrame:
-        """Build case-alternative dataset for Larch."""
-        # Get zone IDs
-        self.zone_ids = landuse["zone_id"].unique() if "zone_id" in landuse.columns else landuse.index.unique()
-        
-        # For each trip, create alternatives
-        ca_rows = []
-        for idx, trip in trips.iterrows():
-            otaz = trip["OTAZ"]
-            dtaz = trip["DTAZ"]
-            
-            for zone in self.zone_ids:
-                # Get skim values
-                skim_key = (otaz, zone)
-                skim_vals = skims.get(skim_key, {})
-                
-                # Land use at destination
-                lu = landuse[landuse["zone_id"] == zone].iloc[0] if zone in landuse["zone_id"].values else None
-                
-                row = {
-                    "case_id": idx,
-                    "alt_id": zone,
-                    "chosen": int(zone == dtaz),
-                    "OTAZ": otaz,
-                    "DTAZ": dtaz,
-                    "DIST": skim_vals.get("DIST", 0),
-                    "log_DIST_1": np.log(max(skim_vals.get("DIST", 1), 1)),
-                    "logsum": skim_vals.get("logsum", 0),
-                    "log_CRASH_1": np.log(max(skim_vals.get("CRASH", 1), 1)),
-                }
-                
-                # Add land use attributes
-                if lu is not None:
-                    for col in ["TOTEMP", "RETEMPN", "FPSEMPN", "HEREMPN", "TOTPOP", "is_cbd"]:
-                        if col in lu.index:
-                            row[col.lower()] = lu[col]
-                
-                ca_rows.append(row)
-        
-        return pd.DataFrame(ca_rows)
-    
+        """Build the case-alternative table for larch.
+
+        The table is assembled by repeating the trip block over the zone axis and
+        indexing dense skim matrices, instead of appending one Python dict per
+        (trip, zone) pair. At 371 zones and ~50k trips the dict form holds tens of
+        GB of live objects and costs O(trips * zones**2) time, because the
+        land-use lookup re-scanned the whole table inside the inner loop; that is
+        what exhausted memory and walltime on the cluster.
+        """
+        lu_frame = _zone_attributes(landuse)
+        self.zone_ids = lu_frame.index.to_numpy()
+
+        zone_ids = np.asarray(self.zone_ids)
+        n_zones = len(zone_ids)
+        n_cases = len(trips)
+        if n_cases == 0 or n_zones == 0:
+            return pd.DataFrame(
+                columns=[
+                    "case_id",
+                    "alt_id",
+                    "chosen",
+                    "OTAZ",
+                    "DTAZ",
+                    "DIST",
+                    "log_DIST_1",
+                    "logsum",
+                    "log_CRASH_1",
+                ]
+            )
+
+        matrices, position = _skim_matrices(skims, zone_ids, ("DIST", "logsum", "CRASH"))
+
+        otaz = trips["OTAZ"].to_numpy()
+        dtaz = trips["DTAZ"].to_numpy()
+        origin_pos = _zone_positions(otaz, position)
+        chosen_pos = _zone_positions(dtaz, position)
+
+        sample_size = int(self.sample_size or 0)
+        if 2 <= sample_size < n_zones and (chosen_pos >= 0).all():
+            case_rep, alt_rep = self._sample_alternatives(
+                chosen_pos, n_zones, sample_size
+            )
+        else:
+            if 2 <= sample_size < n_zones:
+                warnings.warn(
+                    "Destination alternative sampling disabled: observed destinations "
+                    "fall outside the zone system, so the chosen alternative cannot be "
+                    "kept for every case."
+                )
+            case_rep, alt_rep = self._full_alternatives(n_cases, n_zones)
+
+        case_origin = origin_pos[case_rep]
+        known_origin = case_origin >= 0
+        safe_origin = np.where(known_origin, case_origin, 0)
+
+        alt_ids = zone_ids[alt_rep]
+        dist = matrices["DIST"][safe_origin, alt_rep]
+        logsum = matrices["logsum"][safe_origin, alt_rep]
+        crash = matrices["CRASH"][safe_origin, alt_rep]
+        if not known_origin.all():
+            # Origin outside the zone system: no skim information available.
+            dist = np.where(known_origin, dist, 0.0)
+            logsum = np.where(known_origin, logsum, 0.0)
+            crash = np.where(known_origin, crash, 0.0)
+
+        data = {
+            "case_id": trips.index.to_numpy()[case_rep],
+            "alt_id": alt_ids,
+            "chosen": (alt_ids == dtaz[case_rep]).astype(int),
+            "OTAZ": otaz[case_rep],
+            "DTAZ": dtaz[case_rep],
+            "DIST": dist,
+            "log_DIST_1": np.log(np.maximum(dist, 1.0)),
+            "logsum": logsum,
+            "log_CRASH_1": np.log(np.maximum(crash, 1.0)),
+        }
+        for column in _DEST_LANDUSE_COLUMNS:
+            if column in lu_frame.columns:
+                data[column.lower()] = _numeric_column(lu_frame[column])[alt_rep]
+
+        return pd.DataFrame(data)
+
+    @staticmethod
+    def _full_alternatives(n_cases: int, n_zones: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Every zone as an alternative for every case, in case-major blocks."""
+        return (
+            np.repeat(np.arange(n_cases), n_zones),
+            np.tile(np.arange(n_zones), n_cases),
+        )
+
+    def _sample_alternatives(
+        self, chosen_pos: np.ndarray, n_zones: int, sample_size: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Draw a fixed-size alternative set per case, always keeping the chosen one.
+
+        Non-chosen alternatives are drawn uniformly, which leaves the slope
+        parameters consistent without a Manski-Lerman log-correction: that
+        correction is only required when alternatives are drawn with unequal
+        probability (importance sampling on a size term).
+        """
+        n_cases = len(chosen_pos)
+        sample_size = int(min(max(sample_size, 2), n_zones))
+        rng = np.random.default_rng(self.config.get("seed", 42))
+
+        # Sort in bounded blocks so the draw keys never dominate the allocation.
+        block = max(1, 2_000_000 // max(n_zones, 1))
+        cases: List[np.ndarray] = []
+        alts: List[np.ndarray] = []
+        for start in range(0, n_cases, block):
+            stop = min(start + block, n_cases)
+            keys = rng.random((stop - start, n_zones))
+            keys[np.arange(stop - start), chosen_pos[start:stop]] = -1.0
+            picked = np.argpartition(keys, sample_size - 1, axis=1)[:, :sample_size]
+            cases.append(np.repeat(np.arange(start, stop), sample_size))
+            alts.append(picked.ravel())
+        return np.concatenate(cases), np.concatenate(alts)
+
     def _estimate_segment(self, ca_df: pd.DataFrame, segment: str) -> Any:
         """Estimate model for one segment."""
         ca_df = ca_df.set_index(["case_id", "alt_id"])
         dt = lx.Dataset.construct.from_idca(ca_df, crack=False)
         m = lx.Model(dt)
-        m.choice_co_code = "chosen"
-        
+        m.choice_ca_var = "chosen"
+
         # Build utility
         utility_terms = self._build_utility(ca_df, segment)
-        
+
         if self.model_type == "nl_distance":
             # Nested Logit with distance bands
             nest_names = [f"dist_{i}" for i in range(len(self.distance_bands) - 1)]
             nest_params = {name: P(name) for name in nest_names}
             m.nesting_parameters = nest_params
-        
+
         # Add utility terms
         utility = None
         for coef_name, var_name in utility_terms.items():
             if var_name in ca_df.columns:
                 term = P(coef_name) * X(var_name)
                 utility = term if utility is None else utility + term
-        
+
         if utility is not None:
             m.utility_ca = utility
-        
+
         # Estimate
         m.maximize_loglike(method="slsqp", engine="numba")
-        
+
         # Store coefficients
         self.coefficients[segment] = {
             name: float(m.pf.loc[name, "value"]) for name in m.pf.index
         }
-        
+
+        # The dataset is only needed to fit; keeping it would pin this segment's
+        # whole alternative table in memory and in the saved model file.
+        _release_model_dataset(m)
+
         return m
-    
+
     def _estimate_heuristic(self, trips, persons, landuse, skims, segment_col):
         """Heuristic fallback when Larch unavailable."""
         # Simple gravity model estimation
         self.fitted = True
         return self
-    
+
     def predict(
         self,
         trips: pd.DataFrame,
@@ -355,10 +556,12 @@ class DestinationChoiceModel(BaseChoiceModel):
             predictions.append(preds)
         
         if predictions:
-            pred_df = pd.concat(predictions)
-            trips = trips.merge(pred_df[["case_id", "predicted_DTAZ"]], 
-                              left_index=True, right_on="case_id", how="left")
-            trips["DTAZ_pred"] = trips["predicted_DTAZ"].fillna(trips["DTAZ"])
+            pred_df = pd.concat(predictions).drop_duplicates(subset=["case_id"])
+            pred_map = dict(zip(pred_df["case_id"], pred_df["predicted_DTAZ"]))
+            trips["DTAZ_pred"] = pd.Series(trips.index.map(pred_map), index=trips.index)
+            trips["DTAZ_pred"] = trips["DTAZ_pred"].fillna(trips["DTAZ"])
+        else:
+            trips["DTAZ_pred"] = trips["DTAZ"]
         
         return trips
     
@@ -370,6 +573,7 @@ class DestinationChoiceModel(BaseChoiceModel):
         model.data = dt
         
         choices = model.simulate_choices()
+        _release_model_dataset(model)
         return pd.DataFrame({"case_id": choices.index, "predicted_DTAZ": choices.values})
     
     def _predict_gravity(self, trips, landuse, skims):
@@ -454,7 +658,14 @@ class ModeChoiceModel(BaseChoiceModel):
                     "case_id": idx,
                     "alt_id": mode_code,
                     "mode": mode,
-                    "chosen": int(trip.get("mode", trip.get("tour_mode", 1)) == mode_code),
+                    **{f"mode_{candidate}": int(candidate == mode) for candidate in modes},
+                    "chosen": int(
+                        pd.to_numeric(
+                            pd.Series([trip.get("mode", trip.get("tour_mode", 0))]),
+                            errors="coerce",
+                        ).fillna(0).iloc[0]
+                        == mode_code
+                    ),
                     "avail": avail,
                     "cost": skim_vals.get("cost", 0),
                     "time": skim_vals.get(f"{mode}_time", skim_vals.get("time", 0)),
@@ -491,7 +702,7 @@ class ModeChoiceModel(BaseChoiceModel):
         ca_df = ca_df.set_index(["case_id", "alt_id"])
         dt = lx.Dataset.construct.from_idca(ca_df, crack=False)
         m = lx.Model(dt)
-        m.choice_co_code = "chosen"
+        m.choice_ca_var = "chosen"
         m.availability_ca_var = "avail"
         
         # Build utility
@@ -546,9 +757,12 @@ class ModeChoiceModel(BaseChoiceModel):
         self.model.data = dt
         
         choices = self.model.simulate_choices()
+        choice_map = pd.Series(choices.values, index=choices.index)
         trips = trips.copy()
-        trips["mode_pred"] = choices.map({v: k for k, v in self.mode_codes.items()})
-        trips["mode_code_pred"] = choices.values
+        trips["mode_code_pred"] = pd.Series(trips.index.map(choice_map), index=trips.index)
+        trips["mode_pred"] = trips["mode_code_pred"].map(
+            {v: k for k, v in self.mode_codes.items()}
+        )
         
         return trips
     
@@ -679,7 +893,7 @@ class ParkingChoiceModel(BaseChoiceModel):
         ca_df = ca_df.set_index(["case_id", "alt_id"])
         dt = lx.Dataset.construct.from_idca(ca_df, crack=False)
         m = lx.Model(dt)
-        m.choice_co_code = "chosen"
+        m.choice_ca_var = "chosen"
         
         utility = None
         for coef, var in [
@@ -726,11 +940,13 @@ class ParkingChoiceModel(BaseChoiceModel):
         self.model.data = dt
         
         choices = self.model.simulate_choices()
+        choice_map = pd.Series(choices.values, index=choices.index)
         
-        # Merge back
+        # Merge back on the case ids used to build the alternatives
         trips = trips.copy()
-        trips.loc[auto_mask, "parking_type"] = choices.map(self.PARKING_TYPES).values
-        trips.loc[auto_mask, "parking_type_code"] = choices.values
+        codes = pd.Series(auto_trips.index.map(choice_map), index=auto_trips.index)
+        trips.loc[auto_mask, "parking_type_code"] = codes
+        trips.loc[auto_mask, "parking_type"] = codes.map(self.PARKING_TYPES)
         
         return trips
     
@@ -809,7 +1025,7 @@ class TripDestinationModel(BaseChoiceModel):
         ca_df = ca_df.set_index(["case_id", "alt_id"])
         dt = lx.Dataset.construct.from_idca(ca_df, crack=False)
         m = lx.Model(dt)
-        m.choice_co_code = "chosen"
+        m.choice_ca_var = "chosen"
         
         # Utility with detour, size, logsum
         utility = None
@@ -829,43 +1045,90 @@ class TripDestinationModel(BaseChoiceModel):
         return m
     
     def _build_trip_ca(self, trips, landuse, skims):
-        """Build CA dataset for trip destination."""
-        ca_rows = []
-        zone_ids = landuse["zone_id"].unique() if "zone_id" in landuse.columns else landuse.index.unique()
-        
-        for idx, trip in trips.iterrows():
-            otaz = trip["origin_taz"]
-            dtaz = trip["dest_taz"]
-            anchor = trip["anchor_down_taz"]
-            
-            for zone in zone_ids:
-                # Detour distance
-                d_os = skims.get((otaz, zone), {}).get("DIST", 0)
-                d_sa = skims.get((zone, anchor), {}).get("DIST", 0)
-                d_oa = skims.get((otaz, anchor), {}).get("DIST", 0)
-                detour = max(d_os + d_sa - d_oa, 0)
-                
-                # Trip boundary constraint
-                max_detour = min(self.detour_max_km, self.detour_max_ratio * d_oa + self.detour_base_km)
-                feasible = detour <= max_detour
-                
-                # Size term
-                lu = landuse[landuse["zone_id"] == zone].iloc[0] if zone in landuse["zone_id"].values else None
-                size = sum(lu.get(v, 0) for v in self.size_terms.get(trip["purpose"], ["TOTPOP"])) if lu is not None else 1
-                
-                ca_rows.append({
-                    "case_id": idx,
-                    "alt_id": zone,
-                    "chosen": int(zone == dtaz),
-                    "detour_dist_km": detour,
-                    "log_size": np.log(max(size, 1)),
-                    "logsum": 0,  # Would come from mode choice
-                    "AutoCrashRisk": skims.get((otaz, zone), {}).get("CRASH", 0),
-                    "feasible": feasible,
-                })
-        
-        return pd.DataFrame(ca_rows)
-    
+        """Build the trip-destination CA dataset, vectorised over alternatives."""
+        lu_frame = _zone_attributes(landuse)
+        zone_ids = lu_frame.index.to_numpy()
+        n_zones = len(zone_ids)
+        n_cases = len(trips)
+        if n_cases == 0 or n_zones == 0:
+            return pd.DataFrame(
+                columns=[
+                    "case_id",
+                    "alt_id",
+                    "chosen",
+                    "detour_dist_km",
+                    "log_size",
+                    "logsum",
+                    "AutoCrashRisk",
+                    "feasible",
+                ]
+            )
+
+        matrices, position = _skim_matrices(skims, zone_ids, ("DIST", "CRASH"))
+        dist = matrices["DIST"]
+        crash = matrices["CRASH"]
+
+        origin_pos = _zone_positions(trips["origin_taz"].to_numpy(), position)
+        anchor_pos = _zone_positions(trips["anchor_down_taz"].to_numpy(), position)
+
+        case_rep = np.repeat(np.arange(n_cases), n_zones)
+        alt_rep = np.tile(np.arange(n_zones), n_cases)
+
+        case_origin = origin_pos[case_rep]
+        known_origin = case_origin >= 0
+        safe_origin = np.where(known_origin, case_origin, 0)
+        safe_anchor = np.where(anchor_pos[case_rep] >= 0, anchor_pos[case_rep], 0)
+
+        d_os = dist[safe_origin, alt_rep]
+        d_sa = dist[alt_rep, safe_anchor]
+        d_oa = dist[safe_origin, safe_anchor]
+        risk = crash[safe_origin, alt_rep]
+        if not known_origin.all():
+            d_os = np.where(known_origin, d_os, 0.0)
+            risk = np.where(known_origin, risk, 0.0)
+
+        detour = np.maximum(d_os + d_sa - d_oa, 0.0)
+        max_detour = np.minimum(
+            self.detour_max_km, self.detour_max_ratio * d_oa + self.detour_base_km
+        )
+
+        purposes = (
+            trips["purpose"].to_numpy()
+            if "purpose" in trips.columns
+            else np.full(n_cases, "other", dtype=object)
+        )
+        purpose_codes, purpose_values = pd.factorize(pd.Series(purposes), sort=False)
+        purpose_codes = np.where(purpose_codes < 0, 0, purpose_codes)
+        size_table = np.vstack(
+            [self._size_term(lu_frame, str(purpose)) for purpose in purpose_values]
+        )
+        size = size_table[purpose_codes][case_rep, alt_rep]
+
+        data = {
+            "case_id": trips.index.to_numpy()[case_rep],
+            "alt_id": zone_ids[alt_rep],
+            "chosen": (
+                zone_ids[alt_rep] == trips["dest_taz"].to_numpy()[case_rep]
+            ).astype(int),
+            "detour_dist_km": detour,
+            "log_size": np.log(np.maximum(size, 1.0)),
+            "logsum": 0.0,
+            "AutoCrashRisk": risk,
+            "feasible": detour <= max_detour,
+        }
+        return pd.DataFrame(data)
+
+    def _size_term(self, lu_frame: pd.DataFrame, purpose: str) -> np.ndarray:
+        """Summed size term per zone for one purpose."""
+        size = np.zeros(len(lu_frame), dtype=float)
+        for column in self.size_terms.get(purpose, ["TOTPOP"]):
+            if column in lu_frame.columns:
+                values = pd.to_numeric(
+                    pd.Series(_numeric_column(lu_frame[column])), errors="coerce"
+                )
+                size = size + values.fillna(0.0).to_numpy(dtype=float)
+        return size
+
     def predict(
         self,
         stop_trips: pd.DataFrame,
@@ -899,9 +1162,16 @@ class TripDestinationModel(BaseChoiceModel):
             }))
         
         if predictions:
-            pred_df = pd.concat(predictions)
-            stop_trips = stop_trips.merge(pred_df, left_index=True, right_on="case_id", how="left")
-            stop_trips["dest_taz_pred"] = stop_trips["predicted_dest_taz"].fillna(stop_trips["dest_taz"])
+            pred_df = pd.concat(predictions).drop_duplicates(subset=["case_id"])
+            pred_map = dict(zip(pred_df["case_id"], pred_df["predicted_dest_taz"]))
+            stop_trips["dest_taz_pred"] = pd.Series(
+                stop_trips.index.map(pred_map), index=stop_trips.index
+            )
+            stop_trips["dest_taz_pred"] = stop_trips["dest_taz_pred"].fillna(
+                stop_trips["dest_taz"]
+            )
+        else:
+            stop_trips["dest_taz_pred"] = stop_trips["dest_taz"]
         
         return stop_trips
     

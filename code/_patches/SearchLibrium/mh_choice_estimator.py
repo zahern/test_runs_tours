@@ -12,10 +12,11 @@ import logging
 import os
 import re
 from typing import Iterable, Mapping, Sequence
-
 import numpy as np
 import pandas as pd
 from scipy.special import logsumexp
+from collections import deque
+
 
 try:
     from numba import njit, prange
@@ -32,7 +33,7 @@ except Exception:  # pragma: no cover - numba simply absent
         return range(*a)
 
 
-@njit(cache=False, parallel=True)
+@njit(cache=True, parallel=True)
 def _choice_case_ll_nb(beta, x, valid, off, chosen_col):
     """Per-case log-likelihood contributions, compiled.
 
@@ -72,7 +73,7 @@ def _choice_case_ll_nb(beta, x, valid, off, chosen_col):
     return out
 
 
-@njit(cache=False, parallel=True)
+@njit(cache=True, parallel=True)
 def _choice_case_grad_nb(beta, x, valid, off, chosen_col, chosen_x):
     """Per-case gradient contributions ``w_i * (x_chosen - E_p[x])``, compiled.
 
@@ -211,12 +212,18 @@ class IdentificationReport:
     eigenvalues: np.ndarray
     suggested_drop: tuple[str, ...] = ()
     weak_directions: tuple[dict, ...] = ()
+    # Features that do not vary within a case.  In a conditional logit such a
+    # column is a case-level constant and cancels from the probability, so it
+    # is unidentified whatever the information matrix looks like -- see the
+    # constant-column pass in identify_weak_features.
+    constant_features: tuple[str, ...] = ()
 
     def as_dict(self) -> dict:
         return {
             "condition_number": float(self.condition_number),
             "eigenvalues": [float(v) for v in np.asarray(self.eigenvalues).ravel()],
             "suggested_drop": list(self.suggested_drop),
+            "constant_features": list(self.constant_features),
             "weak_directions": [
                 {
                     "eigenvalue": float(d["eigenvalue"]),
@@ -240,6 +247,7 @@ def identify_weak_features(
     offset_col: str = "log_correction",
     max_drop: int | None = None,
     protected: Sequence[str] = (),
+    constant_tol: float = 1e-10,
 ) -> IdentificationReport:
     """Find structurally weak directions in a long choice-set frame.
 
@@ -247,6 +255,16 @@ def identify_weak_features(
     ``possible_overspec.py``) for the sampled MNL used here: eigendecompose the
     scaled exact information matrix at ``beta`` (zeros when omitted) and return
     one feature per near-null direction as ``suggested_drop``.
+
+    A separate pass catches features that are CONSTANT WITHIN A CASE.  Those are
+    case-level constants in a conditional logit -- they cancel from the
+    probability -- so the estimator leaves them at the ridge (coefficient ~0)
+    however much the column varies across cases.  The eigen test cannot see
+    them: it rescales by ``sqrt(diag(info))``, and for such a column that
+    diagonal is its own numerical residue, so the column reports a unit
+    "self-correlation" and no weak direction.  The share of a feature's
+    variation that lies within cases is the direct test, and any feature below
+    ``constant_tol`` of it is reported in ``constant_features``.
     """
     frame = data if isinstance(data, ChoiceSetFrame) else ChoiceSetFrame.from_long(
         data, feature_cols, case_col=case_col, alt_col=alt_col,
@@ -259,35 +277,75 @@ def identify_weak_features(
     else:
         beta_vec = np.asarray(beta, dtype=float).reshape(-1)
     info, _, _ = frame.information(beta_vec)
-    diag = np.clip(np.diag(info), 1e-300, None)
-    scale = np.sqrt(diag)
-    scaled = info / np.outer(scale, scale)
-    evals, evecs = np.linalg.eigh(0.5 * (scaled + scaled.T))
-    condition = float(evals[-1] / max(evals[0], 1e-300))
-    weak = np.flatnonzero(evals < float(tol))
     protected_set = {str(p) for p in (protected or ())}
     drops: list[str] = []
     directions: list[dict] = []
+
+    # ── Case-constant columns (before the eigen pass) ──────────────────────
+    # Within-case variation is the only variation a conditional logit can use.
+    # A column without it is unidentified whatever the information matrix says
+    # -- and what it says is numerical noise: the row is a difference of two
+    # ~equal quantities, so its diagonal is a residue and the scaled matrix
+    # picks up huge NEGATIVE eigenvalues that then masquerade as weak
+    # directions.  Identify the constant columns first and run the eigen pass on
+    # the remaining submatrix, so those artifacts cannot produce a drop list
+    # (and cannot displace the real loaders by already-claimed names).
+    d = frame.dimension
+    s1 = np.zeros(d)
+    s2 = np.zeros(d)
+    within_ss = np.zeros(d)
+    n_rows = 0
+    for x in frame.x:
+        xi = np.asarray(x, dtype=float)
+        if xi.ndim != 2 or xi.shape[0] < 2:
+            continue
+        s1 += xi.sum(axis=0)
+        s2 += (xi * xi).sum(axis=0)
+        n_rows += xi.shape[0]
+        within_ss += ((xi - xi.mean(axis=0)) ** 2).sum(axis=0)
+    total_ss = np.clip(s2 - (s1 * s1) / max(n_rows, 1), 0.0, None)
+    share = np.divide(within_ss, total_ss,
+                      out=np.zeros(d), where=total_ss > 0)
+    # ``where=total_ss > 0`` leaves the share at 0 for a column with no variance
+    # at all, which is equally unidentified, so one test covers both.
+    constant_mask = share <= float(constant_tol)
+    constant = [names[j] for j in np.flatnonzero(constant_mask)
+                if names[j] not in protected_set]
+    for name in constant:
+        directions.append({"eigenvalue": 0.0, "loadings": {name: 1.0}})
+    drops.extend(constant)
+
+    keep = np.flatnonzero(~constant_mask)
+    keep_names = [names[j] for j in keep]
+    sub = info[np.ix_(keep, keep)]
+    diag = np.clip(np.diag(sub), 1e-300, None)
+    scale = np.sqrt(diag)
+    scaled = sub / np.outer(scale, scale)
+    evals, evecs = np.linalg.eigh(0.5 * (scaled + scaled.T))
+    condition = float(evals[-1] / max(evals[0], 1e-300)) if evals.size else float("nan")
+    weak = np.flatnonzero(evals < float(tol))
+
     for idx in weak:
         # Unscale the direction: v_j = evec_j / sqrt(info_jj).
         v = evecs[:, idx] / scale
         v = v / (np.linalg.norm(v) + 1e-300)
         order = np.argsort(-np.abs(v))
-        top = {names[j]: float(v[j]) for j in order[: min(8, len(order))]}
+        top = {keep_names[j]: float(v[j]) for j in order[: min(8, len(order))]}
         directions.append({"eigenvalue": float(evals[idx]), "loadings": top})
         # Never drop user-protected features (e.g. explicitly requested
         # behavioural interactions); fall through to the next-largest loader.
         j = next((int(k) for k in order
-                  if names[int(k)] not in protected_set), None)
+                  if keep_names[int(k)] not in protected_set), None)
         if j is None:
             continue
-        if abs(v[j]) >= float(loading_threshold) and names[j] not in drops:
-            drops.append(names[j])
+        if abs(v[j]) >= float(loading_threshold) and keep_names[j] not in drops:
+            drops.append(keep_names[j])
     if max_drop is not None and len(drops) > int(max_drop):
         drops = drops[: int(max_drop)]
     return IdentificationReport(
         condition_number=condition, eigenvalues=evals,
-        suggested_drop=tuple(drops), weak_directions=tuple(directions))
+        suggested_drop=tuple(drops), weak_directions=tuple(directions),
+        constant_features=tuple(constant))
 
 
 class GaussianRandomWalkProposal:
@@ -410,7 +468,9 @@ class PreconditionedRandomWalkProposal:
         self.log_scale = 0.0
         self.n_observed = 0
         self.rng = np.random.default_rng(seed)
-        self.acceptance_history: list[int] = []
+        # Appended once per MCMC step; the running rate is tracked separately
+        # via n_observed, so only a recent window needs retaining.
+        self.acceptance_history: deque = deque(maxlen=4096)
 
     @property
     def covariance(self) -> np.ndarray:
@@ -478,6 +538,13 @@ class BlockRandomWalkProposal:
 # ---------------------------------------------------------------------------
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.environ.get(name, "")).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 class HHTSCompetingPrior:
     """Dirichlet-smoothed HHTS shares blended with current utilities."""
 
@@ -493,6 +560,8 @@ class HHTSCompetingPrior:
         max_alpha: float = 0.95,
         min_temperature: float = 0.15,
         max_temperature: float = 8.0,
+        max_history: int | None = None,
+        record_history: bool = True,
     ) -> None:
         raw = shares or {}
         if raw and all(not isinstance(value, Mapping) for value in raw.values()):
@@ -506,7 +575,17 @@ class HHTSCompetingPrior:
         self.adaptation_rate = float(adaptation_rate)
         self.min_alpha, self.max_alpha = float(min_alpha), float(max_alpha)
         self.min_temperature, self.max_temperature = float(min_temperature), float(max_temperature)
-        self.history: list[dict] = []
+        # adapt_to_denominator_ess runs once per CHOICE CASE per Gibbs
+        # iteration, so an unbounded list here grew by n_cases x outer
+        # iterations (millions of dicts on the 13k-case datasets). Only the
+        # most recent entry is ever read, so keep a bounded window
+        # (SL_HHTS_MAX_HISTORY, default 4096; 0 disables recording).
+        if max_history is None:
+            max_history = _env_int("SL_HHTS_MAX_HISTORY", 4096)
+        self.max_history = max(0, int(max_history))
+        self.record_history = bool(record_history) and self.max_history > 0
+        self.history_maxlen: int = self.max_history or 1
+        self.history: deque = deque(maxlen=self.history_maxlen)
 
     @classmethod
     def from_hhts(
@@ -570,7 +649,8 @@ class HHTSCompetingPrior:
         self.alpha = float(np.clip(self.alpha + self.adaptation_rate * error, self.min_alpha, self.max_alpha))
         self.temperature = float(np.clip(self.temperature * np.exp(self.adaptation_rate * error),
                                          self.min_temperature, self.max_temperature))
-        self.history.append({"denominator_ess": ess, "alpha": self.alpha, "temperature": self.temperature})
+        if self.record_history:
+            self.history.append({"denominator_ess": ess, "alpha": self.alpha, "temperature": self.temperature})
         return ess
 
     def sample_choice_sets(self, observations: pd.DataFrame, zone_ids: Sequence[object],
@@ -1257,17 +1337,29 @@ def _weighted_frame(frame: "ChoiceSetFrame",
         frame.feature_names, tuple(float(w) for w in np.asarray(weights).ravel()))
 
 
-def _fit_membership_gammas(case_X, resp, l2: float = 1.0, maxiter: int = 200):
+def _fit_membership_gammas(case_X, resp, l2: float = 1.0, maxiter: int = 200,
+                           standardize: bool = True):
     """Weighted multinomial-logit M-step for the class-membership equation.
 
     ``gammas`` has shape (C-1, K+1) with class 0 as the reference and an
     intercept column.  Rows are weighted by the EM responsibilities (soft
     labels), so the step maximises the expected membership log-likelihood;
     slopes carry an L2 penalty, intercepts do not.
+
+    If ``standardize=True`` (default), covariates are standardized to mean=0,
+    std=1 before fitting, and coefficients are transformed back to the original
+    scale for the returned ``gammas``.
     """
     from scipy.optimize import minimize
     N = np.asarray(case_X).shape[0]
-    Xa = np.column_stack([np.ones(N), np.asarray(case_X, dtype=float)])
+    X = np.asarray(case_X, dtype=float)
+    if standardize:
+        X_mean = X.mean(axis=0)
+        X_std = X.std(axis=0, ddof=0)
+        X_std = np.where(X_std > 1e-12, X_std, 1.0)
+        Xa = np.column_stack([np.ones(N), (X - X_mean) / X_std])
+    else:
+        Xa = np.column_stack([np.ones(N), X])
     C = np.asarray(resp).shape[1]
     Ka = Xa.shape[1]
     if C < 2:
@@ -1288,16 +1380,38 @@ def _fit_membership_gammas(case_X, resp, l2: float = 1.0, maxiter: int = 200):
 
     res = minimize(nll, g0.ravel(), method="L-BFGS-B",
                    options={"maxiter": int(maxiter)})
-    return res.x.reshape(C - 1, Ka)
+    G = res.x.reshape(C - 1, Ka)
+    # Transform back to original scale if standardized
+    if standardize:
+        # G has shape (C-1, Ka) where Ka = n_features + 1 (intercept)
+        # G[:, 0] are intercepts, G[:, 1:] are slopes on standardized features
+        G_out = G.copy()
+        G_out[:, 1:] = G[:, 1:] / X_std
+        # Intercept adjustment: intercept = intercept - sum(mean_k * slope_k / std_k)
+        # For each class (row), compute dot product of (mean/std) with slopes
+        G_out[:, 0] = G[:, 0] - np.sum((X_mean / X_std) * G[:, 1:], axis=1)
+        return G_out
+    return G
 
 
 def _fit_frame_mnl(frame: "ChoiceSetFrame", x0, *, prior_scale: float = 5.0,
-                   bounds: float = 15.0, maxiter: int = 500, tol: float = 1e-9):
+                   bounds: float = 15.0, maxiter: int = 500, tol: float = 1e-9,
+                   grad_tol: float = 1e-6, retries: int = 2):
     """Weighted MNL fit on a (copied) frame: L-BFGS-B on the analytic gradient.
 
     Mirrors larch's ``minimize(logloss, jac=d_logloss, bounds=pbounds)`` with
     a weak N(0, prior_scale^2) ridge so unidentified directions are bounded.
     The Manski-Lerman offset travels inside the frame, so it is exact here.
+
+    ``ftol`` alone is a relative decrease test, so L-BFGS-B can stop with a
+    large gradient and still report success -- and can stop short of the
+    optimum when it runs out of iterations. The fit is therefore re-started
+    from its own solution while the gradient is too large, keeping the better
+    objective value, and the returned result carries the evidence
+    (``grad_inf``, ``grad_tol``, ``fit_message``) alongside ``success``, which
+    is true when either scipy succeeded or the gradient shows a stationary
+    point. The threshold is per observation, since the likelihood scales with
+    the sample.
     """
     from scipy.optimize import minimize
     d = frame.dimension
@@ -1309,10 +1423,49 @@ def _fit_frame_mnl(frame: "ChoiceSetFrame", x0, *, prior_scale: float = 5.0,
         g = grad - prior_prec * np.asarray(beta, dtype=float)
         return -total, -g
 
-    res = minimize(nll, np.asarray(x0, dtype=float), jac=True,
-                   method="L-BFGS-B",
-                   bounds=[(-float(bounds), float(bounds))] * d,
-                   options={"maxiter": int(maxiter), "ftol": float(tol)})
+    try:
+        g_tol = float(grad_tol) * max(int(frame.n_cases), 1)
+    except Exception:
+        g_tol = float(grad_tol)
+
+    def _run(start, n_iter):
+        # ftol is a relative-decrease test on an objective of order 1e3, so on
+        # its own it stops while the gradient is still ~1e-2. Stop on the
+        # gradient; ftol is only kept as a floating-point floor.
+        return minimize(nll, np.asarray(start, dtype=float), jac=True,
+                        method="L-BFGS-B",
+                        bounds=[(-float(bounds), float(bounds))] * d,
+                        options={"maxiter": int(n_iter),
+                                 "ftol": min(float(tol), 1e-15),
+                                 "gtol": g_tol})
+
+    res = _run(x0, maxiter)
+    left = int(retries)
+    while left > 0:
+        g = np.asarray(nll(np.asarray(res.x, dtype=float))[1], dtype=float)
+        g_inf = float(np.max(np.abs(g))) if g.size else float("nan")
+        if not np.isfinite(g_inf) or g_inf <= g_tol:
+            break
+        left -= 1
+        try:
+            retry = _run(res.x, max(2 * int(maxiter), int(maxiter)))
+        except Exception:
+            break
+        if not np.isfinite(float(getattr(retry, "fun", np.inf))) \
+                or float(retry.fun) > float(res.fun) - 1e-9:
+            break                     # no progress: keep what we had
+        res = retry
+
+    try:
+        g = np.asarray(nll(np.asarray(res.x, dtype=float))[1], dtype=float)
+        g_inf = float(np.max(np.abs(g))) if g.size else float("nan")
+    except Exception:
+        g_inf = float("nan")
+    res.grad_inf = g_inf
+    res.grad_tol = g_tol
+    res.fit_message = str(getattr(res, "message", "") or "")
+    res.converged_evidence = bool(np.isfinite(g_inf) and g_inf <= g_tol)
+    res.success = bool(getattr(res, "success", False) or res.converged_evidence)
     return np.asarray(res.x, dtype=float), float(-res.fun), res
 
 
@@ -1455,7 +1608,8 @@ def estimate_dest_choice_lc(
         fit_ll = float(sum(_weighted_frame(frame, (labels == g).astype(float))
                            .loglike(b) for g, b in zip(groups, betas)))
         return _lc_result("grouped", names, betas, ses, shares, fit_ll,
-                          float("nan"), True, 0, frame, labels=groups)
+                          float("nan"), True, 0, frame, labels=groups,
+                          bounds=float(bounds), share_floor=float(share_floor))
 
     # ── Latent classes: EM with weighted-MNL M-steps ──────────────────────
     # Class priors are either fixed shares or a person-type membership
@@ -1494,6 +1648,14 @@ def estimate_dest_choice_lc(
         shares = np.full(n_classes, 1.0 / n_classes)
         gammas = (np.zeros((n_classes - 1, case_X.shape[1] + 1))
                   if case_X is not None else None)
+        if _start and case_X is not None:
+            # The header promises a jitter of "BOTH the class-specific betas AND
+            # the membership gammas". Only the betas were ever jittered: every
+            # restart began from a ZERO membership equation, i.e. uniform class
+            # priors, so restarts differed solely in the choice coefficients and
+            # the membership surface was effectively estimated once. Perturb it
+            # too so a 3-class fit can leave the symmetric starting point.
+            gammas = rng.normal(0.0, float(perturb_sigma), gammas.shape)
         prev_ll = -np.inf
         converged = False
         iterations = 0
@@ -1517,20 +1679,38 @@ def estimate_dest_choice_lc(
                 p = np.clip(p, float(share_floor) / n_classes, None)
                 p /= p.sum(axis=1, keepdims=True)
             new_shares = p.mean(axis=0)
-            # M-step: weighted MNL per class + membership gammas
-            betas = [_fit_frame_mnl(_weighted_frame(frame, p[:, c]), betas[c],
-                                    prior_scale=prior_scale, bounds=bounds)[0]
-                     for c in range(n_classes)]
+            # M-step: weighted MNL per class + membership gammas.
+            # Keep each fit's first-order optimality: the optimizer flag only
+            # says the M-step stopped, the gradient says it stopped at an
+            # optimum, and without it the reported class solution carries no
+            # evidence about the M-steps at all.
+            # NB: warm start from the previous iteration's betas, so build the
+            # new vectors in a separate list rather than clearing `betas` first.
+            _prev = betas
+            betas = []
+            mstep_grad = []
+            for c in range(n_classes):
+                _b, _, _r = _fit_frame_mnl(_weighted_frame(frame, p[:, c]),
+                                           _prev[c], prior_scale=prior_scale,
+                                           bounds=bounds)
+                betas.append(_b)
+                mstep_grad.append(float(getattr(_r, "grad_inf", float("nan"))))
             if case_X is not None:
-                gammas = _fit_membership_gammas(case_X, p, l2=membership_l2)
+                gammas = _fit_membership_gammas(case_X, p, l2=membership_l2, standardize=True)
             shares = new_shares
             if share_floor and float(share_floor) > 0:
                 _coll = int(np.argmin(shares))
                 if float(shares[_coll]) < 0.5 * float(share_floor):
-                    # Re-seed the collapsed class from the pooled fit with a
-                    # fresh jitter + crash anchor (a perturbation move, not a
-                    # failure) so the next E-step can differentiate it.
-                    _b = beta0 + rng.normal(0.0, float(perturb_sigma), d)
+                    # Re-seed the collapsed class so the next E-step can
+                    # differentiate it. This used to overwrite the class with
+                    # `beta0 + jitter`, where beta0 is the POOLED fit -- so a
+                    # class that was genuinely small got reset to the common
+                    # pooled surface on EVERY iteration it stayed small, could
+                    # never differentiate itself, and EM stalled. Perturb the
+                    # class's own current estimate instead: that is the
+                    # "perturbation move, not a failure" the comment claims, and
+                    # it preserves whatever separation the M-step had built.
+                    _b = betas[_coll] + rng.normal(0.0, float(perturb_sigma), d)
                     if crash_cols:
                         _b[names.index(crash_cols[0])] += crash_anchors[
                             _coll % len(crash_anchors)]
@@ -1548,19 +1728,32 @@ def estimate_dest_choice_lc(
         p = np.exp(llw - m)
         p /= p.sum(axis=1, keepdims=True)
         restart_lls.append(fit_ll)
-        if best is None or fit_ll > best[0]:
+        # Rank restarts by (converged, fit_ll), NOT by fit_ll alone. Picking
+        # purely on log-likelihood let a restart that wandered without settling
+        # beat one that had genuinely converged; the caller then rejected the
+        # whole genome ("not converged"), discarding the only usable restart.
+        # That is the mechanism behind the paper-arm runs reporting arm D as
+        # NOT converged at full sample while the n=200 smoke did converge.
+        _rank = (bool(converged), fit_ll)
+        if best is None or _rank > (bool(best[4]), best[0]):
             best = (fit_ll, betas, shares, p, converged, iterations,
-                    None if gammas is None else np.asarray(gammas).copy())
-    fit_ll, betas, shares, resp, converged, iterations, gammas = best
+                    None if gammas is None else np.asarray(gammas).copy(),
+                    mstep_grad)
+    fit_ll, betas, shares, resp, converged, iterations, gammas, mstep_grad = best
     if case_X is None:
         # label switching only reorders the fixed-share solution; with a
         # membership equation the reference class structure must be kept.
         order = np.argsort(-np.asarray(shares))
         betas = [betas[i] for i in order]
-        shares = np.asarray(shares)[order]
-        resp = resp[:, order]
-    else:
-        shares = np.asarray(shares)
+        resp = np.asarray(resp)[:, order]
+        mstep_grad = [mstep_grad[i] for i in order]
+    # Derive the reported shares from the SAME responsibilities that ship with
+    # the result. `shares` carried out of the EM loop was the mean of the
+    # share_floor-CLIPPED responsibilities, while the returned `resp` is the
+    # unclipped posterior, so resp.mean(axis=0) did not reproduce shares -- and
+    # stage5_lc_genes' collapse gate reads `shares` while a consumer reading
+    # `responsibilities` would compute something different.
+    shares = np.asarray(resp).mean(axis=0)
     ses = []
     for c in range(n_classes):
         fw = _weighted_frame(frame, resp[:, c])
@@ -1570,13 +1763,17 @@ def estimate_dest_choice_lc(
     return _lc_result("lc-em", names, betas, ses, shares, fit_ll, float("nan"),
                       converged, iterations, frame, responsibilities=resp,
                       membership_coefs=gammas, membership_vars=memb_cols,
-                      crash_cols=crash_cols, restart_lls=restart_lls)
+                      crash_cols=crash_cols, restart_lls=restart_lls,
+                      bounds=float(bounds), share_floor=float(share_floor),
+                      mstep_grad_inf=mstep_grad,
+                      mstep_grad_tol=1e-6 * frame.n_cases)
 
 
 def _lc_result(method, names, betas, ses, shares, fit_ll, _unused, converged,
                iterations, frame, labels=None, responsibilities=None,
                membership_coefs=None, membership_vars=None, crash_cols=None,
-               restart_lls=None) -> dict:
+               restart_lls=None, bounds=15.0, share_floor=0.05,
+               mstep_grad_inf=None, mstep_grad_tol=None) -> dict:
     n_classes = len(betas)
     k_params = n_classes * frame.dimension + (n_classes - 1)
     if membership_vars:
@@ -1598,6 +1795,29 @@ def _lc_result(method, names, betas, ses, shares, fit_ll, _unused, converged,
         "converged": bool(converged),
         "iterations": int(iterations),
     }
+    if mstep_grad_inf is not None:
+        _mg = [float(v) for v in mstep_grad_inf]
+        _mt = None if mstep_grad_tol is None else float(mstep_grad_tol)
+        out["mstep_grad_inf"] = _mg
+        out["mstep_grad_tol"] = _mt
+        out["mstep_stationary"] = [bool(_mt is not None and np.isfinite(v)
+                                       and v <= _mt) for v in _mg]
+    try:
+        from .lc_rail_guard import lc_result_rail as _lc_rail
+    except Exception:
+        _lc_rail = None
+    if _lc_rail is not None:
+        _rf = _lc_rail(names, betas, ses, shares,
+                       membership_coefs=membership_coefs,
+                       bounds=float(bounds),
+                       share_floor=float(share_floor),
+                       method=method)
+        out["rail"] = list(_rf["rail"])
+        out["railed"] = bool(_rf["railed"])
+        out["rail_warnings"] = list(_rf["warnings"])
+        if _rf["railed"]:
+            out["converged_by_optimizer"] = bool(out["converged"])
+            out["converged"] = False
     if labels is not None:
         out["group_labels"] = list(labels)
     if responsibilities is not None:

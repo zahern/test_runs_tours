@@ -1,66 +1,60 @@
 #!/bin/bash -l
-# Export a completed tours-pipeline run to a MATSim scenario
-# (plans.xml + facilities.xml + config.xml) under <RUN_DIR>/matsim.
-#
-# The staged ga_staged prediction job already auto-exports MATSim via the
-# finalisation path (PIPELINE_MATSIM=1). This job is the standalone, re-runnable
-# equivalent: point it at any finished run directory.
-#
-# Usage:
-#   qsub -v "RUN_ROOT=runs/ga_parallel,RUN_TAG=exp1,CONDA_ENV=zigenv" job_matsim_export.pbs
-#   qsub -v "RUN_DIR=runs/agds_metacount_mv_staged__12345,CONDA_ENV=zigenv" job_matsim_export.pbs
-#   qsub -v "RUN_DIR_MARKER=runs/ga_parallel/exp1/prediction_run_dir.txt,CONDA_ENV=zigenv" job_matsim_export.pbs
-
+#PBS -N matsim_export
+#PBS -P FPAXJW8067
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ncpus=4:mem=32GB
+#PBS -j oe
 #PBS -m n
-#PBS -r y
-#PBS -l select=1:ncpus=1:mem=16GB
-#PBS -l walltime=00:30:00
 
-set -euo pipefail
+# ============================================================
+# job_matsim_export.pbs
+# Export the current synthetic population's activity plans to a
+# MATSim scenario (plans.xml, facilities.xml, config.xml, manifest).
+#
+#   qsub -v "RUN_TAG=qld_shard2" job_matsim_export.pbs
+#   qsub -v "EXPORT_SRC=runs/full_pipeline_dta_tested" job_matsim_export.pbs
+#
+# Source resolution order when EXPORT_SRC is unset:
+#   runs/ga_parallel/<TAG>_predict  ->  runs/<TAG>_predict
+#   ->  runs/ga_parallel/<TAG>  ->  runs/full_pipeline_dta_tested
+# ============================================================
+cd $PBS_O_WORKDIR
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
 
-RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
 RUN_TAG=${RUN_TAG:-}
-RUN_DIR=${RUN_DIR:-}
-RUN_DIR_MARKER=${RUN_DIR_MARKER:-}
-MATSIM_CRS=${MATSIM_CRS:-EPSG:28356}
-CONDA_ENV=${CONDA_ENV:-zigenv}
+EXPORT_SRC=${EXPORT_SRC:-}
+PIPELINE_RUN_ROOT=${PIPELINE_RUN_ROOT:-runs}
 
-cd "$PBS_O_WORKDIR"
+_has_plans () {
+    [ -f "$1/trips_for_aimsun.csv" ] || [ -f "$1/stage6_output.csv" ]
+}
 
-source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
-conda activate "$CONDA_ENV"
-
-export PYTHONUTF8=1
-export PYTHONIOENCODING=utf-8
-
-# Resolve the run directory:
-# 1. Explicit RUN_DIR wins
-# 2. RUN_DIR_MARKER file (written by prediction job) wins
-# 3. RUN_ROOT + RUN_TAG fallback
-if [ -n "${RUN_DIR_MARKER}" ] && [ -f "${RUN_DIR_MARKER}" ]; then
-  RUN_DIR=$(cat "${RUN_DIR_MARKER}" | tr -d '\n\r')
-  echo "Resolved RUN_DIR from marker: ${RUN_DIR}"
-elif [ -z "${RUN_DIR}" ]; then
-  if [ -z "${RUN_TAG}" ]; then
-    echo "ERROR: set RUN_DIR, RUN_DIR_MARKER, or RUN_ROOT + RUN_TAG" >&2
-    exit 2
-  fi
-  RUN_DIR="${RUN_ROOT}/${RUN_TAG}"
+if [ -z "$EXPORT_SRC" ] && [ -n "$RUN_TAG" ]; then
+    for cand in \
+        "${PIPELINE_RUN_ROOT}/ga_parallel/${RUN_TAG}_predict" \
+        "${PIPELINE_RUN_ROOT}/${RUN_TAG}_predict" \
+        "${PIPELINE_RUN_ROOT}/ga_parallel/${RUN_TAG}" \
+        "${PIPELINE_RUN_ROOT}/${RUN_TAG}"; do
+        if _has_plans "$cand"; then EXPORT_SRC="$cand"; break; fi
+    done
+fi
+if [ -z "$EXPORT_SRC" ]; then
+    EXPORT_SRC="${PIPELINE_RUN_ROOT}/full_pipeline_dta_tested"
 fi
 
-if [ ! -d "${RUN_DIR}" ]; then
-  echo "ERROR: run dir ${RUN_DIR} does not exist" >&2
-  exit 2
+echo "[$(date)] MATSim export source: $EXPORT_SRC"
+if ! _has_plans "$EXPORT_SRC"; then
+    echo "FATAL: no trips_for_aimsun.csv / stage6_output.csv under $EXPORT_SRC"
+    exit 3
 fi
 
-# Guard: only run if a final plan CSV exists somewhere under RUN_DIR
-# (matsim_export walks recursively for stage6_output.csv / trips_for_aimsun.csv).
-if ! find "${RUN_DIR}" -maxdepth 4 \( -name stage6_output.csv -o -name trips_for_aimsun.csv \) 2>/dev/null | grep -q .; then
-  echo "No stage6_output.csv / trips_for_aimsun.csv under ${RUN_DIR} — nothing to export."
-  exit 0
-fi
-
-echo "MATSim export: RUN_DIR=${RUN_DIR}  CRS=${MATSIM_CRS}"
-python -u -X utf8 matsim_export.py --run-dir "${RUN_DIR}" --crs "${MATSIM_CRS}"
-
-echo "MATSim export complete: ${RUN_DIR}/matsim"
+mkdir -p "$EXPORT_SRC/matsim"
+python -u matsim_export.py \
+    --run-dir "$EXPORT_SRC" \
+    --out "$EXPORT_SRC/matsim" \
+    --crs EPSG:28356
+echo "[$(date)] matsim_export exit=$?"
+ls -la "$EXPORT_SRC/matsim"

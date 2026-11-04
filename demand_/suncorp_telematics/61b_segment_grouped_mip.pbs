@@ -6,6 +6,12 @@
 #PBS -m abe
 #PBS -r y
 
+# Refuse to run outside PBS: keep all compute off the login/head node.
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+
 set -euo pipefail
 
 # Variant of 61_segment_time_mip.pbs for the segment-grouped test:
@@ -34,8 +40,16 @@ export JAX_PLATFORMS=cpu
 cd "$SCRIPT_DIR"
 mkdir -p "$RESULTS_DIR" "$FIG_DIR"
 
-python -m pip install --upgrade metacountregressor
-python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,165), v"
+# pip upgrade is flock-guarded (same shared-env race note as 61): the lock
+# serialises concurrent installs, and the check asserts dist == module so a
+# torn env fails loudly. Requires >=1.0.165 (temporal_models for stage 2b).
+(
+  flock -w 900 9 || { echo "FATAL: pip lock timeout"; exit 1; }
+  python -m pip install --upgrade --no-deps --retries 2 --timeout 20 metacountregressor \
+    || python -m pip install --upgrade --no-deps --no-index --find-links /home/ahernz/suncorp_wheels metacountregressor \
+    || echo "WARN: metacountregressor upgrade unavailable offline; version assert below still applies"
+) 9>"$PROJ_DIR/.pip-upgrade.lock"
+python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,165), v; assert v==getattr(m,'__version__','?'), 'torn install: dist '+v+' != module '+str(getattr(m,'__version__','?'))"
 
 echo "=================================================================="
 echo "Job $PBS_JOBID started on $(hostname) at $(date)"
@@ -49,12 +63,16 @@ echo "=================================================================="
 [ -s "$DATA_DIR/osm_roads_suncorp.geojson" ] \
   || { echo "FATAL: missing osm_roads_suncorp.geojson"; exit 1; }
 
+# --search-iters 120 continues the 40/40 checkpoint for 80 more iterations
+# (resume skips the completed search); --prune-p 0.05 refits with
+# significance-based backward elimination before the two-stage surface.
 SEARCH_ARGS=(
-  --search-iters 40 --search-chunk 20 --chunk-time 7200
+  --search-iters 120 --search-chunk 20 --chunk-time 7200
   --wall-budget 20000 --n-starts 1
   --search-R 25 --refit-R 100 --search-vars slim
   --target trips_mean_gt_10 --group-by segment
   --two-stage on --temporal-refit ar1
+  --prune-p 0.05
   --out-dir "$RESULTS_DIR" --fig-dir "$FIG_DIR"
 )
 # BAYES=on ships the approximate-Bayes posterior mean (Laplace) and records
@@ -124,7 +142,9 @@ python -u 60_game_day_mip.py \
   --out-dir "$RESULTS_DIR" --fig-dir "$FIG_DIR" \
   --min-marg 0.5 --max-segments 250 \
   --travel-speed-kmh 43.2 --detour-factor 1.3 \
-  --setup-min 5 --max-travel-m 4000 --obs-m 100 2>&1
+  --setup-min 5 --max-travel-m 8000 --obs-m 100 \
+  --max-relocations 2 --min-move-gap-bins 0 \
+  --phase-target-frac 0.05 --mobility-ab on 2>&1
 
 for f in game_day_mip_sites.csv game_day_mip_plans.csv \
          game_day_mip_schedule.csv game_day_mip_summary.json \

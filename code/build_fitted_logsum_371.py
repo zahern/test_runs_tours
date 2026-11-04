@@ -18,9 +18,20 @@ Models source (--models): a pickle holding EITHER a {segment: {'mode_model':
 pickle, which is scanned recursively for such a mapping. Fails loudly when no
 usable mode models are found (run a stage-5 estimation first).
 
+Every fitted model (purpose/segment) is guarded to resolve to the full
+371-zone system: the build RAISES if the landuse, the output row count, or any
+*_acc column is not exactly 371 zones (override with EXPECTED_ZONES_371).
+Flat surfaces warn by default; set STRICT_LOGSUM_371=1 to make them fatal.
+
 Run (needs fitted stage-5 models + skims; login node OK, a few minutes):
-  python build_fitted_logsum_371.py --models runs/ga_parallel/<tag>/merged/ga_results.pkl
-Env: MODELS_371, LANDUSE_371, SKIMS_371, LOGSUM_OUT
+  python build_fitted_logsum_371.py --models saved_data/stage5_models.pkl
+
+--models must point at a pickle that CONTAINS fitted model objects (the
+{segment: {'mode_model': ...}} mapping written by stage5 save_models, or a GA
+result whose metadata carries them). A merge_ga_shards.py `ga_results.pkl`
+holds feature names only - use promoted/stage5_models.pkl, not that file.
+Env: MODELS_371, LANDUSE_371, SKIMS_371, LOGSUM_OUT,
+     EXPECTED_ZONES_371 (default 371), STRICT_LOGSUM_371, STAGE5_PT_MODES
 Output: saved_data/logsum_acc_371.csv
 """
 import argparse
@@ -85,8 +96,9 @@ def main():
     if not args.models or not os.path.exists(args.models):
         raise SystemExit(
             "FATAL: --models pickle with fitted stage-5 models required "
-            "(e.g. runs/ga_parallel/<tag>/merged/ga_results.pkl). "
-            "Run a stage-5 estimation first.")
+            "(e.g. saved_data/stage5_models.pkl or "
+            "runs/ga_parallel/<tag>/stage5/promoted/stage5_models.pkl). "
+            "Run promote_stage5_bests.py / a stage-5 estimation first.")
 
     with open(args.models, "rb") as f:
         blob = pickle.load(f)
@@ -105,7 +117,9 @@ def main():
         lu["ORDER"] = pd.to_numeric(lu["SA2_MAIN16"], errors="coerce").astype("Int64")
     zid = pd.to_numeric(lu["ORDER"], errors="coerce").dropna().astype(int).values
 
-    from logsum_accessibility import compute_logsum_accessibility
+    from logsum_accessibility import (
+        compute_logsum_accessibility, LOGSUM_COL_PREFIX,
+    )
     acc = compute_logsum_accessibility(models, lu, args.skims)
     acc_cols = [c for c in acc.columns if str(c).endswith("_acc")]
     if not acc_cols:
@@ -115,6 +129,55 @@ def main():
     out = out.rename(columns={key: "zone_id"})
     out["zone_id"] = pd.to_numeric(out["zone_id"], errors="coerce").astype("Int64")
     out = out.dropna(subset=["zone_id"]).drop_duplicates("zone_id")
+
+    # ── 371-size guard ───────────────────────────────────────────────────
+    # EVERY model's logsum surface must resolve to the full 371-zone system
+    # (never the retired 330). A stale landuse/skim pairing used to ship a
+    # short 330-row column silently; fail loudly instead.
+    expect = int(os.environ.get("EXPECTED_ZONES_371", "371"))
+    n_landuse = int(pd.Series(zid).nunique())
+    problems = []
+    if n_landuse != expect:
+        problems.append(
+            f"landuse {args.landuse} -> {n_landuse} zones (expected {expect})")
+    if len(out) != expect:
+        problems.append(f"output {len(out)} rows (expected {expect})")
+    diag = dict(acc.attrs.get("diagnostics", {}) or {})
+    segs_used = {d.get("seg") for d in diag.values()}
+    segs_unused = sorted(str(s) for s in set(models) - segs_used
+                         if s not in segs_used)
+    log.info("zone universe: landuse=%d, output=%d (expected %d)",
+             n_landuse, len(out), expect)
+    for c in acc_cols:
+        purp = str(c)[len(LOGSUM_COL_PREFIX):-len("_acc")]
+        d = diag.get(purp, {})
+        n_ok = int(pd.to_numeric(out[c], errors="coerce").notna().sum())
+        _rng = d.get("range")
+        log.info("  %-22s seg=%-9s zones=%d/%d std=%.3g range=%s",
+                 c, str(d.get("seg", "?")), n_ok, expect,
+                 float(d.get("std", float("nan"))),
+                 f"[{_rng[0]:.1f}, {_rng[1]:.1f}]" if _rng else "n/a")
+        if n_ok != expect:
+            problems.append(f"{c}: {n_ok}/{expect} zones")
+        if (d.get("flat_frac", 0.0) > 0.5 or d.get("std", 0.0) < 1e-9) \
+                and os.environ.get("STRICT_LOGSUM_371", "0") == "1":
+            problems.append(
+                f"{c}: FLAT surface (std={d.get('std', 0.0):.3g}) — c_logsum/"
+                "Stage-1 frequency cannot identify zone-variation")
+        elif d.get("flat_frac", 0.0) > 0.5 or d.get("std", 0.0) < 1e-9:
+            log.warning("  %s is FLAT across zones (std=%.3g) — set "
+                        "STRICT_LOGSUM_371=1 to treat this as fatal", c,
+                        d.get("std", 0.0))
+    if segs_unused:
+        log.warning("fitted segments with no *_acc column produced: %s "
+                    "(no purpose mapped to them?)", segs_unused)
+    if problems:
+        for p in problems:
+            log.error("371-GUARD: %s", p)
+        raise SystemExit(
+            f"FATAL: fitted logsum did not resolve to {expect} zones for all "
+            f"models — see 371-GUARD lines above. Refusing to write {args.out}.")
+
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     out.to_csv(args.out, index=False)
     log.info("wrote %d zones x %d fitted logsum columns -> %s",

@@ -154,6 +154,38 @@ def derive_observed_dap(persons: pd.DataFrame, tours: pd.DataFrame,
     dap.name = 'dap'
     dap.attrs['purpose_col'] = purp
     dap.attrs['n_persons_with_tours'] = len(per_person)
+    # ── WFH reconciliation ──────────────────────────────────────────────
+    # A worker whose MAINACT is mandatory but who has no mandatory tour
+    # almost always worked from home that day (no commute recorded): their
+    # pattern IS Mandatory, not NonMandatory. Without this, ~2.6k such
+    # workers mismatch the ANYSTOPS/MAINACT truth (agreement 83.5%).
+    # Requires a wfh flag column; without one the tour-based mapping stands.
+    # Env CDAP_DAP_WFH=0 disables. Never raises.
+    try:
+        if os.environ.get('CDAP_DAP_WFH', '1').strip() != '0' \
+                and 'MAINACT' in persons.columns:
+            _mand_main = persons['MAINACT'].fillna('').astype(str).map(
+                _purpose_is_mandatory).fillna(False).to_numpy(dtype=bool)
+            _wfh = None
+            for _wc in ('wfh', 'WFHDAY', 'WFHWEEK'):
+                if _wc in persons.columns:
+                    _wfh = pd.to_numeric(
+                        persons[_wc], errors='coerce').fillna(0).to_numpy() > 0
+                    break
+            if _wfh is not None:
+                _dapv = dap.to_numpy().astype(object)
+                _got_m = persons[pid].map(
+                    {p: (v == 'M') for p, v in per_person.items()}
+                ).fillna(False).to_numpy(dtype=bool)
+                _fix = _mand_main & (~_got_m) & _wfh
+                if int(_fix.sum()):
+                    _dapv[_fix] = 'M'
+                    dap = pd.Series(_dapv, index=dap.index, name='dap')
+                    dap.attrs['purpose_col'] = purp
+                    dap.attrs['n_persons_with_tours'] = len(per_person)
+                    dap.attrs['n_wfh_reconciled'] = int(_fix.sum())
+    except Exception:
+        pass
     return dap
 
 

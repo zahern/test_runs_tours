@@ -29,9 +29,9 @@ export OPENBLAS_NUM_THREADS=8
 export MKL_NUM_THREADS=8
 export JAX_PLATFORMS=cpu
 
-# --- metacountregressor: always use the latest PyPI release ---
-python -m pip install --upgrade metacountregressor || { echo "FATAL: latest metacountregressor install from PyPI failed"; exit 1; }
-python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,159), v" || { echo "FATAL: metacountregressor older than 1.0.159 or import failed"; exit 1; }
+# --- metacountregressor: latest PyPI release, staged-wheel fallback offline ---
+python -m pip install --upgrade --retries 2 --timeout 20 metacountregressor || python -m pip install --upgrade --no-index --find-links /home/ahernz/suncorp_wheels metacountregressor || { echo "FATAL: metacountregressor install failed (PyPI and staged wheel)"; exit 1; }
+python -c "from importlib.metadata import version; import metacountregressor as m; v=version('metacountregressor'); print('metacountregressor distribution:',v,'module:',getattr(m,'__version__','?'),'code:',m.__file__); t=tuple(int(x) for x in v.split('.')[:3]); assert t>=(1,0,188), v" || { echo "FATAL: metacountregressor older than 1.0.188 or import failed"; exit 1; }
 
 cd "$SCRIPT_DIR"
 python -u 00_mcr_api_check.py 2>&1 || { echo "FATAL: metacountregressor API check failed (need ExperimentBuilder.build_evaluator/run/fit_manual_model + ModelConstraints)"; exit 1; }

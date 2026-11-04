@@ -1,0 +1,647 @@
+\relax 
+\providecommand \babel@aux [2]{\global \let \babel@toc \@gobbletwo }
+\@nameuse{bbl@beforestart}
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\def\@LN@column{1}
+\babel@aux{english}{}
+\@writefile{toc}{\contentsline {section}{Abstract}{1}{section*.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{Introduction}{1}{section*.2}\protected@file@percent }
+\citation{Bhat1993ActivityProgram}
+\citation{Recker1986ComplexTravel}
+\citation{Bowman2001Activity-BasedSchedules}
+\citation{BekkerGrobRyanGerard2012Review}
+\citation{Gossling2024ChildrensSpace,Swain2024ChildrensTravel,Duren2023IdentifyingComponents,Huang2025YoungApproach,Tzouras2025ExploringChoices}
+\citation{Perera2026Data}
+\citation{SwaitBenAkiva1987PLC}
+\citation{Auld2011PlanningConstrained}
+\citation{Volakakis2025IntegratingChoice,Yao2022VAE,Phan2022NewApproach}
+\citation{Golshani2018ActivityModels}
+\citation{Hess2026Significance}
+\citation{AllenbyRossi1998Heterogeneity,HessRose2009Intra}
+\citation{BliemerRoseHess2008Approx,RoseBliemerHensherCollins2008Designing}
+\citation{BekkerGrobRoseBliemer2013Closer,BekkerGrobRyanGerard2012Review}
+\citation{BekkerGrobHole2024Editorial}
+\def\@LN@column{1}
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Full modelling framework. Centre: the six-stage pipeline, estimated on HHTS diaries ($\sim $20,000 persons) and applied to the 3.82-million-person synthetic population across 371 SA2 zones --- from CDAP (Stage~0) through activity frequency, day budget, duration and timing (Stages~1--4) to joint tour mode $\times $ destination choice (Stage~5m/5d: two-level nested logit, MNL over Manski--Lerman-sampled zones, PLC-captivity and M3 schedule-set arms), detour-feasible intermediate-stop destinations (Stage~5b), predict-only validation and repair (Stage~6), and export to DynusT/MATSim-ready plans. \textbf  {Levels:} the left rail separates tour level (Stages~0--5, blue: whole-tour decisions, including the tour's single main mode and its destination) from trip level (Stages~5b--6, teal: the individual legs and intermediate stops inside each tour); the inset states the distinction. Left: data inputs. Right: the P1 crash chain (100~m segments, SPF search, Empirical Bayes, OD accumulation) yielding the \texttt  {CRASH} skim consumed by Stage~5 and the home crash-accessibility index offered to Stages~0--1. Bottom: the P2 SparseEA-AGDS search, which specifies every stage, against the P0 fixed comparison arm (published specifications, maximum likelihood, universal choice sets); shared calibration $\mathcal  {K}$ and the held-out validation block implement the (P0)-versus-(P2) error comparison. Amber dashed: safety terms entering the utilities. Grey dashed: skim feedback from the generated plans into the Stage-5 skims. Skims are $371\times 371$ OD matrices --- travel time [min], monetary cost [\$], distance [km] and \texttt  {CRASH} [expected crashes accumulated per OD path]; the home-zone crash-accessibility index is in log units per origin, and mode logsums are in log-utility units per tour--zone.}}{3}{figure.caption.3}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:pipeline}{{1}{3}{Full modelling framework. Centre: the six-stage pipeline, estimated on HHTS diaries ($\sim $20,000 persons) and applied to the 3.82-million-person synthetic population across 371 SA2 zones --- from CDAP (Stage~0) through activity frequency, day budget, duration and timing (Stages~1--4) to joint tour mode $\times $ destination choice (Stage~5m/5d: two-level nested logit, MNL over Manski--Lerman-sampled zones, PLC-captivity and M3 schedule-set arms), detour-feasible intermediate-stop destinations (Stage~5b), predict-only validation and repair (Stage~6), and export to DynusT/MATSim-ready plans. \textbf {Levels:} the left rail separates tour level (Stages~0--5, blue: whole-tour decisions, including the tour's single main mode and its destination) from trip level (Stages~5b--6, teal: the individual legs and intermediate stops inside each tour); the inset states the distinction. Left: data inputs. Right: the P1 crash chain (100~m segments, SPF search, Empirical Bayes, OD accumulation) yielding the \texttt {CRASH} skim consumed by Stage~5 and the home crash-accessibility index offered to Stages~0--1. Bottom: the P2 SparseEA-AGDS search, which specifies every stage, against the P0 fixed comparison arm (published specifications, maximum likelihood, universal choice sets); shared calibration $\mathcal {K}$ and the held-out validation block implement the (P0)-versus-(P2) error comparison. Amber dashed: safety terms entering the utilities. Grey dashed: skim feedback from the generated plans into the Stage-5 skims. Skims are $371\times 371$ OD matrices --- travel time [min], monetary cost [\$], distance [km] and \texttt {CRASH} [expected crashes accumulated per OD path]; the home-zone crash-accessibility index is in log units per origin, and mode logsums are in log-utility units per tour--zone}{figure.caption.3}{}}
+\newlabel{fig:pipeline@cref}{{[figure][1][]1}{[1][2][]3}{}{}{}}
+\citation{Bowman2001Activity-BasedSchedules,Ben-Akiva1985DiscreteDemand}
+\citation{Board2014Activity-BasedPrimer}
+\citation{Bernardin2009EnhancedCompetition}
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Activity timing profile shown separately from the modelling-flow diagram. The profile illustrates the hour-of-day distribution of activity types that motivates the Stage~4 timing model; it is not an additional pipeline stage or a replacement for the six-period timing-choice specification.}}{4}{figure.caption.4}\protected@file@percent }
+\newlabel{fig:activity-time-profile}{{2}{4}{Activity timing profile shown separately from the modelling-flow diagram. The profile illustrates the hour-of-day distribution of activity types that motivates the Stage~4 timing model; it is not an additional pipeline stage or a replacement for the six-period timing-choice specification}{figure.caption.4}{}}
+\newlabel{fig:activity-time-profile@cref}{{[figure][2][]2}{[1][2][]4}{}{}{}}
+\@writefile{toc}{\contentsline {section}{Background}{4}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{Activity-Based Travel Demand Models}{4}{subsection*.6}\protected@file@percent }
+\citation{VandenBerg2012ADuration}
+\citation{Perera2026Data}
+\citation{Walker2002GeneralizedModel}
+\citation{Kim2016ACars,Ren2022ASet}
+\citation{Board2014Activity-BasedPrimer}
+\citation{Nayak2023ANetworks}
+\citation{Gibbons2025EvaluatingModel}
+\citation{Gemma2022CaseAssignment}
+\citation{Dharmowijoyo2014Day-To-DayCountry}
+\citation{Qin2025TheReview}
+\citation{Tokat2026FromSafety}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {subsection}{Safety as a Behavioral Determinant}{5}{subsection*.7}\protected@file@percent }
+\citation{Bian2025DevelopingData}
+\citation{Mladenovic2014TheProcess,Roorda2008ValidationModel,Luan2025AnalyzingModel}
+\citation{Gossling2024ChildrensSpace,Swain2024ChildrensTravel}
+\citation{Huang2025YoungApproach}
+\citation{Alimo2026TransactionalSatisfaction}
+\citation{Fang2024APrediction,Bartin2023SafetySegments}
+\citation{Ukkusuri2012TheFrequency}
+\citation{Pulugurtha2013TrafficCharacteristics,Chen2016EffectsRisk}
+\citation{Chen2021TheOhio}
+\citation{Wang2016Macro-levelChina}
+\citation{Ahmad2023ApplicationsReview}
+\citation{Beeramole2024SearchlogitPyPI}
+\citation{Ahern2023MetacountregressorPyPI}
+\citation{Ahern2024ExtensiveModels}
+\citation{Rahnasto2024ComparingChoice,Mishra2018EstimationApplications}
+\citation{Ahern2024ExtensiveModels,Paz2015CalibrationAlgorithm}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {subsection}{Feature Selection in Activity-Based Models}{6}{subsection*.8}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {section}{Materials and Methods}{7}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{Six-stage activity--travel pipeline, validated as a complete plan}{7}{subsection*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{Safety hypothesis and the crash-frequency chain in brief}{7}{subsection*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{From records to per-zone risk.}{7}{paragraph*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{From per-zone risk to the OD skim.}{7}{paragraph*.13}\protected@file@percent }
+\citation{Ben-Akiva1985DiscreteDemand}
+\citation{HessRose2009Intra,AllenbyRossi1998Heterogeneity}
+\citation{Walker2002GeneralizedModel}
+\citation{Xu2018RandomUtility}
+\citation{Xu2018RandomUtility}
+\citation{Ahern2024ExtensiveModels,Ahern2023MetacountregressorPyPI}
+\citation{Behara2021AQueensland}
+\citation{Srinivasan2005ModelingParticipation}
+\citation{Cho2023NeedBased}
+\citation{Zong2016PredictionRegression}
+\citation{NurulHabib2009AnModel}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {paragraph}{Counts to behaviour.}{8}{paragraph*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{Stage 0 --- Coordinated daily activity pattern (CDAP)}{8}{subsection*.15}\protected@file@percent }
+\newlabel{eq:m0}{{1}{8}{Stage 0 --- Coordinated daily activity pattern (CDAP)}{equation.1}{}}
+\newlabel{eq:m0@cref}{{[equation][1][]1}{[1][8][]8}{}{}{}}
+\newlabel{eq:m0-joint}{{2}{8}{Stage 0 --- Coordinated daily activity pattern (CDAP)}{equation.2}{}}
+\newlabel{eq:m0-joint@cref}{{[equation][2][]2}{[1][8][]8}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Stage 1 --- Activity frequency}{8}{subsection*.16}\protected@file@percent }
+\newlabel{eq:m1}{{3}{8}{Stage 1 --- Activity frequency}{equation.3}{}}
+\newlabel{eq:m1@cref}{{[equation][3][]3}{[1][8][]8}{}{}{}}
+\newlabel{eq:m1ol}{{4}{8}{Stage 1 --- Activity frequency}{equation.4}{}}
+\newlabel{eq:m1ol@cref}{{[equation][4][]4}{[1][8][]8}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Stage 2 --- Day duration budget}{8}{subsection*.17}\protected@file@percent }
+\newlabel{eq:m2}{{5}{8}{Stage 2 --- Day duration budget}{equation.5}{}}
+\newlabel{eq:m2@cref}{{[equation][5][]5}{[1][8][]8}{}{}{}}
+\citation{Palma2021MDCEV}
+\citation{Calastri2017MDCNEV}
+\citation{Kim2017Duration,Dick1995CompetingDuration,VandenBerg2012ADuration}
+\citation{Khaddar2023Episode}
+\citation{Golshani2018ActivityModels}
+\citation{Swait1987RandomConstraints}
+\citation{NurulHabib2009AnModel}
+\citation{Telework2026Timing}
+\citation{Ben-Akiva1985DiscreteDemand}
+\citation{Nerella2004Sampling}
+\citation{Ben-Akiva1985DiscreteDemand}
+\citation{Nerella2004Sampling,BliemerRoseHess2008Approx,RoseBliemerHensherCollins2008Designing}
+\citation{SwaitBenAkiva1987PLC,Swait1987RandomConstraints}
+\citation{Calastri2019Mode,Haque2019ICMNL}
+\citation{Auld2011PlanningConstrained,Phan2022NewApproach}
+\citation{SwaitBenAkiva1987PLC}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {subsection}{Stage 3 --- Activity duration}{9}{subsection*.18}\protected@file@percent }
+\newlabel{eq:m3}{{6}{9}{Stage 3 --- Activity duration}{equation.6}{}}
+\newlabel{eq:m3@cref}{{[equation][6][]6}{[1][9][]9}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Stage 4 --- Schedule placement}{9}{subsection*.19}\protected@file@percent }
+\newlabel{eq:m4}{{7}{9}{Stage 4 --- Schedule placement}{equation.7}{}}
+\newlabel{eq:m4@cref}{{[equation][7][]7}{[1][9][]9}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Stage 5 --- Joint tour mode--destination and trip chains}{9}{subsection*.20}\protected@file@percent }
+\newlabel{eq:m5m}{{8}{9}{Stage 5 --- Joint tour mode--destination and trip chains}{equation.8}{}}
+\newlabel{eq:m5m@cref}{{[equation][8][]8}{[1][9][]9}{}{}{}}
+\newlabel{eq:m5m-ls}{{9}{9}{Stage 5 --- Joint tour mode--destination and trip chains}{equation.9}{}}
+\newlabel{eq:m5m-ls@cref}{{[equation][9][]9}{[1][9][]9}{}{}{}}
+\newlabel{eq:m5d}{{10}{9}{Stage 5 --- Joint tour mode--destination and trip chains}{equation.10}{}}
+\newlabel{eq:m5d@cref}{{[equation][10][]10}{[1][9][]9}{}{}{}}
+\citation{Walker2002GeneralizedModel}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {paragraph}{Latent-class arm of the Stage-5 mode model.}{10}{paragraph*.21}\protected@file@percent }
+\newlabel{eq:m5m-lc}{{11}{10}{Latent-class arm of the Stage-5 mode model}{equation.11}{}}
+\newlabel{eq:m5m-lc@cref}{{[equation][11][]11}{[1][10][]10}{}{}{}}
+\newlabel{eq:m5m-lc-mem}{{12}{10}{Latent-class arm of the Stage-5 mode model}{equation.12}{}}
+\newlabel{eq:m5m-lc-mem@cref}{{[equation][12][]12}{[1][10][]10}{}{}{}}
+\newlabel{eq:lc-prob}{{13}{10}{Latent-class arm of the Stage-5 mode model}{equation.13}{}}
+\newlabel{eq:lc-prob@cref}{{[equation][13][]13}{[1][10][]10}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Propagation of the latent-class arm through downstream choice.}{10}{paragraph*.22}\protected@file@percent }
+\newlabel{eq:m5m-ls-lc}{{14}{10}{Propagation of the latent-class arm through downstream choice}{equation.14}{}}
+\newlabel{eq:m5m-ls-lc@cref}{{[equation][14][]14}{[1][10][]10}{}{}{}}
+\newlabel{eq:m5m-lc-dest}{{15}{10}{Propagation of the latent-class arm through downstream choice}{equation.15}{}}
+\newlabel{eq:m5m-lc-dest@cref}{{[equation][15][]15}{[1][10][]10}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Hypothesis test for the arm.}{10}{paragraph*.23}\protected@file@percent }
+\citation{Nerella2004Sampling}
+\citation{BliemerRoseHess2008Approx,RoseBliemerHensherCollins2008Designing}
+\citation{Swait1987RandomConstraints}
+\citation{Mariante2018Detour}
+\citation{Auld2011PlanningConstrained}
+\citation{Gibbons2025EvaluatingModel}
+\def\@LN@column{1}
+\newlabel{eq:lc-lr}{{16}{11}{Hypothesis test for the arm}{equation.16}{}}
+\newlabel{eq:lc-lr@cref}{{[equation][16][]16}{[1][11][]11}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Estimation, identification, and variance.}{11}{paragraph*.24}\protected@file@percent }
+\newlabel{eq:mode}{{17}{11}{Estimation, identification, and variance}{equation.17}{}}
+\newlabel{eq:mode@cref}{{[equation][17][]17}{[1][11][]11}{}{}{}}
+\newlabel{eq:dest}{{18}{11}{Estimation, identification, and variance}{equation.18}{}}
+\newlabel{eq:dest@cref}{{[equation][18][]18}{[1][11][]11}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Stage 6 --- Plan validation and finalisation (predict-only)}{11}{subsection*.25}\protected@file@percent }
+\newlabel{eq:m6}{{19}{11}{Stage 6 --- Plan validation and finalisation (predict-only)}{equation.19}{}}
+\newlabel{eq:m6@cref}{{[equation][19][]19}{[1][11][]11}{}{}{}}
+\newlabel{eq:m6b}{{20}{11}{Stage 6 --- Plan validation and finalisation (predict-only)}{equation.20}{}}
+\newlabel{eq:m6b@cref}{{[equation][20][]20}{[1][11][]11}{}{}{}}
+\newlabel{eq:m6c}{{21}{11}{Stage 6 --- Plan validation and finalisation (predict-only)}{equation.21}{}}
+\newlabel{eq:m6c@cref}{{[equation][21][]21}{[1][11][]11}{}{}{}}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {subsection}{Variable inventory: behaviour, joint, and network levels}{12}{subsection*.26}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Model inputs by level: QLD search pools vs.\ MTC mapped equivalents, with program notation per level. QLD entries list the candidate variables the search selects subsets from under (P2); counts are pool sizes.}}{12}{table.caption.27}\protected@file@percent }
+\newlabel{tab:variables}{{1}{12}{Model inputs by level: QLD search pools vs.\ MTC mapped equivalents, with program notation per level. QLD entries list the candidate variables the search selects subsets from under (P2); counts are pool sizes}{table.caption.27}{}}
+\newlabel{tab:variables@cref}{{[table][1][]1}{[1][12][]12}{}{}{}}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {subsection}{Evolutionary feature selection}{13}{subsection*.28}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{Post-selection inference: what the search costs, and how we pay for it}{13}{subsection*.29}\protected@file@percent }
+\newlabel{sec:postselect}{{}{13}{Post-selection inference: what the search costs, and how we pay for it}{subsection*.29}{}}
+\newlabel{sec:postselect@cref}{{}{[1][13][]13}{}{}{}}
+\def\@LN@column{1}
+\newlabel{eq:deltaerr}{{22}{14}{Post-selection inference: what the search costs, and how we pay for it}{equation.22}{}}
+\newlabel{eq:deltaerr@cref}{{[equation][22][]22}{[1][14][]14}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{(PS-I) Sample splitting.}{14}{paragraph*.30}\protected@file@percent }
+\newlabel{eq:split}{{23}{14}{(PS-I) Sample splitting}{equation.23}{}}
+\newlabel{eq:split@cref}{{[equation][23][]23}{[1][14][]14}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{(PS-II) Post-selection (conditional) inference.}{14}{paragraph*.31}\protected@file@percent }
+\newlabel{eq:selinf}{{24}{14}{(PS-II) Post-selection (conditional) inference}{equation.24}{}}
+\newlabel{eq:selinf@cref}{{[equation][24][]24}{[1][14][]14}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{(PS-III) Search-aware parametric bootstrap.}{14}{paragraph*.32}\protected@file@percent }
+\newlabel{eq:psboot}{{25}{14}{(PS-III) Search-aware parametric bootstrap}{equation.25}{}}
+\newlabel{eq:psboot@cref}{{[equation][25][]25}{[1][14][]14}{}{}{}}
+\newlabel{eq:selfreq}{{26}{14}{(PS-III) Search-aware parametric bootstrap}{equation.26}{}}
+\newlabel{eq:selfreq@cref}{{[equation][26][]26}{[1][14][]14}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{(PS-IV) Stability under sample perturbation.}{14}{paragraph*.33}\protected@file@percent }
+\citation{Hess2026Significance}
+\citation{AllenbyRossi1998Heterogeneity,HessRose2009Intra}
+\citation{Board2014Activity-BasedPrimer}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {paragraph}{Reporting rule.}{15}{paragraph*.34}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{Mathematical programming formulation}{15}{subsection*.35}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{(P1) Crash-frequency specification search.}{15}{paragraph*.36}\protected@file@percent }
+\newlabel{eq:p1}{{27}{15}{(P1) Crash-frequency specification search}{equation.27}{}}
+\newlabel{eq:p1@cref}{{[equation][27][]27}{[1][15][]15}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{(P0) Pure-ActivitySim baseline (fit normally).}{15}{paragraph*.37}\protected@file@percent }
+\newlabel{eq:p0}{{28}{15}{(P0) Pure-ActivitySim baseline (fit normally)}{equation.28}{}}
+\newlabel{eq:p0@cref}{{[equation][28][]28}{[1][15][]15}{}{}{}}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {paragraph}{Feeding operator $\Phi $ (shared by both arms): how stages link.}{16}{paragraph*.38}\protected@file@percent }
+\newlabel{eq:feeding}{{29}{16}{Feeding operator $\Phi $ (shared by both arms): how stages link}{equation.29}{}}
+\newlabel{eq:feeding@cref}{{[equation][29][]29}{[1][16][]16}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Feeding holds for every family variant (variant-invariant interface).}{16}{paragraph*.39}\protected@file@percent }
+\newlabel{eq:feeding-invariant}{{30}{16}{Feeding holds for every family variant (variant-invariant interface)}{equation.30}{}}
+\newlabel{eq:feeding-invariant@cref}{{[equation][30][]30}{[1][16][]16}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Calibration operator $\mathcal  {K}$ (shared by both arms).}{16}{paragraph*.40}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{(P2) Framework summary: sets, inputs, decisions.}{16}{paragraph*.41}\protected@file@percent }
+\newlabel{eq:modelspace}{{31}{16}{(P2) Framework summary: sets, inputs, decisions}{equation.31}{}}
+\newlabel{eq:modelspace@cref}{{[equation][31][]31}{[1][16][]16}{}{}{}}
+\gdef \LT@i {\LT@entry 
+    {5}{89.10597pt}\LT@entry 
+    {1}{304.75394pt}}
+\def\@LN@column{1}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Notation: population, choice universe, program inputs (parameters), and decision variables of the unified program. Objective total-BIC \eqref  {eq:p2}--\eqref  {eq:p2-bic}, linkages $\Phi $ \eqref  {eq:feeding} invariant across families \eqref  {eq:feeding-invariant} (logsum S5m$\to $S5d), search constraints \eqref  {eq:c-family}--\eqref  {eq:c-refine} (incl.\ ACDC \eqref  {eq:c-aggl}--\eqref  {eq:c-comp} entering via \eqref  {eq:acdc-mip} and orthogonality \eqref  {eq:c-ortho}--\eqref  {eq:c-ortho-mode} with destination detail \eqref  {eq:ortho-dest}--\eqref  {eq:c-ortho-dest}), schedule-consistency constraints \eqref  {eq:c-anchor}--\eqref  {eq:c-detour}. Index conventions: $n$ person, $h$ household, $t$ tour, $l$ trip-leg, $p$ purpose/activity type, $m$ mode, $j,k$ zones, $i$ estimation case (tour), $q$ latent class, $s$ stage, $k$ segment, $b$ block.}}{17}{table.2}\protected@file@percent }
+\newlabel{tab:notation}{{2}{17}{Notation: population, choice universe, program inputs (parameters), and decision variables of the unified program. Objective total-BIC \eqref {eq:p2}--\eqref {eq:p2-bic}, linkages $\Phi $ \eqref {eq:feeding} invariant across families \eqref {eq:feeding-invariant} (logsum S5m$\to $S5d), search constraints \eqref {eq:c-family}--\eqref {eq:c-refine} (incl.\ ACDC \eqref {eq:c-aggl}--\eqref {eq:c-comp} entering via \eqref {eq:acdc-mip} and orthogonality \eqref {eq:c-ortho}--\eqref {eq:c-ortho-mode} with destination detail \eqref {eq:ortho-dest}--\eqref {eq:c-ortho-dest}), schedule-consistency constraints \eqref {eq:c-anchor}--\eqref {eq:c-detour}. Index conventions: $n$ person, $h$ household, $t$ tour, $l$ trip-leg, $p$ purpose/activity type, $m$ mode, $j,k$ zones, $i$ estimation case (tour), $q$ latent class, $s$ stage, $k$ segment, $b$ block}{table.2}{}}
+\newlabel{tab:notation@cref}{{[table][2][]2}{[1][17][]17}{}{}{}}
+\def\@LN@column{1}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {paragraph}{(P2) Candidate model equations per stage.}{19}{paragraph*.42}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{(P2) Full activity-based specification search (master program).}{19}{paragraph*.43}\protected@file@percent }
+\def\@LN@column{1}
+\newlabel{eq:families}{{32}{20}{(P2) Full activity-based specification search (master program)}{equation.32}{}}
+\newlabel{eq:families@cref}{{[equation][32][]32}{[1][19][]20}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{(P2) Objective: total BIC across all stages.}{20}{paragraph*.44}\protected@file@percent }
+\newlabel{eq:p2}{{33}{20}{(P2) Objective: total BIC across all stages}{equation.33}{}}
+\newlabel{eq:p2@cref}{{[equation][33][]33}{[1][20][]20}{}{}{}}
+\newlabel{eq:p2-bic}{{34}{20}{(P2) Objective: total BIC across all stages}{equation.34}{}}
+\newlabel{eq:p2-bic@cref}{{[equation][34][]34}{[1][20][]20}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{(P2) Decision variables at a glance (what the MIP chooses).}{20}{paragraph*.45}\protected@file@percent }
+\newlabel{eq:c-family}{{35}{20}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.35}{}}
+\newlabel{eq:c-family@cref}{{[equation][35][]35}{[1][20][]20}{}{}{}}
+\newlabel{eq:c-link}{{36}{20}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.36}{}}
+\newlabel{eq:c-link@cref}{{[equation][36][]36}{[1][20][]20}{}{}{}}
+\newlabel{eq:c-force}{{37}{20}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.37}{}}
+\newlabel{eq:c-force@cref}{{[equation][37][]37}{[1][20][]20}{}{}{}}
+\newlabel{eq:c-coll}{{38}{20}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.38}{}}
+\newlabel{eq:c-coll@cref}{{[equation][38][]38}{[1][20][]20}{}{}{}}
+\newlabel{eq:c-min}{{39}{20}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.39}{}}
+\newlabel{eq:c-min@cref}{{[equation][39][]39}{[1][20][]20}{}{}{}}
+\newlabel{eq:c-card}{{40}{20}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.40}{}}
+\newlabel{eq:c-card@cref}{{[equation][40][]40}{[1][20][]20}{}{}{}}
+\newlabel{eq:c-plc}{{41}{20}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.41}{}}
+\newlabel{eq:c-plc@cref}{{[equation][41][]41}{[1][20][]20}{}{}{}}
+\newlabel{eq:c-nhood}{{42}{20}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.42}{}}
+\newlabel{eq:c-nhood@cref}{{[equation][42][]42}{[1][20][]20}{}{}{}}
+\newlabel{eq:c-sig}{{43}{20}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.43}{}}
+\newlabel{eq:c-sig@cref}{{[equation][43][]43}{[1][20][]20}{}{}{}}
+\newlabel{eq:c-sign}{{44}{20}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.44}{}}
+\newlabel{eq:c-sign@cref}{{[equation][44][]44}{[1][20][]20}{}{}{}}
+\newlabel{eq:c-lc-joint}{{45}{20}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.45}{}}
+\newlabel{eq:c-lc-joint@cref}{{[equation][45][]45}{[1][20][]20}{}{}{}}
+\newlabel{eq:c-lc}{{46}{20}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.46}{}}
+\newlabel{eq:c-lc@cref}{{[equation][46][]46}{[1][20][]20}{}{}{}}
+\newlabel{eq:c-aggl}{{47}{20}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.47}{}}
+\newlabel{eq:c-aggl@cref}{{[equation][47][]47}{[1][20][]20}{}{}{}}
+\def\@LN@column{1}
+\newlabel{eq:c-comp}{{48}{21}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.48}{}}
+\newlabel{eq:c-comp@cref}{{[equation][48][]48}{[1][20][]21}{}{}{}}
+\newlabel{eq:c-ortho}{{49}{21}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.49}{}}
+\newlabel{eq:c-ortho@cref}{{[equation][49][]49}{[1][20][]21}{}{}{}}
+\newlabel{eq:c-crash}{{50}{21}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.50}{}}
+\newlabel{eq:c-crash@cref}{{[equation][50][]50}{[1][20][]21}{}{}{}}
+\newlabel{eq:c-refine}{{51}{21}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.51}{}}
+\newlabel{eq:c-refine@cref}{{[equation][51][]51}{[1][20][]21}{}{}{}}
+\newlabel{eq:c-anchor}{{52}{21}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.52}{}}
+\newlabel{eq:c-anchor@cref}{{[equation][52][]52}{[1][21][]21}{}{}{}}
+\newlabel{eq:c-modedom}{{53}{21}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.53}{}}
+\newlabel{eq:c-modedom@cref}{{[equation][53][]53}{[1][21][]21}{}{}{}}
+\newlabel{eq:c-count}{{54}{21}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.54}{}}
+\newlabel{eq:c-count@cref}{{[equation][54][]54}{[1][21][]21}{}{}{}}
+\newlabel{eq:c-time}{{55}{21}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.55}{}}
+\newlabel{eq:c-time@cref}{{[equation][55][]55}{[1][21][]21}{}{}{}}
+\newlabel{eq:c-detour}{{56}{21}{(P2) Decision variables at a glance (what the MIP chooses)}{equation.56}{}}
+\newlabel{eq:c-detour@cref}{{[equation][56][]56}{[1][21][]21}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{(P2) Schedule-consistency constraints: what ties tours to trips.}{21}{paragraph*.46}\protected@file@percent }
+\newlabel{eq:nhood}{{58}{21}{(P2) Schedule-consistency constraints: what ties tours to trips}{equation.58}{}}
+\newlabel{eq:nhood@cref}{{[equation][58][]58}{[1][21][]21}{}{}{}}
+\def\@LN@column{1}
+\newlabel{eq:sigpen}{{59}{22}{(P2) Schedule-consistency constraints: what ties tours to trips}{equation.59}{}}
+\newlabel{eq:sigpen@cref}{{[equation][59][]59}{[1][22][]22}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{(P2) destination-layer data and ACDC as MIP identities + orthogonality constraints.}{22}{paragraph*.47}\protected@file@percent }
+\newlabel{eq:acdc}{{60}{22}{(P2) destination-layer data and ACDC as MIP identities + orthogonality constraints}{equation.60}{}}
+\newlabel{eq:acdc@cref}{{[equation][60][]60}{[1][22][]22}{}{}{}}
+\newlabel{eq:acdc-mip}{{61}{22}{(P2) destination-layer data and ACDC as MIP identities + orthogonality constraints}{equation.61}{}}
+\newlabel{eq:acdc-mip@cref}{{[equation][61][]61}{[1][22][]22}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{(P2) Orthogonality as MIP equalities --- destination in full.}{22}{paragraph*.48}\protected@file@percent }
+\newlabel{eq:ortho}{{62}{22}{(P2) Orthogonality as MIP equalities --- destination in full}{equation.62}{}}
+\newlabel{eq:ortho@cref}{{[equation][62][]62}{[1][22][]22}{}{}{}}
+\newlabel{eq:ortho-dest-block}{{63}{22}{(P2) Orthogonality as MIP equalities --- destination in full}{equation.63}{}}
+\newlabel{eq:ortho-dest-block@cref}{{[subequation][0][63]63}{[1][22][]22}{}{}{}}
+\newlabel{eq:ortho-dest}{{63a}{22}{(P2) Orthogonality as MIP equalities --- destination in full}{equation.63a}{}}
+\newlabel{eq:ortho-dest@cref}{{[subequation][1][63]63a}{[1][22][]22}{}{}{}}
+\newlabel{eq:ortho-dest2}{{63b}{22}{(P2) Orthogonality as MIP equalities --- destination in full}{equation.63b}{}}
+\newlabel{eq:ortho-dest2@cref}{{[subequation][2][63]63b}{[1][22][]22}{}{}{}}
+\newlabel{eq:c-ortho-dest}{{63c}{22}{(P2) Orthogonality as MIP equalities --- destination in full}{equation.63c}{}}
+\newlabel{eq:c-ortho-dest@cref}{{[subequation][3][63]63c}{[1][22][]22}{}{}{}}
+\newlabel{eq:c-ortho-mode}{{64}{22}{(P2) Orthogonality as MIP equalities --- destination in full}{equation.64}{}}
+\newlabel{eq:c-ortho-mode@cref}{{[equation][64][]64}{[1][22][]22}{}{}{}}
+\citation{SwaitBenAkiva1987PLC}
+\citation{Auld2011PlanningConstrained}
+\citation{Volakakis2025IntegratingChoice}
+\citation{Phan2022NewApproach}
+\citation{Yao2022VAE,Yao2020DataDriven}
+\citation{Haghi2026VAEWork}
+\citation{Volakakis2025IntegratingChoice}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {paragraph}{(P2) Metropolis sampled-choice estimator (opt-in inner fit).}{23}{paragraph*.49}\protected@file@percent }
+\newlabel{eq:mh-ll}{{65}{23}{(P2) Metropolis sampled-choice estimator (opt-in inner fit)}{equation.65}{}}
+\newlabel{eq:mh-ll@cref}{{[equation][65][]65}{[1][23][]23}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Functional-form option sets $\mathcal  {F}_b$ (one-hot $\mathbf  {y}_b$) and searched/test-gated decisions per stage in (P2). (P0) fixes the ActivitySim column-equivalent specification with the default family and none of the searched decisions.}}{23}{table.caption.50}\protected@file@percent }
+\newlabel{tab:decisions}{{3}{23}{Functional-form option sets $\mathcal {F}_b$ (one-hot $\mathbf {y}_b$) and searched/test-gated decisions per stage in (P2). (P0) fixes the ActivitySim column-equivalent specification with the default family and none of the searched decisions}{table.caption.50}{}}
+\newlabel{tab:decisions@cref}{{[table][3][]3}{[1][23][]23}{}{}{}}
+\def\@LN@column{1}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Variable treatment by model type. The model-family choice changes the likelihood or choice kernel; it does not silently change the observed design matrix. Variables listed as ``random eligible'' are the only variables that may receive random coefficients by default; binary indicators, constants, thresholds, and structural controls remain fixed.}}{24}{table.caption.51}\protected@file@percent }
+\newlabel{tab:model-variables}{{4}{24}{Variable treatment by model type. The model-family choice changes the likelihood or choice kernel; it does not silently change the observed design matrix. Variables listed as ``random eligible'' are the only variables that may receive random coefficients by default; binary indicators, constants, thresholds, and structural controls remain fixed}{table.caption.51}{}}
+\newlabel{tab:model-variables@cref}{{[table][4][]4}{[1][23][]24}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Crash-frequency workflow and safety experiments}{24}{subsection*.52}\protected@file@percent }
+\newlabel{sec:crash-workflow}{{}{24}{Crash-frequency workflow and safety experiments}{subsection*.52}{}}
+\newlabel{sec:crash-workflow@cref}{{}{[1][24][]24}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Step 1: network stratification.}{24}{paragraph*.53}\protected@file@percent }
+\citation{AASHTO2010HighwayManual}
+\citation{hartley2003multiple}
+\citation{dijkstra_algorithm}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {paragraph}{Step 2: specification search.}{25}{paragraph*.54}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Search setup configuration and selected hyperparameters for the crash-frequency simulated-annealing (SA) search.}}{25}{table.caption.55}\protected@file@percent }
+\newlabel{tab:sa_config}{{5}{25}{Search setup configuration and selected hyperparameters for the crash-frequency simulated-annealing (SA) search}{table.caption.55}{}}
+\newlabel{tab:sa_config@cref}{{[table][5][]5}{[1][25][]25}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces Number of specifications evaluated per stereotype--type pair (Setup~2 reruns in brackets where Setup~1 did not converge).}}{25}{table.caption.56}\protected@file@percent }
+\newlabel{tab:sa_counts}{{6}{25}{Number of specifications evaluated per stereotype--type pair (Setup~2 reruns in brackets where Setup~1 did not converge)}{table.caption.56}{}}
+\newlabel{tab:sa_counts@cref}{{[table][6][]6}{[1][25][]25}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Step 3: prediction.}{25}{paragraph*.57}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Step 4: Empirical Bayes blending.}{25}{paragraph*.58}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Step 5: network transfer and OD accumulation.}{25}{paragraph*.60}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{(C0) Crash-frequency program and absorption into the destination matrix.}{25}{paragraph*.61}\protected@file@percent }
+\newlabel{eq:c0}{{66}{25}{(C0) Crash-frequency program and absorption into the destination matrix}{equation.66}{}}
+\newlabel{eq:c0@cref}{{[equation][66][]66}{[1][25][]25}{}{}{}}
+\newlabel{eq:crash-hier}{{67}{25}{(C0) Crash-frequency program and absorption into the destination matrix}{equation.67}{}}
+\newlabel{eq:crash-hier@cref}{{[subequation][0][67]67}{[1][25][]25}{}{}{}}
+\newlabel{eq:ch-mean}{{67a}{25}{(C0) Crash-frequency program and absorption into the destination matrix}{equation.67a}{}}
+\newlabel{eq:ch-mean@cref}{{[subequation][1][67]67a}{[1][25][]25}{}{}{}}
+\newlabel{eq:ch-het}{{67b}{25}{(C0) Crash-frequency program and absorption into the destination matrix}{equation.67b}{}}
+\newlabel{eq:ch-het@cref}{{[subequation][2][67]67b}{[1][25][]25}{}{}{}}
+\newlabel{eq:ch-group}{{67c}{25}{(C0) Crash-frequency program and absorption into the destination matrix}{equation.67c}{}}
+\newlabel{eq:ch-group@cref}{{[subequation][3][67]67c}{[1][25][]25}{}{}{}}
+\def\@LN@column{1}
+\@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces Overdispersion, predicted (GCF), expected (EB), and observed crash frequencies by stereotype and type (training period 2014--2018).}}{26}{table.caption.59}\protected@file@percent }
+\newlabel{tab:gcf_results}{{7}{26}{Overdispersion, predicted (GCF), expected (EB), and observed crash frequencies by stereotype and type (training period 2014--2018)}{table.caption.59}{}}
+\newlabel{tab:gcf_results@cref}{{[table][7][]7}{[1][25][]26}{}{}{}}
+\newlabel{eq:eb}{{68}{26}{(C0) Crash-frequency program and absorption into the destination matrix}{equation.68}{}}
+\newlabel{eq:eb@cref}{{[equation][68][]68}{[1][26][]26}{}{}{}}
+\newlabel{eq:crash-od}{{69}{26}{(C0) Crash-frequency program and absorption into the destination matrix}{equation.69}{}}
+\newlabel{eq:crash-od@cref}{{[equation][69][]69}{[1][26][]26}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{(D0) Count-to-skim program: from predicted counts to OD matrices to links.}{26}{paragraph*.62}\protected@file@percent }
+\newlabel{eq:od-demand}{{70}{26}{(D0) Count-to-skim program: from predicted counts to OD matrices to links}{equation.70}{}}
+\newlabel{eq:od-demand@cref}{{[equation][70][]70}{[1][26][]26}{}{}{}}
+\newlabel{eq:assign}{{71}{26}{(D0) Count-to-skim program: from predicted counts to OD matrices to links}{equation.71}{}}
+\newlabel{eq:assign@cref}{{[equation][71][]71}{[1][26][]26}{}{}{}}
+\citation{Hansen1959HowManyTrips}
+\def\@LN@column{1}
+\newlabel{eq:skim}{{72}{27}{(D0) Count-to-skim program: from predicted counts to OD matrices to links}{equation.72}{}}
+\newlabel{eq:skim@cref}{{[equation][72][]72}{[1][26][]27}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{(D1) System-dynamics extension: accessibility as a dynamic state.}{27}{paragraph*.63}\protected@file@percent }
+\newlabel{eq:sd-flow}{{73}{27}{(D1) System-dynamics extension: accessibility as a dynamic state}{equation.73}{}}
+\newlabel{eq:sd-flow@cref}{{[subequation][0][73]73}{[1][27][]27}{}{}{}}
+\newlabel{eq:sd-stock}{{73a}{27}{(D1) System-dynamics extension: accessibility as a dynamic state}{equation.73a}{}}
+\newlabel{eq:sd-stock@cref}{{[subequation][1][73]73a}{[1][27][]27}{}{}{}}
+\newlabel{eq:sd-aux}{{73b}{27}{(D1) System-dynamics extension: accessibility as a dynamic state}{equation.73b}{}}
+\newlabel{eq:sd-aux@cref}{{[subequation][2][73]73b}{[1][27][]27}{}{}{}}
+\newlabel{eq:sd-theta}{{73c}{27}{(D1) System-dynamics extension: accessibility as a dynamic state}{equation.73c}{}}
+\newlabel{eq:sd-theta@cref}{{[subequation][3][73]73c}{[1][27][]27}{}{}{}}
+\newlabel{eq:acc}{{74}{27}{(D1) System-dynamics extension: accessibility as a dynamic state}{equation.74}{}}
+\newlabel{eq:acc@cref}{{[subequation][0][74]74}{[1][27][]27}{}{}{}}
+\newlabel{eq:acc-set}{{74a}{27}{(D1) System-dynamics extension: accessibility as a dynamic state}{equation.74a}{}}
+\newlabel{eq:acc-set@cref}{{[subequation][1][74]74a}{[1][27][]27}{}{}{}}
+\newlabel{eq:acc-logsum}{{74b}{27}{(D1) System-dynamics extension: accessibility as a dynamic state}{equation.74b}{}}
+\newlabel{eq:acc-logsum@cref}{{[subequation][2][74]74b}{[1][27][]27}{}{}{}}
+\newlabel{eq:acc-util}{{74c}{27}{(D1) System-dynamics extension: accessibility as a dynamic state}{equation.74c}{}}
+\newlabel{eq:acc-util@cref}{{[subequation][3][74]74c}{[1][27][]27}{}{}{}}
+\newlabel{eq:sd-fp}{{75}{27}{(D1) System-dynamics extension: accessibility as a dynamic state}{equation.75}{}}
+\newlabel{eq:sd-fp@cref}{{[subequation][0][75]75}{[1][27][]27}{}{}{}}
+\newlabel{eq:sd-damp}{{75a}{27}{(D1) System-dynamics extension: accessibility as a dynamic state}{equation.75a}{}}
+\newlabel{eq:sd-damp@cref}{{[subequation][1][75]75a}{[1][27][]27}{}{}{}}
+\newlabel{eq:sd-conv}{{75b}{27}{(D1) System-dynamics extension: accessibility as a dynamic state}{equation.75b}{}}
+\newlabel{eq:sd-conv@cref}{{[subequation][2][75]75b}{[1][27][]27}{}{}{}}
+\newlabel{eq:sd-cons}{{75c}{27}{(D1) System-dynamics extension: accessibility as a dynamic state}{equation.75c}{}}
+\newlabel{eq:sd-cons@cref}{{[subequation][3][75]75c}{[1][27][]27}{}{}{}}
+\citation{ABS2021_ASGS}
+\def\@LN@column{1}
+\@writefile{lot}{\contentsline {table}{\numberline {8}{\ignorespaces Sample OD route lengths and expected crashes for selected SA2 pairs (2020--2023).}}{28}{table.caption.64}\protected@file@percent }
+\newlabel{tab:od_sample}{{8}{28}{Sample OD route lengths and expected crashes for selected SA2 pairs (2020--2023)}{table.caption.64}{}}
+\newlabel{tab:od_sample@cref}{{[table][8][]8}{[1][27][]28}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Data}{28}{subsection*.65}\protected@file@percent }
+\newlabel{sec:data}{{}{28}{Data}{subsection*.65}{}}
+\newlabel{sec:data@cref}{{}{[1][28][]28}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {9}{\ignorespaces Data sources, roles, and spatial/temporal scope. Crash records conflate onto 100\,m homogeneous road segments (six road stereotypes $\times $ five crash types; 2014--2018 observed for fitting, 2020--2023 predicted); HHTS supplies positive microdata for every behavioural stage; census variables enter as stage covariates and synthetic-population attributes.}}{28}{table.caption.66}\protected@file@percent }
+\newlabel{tab:datasources}{{9}{28}{Data sources, roles, and spatial/temporal scope. Crash records conflate onto 100\,m homogeneous road segments (six road stereotypes $\times $ five crash types; 2014--2018 observed for fitting, 2020--2023 predicted); HHTS supplies positive microdata for every behavioural stage; census variables enter as stage covariates and synthetic-population attributes}{table.caption.66}{}}
+\newlabel{tab:datasources@cref}{{[table][9][]9}{[1][28][]28}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Ethics and privacy.}{28}{paragraph*.67}\protected@file@percent }
+\citation{LarchExampvilleDocs}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {section}{Experiments}{29}{section*.68}\protected@file@percent }
+\newlabel{sec:experiments}{{}{29}{Experiments}{section*.68}{}}
+\newlabel{sec:experiments@cref}{{}{[1][29][]29}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Exampville transfer tests: initial validation before Queensland}{29}{subsection*.69}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {10}{\ignorespaces Exampville $\rightarrow $ pipeline schema map (derived fields marked $^*$).}}{29}{table.caption.70}\protected@file@percent }
+\newlabel{tab:exampville_map}{{10}{29}{Exampville $\rightarrow $ pipeline schema map (derived fields marked $^*$)}{table.caption.70}{}}
+\newlabel{tab:exampville_map@cref}{{[table][10][]10}{[1][29][]29}{}{}{}}
+\citation{ActivitySimConsortium,ActivitySimPrototypeMTC}
+\def\@LN@column{1}
+\@writefile{lot}{\contentsline {table}{\numberline {11}{\ignorespaces Exampville Stage-5 comparison (work tours unless noted; E1/E2 completed in the Oct~25 retry run). E0-destination is the published 203 benchmark. n.r.\ = not recorded (mode-MAE extraction depends on a \texttt  {probability()} path unavailable in this rerun).}}{30}{table.caption.71}\protected@file@percent }
+\newlabel{tab:exampville_cmp}{{11}{30}{Exampville Stage-5 comparison (work tours unless noted; E1/E2 completed in the Oct~25 retry run). E0-destination is the published 203 benchmark. n.r.\ = not recorded (mode-MAE extraction depends on a \texttt {probability()} path unavailable in this rerun)}{table.caption.71}{}}
+\newlabel{tab:exampville_cmp@cref}{{[table][11][]11}{[1][30][]30}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {12}{\ignorespaces Exampville Stages~0--1 comparison (final for these arms). n.r.\ = not recorded.}}{30}{table.caption.72}\protected@file@percent }
+\newlabel{tab:exampville_cmp01}{{12}{30}{Exampville Stages~0--1 comparison (final for these arms). n.r.\ = not recorded}{table.caption.72}{}}
+\newlabel{tab:exampville_cmp01@cref}{{[table][12][]12}{[1][30][]30}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Prototype-MTC transfer test: real-world prototype validation}{30}{subsection*.73}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{lot}{\contentsline {table}{\numberline {13}{\ignorespaces Prototype-MTC transfer test (corrected adapter, $n=9{,}806$ trips). MAE vs.\ M0 shares; top-10 = overlap of ten most-chosen destination zones. M2 search failed so M2 = M1 defaults.}}{31}{table.caption.74}\protected@file@percent }
+\newlabel{tab:mtc_transfer}{{13}{31}{Prototype-MTC transfer test (corrected adapter, $n=9{,}806$ trips). MAE vs.\ M0 shares; top-10 = overlap of ten most-chosen destination zones. M2 search failed so M2 = M1 defaults}{table.caption.74}{}}
+\newlabel{tab:mtc_transfer@cref}{{[table][13][]13}{[1][31][]31}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Crash-frequency skims from road segments to OD risk}{31}{subsection*.75}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{Feature selection discovers safety alongside conventional predictors}{31}{subsection*.76}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{GA Stage-5 shard results (work $+$ edu converged; nonmand rerunning).}{31}{paragraph*.77}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Dead-term audit: selection $\neq  $ identification.}{31}{paragraph*.79}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Champion leaderboard, Stage-5 education destination: best BIC/n so far per independent search run (30/30/53 generations). The latest rerun dominates from generation~2; the two earlier runs overlap exactly throughout (bit-identical). Companion boards cover the remaining slots.}}{32}{figure.caption.78}\protected@file@percent }
+\newlabel{fig:champedu}{{3}{32}{Champion leaderboard, Stage-5 education destination: best BIC/n so far per independent search run (30/30/53 generations). The latest rerun dominates from generation~2; the two earlier runs overlap exactly throughout (bit-identical). Companion boards cover the remaining slots}{figure.caption.78}{}}
+\newlabel{fig:champedu@cref}{{[figure][3][]3}{[1][31][]32}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {14}{\ignorespaces GA Stage-5 variant winners (BIC/n lower is better). Education destination superseded by the latest rerun.}}{32}{table.caption.80}\protected@file@percent }
+\newlabel{tab:ga_shard2}{{14}{32}{GA Stage-5 variant winners (BIC/n lower is better). Education destination superseded by the latest rerun}{table.caption.80}{}}
+\newlabel{tab:ga_shard2@cref}{{[table][14][]14}{[1][32][]32}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {15}{\ignorespaces Dead-term audit of the GA picks (post-fit $|t|$). Only LIVE/PARTIAL picks are citable effects.}}{32}{table.caption.81}\protected@file@percent }
+\newlabel{tab:ga_dead}{{15}{32}{Dead-term audit of the GA picks (post-fit $|t|$). Only LIVE/PARTIAL picks are citable effects}{table.caption.81}{}}
+\newlabel{tab:ga_dead@cref}{{[table][15][]15}{[1][32][]32}{}{}{}}
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Salvaged non-mandatory trajectories from an OOM-killed search job (sparse: only every-5th-generation summaries survive in stdout). Mode search converged by gen $\sim $7; destination BIC/n $1.15 \to 1.04$ with late-stage peripheral-pick churn at flat fitness --- the same dead-feature signature as education. Prep accessibilities are healthy (accessibility diagnostics figure, Appendix).}}{33}{figure.caption.82}\protected@file@percent }
+\newlabel{fig:nonmandsalvage}{{4}{33}{Salvaged non-mandatory trajectories from an OOM-killed search job (sparse: only every-5th-generation summaries survive in stdout). Mode search converged by gen $\sim $7; destination BIC/n $1.15 \to 1.04$ with late-stage peripheral-pick churn at flat fitness --- the same dead-feature signature as education. Prep accessibilities are healthy (accessibility diagnostics figure, Appendix)}{figure.caption.82}{}}
+\newlabel{fig:nonmandsalvage@cref}{{[figure][4][]4}{[1][32][]33}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Stage-4 per-purpose GA search traces behind the RRM-vs-TDD shootout: best-so-far and mean BIC/n per generation for work, education, pooled non-mandatory, other-maintenance, and other-discretionary segments.}}{33}{figure.caption.83}\protected@file@percent }
+\newlabel{fig:s4traces}{{5}{33}{Stage-4 per-purpose GA search traces behind the RRM-vs-TDD shootout: best-so-far and mean BIC/n per generation for work, education, pooled non-mandatory, other-maintenance, and other-discretionary segments}{figure.caption.83}{}}
+\newlabel{fig:s4traces@cref}{{[figure][5][]5}{[1][32][]33}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Held-out validation: fit, transfer, and aggregate recovery}{33}{subsection*.85}\protected@file@percent }
+\newlabel{sec:holdout}{{}{33}{Held-out validation: fit, transfer, and aggregate recovery}{subsection*.85}{}}
+\newlabel{sec:holdout@cref}{{}{[1][33][]33}{}{}{}}
+\def\@LN@column{1}
+\@writefile{lot}{\contentsline {table}{\numberline {16}{\ignorespaces Stage-4 family shootout per purpose (smoke budget; BIC/n, lower is better). RRM uses the fixed regret design; TDD uses the searched features. Same estimation data per row ($n$ equal); families model different choice sets (6 periods vs.\ 21 joint alternatives).}}{34}{table.caption.84}\protected@file@percent }
+\newlabel{tab:s4shootout}{{16}{34}{Stage-4 family shootout per purpose (smoke budget; BIC/n, lower is better). RRM uses the fixed regret design; TDD uses the searched features. Same estimation data per row ($n$ equal); families model different choice sets (6 periods vs.\ 21 joint alternatives)}{table.caption.84}{}}
+\newlabel{tab:s4shootout@cref}{{[table][16][]16}{[1][32][]34}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {17}{\ignorespaces Headline arm comparison: (P0) fixed ActivitySim baseline vs.\ (P2) searched safety-augmented specification, on identical estimators, feeding $\Phi $, and calibration $\mathcal  {K}$. Total BIC is computed in-sample (it is a selection-side quantity and is labelled as such); all other rows are held-out. $\Delta \mathrm  {Err}=\mathrm  {Err}(P0)-\mathrm  {Err}(P2)$ \eqref  {eq:deltaerr} per row; the crash LR of \eqref  {eq:crash-lr} tests the forced safety term directly.}}{34}{table.caption.86}\protected@file@percent }
+\newlabel{tab:p0p2}{{17}{34}{Headline arm comparison: (P0) fixed ActivitySim baseline vs.\ (P2) searched safety-augmented specification, on identical estimators, feeding $\Phi $, and calibration $\mathcal {K}$. Total BIC is computed in-sample (it is a selection-side quantity and is labelled as such); all other rows are held-out. $\Delta \mathrm {Err}=\mathrm {Err}(P0)-\mathrm {Err}(P2)$ \eqref {eq:deltaerr} per row; the crash LR of \eqref {eq:crash-lr} tests the forced safety term directly}{table.caption.86}{}}
+\newlabel{tab:p0p2@cref}{{[table][17][]17}{[1][34][]34}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Error propagation across stages.}{34}{paragraph*.87}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{lot}{\contentsline {table}{\numberline {18}{\ignorespaces Held-out validation by stage and segment (person-level split; evaluation frame never used for selection). $n^{\mathrm  {ho}}$ = evaluation observations; $\rho ^2_{\mathrm  {ho}}$ = held-out McFadden; MAE/JS = destination-share mean absolute error and Jensen--Shannon divergence; top-25 = zone-overlap. Values pending the held-out pass over the published run tree.}}{35}{table.caption.88}\protected@file@percent }
+\newlabel{tab:holdout}{{18}{35}{Held-out validation by stage and segment (person-level split; evaluation frame never used for selection). $n^{\mathrm {ho}}$ = evaluation observations; $\rho ^2_{\mathrm {ho}}$ = held-out McFadden; MAE/JS = destination-share mean absolute error and Jensen--Shannon divergence; top-25 = zone-overlap. Values pending the held-out pass over the published run tree}{table.caption.88}{}}
+\newlabel{tab:holdout@cref}{{[table][18][]18}{[1][35][]35}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {19}{\ignorespaces In-sample McFadden $\rho ^2$ by model stage and segment (HHTS \emph  {selection} frame). Values above 0.4 are considered strong for discrete-choice models; these are fit diagnostics, not validation, and are superseded by \Cref  {tab:holdout}.}}{35}{table.caption.89}\protected@file@percent }
+\newlabel{tab:modelfit}{{19}{35}{In-sample McFadden $\rho ^2$ by model stage and segment (HHTS \emph {selection} frame). Values above 0.4 are considered strong for discrete-choice models; these are fit diagnostics, not validation, and are superseded by \Cref {tab:holdout}}{table.caption.89}{}}
+\newlabel{tab:modelfit@cref}{{[table][19][]19}{[1][35][]35}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Post-selection inference: search-aware uncertainty}{35}{subsection*.93}\protected@file@percent }
+\newlabel{sec:psresults}{{}{35}{Post-selection inference: search-aware uncertainty}{subsection*.93}{}}
+\newlabel{sec:psresults@cref}{{}{[1][35][]35}{}{}{}}
+\def\@LN@column{1}
+\@writefile{lot}{\contentsline {table}{\numberline {20}{\ignorespaces In-sample destination-assignment validation on HHTS estimation data (tour level). MAE = mean absolute error in zone share; JS = Jensen--Shannon divergence. This table motivated the held-out protocol described above and is superseded by \Cref  {tab:holdout}.}}{36}{table.caption.90}\protected@file@percent }
+\newlabel{tab:destval}{{20}{36}{In-sample destination-assignment validation on HHTS estimation data (tour level). MAE = mean absolute error in zone share; JS = Jensen--Shannon divergence. This table motivated the held-out protocol described above and is superseded by \Cref {tab:holdout}}{table.caption.90}{}}
+\newlabel{tab:destval@cref}{{[table][20][]20}{[1][35][]36}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces In-sample destination-assignment validation: predicted versus observed zone-level trip shares for work, education, and non-mandatory segments (HHTS estimation frame; legacy 329-zone run, obs $n=6{,}091$/$2{,}935$/$10{,}454$ --- education excludes childcare; 371-native refresh pending with the held-out pass).}}{36}{figure.caption.91}\protected@file@percent }
+\newlabel{fig:destval}{{6}{36}{In-sample destination-assignment validation: predicted versus observed zone-level trip shares for work, education, and non-mandatory segments (HHTS estimation frame; legacy 329-zone run, obs $n=6{,}091$/$2{,}935$/$10{,}454$ --- education excludes childcare; 371-native refresh pending with the held-out pass)}{figure.caption.91}{}}
+\newlabel{fig:destval@cref}{{[figure][6][]6}{[1][35][]36}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Selection frequency and stability.}{36}{paragraph*.94}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The search-inflated threshold.}{36}{paragraph*.96}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{What survives.}{36}{paragraph*.97}\protected@file@percent }
+\newlabel{eq:crash-lr}{{76}{36}{What survives}{equation.76}{}}
+\newlabel{eq:crash-lr@cref}{{[equation][76][]76}{[1][36][]36}{}{}{}}
+\def\@LN@column{1}
+\@writefile{lot}{\contentsline {table}{\numberline {21}{\ignorespaces Mode-share validation (\emph  {pre-calibration} diagnostic, in-sample): observed (HHTS) vs.\ predicted shares by segment. The citable calibrated comparison is the calibrated mode-share artifact (observed/predicted/delta per segment and mode, plus maximum absolute gap), written by every run from post-ASC-calibration coefficients.}}{37}{table.caption.92}\protected@file@percent }
+\newlabel{tab:modeval}{{21}{37}{Mode-share validation (\emph {pre-calibration} diagnostic, in-sample): observed (HHTS) vs.\ predicted shares by segment. The citable calibrated comparison is the calibrated mode-share artifact (observed/predicted/delta per segment and mode, plus maximum absolute gap), written by every run from post-ASC-calibration coefficients}{table.caption.92}{}}
+\newlabel{tab:modeval@cref}{{[table][21][]21}{[1][35][]37}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {22}{\ignorespaces Post-selection diagnostics for the published Stage-5 fits (PS-I/III/IV pass of Oct~25; $B=20$ bootstrap replications, smoke-budget search inside PS-III). $\hat  q$ = fraction of replications that retain the term; \emph  {forced} = force-included (not a searched quantity, LR-tested instead, \eqref  {eq:crash-lr}); $t_{\mathrm  {in}}$ = in-sample $t$-ratio from the dead-term audit where available.}}{37}{table.caption.95}\protected@file@percent }
+\newlabel{tab:ps}{{22}{37}{Post-selection diagnostics for the published Stage-5 fits (PS-I/III/IV pass of Oct~25; $B=20$ bootstrap replications, smoke-budget search inside PS-III). $\hat q$ = fraction of replications that retain the term; \emph {forced} = force-included (not a searched quantity, LR-tested instead, \eqref {eq:crash-lr}); $t_{\mathrm {in}}$ = in-sample $t$-ratio from the dead-term audit where available}{table.caption.95}{}}
+\newlabel{tab:ps@cref}{{[table][22][]22}{[1][36][]37}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Safety effects beyond penalised fit}{37}{subsection*.98}\protected@file@percent }
+\newlabel{sec:safetyeffects}{{}{37}{Safety effects beyond penalised fit}{subsection*.98}{}}
+\newlabel{sec:safetyeffects@cref}{{}{[1][37][]37}{}{}{}}
+\def\@LN@column{1}
+\newlabel{eq:cf}{{77}{38}{Safety effects beyond penalised fit}{equation.77}{}}
+\newlabel{eq:cf@cref}{{[equation][77][]77}{[1][38][]38}{}{}{}}
+\newlabel{eq:elasticity}{{78}{38}{Safety effects beyond penalised fit}{equation.78}{}}
+\newlabel{eq:elasticity@cref}{{[equation][78][]78}{[1][38][]38}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Sensitivity design; uncertainty and equity reporting.}{38}{paragraph*.99}\protected@file@percent }
+\citation{Hess2026Significance}
+\citation{Daly2020VTT}
+\citation{BekkerGrobRoseBliemer2013Closer,Hess2026Significance}
+\citation{ABMDTAConvergence2024}
+\citation{Arentze2013MultiDay}
+\def\@LN@column{1}
+\@writefile{lot}{\contentsline {table}{\numberline {23}{\ignorespaces Safety effects beyond penalised fit, all computed against the unmodified fitted specifications on the full synthetic population. Sign convention $\Delta =\mathcal  {M}_S-\mathcal  {M}_0$; $\eta _{\mathrm  {act}}$ is the induced-demand elasticity of \eqref  {eq:elasticity}. Values pending the counterfactual pass over the published run tree.}}{39}{table.caption.100}\protected@file@percent }
+\newlabel{tab:safety}{{23}{39}{Safety effects beyond penalised fit, all computed against the unmodified fitted specifications on the full synthetic population. Sign convention $\Delta =\mathcal {M}_S-\mathcal {M}_0$; $\eta _{\mathrm {act}}$ is the induced-demand elasticity of \eqref {eq:elasticity}. Values pending the counterfactual pass over the published run tree}{table.caption.100}{}}
+\newlabel{tab:safety@cref}{{[table][23][]23}{[1][38][]39}{}{}{}}
+\@writefile{toc}{\contentsline {section}{Discussion}{39}{section*.101}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{Acknowledgments}{39}{section*.102}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{Author Contributions}{39}{section*.103}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{Author Competing Interests}{39}{section*.104}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{QLD estimated models (primary run qld\_conv1)}{39}{section*.105}\protected@file@percent }
+\newlabel{app:qld-models}{{}{39}{QLD estimated models (primary run qld\_conv1)}{section*.105}{}}
+\newlabel{app:qld-models@cref}{{}{[1][39][]39}{}{}{}}
+\@writefile{toc}{\contentsline {subsection}{Stage~0 --- CDAP (coordinated daily activity pattern)}{39}{subsection*.106}\protected@file@percent }
+\newlabel{app:stage0}{{}{39}{Stage~0 --- CDAP (coordinated daily activity pattern)}{subsection*.106}{}}
+\newlabel{app:stage0@cref}{{}{[1][39][]39}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~0 / all.}{39}{paragraph*.107}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces Stage~0 / all: searched BIC trajectory.}}{40}{figure.caption.108}\protected@file@percent }
+\newlabel{fig:conv-s0-all}{{7}{40}{Stage~0 / all: searched BIC trajectory}{figure.caption.108}{}}
+\newlabel{fig:conv-s0-all@cref}{{[figure][7][]7}{[1][40][]40}{}{}{}}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {subsection}{Stage~1 --- Activity frequency}{41}{subsection*.109}\protected@file@percent }
+\newlabel{app:stage1}{{}{41}{Stage~1 --- Activity frequency}{subsection*.109}{}}
+\newlabel{app:stage1@cref}{{}{[1][41][]41}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~1 / work.}{41}{paragraph*.110}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {8}{\ignorespaces Stage~1 / work: searched BIC trajectory.}}{41}{figure.caption.111}\protected@file@percent }
+\newlabel{fig:conv-s1-work}{{8}{41}{Stage~1 / work: searched BIC trajectory}{figure.caption.111}{}}
+\newlabel{fig:conv-s1-work@cref}{{[figure][8][]8}{[1][41][]41}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~1 / edu.}{41}{paragraph*.112}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {9}{\ignorespaces Stage~1 / edu: searched BIC trajectory.}}{42}{figure.caption.113}\protected@file@percent }
+\newlabel{fig:conv-s1-edu}{{9}{42}{Stage~1 / edu: searched BIC trajectory}{figure.caption.113}{}}
+\newlabel{fig:conv-s1-edu@cref}{{[figure][9][]9}{[1][42][]42}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~1 / nonmand.}{42}{paragraph*.114}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {10}{\ignorespaces Stage~1 / nonmand: searched BIC trajectory.}}{44}{figure.caption.115}\protected@file@percent }
+\newlabel{fig:conv-s1-nonmand}{{10}{44}{Stage~1 / nonmand: searched BIC trajectory}{figure.caption.115}{}}
+\newlabel{fig:conv-s1-nonmand@cref}{{[figure][10][]10}{[1][43][]44}{}{}{}}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {subsection}{Stage~2 --- Day budget}{45}{subsection*.116}\protected@file@percent }
+\newlabel{app:stage2}{{}{45}{Stage~2 --- Day budget}{subsection*.116}{}}
+\newlabel{app:stage2@cref}{{}{[1][45][]45}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~2 / start.}{45}{paragraph*.117}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {11}{\ignorespaces Stage~2 / start: searched BIC trajectory.}}{45}{figure.caption.118}\protected@file@percent }
+\newlabel{fig:conv-s2-start}{{11}{45}{Stage~2 / start: searched BIC trajectory}{figure.caption.118}{}}
+\newlabel{fig:conv-s2-start@cref}{{[figure][11][]11}{[1][45][]45}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~2 / end.}{45}{paragraph*.119}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {12}{\ignorespaces Stage~2 / end: searched BIC trajectory.}}{46}{figure.caption.120}\protected@file@percent }
+\newlabel{fig:conv-s2-end}{{12}{46}{Stage~2 / end: searched BIC trajectory}{figure.caption.120}{}}
+\newlabel{fig:conv-s2-end@cref}{{[figure][12][]12}{[1][46][]46}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~2 / budget.}{46}{paragraph*.121}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {13}{\ignorespaces Stage~2 / budget: searched BIC trajectory.}}{47}{figure.caption.122}\protected@file@percent }
+\newlabel{fig:conv-s2-budget}{{13}{47}{Stage~2 / budget: searched BIC trajectory}{figure.caption.122}{}}
+\newlabel{fig:conv-s2-budget@cref}{{[figure][13][]13}{[1][47][]47}{}{}{}}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {subsection}{Stage~3 --- Activity duration}{48}{subsection*.123}\protected@file@percent }
+\newlabel{app:stage3}{{}{48}{Stage~3 --- Activity duration}{subsection*.123}{}}
+\newlabel{app:stage3@cref}{{}{[1][48][]48}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~3 / work.}{48}{paragraph*.124}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {14}{\ignorespaces Stage~3 / work: searched BIC trajectory.}}{48}{figure.caption.125}\protected@file@percent }
+\newlabel{fig:conv-s3-work}{{14}{48}{Stage~3 / work: searched BIC trajectory}{figure.caption.125}{}}
+\newlabel{fig:conv-s3-work@cref}{{[figure][14][]14}{[1][48][]48}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~3 / edu.}{48}{paragraph*.126}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {15}{\ignorespaces Stage~3 / edu: searched BIC trajectory.}}{49}{figure.caption.127}\protected@file@percent }
+\newlabel{fig:conv-s3-edu}{{15}{49}{Stage~3 / edu: searched BIC trajectory}{figure.caption.127}{}}
+\newlabel{fig:conv-s3-edu@cref}{{[figure][15][]15}{[1][48][]49}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~3 / nonmand.}{49}{paragraph*.128}\protected@file@percent }
+\def\@LN@column{1}
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {16}{\ignorespaces Stage~3 / nonmand: searched BIC trajectory.}}{51}{figure.caption.129}\protected@file@percent }
+\newlabel{fig:conv-s3-nonmand}{{16}{51}{Stage~3 / nonmand: searched BIC trajectory}{figure.caption.129}{}}
+\newlabel{fig:conv-s3-nonmand@cref}{{[figure][16][]16}{[1][51][]51}{}{}{}}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {subsection}{Stage~4 --- Schedule placement}{52}{subsection*.130}\protected@file@percent }
+\newlabel{app:stage4}{{}{52}{Stage~4 --- Schedule placement}{subsection*.130}{}}
+\newlabel{app:stage4@cref}{{}{[1][52][]52}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~4 / work.}{52}{paragraph*.131}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {17}{\ignorespaces Stage~4 / work: searched BIC trajectory.}}{52}{figure.caption.132}\protected@file@percent }
+\newlabel{fig:conv-s4-work}{{17}{52}{Stage~4 / work: searched BIC trajectory}{figure.caption.132}{}}
+\newlabel{fig:conv-s4-work@cref}{{[figure][17][]17}{[1][52][]52}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~4 / edu.}{52}{paragraph*.133}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Stage~4 / escort.}{52}{paragraph*.135}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Stage~4 / shopping.}{52}{paragraph*.137}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {18}{\ignorespaces Stage~4 / edu: searched BIC trajectory.}}{53}{figure.caption.134}\protected@file@percent }
+\newlabel{fig:conv-s4-edu}{{18}{53}{Stage~4 / edu: searched BIC trajectory}{figure.caption.134}{}}
+\newlabel{fig:conv-s4-edu@cref}{{[figure][18][]18}{[1][52][]53}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {19}{\ignorespaces Stage~4 / escort: searched BIC trajectory.}}{53}{figure.caption.136}\protected@file@percent }
+\newlabel{fig:conv-s4-escort}{{19}{53}{Stage~4 / escort: searched BIC trajectory}{figure.caption.136}{}}
+\newlabel{fig:conv-s4-escort@cref}{{[figure][19][]19}{[1][52][]53}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~4 / othmaint.}{53}{paragraph*.139}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {20}{\ignorespaces Stage~4 / shopping: searched BIC trajectory.}}{54}{figure.caption.138}\protected@file@percent }
+\newlabel{fig:conv-s4-shopping}{{20}{54}{Stage~4 / shopping: searched BIC trajectory}{figure.caption.138}{}}
+\newlabel{fig:conv-s4-shopping@cref}{{[figure][20][]20}{[1][52][]54}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {21}{\ignorespaces Stage~4 / othmaint: searched BIC trajectory.}}{54}{figure.caption.140}\protected@file@percent }
+\newlabel{fig:conv-s4-othmaint}{{21}{54}{Stage~4 / othmaint: searched BIC trajectory}{figure.caption.140}{}}
+\newlabel{fig:conv-s4-othmaint@cref}{{[figure][21][]21}{[1][53][]54}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~4 / othdiscr.}{54}{paragraph*.141}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {22}{\ignorespaces Stage~4 / othdiscr: searched BIC trajectory.}}{55}{figure.caption.142}\protected@file@percent }
+\newlabel{fig:conv-s4-othdiscr}{{22}{55}{Stage~4 / othdiscr: searched BIC trajectory}{figure.caption.142}{}}
+\newlabel{fig:conv-s4-othdiscr@cref}{{[figure][22][]22}{[1][54][]55}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~4 / eat.}{55}{paragraph*.143}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Stage~4 / social.}{55}{paragraph*.145}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {23}{\ignorespaces Stage~4 / eat: searched BIC trajectory.}}{56}{figure.caption.144}\protected@file@percent }
+\newlabel{fig:conv-s4-eat}{{23}{56}{Stage~4 / eat: searched BIC trajectory}{figure.caption.144}{}}
+\newlabel{fig:conv-s4-eat@cref}{{[figure][23][]23}{[1][55][]56}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {24}{\ignorespaces Stage~4 / social: searched BIC trajectory.}}{57}{figure.caption.146}\protected@file@percent }
+\newlabel{fig:conv-s4-social}{{24}{57}{Stage~4 / social: searched BIC trajectory}{figure.caption.146}{}}
+\newlabel{fig:conv-s4-social@cref}{{[figure][24][]24}{[1][55][]57}{}{}{}}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {subsection}{Stage~5 --- Tour mode and destination}{58}{subsection*.147}\protected@file@percent }
+\newlabel{app:stage5}{{}{58}{Stage~5 --- Tour mode and destination}{subsection*.147}{}}
+\newlabel{app:stage5@cref}{{}{[1][58][]58}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stage~5 / work.}{58}{paragraph*.148}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Stage~5 / edu.}{58}{paragraph*.149}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {paragraph}{Stage~5 / nonmand.}{59}{paragraph*.150}\protected@file@percent }
+\def\@LN@column{1}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {subsection}{Stage~5 safety effects at a glance}{61}{subsection*.151}\protected@file@percent }
+\newlabel{app:safety-forest}{{}{61}{Stage~5 safety effects at a glance}{subsection*.151}{}}
+\newlabel{app:safety-forest@cref}{{}{[1][61][]61}{}{}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {25}{\ignorespaces Stage~5 crash/safety coefficients (95\% CI) by segment and sub-model.}}{61}{figure.caption.152}\protected@file@percent }
+\newlabel{fig:safety-forest}{{25}{61}{Stage~5 crash/safety coefficients (95\% CI) by segment and sub-model}{figure.caption.152}{}}
+\newlabel{fig:safety-forest@cref}{{[figure][25][]25}{[1][61][]61}{}{}{}}
+\@writefile{toc}{\contentsline {section}{Software stack and reproducibility}{61}{section*.153}\protected@file@percent }
+\newlabel{app:software}{{}{61}{Software stack and reproducibility}{section*.153}{}}
+\newlabel{app:software@cref}{{}{[1][61][]61}{}{}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {24}{\ignorespaces Pinned software stack for the Queensland estimation and application runs. Version bounds are load-bearing: \texttt  {numpy}$<$2.4 and \texttt  {scipy}$<$1.16 are ceilings required by the Just-In-Time and optimiser back-ends listed below, and are re-installed on every job rather than cached.}}{61}{table.caption.154}\protected@file@percent }
+\newlabel{tab:stack}{{24}{61}{Pinned software stack for the Queensland estimation and application runs. Version bounds are load-bearing: \texttt {numpy}$<$2.4 and \texttt {scipy}$<$1.16 are ceilings required by the Just-In-Time and optimiser back-ends listed below, and are re-installed on every job rather than cached}{table.caption.154}{}}
+\newlabel{tab:stack@cref}{{[table][24][]24}{[1][61][]61}{}{}{}}
+\@writefile{toc}{\contentsline {paragraph}{Estimator and search engines.}{61}{paragraph*.155}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Determinism, seeds, and artifact layout.}{61}{paragraph*.156}\protected@file@percent }
+\bibstyle{abbrvnat}
+\bibdata{localbibliography}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {paragraph}{Benchmark reproduction.}{62}{paragraph*.157}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Validation and post-selection utilities.}{62}{paragraph*.158}\protected@file@percent }
+\gdef \@abspage@last{62}

@@ -579,6 +579,25 @@ def compute_accessibility(
         decay_type = entry['decay_type']
         b          = entry['decay_coeff']
         cap_tt     = entry.get('cap_tt', 999.0)
+        # Env-overridable decay / cap so the gravity decay coefficients (which
+        # were hand-set at 0.05-0.08) can be calibrated or swept instead of
+        # frozen -- ACC_DECAY_<acc_name> / ACC_CAP_<acc_name> (upper-cased), or
+        # the blanket ACC_DECAY_SCALE multiplier on every measure. An outer
+        # sweep/search varies these; a per-GA-eval gene is not used because
+        # accessibility is precomputed once rather than rebuilt per candidate.
+        import os as _os
+        try:
+            _ov = _os.environ.get('ACC_DECAY_' + acc_name.upper())
+            if _ov is not None:
+                b = float(_ov)
+            _scale = _os.environ.get('ACC_DECAY_SCALE')
+            if _scale is not None:
+                b = b * float(_scale)
+            _capov = _os.environ.get('ACC_CAP_' + acc_name.upper())
+            if _capov is not None:
+                cap_tt = float(_capov)
+        except (TypeError, ValueError):
+            pass
 
         # build attractor vector (n_dest,)
         attractor = np.zeros(n_zones, dtype=np.float32)
@@ -736,11 +755,31 @@ def compute_logsum_accessibility(landuse: pd.DataFrame,
     n = len(zone_ids)
     lu = lu.reindex(zone_ids)
 
+    # ── skim zone-key crosswalk ───────────────────────────────────────────
+    # ORDER is positional (1..371) in the synthetic 371-zone build while the
+    # skims are keyed by the real zone code (SA2_MAIN16).  Filtering/pivoting
+    # skims on ORDER silently produced an empty skim subset -> every mode
+    # utility fell to the -700 sentinel and asim_*_acc came out ~= -694 for
+    # all zones (observed 16/10 in the safety + predict runs).  Map through
+    # SA2_MAIN16 when present; legacy builds where ORDER already carries the
+    # zone code keep working because SA2_MAIN16 is absent there.
+    if 'SA2_MAIN16' in lu.columns:
+        _codes = pd.to_numeric(lu['SA2_MAIN16'], errors='coerce')
+        zone_codes = _codes.fillna(pd.Series(zone_ids, index=lu.index)).astype(int).values
+    else:
+        zone_codes = zone_ids
+
     # ── skim matrices (minutes) ───────────────────────────────────────────
     sk = skim_df.copy()
     sk['OTAZ'] = sk['OTAZ'].astype(int)
     sk['DTAZ'] = sk['DTAZ'].astype(int)
-    sk = sk[sk['OTAZ'].isin(set(zone_ids)) & sk['DTAZ'].isin(set(zone_ids))]
+    sk = sk[sk['OTAZ'].isin(set(zone_codes)) & sk['DTAZ'].isin(set(zone_codes))]
+    if len(sk) == 0:
+        raise RuntimeError(
+            "Accessibility skims have no OTAZ/DTAZ in the landuse zone-code "
+            f"space (landuse codes e.g. {list(zone_codes[:3])}; skim OTAZ e.g. "
+            f"{sorted(set(skim_df['OTAZ'].astype(int)))[:3]}) — zone systems "
+            "are misaligned (ORDER vs SA2_MAIN16 vs skim OTAZ).")
 
     try:
         from read_skims import to_minutes as _to_minutes
@@ -752,7 +791,7 @@ def compute_logsum_accessibility(landuse: pd.DataFrame,
             return None
         piv = (sk.pivot_table(index='OTAZ', columns='DTAZ', values=col,
                               aggfunc='first')
-                 .reindex(index=zone_ids, columns=zone_ids))
+                 .reindex(index=zone_codes, columns=zone_codes))
         piv = piv.apply(pd.to_numeric, errors='coerce')
         if _to_minutes is not None and _is_time_matrix(col):
             # minutes via unit sidecar (measured); legacy guess only unknown.

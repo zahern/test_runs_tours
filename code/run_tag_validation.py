@@ -7,8 +7,10 @@ Usage:
 
 Loads fitted stage model pkls under runs/ga_parallel/<TAG>/, rebuilds the
 HHTS frames via Synth_Connect().process_survey(save=False), and calls
-validate_hhts.run_validation. Plots land in <TAG>/plots/validation/.
-Missing model pkls are tolerated (that stage is skipped by run_validation).
+validate_hhts.run_validation. Plots land in <TAG>/plots/validation/ and the
+ActivitySim-style dashboard (charts, tables, figure gallery) in
+<TAG>/summarize/. Missing model pkls are tolerated (that stage is skipped by
+run_validation).
 """
 import os
 import pickle
@@ -17,7 +19,8 @@ from data_connect import Synth_Connect
 from validate_hhts import run_validation
 
 TAG = os.environ.get('RUN_TAG', 'ga371_20260912r2')
-BASE = os.path.join('runs', 'ga_parallel', TAG)
+ROOT = os.environ.get('RUN_ROOT', os.path.join('runs', 'ga_parallel'))
+BASE = os.path.join(ROOT, TAG)
 
 
 def _load(*parts):
@@ -30,6 +33,7 @@ def _load(*parts):
 
 
 def main():
+    print(f'run dir: {os.path.abspath(BASE)}', flush=True)
     print('building HHTS frames via process_survey ...', flush=True)
     out = Synth_Connect().process_survey(save=False)
     print('loading stage models ...', flush=True)
@@ -43,6 +47,15 @@ def main():
                    s4_models=s4, s5_models=s5, out_dir=BASE)
     print('done. plots in', os.path.join(BASE, 'plots', 'validation'),
           flush=True)
+
+    # ActivitySim-style dashboard pages (observed vs predicted) for this run
+    try:
+        from build_validation_dashboard import build_validation_dashboard
+        build_validation_dashboard(
+            BASE, out_dir=os.path.join(BASE, 'summarize'))
+        print('dashboard in', os.path.join(BASE, 'summarize'), flush=True)
+    except Exception as exc:
+        print(f'  [validate] dashboard skipped: {exc}', flush=True)
 
 
 if __name__ == '__main__':

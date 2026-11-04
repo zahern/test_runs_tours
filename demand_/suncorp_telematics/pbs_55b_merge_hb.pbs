@@ -1,0 +1,61 @@
+#!/bin/bash -l
+#PBS -N hb55merge
+#PBS -l select=1:ncpus=4:mem=64gb
+#PBS -l walltime=06:00:00
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+#PBS -o logs/hb55merge.log
+
+# Merge the 20 per-shard outputs of pbs_55_rebuild_hb.pbs into the single
+# full-period file data/hard_braking_events_full.csv, with validation
+# gates (dates within raw window, exact category bounds, no March-only
+# skew). Submit ONLY after all 20 array tasks finish, e.g.:
+#
+#   qsub pbs_55_rebuild_hb.pbs            # note the job id, e.g. 1234567[]
+#   qsub -W depend=afterok:1234567 pbs_55b_merge_hb.pbs
+#
+# Or submit standalone once the shards exist:
+#   qsub pbs_55b_merge_hb.pbs
+
+cd "$PBS_O_WORKDIR" || exit 1
+mkdir -p logs results data
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export JAX_PLATFORMS=cpu
+
+PATTERN="${PATTERN:-results/hb_full.shard*.csv.gz}"
+OUT="${OUT:-data/hard_braking_events_full.csv}"
+
+echo "merge started on $(hostname) at $(date)"
+echo "pattern: $PATTERN"
+echo "out:     $OUT"
+
+NSHARD=$(ls $PATTERN 2>/dev/null | wc -l)
+echo "shards found: $NSHARD"
+if [ "$NSHARD" -lt 20 ]; then
+    echo "WARNING: expected 20 shards, found $NSHARD."
+    echo "  If the array job is still running, wait for it to finish first."
+fi
+
+python -u scripts/55b_merge_hb_shards.py \
+    --pattern "$PATTERN" \
+    --out "$OUT" 2>&1
+RC=$?
+echo "merge exit=$RC at $(date)"
+
+# Gate: merged file must exist and be non-empty.
+if [ ! -s "$OUT" ]; then
+    echo "MISSING/EMPTY merged output: $OUT"
+    exit 1
+fi
+wc -l "$OUT"
+exit $RC

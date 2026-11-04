@@ -33,6 +33,9 @@ fi
 GA_BUDGET=${GA_BUDGET:-fast}
 GA_ESTIMATOR=${GA_ESTIMATOR:-metacount_mv}
 GA_ENGINE=${GA_ENGINE:-agds}
+GA_USE_BANDIT=0
+GA_USE_BANDIT_SA=0
+GA_USE_SA=0
 GA_N_RESTARTS=${GA_N_RESTARTS:-0}
 GA_PARALLEL_SEGMENTS=${GA_PARALLEL_SEGMENTS:-1}
 GA_SHARD_VARIANTS=${GA_SHARD_VARIANTS:-1}
@@ -55,6 +58,7 @@ STAGE2_MH_SEED=${STAGE2_MH_SEED:-42}
 STAGE2_MH_PROPOSAL_SCALE=${STAGE2_MH_PROPOSAL_SCALE:-1.0}
 GA_S5_MODE_VARIANTS=${GA_S5_MODE_VARIANTS:-nl;mnl}
 GA_S5_DEST_VARIANTS=${GA_S5_DEST_VARIANTS:-mnl;nl_dist}
+STAGE5_LC_GENES=${STAGE5_LC_GENES:-0}
 # Stage-5 overrun controls (see job_submit_ga_sharded.pbs header comments).
 GA_STAGE5_GENS=${GA_STAGE5_GENS:-}
 GA_STAGE5_RESTARTS=${GA_STAGE5_RESTARTS:-}
@@ -106,13 +110,14 @@ export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-1}
 export XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE:-false}
 export PYTHONWARNINGS="ignore::RuntimeWarning:jaxlib.plugin_support,ignore::RuntimeWarning:jaxlib"
 
-for _v in GA_BUDGET GA_ESTIMATOR GA_ENGINE GA_N_RESTARTS GA_PARALLEL_SEGMENTS \
+for _v in GA_BUDGET GA_ESTIMATOR GA_ENGINE GA_USE_BANDIT GA_USE_BANDIT_SA GA_USE_SA \
+         GA_N_RESTARTS GA_PARALLEL_SEGMENTS \
          GA_SHARD_VARIANTS GA_S4_VARIANTS GA_STAGE4_MXL_SEARCH GA_STAGE4_GENS \
          GA_STAGE4_RESTARTS GA_STAGE4_EARLY_STOP GA_STAGE4_EARLY_STOP_PATIENCE \
          GA_STAGE4_EARLY_STOP_MIN_GENS GA_SA2_GENS GA_SA2_RESTARTS \
          STAGE2_MH STAGE2_MH_BURN STAGE2_MH_DRAWS STAGE2_MH_THIN \
          STAGE2_MH_SEED STAGE2_MH_PROPOSAL_SCALE \
-         GA_S5_MODE_VARIANTS GA_S5_DEST_VARIANTS \
+         GA_S5_MODE_VARIANTS GA_S5_DEST_VARIANTS STAGE5_LC_GENES \
          GA_STAGE5_GENS GA_STAGE5_RESTARTS GA_STAGE0_GENS GA_STAGE0_RESTARTS GA_STAGE51_GENS GA_STAGE51_RESTARTS GA_STAGE5_STAG \
          GA_WALLTIME_MARGIN_SECONDS GA_STAGE5_RUN_MODE GA_STAGE5_RUN_DEST \
          GA_SEED GA_L1_L2_ALPHA STAGE5B_CA_FULLGRID_CASES \
@@ -140,6 +145,73 @@ ARGS=(--stage-id "${STAGE_ID}" --segment "${SHARD_SEGMENT}" \
       --run-root "${RUN_ROOT}" --run-tag "${RUN_TAG}")
 if [ "${GA_SHARD_VARIANTS}" = "0" ]; then
   ARGS+=(--no-variants)
+fi
+
+# ── Preflight: latent-class destination estimator must be importable ────────
+# STAGE5_LC_GENES=1 widens the destination chromosome with the LC gene block
+# (stage5_lc_genes), and every lc_on genome is scored by
+# SearchLibrium.estimate_dest_choice_lc. That function lives ONLY in the local
+# patch (_patches/SearchLibrium/mh_choice_estimator.py). When the installed
+# zigenv wheel shadows it, each LC genome raised
+#   ImportError: cannot import name 'estimate_dest_choice_lc'
+# inside fitness_fn, which the wrapper converts to the -1e9 failure sentinel --
+# so the job ran to completion while EVERY LC evaluation silently failed
+# (conv1 tour shards: 168/120/642 failed LC evals on work/nonmand/edu, and a
+# population mean_BIC/n of 9.25e8 from the leaked sentinel). Fail loudly here
+# instead: a green exit status that produced no latent-class model is worse than
+# an early abort.
+_LC_ON="${STAGE5_LC_GENES:-0}"
+if [ "${STAGE_ID}" = "5" ] && [ "${_LC_ON}" != "0" ]; then
+  echo "Preflight: STAGE5_LC_GENES=${_LC_ON} requires the patched SearchLibrium"
+  # In-place self-heal -- DISABLED by default.  It mutates the shared zigenv
+  # package: on 2026-10-17 a stray `pip install --upgrade SearchLibrium`
+  # replaced the 89333 B patched module with a 56160 B stock 0.0.261.  Stock
+  # 0.0.261 already ships estimate_dest_choice_lc, so the LC arm runs without
+  # identify_weak_features (the doctor is optional).  Set
+  # SEARCHLIBRIUM_SELFHEAL=1 only to deliberately copy the local patch over
+  # the installed module.
+  _SP="$HOME/miniconda3/envs/zigenv/lib/python3.12/site-packages/SearchLibrium"
+  _PATCH="${PBS_O_WORKDIR}/_patches/SearchLibrium/mh_choice_estimator.py"
+  if [ "${SEARCHLIBRIUM_SELFHEAL:-0}" != "0" ] \
+       && [ -f "$_PATCH" ] && [ -d "$_SP" ] \
+       && ! grep -q 'def identify_weak_features' "$_SP/mh_choice_estimator.py" 2>/dev/null; then
+    echo "Preflight: SEARCHLIBRIUM_SELFHEAL=1 - copying $_PATCH over installed module"
+    cp -p "$_PATCH" "$_SP/mh_choice_estimator.py" \
+      && { find "$_SP" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true; }
+    echo "Preflight: patched module size now $(wc -c < "$_SP/mh_choice_estimator.py") B"
+  fi
+  if ! python - <<'PYEOF'
+import sys
+try:
+    import SearchLibrium.mh_choice_estimator as M
+except Exception as _e:
+    print(f"  cannot import SearchLibrium.mh_choice_estimator: {_e!r}")
+    sys.exit(1)
+import os
+need = ["estimate_dest_choice_lc"]
+_doc = (os.environ.get("STAGE5_LC_DOCTOR", "0") or "0").strip().lower()
+if _doc not in ("0", "off", "no", "false", ""):
+    need.append("identify_weak_features")
+miss = [n for n in need if not hasattr(M, n)]
+if miss:
+    print(f"  installed SearchLibrium ({M.__file__}) lacks {miss}")
+    sys.exit(1)
+print(f"  OK: {M.__file__}")
+sys.exit(0)
+PYEOF
+  then
+    cat >&2 <<'MSG'
+FATAL: STAGE5_LC_GENES is on but the active SearchLibrium has no
+       estimate_dest_choice_lc -- every latent-class genome would fail with an
+       ImportError and be scored as the -1e9 sentinel.
+       (The identification doctor additionally needs identify_weak_features
+        only when STAGE5_LC_DOCTOR is reject/prune; it is disabled otherwise.)
+  Fix:  bash _install_patched_searchlibrium.sh
+     or:  export SEARCHLIBRIUM_SRC=<workdir>/_patches
+  Or resubmit with STAGE5_LC_GENES=0 to run without the LC destination arm.
+MSG
+    exit 3
+  fi
 fi
 
 python -u -X utf8 _run_ga_shard.py "${ARGS[@]}"

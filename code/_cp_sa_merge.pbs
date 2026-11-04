@@ -1,0 +1,18 @@
+#!/bin/bash
+#PBS -P FPAXJW8067
+#PBS -N cp_sa_merge
+#PBS -l select=1:ncpus=1:mem=8GB
+#PBS -l walltime=00:15:00
+#PBS -j oe
+#PBS -o cp_sa_merge.log
+
+SYNTH_POP=/home/ahernz/Paper_Plan/synth_pop
+cd "$SYNTH_POP" || exit 1
+source /home/ahernz/miniconda3/etc/profile.d/conda.sh
+conda activate syn_env
+
+export RESULTS_DIR="$SYNTH_POP/outputs/cp_pool_results"
+python -u "$SYNTH_POP/merge_cp_sa_summaries.py"
+rc=$?
+echo "MERGE_EXIT=$rc"
+exit $rc

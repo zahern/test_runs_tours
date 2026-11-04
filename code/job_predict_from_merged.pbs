@@ -38,7 +38,7 @@
 #PBS -N ga_predict_merged
 #PBS -m n
 #PBS -r y
-#PBS -l select=1:ncpus=8:mem=190GB
+#PBS -l select=1:ncpus=8:mem=400GB
 #PBS -l walltime=20:00:00
 
 set -euo pipefail
@@ -108,6 +108,12 @@ export GA_STAGED_REUSE_ESTIMATOR=1
 export GA_STAGED_GA_DIR="${MERGED_DIR}"
 export PIPELINE_RUN_TAG="${OUTPUT_RUN_TAG}"
 export PIPELINE_RUN_ROOT="runs"
+# Stage-3 predict runs person-chunked in run_stage3 (runs/ga_parallel reuse flow);
+# smaller chunk = lower peak RSS. 128GB was too small (OOM at 133.9GB, 22/10).
+# 192GB was also too small: OOM-killed at 195.8GB at the Stage-5/6 vectorised
+# prediction step (22/10, exit 137), i.e. the peak is set by the full-population
+# pass, not the stage-3 chunks. 400GB gives real margin (queue allows up to 16TB).
+export STAGE3_PREDICT_CHUNK=${STAGE3_PREDICT_CHUNK:-250000}
 
 # Reuse the same population/skims convention as the shard search.
 export NEW_POP=${NEW_POP:-1}

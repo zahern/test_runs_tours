@@ -130,7 +130,7 @@ def shard_keep(stage: int, segment_key: str) -> bool:
 S4_VARIANTS_DEFAULT = ["rrm", "tdd"]
 S4_VARIANTS_ALL = ["rrm", "tdd", "mnl", "ordered", "hybrid", "mxl"]
 S5_MODE_VARIANTS_DEFAULT = ["nl", "mnl"]
-S5_MODE_VARIANTS_ALL = ["nl", "mnl", "mxl", "gse"]
+S5_MODE_VARIANTS_ALL = ["nl", "mnl", "mxl", "gse", "lccm"]
 S5_DEST_VARIANTS_DEFAULT = ["mnl", "nl_dist"]
 S5_DEST_VARIANTS_ALL = ["mnl", "nl_dist", "exploded"]
 
@@ -169,6 +169,7 @@ VARIANT_GROUPS = {
     ("s4", "tdd"): "s4-joint",
     ("s5mode", "nl"): "s5mode",
     ("s5mode", "mnl"): "s5mode",
+    ("s5mode", "lccm"): "s5mode",
     ("s5mode", "mxl"): "s5mode-mxl",
     ("s5mode", "gse"): "s5mode-mxl",
     ("s5dest", "mnl"): "s5dest",
@@ -191,6 +192,7 @@ VARIANT_DESCRIPTIONS = {
     ("s4", "hybrid"): "Hybrid RUM-RRM regret choice",
     ("s5mode", "nl"): "Nested logit Motor/NonMotor (default structure)",
     ("s5mode", "mnl"): "Flat MNL (no nests)",
+    ("s5mode", "lccm"): "Latent class (2-class) mode choice, BIC-comparable",
     ("s5mode", "mxl"): "Mixed logit, random coefficients (needs converged base)",
     ("s5mode", "gse"): "GSE mixed logit (systematic gamma*g loadings + mixtures)",
     ("s5dest", "mnl"): "Sampled-choice MNL destination (default)",

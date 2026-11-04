@@ -1,19 +1,22 @@
-"""GSE structured random-parameter pilot (metacountregressor>=1.0.151).
+"""GSE structured random-parameter pilot (metacountregressor>=1.0.177).
 
 Unrestricted random-parameter blocks keep failing the significance verdict
 (degenerate means, n.s. SDs; see eb_searched_verdict.csv: REJECT/REJECT).
-1.0.151 exposes the canonical structural equation
+1.0.177 exposes the canonical structural equation
 (beta_nk = T(beta_k + delta'z_n + gamma*g_nk + exp(lnsig_k + omega'w_n)*nu))
 via manual_spec keys hetro_in_means / hetro_in_variances / gse_cols+gse_scores
-(see random_parameter_structure.py in the 1.0.151 wheel).
+(see random_parameter_structure.py in the 1.0.177 wheel).
 
 Arms per response (searched specs; HB 10 vars / crash 8 vars; same MCR roles
 as run_rp_check.py; R=200 Halton draws; log_len offset):
   A  unstructured RP ............... baseline replicate (expect REJECT)
-  B  + hetro_in_means [AADT, SL] .... exposure-like mean helpers
-  C  + hetro_in_means + hetro_in_variances [AADT, SL]
-  D  + GSE gradient scores ......... best-effort; SKIP with reason on any
+  B  + hetro_in_means [distinct helpers] .... mean heterogeneity
+  C  + hetro_in_means + hetro_in_variances [distinct helpers]
+  D  + GSE gradient scores only ...... best-effort; SKIP with reason on any
                                      API failure (never fails the job)
+
+Per-term distributions (no forced normal): lognormal for positive-only effects.
+Heterogeneity helpers must be DISTINCT from fixed/random (MCR 1.0.177 role exclusivity).
 
 Estimation mirrors nearmiss_hb_analysis.fit_model exactly (standardise,
 build_model_from_manual_spec, L-BFGS-B 5000, JAX SEs w/ scipy fallback).
@@ -36,18 +39,23 @@ from scipy.special import gammaln
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MCR_MIN_VERSION = (1, 0, 165)
+MCR_MIN_VERSION = (1, 0, 177)
 ALPHA = 0.10
 
 HB_FEATS = ["AADT", "IC", "IP", "IV_M", "PA_COM1",
             "PSDSG24", "RSDSDL5", "RSDSO", "SKD_SP", "SL"]
 CRASH_FEATS = ["AADT", "IP", "MEDSFBar", "PSDS1T24", "PSDSNIL",
                "RSDSDG10", "RSDSDL5", "SL"]
-HB_RDM = ["IC:normal", "IV_M:normal"]
+# Per-term distributions (not forced normal). lognormal for positive-only effects.
+HB_RDM = ["IC:normal", "IV_M:lognormal"]
 HB_RDM_COR = ["PA_COM1:normal", "RSDSO:normal", "RSDSDL5:normal"]
-CR_RDM = ["PSDS1T24:normal", "RSDSDG10:normal"]
+CR_RDM = ["PSDS1T24:lognormal", "RSDSDG10:lognormal"]
 CR_RDM_COR = ["SL:normal", "RSDSDL5:normal"]
-HELPERS = ["AADT", "SL"]  # exposure-like helpers for means and variances
+# Heterogeneity helpers must be DISTINCT from the fixed/random terms
+# (MCR 1.0.177 role exclusivity): a variable cannot be both fixed and a
+# hetro_in_means/variances helper. Pick helpers outside each spec.
+HB_HELPERS = ["IV_VL", "NL", "IV_L"]      # not in HB fixed/random
+CR_HELPERS = ["NL", "SKD_SP", "IV_L"]     # not in Crash fixed/random
 
 
 def _gate():
@@ -61,13 +69,13 @@ def _gate():
         ver = _pkg_version("metacountregressor")
     except Exception:
         ver = getattr(mcr, "__version__", "0.0.0")
-    print(f"metacountregressor {ver} (required >= 1.0.165)", flush=True)
+    print(f"metacountregressor {ver} (required >= 1.0.177)", flush=True)
     try:
         tup = tuple(int(x) for x in ver.split(".")[:3])
     except ValueError:
         tup = (0, 0, 0)
     if tup < MCR_MIN_VERSION:
-        print(f"FATAL: metacountregressor {ver} < 1.0.165 -- refusing to run",
+        print(f"FATAL: metacountregressor {ver} < 1.0.177 -- refusing to run",
               flush=True)
         sys.exit(2)
 
@@ -103,6 +111,7 @@ def _unified_pbic(m):
 
     ct = m["coef_table"]
     main = ct[~ct["Variable"].str.startswith(("RND", "chol(", "param", "ln("))
+               & ~ct["Variable"].isin(["(Intercept)", "alpha"])
                & (ct["Variable"] != "(Intercept)")]
     n_fix = int(((main["p"] > ALPHA) | main["p"].isna()).sum())
     sd_rows = ct[ct["Variable"].str.startswith("RND sd(")]
@@ -119,8 +128,12 @@ def _unified_pbic(m):
     n_chol = int(((chol_rows["p"] > ALPHA) | chol_rows["p"].isna()).sum()) if len(chol_rows) else 0
     mean_rows = ct[ct["Variable"].str.startswith("RND mean(")]
     n_degen = int((mean_rows["Estimate"].abs() >= 5).sum()) if len(mean_rows) else 0
+    # dispersion is labelled "alpha" (display scale) in these tables
+    # (older tables used "ln(overdispersion)"): accept either
     try:
-        disp_p = float(ct.set_index("Variable").loc["ln(overdispersion)", "p"])
+        _cti = ct.set_index("Variable")
+        _dp = _cti.loc["alpha", "p"] if "alpha" in _cti.index else _cti.loc["ln(overdispersion)", "p"]
+        disp_p = float(_dp)
     except KeyError:
         disp_p = float("nan")
     n_disp = 0 if (pd.notna(disp_p) and disp_p <= ALPHA) else 1
@@ -129,7 +142,7 @@ def _unified_pbic(m):
 
 
 def _fit_structured(df, feats, y_col, label, rdm, rdm_cor, helpers,
-                    variances_on, gse_pack, draws_R=200):
+                    variances_on, gse_pack, draws_R=500):
     """Structured-RP fit mirroring fit_model; returns (model_dict, verdict)."""
     from sklearn.preprocessing import StandardScaler
     from scipy.optimize import minimize as scipy_min
@@ -159,24 +172,79 @@ def _fit_structured(df, feats, y_col, label, rdm, rdm_cor, helpers,
 
     rdm_s = _remap(rdm)
     rdmc_s = _remap(rdm_cor)
-    help_s = [col2f[h] for h in helpers if h in col2f]
+
+    # Random parameters replace their fixed effects
+    rdm_bases = {t.split(":")[0] for t in (rdm or []) + (rdm_cor or [])}
+    fstd_active = [col2f[f] for f in feats if f not in rdm_bases]
+
+    # Heterogeneity helpers under 1.0.177 role exclusivity: a helper must be
+    # a DISTINCT variable (cannot also be fixed or random). In-spec helpers
+    # are skipped; out-of-spec helpers get dedicated __h{i}__ columns
+    # (centred, orthogonalised against the fixed design, scaled).
+    _used_bases = set(fstd_active) | {t.split(":")[0] for t in (rdm_s or []) + (rdmc_s or [])}
+    help_s = []
+    for hi, h in enumerate(helpers or []):
+        if h not in df_m.columns:
+            continue
+        # In-spec helper (already fixed or random) is illegal under 1.0.177
+        # role exclusivity -> skip it. Out-of-spec helpers (present in the
+        # data but not in this spec) get a dedicated __h{i}__ column.
+        if h in col2f and col2f[h] in _used_bases:
+            continue
+        v = df_m[h].values.astype(float)
+        v = v - v.mean()
+        X_fixed = df_m[fstd_active].values if fstd_active else np.ones((len(df_m), 1))
+        X_fixed = np.column_stack([np.ones(len(df_m)), X_fixed])
+        beta, *_ = np.linalg.lstsq(X_fixed, v, rcond=None)
+        resid = v - X_fixed @ beta
+        resid = resid - resid.mean()
+        if resid.std() > 1e-12:
+            resid = resid / resid.std()
+        hc = f"__h{hi}__"
+        df_m[hc] = resid
+        help_s.append(hc)
+    if (helpers or []) and not help_s:
+        # all requested helpers were in-spec: heterogeneity inexpressible
+        # under 177 exclusivity with these helpers
+        raise RuntimeError(
+            "SKIP: het helpers " + ",".join(helpers or []) +
+            " overlap the fixed/random spec (1.0.177 role exclusivity)")
+
+    # 177+ also forbids one column under TWO hetro roles: means and variances
+    # need DISTINCT columns -> clone the orthogonalised helpers as __hv{i}__.
+    het_var_s = []
+    if variances_on:
+        for vi, hc in enumerate(help_s):
+            hvc = f"__hv{vi}__"
+            df_m[hvc] = df_m[hc].values
+            het_var_s.append(hvc)
 
     y_raw = df_m[y_col].values.astype(float)
     df_m["_id"] = np.arange(len(df_m))
     df_m["_off"] = df_m["log_len"].values.astype(float)
 
     manual_spec = {
-        "fixed_terms": fstd, "rdm_terms": rdm_s, "rdm_cor_terms": rdmc_s,
+        "fixed_terms": fstd_active, "rdm_terms": rdm_s, "rdm_cor_terms": rdmc_s,
         "grouped_terms": [],
         "hetro_in_means": help_s,
-        "hetro_in_variances": help_s if variances_on else [],
-        "transformations": ["no"] * len(fstd),
+        "hetro_in_variances": het_var_s,
+        "transformations": ["no"] * len(fstd_active),
         "dispersion": 1, "latent_classes": 1,
     }
     if gse_pack is not None:
-        gcols, gscores = gse_pack
-        manual_spec["gse_cols"] = gcols
-        manual_spec["gse_scores"] = np.asarray(gscores, dtype=float)
+        _, gscores = gse_pack
+        G = np.asarray(gscores, dtype=float)
+        if G.ndim != 2:
+            raise RuntimeError("SKIP: GSE scores must be (N, K_random)")
+        # Distinct __g{i}__ columns (order = cor-block then ind-block, as
+        # scored) to satisfy 177 role exclusivity; mapping is positional.
+        g_new = []
+        for gi in range(G.shape[1]):
+            gc = f"__g{gi}__"
+            df_m[gc] = G[:, gi]
+            g_new.append(gc)
+        manual_spec["gse_cols"] = g_new
+        manual_spec["gse_scores"] = G
 
     data, spec = build_model_from_manual_spec(
         df_m, manual_spec, id_col="_id", y_col=y_col, offset_col="_off",
@@ -189,6 +257,7 @@ def _fit_structured(df, feats, y_col, label, rdm, rdm_cor, helpers,
     init = np.zeros(K)
     init[pi["fixed"][0]:pi["fixed"][1]] = 0.0
     init[pi["fixed"][0]] = np.log(max(y_raw.mean(), 0.01))
+    # SDs and Cholesky init at 0.0 -> exp(0)=1 SD, zero correlation
     for key in ("ind_mean", "ind_sd", "cor_mean", "chol", "group_mean",
                 "group_sd", "het_mean", "het_var", "het_gamma", "gamma_gse",
                 "gse_gamma"):
@@ -199,24 +268,114 @@ def _fit_structured(df, feats, y_col, label, rdm, rdm_cor, helpers,
     def obj(p):
         return float(mixed_model_loglik(jnp.array(p), data, spec, indivi=False))
 
-    res = scipy_min(obj, init, method="L-BFGS-B", options={"maxiter": 5000})
-    params = res.x
+    # Multi-start: jitter fixed effects and SD blocks; keep best LL.
+    best_params = None
+    best_ll = -np.inf
+    best_se = None
+    rng = np.random.default_rng(12345)
+    for attempt in range(5):
+        if attempt == 0:
+            start = init
+        else:
+            start = init.copy()
+            f_start, f_end = pi["fixed"]
+            start[f_start:f_end] += rng.normal(0, 0.1, size=f_end - f_start)
+            for key in ("ind_sd", "chol", "group_sd"):
+                if key in pi:
+                    s, e = pi[key]
+                    start[s:e] += rng.normal(0, 0.2, size=e - s)
+        res = scipy_min(obj, start, method="L-BFGS-B", options={"maxiter": 5000})
+        if res.success:
+            ll_attempt = -obj(res.x)
+            if ll_attempt > best_ll:
+                best_ll = ll_attempt
+                best_params = res.x
+                try:
+                    se_jax = np.asarray(compute_standard_errors(jnp.array(res.x), obj))
+                    if np.isfinite(se_jax).any() and np.nanmax(np.abs(se_jax)) < 50:
+                        best_se = se_jax
+                except Exception:
+                    pass
+    if best_params is None:
+        best_params = res.x
+        best_se = None
+    params = best_params
     n = len(df_m)
-    ll = -obj(params)
+    ll = best_ll
     bic = K * np.log(n) - 2 * ll
 
-    try:
-        se_jax = np.asarray(compute_standard_errors(jnp.array(params), obj))
-        se = se_jax if (np.isfinite(se_jax).any()
-                        and np.nanmax(np.abs(se_jax)) < 50) else None
-    except Exception:
-        se = None
-    if se is None:
-        se = _scipy_hessian_se(obj, params)
-    se = np.where(np.abs(se) > 50, np.nan, se)
-    z = np.where(np.isfinite(se) & (se > 1e-12), params / se, np.nan)
-    p = np.where(np.isfinite(z), 2 * (1 - scipy_stats.norm.cdf(np.abs(z))),
-                 np.nan)
+    if best_se is None:
+        best_se = _scipy_hessian_se(obj, params)
+    se = np.where(np.abs(best_se) > 50, np.nan, best_se)
+
+    # z/p on RAW scale initially; will be overridden for SD/chol/disp rows below
+    z_raw = np.where(np.isfinite(se) & (se > 1e-12), params / se, np.nan)
+    p_raw = np.where(np.isfinite(z_raw), 2 * (1 - scipy_stats.norm.cdf(np.abs(z_raw))),
+                     np.nan)
+
+    # Delta-method display transforms for SD/chol/dispersion
+    def _exp_display(raw, se_raw, clip_lo=-12.0, clip_hi=6.0):
+        raw = np.asarray(raw, dtype=float)
+        se_raw = np.asarray(se_raw, dtype=float)
+        clipped = np.clip(raw, clip_lo, clip_hi)
+        disp = np.exp(clipped)
+        return disp, disp * se_raw
+
+    def _disp_display(raw, se_raw):
+        raw = np.asarray(raw, dtype=float)
+        se_raw = np.asarray(se_raw, dtype=float)
+        clipped = np.clip(raw, -12.0, 12.0)
+        disp = np.exp(clipped)
+        return disp, disp * se_raw
+
+    est = params[:K].copy()
+    se_disp = se[:K].copy()
+    z_disp = z_raw[:K].copy()
+    p_disp = p_raw[:K].copy()
+
+    if "ind_sd" in pi:
+        ss, es = pi["ind_sd"]
+        sd_disp, sd_se = _exp_display(params[ss:es], se[ss:es])
+        est[ss:es] = sd_disp
+        se_disp[ss:es] = sd_se
+        z_disp[ss:es] = np.where(np.isfinite(sd_se) & (sd_se > 1e-12),
+                                 sd_disp / sd_se, np.nan)
+        p_disp[ss:es] = np.where(np.isfinite(z_disp[ss:es]),
+                                 2*(1-scipy_stats.norm.cdf(np.abs(z_disp[ss:es]))), np.nan)
+
+    if "chol" in pi:
+        s_ch, e_ch = pi["chol"]
+        mcor = len(rdmc_s)
+        if mcor > 0:
+            diag_offsets = [i * (i + 3) // 2 for i in range(mcor)]
+            chol_disp = params[s_ch:e_ch].copy()
+            chol_se = se[s_ch:e_ch].copy()
+            chol_z = z_raw[s_ch:e_ch].copy()
+            chol_p = p_raw[s_ch:e_ch].copy()
+            for d_idx in diag_offsets:
+                if d_idx < (e_ch - s_ch):
+                    d_raw = params[s_ch + d_idx]
+                    d_se = se[s_ch + d_idx]
+                    d_disp, d_se_disp = _exp_display(d_raw, d_se)
+                    chol_disp[d_idx] = d_disp
+                    chol_se[d_idx] = d_se_disp
+                    chol_z[d_idx] = d_disp / d_se_disp if (np.isfinite(d_se_disp) and d_se_disp > 1e-12) else np.nan
+                    chol_p[d_idx] = 2*(1-scipy_stats.norm.cdf(abs(chol_z[d_idx]))) if np.isfinite(chol_z[d_idx]) else np.nan
+            est[s_ch:e_ch] = chol_disp
+            se_disp[s_ch:e_ch] = chol_se
+            z_disp[s_ch:e_ch] = chol_z
+            p_disp[s_ch:e_ch] = chol_p
+
+    if "dispersion" in pi:
+        dpos = pi["dispersion"]
+        dpos = dpos[0] if isinstance(dpos, (tuple, list)) else int(dpos)
+        d_raw = params[dpos]
+        d_se = se[dpos]
+        d_disp, d_se_disp = _disp_display(d_raw, d_se)
+        est[dpos] = d_disp
+        se_disp[dpos] = d_se_disp
+        z_disp[dpos] = d_disp / d_se_disp if (np.isfinite(d_se_disp) and d_se_disp > 1e-12) else np.nan
+        p_disp[dpos] = 2*(1-scipy_stats.norm.cdf(abs(z_disp[dpos]))) if np.isfinite(z_disp[dpos]) else np.nan
 
     # names mirror fit_model: fixed, RND means/SDs, Cholesky; any extra
     # 1.0.151 hetro/gse blocks fall through to generic param{i} labels
@@ -239,25 +398,29 @@ def _fit_structured(df, feats, y_col, label, rdm, rdm_cor, helpers,
     if "chol" in pi:
         s_ch, e_ch = pi["chol"]
         n_ch = e_ch - s_ch
-        mcor = len(rdm_cor)
+        mcor = len(rdmc_s)
         if mcor and n_ch == mcor * (mcor + 1) // 2:
-            cvars = [_V(t.split(":")[0]) for t in rdm_cor]
+            cvars = [_V(t.split(":")[0]) for t in rdmc_s]
             for i in range(mcor):
                 for j in range(i + 1):
                     chol_names.append(f"chol({cvars[i]}|{cvars[j]})")
-    names_full = (["(Intercept)"] + [_V(f) for f in feats]
+    # Random parameters replace their fixed effects: fixed names cover the
+    # active (non-random) vars only, aligned to the fixed param block.
+    rdm_bases_all = {t.split(":")[0] for t in (rdm or []) + (rdm_cor or [])}
+    active_labels = [_V(f) for f in feats if f not in rdm_bases_all]
+    names_full = (["(Intercept)"] + active_labels
                   + rdm_mean_names + rdm_sd_names + chol_names)
     if "dispersion" in pi:
         dpos = pi["dispersion"]
         dpos = dpos[0] if isinstance(dpos, (tuple, list)) else int(dpos)
         for j in range(len(names_full), dpos):
             names_full.append(f"param{j}")
-        names_full.append("ln(overdispersion)")
+        names_full.append("alpha")  # displayed scale alpha
     if len(names_full) < K:
         names_full += [f"param{i}" for i in range(len(names_full), K)]
     names_full = names_full[:K]
-    ct = pd.DataFrame({"Variable": names_full, "Estimate": params[:K],
-                       "Std.Err": se[:K], "z": z[:K], "p": p[:K]})
+    ct = pd.DataFrame({"Variable": names_full, "Estimate": est,
+                       "Std.Err": se_disp, "z": z_disp, "p": p_disp})
 
     sd_rows = ct[ct["Variable"].str.startswith("RND sd(")]
     mean_rows = ct[ct["Variable"].str.startswith("RND mean(")]
@@ -266,13 +429,13 @@ def _fit_structured(df, feats, y_col, label, rdm, rdm_cor, helpers,
         sd_rows = ct[ct["Variable"].str.contains("sd", case=False)
                      & ~ct["Variable"].isin(["(Intercept)"]
                                             + [_V(f) for f in feats]
-                                            + ["ln(overdispersion)"])]
+                                            + ["alpha"])]
     ok_sd = bool((sd_rows["p"] < ALPHA).all()) if len(sd_rows) else True
     ok_mean = True
     if len(mean_rows):
         ok_mean = bool((mean_rows["Estimate"].abs() < 5).all())
     try:
-        disp_p = float(ct.set_index("Variable").loc["ln(overdispersion)", "p"])
+        disp_p = float(ct.set_index("Variable").loc["alpha", "p"])
     except KeyError:
         disp_p = np.nan
     # guard: if random terms were requested but no RND rows were labelled
@@ -283,7 +446,9 @@ def _fit_structured(df, feats, y_col, label, rdm, rdm_cor, helpers,
                 "verdict": "NO-RND-ROWS", "ok_sd": "", "ok_mean": "",
                 "disp_p": disp_p}, ct
     try:
-        disp_p = float(ct.set_index("Variable").loc["ln(overdispersion)", "p"])
+        _cti2 = ct.set_index("Variable")
+        _dp2 = _cti2.loc["alpha", "p"] if "alpha" in _cti2.index else _cti2.loc["ln(overdispersion)", "p"]
+        disp_p = float(_dp2)
     except KeyError:
         disp_p = np.nan
     ok_disp = bool(disp_p < ALPHA) if np.isfinite(disp_p) else False
@@ -298,34 +463,53 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default=os.path.join(HERE, "near_miss_hb_ecf.csv"))
     ap.add_argument("--out-dir", default=HERE)
+    ap.add_argument("--arms", default="A-unstruct,B-hetmean,C-hetmeanvar,D-gse",
+                    help="comma list of arms to run; strict subsets write "
+                         "gse_rp_pilot_partial.* sidecars instead of the "
+                         "full-run aggregates")
+    ap.add_argument("--tags", default="HB,Crash",
+                    help="comma list of response tags to run, e.g. Crash")
+    ap.add_argument("--suffix", default="",
+                    help="explicit output suffix override, e.g. _partial_abd")
     args = ap.parse_args()
+    sel = [a.strip() for a in args.arms.split(",") if a.strip()]
+    tagsel = [t.strip() for t in args.tags.split(",") if t.strip()]
+    _all_arms = ["A-unstruct", "B-hetmean", "C-hetmeanvar", "D-gse"]
+    suffix = (args.suffix if args.suffix else
+              ("" if all(a in sel for a in _all_arms) else "_partial"))
     _gate()
 
     import pandas as pd
     from nearmiss_hb_analysis import fit_model
     df = pd.read_csv(args.data, low_memory=False)
-    for c in sorted(set(HB_FEATS) | set(CRASH_FEATS)):
+    _need = (set(HB_FEATS) | set(CRASH_FEATS)
+             | set(HB_HELPERS) | set(CR_HELPERS))
+    for c in sorted(_need):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
     nm_col = "nm_total" if "nm_total" in df.columns else "HB_Total"
     print(f"Loaded {len(df)} rows; HB col={nm_col}", flush=True)
 
     rows, verdicts = [], []
-    for y_col, tag, feats, rdm, rdmc in [
-        (nm_col, "HB", HB_FEATS, HB_RDM, HB_RDM_COR),
-        ("ObsCrashes", "Crash", CRASH_FEATS, CR_RDM, CR_RDM_COR),
+    for y_col, tag, feats, rdm, rdmc, helpers in [
+        (nm_col, "HB", HB_FEATS, HB_RDM, HB_RDM_COR, HB_HELPERS),
+        ("ObsCrashes", "Crash", CRASH_FEATS, CR_RDM, CR_RDM_COR, CR_HELPERS),
     ]:
+        if tag not in tagsel:
+            continue
         # fixed reference (same estimator as reported best models)
         m0 = fit_model(df, feats, y_col, "log_len", label=f"{tag}-fixed")
         # Arms A/B/C: unstructured | +hetro_in_means | +means+variances
-        for arm, helpers, var_on, gse in [
+        for arm, h, var_on, gse in [
             ("A-unstruct", [], False, None),
-            ("B-hetmean", HELPERS, False, None),
-            ("C-hetmeanvar", HELPERS, True, None),
+            ("B-hetmean", helpers, False, None),
+            ("C-hetmeanvar", helpers, True, None),
         ]:
+            if arm not in sel:
+                continue
             try:
                 m, _ = _fit_structured(df, feats, y_col, f"{tag}-{arm}",
-                                       rdm, rdmc, helpers, var_on, gse)
+                                       rdm, rdmc, h, var_on, gse)
                 pb, ni = _unified_pbic(m)
                 rows.append({"model": f"{tag}-{arm}", "ll": m["ll"],
                              "bic": m["bic"], "pbic": pb, "n_insig": ni,
@@ -344,53 +528,55 @@ def main():
                 verdicts.append({"model": f"{tag}-{arm}", "verdict": f"ERROR: {e}",
                                  "ok_sd": "", "ok_mean": "", "disp_p": ""})
         # Arm D: GSE scores (best-effort; SKIP on any API failure)
-        try:
-            mf = fit_model(df, feats, y_col, "log_len", label=f"{tag}-fx-gse")
-            mu = np.exp(np.clip(
-                mf["params"][0] + mf["scaler"].transform(
-                    df.dropna(subset=feats + [y_col, "log_len"])[feats].values.astype(float)
-                ) @ mf["params"][1:len(feats) + 1]
-                + df.dropna(subset=feats + [y_col, "log_len"])["log_len"].values, -20, 20))
-            yy = df.dropna(subset=feats + [y_col, "log_len"])[y_col].values.astype(float)
-            G = _nb2_grad_scores(yy, mu, mf["alpha"],
-                                 mf["scaler"].transform(
-                                     df.dropna(subset=feats + [y_col, "log_len"])[feats].values.astype(float)))
-            # G must be (N, K_random) in cor-then-ind order (MCR build_eta
-            # validates G.shape[-1] == Kr_cor + Kr_ind). Slice the full
-            # J-feat gradient scores down to the random-coefficient order.
-            rand_order = [t.split(":")[0] for t in rdmc] + [
-                t.split(":")[0] for t in rdm]
-            ridx = [feats.index(b) for b in rand_order]
-            G = np.asarray(G)[:, ridx]
-            gcols = [f"__f{i}__" for i in ridx]
-            m, _ = _fit_structured(df, feats, y_col, f"{tag}-D-gse",
-                                   rdm, rdmc, HELPERS, True, (gcols, G))
-            pb, ni = _unified_pbic(m)
-            rows.append({"model": f"{tag}-D-gse", "ll": m["ll"], "bic": m["bic"],
-                         "pbic": pb, "n_insig": ni,
-                         "k": m["k"], "n": m["n"], "converged": m["converged"]})
-            verdicts.append({"model": f"{tag}-D-gse", "verdict": m["verdict"],
-                             "ok_sd": m["ok_sd"], "ok_mean": m["ok_mean"],
-                             "disp_p": m["disp_p"]})
-            print(f"[{tag}-D-gse] BIC={m['bic']:.1f} pBIC={pb:.1f} "
-                  f"-> {m['verdict']}", flush=True)
-        except Exception as e:  # noqa: BLE001
-            print(f"[{tag}-D-gse] SKIP: {e}", flush=True)
-            verdicts.append({"model": f"{tag}-D-gse", "verdict": "SKIP",
-                             "ok_sd": "", "ok_mean": "", "disp_p": ""})
+        if "D-gse" in sel:
+            try:
+                mf = fit_model(df, feats, y_col, "log_len", label=f"{tag}-fx-gse")
+                mu = np.exp(np.clip(
+                    mf["params"][0] + mf["scaler"].transform(
+                        df.dropna(subset=feats + [y_col, "log_len"])[feats].values.astype(float)
+                    ) @ mf["params"][1:len(feats) + 1]
+                    + df.dropna(subset=feats + [y_col, "log_len"])["log_len"].values, -20, 20))
+                yy = df.dropna(subset=feats + [y_col, "log_len"])[y_col].values.astype(float)
+                G = _nb2_grad_scores(yy, mu, mf["alpha"],
+                                     mf["scaler"].transform(
+                                         df.dropna(subset=feats + [y_col, "log_len"])[feats].values.astype(float)))
+                # G must be (N, K_random) in cor-then-ind order (MCR build_eta
+                # validates G.shape[-1] == Kr_cor + Kr_ind). Slice the full
+                # J-feat gradient scores down to the random-coefficient order.
+                rand_order = [t.split(":")[0] for t in rdmc] + [
+                    t.split(":")[0] for t in rdm]
+                ridx = [feats.index(b) for b in rand_order]
+                G = np.asarray(G)[:, ridx]
+                gcols = [f"__f{i}__" for i in ridx]
+                # No hetro helpers in D-gse to avoid role-exclusivity conflicts
+                m, _ = _fit_structured(df, feats, y_col, f"{tag}-D-gse",
+                                       rdm, rdmc, [], False, (gcols, G))
+                pb, ni = _unified_pbic(m)
+                rows.append({"model": f"{tag}-D-gse", "ll": m["ll"], "bic": m["bic"],
+                             "pbic": pb, "n_insig": ni,
+                             "k": m["k"], "n": m["n"], "converged": m["converged"]})
+                verdicts.append({"model": f"{tag}-D-gse", "verdict": m["verdict"],
+                                 "ok_sd": m["ok_sd"], "ok_mean": m["ok_mean"],
+                                 "disp_p": m["disp_p"]})
+                print(f"[{tag}-D-gse] BIC={m['bic']:.1f} pBIC={pb:.1f} "
+                      f"-> {m['verdict']}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[{tag}-D-gse] SKIP: {e}", flush=True)
+                verdicts.append({"model": f"{tag}-D-gse", "verdict": "SKIP",
+                                 "ok_sd": "", "ok_mean": "", "disp_p": ""})
         rows.append({"model": f"{tag}-fixed", "ll": m0["ll"], "bic": m0["bic"],
                      "pbic": float(m0["bic"]), "n_insig": 0,
                      "k": m0["k"], "n": m0["n"], "converged": m0["converged"]})
 
-    pd.DataFrame(rows).to_csv(os.path.join(args.out_dir, "gse_rp_pilot.csv"),
+    pd.DataFrame(rows).to_csv(os.path.join(args.out_dir, f"gse_rp_pilot{suffix}.csv"),
                               index=False)
     pd.DataFrame(verdicts).to_csv(os.path.join(args.out_dir,
-                                               "gse_rp_pilot_verdict.csv"), index=False)
-    with open(os.path.join(args.out_dir, "gse_rp_pilot.tex"), "w") as f:
-        f.write("% Auto-generated by gse_rp_pilot.py (1.0.151 structured RP)\n")
+                                               f"gse_rp_pilot_verdict{suffix}.csv"), index=False)
+    with open(os.path.join(args.out_dir, f"gse_rp_pilot{suffix}.tex"), "w") as f:
+        f.write("% Auto-generated by gse_rp_pilot.py (structured RP pilot)\n")
         f.write("\\begin{table}[!ht]\n")
-        f.write("  \\caption{Structured random-parameter pilot (1.0.151 "
-                "structural equation; $N=10{,}780$, $R=200$ Halton draws; "
+        f.write("  \\caption{Structured random-parameter pilot (metacountregressor "
+                "structural equation; $N=10{,}780$, $R=500$ Halton draws; "
                 "verdict: every retained SD $p<0.10$, $|$mean$|<5$, "
                 "dispersion $p<0.10$)}\\label{tab:gse_rp_pilot}\n")
         f.write("  \\begin{center}\n    \\begin{tabular}{lrrrrrc}\n")
@@ -407,8 +593,8 @@ def main():
                         f"& {int(r['k'])} & {r['pbic'] - base:+,.1f} & {v} \\\\\n")
         f.write("      \\bottomrule\n    \\end{tabular}\n  \\end{center}\n")
         f.write("\\end{table}\n")
-    print("Wrote gse_rp_pilot.csv / gse_rp_pilot_verdict.csv / gse_rp_pilot.tex",
-          flush=True)
+    print(f"Wrote gse_rp_pilot{suffix}.csv / gse_rp_pilot_verdict{suffix}.csv / "
+          f"gse_rp_pilot{suffix}.tex", flush=True)
 
 
 if __name__ == "__main__":

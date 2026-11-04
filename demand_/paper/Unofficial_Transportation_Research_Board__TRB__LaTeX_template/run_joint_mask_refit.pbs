@@ -5,14 +5,14 @@
 #PBS -j oe
 #PBS -r n
 # Significance pruning for the Gumbel joint-searched masks (promoted
-# eb_search_joint_best.csv: HB 25 / crash 16 vars). The joint search scores
+# eb_search_joint_best.csv: HB 17 / crash 13 vars, mcr 1.0.177). Joint search scores
 # raw joint BIC with no per-coefficient penalty, so its masks are large;
 # this job refits each mask as fixed-effect NB (VMT-years exposure offset)
 # and backward-eliminates to p<0.10, supplying the coefficient tables +
 # significance verdicts the search itself does not record.
 # Outputs (project root = paper inputs, auto-populate the gated tables):
 #   joint_mask_refit_{hb,crash}.tex/.csv, joint_mask_refit_verdict.csv
-# Est: minutes to ~2h on 4 cpus (HB-25 elimination dominates).
+# Est: minutes to ~2h on 4 cpus (HB-17 elimination dominates).
 
 PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template
 module purge
@@ -24,7 +24,7 @@ module unload Anaconda3
 mkdir -p /mnt/hpccs01/home/ahernz/test_runs_tours/code
 (
     flock -w 900 9 2>/dev/null || echo "(flock unavailable, proceeding without lock)"
-    pip install --quiet --upgrade --retries 5 --timeout 60 "metacountregressor==1.0.154" 2>&1 | tail -5
+    pip install --quiet --upgrade --retries 5 --timeout 60 metacountregressor 2>&1 | tail -5
 ) 9>/mnt/hpccs01/home/ahernz/test_runs_tours/code/.pkg_upgrade.lock
 # Hard gate (this file has NO `set -e`, so a bare failing assert would NOT stop
 # the job -- reads distribution metadata, NOT m.__version__).
@@ -46,3 +46,5 @@ for f in "$PROJ_DIR/joint_mask_refit_hb.tex" "$PROJ_DIR/joint_mask_refit_hb.csv"
 done
 echo "Job finished at $(date) exit=$EXIT_CODE"
 exit $EXIT_CODE
+
+

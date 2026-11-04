@@ -24,16 +24,26 @@ HB_FEATS = ["AADT", "SL", "NL", "SKD_SP", "IC", "IP", "PA_COM1",
             "PSDSG24", "PSDS1T24", "IV_VL", "IV_M", "RSPSDL5", "RSDSO", "RSDSDL5"]
 CRASH_FEATS = ["AADT", "SL", "IP", "MEDSFBar", "PSDS1T24", "PSDSNIL",
                "IV_VL", "RSDSDG10", "RSDSO", "RSDSDL5"]
-HB_RDM = ["IC", "IV_M"]
-HB_RDM_COR = ["PA_COM1", "RSDSO", "RSDSDL5"]
-CR_RDM = ["PSDS1T24", "RSDSDG10"]
-CR_RDM_COR = ["SL", "RSDSDL5"]
-HELPERS = ["AADT", "SL"]
+
+# RP specs now carry distributions: "VAR:dist" or "VAR" (defaults to "normal")
+HB_RDM = ["IC:normal", "IV_M:lognormal"]
+HB_RDM_COR = ["PA_COM1:normal", "RSDSO:normal", "RSDSDL5:normal"]
+CR_RDM = ["PSDS1T24:lognormal", "RSDSDG10:lognormal"]
+CR_RDM_COR = ["SL:normal", "RSDSDL5:normal"]
+# Heterogeneity helpers must be DISTINCT from the fixed/random terms
+# (MCR 1.0.177 role exclusivity): a variable cannot be both fixed and a
+# hetro_in_means/variances helper. Pick helpers outside each spec.
+HB_HELPERS = ["IV_L", "DEL_P", "MEDPM"]      # not in HB fixed/random
+CR_HELPERS = ["NL", "SKD_SP", "IV_L"]        # not in Crash fixed/random
 DISTS = ["normal", "lognormal", "triangular", "uniform"]
 
 
+def _helpers_for(tag):
+    return HB_HELPERS if tag == "HB" else CR_HELPERS
+
+
 def _with_dist(terms, dist):
-    return [f"{t.split(':')[0]}:{dist}" for t in terms]
+    return [f"{t.split(':')[0]}:{dist}" if ':' not in t else t for t in terms]
 
 
 def _sig(p):
@@ -78,8 +88,10 @@ PENALTY = 10.0  # per insignificant/degenerate coefficient
 
 def _penalised_bic(m):
     ct = m["coef_table"]
-    # fixed means (exclude intercept, RND/chol/param/dispersion rows)
+    # fixed means (exclude intercept, RND/chol/param rows and dispersion
+    # labelled either "alpha" or "ln(overdispersion)")
     main = ct[~ct["Variable"].str.startswith(("RND", "chol(", "param", "ln("))
+               & ~ct["Variable"].isin(["(Intercept)", "alpha"])
                & (ct["Variable"] != "(Intercept)")]
     n_fix = int(((main["p"] > ALPHA) | main["p"].isna()).sum())
     # random SDs must each be significant; untestable (NaN/--) counts as insig
@@ -97,8 +109,11 @@ def _penalised_bic(m):
     mean_rows = ct[ct["Variable"].str.startswith("RND mean(")]
     n_degen = int((mean_rows["Estimate"].abs() >= 5).sum()) if len(mean_rows) else 0
     # dispersion must stay significant once the random block is in
+    # (labelled "alpha" on 1.0.165+ tables, "ln(overdispersion)" before)
     try:
-        disp_p = float(ct.set_index("Variable").loc["ln(overdispersion)", "p"])
+        _cti = ct.set_index("Variable")
+        _dp = _cti.loc["alpha", "p"] if "alpha" in _cti.index else _cti.loc["ln(overdispersion)", "p"]
+        disp_p = float(_dp)
     except KeyError:
         disp_p = float("nan")
     n_disp = 0 if (pd.notna(disp_p) and disp_p <= ALPHA) else 1
@@ -110,19 +125,25 @@ def search_response(df, feats, y_col, rdm, rdm_cor, tag):
     cands = []
     cands.append((f"{tag}-fixed", dict(rdm=[], rdm_cor=[], helpers=[],
                                        variances_on=False, gse_pack=None)))
+    # Try each distribution for independent RP block, keep correlated as normal
     for d in DISTS:
         cands.append((f"{tag}-rdm-{d}",
                       dict(rdm=_with_dist(rdm, d),
                            rdm_cor=_with_dist(rdm_cor, "normal"),
                            helpers=[], variances_on=False, gse_pack=None)))
-    cands.append((f"{tag}-rdm-normal-hetM",
-                  dict(rdm=_with_dist(rdm, "normal"),
-                       rdm_cor=_with_dist(rdm_cor, "normal"),
-                       helpers=HELPERS, variances_on=False, gse_pack=None)))
-    cands.append((f"{tag}-rdm-normal-hetMV",
-                  dict(rdm=_with_dist(rdm, "normal"),
-                       rdm_cor=_with_dist(rdm_cor, "normal"),
-                       helpers=HELPERS, variances_on=True, gse_pack=None)))
+    # Also try per-term distributions: lognormal for all independent RP
+    cands.append((f"{tag}-rdm-perterm",
+                  dict(rdm=rdm, rdm_cor=rdm_cor,  # use as-is with their dists
+                       helpers=[], variances_on=False, gse_pack=None)))
+    # Heterogeneity arms use per-term distributions and distinct helpers
+    cands.append((f"{tag}-rdm-perterm-hetM",
+                  dict(rdm=rdm, rdm_cor=rdm_cor,
+                       helpers=HB_HELPERS if tag == "HB" else CR_HELPERS,
+                       variances_on=False, gse_pack=None)))
+    cands.append((f"{tag}-rdm-perterm-hetMV",
+                  dict(rdm=rdm, rdm_cor=rdm_cor,
+                       helpers=HB_HELPERS if tag == "HB" else CR_HELPERS,
+                       variances_on=True, gse_pack=None)))
     results = []
     for label, kw in cands:
         print(f"--- {label} ---", flush=True)
@@ -136,11 +157,14 @@ def search_response(df, feats, y_col, rdm, rdm_cor, tag):
               f"verdict={m.get('verdict')} converged={m['converged']}", flush=True)
         results.append({"label": label, "m": m, "pbic": pb, "n_insig": ni,
                         "kw": kw})
-    # Unified selection: lowest penalised BIC wins outright. The penalty
-    # already encodes every significance gate (fixed/SD/chol/mean/disp),
-    # so no ACCEPT-first filter -- verdict is reported, not filtered on.
-    results.sort(key=lambda r: r["pbic"])
-    best = results[0]
+    # Best-models-only rule: among ACCEPT (fully significant) arms take the
+    # lowest penalised BIC. The penalty already pushes significance in-search,
+    # but a REJECT arm must never be reported over an ACCEPT one (the HB
+    # rdm-normal arm beats rdm-lognormal on raw pBIC yet fails the gate).
+    acc = [r for r in results if r["m"].get("verdict") == "ACCEPT"]
+    pool = acc if acc else results
+    pool.sort(key=lambda r: r["pbic"])
+    best = pool[0]
     print(f"SELECTED {best['label']} pBIC={best['pbic']:.1f} "
           f"verdict={best['m'].get('verdict')}", flush=True)
 
@@ -185,7 +209,8 @@ def search_response(df, feats, y_col, rdm, rdm_cor, tag):
 
 def main():
     df = pd.read_csv(DATA, low_memory=False)
-    for c in sorted(set(HB_FEATS) | set(CRASH_FEATS)):
+    _need = set(HB_FEATS) | set(CRASH_FEATS) | set(HB_HELPERS) | set(CR_HELPERS)
+    for c in sorted(_need):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
     print(f"Loaded {len(df)} rows", flush=True)

@@ -961,7 +961,9 @@ def main():
             ok_sd = bool((sd["p"] < 0.10).all()) if len(sd) else True
             ok_mean = bool((means["Estimate"].abs() < 5).all()) if len(means) else True
             try:
-                disp_p = float(ct.set_index("Variable").loc["ln(overdispersion)", "p"])
+                _cti = ct.set_index("Variable")
+                _dp = _cti.loc["alpha", "p"] if "alpha" in _cti.index else _cti.loc["ln(overdispersion)", "p"]
+                disp_p = float(_dp)
             except KeyError:
                 disp_p = np.nan
             v = ("ACCEPT" if (ok_sd and ok_mean and disp_p < 0.10) else "REJECT")

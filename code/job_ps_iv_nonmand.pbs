@@ -1,0 +1,62 @@
+#!/bin/bash -l
+#PBS -N ps_iv_nonmand
+#PBS -P FPAXJW8067
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=8:mem=160GB
+#PBS -j oe
+#PBS -m n
+
+# ============================================================
+# job_ps_iv_nonmand.pbs
+# Re-runs a single post-selection array task that was OOM-killed:
+#   PS-IV / nonmandatory  (protocol IV = subsample stability, rho=0.5/0.7/0.9)
+#
+# In array 27013818[8] the rho=0.9 replication was SIGKILLed at the 64GB
+# cap, leaving runs/ps_inference/out/IV_nonmandatory.json with an empty
+# rho0.9 feature set.  160GB gives headroom for the nonmand GA search.
+#
+# Chain this to a merge (post_selection_inference.py --merge) afterwards so
+# runs/ps_inference/tables/{ps_diagnostics.csv,auto_ps.tex} pick it up.
+# ============================================================
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+export PATH="${CONDA_PREFIX:?}/bin:$PATH"
+export PYTHONPATH="${PBS_O_WORKDIR}/compat:${PYTHONPATH:-}"
+hash -r
+
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+export PIPELINE_ACCELERATOR=${PIPELINE_ACCELERATOR:-cpu}
+export GA_METACOUNT_FORCE_CPU=${GA_METACOUNT_FORCE_CPU:-1}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+export NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-1}
+
+export NEW_POP=${NEW_POP:-1}
+export NEW_POP_MAPPED=${NEW_POP_MAPPED:-0}
+export NEW_POP_DIR=${NEW_POP_DIR:-../new_pop}
+if [ "${NEW_POP}" = "1" ] && [ "${NEW_POP_MAPPED}" != "1" ]; then
+  export PIPELINE_SKIMS_PATH=${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}
+fi
+
+RUN_TAG=${RUN_TAG:-paper_missing_20260929}
+RUN_ROOT=${RUN_ROOT:-runs/ga_parallel}
+PS_ROOT=${PS_ROOT:-runs/ps_inference}
+PS_B=${PS_B:-20}
+GA_BUDGET=${GA_BUDGET:-smoke}
+STAGE_ID=${STAGE_ID:-5}
+
+echo "[$(date)] ps rerun proto=IV seg=nonmandatory"
+python -u post_selection_inference.py \
+    --protocol IV --segment nonmandatory \
+    --run-tag "${RUN_TAG}" --run-root "${RUN_ROOT}" --ps-root "${PS_ROOT}" \
+    --stage-id "${STAGE_ID}" --B "${PS_B}" --budget "${GA_BUDGET}"
+_rc=$?
+echo "[$(date)] ps rerun IV/nonmandatory exit=${_rc}"
+exit "${_rc}"

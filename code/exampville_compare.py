@@ -442,22 +442,29 @@ def main():
     # consolidated n_nonmand_out). Observed means from person tour counts;
     # predicted means best-effort from run_stage1's synth predictions.
     def _pred_means(synth_pred, tags):
+        # run_stage1 returns per-person predicted counts as n_<purpose>_out.
+        # Take that column EXACTLY: a substring match on 'work' also picks up
+        # employment totals and household counts, which are not per-person
+        # tour counts and inflated the mean by ~3 orders of magnitude (the
+        # 2852.94 'mean MAE' in jobs 27074291 / 20260924).
         out = {}
+        used = {}
         try:
             cols = list(synth_pred.columns)
-            for tag, keys in tags.items():
-                hit = [c for c in cols
-                       if any(k in str(c).lower() for k in keys)]
-                vals = []
-                for c in hit:
-                    try:
-                        vals += pd.to_numeric(
-                            synth_pred[c], errors='coerce').dropna().tolist()
-                    except Exception:
-                        pass
-                out[tag] = float(np.mean(vals)) if vals else None
+            for tag in tags:
+                cand = [f'n_{tag}_out', f'n_{tag}']
+                col = next((c for c in cand if c in cols), None)
+                if col is None:
+                    used[tag] = None
+                    out[tag] = None
+                    continue
+                vals = pd.to_numeric(
+                    synth_pred[col], errors='coerce').dropna()
+                out[tag] = float(vals.mean()) if len(vals) else None
+                used[tag] = col
         except Exception:
             pass
+        out['_columns'] = used
         return out
 
     _obs_means = {'work': float(_nw.mean()),

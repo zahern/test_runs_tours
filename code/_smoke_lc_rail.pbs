@@ -1,0 +1,32 @@
+#!/bin/bash -l
+#PBS -N lc_rail_smoke
+#PBS -P FPAXJW8067
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ncpus=2:mem=16GB
+#PBS -j oe
+#PBS -m n
+#PBS -r y
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+export PATH="${CONDA_PREFIX}/bin:${PATH}"
+
+export JAX_PLATFORMS=cpu
+export CUDA_VISIBLE_DEVICES=""
+export NEW_POP=1 NEW_POP_MAPPED=0
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+
+STAMP="$(date -u +%Y%m%d_%H%M%S)_${PBS_JOBID:-local}"
+OUT="runs/lc_rail_smoke/${STAMP}"
+mkdir -p "${OUT}"
+echo "lc rail smoke -> ${OUT}"
+
+python _test_lc_rail_guard.py 2>&1 | tee "${OUT}/helper.out"
+python _test_lc_rail_guard_hpc.py 2>&1 | tee "${OUT}/smoke.out"
+echo "LC-RAIL-SMOKE-DONE $(date)" | tee -a "${OUT}/smoke.out"

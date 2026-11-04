@@ -1,0 +1,40 @@
+#!/bin/bash -l
+# Compute-node verification of the edited pipeline files.
+#
+# NOTHING runs on the head node: py_compile / bash -n / the r5py JVM-heap
+# check all execute inside this modest allocation. Submit from the code dir:
+#
+#   qsub job_verify_edits.pbs
+#
+# Output in job_verify_edits.pbs.o<jobid> (same dir). Expect
+# "RESULT: ALL CHECKS PASSED" and exit 0.
+#PBS -N verify_edits
+#PBS -m n
+#PBS -l select=1:ncpus=1:mem=8GB
+#PBS -l walltime=00:15:00
+
+set -uo pipefail
+
+CONDA_ENV=${CONDA_ENV:-geotfenv}
+cd "$PBS_O_WORKDIR"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "$CONDA_ENV"
+module unload Anaconda3
+
+# Same defensive PATH as job_transit_dtim.pbs: the module's Anaconda (3.11.7)
+# wins the PATH-order fight against the activated env, so bare `python` then
+# resolves to an interpreter without r5py (observed 2026-10-16). Pin the env
+# first, clear bash's cached command paths, then hard-assert the interpreter.
+export PATH="${CONDA_PREFIX:?conda activate ${CONDA_ENV} failed}/bin:$PATH"
+hash -r
+python -c "import sys; assert sys.prefix == '${CONDA_PREFIX}', sys.executable"
+
+echo "=== node=$(hostname) env=${CONDA_ENV} python=$(python -V 2>&1) at $(which python) ==="
+date
+python _verify_edits.py
+RC=$?
+echo "=== verify exit=${RC} ==="
+date
+exit "$RC"

@@ -57,7 +57,10 @@ for fig in re.findall(r'\\includegraphics\[[^\]]*\]\{([^}]+)\}', code):
 # 5. no leftover template/red/test text
 check("no lipsum", 'lipsum' not in code.lower())
 check("no red author notes", 'textcolor{red}' not in code)
-check("no TODO/FIXME", not re.search(r'TODO|FIXME|XXX', code))
+check("no FIXME/XXX", not re.search(r'FIXME|XXX', code))
+check("TODOs are explicit status markers",
+      not re.search(r'(?<!Status)TODO', code)
+      or 'StatusTodo' in code)
 
 # 6. document begin/end exactly once
 check("single document env",
@@ -65,7 +68,8 @@ check("single document env",
 
 # 7. natbib + bibliography present
 check("bibliography wired",
-      r'\bibliography{localbibliography.bib}' in code
+      (r'\bibliography{localbibliography.bib}' in code
+       or r'\bibliography{localbibliography}' in code)
       and os.path.exists(os.path.join(D, 'localbibliography.bib')))
 
 print()

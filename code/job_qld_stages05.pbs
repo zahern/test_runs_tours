@@ -91,10 +91,16 @@ if missing:
           "inside `except ImportError: X = None` and silently produce no "
           "models. Activate zigenv.", file=sys.stderr)
     raise SystemExit(2)
-if int(numpy.__version__.split(".")[0]) >= 2:
-    print("FATAL: numpy>=2 with this pipeline (targets numpy 1.26); the "
-          "sharrow/numexpr flows and MCR fits break under numpy 2.",
-          file=sys.stderr)
+# Version window, not "numpy must be 1.x".  The old blanket numpy>=2 rejection
+# predates the current stack: the QLD estimation window is numpy>=2.1,<2.4
+# (constraints.txt / environment_qld.yml), and the stage-5 compare job fitted
+# mode models on numpy 2.3.5 in zigenv (work LL -4265, rho2 0.58) on
+# 2026-10-06.  Only reject what is genuinely outside the window.
+_np_parts = [int(p) for p in numpy.__version__.split(".")[:2]]
+if not ((2, 1) <= tuple(_np_parts) < (2, 4)):
+    print(f"FATAL: numpy {numpy.__version__} is outside the supported "
+          "estimation window (>=2.1,<2.4); sharrow/numexpr flows and the "
+          "MCR fits are only verified there.", file=sys.stderr)
     raise SystemExit(2)
 PYEOF
 

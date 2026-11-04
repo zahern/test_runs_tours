@@ -24,8 +24,13 @@ import pandas as pd
 
 from pyram.config import Config, ConfigManager
 from pyram.data import load_all_data, build_synthetic_population
+from pyram.dta import DTAFeedbackLoop
 from pyram.models import (
     create_all_models,
+    create_cdap_model,
+    create_purpose_timing_model,
+    expand_daily_patterns,
+    build_trip_chains,
     DestinationChoiceModel,
     ModeChoiceModel,
     ParkingChoiceModel,
@@ -91,8 +96,8 @@ class Pipeline:
             self._load_data()
             completed.append("load_data")
             
-            # Stage 0.5: Build synthetic population
-            if 0 in stages or (not stages and True):
+            # Stage 0.5: Build synthetic population (required by stages 1 and 5)
+            if 0 in stages or any(stage in stages for stage in (1, 5)):
                 self._build_synthetic_population()
                 completed.append("synthetic_population")
             
@@ -199,18 +204,107 @@ class Pipeline:
         """Stage 1: Household coordination (CDAP) + joint tours."""
         print("Stage 1: CDAP household coordination...")
         
-        # TODO: Implement CDAP from original codebase
-        # This would use cdap_households.py logic
-        warnings.warn("Stage 1 CDAP not yet implemented in Pipeline class")
-        self.results['stage1_cdap'] = {"status": "skipped"}
+        if not self.config.cdap.enable:
+            print("  CDAP disabled in config")
+            self.results['stage1_cdap'] = {"status": "disabled"}
+            return
+        
+        synth = self.data.get('synthetic_population')
+        if synth is None:
+            raise ValueError(
+                "Synthetic population required for Stage 1. "
+                "Run _build_synthetic_population first."
+            )
+        
+        cdap_config = {
+            **self.config.cdap.__dict__,
+            "max_acts_per_person": self.config.trip_chain.max_acts_per_person,
+        }
+        model = create_cdap_model(cdap_config, seed=self.config.seed)
+        model.estimate(persons=self.data['persons'], trips=self.data['trips'])
+        
+        patterns = model.simulate(synth)
+        if self.config.cdap.joint_tours:
+            joint_tours = model.coordinate_households(patterns, synth)
+        else:
+            joint_tours = pd.DataFrame(
+                columns=["tour_id", "hhid", "purpose", "participants", "n_participants"]
+            )
+        
+        output_dir = Path(self.config.data.output_dir)
+        pattern_path = output_dir / "stage1_daily_patterns.csv"
+        joint_path = output_dir / "stage1_joint_tours.csv"
+        patterns.to_csv(pattern_path, index=False)
+        joint_tours.to_csv(joint_path, index=False)
+        model.save(output_dir / "models" / "cdap_model.pkl")
+        
+        self.models['cdap'] = model
+        self.data['daily_patterns'] = patterns
+        self.data['joint_tours'] = joint_tours
+        
+        counts = patterns['cdap'].value_counts()
+        shares = {
+            f"share_{state}": float(counts.get(state, 0)) / max(len(patterns), 1)
+            for state in ("H", "N", "M")
+        }
+        
+        self.results['stage1_cdap'] = {
+            "status": "completed",
+            "model_path": str(output_dir / "models" / "cdap_model.pkl"),
+            "pattern_path": str(pattern_path),
+            "joint_tour_path": str(joint_path),
+            "n_joint_tours": int(len(joint_tours)),
+            **shares,
+        }
+        print(
+            f"  Patterns: H {shares['share_H']:.1%}, N {shares['share_N']:.1%}, "
+            f"M {shares['share_M']:.1%}"
+        )
+        print(f"  Joint tours: {len(joint_tours):,}")
+        print(f"  Saved to {pattern_path}")
     
     def _run_stage2_timing(self):
         """Stage 2: Departure time / duration models."""
         print("Stage 2: Timing models...")
         
-        # TODO: Implement timing models
-        warnings.warn("Stage 2 timing not yet implemented in Pipeline class")
-        self.results['stage2_timing'] = {"status": "skipped"}
+        patterns = self.data.get('daily_patterns')
+        if patterns is None:
+            raise ValueError(
+                "Stage 2 requires daily patterns from Stage 1 "
+                "(run stages 1-2 together, or enable cdap in the config)."
+            )
+        
+        synth = self.data.get('synthetic_population')
+        activities = expand_daily_patterns(
+            patterns,
+            persons=synth,
+            joint_tours=self.data.get('joint_tours'),
+            cdap_model=self.models.get('cdap'),
+            seed=self.config.seed,
+        )
+        
+        timing = create_purpose_timing_model(
+            self.config.timing.__dict__, seed=self.config.seed
+        )
+        timing.estimate(self.data['trips'])
+        schedule = timing.predict(activities)
+        
+        output_dir = Path(self.config.data.output_dir)
+        schedule_path = output_dir / "stage2_activity_schedule.csv"
+        schedule.to_csv(schedule_path, index=False)
+        timing.save(output_dir / "models" / "timing_model.pkl")
+        
+        self.models['timing'] = timing
+        self.data['activity_schedule'] = schedule
+        
+        self.results['stage2_timing'] = {
+            "status": "completed",
+            "model_path": str(output_dir / "models" / "timing_model.pkl"),
+            "schedule_path": str(schedule_path),
+            "n_activities": int(len(schedule)),
+        }
+        print(f"  Scheduled {len(schedule):,} activities")
+        print(f"  Saved to {schedule_path}")
     
     def _run_stage3_destination(self):
         """Stage 3: Destination choice estimation."""
@@ -261,44 +355,100 @@ class Pipeline:
         print(f"  Mode model saved to {model_path}")
     
     def _run_stage5_trip_chain(self):
-        """Stage 5: Trip chain building with destination + mode prediction."""
+        """
+        Stage 5: Trip chain building with destination + mode prediction.
+        
+        Builds home-based tours from the Stage 2 activity schedule, applies the
+        fitted destination and mode models to those tours, and writes the final
+        synthetic trip list.
+        """
         print("Stage 5: Trip chain building...")
         
-        # This combines destination prediction, mode prediction, and trip chain assembly
-        # Uses synthetic population as input
+        schedule = self.data.get('activity_schedule')
+        if schedule is None:
+            schedule_path = (
+                Path(self.config.data.output_dir) / "stage2_activity_schedule.csv"
+            )
+            if schedule_path.exists():
+                schedule = pd.read_csv(schedule_path)
+        if schedule is None:
+            raise ValueError(
+                "Stage 5 requires an activity schedule from Stage 2. "
+                "Run stages 1-2 first, or provide stage2_activity_schedule.csv."
+            )
         
         synth = self.data.get('synthetic_population')
         if synth is None:
-            raise ValueError("Synthetic population required for Stage 5. Run _build_synthetic_population first.")
-        
-        # Predict destinations for synthetic population
-        if 'destination' in self.models:
-            dest_pred = self.models['destination'].predict(
-                trips=synth,  # synth has trip-like structure
-                persons=self.data['persons'],
-                landuse=self.data['landuse'],
-                skims=self.data['skim_lookup'],
+            raise ValueError(
+                "Synthetic population required for Stage 5. "
+                "Run _build_synthetic_population first."
             )
         
-        # Predict modes
-        if 'mode' in self.models:
-            mode_pred = self.models['mode'].predict(
-                trips=dest_pred if 'destination' in self.models else synth,
-                persons=self.data['persons'],
-                landuse=self.data['landuse'],
-                skims=self.data['skim_lookup'],
+        chains = build_trip_chains(schedule, persons=synth)
+        landuse = self.data['landuse']
+        skims = self.data.get('skim_lookup', {})
+        
+        destination_model = self.models.get('destination')
+        if destination_model is not None and getattr(destination_model, 'fitted', False):
+            outbound = chains['leg'] == 'outbound'
+            predicted = destination_model.predict(
+                trips=chains.loc[outbound].copy(),
+                persons=synth,
+                landuse=landuse,
+                skims=skims,
+            )
+            destinations = dict(
+                zip(predicted['tour_id'], predicted['DTAZ_pred'])
+            )
+            mapped = chains['tour_id'].map(destinations)
+            chains.loc[outbound, 'DTAZ'] = (
+                mapped[outbound]
+                .fillna(chains.loc[outbound, 'DTAZ'])
+                .astype(int)
+                .to_numpy()
+            )
+            chains.loc[~outbound, 'OTAZ'] = (
+                mapped[~outbound]
+                .fillna(chains.loc[~outbound, 'OTAZ'])
+                .astype(int)
+                .to_numpy()
+            )
+            self.results.setdefault('stage5_trip_chain', {})['destination_model'] = 'applied'
+        else:
+            warnings.warn(
+                "Destination model is not fitted; Stage 5 keeps home zones as destinations"
             )
         
-        # Build trip chains
-        # TODO: Implement trip chain building from original codebase
+        mode_model = self.models.get('mode')
+        if mode_model is not None and getattr(mode_model, 'fitted', False):
+            predicted = mode_model.predict(
+                trips=chains.copy(),
+                persons=synth,
+                landuse=landuse,
+                skims=skims,
+            )
+            chains['mode_pred'] = predicted['mode_pred'].to_numpy()
+            chains['mode_code_pred'] = predicted['mode_code_pred'].to_numpy()
+            chains['mode'] = chains['mode_code_pred'].fillna(1).astype(int)
+            self.results.setdefault('stage5_trip_chain', {})['mode_model'] = 'applied'
+        else:
+            warnings.warn("Mode model is not fitted; Stage 5 leaves mode unassigned")
+            chains['mode'] = np.nan
         
         output_path = Path(self.config.data.output_dir) / "stage5_trip_chains.csv"
-        # mode_pred.to_csv(output_path, index=False)
+        chains.to_csv(output_path, index=False)
         
+        self.data['trip_chains'] = chains
+        existing = self.results.get('stage5_trip_chain', {})
         self.results['stage5_trip_chain'] = {
+            **existing,
             "status": "completed",
             "output_path": str(output_path),
+            "trip_chains": chains,
+            "n_trips": int(len(chains)),
+            "n_tours": int(chains['tour_id'].nunique()),
         }
+        print(f"  Built {chains['tour_id'].nunique():,} tours / {len(chains):,} trips")
         print(f"  Trip chains saved to {output_path}")
     
     def _run_stage6_parking(self):
@@ -322,7 +472,7 @@ class Pipeline:
         if trip_chains is not None:
             model.estimate(
                 trips=trip_chains,
-                persons=self.data['persons'],
+                persons=self.data.get('synthetic_population', self.data['persons']),
                 location_table=self.data['location_table'],
                 landuse=self.data['landuse'],
                 skims=self.data['skim_lookup'],
@@ -348,9 +498,60 @@ class Pipeline:
             print("  DTA feedback disabled in config")
             return
         
-        # TODO: Implement DTA feedback from dta_feedback.py
-        warnings.warn("Stage 7 DTA feedback not yet implemented in Pipeline class")
-        self.results['stage7_dta_feedback'] = {"status": "skipped"}
+        trip_chains = self.data.get('trip_chains')
+        if trip_chains is None:
+            trip_chain_path = Path(self.config.data.output_dir) / "stage5_trip_chains.csv"
+            if trip_chain_path.exists():
+                trip_chains = pd.read_csv(trip_chain_path)
+        if trip_chains is None:
+            warnings.warn("No trip chains available for DTA feedback")
+            self.results['stage7_dta_feedback'] = {"status": "skipped"}
+            return
+        
+        loop = DTAFeedbackLoop(
+            config=self.config.dta,
+            output_dir=Path(self.config.data.output_dir) / "dta_feedback",
+        )
+        outcome = loop.run(
+            trip_chains,
+            skim_lookup=self.data.get('skim_lookup'),
+            landuse=self.data.get('landuse'),
+        )
+        
+        if outcome.status not in ("completed", "max_iterations"):
+            warnings.warn(f"DTA feedback {outcome.status}: {outcome.message}")
+            self.results['stage7_dta_feedback'] = {
+                "status": outcome.status,
+                "engine": outcome.engine,
+                "iterations": outcome.iterations,
+                "message": outcome.message,
+            }
+            print(f"  DTA feedback not run: {outcome.message}")
+            return
+        
+        final_plan_path = (
+            Path(self.config.data.output_dir) / "stage7_final_plan.csv"
+        )
+        if outcome.plan is not None and len(outcome.plan):
+            outcome.plan.to_csv(final_plan_path, index=False)
+            self.data['trip_chains'] = outcome.plan
+        if outcome.skim_lookup:
+            self.data['skim_lookup'] = outcome.skim_lookup
+        
+        self.results['stage7_dta_feedback'] = {
+            "status": outcome.status,
+            "engine": outcome.engine,
+            "iterations": outcome.iterations,
+            "converged": outcome.converged,
+            "history": outcome.history,
+            "output_path": str(final_plan_path),
+            "output_dir": outcome.output_dir,
+        }
+        print(
+            f"  {outcome.engine}: {outcome.iterations} iteration(s), "
+            f"{'converged' if outcome.converged else 'not converged'}"
+        )
+        print(f"  Final plan saved to {final_plan_path}")
 
 
 # ── Convenience Functions ─────────────────────────────────────────────────────

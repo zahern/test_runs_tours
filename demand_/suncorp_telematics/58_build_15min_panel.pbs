@@ -6,6 +6,12 @@
 #PBS -m abe
 #PBS -r y
 
+# Refuse to run outside PBS: keep all compute off the login/head node.
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+
 # Job 58: segment x 15-minute speeding panel from the all-points Compass extract
 # (results/traffic_points_full.csv.gz, produced by 54_extract_parallel.py
 # --all-points). One streaming pass + month finalize + merge + summary figures.

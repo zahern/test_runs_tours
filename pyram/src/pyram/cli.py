@@ -2,23 +2,27 @@
 Command-line interface for pyram.
 
 Provides CLI commands for:
-- pyram: main entry point
+- pyram init: create a configuration file
+- pyram validate: check configuration and inputs
 - pyram-build-pop: build synthetic population
 - pyram-run-pipeline: run full pipeline
 - pyram-dta-feedback: run DTA feedback loop
+- pyram estimate / predict: model estimation and application
 - pyram-visualize: launch 3D visualizer
 """
 
 import os
 from pathlib import Path
 from typing import Optional, List
+import pandas as pd
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from pyram.config import Config, ConfigManager, create_default_config
-from pyram.data import load_all_data
+from pyram.data import load_all_data, build_synthetic_population
 from pyram.models import create_all_models
+from pyram.pipeline import Pipeline
 
 app = typer.Typer(
     name="pyram",
@@ -108,19 +112,56 @@ def build_pop(
 ):
     """Build synthetic population from HHTS + Overture."""
     cfg = Config.from_yaml(config)
-    
+    manager = ConfigManager(cfg)
+    manager.create_output_dirs()
+
     if target_pop:
         console.print(f"[yellow]Target population override: {target_pop:,}[/yellow]")
-    
+
     console.print("[bold]Loading data...[/bold]")
     data = load_all_data(cfg)
     
     console.print(f"[green]Loaded {len(data['persons']):,} HHTS persons[/green]")
     console.print(f"[green]Loaded {len(data['trips']):,} HHTS trips[/green]")
-    
-    # TODO: Implement synthetic population generation
-    console.print("[yellow]Synthetic population generation not yet implemented in CLI[/yellow]")
-    console.print("Use Python API: from pyram.data import build_synthetic_population")
+
+    use_ov = cfg.population.use_overture if use_overture is None else bool(use_overture)
+    target = int(target_pop) if target_pop else int(
+        len(data["persons"]) * cfg.population.sample_fraction
+    )
+    target = max(target, 1)
+
+    overture_gdf = None
+    if use_ov:
+        overture_path = Path(cfg.data.output_dir) / "overture_population.parquet"
+        if overture_path.exists():
+            import geopandas as gpd
+
+            overture_gdf = gpd.read_parquet(overture_path)
+            console.print(f"  Overture features: {len(overture_gdf):,}")
+        else:
+            console.print(
+                "[yellow]  No overture_population.parquet found - "
+                "expanding the HHTS sample only[/yellow]"
+            )
+
+    synth = build_synthetic_population(
+        hhts_persons=data["persons"],
+        hhts_households=data.get("households", pd.DataFrame()),
+        zone_crosswalk=data["crosswalk"],
+        landuse=data["landuse"],
+        target_population=target,
+        seed=cfg.seed,
+        use_overture=use_ov,
+        overture_gdf=overture_gdf,
+        zone_boundaries=None,
+    )
+
+    output_path = Path(output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    synth.to_csv(output_path, index=False)
+
+    console.print(f"[green]Generated {len(synth):,} synthetic persons[/green]")
+    console.print(f"[green]Written to {output_path}[/green]")
 
 
 @app.command()
@@ -151,10 +192,28 @@ def run(
         return
     
     console.print("[bold]Running pyram pipeline...[/bold]")
-    
-    # TODO: Implement full pipeline execution
-    console.print("[yellow]Full pipeline execution not yet implemented in CLI[/yellow]")
-    console.print("Use Python API: from pyram.pipeline import Pipeline")
+    selected = [int(stage) for stage in stages] if stages else None
+
+    pipeline = Pipeline(cfg)
+    result = pipeline.run(stages=selected)
+
+    table = Table(title="Pipeline stages")
+    table.add_column("Stage", style="cyan")
+    table.add_column("Status", style="white")
+    requested = selected or list(range(1, 8))
+    for stage in result.stages_completed:
+        table.add_row(stage, "[green]completed[/green]")
+    missing = [s for s in requested if f"stage{s}" not in " ".join(result.stages_completed)]
+    for stage in missing:
+        table.add_row(f"stage{stage}", "[yellow]not run[/yellow]")
+    console.print(table)
+
+    if not result.success:
+        for error in result.errors:
+            console.print(f"[red]{error}[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(f"[green]Pipeline complete. Outputs in {cfg.data.output_dir}[/green]")
 
 
 @app.command()
@@ -176,10 +235,35 @@ def dta_feedback(
     console.print(f"  Iterations: {iterations}")
     console.print(f"  Input plan: {input_plan}")
     console.print(f"  Output: {output_dir}")
-    
-    # TODO: Implement DTA feedback
-    console.print("[yellow]DTA feedback loop not yet implemented in CLI[/yellow]")
-    console.print("Use Python API: from pyram.pipeline import run_stage7_dta_feedback")
+
+    plan_path = Path(input_plan)
+    if not plan_path.exists():
+        console.print(f"[red]Plan CSV not found: {plan_path}[/red]")
+        console.print("Run the pipeline first to produce a trip plan.")
+        raise typer.Exit(code=1)
+
+    from pyram.dta import DTAFeedbackLoop
+
+    plan = pd.read_csv(plan_path)
+    loop = DTAFeedbackLoop(config=cfg.dta, output_dir=output_dir)
+    outcome = loop.run(plan)
+
+    if outcome.status not in ("completed", "max_iterations"):
+        console.print(f"[yellow]DTA feedback {outcome.status}: {outcome.message}[/yellow]")
+        raise typer.Exit(code=2)
+
+    final_path = Path(output_dir) / "final_plan.csv"
+    if outcome.plan is not None and len(outcome.plan):
+        outcome.plan.to_csv(final_path, index=False)
+
+    console.print(
+        f"[green]{engine}: {outcome.iterations} iteration(s), "
+        f"{'converged' if outcome.converged else 'not converged'}[/green]"
+    )
+    for row in outcome.history:
+        console.print(f"  iteration {int(row['iteration'])}: skim RMSE {row['skim_rmse']:.5f}")
+    if final_path.exists():
+        console.print(f"[green]Final plan: {final_path}[/green]")
 
 
 @app.command()
@@ -191,6 +275,10 @@ def estimate(
     cfg = Config.from_yaml(config)
     manager = ConfigManager(cfg)
     manager.setup_environment()
+    manager.create_output_dirs()
+
+    models_dir = Path(cfg.data.output_dir) / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
     
     console.print("[bold]Loading data...[/bold]")
     data = load_all_data(cfg)
@@ -203,7 +291,7 @@ def estimate(
         models["destination"].estimate(
             data["trips"], data["persons"], data["landuse"], data["skim_lookup"]
         )
-        models["destination"].save("output/models/destination_model.pkl")
+        models["destination"].save(models_dir / "destination_model.pkl")
         console.print("[green]Destination model saved[/green]")
     
     if model in ("all", "mode"):
@@ -211,7 +299,7 @@ def estimate(
         models["mode"].estimate(
             data["trips"], data["persons"], data["landuse"], data["skim_lookup"]
         )
-        models["mode"].save("output/models/mode_model.pkl")
+        models["mode"].save(models_dir / "mode_model.pkl")
         console.print("[green]Mode model saved[/green]")
     
     if model in ("all", "parking"):
@@ -219,13 +307,37 @@ def estimate(
         models["parking"].estimate(
             data["trips"], data["persons"], data["location_table"], data["landuse"], data["skim_lookup"]
         )
-        models["parking"].save("output/models/parking_model.pkl")
+        models["parking"].save(models_dir / "parking_model.pkl")
         console.print("[green]Parking model saved[/green]")
     
     if model in ("all", "trip_dest"):
         console.print("[cyan]Estimating trip-level destination...[/cyan]")
-        # Need stop trips extracted from trip chains
-        console.print("[yellow]Trip destination estimation requires stop trips from Stage 5[/yellow]")
+        chains_path = Path(cfg.data.output_dir) / "stage5_trip_chains.csv"
+        if not chains_path.exists():
+            console.print(
+                "[yellow]No stage5_trip_chains.csv found - run stages 1-5 first; "
+                "trip-level destination estimation skipped[/yellow]"
+            )
+        else:
+            chains = pd.read_csv(chains_path)
+            stop_trips = (
+                chains[chains["leg"] == "outbound"].copy()
+                if "leg" in chains.columns
+                else chains.copy()
+            )
+            stop_trips = stop_trips.rename(
+                columns={"OTAZ": "origin_taz", "DTAZ": "dest_taz"}
+            )
+            stop_trips["anchor_down_taz"] = stop_trips.get(
+                "home_zone", stop_trips["dest_taz"]
+            )
+            models["trip_destination"].estimate(
+                stop_trips, data["landuse"], data["skim_lookup"]
+            )
+            models["trip_destination"].save(
+                models_dir / "trip_destination_model.pkl"
+            )
+            console.print("[green]Trip destination model saved[/green]")
     
     console.print("[green]Estimation complete![/green]")
 
@@ -240,20 +352,60 @@ def predict(
     cfg = Config.from_yaml(config)
     manager = ConfigManager(cfg)
     manager.setup_environment()
+    manager.create_output_dirs()
     
     console.print("[bold]Loading data and models...[/bold]")
     data = load_all_data(cfg)
+
+    population_path = Path(input_plan)
+    if not population_path.exists():
+        console.print(f"[red]Input population not found: {population_path}[/red]")
+        raise typer.Exit(code=1)
+    population = pd.read_csv(population_path)
+
     models = create_all_models(cfg)
-    
-    # Load saved models
-    for name, model in models.items():
-        model_path = f"output/models/{name}_model.pkl"
-        if Path(model_path).exists():
-            model.load(model_path)
+    loaded = 0
+    for name in ("destination", "mode", "parking", "trip_destination"):
+        model_path = Path(cfg.data.output_dir) / "models" / f"{name}_model.pkl"
+        if not model_path.exists():
+            continue
+        try:
+            models[name] = type(models[name]).load(model_path)
+            loaded += 1
             console.print(f"  Loaded {name} model")
-    
-    # TODO: Implement prediction pipeline
-    console.print("[yellow]Prediction pipeline not yet implemented in CLI[/yellow]")
+        except Exception as exc:  # noqa: BLE001 - report and keep other models
+            console.print(f"[yellow]  Could not load {name} model: {exc}[/yellow]")
+
+    if loaded == 0:
+        console.print(
+            f"[red]No estimated models in {Path(cfg.data.output_dir) / 'models'}; "
+            "run `pyram estimate` first[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    pipeline = Pipeline(cfg)
+    pipeline.data = data
+    pipeline.data["synthetic_population"] = population
+    pipeline.models = models
+
+    try:
+        pipeline._run_stage1_cdap()
+        pipeline._run_stage2_timing()
+        pipeline._run_stage5_trip_chain()
+    except Exception as exc:  # noqa: BLE001 - surface as a CLI failure
+        console.print(f"[red]Prediction failed: {exc}[/red]")
+        raise typer.Exit(code=1)
+
+    chains = pipeline.data.get("trip_chains")
+    if chains is None:
+        console.print("[red]Prediction produced no trip chains[/red]")
+        raise typer.Exit(code=1)
+
+    output_path = Path(output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    chains.to_csv(output_path, index=False)
+
+    console.print(f"[green]Wrote {len(chains):,} predicted trips to {output_path}[/green]")
 
 
 @app.command()

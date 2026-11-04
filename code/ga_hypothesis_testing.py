@@ -7136,7 +7136,9 @@ def _stage5_mode_candidates(data: pd.DataFrame = None) -> List[str]:
     #   selecting the *_generic gene applies ONE shared effect across modes
     #   instead of the per-mode block (mutex-guarded against the ASV genes).
     generic_genes = ['incp_generic', 'veh_generic', 'crash_generic',
-                     'age_active_generic']
+                     'age_active_generic',
+                     # intermediate grouped-reference encodings (larch MTC 017)
+                     'incp_motref', 'incp_active', 'veh_active', 'age_nonauto']
     # Cost / tolls & extra time-of-day IVT periods (mutex: one auto IVT period)
     cost_tod = ['SOVTOLL_TOLL__AM', 'auto_toll', 'auto_cost',
                 'SOVTOLL_TIME__MD', 'SOVTOLL_TIME__EV',
@@ -7329,6 +7331,7 @@ def _stage5_mode_candidates_for_segment(segment: str) -> List[str]:
         'is_cbd', 'transit_walk_acc', 'emp_density',   # emp_density = MTC wkempden
         # ActivitySim-inspired genes (all gated in MODE_UEC / _COEFF_GATE)
         'incp_generic', 'veh_generic', 'crash_generic', 'age_active_generic',
+        'incp_motref', 'incp_active', 'veh_active', 'age_nonauto',
         'auto_cost', 'SOVTOLL_TOLL__AM', 'SOVTOLL_TIME__MD', 'SOVTOLL_TIME__EV',
         'WLK_LOC_DRV_DTIM__AM',
         'auto_deficient', 'short_dist_active',
@@ -7878,6 +7881,17 @@ def ensure_prediction_features(df: pd.DataFrame,
                 d['workstat_fulltime'] = (_ws == 1).astype(int)
             if 'workstat_parttime' not in d.columns:
                 d['workstat_parttime'] = (_ws == 2).astype(int)
+        # WFHDAY is the diary-day work-from-home flag; the HHTS carries it as a
+        # boolean, while the prediction frame carries the modelled `wfh`
+        # indicator (written by wfh_telecommute in the prep phase).  Derive the
+        # same >0 rule so a GA-selected WFHDAY term resolves instead of falling
+        # to the mean imputation and silently dropping the covariate.
+        if 'WFHDAY' not in d.columns:
+            for _src in ('wfh', 'WFHWEEK', 'WFHOMEWEEKDAY'):
+                if _src in d.columns:
+                    _wf = pd.to_numeric(d[_src], errors='coerce').fillna(0)
+                    d['WFHDAY'] = (_wf > 0).astype(int)
+                    break
         if 'STUDYING' in d.columns:
             _st = pd.to_numeric(d['STUDYING'], errors='coerce').fillna(0).astype(int)
             for _code, _name in ((1, 'primary'), (2, 'secondary'),

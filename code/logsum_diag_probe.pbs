@@ -1,0 +1,34 @@
+#!/bin/bash -l
+#PBS -N logsum_diag
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=8:mem=194GB
+#PBS -m n
+#PBS -r y
+#PBS -j oe
+
+# dt-level diagnostic for the flat mode-logsum fallback.  Runs the REAL stage-5
+# mode fit on compute nodes, then dumps the logsum diagnostics and aborts at the
+# variance gate (STAGE5_REQUIRE_LOGSUM_VARIANCE=1), so no destination fit runs.
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate "${CONDA_ENV:-zigenv}"
+module unload Anaconda3
+
+export NEW_POP=1
+export NEW_POP_MAPPED=0
+export NEW_POP_DIR="${NEW_POP_DIR:-../new_pop}"
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371.omx}"
+export STAGE5_REQUIRE_LOGSUM_VARIANCE=1
+export STAGE5_DEST_ESTIMATOR=larch
+export JAX_PLATFORMS=cpu
+export CUDA_VISIBLE_DEVICES=""
+export TF_CPP_MIN_LOG_LEVEL=3
+export OMP_NUM_THREADS="${NCPUS:-8}"
+export OPENBLAS_NUM_THREADS="${NCPUS:-8}"
+
+echo "host: $(hostname)  ncpus=${NCPUS:-8}"
+python -u _probe_logsum_diag.py
+echo "probe finished: $(date)"

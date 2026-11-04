@@ -1,5 +1,6 @@
 #!/bin/bash -l
 #PBS -N saw_safety_submit
+#PBS -P FPAXJW8067
 #PBS -l walltime=00:02:00
 #PBS -l select=1:ncpus=1:mem=2GB
 #PBS -j oe
@@ -8,9 +9,10 @@
 # ============================================================
 # job_safety_experiment.pbs
 # Submits three sequential jobs:
-#   1. safety_baseline   — Stage 5 WITH  CRASH + CRASHPT skims
-#   2. safety_nosafety   — Stage 5 WITHOUT safety skims
-#   3. safety_analysis   — compares outputs, plots, HTML report
+#   1. safety_baseline         — Stage 5 WITH  CRASH + CRASHPT skims
+#   2. safety_nosafety         — refitted Stage 5 WITHOUT crash utility terms,
+#                                while retaining true CRASH exposure for evaluation
+#   3. safety_analysis         — compares outputs, plots, and per-segment table
 # ============================================================
 
 cd $PBS_O_WORKDIR
@@ -23,8 +25,9 @@ module unload Anaconda3
 cat > _tmp_safety_baseline.pbs << 'INNER'
 #!/bin/bash -l
 #PBS -N saw_safety_base
-#PBS -l walltime=23:59:00
-#PBS -l select=1:ncpus=4:mem=194GB
+#PBS -P FPAXJW8067
+#PBS -l walltime=36:00:00
+#PBS -l select=1:ncpus=8:mem=250GB
 #PBS -j oe
 #PBS -m n
 cd $PBS_O_WORKDIR
@@ -37,15 +40,27 @@ echo "[$(date)] safety_baseline starting"
 export SAFETY_EXPERIMENT_MODE=baseline
 python -u pipeline_logger.py safety_baseline \
     > log_safety_baseline.out 2> log_safety_baseline.err
-echo "[$(date)] safety_baseline done  exit=$?"
+RC=$?
+echo "[$(date)] safety_baseline done  exit=$RC"
+if [ "$RC" -ne 0 ]; then exit "$RC"; fi
+D="runs/safety_baseline__${PBS_JOBID}"
+if [ ! -f "$D/stage6_output.csv" ]; then
+    D=$(ls -dt runs/safety_baseline__* 2>/dev/null | head -1)
+fi
+if [ -z "$D" ] || [ ! -f "$D/stage6_output.csv" ]; then
+    echo "[$(date)] ERROR: safety_baseline produced no stage6_output.csv — marking arm FAILED"
+    exit 3
+fi
+echo "[$(date)] artifact check OK: $D/stage6_output.csv"
 INNER
 
 # ── Job 2: no-safety (safety skims excluded) ─────────────────
 cat > _tmp_safety_nosafety.pbs << 'INNER'
 #!/bin/bash -l
 #PBS -N saw_safety_nosa
-#PBS -l walltime=23:59:00
-#PBS -l select=1:ncpus=4:mem=194GB
+#PBS -P FPAXJW8067
+#PBS -l walltime=36:00:00
+#PBS -l select=1:ncpus=8:mem=250GB
 #PBS -j oe
 #PBS -m n
 cd $PBS_O_WORKDIR
@@ -58,13 +73,25 @@ echo "[$(date)] safety_nosafety starting"
 export SAFETY_EXPERIMENT_MODE=nosafety
 python -u pipeline_logger.py safety_nosafety \
     > log_safety_nosafety.out 2> log_safety_nosafety.err
-echo "[$(date)] safety_nosafety done  exit=$?"
+RC=$?
+echo "[$(date)] safety_nosafety done  exit=$RC"
+if [ "$RC" -ne 0 ]; then exit "$RC"; fi
+D="runs/safety_nosafety__${PBS_JOBID}"
+if [ ! -f "$D/stage6_output.csv" ]; then
+    D=$(ls -dt runs/safety_nosafety__* 2>/dev/null | head -1)
+fi
+if [ -z "$D" ] || [ ! -f "$D/stage6_output.csv" ]; then
+    echo "[$(date)] ERROR: safety_nosafety produced no stage6_output.csv — marking arm FAILED"
+    exit 3
+fi
+echo "[$(date)] artifact check OK: $D/stage6_output.csv"
 INNER
 
-# ── Job 3: analysis ───────────────────────────────────────────
+# ── Job 4: analysis ───────────────────────────────────────────
 cat > _tmp_safety_analysis.pbs << 'INNER'
 #!/bin/bash -l
 #PBS -N saw_safety_anal
+#PBS -P FPAXJW8067
 #PBS -l walltime=02:00:00
 #PBS -l select=1:ncpus=4:mem=32GB
 #PBS -j oe
@@ -76,20 +103,36 @@ conda activate zigenv
 module unload Anaconda3
 mkdir -p runs/safety_analysis/plots
 echo "[$(date)] safety_analysis starting"
+# S3 uses the zone-level accessibility artifact. Build it before the analysis
+# so the safety table is never silently emitted with a missing accessibility row.
+python -u build_accessibility_371_extended.py \
+    > log_accessibility_371.err 2>&1
+RC0=$?
+if [ "$RC0" -ne 0 ] || [ ! -s saved_data/accessibility_371_extended.csv ]; then
+    echo "[$(date)] ERROR: accessibility_371_extended.csv was not produced"
+    exit 4
+fi
 python -u safety_experiment_analysis.py \
     > log_safety_analysis.out 2> log_safety_analysis.err
-echo "[$(date)] safety_analysis done  exit=$?"
+RC1=$?
+echo "[$(date)] safety_experiment_analysis done  exit=$RC1"
+python -u safety_plan_impact.py \
+    --out runs/safety_plan_impact \
+    > log_safety_impact.out 2> log_safety_impact.err
+RC2=$?
+echo "[$(date)] safety_plan_impact done  exit=$RC2"
+if [ "$RC1" -ne 0 ] || [ "$RC2" -ne 0 ]; then exit 1; fi
 INNER
 
 # ── Submit chain ──────────────────────────────────────────────
 JID1=$(qsub _tmp_safety_baseline.pbs)
-echo "Submitted safety_baseline  → $JID1"
+echo "Submitted safety_baseline        → $JID1"
 
 JID2=$(qsub -W depend=afterok:$JID1 _tmp_safety_nosafety.pbs)
-echo "Submitted safety_nosafety  → $JID2  (after $JID1)"
+echo "Submitted safety_nosafety        → $JID2  (after $JID1)"
 
 JID3=$(qsub -W depend=afterok:$JID2 _tmp_safety_analysis.pbs)
-echo "Submitted safety_analysis  → $JID3  (after $JID2)"
+echo "Submitted safety_analysis        → $JID3  (after $JID2)"
 
 rm -f _tmp_safety_baseline.pbs _tmp_safety_nosafety.pbs _tmp_safety_analysis.pbs
 

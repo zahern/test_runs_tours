@@ -1,0 +1,50 @@
+#!/bin/bash -l
+#PBS -N suncorp_syntax_chk
+#PBS -l walltime=00:10:00
+#PBS -l select=1:ncpus=1:mem=2GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# Compile-check only (cheap). Catches syntax/indent errors introduced by
+# the SD jam-density EB, per-segment elasticity, and calsd units fixes
+# BEFORE spending 8 hours of an 8-core node on the real run.
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+echo "=== compile check ==="
+cd "$PROJ_DIR/scripts"
+python -m py_compile 59_game_day_search_predict.py \
+  && echo "59 OK" || { echo "59 FAILED"; exit 1; }
+python -m py_compile 60_game_day_mip.py \
+  && echo "60 OK" || { echo "60 FAILED"; exit 1; }
+python -m py_compile 00_sd_diag.py 00_rank_diag.py \
+  && echo "diagnostics OK" || echo "diagnostic scripts failed (non-fatal)"
+
+echo "=== import check (no data reads) ==="
+python - <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location(
+    "m59", "/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/"
+            "suncorp_telematics/scripts/59_game_day_search_predict.py")
+m = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(m)
+except SystemExit:
+    pass
+except Exception as exc:
+    print("import raised:", type(exc).__name__, str(exc)[:300])
+    sys.exit(1)
+for fn in ("fit_speed_density", "sd_regime", "sd_predict",
+           "estimate_seg_crowd_elasticity", "calibrate_sd_lift",
+           "estimate_demand_elasticity", "predict_future_chunked"):
+    print(f"  {fn}: {'present' if hasattr(m, fn) else 'MISSING'}")
+print("import OK")
+PY
+
+echo "done"

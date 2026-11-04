@@ -1,0 +1,101 @@
+#!/bin/bash -l
+#PBS -N t6grouped
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=4:mem=192GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# T6 — grouped temporal variation smoke test on real data.
+#
+# Uses --group-temporal on with --group-by segment so the temporal basis
+# (rel_sin / rel_cos) takes the grouped role 4. This is the cheapest way to
+# see whether per-segment temporal structure actually fits: it answers
+# "does risk vary by segment over the event window" without running the
+# full 200-iteration search. Deliberately tiny and NOT a scientific result.
+#
+# Also turns stage 2b into an AR(2) refit (2-bin lag) so the temporal
+# surface exists for a later MIP pass, without --temporal-predict
+# overwriting the main surface.
+# o27011171 OOM'd at 64GB during the refit (RSS 61.2GB) — the grouped
+# model on 7,558 segments is memory-heavy. Bumped to 192GB/4h and
+# --refit-R 10 to halve N*R headroom needs.
+set -u
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+OUT_DIR=$PROJ_DIR/results_tests/t6_grouped_temporal
+FIG_DIR=$PROJ_DIR/figures_tests/t6_grouped_temporal
+
+# Refuse to run outside PBS: keep all compute off the login/head node.
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export JAX_PLATFORMS=cpu
+export PYTHONIOENCODING=utf-8
+
+cd "$SCRIPT_DIR"
+rm -rf "$OUT_DIR" "$FIG_DIR"
+mkdir -p "$OUT_DIR" "$FIG_DIR"
+
+echo "=================================================================="
+echo "T6 grouped temporal smoke test started on $(hostname) at $(date)"
+echo "=================================================================="
+echo "package: $(python -c 'from importlib.metadata import version; print(version("metacountregressor"))')"
+echo
+
+python -u 59_game_day_search_predict.py \
+  --out-dir "$OUT_DIR" --fig-dir "$FIG_DIR" \
+  --search-iters 2 --search-chunk 2 --wall-budget 1800 \
+  --n-starts 1 --search-R 5 --refit-R 10 \
+  --search-vars slim --target trips_mean_gt_10 \
+  --group-by segment \
+  --group-temporal on \
+  --n-future 2 \
+  --two-stage on \
+  --temporal-mode ar1 --temporal-refit ar2 \
+  2>&1
+
+RC=$?
+echo
+echo "=================================================================="
+echo "T6 python exit code: $RC"
+echo
+
+python - "$OUT_DIR" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+p = os.path.join(d, "game_day_holdout_metrics.json")
+if not os.path.exists(p):
+    print("FAIL: no holdout metrics json written")
+    sys.exit(1)
+j = json.load(open(p))
+a = j.get("audit") or {}
+m = j.get("metrics") or {}
+print("group_temporal:", a.get("group_temporal"))
+print("temporal_mode:", a.get("temporal_mode"))
+print("temporal_stage:", json.dumps(a.get("temporal_stage") or {}, sort_keys=True)[:600])
+print("metrics:", {k: m.get(k) for k in (
+    "rmse", "calibration_slope", "segment_top20",
+    "temporal_bin_spearman", "temporal_segment_spearman",
+    "temporal_segment_top20")})
+PY
+if [ "$RC" -ne 0 ]; then
+  echo "FAILED (python exit $RC)"
+  exit "$RC"
+fi
+echo
+echo "=================================================================="
+echo "T6 finished at $(date)"
+echo "=================================================================="

@@ -71,6 +71,10 @@ EXPECTED_N_ZONES = int(os.environ.get('ZONE_SYSTEM_N_ZONES', '371'))
 # ---------------------------------------------------------------------------
 _SKIM_UNITS_CACHE = None
 _SKIM_UNITS_N_ZONES = None
+# {matrix_name: unit label} from the sidecar's 'units' section (km, minutes,
+# crash count, boardings, cents, ...). Used to recognise NON-time matrices so
+# to_minutes() passes them through untouched instead of legacy value-guessing.
+_SKIM_UNIT_LABELS: dict = {}
 
 
 def _skim_units_path() -> Optional[str]:
@@ -84,7 +88,7 @@ def _skim_units_path() -> Optional[str]:
 
 def load_skim_unit_divisors() -> dict:
     """{matrix_name: divisor} from the sidecar (cached; {} when unavailable)."""
-    global _SKIM_UNITS_CACHE, _SKIM_UNITS_N_ZONES
+    global _SKIM_UNITS_CACHE, _SKIM_UNITS_N_ZONES, _SKIM_UNIT_LABELS
     if _SKIM_UNITS_CACHE is not None:
         return _SKIM_UNITS_CACHE
     _SKIM_UNITS_CACHE = {}
@@ -98,9 +102,28 @@ def load_skim_unit_divisors() -> dict:
                 _SKIM_UNITS_CACHE = {str(k): float(v)
                                      for k, v in _doc['time_divisors'].items()}
                 _SKIM_UNITS_N_ZONES = int(_doc.get('n_zones', -1))
+            # 'units' section: {name: {units: label, ...}} (or a bare string).
+            if isinstance(_doc, dict) and isinstance(_doc.get('units'), dict):
+                for _k, _v in _doc['units'].items():
+                    _lbl = _v.get('units') if isinstance(_v, dict) else _v
+                    if _lbl is not None:
+                        _SKIM_UNIT_LABELS[str(_k)] = str(_lbl).strip()
     except Exception as _e:
         logger.debug(f"load_skim_unit_divisors skipped ({_e})")
     return _SKIM_UNITS_CACHE
+
+
+# Unit labels that mean "this is already a time in minutes" (no scaling).
+_TIME_UNIT_LABELS = {'minutes', 'minute', 'min', 'mins', 'minutes (min)'}
+
+
+def skim_unit_label(matrix_name: str) -> Optional[str]:
+    """Unit label recorded for a matrix in the sidecar, or None if unknown."""
+    try:
+        load_skim_unit_divisors()
+        return _SKIM_UNIT_LABELS.get(str(matrix_name))
+    except Exception:
+        return None
 
 
 def skim_time_divisor(matrix_name: str, n_zones=None) -> Optional[float]:
@@ -146,6 +169,20 @@ def to_minutes(matrix_name: str, values, n_zones=None):
                             f"(/{_div:g} -> minutes, no value-guessing)")
             out = _arr / _div
             return float(out) if _scalar else out
+        # Documented matrix with a known unit label: trust the sidecar and pass
+        # raw values through unchanged. For minutes that is exactly right
+        # (divisor 1.0 = already minutes); for non-time quantities (km
+        # distance, crash count, boardings, cents) time-value guessing would
+        # mis-scale them (a 250 km walk leg divided by 10) and spam the
+        # "NOT in sidecar" warning. Only matrices UNKNOWN to the sidecar fall
+        # through to the legacy value-guess.
+        _lbl = skim_unit_label(matrix_name)
+        if _lbl:
+            if matrix_name not in _ANNOUNCED_UNITS:
+                _ANNOUNCED_UNITS.add(matrix_name)
+                logger.info(f"skim units: '{matrix_name}' is '{_lbl}' per "
+                            f"sidecar — passed through unchanged (no guessing)")
+            return values
         # — legacy fallback for unmeasured matrices/files —
         if matrix_name not in _ANNOUNCED_UNITS:
             _ANNOUNCED_UNITS.add(matrix_name)

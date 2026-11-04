@@ -1,0 +1,967 @@
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+IMPLEMENTATION: RANDOM REGRET MINIMIZATION (RRM)
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+'''
+THEORY:
+
+n - individual
+i - alternative
+m - attribute
+
+X[n][i][m] - value of attribute m if individual n chooses alternative i 
+y[n] - alternative chosen by individual n
+
+
+beta[m] - value represents the relative importance or sensitivity of a specific attribute or 
+characteristic of the alternatives in the choice set. In simpler terms, it tells you how much
+an attribute impacts the regret calculation when a decision-maker is choosing between alternatives.
+
+Large beta[m] => attribute m more strongly influences the regret when alternatives are compared
+Small beta[m] => less impact
+Sign of beta[m]:
+    beta[m] > 0 => an increase in X[.][i][m] reduces regret, and alternative i more attractive
+    beta[m] < 0 => an increase in X[.][i][m] increases regret, and alternative i less attractive
+    beta[m] ~= 0 => decision makers are indifferent to variations in attribute m
+    
+
+regret[n][i] - Regret realised when individual n chooses alternative i
+regret[n][i] = sum(j!=i, r[n][i][j])
+where: r[n][i][j] = sum(m, log(1 + exp(beta[m] * (X[n][j][m] - X[n][i][m]))))) 
+
+Generally: 
+RR[i] - Random regret with considered alternative i
+RR[i] = R[i] + err[i]
+where: R[i] = sum(j!=i, reg[i][j])
+where: reg[i][j] = sum(n, r[n][i][j]) 
+
+Pr(i) = exp(-R[i]) / sum(j, exp(_R[j]))
+
+Note: I do not compute reg[i][j], rather regret[n][i].
+Hence, I compute R[i] as sum(n, regret[n][i])
+Proof: R[i] =  sum(j!=i, sum(n, r[n][i][j])) == sum(n, sum(j!=i, r[n][i][j])) = sum(n, regret[n][i])
+
+'''
+
+import numpy as np
+from numpy.typing import NDArray
+from scipy import stats
+from scipy.optimize import minimize
+
+# ── Convergence assessment ─────────────────────────────────────────────────
+# scipy's BFGS reports success=False with "Desired error not necessarily
+# achieved due to precision loss" once the line search can no longer improve
+# at float64 precision. That happens AFTER the optimum has been reached, so
+# treating result.success as the convergence verdict marks good fits as
+# failures. Downstream that is expensive: the ABM pipeline (stage4 Schedule
+# Placement) labels the model 'optimizer_stopped' and down-weights its period
+# probabilities (blend_alpha 0.08-0.35), so a converged RRM contributes almost
+# nothing to the simulated schedule. All 8 RRM timing models in runs
+# 27284748/27293944 hit this.
+#
+# The verdict below is first-order optimality (scaled gradient at the
+# solution), with a short re-polish when the gradient is still large, which is
+# what actually recovers fits that stalled in the line search.
+RRM_GRAD_TOL = 1e-6          # on the MEAN log-likelihood gradient, per obs
+RRM_POLISH_ATTEMPTS = 2
+RRM_POLISH_MAXITER = 2000
+
+
+def grad_tolerance(n_obs=None, gtol=None):
+    """Absolute gradient threshold for a sample of ``n_obs`` observations.
+
+    The likelihood is a sum, so its gradient grows with the sample size: a
+    fixed absolute threshold is strict on small samples and meaningless on
+    large ones. The criterion used here is that the gradient of the *mean* log
+    likelihood is below ``RRM_GRAD_TOL``. At that point the remaining
+    log-likelihood gain is far below what any reported digit could show.
+    """
+    if gtol is not None:
+        return float(gtol)
+    try:
+        n = int(n_obs or 0)
+    except Exception:
+        n = 0
+    return float(RRM_GRAD_TOL * max(n, 1))
+
+
+def _grad_inf_norm(result, n_params=None, grad=None):
+    """Largest absolute gradient component at the reported solution.
+
+    ``grad`` overrides ``result.jac`` so callers holding a more accurate
+    gradient (the analytic numpy one, or the numba engine's finite-difference
+    estimate at a nearly-collinear solution) can supply it.
+    """
+    try:
+        jac = (np.asarray(grad, dtype=float) if grad is not None
+               else np.asarray(result.jac, dtype=float)).ravel()
+        if jac.size == 0 or not np.all(np.isfinite(jac)):
+            return float('nan')
+        return float(np.max(np.abs(jac)))
+    except Exception:
+        return float('nan')
+
+
+def assess_convergence(result, gtol=None, n_obs=None, grad=None):
+    """Decide convergence from the evidence, not only ``result.success``.
+
+    Returns ``(converged, grad_inf, message)``. A fit counts as converged when
+    scipy says so, or when the gradient is small enough to be at a stationary
+    point even though the line search gave up on precision. Unknown gradients
+    fall back to scipy's verdict rather than claiming success.
+    """
+    tol = grad_tolerance(n_obs, gtol)
+    grad = _grad_inf_norm(result, grad=grad)
+    msg = str(getattr(result, 'message', '') or '')
+    success = bool(getattr(result, 'success', False))
+    if success:
+        return True, grad, msg
+    if np.isfinite(grad) and grad <= tol:
+        return True, grad, msg + ' [accepted: scaled gradient below tolerance]'
+    return False, grad, msg
+
+
+def polish_result(fun, result, gtol=None, attempts=None, maxiter=None,
+                  grad_fun=None, n_obs=None):
+    """Re-run BFGS from the reported solution while the gradient is too large.
+
+    The first BFGS call already did the work; this only rescues fits that
+    stopped early with a usable point. The best objective value wins, so a
+    polish pass can never return a worse fit than the one it started from.
+
+    ``grad_fun(x)`` supplies a more accurate gradient than ``result.jac`` for
+    the stopping test (the numba engine's finite differences are noisy where
+    the specification is nearly collinear, which would otherwise keep the
+    retry loop running at a point that is already optimal).
+    """
+    tol = grad_tolerance(n_obs, gtol)
+    n_left = int(RRM_POLISH_ATTEMPTS if attempts is None else attempts)
+    n_iter = int(RRM_POLISH_MAXITER if maxiter is None else maxiter)
+    best = result
+    best_f = float(getattr(result, 'fun', np.inf))
+
+    def _stopping_grad(res):
+        if grad_fun is None:
+            return None
+        try:
+            return grad_fun(res.x)
+        except Exception:
+            return None
+
+    while n_left > 0:
+        ok, grad, _msg = assess_convergence(best, tol, grad=_stopping_grad(best))
+        if ok:
+            break
+        n_left -= 1
+        try:
+            retry = minimize(fun, np.asarray(best.x, dtype=float), jac=True,
+                             method='BFGS', tol=1e-8,
+                             options={'maxiter': n_iter,
+                                      'gtol': max(tol, 1e-6), 'disp': False})
+        except Exception:
+            break
+        f_new = float(getattr(retry, 'fun', np.inf))
+        if not np.isfinite(f_new) or f_new > best_f + 1e-9:
+            break                      # no progress: keep what we had
+        best, best_f = retry, f_new
+    return best
+import pandas as pd
+from time import time
+try:
+    from _choice_model import DiscreteChoiceModel
+except ImportError:
+    from ._choice_model import  DiscreteChoiceModel
+minval = 1E-30
+
+''' ---------------------------------------------------------- '''
+''' Function                                                   '''
+''' ---------------------------------------------------------- '''
+
+def convert_df_long(df_long):
+# {
+    exclude = {'id', 'alt', 'chosen'}
+    attrs = list(df_long.columns.difference(exclude)) # Grab all columns not excluded
+    nb_ind = len(df_long['id'].unique())
+    new_rows = [{} for i in range(nb_ind)]
+    for _, row in df_long.iterrows():
+    # {
+        i = int(row['id']) - 1 # ids start at 1 and are sequential
+        alt = int(row['alt'])
+        if int(row['chosen']) == 1: new_rows[i]['choice'] = alt
+        for attr in attrs:
+            label = f"{attr}_{alt}"
+            new_rows[i][label] = row[attr]
+    # }
+    df_short = pd.DataFrame(new_rows)  # Create new DataFrame
+    return df_short
+# }
+
+''' ---------------------------------------------------------- '''
+''' Function                                                   '''
+''' ---------------------------------------------------------- '''
+# Convert df in short format to long format
+def convert_df_short(df_short):
+# {
+    # Extract base attribute names
+    attrs = list(dict.fromkeys(col.split('_')[0] for col in df_short.columns if col != "choice"))
+    nb_alt = len(np.unique(df_short['choice']))
+
+    # Build long-format rows
+    rows = []
+    for idx, row in df_short.iterrows():
+    # {
+        # Create a row for each alternative
+        for alt in range(nb_alt):
+        # {
+            chosen = 1 if row['choice'] == alt + 1 else 0
+            # For each row add a chosen flag and "alternative" entry
+            new_row = {
+                'id': idx + 1,
+                'alt': alt + 1,
+                'chosen': chosen,
+            }
+            # Add a column entry for each attribute:
+            for attr in attrs:
+                new_row[attr] = row[f"{attr}_{alt+1}"] # Grab the value
+            rows.append(new_row)
+        # }
+    # }
+
+    df_long = pd.DataFrame(rows) # Create new DataFrame
+    return df_long
+# }
+
+''' ---------------------------------------------------------- '''
+''' CLASS FOR ESTIMATION OF RANDOM REGRET MINIMIZATION MODEL   '''
+''' ---------------------------------------------------------- '''
+
+class RandomRegret(DiscreteChoiceModel):
+# {
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' ---------------------------------------------------------- '''
+
+
+
+
+
+
+
+    def __init__(self, **kwargs):
+    # {
+
+
+        super().__init__()
+        self.descr = "RRM"
+
+        # Check if kwargs is empty
+        if not kwargs:  # If kwargs is empty, do nothing
+            self.choice = None
+            self.id = None
+            self.choosen=  None
+            return
+        short = kwargs.get("short")
+        if short:
+            self.setup_short(**kwargs)
+        else:
+            self.setup_long(**kwargs)
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' ---------------------------------------------------------- '''
+    def unscale_beta(self, beta):
+    # {
+        ranges = np.array([self.range[attr] for attr in self.attrs])
+        return beta / ranges
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' ---------------------------------------------------------- '''
+    # By attribute - dataframe is in short format
+    def normalize_data_short(self, df):
+    # {
+        self.normalize = True
+        self.range = {}
+        for attr in self.attrs:
+        # {
+            cols = [col for col in df.columns if col.split('_')[0] == attr]
+            min_value = df[cols].min().min()
+            max_value = df[cols].max().max()
+            attr_range = max_value - min_value
+            if attr_range == 0: raise ValueError(f"Attribute '{attr}' has zero range (max = min).")
+            self.range[attr] = attr_range
+            for col in cols: df[col] = (df[col] - min_value) / self.range[attr]
+        # }
+    # }
+
+    def normalize_data_long(self, df):
+    # {
+        self.normalize = True
+        self.range = {}
+        exclude = {'id', 'choice', 'alt'}
+        attr_cols = list(df.columns.difference(exclude)) # Grab all columns not excluded
+        for col in attr_cols:
+        # {
+            min_value = df[col].min()
+            max_value = df[col].max()
+            col_range = max_value - min_value
+            if col_range == 0:
+                raise ValueError(f"Attribute '{col}' has zero range (max = min).")
+            self.range[col] = col_range
+            df[col] = (df[col] - min_value) / col_range
+        # }
+    # }
+
+    '''Function to setup the Code'''
+
+
+    def setup(self, X=None, y=None, varnames = None, alts = None, isvars = None, transvars = None, ids =None, weights = None, panels = None, avail = None, base_alt = None,
+              transformation= 'boxcox', maxiter = 2000, engine=None, **kwargs):
+        """
+        Generic setup function to initialize the model using provided data.
+
+        engine : optional execution engine for fit(); 'numba' selects the
+        njit likelihood + gradient (see numba_rrm / numba_engine), anything
+        else (or None) keeps the standard SciPy/JAX paths. May also be set
+        post-hoc as model.engine; an explicit kwarg wins over a pre-set
+        attribute.
+        """
+
+        X, y, varnames, alts, isvars, transvars, ids, weights, panels, avail = \
+            self.set_asarray(X, y, varnames, alts, isvars, transvars, ids, weights, None, avail)
+        self.nb_samples, self.nb_attr = X.shape
+        self.nb_alt = len(set(alts))
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # CHECK FOR MISTAKES IN DATA
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        self.validate_inputs(X, y, alts, varnames)
+        # REMOVED: , isvars, ids, weights, None, base_alt, fit_intercept, maxiter)
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # RECORD PARAMETERS AS MEMBER VARIABLES
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        self.X, self.y = X, y
+
+        if self.X.shape[1] > 0 and self.X[0].dtype == np.object_:
+            Xis_numeric = pd.to_numeric(self.X.flatten(), errors='coerce').reshape(self.X.shape)
+            Xis_numeric = np.nan_to_num(Xis_numeric, nan=0)
+            self.X = Xis_numeric
+
+        self.pre_process(alts, varnames, isvars, transvars, base_alt, self.fit_intercept, transformation, maxiter, panels)
+        self.weights, self.avail = weights, avail
+        self.engine = engine if engine is not None else getattr(self, 'engine', None)
+
+
+
+        self.panels = panels
+        self.jac = True if self.return_grad else False
+        self.fxidx, self.fxtransidx = [], []  # Initialise empty arrays
+        # FIX ME
+        for var in self.asvars:  # {
+            is_transvar = var in self.transvars  # True or False state
+            self.fxidx.append(not is_transvar)
+            self.fxtransidx.append(is_transvar)
+        # }
+        '''
+        if self.transformation == "boxcox":  # {
+            self.trans_func = boxcox_transformation
+            self.transform_deriv = boxcox_param_deriv
+        # }
+        '''
+        self.fixedtransvars = self.transvars
+        self.X, self.Xnames = self.setup_design_matrix(self.X)
+
+        # Update nb_samples to reflect per-observation count (after 3D reshape)
+        self.nb_samples = self.N
+        self.nb_attr = self.X.shape[2] if self.X.ndim == 3 else self.X.shape[1]
+        # Convert binary choice indicators (N*J,) to per-obs chosen alt index (N,)
+        y_matrix = self.y.reshape(self.N, self.J)
+        self.y = np.argmax(y_matrix, axis=1).astype(int)
+
+
+
+        if self.weights is not None:
+            self.weights = self.weights.reshape(self.X.shape[0], self.X.shape[1])  # Match the size of X
+
+        if self.avail is not None:
+            self.avail = self.avail.reshape(self.X.shape[0], self.X.shape[1])  # Match the size of X
+
+        # The code self.y.reshape(-1, self.J) is reshaping the array self.y into a two-dimensional
+        # array with a specified number of columns (self.J) while inferring the appropriate number
+        # of rows based on the size of the original array.
+
+        #self.y = self.y.reshape(-1, self.J)
+
+        #self.obs_prob = np.mean(self.y, axis=0)  # Compute: obs_prob[j] = average(y[:,j])
+
+
+        '''
+                self.X = np.zeros((self.nb_samples, self.nb_alt, self.nb_attr))  # Define X[n][i][m] - ind. n, alt. i, attr. m
+
+        # Convert columns for indexing
+        ind = self.df['id'].astype(int) - 1
+        alt = self.df['alt'].astype(int) - 1
+
+        # Populate self.X
+        for m, attr in enumerate(self.attrs):
+            self.X[ind, alt, m] = self.df[attr].to_numpy()
+
+        # Extract the choices
+        self.y = np.zeros((self.nb_samples), dtype=int)
+        chosen_rows = self.df[self.df['chosen'] == 1]
+        self.y[chosen_rows['id'].values - 1] = chosen_rows['alt'].values - 1
+        
+        '''
+        self.y = np.zeros((self.nb_samples), dtype=int)
+        self.attrs = kwargs.get("varnames", varnames)
+        self.normalize = kwargs.get('normalize', False)
+        self.initialise()
+
+
+        # }
+
+
+    def validate_dataframe_columns(self, df, required_columns):
+        """
+        Validate if the dataframe contains the required columns.
+        Raise a ValueError if any column is missing.
+        """
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            raise ValueError(f"The dataframe is missing the following required columns: {missing_columns}")
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' ---------------------------------------------------------- '''
+    def setup_long(self, **kwargs):
+    # {
+        self.df = kwargs.get('df')  # The full dataframe
+
+        self.validate_dataframe_columns(self.df, ['id', 'choice', 'alt'])
+
+        id_codes, id_index = np.unique(self.df['id'].to_numpy(), return_inverse=True)
+        alt_codes, alt_index = np.unique(self.df['alt'].to_numpy(), return_inverse=True)
+        self.nb_alt = len(alt_codes)
+        self.nb_samples = len(id_codes)
+
+        exclude_columns = {'id', 'alt', 'choice'}
+        self.attrs = [col for col in self.df.columns if col not in exclude_columns]
+        self.nb_attr = len(self.attrs)
+        self.normalize = kwargs.get('normalize')
+        if self.normalize: self.normalize_data_long(self.df)
+
+        # Translate the dataframe contents into a 3D matrix
+        self.X = np.zeros((self.nb_samples, self.nb_alt, self.nb_attr))  # Define X[n][i][m] - ind. n, alt. i, attr. m
+
+        # Convert columns for indexing
+        # Populate self.X
+        for m, attr in enumerate(self.attrs):
+            self.X[id_index, alt_index, m] = self.df[attr].to_numpy()
+
+        # Extract the choices
+        self.y = np.zeros((self.nb_samples), dtype=int)
+        chosen_pos = np.flatnonzero(self.df['choice'].to_numpy() == 1)
+        self.y[id_index[chosen_pos]] = alt_index[chosen_pos]
+        self.initialise()
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' ---------------------------------------------------------- '''
+    # Assumption: The df has one row for each individual
+    # Assumption: The df has one column for each "attribute_alternative" pairing
+    # e.g., time_1, time_2, time_3, cost_1, cost_2, cost_3 for attr = {time, cost}, alt = {1,2,3}
+    def setup_short(self, **kwargs):
+    # {
+        self.df = kwargs.get('df')  # The full dataframe
+        self.nb_samples = len(self.df)
+        self.nb_alt = len(np.unique(self.df['choice']))
+        self.attrs = list(dict.fromkeys(col.split('_')[0] for col in self.df.columns if col != 'choice'))
+        self.nb_attr = len(self.attrs)
+        self.normalize = kwargs.get('normalize')
+        if self.normalize: self.normalize_data_short(self.df)
+
+        # Translate the dataframe contents into a 3D matrix
+        self.X = np.zeros((self.nb_samples, self.nb_alt, self.nb_attr))  # Define X[n][i][m] - ind. n, alt. i, attr. m
+        for i in range(self.nb_alt): # alternative i
+            for m, attr in enumerate(self.attrs): # mth attribute
+                name = f'{attr}_{i + 1}'
+                self.X[:, i, m] = self.df[name]  # Copy column array to individuals
+
+        self.y = self.df['choice'].values - 1  # Convert to 0-based indexing for python arrays
+        self.initialise()
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' ---------------------------------------------------------- '''
+    def initialise(self):
+    # {
+        self.beta = np.zeros(self.nb_attr, dtype=float)
+        self.labels = np.array(self.attrs)
+        # summarise()/search need coefficient names; without this every
+        # converged fixed-RRM best crashed print_best_solution with
+        # TypeError: 'NoneType' object is not iterable.
+        self.coeff_names = [str(v) for v in list(self.labels)]
+
+        self.stderr = np.zeros(self.nb_attr)
+        self.signif_lb = np.zeros(self.nb_attr)
+        self.signif_ub = np.zeros(self.nb_attr)
+        self.pvalues = np.zeros(self.nb_attr)
+        self.zvalues = np.zeros(self.nb_attr)
+        self.prob = np.zeros((self.nb_samples, self.nb_alt))
+
+        self.loglik = None
+        self.aic = None
+        self.bic = None
+    # }
+
+    def _availability_matrix(self, avail=None, n_samples=None):
+        values = self.avail if avail is None else avail
+        if values is None or len(values) == 0:
+            return None
+        values = np.asarray(values)
+        n_samples = self.nb_samples if n_samples is None else int(n_samples)
+        if values.ndim == 1:
+            expected = n_samples * self.nb_alt
+            if values.size != expected:
+                return None
+            values = values.reshape(n_samples, self.nb_alt)
+        if values.shape != (n_samples, self.nb_alt):
+            return None
+        return (values > 0).astype(float)
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' ---------------------------------------------------------- '''
+    # Compute regret between alternative i and alternative j
+    # Where: x_i and x_j are 1d arrays. Dimension: (nb_attr, )
+    # beta[m] - estimable parameter (weighting) for attribute m
+    # Compute: regret = 0.0 and
+    #  for m in range(self.nb_attr): regret += np.log(1.0 + np.exp(beta[m] * (x_v[m] - x_u[m]))))
+    def get_regret(self, x_i:np.ndarray, x_j:np.ndarray, beta:np.ndarray)->float:
+    # {
+        # Apply the regret formula element-wise using vectorized operations
+        diff = x_j - x_i  # Calculate all differences between x_i and x_j
+        # |diff| = nb_attr
+        regret = float(np.sum(np.logaddexp(0.0, beta * diff)))
+        return regret
+    # }
+
+    # For each individual, for each alternative, compute the
+    # regret of not taking other alternatives
+    def compute_regrets(self, beta:np.ndarray, X=None, avail=None):
+    # {
+        X = np.asarray(self.X if X is None else X, dtype=float)
+        diff = X[:, None, :, :] - X[:, :, None, :]
+        pairwise = np.sum(np.logaddexp(0.0, beta[None, None, None, :] * diff), axis=-1)
+        pair_mask = 1.0 - np.eye(self.nb_alt, dtype=float)[None, :, :]
+        availability = self._availability_matrix(avail, n_samples=X.shape[0])
+        if availability is not None:
+            pair_mask = pair_mask * availability[:, :, None] * availability[:, None, :]
+        return np.sum(pairwise * pair_mask, axis=2)
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' ---------------------------------------------------------- '''
+    ''' Compute: 
+        probs = np.zeros((self.nb_samples, self.nb_alt)) # shape = (#samp., #alt.)
+        for n in range(self.nb_samples):
+            sum_exp_regrets = np.sum([exp_neg_regret[n,j] for j in range(self.nb_alt)])
+            for i in range(self.nb_alt): probs[n,i] = exp_neg_regret[n, i] / sum_exp_regrets
+    '''
+    def compute_probability(self, beta: np.ndarray, X=None, avail=None)-> np.ndarray:
+    # {
+        regrets = self.compute_regrets(beta, X=X, avail=avail)  # shape: (n_samples, nb_alt)
+        logits = -regrets
+        n_samples = np.asarray(self.X if X is None else X).shape[0]
+        availability = self._availability_matrix(avail, n_samples=n_samples)
+        if availability is not None:
+            logits = np.where(availability > 0, logits, -np.inf)
+        row_max = np.max(logits, axis=1, keepdims=True)
+        safe_max = np.where(np.isfinite(row_max), row_max, 0.0)
+        shifted_logits = logits - safe_max
+        exp_neg_regret = np.exp(np.where(np.isfinite(shifted_logits), shifted_logits, -np.inf))
+        denom = np.sum(exp_neg_regret, axis=1, keepdims=True)
+        return np.divide(exp_neg_regret, denom, out=np.zeros_like(exp_neg_regret), where=denom > 0)
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' ---------------------------------------------------------- '''
+    # From: https://www.stata.com/meeting/uk20/slides/UK20_Vargas.pdf
+    ''' More numerically stable version:
+          for n in range(self.nb_samples):
+              for i in range(self.nb_alt):
+                 if self.y[n] == i: 
+                    loglik += regrets[n,i] + np.log(sum(i_, np.exp(-regrets[n,i_]))                
+    '''
+    def get_loglike_2(self, beta: np.ndarray)->float:
+    # {
+        regrets = self.compute_regrets(beta)  # shape: (n_samples, nb_alt)
+        logits = -regrets
+        avail = self._availability_matrix()
+        if avail is not None:
+            logits = np.where(avail > 0, logits, -np.inf)
+        valid_rows = np.isfinite(logits).any(axis=1)
+        chosen_available = np.isfinite(logits[np.arange(self.nb_samples), self.y])
+        if not np.all(valid_rows & chosen_available):
+            return np.inf
+        max_logits = np.max(logits, axis=1, keepdims=True)
+        log_sums = max_logits[:, 0] + np.log(np.sum(np.exp(logits - max_logits), axis=1))
+        chosen_regrets = regrets[np.arange(self.nb_samples), self.y]
+        loglik = np.sum(chosen_regrets + log_sums)
+        return -loglik
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' ---------------------------------------------------------- '''
+    # Note: np.arange(self.nb_samples) => [0, 1, 2, ..., n-1]
+    def get_loglike(self, beta: np.ndarray)->float:
+    # {
+        self.probs = self.compute_probability(beta)  # shape: (n_samples, nb_alt)
+        chosen = self.probs[np.arange(self.nb_samples), self.y]
+        loglik = float(np.sum(np.log(np.clip(chosen, 1e-300, 1.0))))
+        return loglik
+    # }
+
+    def get_neg_loglike(self, beta):
+        self.loglik = self.get_loglike(beta)
+        return - self.loglik
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    def evaluate(self, beta: np.ndarray, minimize=True) -> float:
+    # {
+        self.loglik = self.get_loglike(beta)
+        score = self.loglik
+        return -score if minimize else score
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    def get_loglike_gradient(self, beta: np.ndarray, delta: np.ndarray):
+    # {
+        score = self.evaluate(beta) # or use: get_neg_loglike
+        X = np.asarray(self.X, dtype=float)
+        diff = X[:, None, :, :] - X[:, :, None, :]
+        scaled = beta[None, None, None, :] * diff
+        pair_grad = diff * (1.0 / (1.0 + np.exp(-np.clip(scaled, -700.0, 700.0))))
+        pair_mask = 1.0 - np.eye(self.nb_alt, dtype=float)[None, :, :]
+        avail = self._availability_matrix()
+        if avail is not None:
+            pair_mask = pair_mask * avail[:, :, None] * avail[:, None, :]
+        regret_grad = np.sum(pair_grad * pair_mask[:, :, :, None], axis=2)
+        probs = self.compute_probability(beta)
+        expected_grad = np.sum(probs[:, :, None] * regret_grad, axis=1)
+        gradient = np.sum(
+            regret_grad[np.arange(self.nb_samples), self.y] - expected_grad, axis=0
+        )
+        return (score, gradient)
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    def get_bic(self, loglike):
+        return np.log(max(self.nb_samples, 1)) * self.nb_attr - 2.0 * loglike
+
+    def get_aic(self, loglike):
+         return 2.0 * self.nb_attr - 2.0 * loglike
+
+    def predict_proba(self, X=None, avail=None):
+        beta = np.asarray(getattr(self, 'beta', self.coeff_est), dtype=float)
+        if X is None:
+            X = self.X
+        X = np.asarray(X, dtype=float)
+        if X.ndim != 3 or X.shape[1] != self.nb_alt or X.shape[2] != self.nb_attr:
+            raise ValueError(
+                f'X must have shape (N, {self.nb_alt}, {self.nb_attr}); received {X.shape}'
+            )
+        return self.compute_probability(beta, X=X, avail=avail)
+
+    def predict(self, X=None, avail=None):
+        return np.argmax(self.predict_proba(X=X, avail=avail), axis=1)
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    # ------------------------------------------------------------------
+    # JAX-based MLE for RRM
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _jax_rrm_negloglik(beta, X_jax, y_jax):
+        """Pure-JAX negative log-likelihood for the Random Regret Model.
+
+        Parameters
+        ----------
+        beta  : jax array (M,) – attribute weights
+        X_jax : jax array (N, I, M) – attribute values per individual/alternative
+        y_jax : jax int array (N,) – chosen alternative index (0-based)
+        """
+        import jax
+        import jax.numpy as jnp
+
+        N, I, M = X_jax.shape
+        # regret[n,i] = sum_{j!=i} sum_m log(1 + exp(beta_m * (x_{n,j,m} - x_{n,i,m})))
+        diff = X_jax[:, None, :, :] - X_jax[:, :, None, :]   # (N, I, I, M)
+        inner = jax.nn.softplus(beta[None, None, None, :] * diff)       # (N, I, I, M)
+        pairwise = jnp.sum(inner, axis=-1)                             # (N, I, I)
+        # zero diagonal (same alternative)
+        mask = 1.0 - jnp.eye(I)[None, :, :]                           # (1, I, I)
+        regrets = jnp.sum(pairwise * mask, axis=2)                     # (N, I)
+
+        # choice probabilities: exp(-R_i) / sum_j exp(-R_j)
+        neg_reg  = -regrets
+        neg_reg  = neg_reg - jnp.max(neg_reg, axis=1, keepdims=True)
+        exp_neg  = jnp.exp(neg_reg)
+        probs    = exp_neg / jnp.sum(exp_neg, axis=1, keepdims=True)  # (N, I)
+        probs    = jnp.clip(probs, 1e-300, 1.0)
+
+        chosen_lp = jnp.log(probs)[jnp.arange(N), y_jax]             # (N,)
+        return -jnp.sum(chosen_lp)
+
+    def fit_jax(self, start=None):
+        """JAX-accelerated fit; falls back to scipy finite-difference on failure."""
+        try:
+            import jax
+            import jax.numpy as jnp
+            from scipy.optimize import minimize as sp_min
+
+            if start is None:
+                start = np.zeros(self.nb_attr)
+
+            X_jax = jnp.array(self.X, dtype=jnp.float64)
+            y_jax = jnp.array(self.y, dtype=jnp.int32)
+
+            @jax.jit
+            def _neg_ll(b):
+                return self._jax_rrm_negloglik(b, X_jax, y_jax)
+
+            _val_grad = jax.jit(jax.value_and_grad(_neg_ll))
+
+            def _obj(betas_np):
+                b    = jnp.array(betas_np, dtype=jnp.float64)
+                v, g = _val_grad(b)
+                return float(v), np.array(g, dtype=np.float64)
+
+            from time import time as _time
+            self.fit_start_time = _time()
+            result = sp_min(_obj, start, jac=True, method='BFGS',
+                            options={'maxiter': 2000, 'gtol': 1e-6, 'disp': False})
+            result = polish_result(_obj, result, maxiter=2000,
+                                   n_obs=self.nb_samples)
+            self.coeff_est = result.x
+            self.converged, self.grad_norm_inf, self.fit_message = \
+                assess_convergence(result, n_obs=self.nb_samples)
+            self.beta      = result.x
+            self.post_process()
+            return
+        except Exception as e:
+            print(f"[JAX RRM optimizer] falling back to scipy finite-diff: {e}")
+
+        self.fit()   # fallback
+
+    def fit(self, start=None, compute_inference=True):
+    # {
+        if start is None: start = np.zeros(self.nb_attr)
+        tol = 1e-10
+
+
+        self.fit_start_time = time()  # Set the start time for runtime calculation
+        # Optional numba engine: njit likelihood + prange gradient under the
+        # same BFGS contract (sets coeff_est/beta/converged + post_process).
+        # An explicit model.engine wins; otherwise the global default
+        # (SL_ENGINE env var or numba_engine.set_default_engine) applies.
+        # Any failure falls through to the standard path below.
+        try:
+            try:
+                from numba_engine import effective_engine as _rrm_eff_eng
+            except ImportError:
+                from .numba_engine import effective_engine as _rrm_eff_eng
+            _rrm_use_numba = (_rrm_eff_eng(self) == 'numba')
+        except Exception:
+            _rrm_use_numba = (getattr(self, 'engine', None) == 'numba')
+        if _rrm_use_numba:
+            try:
+                try:
+                    from numba_rrm import fit_rrm_numba
+                except ImportError:
+                    from .numba_rrm import fit_rrm_numba
+                return fit_rrm_numba(self, start, compute_inference)
+            except Exception as _e:
+                print(f"[RRM numba engine] failed ({_e}); falling back to scipy.")
+        # Optional:
+        #result = minimize(fun=self.get_neg_loglike, x0=start, method='BFGS', tol=tol, jac=False)
+
+        delta = np.ones(self.nb_attr) * tol
+        args = (delta,)  # tuple
+        result = minimize(
+            fun=self.get_loglike_gradient,
+            x0=start,
+            method='BFGS',
+            args=args,
+            tol=tol,
+            jac=True,
+            options={'maxiter': getattr(self, 'maxiter', 2000)},
+        )
+        # Re-polish while the gradient is still large, then judge convergence
+        # on first-order optimality rather than scipy's precision-loss flag
+        # (see assess_convergence above).
+        _polish_fun = lambda _x: self.get_loglike_gradient(_x, delta)
+        result = polish_result(_polish_fun, result, n_obs=self.nb_samples)
+        self.coeff_est = result.x
+        self.converged, self.grad_norm_inf, self.fit_message = \
+            assess_convergence(result, n_obs=self.nb_samples)
+        self.beta = result.x  # Extract results
+        self.post_process(compute_inference=compute_inference)
+    # }
+
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    def compute_gradient_central(self, params:NDArray[np.float64], delta:NDArray[np.float64])->NDArray[np.float64]:
+    # {
+        gradient = np.zeros_like(params) # create an array
+        for i in range(len(params)):
+        # {
+            params_plus = params.copy()
+            params_minus = params.copy()
+
+            params_plus[i] += delta[i]
+            params_minus[i] -= delta[i]
+
+            case_1 = self.evaluate(params_plus)
+            case_2 = self.evaluate(params_minus)
+
+            gradient[i] = (case_1 - case_2) / (2.0 * delta[i])
+        # }
+        return gradient
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    def get_hessian(self, eps=1e-6):
+    # {
+        N = self.nb_attr  # Cardinality of hessian matrix
+        hessian = np.zeros((N, N))  # Initialise hessian matrix
+        delta = [eps] * N
+        beta = np.copy(self.beta)
+        df_0 = self.compute_gradient_central(beta, delta)
+        for i in range(N):  # i.e., for i = 0, 1, ..., N-1
+        # {
+            beta[i] += eps  # Increment by epsilon
+            df_1 = self.compute_gradient_central(beta, delta)
+            hessian[i, :] = (df_1 - df_0) / eps  # Compute the gradient for row i elements
+            beta[i] -= eps  # Undo the change
+        # }
+        return hessian
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    def compute_stderr(self, tol):
+    # {
+        hessian = self.get_hessian(tol)
+        inverse = np.linalg.pinv(hessian)  # Conventional approach
+        diag = np.diagonal(inverse)
+        diag_copy = np.copy(diag)
+        diag_copy[diag_copy < minval] = 0
+        self.stderr = np.sqrt(diag_copy)
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    def compute_confidence_intervals(self):
+        self.signif_lb = self.beta - 1.96 * self.stderr  # i.e. signif_lb[m] = beta[m] - 1.96 * stderr[m]
+        self.signif_ub = self.beta + 1.96 * self.stderr  # i.e.,signif_ub[m] = beta[m] + 1.96 * stderr[m]
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    def compute_zvalues(self):
+    # {
+        for m in range(self.nb_attr):
+        # {
+            if self.stderr[m] > minval:
+                self.zvalues[m] = self.beta[m] / self.stderr[m]
+            else:
+                self.zvalues[m] = np.nan
+        # }
+        self.zvalues = np.clip(self.zvalues, -np.inf, np.inf)  # Set limits
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    def compute_pvalues(self):
+    # {
+        if self.nb_attr < 100:
+            self.pvalues = 2.0 * (1.0 - stats.t.cdf(np.abs(self.zvalues), df=self.nb_attr))
+        else:
+            self.pvalues = 2.0 * (1.0 - stats.norm.cdf(np.abs(self.zvalues)))
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    def post_process(self, compute_inference=True):
+        self.loglik = self.evaluate(self.beta, False)
+        self.aic = self.get_aic(self.loglik)
+        self.bic = self.get_bic(self.loglik)
+        if compute_inference:
+            self.compute_stderr(1E-4) #1E-6)
+            self.compute_zvalues()
+            self.compute_pvalues()
+            self.compute_confidence_intervals()
+        self.estim_time_sec = time() - self.fit_start_time
+        if self.normalize: self.unscaled_beta = self.unscale_beta(self.beta)
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    def report(self):
+        dp = 6
+        fmt = f".{dp}f"
+        np.set_printoptions(precision=dp, suppress=True)
+
+        print("=" * 100)
+        print("Method: RRM")
+        print(f"Log-Likelihood: {self.loglik:{fmt}}")
+        print(f"AIC: {self.aic:{fmt}}")
+        print(f"BIC: {self.bic:{fmt}}")
+        if self.normalize: print("Beta (unscaled):",self.labels," => ",self.unscaled_beta)
+        print("=" * 100)
+
+        # Print out table:
+        # Left-justify the variable name in a column wide enough for the longest
+        # label so the numeric columns stay aligned (names can exceed 10 chars).
+        name_w = max((len(str(l)) for l in self.labels), default=10)
+        name_w = max(name_w, len("Coeff"))
+        cw = 12
+        hdr = ("{:<{nw}} {:>{cw}} {:>{cw}} {:>{cw}} {:>{cw}} {:>{cw}} {:>{cw}}"
+               .format("Coeff", "Estimate", "Std.Err.", "z-val", "p-val",
+                       "[0.025", "0.975]", nw=name_w, cw=cw))
+        print(hdr)
+        print("-" * len(hdr))
+        cond = ("{:<{nw}} {:>{cw}.6f} {:>{cw}.6f} {:>{cw}.6f} {:>{cw}.6f} "
+                "{:>{cw}.6f} {:>{cw}.6f}")
+
+        for m in range(self.nb_attr):
+        # {
+            formatted_str = cond.format(str(self.labels[m]), self.beta[m], self.stderr[m],
+                self.zvalues[m], self.pvalues[m], self.signif_lb[m], self.signif_ub[m],
+                nw=name_w, cw=cw)
+            if self.pvalues[m] < 0.05:
+                formatted_str += (" (*)")
+            print(formatted_str)
+        # }
+        print("=" * len(hdr))
+    # }

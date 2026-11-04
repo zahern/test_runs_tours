@@ -1,0 +1,20 @@
+#!/bin/bash -l
+#PBS -N suncorp_diag
+#PBS -l walltime=00:20:00
+#PBS -l select=1:ncpus=1:mem=16GB
+#PBS -j oe
+#PBS -m be
+#PBS -r y
+
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+set -uo pipefail
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+cd "$PROJ_DIR"
+python -u scripts/70_diag_counts.py

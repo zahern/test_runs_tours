@@ -411,7 +411,9 @@ def main() -> int:
         except Exception as _salv_exc:
             logger.error(f"salvage errored: {_salv_exc}")
             partial, n_seg = None, 0
-        if partial is not None:
+        # Honesty gate (2026-10-08, mirrors _run_ga_shard.py): a 0-segment
+        # salvage must not be blessed as success with a live ga_results.pkl.
+        if partial is not None and n_seg > 0:
             all_ga.results[stage_id] = partial
             _save_ga_checkpoint(all_ga, stage_id=stage_id, failed=False)
             marker = os.path.join(stage_dir, "PARTIAL")

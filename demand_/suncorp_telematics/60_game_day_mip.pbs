@@ -6,6 +6,12 @@
 #PBS -m abe
 #PBS -r y
 
+# Refuse to run outside PBS: keep all compute off the login/head node.
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+
 set -euo pipefail
 
 # Job 60: police site-selection MIP on the predicted future-game 15-min surfaces.
@@ -40,6 +46,7 @@ echo "=================================================================="
 
 python -u 60_game_day_mip.py \
   --min-marg 0.5 --max-segments 250 \
+  --chunk-m 150 --max-chunks-per-road 3 \
   --travel-speed-kmh 43.2 --detour-factor 1.3 \
   --setup-min 5 --max-travel-m 4000 2>&1
 

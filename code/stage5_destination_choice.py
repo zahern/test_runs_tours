@@ -19,6 +19,7 @@ import os
 import pickle
 import re
 import sys
+import traceback
 import warnings
 from typing import Optional
 
@@ -547,6 +548,81 @@ def _open_skims(skims):
     return skims, False
 
 
+_ZONE_LOOKUP_PREFERENCE = (
+    'TAZ_ID', 'TAZ', 'taz_id', 'taz', 'ZONE', 'zone', 'ZONES', 'zones',
+    'ORIGINS', 'origins', 'DESTINATIONS', 'destinations', 'ID', 'id')
+
+
+def _omx_zone_mapping(handle) -> dict:
+    """Return {zone_id: matrix_row_index} from an OPEN OMX handle.
+
+    ``listMappings()`` returns the lookup tables in whatever order they were
+    written, so index 0 is NOT reliably the zone-id table.  ActivitySim's
+    Exampville export carries TAZ_AREA_TYPE (the strings 'SUB'/'URB'/'CBD')
+    alongside TAZ_ID; taking [0] there yields {b'SUB': 39, b'URB': 34,
+    b'CBD': 35}, int() on those keys raises ValueError, and every caller's
+    ``except`` swallowed it.
+
+    Downstream that emptied ``zone_to_idx`` in both logsum engines, so
+    ``_gather`` returned a constant for every case, the logsum surface had
+    zero within-case variance for 100% of cases, and the destination
+    c_logsum was structurally unidentified -- Stage 5 could not run at all on
+    a freshly fetched Exampville bundle (job 27308422, work segment).  The
+    raised message blamed "origins unresolved in the OMX mapping", but all
+    40 tour OTAZ resolved to 1-40 and the matrices were intact: the only
+    defect was which lookup table got read.
+
+    Score ID-like table names first, then take the first table whose keys are
+    all integer-parseable.  Never raises: {} means "no usable table" and every
+    caller already degrades from there.
+    """
+    try:
+        names = list(handle.listMappings())
+    except Exception:
+        return {}
+    if not names:
+        return {}
+    ordered = [n for n in names if n in _ZONE_LOOKUP_PREFERENCE]
+    ordered += [n for n in names if n not in ordered]
+    for name in ordered:
+        try:
+            cand = {int(k): int(v)
+                    for k, v in dict(handle.mapping(name)).items()}
+        except Exception:
+            continue
+        if cand:
+            return cand
+    logger.warning("_omx_zone_mapping: no integer zone lookup in %s", names)
+    return {}
+
+
+def _omx_matrix_names(handle) -> set:
+    """Return every readable matrix name in an OPEN OMX handle (as str).
+
+    ``listMatrices()`` reports ONLY compressed nodes (CArray/EArray): it walks
+    ``/data`` and keeps children carrying an OMX ``maindim`` attribute, so a
+    plain pytables ``Array`` -- how larch writes a matrix it does not
+    compress -- is silently omitted.  ActivitySim's Exampville skims.omx is
+    written that way: 9 CArray + 20 Array, and every omitted name is a
+time/distance/cost column (SOVTOLL_*, DIST*, CRASH, WLK_LOC_*).  So each
+    ``name in skims.listMatrices()`` guard read those as ABSENT even though
+    ``skims[name]`` opens fine, ``_read_mat`` returned None for all four mode
+    impedances, and the logsum collapsed to a constant surface (job 27308422:
+    "skim matrices unreadable: ['SOVTOLL_TIME__AM', ...]" on a file that has
+    all four).  Union the node names with listMatrices() so both layouts work.
+    """
+    names: set = set()
+    try:
+        names |= {str(n) for n in handle.listMatrices()}
+    except Exception:
+        pass
+    try:
+        names |= {str(n) for n in handle.root.data._v_children.keys()}
+    except Exception:
+        pass
+    return names
+
+
 def _skim_keyspace(ids) -> str:
     """Classify a zone-id collection as 'SA2' (9-digit codes), 'ORDER' (small
     ints) or 'mixed/unknown'. The 371 system is SA2-keyed; the retired 330
@@ -743,7 +819,7 @@ def _skim_flat(skims) -> pd.DataFrame:
                 rows.append({'OTAZ': otaz, 'DTAZ': dtaz})
         base_df = pd.DataFrame(rows)
         mat_cols = {}
-        for name in _skims_h.listMatrices():
+        for name in sorted(_omx_matrix_names(_skims_h)):
             mat = np.array(_skims_h[name])
             mat_cols[name] = mat.ravel()
         df = pd.concat([base_df, pd.DataFrame(mat_cols)], axis=1)
@@ -802,7 +878,7 @@ def _crash_table_from_open_omx(cf, label: str, zone_ids: list = None,
     _mat_name = (matrix_name
                  or os.environ.get('STAGE5_CRASH_MATRIX', '').strip()
                  or 'CRASH')
-    _avail = list(cf.listMatrices())
+    _avail = sorted(_omx_matrix_names(cf))
     if _mat_name not in _avail:
         raise RuntimeError(
             f"Crash OMX {label!r} has no matrix "
@@ -814,7 +890,9 @@ def _crash_table_from_open_omx(cf, label: str, zone_ids: list = None,
     # cannot blow up the DataFrame constructor with "All arrays must be of
     # the same length".
     try:
-        _mp = dict(cf.mapping(cf.listMappings()[0]))
+        _mp = _omx_zone_mapping(cf)
+        if not _mp:
+            raise LookupError('no integer zone lookup in OMX')
         _omx_z = [int(z) for z in sorted(_mp.keys(), key=lambda k: _mp[k])]
     except Exception:
         _omx_z = None
@@ -921,7 +999,7 @@ def _resolve_default_crash_source() -> Optional[str]:
         try:
             cf, owned = _open_skims(p)
             try:
-                if 'CRASH' in cf.listMatrices():
+                if 'CRASH' in _omx_matrix_names(cf):
                     return p
             finally:
                 if owned:
@@ -3980,8 +4058,8 @@ def _bridge_tours_zones_auto(tours, skims, skim_df, label: str):
                 and {'OTAZ', 'DTAZ'} <= set(skim_df.columns):
             _ref_o, _ref_d = skim_df['OTAZ'], skim_df['DTAZ']
         elif skims is not None:
-            _mp = skims.mapping(skims.listMappings()[0])
-            _ref_o = _ref_d = list(_mp.keys())
+            _mp = _omx_zone_mapping(skims)
+            _ref_o = _ref_d = list(_mp.keys()) or None
         if _ref_o is None:
             return tours
         return _bridge_tours_zones(tours, _ref_o, _ref_d, label)
@@ -4827,8 +4905,10 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
         zone_ids = [int(z) for z in logsums.coords['zones'].values]
     else:
         try:
-            mapping = dict(skims.mapping(skims.listMappings()[0]))
-            zone_ids = sorted([int(k) for k in mapping.keys()])
+            mapping = _omx_zone_mapping(skims)
+            if not mapping:
+                raise LookupError('no integer zone lookup in OMX')
+            zone_ids = sorted(int(k) for k in mapping)
         except Exception:
             zone_ids = _default_zone_universe()
 
@@ -5136,12 +5216,15 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
             zone_to_col = {z: c for c, z in enumerate(zone_ids)}
 
         ca_rows = []
+        _have   = []      # per-row: did this tour/zone hit the logsum surface?
         for _, row in sampled_alts.iterrows():
             pid  = str(row['ptour_id'])
             zone = int(row['alt_zone'])
             r    = case_to_row.get(pid)
             c    = zone_to_col.get(zone)
-            ls_val = float(ls_vals[r, c]) if (r is not None and c is not None) else 0.0
+            _hit = (r is not None and c is not None)
+            ls_val = float(ls_vals[r, c]) if _hit else 0.0
+            _have.append(_hit)
             ca_rows.append({
                 'ptour_id':       pid,
                 '_altid_':        zone,
@@ -5149,6 +5232,10 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                 'log_correction': float(row['log_correction']),
             })
         ca_df = pd.DataFrame(ca_rows)
+        # _ls_have marks rows that carry a REAL surface value. The orthogonalization
+        # below must not touch the 0.0 fills (see the note at that block); keeping
+        # the mask here is what makes the two distinguishable after the fact.
+        _ls_have = np.asarray(_have, dtype=bool)
         logger.info(
             f"_dest_tree: importance-sampled CA table "
             f"{n_cases} cases × up to {DEST_EST_SAMPLE_SIZE} alts "
@@ -5192,6 +5279,9 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
             'logsum':         ls_flat,
             'log_correction': 0.0,
         })
+        # Every row here is a direct surface lookup, so only non-finite entries
+        # (if the surface itself has holes) are treated as unfilled.
+        _ls_have = np.isfinite(np.asarray(ls_flat, dtype=float))
         print(f"  _dest_tree: ALL-ZONES CA table {n_cases} cases × {n_zones} zones = {len(ca_df)} rows")
 
     # ── Pre-join OD skim columns into ca_df (keyed by OTAZ × DTAZ) ───────
@@ -5269,11 +5359,32 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
     # sitting at a collinear artifact. ON by default; STAGE5_LOGSUM_ORTHOG=0 off.
     if os.environ.get('STAGE5_LOGSUM_ORTHOG', '1') == '1' and 'logsum' in ca_df.columns:
         try:
-            _g   = ca_df.groupby('ptour_id', sort=False)
-            _L   = ca_df['logsum'].astype(float).values
+            # Rows whose tour/zone has no entry on the mode-logsum surface were
+            # filled with the constant 0.0 above. They must be EXCLUDED from the
+            # residualization, not merely left zero-weighted: for a case whose
+            # rows are all 0.0 the within-case demeaned value is 0, and
+            # 0 - (β_dist·dw + β_ldist·ldw) is a synthetic profile along
+            # within-case distance (measured +0.49·log-distance, median R² 0.886
+            # on the 79 affected work tours). A distance mirror wearing the
+            # accessibility column's name biases c_logsum instead of identifying
+            # it. Only rows carrying a real surface value are residualized; the
+            # rest keep their constant fill.
+            _ok = pd.Series(np.asarray(_ls_have, dtype=bool),
+                            index=ca_df.index).fillna(False).astype(bool).values
+            _n_skip = int((~_ok).sum())
+            if _n_skip:
+                _n_skip_cases = int(ca_df.loc[~_ok, 'ptour_id'].nunique())
+                logger.warning(
+                    f"_dest_tree: logsum orthogonalization restricted to "
+                    f"{int(_ok.sum())}/{len(ca_df)} rows with a surface value — "
+                    f"{_n_skip_cases} case(s) have no logsum row and keep the "
+                    f"constant fill (they are NOT distance-mirrored)")
+            _fit  = ca_df.loc[_ok, ['ptour_id', 'logsum', 'DIST', 'log_DIST_1']]
+            _g   = _fit.groupby('ptour_id', sort=False)
+            _L   = _fit['logsum'].astype(float).values
             _Lm  = _g['logsum'].transform('mean').values          # per-case mean
-            _dw  = ca_df['DIST'].astype(float).values      - _g['DIST'].transform('mean').values
-            _ldw = ca_df['log_DIST_1'].astype(float).values - _g['log_DIST_1'].transform('mean').values
+            _dw  = _fit['DIST'].astype(float).values      - _g['DIST'].transform('mean').values
+            _ldw = _fit['log_DIST_1'].astype(float).values - _g['log_DIST_1'].transform('mean').values
             _Lw  = _L - _Lm                                        # within-case demeaned logsum
             _X    = np.column_stack([_dw, _ldw])
             _mask = np.isfinite(_X).all(axis=1) & np.isfinite(_Lw)
@@ -5282,10 +5393,13 @@ def _dest_tree(tours, persons, landuse, skims, logsums, sampled_alts=None,
                 _resid = _Lw - _X @ _beta                          # logsum ⊥ distance (within case)
                 _new   = _Lm + _resid
                 _v0, _v1 = float(np.nanvar(_L)), float(np.nanvar(_new))
-                ca_df['logsum'] = _new.astype(np.float32)
+                _col = ca_df['logsum'].to_numpy(dtype=np.float32, copy=True)
+                _col[_ok] = _new.astype(np.float32)
+                ca_df['logsum'] = _col
                 logger.info(
                     f"_dest_tree: logsum ⊥ distance orthogonalized (within-case, "
                     f"β={np.round(_beta, 4).tolist()}); total var {_v0:.4g}→{_v1:.4g}"
+                    f" on {int(_ok.sum())} surface rows"
                 )
             else:
                 logger.warning("_dest_tree: logsum orthogonalization skipped "
@@ -9644,6 +9758,426 @@ def _mu_scales_valid(mode_mdl, segment: str):
         return False, f'gate failed ({_e})'
 
 
+def _enforce_mu_gate(mode_mdl, segment: str, estimate_fn, stage: str):
+    """Re-apply the nest-scale validity gate after a refit, not just once.
+
+    _mu_scales_valid() only describes the fit it inspects. Every refit that
+    follows the first one (nest-structure compare, _collapse_generic_groups,
+    _prune_and_refit, _apply_sign_constraints, the income-collinearity
+    re-estimate) re-maximises with Mu still FREE, so an interior scale that
+    passed the initial gate can drift onto 0.10 or 1.00 without any gate ever
+    seeing it. Run 20261030 exposed exactly this: E1 [work] logged "freed nest
+    scales accepted" and ended with Mu_NonMotor = 1.0000, E1 [nonmand] ended
+    with Mu_NonMotor = 0.1000, and the freed-scale fits are therefore not
+    comparable with the fixed-scale ones.
+
+    Contract is the same accept-or-revert as the initial gate: scales that are
+    holdfast (already fixed) or absent (flat structure) are left untouched;
+    scales that are free but not interior + significant are locked at
+    STAGE5_MU_FIXED_VALUE and the model is refit once.
+    """
+    if os.environ.get('STAGE5_ESTIMATE_MU', '0') != '1':
+        return mode_mdl
+    try:
+        _idx = set(mode_mdl.pf.index.tolist())
+    except Exception:
+        return mode_mdl
+    _mus = [p for p in ('Mu_Motor', 'Mu_NonMotor', 'Mu_Transit') if p in _idx]
+    if not _mus:
+        return mode_mdl                      # flat structure: nothing to gate
+    try:
+        _free = [p for p in _mus
+                 if not bool(mode_mdl.pf.loc[p].get('holdfast', False))]
+    except Exception:
+        return mode_mdl
+    if not _free:
+        return mode_mdl                      # already fixed: nothing to gate
+
+    _ok, _why = _mu_scales_valid(mode_mdl, segment)
+    if _ok:
+        logger.info(f"[{segment}] nest scales accepted at {stage} ({_why})")
+        return mode_mdl
+
+    _mu_fx = float(os.environ.get('STAGE5_MU_FIXED_VALUE', '0.8'))
+    logger.warning(f"[{segment}] nest scales rejected at {stage} ({_why}) — "
+                   f"locking at {_mu_fx} and refitting once")
+    try:
+        for _mp in _mus:
+            mode_mdl.lock_value(_mp, _mu_fx)
+        # No _prefit rerun: starts from the freed fit are already good, and the
+        # DE pre-search must not touch locked Mus (same as the initial gate).
+        mode_mdl = estimate_fn(mode_mdl)
+        logger.info(f"[{segment}] fixed-scale refit complete at {stage} "
+                    f"(Mu={_mu_fx})")
+    except Exception as _mu_e:
+        logger.warning(f"[{segment}] fixed-scale refit failed at {stage} "
+                       f"({_mu_e}) — keeping the freed-scale model")
+    return mode_mdl
+
+
+def _sign_bound_of(model, p: str, sign: str) -> float:
+    """The declared sign bound a 'neg'/'pos' parameter is constrained against."""
+    try:
+        col = 'maximum' if sign == 'neg' else 'minimum'
+        _pf = model.pf
+        if col in _pf.columns:
+            _v = float(_pf.loc[p, col])
+            if np.isfinite(_v):
+                return _v
+    except Exception:
+        pass
+    return 0.0
+
+
+def _sign_gate_tmin() -> float:
+    """The |t| cut that separates "identified" from "at the bound".
+
+    Same knobs the pruning rule uses, so one setting (GA_SIG_PVAL_THRESH, or an
+    explicit GA_S5_PRUNE_TMIN) governs both.
+    """
+    _t_env = os.environ.get('GA_S5_PRUNE_TMIN', '').strip()
+    if _t_env:
+        try:
+            return float(_t_env)
+        except Exception:
+            return 1.6
+    try:
+        from scipy.stats import norm as _norm
+        return float(_norm.isf(float(os.environ.get('GA_SIG_PVAL_THRESH', '0.10')) / 2.0))
+    except Exception:
+        return 1.6
+
+
+def _sign_gate_candidates(model, stage: str, eps: float, tmin: float):
+    """Free coefficients that sit ON a declared sign bound and are not
+    significantly different from it — i.e. censored, not estimated.
+
+    Detection is the same shape as `_mu_scales_valid`: at bound + insignificant
+    means the data did not locate the parameter, so the printed value is set by
+    the prior, not by the sample.
+    """
+    try:
+        from ga_constraints import sign_constraints as _sc
+        signs = _sc(stage) or {}
+    except Exception:
+        return []
+    try:
+        _pf = getattr(model, '_final_pf', None)
+        if _pf is None:
+            _pf = model.pf
+    except Exception:
+        return []
+    _ts = _param_tstats(model) or {}
+    _out = []
+    for p, s in signs.items():
+        if p not in _pf.index or s not in ('neg', 'pos'):
+            continue
+        if p.startswith('ASC_'):
+            continue                      # share-calibrated, never estimated
+        try:
+            if bool(_pf.loc[p].get('holdfast', False)):
+                continue
+            _val = float(_pf.loc[p, 'value'])
+        except Exception:
+            continue
+        if not np.isfinite(_val):
+            continue
+        _b = _sign_bound_of(model, p, s)
+        if abs(_val - _b) > eps:
+            continue                      # interior: a real estimate
+        _t = _ts.get(p, float('nan'))
+        if np.isfinite(_t) and abs(_t) >= tmin:
+            continue                      # at the bound but significantly off it
+        _out.append((p, s, _val, _b, _t))
+    return _out
+
+
+def _enforce_sign_gate(model, stage: str, estimate_fn, *,
+                       label: str = '', max_iters: int = 2):
+    """Reject a sign-censored coefficient instead of reporting it as an estimate.
+
+    `_apply_sign_constraints` (and `_estimate`'s post-clip) enforce a sign prior
+    by *writing* a placeholder value at the bound (-0.001 for 'neg', 0.001 for
+    'pos') whenever the unconstrained estimate violates the prior. Nothing then
+    re-checks that value, so it is printed, saved and compared as if the sample
+    had produced it. Run 20261030/27485123 exposed the cost of that: E1 and E2
+    each reported exactly one of c_ivt_auto / c_ivt_transit at -0.001000 with
+    |t| ~ 0.004, in mirror image (E1: auto censored; E2: transit censored), and
+    the apparent +1063/+2529 mode gain was largely which term got clamped
+    rather than anything the search selected.
+
+    Contract, mirroring `_enforce_mu_gate` — detect, act once, refit, re-check:
+
+      * non-protected term  → lock at 0.0 and refit once. The term leaves the
+        utility and the free-parameter count, which is the honest reading of
+        "the data says this is not a deterrent".
+      * protected/structural term (ga_constraints.protected_backbone, e.g. the
+        mode time coefficients) → refit once from a start moved off the bound.
+        If a genuine interior estimate exists the optimizer finds it and the
+        term is kept; if it lands on the bound again the term is flagged
+        `model._sign_censored` and logged at ERROR rather than reported.
+
+    Loop stops as soon as nothing more is censored, so a clean model costs one
+    inspection and no refit.
+    """
+    if os.environ.get('STAGE5_SIGN_GATE', '1').strip() == '0':
+        return model
+    try:
+        _eps = float(os.environ.get('STAGE5_SIGN_BOUND_EPS', '2e-3'))
+    except Exception:
+        _eps = 2e-3
+    # Same |t| cut the prune rule uses, so one knob (GA_SIG_PVAL_THRESH) governs
+    # "identified" across pruning and the sign gate alike.
+    _tmin = _sign_gate_tmin()
+    try:
+        from ga_constraints import protected_backbone as _pb
+        _protected = set(_pb(stage))
+    except Exception:
+        _protected = set()
+    _restart = os.environ.get('STAGE5_SIGN_RESTART', '1').strip() != '0'
+    _already_censored = set(getattr(model, '_sign_censored', []) or [])
+    _tag = f"[sign {label or stage}]"
+
+    for _it in range(max_iters):
+        _cands = _sign_gate_candidates(model, stage, _eps, _tmin)
+        if not _cands:
+            if _it == 0:
+                logger.info(f"{_tag} no free coefficient sits on a sign bound")
+            return model
+        _ll0 = _model_ll(model)
+        _dropped, _censored = [], []
+        for _p, _s, _val, _b, _t in _cands:
+            _tt = 'nan' if not np.isfinite(_t) else f'{_t:+.2f}'
+            if _p in _protected and _restart:
+                # Structural term: never dropped silently. Try to reveal an
+                # interior estimate by restarting away from the bound — once.
+                # A term already established as unidentified at its bound is
+                # left flagged: retrying the restart costs a refit that cannot
+                # change the verdict, and would stop the gate from settling.
+                if _p in _already_censored:
+                    continue
+                try:
+                    model.set_value(_p, -max(0.05, _eps * 10.0) if _s == 'neg'
+                                    else max(0.05, _eps * 10.0))
+                    model = estimate_fn(model)
+                except Exception as _re:
+                    logger.warning(f"{_tag} {_p}: restart refit failed ({_re!r})")
+                    _censored.append(_p)
+                    continue
+                try:
+                    _now = float(model.pf.loc[_p, 'value'])
+                except Exception:
+                    _now = float('nan')
+                _t2 = (_param_tstats(model) or {}).get(_p, float('nan'))
+                if (np.isfinite(_now) and abs(_now - _b) > _eps
+                        and np.isfinite(_t2) and abs(_t2) >= _tmin):
+                    logger.warning(
+                        f"{_tag} {_p} rescued by restart: {_val:+.4f} "
+                        f"(|t|={_tt}) -> {_now:+.4f} (|t|={_t2:+.2f})")
+                else:
+                    logger.error(
+                        f"{_tag} {_p} is unidentified at its sign bound "
+                        f"({_val:+.4f}, |t|={_tt}); protected, so kept but "
+                        f"marked CENSORED — do not read it as an estimate")
+                    # Restore the constrained optimum: the restart nudge is an
+                    # arbitrary point and must not masquerade as the estimate.
+                    try:
+                        model.set_value(_p, _val)
+                    except Exception:
+                        _pf_set(model, _p, 'value', _val)
+                    _censored.append(_p)
+            else:
+                try:
+                    # Bind at exactly 0.0 first: _estimate restores pf maxima and
+                    # would otherwise re-clip a 0.0 value back onto a -0.001
+                    # bound, resurrecting the placeholder we are removing.
+                    if _s == 'neg':
+                        _pf_set(model, _p, 'maximum', 0.0)
+                    model.lock_value(_p, 0.0)
+                    _dropped.append(_p)
+                except Exception as _le:
+                    logger.warning(f"{_tag} cannot lock {_p} at 0.0: {_le!r}")
+                    _censored.append(_p)
+        if _dropped:
+            logger.warning(
+                f"{_tag} iter {_it + 1}: dropping sign-censored {_dropped} "
+                f"(locked at 0.0 — term leaves the utility)")
+            try:
+                model = estimate_fn(model)
+            except Exception as _de:
+                logger.warning(f"{_tag} refit after sign gate failed: {_de!r}")
+                _dropped = []
+            if _dropped:
+                _d = (_model_ll(model) - _ll0
+                      if np.isfinite(_ll0) else float('nan'))
+                if np.isfinite(_d):
+                    logger.info(f"{_tag} refit after sign gate: dLL={_d:+.3f}")
+                else:
+                    logger.info(f"{_tag} refit after sign gate complete")
+        if _censored:
+            try:
+                _prev = set(getattr(model, '_sign_censored', []) or [])
+                model._sign_censored = sorted(_prev | set(_censored))
+            except Exception:
+                pass
+        if not _dropped:
+            return model
+    return model
+
+
+def _settle_scales_and_signs(mode_mdl, segment: str, estimate_fn, *,
+                             stage: str = 'stage5_mode', label: str = '',
+                             rounds: int = 3):
+    """Alternate the sign gate and the Mu gate until neither one acts.
+
+    Both gates end by refitting, and a refit can re-censor what the other gate
+    just cleared, so running each exactly once does not leave a settled model.
+    Run 20261102/27508262 showed the cost in E1 [nonmand]: the sign gate caught
+    c_ivt_transit at -0.0010, then the Mu gate rejected Mu_Motor=0.1000 and
+    refit, and that refit moved the censoring onto c_ivt_auto (-0.001000,
+    |t|=0.004), which was then reported as an estimate because no gate looked
+    at the vector again.
+
+    A gate with nothing to do costs one scan and no refit, so the loop is
+    cheap. It stops as soon as a full round leaves the log-likelihood
+    untouched: no refit happened, so nothing can have moved since the scan.
+
+    On exit `model._sign_censored` describes the coefficient vector actually
+    being reported, not an intermediate one.
+    """
+    try:
+        _eps = float(os.environ.get('STAGE5_SIGN_BOUND_EPS', '2e-3'))
+    except Exception:
+        _eps = 2e-3
+    for _r in range(max(1, int(rounds))):
+        _ll0 = _model_ll(mode_mdl)
+        mode_mdl = _enforce_sign_gate(
+            mode_mdl, stage, estimate_fn,
+            label=(label if _r == 0 else f'{label} settle{_r + 1}'))
+        mode_mdl = _enforce_mu_gate(mode_mdl, segment, estimate_fn, 'post-refit')
+        _ll1 = _model_ll(mode_mdl)
+        if np.isfinite(_ll0) and np.isfinite(_ll1) and _ll1 == _ll0:
+            break
+    else:
+        logger.error(
+            f"[settle {label or segment}] sign/Mu gates still acting after "
+            f"{rounds} rounds — the reported fit may still carry a censored "
+            f"coefficient or scale")
+    # Re-record the flags from the final vector, replacing any intermediate
+    # set: a term censored mid-chain but interior at the end is not censored.
+    try:
+        mode_mdl._sign_censored = sorted(
+            {c[0] for c in _sign_gate_candidates(mode_mdl, stage, _eps,
+                                                 _sign_gate_tmin())})
+    except Exception:
+        pass
+    return mode_mdl
+
+
+def _mode_holdfast_policy() -> set:
+    """Coefficients declared to be held at exactly 0.0 in EVERY fit.
+
+    `STAGE5_MODE_HOLDFAST` (comma-separated names) makes a block of the mode
+    utility identical across arms instead of letting each arm's own fit decide
+    how it is treated.
+
+    Why this exists: runs 27508262 and 27516742 fitted E1 and E2 with both IVT
+    coefficients free, and the sign gate censored a DIFFERENT one in each arm
+    (E1: c_ivt_auto at -0.001000, |t|=0.004; E2: c_ivt_transit at -0.001000,
+    |t|=0.002). A censored coefficient is effectively off, so the two arms were
+    not estimating the same utility function and part of the +1063 / +2529
+    mode-LL gap was which term got switched off. Holding the block at 0.0 in
+    both arms removes that degree of freedom from the comparison: it cannot be
+    censored, cannot be re-estimated, and is reported as `holdfast` rather
+    than as a fitted deterrent.
+
+    Applied in `_build_mode_model`, so it covers the GA's candidate fits as
+    well as the final Stage-5 fit — a search must optimise the specification
+    that is actually reported.
+    """
+    raw = os.environ.get('STAGE5_MODE_HOLDFAST', '').strip()
+    if not raw:
+        return set()
+    return {p.strip() for p in raw.split(',') if p.strip()}
+
+
+def _multistart_refit(model, estimate_fn, *, label: str = '', n_starts: int = 2,
+                      jitter: float = 0.5, seed: int = 20261102):
+    """Refit from extra starting points and keep the best likelihood.
+
+    A single start is not always enough. Run 27538567's E2 [nonmand] mode fit
+    converged after 28 iterations to -9256.83, although its free parameters
+    contain all six of E1's, whose fit reaches -6848.59 — 2408 LL better. A
+    maximum likelihood 2408 below a nested model means the reported vector was
+    not the optimum of its own family, so the optimiser needs another attempt
+    from a different basin.
+
+    Each extra start multiplies the free non-ASC coefficients by 1 + U(-j, j)
+    (sign-preserving, fixed seed so a re-run reproduces). ASCs are left alone:
+    they are share-calibrated and re-fit anyway. `_keep_better_solution` inside
+    `_estimate` restores the incumbent vector whenever a start lands worse, so
+    the model always ends at the best solution seen and the reported LL cannot
+    depend on which start happened to win.
+    """
+    if n_starts <= 0:
+        return model
+    try:
+        free = [p for p in model.pf.index
+                if not bool(model.pf.loc[p].get('holdfast', False))
+                and not str(p).startswith('ASC_')]
+    except Exception:
+        return model
+    if not free:
+        return model
+
+    rng = np.random.default_rng(seed)
+    _ll_best = _model_ll(model)
+    _improved = 0
+    for _k in range(int(n_starts)):
+        _nudged = []
+        for _p in free:
+            try:
+                _v = float(model.pf.loc[_p, 'value'])
+            except Exception:
+                continue
+            if not np.isfinite(_v) or _v == 0.0:
+                continue                      # zero/junk term: nothing to scale
+            try:
+                model.set_value(_p, _v * (1.0 + float(rng.uniform(-jitter, jitter))))
+                _nudged.append(_p)
+            except Exception:
+                pass
+        if not _nudged:
+            continue
+        try:
+            model = estimate_fn(model)
+        except Exception as _ms_e:
+            logger.warning(
+                f"[multistart {label or 'mode'}] start {_k + 1} failed "
+                f"({_ms_e!r}) — keeping the best so far")
+            continue
+        _ll = _model_ll(model)
+        # 1e-3, not 1e-6: run 27540667 logged "2/2 extra start(s) beat the
+        # single-start fit" for a 1e-4 difference, which is optimiser noise on
+        # a 12772-case log-likelihood, not a better fit.
+        if np.isfinite(_ll) and (not np.isfinite(_ll_best)
+                                 or _ll > _ll_best + 1e-3):
+            _improved += 1
+            _ll_best = _ll
+        logger.info(
+            f"[multistart {label or 'mode'}] start {_k + 1}/{n_starts}: "
+            f"LL={_ll:.3f} (best so far {_ll_best:.3f})")
+    if _improved:
+        logger.warning(
+            f"[multistart {label or 'mode'}] {_improved}/{n_starts} extra "
+            f"start(s) beat the single-start fit; kept LL={_ll_best:.3f}")
+    else:
+        logger.info(
+            f"[multistart {label or 'mode'}] no extra start beat the "
+            f"single-start fit (LL={_ll_best:.3f})")
+    return model
+
+
 def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=None,
                       structure=None):
     """
@@ -9864,6 +10398,29 @@ def _build_mode_model(dt, segment: str, custom_mode_vars=None, avail_vars_hint=N
 
     # apply per-segment coefficient starting values (ActivitySim: get_segment_coefficients)
     m = _apply_segment_coefficients(m, segment)
+
+    # ── Declared coefficient policy: identical block in every arm ──────────
+    # See _mode_holdfast_policy(): holding the term at exactly 0.0 keeps the
+    # utility identical across arms, so the comparison cannot turn on which
+    # coefficient a particular fit happened to censor.
+    _held_policy = _mode_holdfast_policy()
+    if _held_policy:
+        _held_applied = []
+        for _hp in sorted(_held_policy):
+            try:
+                if _hp in m.pf.index:
+                    m.lock_value(_hp, 0.0)
+                    _held_applied.append(_hp)
+            except Exception as _hp_e:
+                logger.warning(f"[{segment}] cannot hold {_hp} at 0.0: {_hp_e!r}")
+        if _held_applied:
+            logger.warning(
+                f"[{segment}] mode coefficients held at exactly 0.0 by policy "
+                f"(STAGE5_MODE_HOLDFAST): {_held_applied}")
+        else:
+            logger.info(
+                f"[{segment}] STAGE5_MODE_HOLDFAST names no parameter present "
+                f"in this model: {sorted(_held_policy)}")
 
     # ── Holdfast collinear income parameters for nonmand ─────────────
     # In test runs all four c_incp_* collapsed to ≈ −3.46 for nonmand,
@@ -12735,6 +13292,21 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
                     "keeping phase-1 values"
                 )
 
+    # ── Incumbent guard: never accept a worse refit of the same model ────────
+    # See _keep_better_solution(): a refit that re-maximises an unchanged
+    # parameter set from the current values can land in a worse basin, and the
+    # chain would otherwise report that point as the arm's fit.
+    try:
+        _ll_kept = _keep_better_solution(model, float(result.loglike))
+        if np.isfinite(_ll_kept) and _ll_kept > float(result.loglike) + 1e-9:
+            result = type('_Incumbent', (), {
+                'loglike': float(_ll_kept),
+                'nit': getattr(result, 'nit', 0),
+                'success': True,
+            })()
+    except Exception as _ig_e:
+        logger.debug(f"_estimate: incumbent guard skipped ({_ig_e!r})")
+
     # ── Post-estimation sign enforcement ─────────────────────────────────────
     # If the optimizer escaped the bounds for travel-time parameters (can happen
     # when L-BFGS-B bounds are not propagated correctly through set_cap), clip
@@ -12750,9 +13322,22 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
                         model.set_value(_sn, -0.001)
                     except Exception:
                         _pf_set(model, _sn, 'value', -0.001)
-                    logger.debug(
-                        f"_estimate: post-clip {_sn}={_sv:.4f} → -0.001 "
-                        "(sign constraint enforced after optimization)"
+                    # Audible, and recorded: this is a prior-imposed value,
+                    # not an estimate. _enforce_sign_gate rejects it later
+                    # instead of letting it be reported.
+                    try:
+                        _clip = dict(getattr(model, '_sign_clipped', {}) or {})
+                        _clip[_sn] = _sv
+                        model._sign_clipped = _clip
+                    except Exception:
+                        pass
+                    # INFO, not WARNING: this fires on most search fits, so a
+                    # warning here would bury the gate's real rejections. The
+                    # value is recorded on the model and the gate reports it.
+                    logger.info(
+                        f"_estimate: post-clip {_sn}={_sv:+.4f} -> -0.001 "
+                        "(sign constraint enforced after optimization; "
+                        "value is prior-imposed, not estimated)"
                     )
     except Exception as _sc_e:
         logger.debug(f"_estimate: post-clip sign constraint failed: {_sc_e}")
@@ -13506,6 +14091,70 @@ def _model_ll(model) -> float:
         return float('nan')
 
 
+def _keep_better_solution(model, new_ll: float) -> float:
+    """Record the best fit seen for the current free-parameter signature.
+
+    Every refit in the Stage-5 chain (prune, generic-group collapse, sign gate,
+    Mu gate) re-runs maximize_loglike from the current values. When the set of
+    free parameters has not changed, a second call can come back at a LOWER
+    likelihood: run 27520087's E2 [work] chain refit the same 13 free
+    parameters and returned -4871.329 after -4871.242, and did the same at 15
+    free (-4870.49 -> -4870.58). The optimiser had stalled in a different
+    basin, so the arm's reported LL ended up depending on refit order rather
+    than on the specification.
+
+    Returns the likelihood the model should be reported at: `new_ll` normally,
+    or the incumbent's value when this worse refit is rejected and the better
+    coefficient vector is restored.
+
+    Signature tracking is what keeps this honest: once a prune/collapse changes
+    the set, a lower LL is expected (fewer free parameters) and is accepted.
+    """
+    if not np.isfinite(new_ll):
+        return new_ll
+    try:
+        sig = tuple(sorted(
+            p for p in model.pf.index
+            if not bool(model.pf.loc[p].get('holdfast', False))))
+    except Exception:
+        return new_ll
+    inc_sig = getattr(model, '_incumbent_sig', None)
+    try:
+        inc_ll = float(getattr(model, '_incumbent_ll', float('nan')))
+    except Exception:
+        inc_ll = float('nan')
+    inc_coef = getattr(model, '_incumbent_coef', None) or {}
+
+    if (inc_sig == sig and inc_coef and np.isfinite(inc_ll)
+            and new_ll < inc_ll - 1e-6):
+        for p, v in inc_coef.items():
+            try:
+                if p in model.pf.index:
+                    model.set_value(p, float(v))
+            except Exception:
+                _pf_set(model, p, 'value', float(v))
+        logger.warning(
+            f"_estimate: refit of the same {len(sig)} free parameter(s) came "
+            f"back worse ({new_ll:.3f} < {inc_ll:.3f}) — restoring the better "
+            f"solution instead of accepting it")
+        try:
+            model._refit_regressions = int(
+                getattr(model, '_refit_regressions', 0)) + 1
+        except Exception:
+            pass
+        return inc_ll
+
+    if inc_sig != sig or not np.isfinite(inc_ll) or new_ll > inc_ll:
+        try:
+            model._incumbent_sig = sig
+            model._incumbent_ll = new_ll
+            model._incumbent_coef = {str(p): float(model.pf.loc[p, 'value'])
+                                     for p in sig}
+        except Exception:
+            pass
+    return new_ll
+
+
 def _model_n_free(model) -> int:
     """Number of free (non-holdfast) parameters."""
     try:
@@ -13751,6 +14400,35 @@ def _prune_and_refit(model, estimate_fn, stage: str, *,
                 and bic_after > bic_before + 2.0):
             logger.info(f"{_tag} BIC {bic_before:.1f}→{bic_after:.1f} after prune "
                         "(kept — removed terms were statistically dead)")
+    # Exhausting max_iters used to exit silently, leaving free parameters that
+    # the rule had already judged unidentified (|t| below tmin or ~0). Run
+    # 27520087's E2 [work] model ended with four such terms because the chain
+    # spent all four rounds on prune/refit. Report them instead of shipping a
+    # model whose table shows |t|=0 rows with nothing saying why.
+    try:
+        pf = getattr(model, '_final_pf', None)
+        if pf is None:
+            pf = model.pf
+        _left = []
+        _tstats = _param_tstats(model) or {}
+        for p in list(pf.index):
+            if p in protected or bool(pf.loc[p].get('holdfast', False)):
+                continue
+            _v = float(pf.loc[p, 'value'])
+            _t = _tstats.get(p, float('nan'))
+            if abs(_v) < zero_eps or (np.isfinite(_t) and abs(_t) < tmin):
+                _left.append(p)
+        if _left:
+            logger.warning(
+                f"{_tag} still holds {len(_left)} free parameter(s) the prune "
+                f"rule would remove after {max_iters} round(s): {_left} — they "
+                f"remain in the reported model")
+            try:
+                model._prune_leftover = _left
+            except Exception:
+                pass
+    except Exception as _pl_e:
+        logger.debug(f"{_tag} prune-leftover check skipped ({_pl_e!r})")
     return model
 
 
@@ -14868,7 +15546,7 @@ def _pt_composite_skim(skims, access_mode, base_transit=None, base_walk=None):
     mat = None
     if col is not None and skims is not None:
         try:
-            if col in skims.listMatrices():
+            if col in _omx_matrix_names(skims):
                 mat = np.asarray(_skim_minutes(col, np.array(skims[col],
                                                              dtype=np.float32)),
                                  dtype=np.float64)
@@ -15118,17 +15796,16 @@ def _logsums_vmap(mode_model, dt_mode, case_ids, zone_ids, skims=None,
     # OMX zone mapping + matrices (same reads as the numpy fallback §2–3)
     zone_to_idx: dict = {}
     if skims is not None:
-        try:
-            mapping = dict(skims.mapping(skims.listMappings()[0]))
-            zone_to_idx = {int(k): int(v) for k, v in mapping.items()}
-        except Exception as e:
-            logger.warning(f"_logsums_vmap: OMX mapping unreadable ({e})")
+        zone_to_idx = _omx_zone_mapping(skims)
+        if not zone_to_idx:
+            logger.warning("_logsums_vmap: OMX mapping unreadable "
+                           "(no integer zone lookup)")
 
     def _read_mat(name):
         if skims is None:
             return None
         try:
-            if name in skims.listMatrices():
+            if name in _omx_matrix_names(skims):
                 arr = np.array(skims[name], dtype=np.float32)
                 return np.asarray(_skim_minutes(name, arr), dtype=np.float32)
         except Exception:
@@ -15166,7 +15843,7 @@ def _logsums_vmap(mode_model, dt_mode, case_ids, zone_ids, skims=None,
                 "pairs keep the nest floor", _tfe)
     mat_crash = None
     try:
-        if skims is not None and 'CRASH' in skims.listMatrices():
+        if skims is not None and 'CRASH' in _omx_matrix_names(skims):
             mat_crash = np.array(skims['CRASH'], dtype=np.float32)
     except Exception:
         mat_crash = None
@@ -15174,14 +15851,14 @@ def _logsums_vmap(mode_model, dt_mode, case_ids, zone_ids, skims=None,
     try:
         if skims is not None:
             for _dn in ('DIST', 'SOVTOLL_DIST__AM'):
-                if _dn in skims.listMatrices():
+                if _dn in _omx_matrix_names(skims):
                     mat_dist = np.array(skims[_dn], dtype=np.float32)
                     break
     except Exception:
         mat_dist = None
     mat_toll = None
     try:
-        if skims is not None and 'SOVTOLL_TOLL__AM' in skims.listMatrices():
+        if skims is not None and 'SOVTOLL_TOLL__AM' in _omx_matrix_names(skims):
             mat_toll = np.array(skims['SOVTOLL_TOLL__AM'], dtype=np.float32)
     except Exception:
         mat_toll = None
@@ -15773,16 +16450,20 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
     zone_to_idx: dict = {}    # zone_id → OMX row/col index (0-based)
     if skims is not None:
         try:
-            mapping = dict(skims.mapping(skims.listMappings()[0]))
-            # mapping is {zone_id: 0-based_index}
-            zone_to_idx = {int(k): int(v) for k, v in mapping.items()}
+            # mapping is {zone_id: 0-based_index}. _omx_zone_mapping picks the
+            # integer zone table, NOT listMappings()[0] -- on ActivitySim's
+            # Exampville export [0] is TAZ_AREA_TYPE ('SUB'/'URB'/'CBD'), whose
+            # string keys raised here and left zone_to_idx empty, which made
+            # _gather return a constant and flattened the whole logsum surface.
+            zone_to_idx = _omx_zone_mapping(skims)
         except Exception as e:
             # WARNING, not DEBUG: an empty zone_to_idx makes _gather return a
             # constant for every case, which silently flattens the whole logsum
             # surface and leaves the destination c_logsum unidentified.
             logger.warning(
                 "_logsums_numpy_fallback: could not read OMX mapping (%s) - "
-                "zone lookups will miss and logsums may be degenerate", e)
+                "zone lookups will miss and logsums may be degenerate",
+                list(skims.listMappings()))
     if not zone_to_idx:
         logger.error(
             "_logsums_numpy_fallback: OMX zone mapping is EMPTY "
@@ -15800,7 +16481,7 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
         if skims is None:
             return None
         try:
-            if name in skims.listMatrices():
+            if name in _omx_matrix_names(skims):
                 arr = np.array(skims[name], dtype=np.float32)
                 arr = np.asarray(_skim_minutes(name, arr), dtype=np.float32)
                 return arr
@@ -16064,7 +16745,7 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
     # OD tolls ($, NO time-unit conversion — read raw, scale /10 per MODE_UEC)
     _toll = None
     try:
-        if skims is not None and 'SOVTOLL_TOLL__AM' in skims.listMatrices():
+        if skims is not None and 'SOVTOLL_TOLL__AM' in _omx_matrix_names(skims):
             _toll = np.array(skims['SOVTOLL_TOLL__AM'], dtype=np.float32)
     except Exception as _t_e:
         logger.debug(f"_logsums_numpy_fallback: toll matrix unreadable ({_t_e})")
@@ -16327,7 +17008,7 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
             if _need_crash or _need_cost or _need_short or _need_cbd_srda or _need_emp_srwb:
                 _crash_mat = None
                 try:
-                    if skims is not None and 'CRASH' in skims.listMatrices():
+                    if skims is not None and 'CRASH' in _omx_matrix_names(skims):
                         _crash_mat = np.array(skims['CRASH'], dtype=np.float32)
                 except Exception:
                     _crash_mat = None
@@ -16340,7 +17021,7 @@ def _logsums_numpy_fallback(mode_model, dt_mode, case_ids, zone_ids,
                 try:
                     if skims is not None:
                         for _dn in ('DIST', 'SOVTOLL_DIST__AM'):
-                            if _dn in skims.listMatrices():
+                            if _dn in _omx_matrix_names(skims):
                                 _dist_mat = np.array(skims[_dn], dtype=np.float32)
                                 break
                 except Exception:
@@ -18411,8 +19092,7 @@ def _sched_time_matrix(skims=None, skim_df=None, lookup=None):
             _mnames = [str(m) for m in _h.list_matrices()]
             _tm = next((m for m in _TKEYS if m in _mnames), None)
             if _tm is not None:
-                _map = dict(_h.mapping(_h.listMappings()[0]))
-                _zmap = {int(k): int(v) for k, v in _map.items()}
+                _zmap = _omx_zone_mapping(_h)
                 _arr = np.asarray(_h[_tm]).astype(float)
                 for (o, i) in _zmap.items():
                     row = _arr[i, :]
@@ -20979,26 +21659,9 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     # touched (normalisation). Same accept-or-revert contract as the MXL and
     # PLC refinements; at-bound scales are additionally penalised downstream
     # by SigPen, so the search cannot favour unidentified nesting.
-    if os.environ.get('STAGE5_ESTIMATE_MU', '0') == '1':
-        _mu_ok, _mu_why = _mu_scales_valid(mode_mdl, segment)
-        if _mu_ok:
-            logger.info(f"[{segment}] freed nest scales accepted ({_mu_why})")
-        else:
-            logger.warning(f"[{segment}] freed nest scales rejected "
-                           f"({_mu_why}) — refitting with fixed scales")
-            try:
-                _mu_fx = float(os.environ.get('STAGE5_MU_FIXED_VALUE', '0.8'))
-                for _mp in ('Mu_Motor', 'Mu_NonMotor'):
-                    if _mp in mode_mdl.pf.index:
-                        mode_mdl.lock_value(_mp, _mu_fx)
-                # No _prefit rerun: ASC starts from the freed fit are already
-                # good, and the DE pre-search must not touch locked Mus.
-                mode_mdl = _estimate(mode_mdl)
-                logger.info(f"[{segment}] fixed-scale refit complete "
-                            f"(Mu={_mu_fx})")
-            except Exception as _mu_e:
-                logger.warning(f"[{segment}] fixed-scale refit failed "
-                               f"({_mu_e}) — keeping freed-scale model")
+    # Gate #1, on the initial fit. Gate #2 runs after the last refit that can
+    # move Mu (see _enforce_mu_gate) — passing here is not sufficient on its own.
+    mode_mdl = _enforce_mu_gate(mode_mdl, segment, _estimate, 'initial fit')
 
     # ── Nest-structure decision: nested logit vs flat MNL ────────────────────
     # STAGE5_MODE_STRUCTURE=auto/search fits the FLAT (MNL) version of the same
@@ -21112,19 +21775,12 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     #     nearly identical values (spread < 30 % of |mean|), they form a
     #     near-rank-deficient block in the Hessian. Fix: holdfast all except
     #     c_incp_da to the mean and re-estimate with one generic income param.
+    #     The boundary check that used to live here only logged, and its floor
+    #     test (<= 0.011) could not see the 0.10 bound at all, so a scale pinned
+    #     at the floor survived as a free parameter.  Enforcement now happens
+    #     after the last refit below (_enforce_mu_gate), which both detects and
+    #     reverts it.
     _mode_reestimate_needed = False
-    try:
-        for _mu_p in ('Mu_Motor', 'Mu_NonMotor'):
-            if _mu_p in mode_mdl.pf.index:
-                _is_hf = bool(mode_mdl.pf.loc[_mu_p].get('holdfast', False))
-                _mu_v  = float(mode_mdl.pf.loc[_mu_p, 'value'])
-                if not _is_hf and np.isfinite(_mu_v) and (_mu_v >= 0.99 or _mu_v <= 0.011):
-                    logger.info(
-                        f"[{segment}] {_mu_p}={_mu_v:.4f} sits at its bound "
-                        "(nest near-degenerate to MNL) - kept FREE, not holdfasted"
-                    )
-    except Exception as _mu_e:
-        logger.debug(f"[{segment}] Mu boundary check failed: {_mu_e}")
 
     try:
         _incp_pnames = ['c_incp_da', 'c_incp_sr', 'c_incp_transit', 'c_incp_active']
@@ -21161,6 +21817,34 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     if _mode_reestimate_needed:
         print(f"  [{segment}] Re-estimating mode model after fixing degenerate parameters...")
         mode_mdl = _estimate(mode_mdl)
+
+    # Gate #2: this is the LAST refit in the chain that can move Mu (nest-
+    # structure compare, generic-group collapse, prune-and-refit, sign
+    # constraints, income re-estimate). Everything downstream — ASC
+    # calibration included — works on a coefficient vector and cannot move a
+    # scale, so a scale accepted here is the one that is reported.
+    # Reject sign-censored coefficients (a -0.001 placeholder is not an
+    # estimate) alongside the nest-scale gate. Each gate ends by refitting and
+    # each refit can re-censor what the other just cleared, so alternate them
+    # to a fixed point: in run 27508262 the sign gate cleared c_ivt_transit and
+    # the Mu gate's refit moved the censoring onto c_ivt_auto, which was then
+    # reported as a placeholder.
+    mode_mdl = _settle_scales_and_signs(mode_mdl, segment, _estimate,
+                                        label=segment)
+
+    # Additional starting points: the searched specification is not always
+    # reached from where the prune/collapse chain ends (see _multistart_refit).
+    # STAGE5_MODE_MULTISTART=0 disables it.
+    try:
+        _ms_n = int(os.environ.get('STAGE5_MODE_MULTISTART', '2'))
+    except Exception:
+        _ms_n = 2
+    if _ms_n > 0:
+        mode_mdl = _multistart_refit(mode_mdl, _estimate, label=segment,
+                                     n_starts=_ms_n)
+        # A different basin can also censor a sign or move a scale, so re-settle.
+        mode_mdl = _settle_scales_and_signs(mode_mdl, segment, _estimate,
+                                            label=f'{segment} post-ms')
 
     # ── Post-estimation: ASC calibration for SR/Walk/Bike/Transit ───────────
     # Iteratively adjust the non-DA mode ASCs so aggregate predicted shares
@@ -21935,6 +22619,12 @@ def _run_segment(segment: str, tours: pd.DataFrame,
                 dest_mdl, lambda _m: _estimate(_m, two_phase=True),
                 'stage5_dest', label=segment)
             dest_mdl = _apply_sign_constraints(dest_mdl, 'stage5_dest')
+            # Same contract as the mode model: a sign-censored destination
+            # coefficient is dropped (or flagged if structural), never
+            # reported as an estimate.
+            dest_mdl = _enforce_sign_gate(
+                dest_mdl, 'stage5_dest',
+                lambda _m: _estimate(_m, two_phase=True), label=segment)
             try:
                 _ll_after = float(dest_mdl.loglike())
                 print(f"  [{segment}] LL after estimation: {_ll_after:.1f}")
@@ -23869,7 +24559,9 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
         ivt_transit = np.full(n, 45.0, dtype=np.float32)
         # PT_Drive access IVT (WLK_LOC_DRV_TOTIVT__* = park-and-ride access +
         # ride). -1 sentinel = unknown; falls back to the walk-access value
-        # before the PT utilities are built. Only used with STAGE5_PT_MODES=1.
+        # before the PT utilities are built. Read for every run: the
+        # drive-access availability fallback below uses it even with
+        # STAGE5_PT_MODES=0.
         ivt_transit_drv = np.full(n, -1.0, dtype=np.float32)
         dist_walk   = np.full(n, 5.0,  dtype=np.float32)
         dist_bike   = np.full(n, 5.0,  dtype=np.float32)
@@ -23940,13 +24632,15 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                 suf = period_suffix[i]
                 ivt_auto[i]    = float(sk.get(f'SOVTOLL_TIME__{suf}', sk.get('SOVTOLL_TIME__AM', 30.0)) or 30.0)
                 ivt_transit[i] = float(sk.get(f'WLK_LOC_WLK_TOTIVT__{suf}', sk.get('WLK_LOC_WLK_TOTIVT__AM', 45.0)) or 45.0)
-                if STAGE5_PT_MODES:
-                    _drv_v = sk.get(f'WLK_LOC_DRV_TOTIVT__{suf}',
-                                    sk.get('WLK_LOC_DRV_TOTIVT__AM', -1.0))
-                    try:
-                        ivt_transit_drv[i] = float(_drv_v)
-                    except (TypeError, ValueError):
-                        pass
+                # Drive-access transit is read for EVERY run (not just
+                # STAGE5_PT_MODES): the drive-access availability fallback
+                # below uses it even with PT_Drive alternatives disabled.
+                _drv_v = sk.get(f'WLK_LOC_DRV_TOTIVT__{suf}',
+                                sk.get('WLK_LOC_DRV_TOTIVT__AM', -1.0))
+                try:
+                    ivt_transit_drv[i] = float(_drv_v)
+                except (TypeError, ValueError):
+                    pass
                 crash[i]       = float(sk.get('CRASH', 0.0)                    or 0.0)
                 # Walk/bike: use SA1/Lvl4-origin × SA2-destination skim when available.
                 # DTAZ is either a 9-digit SA2 code (new_pop/507-zone) or an ORDER
@@ -23978,7 +24672,7 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                 # ("falling back to 45.0") that re-fired on every fit/refit/GA
                 # evaluation (job 26958837: 149/6909 work lines etc.).
                 try:
-                    if name in skims.listMatrices():
+                    if name in _omx_matrix_names(skims):
                         arr = np.asarray(_skim_minutes(name, np.array(
                             skims[name], dtype=np.float32)), dtype=np.float32)
                         _bad = ~np.isfinite(arr)
@@ -23994,20 +24688,18 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                 except Exception:
                     pass
                 return None
-            mapping = {}
-            try:
-                mapping = {int(k): int(v)
-                           for k, v in dict(skims.mapping(skims.listMappings()[0])).items()}
-            except Exception:
-                pass
+            mapping = _omx_zone_mapping(skims)
             # Load per-period matrices (falls back to AM-only matrices for
             # legacy OMX files that don't have the full 5-period set).
             mat_ivt_auto_by_period    = {p: _mat(f'SOVTOLL_TIME__{p}', 30.0) for p in ('AM', 'MD', 'PM', 'EA', 'EV')}
             mat_ivt_transit_by_period = {p: _mat(f'WLK_LOC_WLK_TOTIVT__{p}', 45.0) for p in ('AM', 'MD', 'PM', 'EA', 'EV')}
-            mat_ivt_drv_by_period     = (
-                {p: _mat(f'WLK_LOC_DRV_TOTIVT__{p}', -1.0)
-                 for p in ('AM', 'MD', 'PM', 'EA', 'EV')}
-                if STAGE5_PT_MODES else {})
+            mat_ivt_drv_by_period     = {
+                # Always built (not gated on STAGE5_PT_MODES): the drive-access
+                # transit availability fallback below needs WLK_LOC_DRV_TOTIVT
+                # even when PT_Drive alternatives are off. 5 extra 371x371
+                # float32 matrices ≈ 2.7 MB.
+                p: _mat(f'WLK_LOC_DRV_TOTIVT__{p}', -1.0)
+                for p in ('AM', 'MD', 'PM', 'EA', 'EV')}
             mat_walk        = _mat('DISTWALK', 5.0)
             mat_bike        = _mat('DISTBIKE', 5.0)
             mat_crash       = _mat('CRASH', 0.0)
@@ -24023,7 +24715,7 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                     mat_ivt_transit = mat_ivt_transit_by_period.get('AM')
                 if mat_ivt_auto    is not None: ivt_auto[i]    = mat_ivt_auto[oi, di]
                 if mat_ivt_transit is not None: ivt_transit[i] = mat_ivt_transit[oi, di]
-                if STAGE5_PT_MODES and mat_ivt_drv_by_period:
+                if mat_ivt_drv_by_period:
                     _mdrv = mat_ivt_drv_by_period.get(suf)
                     if _mdrv is None:
                         _mdrv = mat_ivt_drv_by_period.get('AM')
@@ -24055,13 +24747,43 @@ def _mode_probs_numpy(mode_mdl, tour_rows, persons, skims, skim_lookup=None,
                     f"{_nm} from skim join — falling back to {_fb}")
                 _arr[_bad] = _fb
 
-        # DISTWALK/DISTBIKE are already in km - match MODE_UEC expressions exactly:
-        #   log(od.DISTWALK * 12 + 1)  (12 min/km at 5 km/h)
-        #   log(od.DISTBIKE * 4 + 1)   (4 min/km at 15 km/h)
         # Transit availability: block if IVT >= threshold (no service).
         # Default skim value of 45 min is used when transit is unknown -
         # only block when it equals the sentinel fill (>= 90 min) or 0.
         TRANSIT_IVT_UNAVAIL_MIN = 90.0   # block transit when IVT ≥ this (min)
+
+        # ── Transit drive-access fallback (job 27255593 rerun, Oct-30) ──────
+        # WLK_LOC_WLK_TOTIVT__AM is 49% NaN in skims_371.omx (every other
+        # period is complete) and the skim builder zeroes every intrazonal
+        # cell, so walk-only availability crushed the Education calibration
+        # to 239/3412 = 7.0% while 50% of observed edu transit tours are
+        # intrazonal and ~95% ride a transit path that exists by drive access
+        # (WLK_LOC_DRV_TOTIVT is fully populated INCLUDING the diagonal:
+        # intrazonal median 26.4 min). Treat "a transit service exists" as
+        # true when EITHER access path is usable: an unusable walk-access
+        # IVT (missing/0/≥ threshold) is imputed from the drive-access
+        # TOTIVT so availability and utility encode the same fact.  Set
+        # STAGE5_TRANSIT_DRV_FALLBACK=0 to restore walk-only availability.
+        if os.environ.get('STAGE5_TRANSIT_DRV_FALLBACK', '1').strip().lower() \
+                in ('1', 'true', 'yes'):
+            _w   = np.asarray(ivt_transit,     dtype=np.float32)
+            _drv = np.asarray(ivt_transit_drv, dtype=np.float32)
+            _drv_ok = np.isfinite(_drv) & (_drv > 0) & \
+                (_drv < TRANSIT_IVT_UNAVAIL_MIN)
+            _w_bad  = ~np.isfinite(_w) | (_w <= 0) | \
+                (_w >= TRANSIT_IVT_UNAVAIL_MIN)
+            _use    = _drv_ok & _w_bad
+            if _use.any():
+                ivt_transit = np.where(_use, _drv, _w).astype(np.float32)
+                logger.info(
+                    f"_mode_probs_numpy transit drive-access fallback: "
+                    f"{int(_use.sum())}/{n} tours with unusable walk-access "
+                    f"IVT imputed from WLK_LOC_DRV_TOTIVT (transit service "
+                    f"exists on the drive-access path)")
+
+        # DISTWALK/DISTBIKE are already in km - match MODE_UEC expressions exactly:
+        #   log(od.DISTWALK * 12 + 1)  (12 min/km at 5 km/h)
+        #   log(od.DISTBIKE * 4 + 1)   (4 min/km at 15 km/h)
         transit_avail_raw = np.asarray(ivt_transit, dtype=np.float32)
         transit_avail = (
             (transit_avail_raw > 0) & (transit_avail_raw < TRANSIT_IVT_UNAVAIL_MIN)
@@ -26128,7 +26850,11 @@ def _build_trip_chain(
                 rng=rng,
             )
         except Exception as _e:
-            logger.warning(f"Trip-level destination enhancement failed: {_e}")
+            logger.warning(
+                f"Trip-level destination enhancement failed: {_e} "
+                f"[{type(_e).__name__}] "
+                + (f"<{traceback.format_exc().splitlines()[-1]}>"
+                   if traceback.format_exc().strip() else ''))
 
     # ── Vehicle ID assignment + joint household travel coordination ────────
     plan = _assign_vehicle_ids(plan, persons)
@@ -26221,6 +26947,12 @@ def enhance_plan_with_trip_destinations(
     # (1804)" on 14 segments (persons had duplicate person_ids, duplicating
     # the merged frame) and skipped the whole enhancement.
     trip_rows['_plan_row'] = trip_rows.index
+    # Row-count anchor for the merge-inflation guard further below (job
+    # 27255593 rerun diagnostic): if a merge below doubles trip_rows, the
+    # final `plan.loc[_plan_rows,'DTAZ']=_pred` write-back matches 2 rows per
+    # carried label and pandas kills the whole enhancement with
+    # "Length of values (N/2) does not match length of index (N)".
+    _trip_pre = len(trip_rows)
 
     # Need tour_id to group trips into tours
     if 'tour_id' not in trip_rows.columns:
@@ -26281,6 +27013,23 @@ def enhance_plan_with_trip_destinations(
 
     # Build trip records with is_tour_dest_leg and anchor
     trip_rows = build_trip_records(trip_rows, home_taz_col='home_taz')
+
+    # ── merge-inflation guard (job 27255593 rerun, Oct-30) ──────────────
+    # A join-key collision above (duplicate person_id or tour_id on either
+    # side of a merge) copies whole rows and breaks the 1:1 plan-row
+    # write-back, so every plan then loses its stop-destination enhancement
+    # with "Length of values (N/2) does not match length of index (N)".
+    # De-duplicating on the carried _plan_row restores the 1:1 mapping (the
+    # duplicates are identical copies of the same plan row) and logs loudly
+    # so the root merge can be fixed later.
+    if len(trip_rows) != _trip_pre:
+        logger.warning(
+            f"enhance_plan_with_trip_destinations: trip frame inflated "
+            f"{_trip_pre} -> {len(trip_rows)} rows during home/anchor merges "
+            f"(duplicate join key on person_id/tour_id) - de-duplicating on "
+            f"_plan_row to restore the 1:1 write-back")
+        trip_rows = trip_rows.drop_duplicates(subset=['_plan_row'],
+                                              keep='first')
 
     # Load skims for detour computation
     if isinstance(skims, str):
@@ -28131,6 +28880,24 @@ def _save_coefficients(models: dict, path: str):
                 ll = float(ll) if ll is not None else float('nan')
                 rho2 = _rho_sq_null(mdl, ll)
 
+                # Coefficients whose reported value is the sign prior rather
+                # than the sample's estimate: pinned on the bound with |t| ~ 0.
+                # Flagged in the table so a reader cannot mistake -0.0010 for a
+                # fitted deterrent. Re-detected from the frame as well, so the
+                # flag survives a model reloaded from disk.
+                try:
+                    _censored_names = set(getattr(mdl, '_sign_censored', []) or [])
+                except Exception:
+                    _censored_names = set()
+                try:
+                    _censored_names |= {c[0] for c in _sign_gate_candidates(
+                        mdl,
+                        'stage5_dest' if mtype == 'dest_model' else 'stage5_mode',
+                        float(os.environ.get('STAGE5_SIGN_BOUND_EPS', '2e-3')),
+                        _sign_gate_tmin())}
+                except Exception:
+                    pass
+
                 # Per-model convergence metadata (persisted so the report /
                 # paper appendix can show real final-fit convergence, not just
                 # the GA BIC trajectory).
@@ -28309,6 +29076,7 @@ def _save_coefficients(models: dict, path: str):
                         'n_iter':     n_iter,
                         'converged':  converged,
                         'holdfast':   holdfast,
+                        'sign_censored': str(param_name) in _censored_names,
                     }
                     rows.append(r)
                     seg_rows.append(r)
@@ -28338,7 +29106,7 @@ def _save_coefficients(models: dict, path: str):
                             'std_err': (float(_ixse) if _ixse is not None else float('nan')),
                             'tstat': (float(_ixt) if _ixt is not None else float('nan')),
                             'pval': _ixp, 'loglike': ll, 'rho2': rho2,
-                            'holdfast': False,
+                            'holdfast': False, 'sign_censored': False,
                         }
                         rows.append(_r)
                         seg_rows.append(_r)
@@ -30213,12 +30981,31 @@ def _check_behavioural_signs(models: dict) -> list:
                 continue
             coef = (res.get('dest_coef' if mtype == 'dest_model' else 'mode_coef')
                     or {})
+            # Coefficients whose value came from the sign prior rather than the
+            # sample. _enforce_sign_gate records these; re-detecting them here
+            # keeps the check honest for a model reloaded from disk too.
+            _censored = set(getattr(mdl, '_sign_censored', []) or [])
+            try:
+                _censored |= {c[0] for c in _sign_gate_candidates(
+                    mdl,
+                    'stage5_dest' if mtype == 'dest_model' else 'stage5_mode',
+                    float(os.environ.get('STAGE5_SIGN_BOUND_EPS', '2e-3')),
+                    _sign_gate_tmin())}
+            except Exception:
+                pass
             for pname, (op, threshold, note) in EXPECTED.items():
                 if pname not in coef:
                     continue
                 val = float(coef[pname])
+                _cens = pname in _censored
                 if np.isnan(val):
                     ok = None
+                elif _cens:
+                    # The reported value sits on the sign bound because the
+                    # unconstrained estimate violated the prior. It is a
+                    # placeholder, so the behavioural sign is NOT demonstrated.
+                    ok = False
+                    note = note + ' => CENSORED at sign bound (prior-imposed value, not an estimate)'
                 elif abs(val) < 1e-6:
                     # Held-at-zero (collinear/holdfasted) or not identified on
                     # this sample: a ~0 coefficient has no sign to check, so it

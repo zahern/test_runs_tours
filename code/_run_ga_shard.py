@@ -27,6 +27,8 @@ What it does:
 import argparse
 import json
 import os
+import pickle
+import signal as _signal_mod
 import sys
 import time
 import traceback
@@ -68,6 +70,217 @@ def _parse_args():
     return p.parse_args()
 
 
+# ---- Kill-save state (fixes 1+2: SIGTERM/SIGINT finalise) -------------------
+# The GA loop's SIGTERM backstop (ga_hypothesis_testing._walltime_sigterm_handler)
+# only flips a flag checked once per generation. A kill landing inside a long
+# single generation (stage-5 LCCM fits), load_data, the variant shootout, or
+# the export path never reaches the next check before PBS SIGKILLs the job, so
+# the shard dies with no ga_results.pkl, no ga_progress.json and no PARTIAL
+# marker (observed: qld_conv1 stage-5 shards, Exit 143, 19 min in). This handler
+# finalises immediately from the on-disk sidecars (ga_best_partial_*.npz +
+# per-segment checkpoints, written every GA_CHECKPOINT_EVERY generations) so
+# every kill leaves either a resumable salvage or an honest failure.
+_SHARD_CTX = {"stage_id": None, "segment": None, "shard_dir": None,
+              "run_root": None, "run_tag": None, "t0": None,
+              "finalised": False}
+
+
+def _fast_result_pickle(shard_dir: str, stage_id: int, res) -> bool:
+    """Write a minimal ga_results.pkl with plain pickle -- no plots, no reports.
+
+    _save_ga_checkpoint renders plots and full reports and is far too slow to
+    complete inside the PBS kill-delay window, so a shard whose walltime guard
+    trips late can be SIGKILLed before it ever persists its result.  This writes
+    the mergeable artifact first, in milliseconds; the full checkpoint overwrites
+    it later when there is wallclock to spare.  Never raises.
+    """
+    try:
+        os.makedirs(shard_dir, exist_ok=True)
+        import pickle as _pk
+        _all = AllStagesResult()
+        _all.results[int(stage_id)] = res
+        for _name in ("ga_results.pkl", "ga_results_checkpoint.pkl"):
+            with open(os.path.join(shard_dir, _name), "wb") as _fh:
+                _pk.dump(_all, _fh)
+        return True
+    except Exception as _e:  # noqa: BLE001
+        logger.warning(f"Fast result pickle failed: {_e}")
+        return False
+
+
+def _terminate_requested() -> bool:
+    """True once a kill was received or the GA walltime guard tripped."""
+    if _SHARD_CTX.get("finalised"):
+        return True
+    try:
+        import ga_hypothesis_testing as _gh
+        if bool(getattr(_gh, "_GA_WALLTIME_HIT", False)):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _write_kill_certificate(shard_dir: str, stage_id: int, segment: str,
+                            signame: str, salvaged_units: int,
+                            usable: bool, best_fitness=None) -> None:
+    """Minimal fast death certificate: progress + PARTIAL + shard info.
+
+    Deliberately avoids _save_ga_checkpoint (plots + full reports are too slow
+    for the ~10s PBS kill-delay window). Never raises.
+    """
+    try:
+        os.makedirs(shard_dir, exist_ok=True)
+    except Exception:
+        return
+    try:
+        status = {
+            "completed_stages": [int(stage_id)] if usable else [],
+            "last_stage": int(stage_id),
+            "failed": not usable,
+            "killed": True,
+            "signal": signame,
+            "partial_units": int(salvaged_units),
+            "out_dir": shard_dir,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        if best_fitness is not None:
+            try:
+                status["best_fitness"] = float(best_fitness)
+            except Exception:
+                pass
+        with open(os.path.join(shard_dir, "ga_progress.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(status, fh, indent=2)
+    except Exception:
+        pass
+    try:
+        if usable:
+            with open(os.path.join(shard_dir, "PARTIAL"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(f"killed by {signame}; salvaged {salvaged_units} "
+                         f"unit(s); resume driver should resubmit\n")
+    except Exception:
+        pass
+
+
+def _shard_kill_handler(signum, frame):
+    """SIGTERM/SIGINT: salvage best-so-far to disk, then exit killed."""
+    try:
+        _signal_mod.signal(_signal_mod.SIGTERM, _signal_mod.SIG_DFL)
+        _signal_mod.signal(_signal_mod.SIGINT, _signal_mod.SIG_DFL)
+    except Exception:
+        pass
+    if _SHARD_CTX.get("finalised"):
+        sys.exit(143 if signum == _signal_mod.SIGTERM else 130)
+    _SHARD_CTX["finalised"] = True
+    try:
+        import ga_hypothesis_testing as _gh
+        _gh._GA_WALLTIME_HIT = True
+    except Exception:
+        pass
+    stage_id = _SHARD_CTX.get("stage_id")
+    segment = _SHARD_CTX.get("segment") or ""
+    shard_dir = _SHARD_CTX.get("shard_dir") or ""
+    signame = "SIGTERM" if signum == _signal_mod.SIGTERM else f"sig{signum}"
+    partial, n_seg = None, 0
+    if stage_id is not None and shard_dir:
+        try:
+            partial, n_seg = _single._salvage_partial_result(int(stage_id))
+        except Exception:
+            partial, n_seg = None, 0
+    usable = False
+    try:
+        if partial is not None and n_seg > 0 and shard_dir:
+            # Honesty gate (mirrors the in-flow salvage rule): a salvage with
+            # zero completed segments is not a salvage — quarantining it keeps
+            # merge/progress/resume in agreement.
+            _segs = ((getattr(partial, "metadata", None) or {})
+                     .get("segment_results", {}) or {})
+            _fm = str(getattr(partial, "fitness_metric", "") or "")
+            if _segs or "salvaged" not in _fm:
+                all_ga = AllStagesResult()
+                all_ga.results[int(stage_id)] = _keep_shard_segments(
+                    partial, int(stage_id), str(segment))
+                with open(os.path.join(shard_dir, "ga_results.pkl"),
+                          "wb") as fh:
+                    pickle.dump(all_ga, fh)
+                with open(os.path.join(shard_dir,
+                                       "ga_results_checkpoint.pkl"),
+                          "wb") as fh:
+                    pickle.dump(all_ga, fh)
+                usable = True
+    except Exception:
+        usable = False
+    if not usable and shard_dir:
+        try:
+            all_ga = AllStagesResult()
+            with open(os.path.join(shard_dir, "ga_results.FAILED.pkl"),
+                      "wb") as fh:
+                pickle.dump(all_ga, fh)
+        except Exception:
+            pass
+    if shard_dir and stage_id is not None:
+        _write_kill_certificate(
+            shard_dir, int(stage_id), str(segment), signame, n_seg, usable,
+            getattr(partial, "best_fitness", None))
+        try:
+            _write_info(shard_dir, argparse.Namespace(
+                stage_id=int(stage_id),
+                run_root=_SHARD_CTX.get("run_root") or "",
+                run_tag=_SHARD_CTX.get("run_tag") or ""), str(segment),
+                "killed-partial" if usable else "killed",
+                _SHARD_CTX.get("t0") or time.time(),
+                {"signal": signame, "salvaged_units": int(n_seg)})
+        except Exception:
+            pass
+    sys.exit(143 if signum == _signal_mod.SIGTERM else 130)
+
+
+def _install_kill_handler(stage_id: int, segment: str, shard_dir: str,
+                          run_root: str, run_tag: str) -> None:
+    """Install the kill-save handler. Call after shard_dir exists."""
+    _SHARD_CTX.update({"stage_id": int(stage_id), "segment": str(segment),
+                       "shard_dir": str(shard_dir), "run_root": str(run_root),
+                       "run_tag": str(run_tag), "t0": time.time(),
+                       "finalised": False})
+    try:
+        _signal_mod.signal(_signal_mod.SIGTERM, _shard_kill_handler)
+        _signal_mod.signal(_signal_mod.SIGINT, _shard_kill_handler)
+    except Exception as exc:
+        logger.warning(f"Kill handler install skipped: {exc}")
+
+
+def _apply_ps_frame_filter(out):
+    """Restrict the search's survey frame for post-selection inference.
+
+    GA_PS_SUBSET_FILE : CSV with a ``person_id`` column. When set, only those
+    persons survive in ``out['persons'/'trips'/'tours']``. Used by
+    ``post_selection_inference.py`` for PS-I (selection half), PS-IV
+    (subsamples), and PS-III (bootstrap draws). Unset => bit-identical to an
+    ordinary run, so the published results are unaffected.
+    """
+    subset_file = os.environ.get("GA_PS_SUBSET_FILE", "").strip()
+    if not subset_file or not isinstance(out, dict):
+        return out
+    if not os.path.isfile(subset_file):
+        logger.warning(f"GA_PS_SUBSET_FILE set but not found: {subset_file}")
+        return out
+    try:
+        ids = pd.read_csv(subset_file, usecols=["person_id"])["person_id"]
+        keep = set(ids.astype(str))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"PS subset file load failed ({exc}); frame unchanged")
+        return out
+    out = dict(out)
+    for key in ("persons", "trips", "tours"):
+        df = out.get(key)
+        if isinstance(df, pd.DataFrame) and "person_id" in df.columns:
+            out[key] = df[df["person_id"].astype(str).isin(keep)].copy()
+            logger.info(f"PS frame filter: {key} {len(df)} -> {len(out[key])} rows")
+    return out
+
+
 def main() -> int:
     args = _parse_args()
     stage_id = int(args.stage_id)
@@ -95,6 +308,12 @@ def main() -> int:
     pl.OUT_DIR = shard_dir
     os.environ["PIPELINE_OUT_DIR"] = shard_dir
 
+    # Kill-save handler BEFORE load_data: even a kill during data loading must
+    # leave a death certificate (ga_progress.json + PARTIAL/shard_info) rather
+    # than a silent empty shard dir.
+    _install_kill_handler(stage_id, segment, shard_dir,
+                          args.run_root, args.run_tag)
+
     logger.info("=" * 70)
     logger.info(f"SHARD start: stage={stage_id} segment={segment} tag={args.run_tag}")
     logger.info(f"shard_dir={shard_dir}")
@@ -107,6 +326,8 @@ def main() -> int:
         logger.error(f"Shard stage {stage_id}/{segment}: load_data failed: {exc}")
         logger.error(traceback.format_exc())
         return 1
+
+    out = _apply_ps_frame_filter(out)
 
     runner, effective_sid = _single._stage_runner(stage_id)
     if runner is None:  # stage 3 no-op under STAGE23_JOINT=1
@@ -124,7 +345,12 @@ def main() -> int:
             partial, n_seg = _single._salvage_partial_result(stage_id)
         except Exception:
             partial, n_seg = None, 0
-        if partial is None:
+        # Honesty gate (2026-10-08): a salvage with ZERO completed segments is
+        # not a salvage — writing it as success produces a live-named but
+        # content-free ga_results.pkl next to ga_results.FAILED.pkl while
+        # ga_progress.json claims failed=false (observed on paper_missing
+        # stage5 nonmand/work). Treat it as failure so merge/progress agree.
+        if partial is None or n_seg == 0:
             _write_info(shard_dir, args, segment, "failed", t0,
                         {"error": str(exc)})
             return 1
@@ -134,6 +360,18 @@ def main() -> int:
     # Keep only this shard's segment(s) in case the filter missed anything.
     res = _keep_shard_segments(res, stage_id, segment)
     all_ga.results[stage_id] = res
+
+    # Durability first: persist the mergeable artifact with plain pickle before
+    # any plotting/reporting.  _save_ga_checkpoint below does the full render and
+    # can be cut off by a late SIGKILL, which is how qld_fix1 escort/social lost
+    # their results despite tripping the walltime guard gracefully.
+    _fast_result_pickle(shard_dir, stage_id, res)
+
+    if _terminate_requested():
+        logger.warning("Walltime/terminate already signalled: skipping the full "
+                       "checkpoint + report chain (fast ga_results.pkl is saved)")
+        return 0
+
     _save_ga_checkpoint(all_ga, stage_id=stage_id, failed=False)
 
     try:
@@ -216,10 +454,17 @@ def main() -> int:
         logger.warning(f"Shard per-stage salvage plot skipped: {exc}")
 
     # ---- Model-family variant shootout (stages 4/5) ---------------------
+    # Terminate-aware: the search result is already checkpointed above. If a
+    # kill/walltime guard tripped during the search, skip the expensive refits
+    # and finalise immediately rather than burning the kill-delay window.
     variant_rows = []
     do_variants = (not args.no_variants
                    and os.environ.get("GA_SHARD_VARIANTS", "1").strip() != "0"
-                   and stage_id in (4, 5))
+                   and stage_id in (4, 5)
+                   and not _terminate_requested())
+    if args.no_variants is False and stage_id in (4, 5) and _terminate_requested():
+        logger.warning("Shard variants skipped: terminate requested "
+                       "(search result already saved)")
     if do_variants:
         try:
             variant_rows = _run_variants(stage_id, segment, res, out, landuse,
@@ -237,31 +482,41 @@ def main() -> int:
     # break the shard (tour results are already saved above). Runs over all
     # trip purposes (per-purpose models inside), not just this segment.
     if stage_id == 5 and os.environ.get("GA_SHARD_STAGE5B", "0").strip() == "1":
-        try:
-            from stage5b_trip_destination import run_stage5b_pipeline as _run_s5b
-            _s5b_trips = out.get("trips") if isinstance(out, dict) else None
-            _s5b_persons = out.get("persons") if isinstance(out, dict) else None
-            _s5b_skims_path = (getattr(pl, "PIPELINE_SKIMS_PATH", None)
-                               or os.environ.get("PIPELINE_SKIMS_PATH", ""))
-            _s5b_dir = os.path.join(shard_dir, "stage5b")
-            os.makedirs(_s5b_dir, exist_ok=True)
-            if _s5b_trips is None or _s5b_persons is None or not _s5b_skims_path:
-                logger.warning("Shard stage5b skipped: missing trips/persons/skims_path")
-            else:
-                _s5b_res = _run_s5b(trips=_s5b_trips, persons=_s5b_persons,
-                                    skims_path=_s5b_skims_path, landuse=landuse,
-                                    output_dir=_s5b_dir, validate=True)
-                logger.info(f"Shard stage5b done: "
-                            f"{len(_s5b_res.get('dest_models', {}))} dest + "
-                            f"{len(_s5b_res.get('mode_models', {}))} mode trip models -> {_s5b_dir}")
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"Shard stage5b failed (tour results kept): {exc}")
+        if _terminate_requested():
+            logger.warning("Shard stage5b skipped: terminate requested "
+                           "(tour results already saved)")
+        else:
+            try:
+                from stage5b_trip_destination import run_stage5b_pipeline as _run_s5b
+                _s5b_trips = out.get("trips") if isinstance(out, dict) else None
+                _s5b_persons = out.get("persons") if isinstance(out, dict) else None
+                _s5b_skims_path = (getattr(pl, "PIPELINE_SKIMS_PATH", None)
+                                   or os.environ.get("PIPELINE_SKIMS_PATH", ""))
+                _s5b_dir = os.path.join(shard_dir, "stage5b")
+                os.makedirs(_s5b_dir, exist_ok=True)
+                if _s5b_trips is None or _s5b_persons is None or not _s5b_skims_path:
+                    logger.warning("Shard stage5b skipped: missing trips/persons/skims_path")
+                else:
+                    _s5b_res = _run_s5b(trips=_s5b_trips, persons=_s5b_persons,
+                                        skims_path=_s5b_skims_path, landuse=landuse,
+                                        output_dir=_s5b_dir, validate=True)
+                    logger.info(f"Shard stage5b done: "
+                                f"{len(_s5b_res.get('dest_models', {}))} dest + "
+                                f"{len(_s5b_res.get('mode_models', {}))} mode trip models -> {_s5b_dir}")
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"Shard stage5b failed (tour results kept): {exc}")
 
     _write_info(shard_dir, args, segment, "done", t0,
                 {"best_fitness": float(getattr(res, "best_fitness", float("nan"))),
                  "n_variant_rows": len(variant_rows)})
     logger.info(f"SHARD done: stage={stage_id} segment={segment} "
                 f"elapsed={(time.time()-t0)/60:.1f}min -> {shard_dir}")
+    try:
+        _signal_mod.signal(_signal_mod.SIGTERM, _signal_mod.SIG_DFL)
+        _signal_mod.signal(_signal_mod.SIGINT, _signal_mod.SIG_DFL)
+    except Exception:
+        pass
+    _SHARD_CTX["finalised"] = True
     return 0
 
 
@@ -328,17 +583,11 @@ def _run_variants(stage_id, segment, res, out, landuse, variants_dir):
                 search_metadata=meta)
             # Dest context (logsums/size/acdc) rebuilt from the winning mode
             # spec, mirroring the worker prep; guarded — failure yields
-            # non-converged rows, never a crash.
-            try:
-                ctx = _s5_dest_context(segment, mode_vars, tours, persons,
-                                       landuse, skims)
-                rows += _vr.run_s5dest_variants(
-                    segment, [1] * len(dest_vars), dest_vars, ctx["seg_tours"],
-                    persons, ctx["lu_st"], skims, ctx["ls"], ctx["acdc"],
-                    variants_dir, warm_start=ctx.get("warm_start"))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"Shard S5/{segment}: dest context rebuild failed "
-                               f"({exc!r}) — dest variants recorded as not-run")
+            # non-converged rows, never a crash. Skipped outright when a
+            # terminate was requested mid-shootout (mode rows already kept).
+            if _terminate_requested():
+                logger.warning(f"Shard S5/{segment}: dest variants skipped "
+                               f"(terminate requested; mode rows kept)")
                 for v in _shard.s5_dest_variants():
                     rows.append({"stage": 5, "segment": segment, "slot": "s5dest",
                                  "variant": v,
@@ -347,7 +596,27 @@ def _run_variants(stage_id, segment, res, out, landuse, variants_dir):
                                  "converged": 0, "ll": "", "k": "", "n": "",
                                  "bic_per_obs": "", "winner_in_group": 0,
                                  "overall_pick": 0,
-                                 "note": f"context rebuild failed: {exc!r}"})
+                                 "note": "skipped: terminate requested"})
+            else:
+                try:
+                    ctx = _s5_dest_context(segment, mode_vars, tours, persons,
+                                           landuse, skims)
+                    rows += _vr.run_s5dest_variants(
+                        segment, [1] * len(dest_vars), dest_vars, ctx["seg_tours"],
+                        persons, ctx["lu_st"], skims, ctx["ls"], ctx["acdc"],
+                        variants_dir, warm_start=ctx.get("warm_start"))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Shard S5/{segment}: dest context rebuild failed "
+                                   f"({exc!r}) — dest variants recorded as not-run")
+                    for v in _shard.s5_dest_variants():
+                        rows.append({"stage": 5, "segment": segment, "slot": "s5dest",
+                                     "variant": v,
+                                     "group": _shard.variant_group("s5dest", v),
+                                     "primary_group": _shard.PRIMARY_GROUP["s5dest"],
+                                     "converged": 0, "ll": "", "k": "", "n": "",
+                                     "bic_per_obs": "", "winner_in_group": 0,
+                                     "overall_pick": 0,
+                                     "note": f"context rebuild failed: {exc!r}"})
             # Single combined write (mode + dest rows together — the variant
             # functions deliberately do not write, so neither family clobbers
             # the other).

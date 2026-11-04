@@ -84,8 +84,8 @@ TIME_ORDER = ["early", "am_peak", "midday", "pm_peak", "evening", "late"]
 
 USECOLS = [
     "person_id", "row_type", "purpose", "OTAZ", "DTAZ", "mode", "mode_name",
-    "dist", "travtime", "crash", "ptype", "time_period", "generalised_cost",
-    "departure_time", "STARTIME",
+    "dist", "travtime", "crash", "ptype", "agep", "incp", "time_period",
+    "generalised_cost", "departure_time", "STARTIME",
 ]
 
 PAPER_RC = {
@@ -678,6 +678,171 @@ def write_latex(out_tex, ms_rows, agg_b, agg_n, pop_delta) -> None:
 
 
 # ---------------------------------------------------------------------------
+# safety-value experiment (S1-S5 of the paper's safety-effects section)
+# ---------------------------------------------------------------------------
+
+RISK_PTYPE = {
+    "children_teens": {"SchoolChild", "Preschool"},
+    "older_persons": {"Retired"},
+}
+
+
+def _low_income_mask(t: pd.DataFrame, low_incp_thresh: float | None):
+    """Bottom income tertile of observed QTS income codes.
+
+    The modal `incp` code is treated as non-response and excluded before the
+    tertile is taken, so the cut tracks declared income bands only. Assumes the
+    QTS income code ascends with income (to be confirmed against the codebook).
+    """
+    incp = _num(t, "incp")
+    if low_incp_thresh is None:
+        pos = incp[incp > 0]
+        if not pos.empty:
+            modal = pos.mode().iloc[0]
+            rest = pos[pos != modal]
+            if not rest.empty:
+                low_incp_thresh = float(rest.quantile(1.0 / 3.0))
+    if low_incp_thresh is None or not np.isfinite(low_incp_thresh):
+        return pd.Series(False, index=t.index), np.nan
+    return (incp > 0) & (incp <= low_incp_thresh), float(low_incp_thresh)
+
+
+def _active_pct(t: pd.DataFrame, mask=None) -> float:
+    if t is None or len(t) == 0:
+        return np.nan
+    a = t["is_active"]
+    if mask is not None:
+        a = a[mask.reindex(t.index, fill_value=False)]
+    return float(a.mean() * 100) if len(a) else np.nan
+
+
+def risk_group_table(t: pd.DataFrame, low_incp_thresh: float | None = None):
+    """S4: active/motor share, mean OD crash and distance per risk group."""
+    if t is None or t.empty:
+        return pd.DataFrame(), low_incp_thresh
+    incp_mask, low_incp_thresh = _low_income_mask(t, low_incp_thresh)
+    true_all = pd.Series(True, index=t.index)
+    masks = {
+        "children_teens": t["ptype"].isin(RISK_PTYPE["children_teens"]),
+        "older_persons": t["ptype"].isin(RISK_PTYPE["older_persons"]),
+        "low_income": incp_mask,
+        "all": true_all,
+    }
+    d, c = _num(t, "dist"), _num(t, "crash")
+    rows = []
+    for g, m in masks.items():
+        m = m.reindex(t.index, fill_value=False)
+        sub = t[m]
+        rows.append({
+            "risk_group": g,
+            "n_trips": int(len(sub)),
+            "active_pct": _active_pct(t, m),
+            "motor_pct": float(sub["is_motor"].mean() * 100) if len(sub) else np.nan,
+            "mean_dist_km": float(d[m].mean()) if len(sub) else np.nan,
+            "mean_crash": float(c[m].mean()) if len(sub) else np.nan,
+        })
+    return pd.DataFrame(rows), low_incp_thresh
+
+
+SEGMENT_PURPOSES = {
+    "all": None,
+    "work": {"work"},
+    "education": {"edu"},
+    "nonmandatory": {"social", "shopping", "escort", "othmaint", "eat",
+                     "othdiscr", "home"},
+}
+
+
+def _seg_sub(t, seg):
+    if t is None or t.empty:
+        return t
+    purs = SEGMENT_PURPOSES.get(seg)
+    if purs is None or "purpose" not in t.columns:
+        return t
+    return t[t["purpose"].isin(purs)]
+
+
+def _seg_metrics(t):
+    if t is None or len(t) == 0:
+        return {"active_share_pct": np.nan, "motor_share_pct": np.nan,
+                "mean_dest_crash": np.nan, "p90_dest_crash": np.nan,
+                "mean_dist_km": np.nan, "n_trips": 0}
+    return {
+        "active_share_pct": float(t["is_active"].mean() * 100),
+        "motor_share_pct": float(t["is_motor"].mean() * 100),
+        "mean_dest_crash": float(_num(t, "crash").mean()),
+        "p90_dest_crash": float(_num(t, "crash").quantile(0.9)),
+        "mean_dist_km": float(_num(t, "dist").mean()),
+        "n_trips": int(len(t)),
+    }
+
+
+def safety_experiment_table(tb, tn, tcf, delta, low_incp_thresh=None):
+    """S1-S5 measures in one long table for the paper's safety-value section.
+
+    Grid of (measure, segment) x (base, nosafety, counterfactual). Segments:
+    all / work / education / nonmandatory. S1 mode substitution, S2 spatial
+    substitution (destination crash + distance), S4 distributional risk groups,
+    S5 induced-demand elasticity eta_act from the delta counterfactual arm.
+    S3 active-mode accessibility is a zone-level artifact and is emitted as a
+    placeholder row (NaN) pending the walk/bike logsum.
+    """
+    arms = {"base": tb}
+    if tn is not None and not tn.empty:
+        arms["nosafety"] = tn
+    if tcf is not None and not tcf.empty:
+        arms["counterfactual"] = tcf
+
+    segs = ("all", "work", "education", "nonmandatory")
+    metrics = {(seg, k): _seg_metrics(_seg_sub(arm, seg))
+               for seg in segs for k, arm in arms.items()}
+
+    def _g(seg, key, arm):
+        return metrics.get((seg, arm), {}).get(key, np.nan)
+
+    def _arm_rows(seg, mid, key, note):
+        return {"measure": mid, "segment": seg,
+                "base": _g(seg, key, "base"),
+                "nosafety": _g(seg, key, "nosafety"),
+                "counterfactual": _g(seg, key, "counterfactual"),
+                "note": note}
+
+    rows = [_arm_rows(seg, "S1_active_share_pct", "active_share_pct",
+                      "walk+bike share (%)") for seg in segs]
+    for seg in segs:
+        for mid, key, note in [
+            ("S1_motor_share_pct", "motor_share_pct", "car+transit share (%)"),
+            ("S2_mean_dest_crash", "mean_dest_crash", "mean OD crash of chosen destination"),
+            ("S2_p90_dest_crash", "p90_dest_crash", "p90 OD crash of chosen destination"),
+            ("S2_mean_dist_km", "mean_dist_km", "mean trip length (km)"),
+        ]:
+            rows.append(_arm_rows(seg, mid, key, note))
+
+    rg, low_incp_thresh = risk_group_table(tb, low_incp_thresh)
+    for _, r in rg.iterrows():
+        note = f"n_trips={int(r['n_trips'])}"
+        if pd.notna(r["mean_crash"]):
+            note += f"; mean_crash={r['mean_crash']:.3f}"
+        rows.append({"measure": f"S4_active_pct__{r['risk_group']}", "segment": "all",
+                     "base": float(r["active_pct"]),
+                     "nosafety": np.nan, "counterfactual": np.nan, "note": note})
+
+    rows.append({"measure": "S3_active_accessibility", "segment": "all",
+                 "base": np.nan, "nosafety": np.nan, "counterfactual": np.nan,
+                 "note": "Hansen active-mode logsum; source accessibility_371_extended.csv (zone-level)"})
+
+    for seg in segs:
+        a0 = _g(seg, "active_share_pct", "base")
+        a1 = _g(seg, "active_share_pct", "counterfactual")
+        eta = ((a1 - a0) / (a0 * delta)
+               if pd.notna(a0) and pd.notna(a1) and a0 and delta else np.nan)
+        rows.append({"measure": "S5_eta_act", "segment": seg, "base": eta,
+                     "nosafety": np.nan, "counterfactual": np.nan,
+                     "note": f"fractional active-share change per unit crash reduction; delta={delta}"})
+    return pd.DataFrame(rows), low_incp_thresh
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -685,6 +850,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Paper-ready safety impact on travel plans + coverages")
     ap.add_argument("--baseline", default=None)
     ap.add_argument("--nosafety", default=None)
+    ap.add_argument("--counterfactual", default=None,
+                    help="optional delta-crash arm (STAGE5_CRASH_SCALE=1-delta run)")
+    ap.add_argument("--delta", type=float, default=0.2,
+                    help="proportional crash reduction of the counterfactual arm")
     ap.add_argument("--out", default="runs/safety_plan_impact")
     ap.add_argument("--crosswalk", default=None)
     ap.add_argument("--chunksize", type=int, default=500_000)
@@ -693,22 +862,25 @@ def main() -> int:
     run_root = os.environ.get("PIPELINE_RUN_ROOT", "runs")
     base_dir = a.baseline or _latest_run_dir("safety_baseline", run_root)
     nosa_dir = a.nosafety or _latest_run_dir("safety_nosafety", run_root)
-    # fall back: newest run with a stage6 output (single-arm audit of whatever exists)
-    if base_dir is None or _find_trips_file(base_dir) is None:
-        cands = [d for d in glob.glob(os.path.join(run_root, "*"))
-                 if os.path.isdir(d) and _find_trips_file(d)]
-        cands += [d for d in glob.glob(os.path.join(run_root, "ga_parallel", "*"))
-                  if os.path.isdir(d) and _find_trips_file(d)]
-        base_dir = max(cands, key=os.path.getmtime) if cands else base_dir
+    cf_dir = a.counterfactual or _latest_run_dir("safety_counterfactual", run_root)
 
     print("=" * 70)
     print("SAFETY PLAN IMPACT — travel plans + coverages (paper-ready)")
     print(f"  M_S baseline : {base_dir}")
     print(f"  M_0 nosafety : {nosa_dir}")
+    print(f"  delta-crash  : {cf_dir}  (delta={a.delta})")
     print(f"  output       : {a.out}")
     print("=" * 70)
+    # The baseline arm MUST be a completed safety run.  The old fallback
+    # ("newest run with any stage6 output") silently substituted an unrelated
+    # run (runs/smoke_lvl4, 894 trips) when the safety arms died, producing a
+    # meaningless single-arm audit — refuse instead.
     if base_dir is None or _find_trips_file(base_dir) is None:
-        print("ERROR: no run with stage6_output.csv / trips_for_aimsun.csv found.")
+        print("ERROR: safety_baseline arm has no stage6_output.csv / "
+              f"trips_for_aimsun.csv (dir={base_dir}).")
+        print("       The safety experiment has not completed — re-run "
+              "job_safety_experiment.pbs and retry. Refusing to substitute "
+              "an unrelated run.")
         return 2
 
     os.makedirs(os.path.join(a.out, "tables"), exist_ok=True)
@@ -725,6 +897,15 @@ def main() -> int:
     else:
         print("  M_0: not found — single-arm audit (deltas left empty)")
     two_arm = tn is not None and not tn.empty
+
+    tcf = None
+    if cf_dir and os.path.isdir(cf_dir) and _find_trips_file(cf_dir):
+        print(f"Loading delta-crash trips from {cf_dir} ...")
+        tcf = load_trips(cf_dir, a.chunksize)
+        print(f"  delta-crash: {len(tcf):,} trips")
+    else:
+        print(f"  delta-crash: not found — eta_act left empty (delta={a.delta})")
+    three_arm = tcf is not None and not tcf.empty
 
     crosswalk = None
     if a.crosswalk and os.path.isfile(a.crosswalk):
@@ -840,6 +1021,12 @@ def main() -> int:
     if t8:
         pd.DataFrame(t8).to_csv(os.path.join(T, "08_tour_stats.csv"), index=False)
 
+    # ---- 09 safety-value experiment (S1-S5 for the safety-effects section) ----
+    sx, low_incp_thresh = safety_experiment_table(tb, tn, tcf, a.delta)
+    sx.to_csv(os.path.join(T, "09_safety_experiment.csv"), index=False)
+    _eta = sx.loc[sx["measure"] == "S5_eta_act", "base"]
+    eta_act = float(_eta.iloc[0]) if len(_eta) else np.nan
+
     # ---- headline numbers ----
     hl = [
         ("active_share_base", agg_b.get("active_share_pct", np.nan)),
@@ -851,6 +1038,9 @@ def main() -> int:
         ("active_km_nosa", agg_n.get("active_km", np.nan) if two_arm else np.nan),
         ("mean_dist_base", agg_b.get("mean_dist_km", np.nan)),
         ("mean_dist_nosa", agg_n.get("mean_dist_km", np.nan) if two_arm else np.nan),
+        ("eta_act", eta_act),
+        ("delta_crash", a.delta if three_arm else np.nan),
+        ("low_income_incp_thresh", low_incp_thresh),
         ("hi_crash_thresh", hi if "hi" in dir() else np.nan),
     ]
     for r in ms_rows:
@@ -889,6 +1079,11 @@ def main() -> int:
     if two_arm and pd.notna(_bvkt) and pd.notna(_nvkt) and _bvkt:
         _vkt_str = f"   delta={(_nvkt - _bvkt) / _bvkt * 100:+.1f}%"
     print(f"  motor VKT    M_S={_bvkt:,.0f} km" + _vkt_str)
+    if three_arm:
+        print(f"  eta_act      {eta_act:+.3f}  (active share vs delta={a.delta} crash cut)")
+    else:
+        _mdc_b = agg_b.get("mean_dest_crash", np.nan)
+        print(f"  mean dest crash M_S={_mdc_b:.3f}" + ("" if pd.isna(_mdc_b) else "  (delta-crash arm not run)"))
     print(f"\nDONE — tables: {T}  figures: {F}  latex: {os.path.join(a.out, 'tables_for_paper.tex')}")
     return 0
 

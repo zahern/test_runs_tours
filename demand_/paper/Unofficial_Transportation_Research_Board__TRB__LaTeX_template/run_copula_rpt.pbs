@@ -19,7 +19,7 @@ module unload Anaconda3
 mkdir -p /mnt/hpccs01/home/ahernz/test_runs_tours/code
 (
     flock -w 900 9 2>/dev/null || echo "(flock unavailable, proceeding without lock)"
-    pip install --quiet --upgrade --retries 5 --timeout 60 "metacountregressor==1.0.151" 2>&1 | tail -5
+    pip install --quiet --upgrade --retries 5 --timeout 60 metacountregressor 2>&1 | tail -5
 ) 9>/mnt/hpccs01/home/ahernz/test_runs_tours/code/.pkg_upgrade.lock
 # Log dist metadata, not m.__version__ (stale "1.0.143" in the 1.0.151 wheel).
 python -c "from importlib.metadata import version as _v; print('mcr', _v('metacountregressor'))"
@@ -39,3 +39,5 @@ for f in "$PROJ_DIR/copula_tiers.tex" "$PROJ_DIR/copula_tiers.csv"; do
 done
 echo "Job finished at $(date) exit=$EXIT_CODE"
 exit $EXIT_CODE
+
+

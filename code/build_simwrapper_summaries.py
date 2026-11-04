@@ -12,6 +12,9 @@ subfolder that SimWrapper can render with `simwrapper open asim`:
     zone counts can be drawn as a choropleth map
   * write dashboard-1-summary.yaml (charts + map) and topsheet.yaml
     (at-a-glance KPI calculation table)
+  * add the HHTS re-prediction validation tab (dashboard-2-validation.yaml,
+    topsheet-validation.yaml, validation_gallery.html) from the artifacts
+    validate_hhts writes, when the run has them
 
 Usage:
   python build_simwrapper_summaries.py <run_dir> [--skip-map]
@@ -109,22 +112,21 @@ def to_csv(rows, path):
 def consolidate_coefficients(run_dir, out_path):
     """Merge every stage*_coefficients*.csv found in the run into one long table."""
     rows = []
-    for rel in COEF_FILES:
-        p = os.path.join(run_dir, rel)
-        if not os.path.exists(p):
-            continue
+    seen = set()
+
+    def _absorb(path, label):
         try:
-            data = read_csv(p)
+            data = read_csv(path)
         except Exception as e:
-            log(f'  warn: cannot read {rel}: {e}')
-            continue
+            log(f'  warn: cannot read {path}: {e}')
+            return False
         if pd is not None and isinstance(data, pd.DataFrame):
             records = data.to_dict('records')
         else:
             records = data
         for r in records:
             rows.append({
-                'stage': r.get('stage') or rel.split('/')[0],
+                'stage': r.get('stage') or label,
                 'segment': r.get('segment', ''),
                 'param': r.get('param') or r.get('parameter', ''),
                 'value': r.get('value', ''),
@@ -132,6 +134,28 @@ def consolidate_coefficients(run_dir, out_path):
                 't_stat': _first(r, 't_stat', 'tstat'),
                 'p_value': _first(r, 'p_value', 'pval'),
             })
+        return bool(records)
+
+    for rel in COEF_FILES:
+        p = os.path.join(run_dir, rel)
+        if not os.path.exists(p):
+            continue
+        label = rel.split('/')[0]
+        if _absorb(p, label):
+            seen.add(label)
+
+    # GA/staged runs keep the per-stage tables at the run root (and in models/)
+    # instead of stageN/ subdirectories.  Without this fallback those runs get
+    # an empty coefficient table and the dashboard loses its coefficient panels.
+    for pat in ('stage*_coefficients.csv',
+                os.path.join('models', 'stage*_coefficients.csv')):
+        for p in sorted(glob.glob(os.path.join(run_dir, pat))):
+            label = os.path.basename(p).split('_coefficients')[0] or 'stage'
+            if label in seen:
+                continue
+            if _absorb(p, label):
+                seen.add(label)
+
     if to_csv(rows, out_path):
         log(f'  wrote {out_path} ({len(rows)} coefficient rows)')
 
@@ -416,6 +440,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('run_dir', nargs='?')
     ap.add_argument('--skip-map', action='store_true')
+    ap.add_argument('--no-validation', action='store_true',
+                    help='skip the HHTS re-prediction validation tab')
     args = ap.parse_args()
 
     run_dir = args.run_dir
@@ -470,6 +496,15 @@ def main():
 
     write_dashboard_yaml(out_dir, has_map, has_trips)
     write_topsheet(out_dir, has_trips)
+
+    # HHTS re-prediction validation: observed vs predicted charts and the
+    # figure gallery, alongside the study-area map and coefficient pages.
+    if not args.no_validation:
+        try:
+            from build_validation_dashboard import build_validation_dashboard
+            build_validation_dashboard(run_dir, out_dir=out_dir)
+        except Exception as exc:
+            log(f'  validation dashboard skipped: {exc}')
 
     log(f'Done. View with:  simwrapper open asim {out_dir}')
 

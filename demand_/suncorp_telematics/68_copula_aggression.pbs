@@ -1,0 +1,57 @@
+#!/bin/bash -l
+#PBS -N suncorp_copula
+#PBS -l walltime=6:00:00
+#PBS -l select=1:ncpus=8:mem=96GB
+#PBS -j oe
+#PBS -m abe
+#PBS -r y
+
+# Refuse to run outside PBS: keep all compute off the login/head node.
+if [ -z "${PBS_JOBID:-}" ] && [ "${ALLOW_HEAD_NODE:-0}" != "1" ]; then
+  echo "$(basename "$0"): PBS batch script; refusing to run on $(hostname). Submit with qsub." >&2
+  exit 2
+fi
+
+# Job 68: copula Stage 2 - joint speeding x hard-braking margins, AIC copula
+# selection, auto-selected aggression threshold, honest gates. Needs the braking
+# panel from 58b (submit with: qsub -W depend=afterok:<58b_jobid> 68_...pbs).
+
+PROJ_DIR=/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics
+SCRIPT_DIR=$PROJ_DIR/scripts
+RESULTS_DIR=$PROJ_DIR/results
+FIG_DIR=$PROJ_DIR/figures
+
+module purge
+module load Anaconda3/2024.02-1
+conda activate zigenv
+module unload Anaconda3
+
+export PYTHONWARNINGS="ignore::RuntimeWarning"
+export OMP_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+
+cd "$SCRIPT_DIR"
+
+echo "=================================================================="
+echo "Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "68: copula (joint speeding x hard-braking) + aggression score"
+echo "=================================================================="
+
+[ -s "$RESULTS_DIR/segment_15min_panel.parquet" ] \
+  || { echo "FATAL: missing results/segment_15min_panel.parquet (run 58)"; exit 1; }
+[ -s "$RESULTS_DIR/segment_15min_panel_braking.parquet" ] \
+  || { echo "FATAL: missing results/segment_15min_panel_braking.parquet (run 58b)"; exit 1; }
+[ -s "$RESULTS_DIR/game_day_pred_15min.parquet" ] \
+  || { echo "FATAL: missing results/game_day_pred_15min.parquet (run 59)"; exit 1; }
+
+python -u 68_copula_aggression.py 2>&1
+[ $? -ne 0 ] && { echo "FATAL: 68 copula stage failed"; exit 1; }
+
+[ -s "$RESULTS_DIR/copula_aggression_report.json" ] \
+  || { echo "FATAL: missing results/copula_aggression_report.json"; exit 1; }
+[ -s "$RESULTS_DIR/segment_aggression.parquet" ] \
+  || { echo "FATAL: missing results/segment_aggression.parquet"; exit 1; }
+
+echo "68 OK"
+echo "Job finished at $(date)"

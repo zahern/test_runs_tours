@@ -29,6 +29,9 @@
 #   PAPER_MEMB=STUDYING,age5p,sexp,safety_sensitivity
 #   PAPER_N_PERT=2  PAPER_LC_MAXITER=150  PAPER_MSTEP_MAXITER=200
 #   PAPER_LC_PERTURB_SIGMA=0.5  PAPER_SEED=42
+#   PAPER_DROP_NOLOGSUM=1  drop tours with no cached logsum row (their 0.0
+#                          fill becomes a distance mirror after orthogonalization)
+#   PAPER_REBUILD_CACHE=1  retire the cached destination frame and rebuild it
 #   CONDA_ENV=zigenv  SEARCHLIBRIUM_SRC (defaults to _patches fallback)
 #
 # OUTPUT  runs/stage5_paper_arms/<PBS_JOBID or PAPER_OUT>: arms.json + arms.md

@@ -2063,8 +2063,12 @@ def stage4_fitness_searchlibrium_mixed(
                     _rdm_set = set(random_var_policy('stage4', avail_feats, rand_dist))
                 except Exception:
                     _rdm_set = set(avail_feats)
-            rv       = ({v: rand_dist for v in avail_feats if v in _rdm_set}
-                        or {v: rand_dist for v in avail_feats})
+            rv       = {v: rand_dist for v in avail_feats if v in _rdm_set}
+            if not rv:
+                logger.info(
+                    "[%s] no eligible continuous random parameters; "
+                    "skipping mixed-logit fitness", purpose)
+                continue
 
             mxl_kwargs: dict = dict(
                 X        = long[avail_feats].values.astype(float),
@@ -2112,6 +2116,7 @@ def _fit_bic_rv(long, avail_feats, alts, rv, n_obs, n_draws=50):
     Used by the greedy random-parameter search below; np.inf on any failure
     so a failed trial can never be selected.
     """
+    m = None
     try:
         if rv:
             m = MixedLogit()
@@ -2145,6 +2150,32 @@ def _fit_bic_rv(long, avail_feats, alts, rv, n_obs, n_draws=50):
         return -2.0 * ll + k * np.log(max(n_obs, 1))
     except Exception:
         return float('inf')
+    finally:
+        # These are screening fits, not retained production models. Search-
+        # time objects may hold X/y panels, simulated draws, probabilities, and
+        # compiled executables; release them before the next random-status
+        # trial so the greedy search has bounded live memory.
+        if m is not None:
+            try:
+                release = getattr(m, 'release_memory', None)
+                if callable(release):
+                    release()
+                else:
+                    clear_cache = getattr(type(m), '_clear_jit_cache', None)
+                    if callable(clear_cache):
+                        clear_cache()
+            except Exception:
+                pass
+            for attr in (
+                'X', 'X_original', 'y', 'y_original', 'panels',
+                'draws', 'drawstrans', 'choice_pred_prob',
+                'ind_pred_prob', 'pred_prob', 'prob_full',
+            ):
+                try:
+                    setattr(m, attr, None)
+                except Exception:
+                    pass
+        gc.collect()
 
 
 def _greedy_randvar_search(long, avail_feats, alts, rv0, rand_dist, n_obs,
@@ -2227,8 +2258,7 @@ def stage4_final_mixed_logit(
             _rdm_set = set(random_var_policy('stage4', selected_vars, rand_dist))
         except Exception:
             _rdm_set = set(selected_vars)
-    randvars = ({v: rand_dist for v in selected_vars if v in _rdm_set}
-                or {v: rand_dist for v in selected_vars})
+    randvars = {v: rand_dist for v in selected_vars if v in _rdm_set}
     try:
         from ga_constraints import rand_param_search_enabled, get_constraints
         _rand_search = rand_param_search_enabled()
@@ -2250,7 +2280,12 @@ def stage4_final_mixed_logit(
                 feat_cols=avail_feats, n_alts=n_alts,
             )
             alts = np.arange(n_alts)
-            rv   = {v: rand_dist for v in avail_feats if v in randvars} or {v: rand_dist for v in avail_feats}
+            rv   = {v: rand_dist for v in avail_feats if v in randvars}
+            if not rv:
+                logger.info(
+                    "[%s] no eligible continuous random parameters; "
+                    "skipping mixed-logit refit", purpose)
+                continue
             if _rand_search and len(avail_feats) >= 2:
                 # Random-parameter treatment as a searched decision, not a
                 # blanket default (GA_RAND_PARAM_SEARCH=1): greedy BIC toggle
@@ -2263,7 +2298,8 @@ def stage4_final_mixed_logit(
                 if not rv:
                     # MixedLogit.setup requires ≥1 random var; keep the first
                     # eligible one so the production fit below stays valid.
-                    _elig = [v for v in avail_feats if v not in set(_never_random)]
+                    _elig = [v for v in avail_feats if v in randvars
+                             and v not in set(_never_random)]
                     rv = {(_elig[0] if _elig else avail_feats[0]): rand_dist}
                     logger.info(f"[{purpose}] greedy search kept no random params - "
                                 f"retaining minimal mixture on '{list(rv)[0]}'")

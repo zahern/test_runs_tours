@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import sys
 import traceback
 
 import numpy as np
@@ -267,23 +268,75 @@ def run_s5mode_variants(seg: str, mode_genes, mode_cands: list, tours, persons,
     genes = np.asarray(list(mode_genes), dtype=int)
     n = int(genes.sum())
 
-    struct_of = {"nl": "nested", "mnl": "flat"}
-    for variant in [v for v in ("nl", "mnl") if v in variants]:
+    # The feature SEARCH leaves large JAX compilation caches resident; each
+    # variant refit then rebuilds the mode datatree + a fresh model on top. On
+    # a 64GB stage-5 shard that tipped edu into cgroup OOM (job 26463013) once
+    # 'lccm' (a 2-class model) was added as a 3rd, heavier variant. Free the
+    # caches before the phase and between variants so memory can't accumulate.
+    def _free_jax():
+        try:
+            import ga_external_estimators as _gee
+            _gee._maybe_clear_jax_caches()
+        except Exception:
+            pass
+        try:
+            import jax
+            jax.clear_caches()
+        except Exception:
+            pass
+        import gc as _gc
+        _gc.collect()
+
+    struct_of = {"nl": "nested", "mnl": "flat", "lccm": "lccm"}
+    _free_jax()
+    for variant in [v for v in ("nl", "mnl", "lccm") if v in variants]:
         try:
             fit = _stage5_mode_only_fitness(
                 genes, list(mode_cands), seg, tours, persons, landuse, skims,
                 distribution_policy=None, structure=struct_of[variant])
             if fit is not None and np.isfinite(float(fit)) and float(fit) > -1e8:
-                rows.append(_row(5, seg, "s5mode", variant, converged=True,
-                                 bic=-float(fit), n=n,
-                                 note=f"search fitness -> BIC/n; "
-                                      f"structure={struct_of[variant]}"))
+                # Real ll/k/n recorded by the refit itself. `fit` is the GA
+                # SEARCH objective (selected-feature k, GA_COMPLEXITY_PENALTY
+                # scaling, minus a significance penalty) — not a BIC — so
+                # writing it as bic_per_obs made a 2-class lccm look
+                # artificially cheap against nl/mnl. The leaderboard now uses
+                # the genuine BIC computed from the fitted ll and the fitted
+                # free-parameter count, and keeps the search value in `note`.
+                from ga_hypothesis_testing import get_fit_info
+                _info = get_fit_info("s5mode", seg, struct_of[variant]) or {}
+                if _info.get("ll") is not None and _info.get("k") is not None:
+                    rows.append(_row(5, seg, "s5mode", variant, converged=True,
+                                     ll=_info["ll"], k=_info["k"],
+                                     n=_info.get("n", n),
+                                     note=f"structure={struct_of[variant]}; "
+                                          f"search_obj={float(fit):.6f}"))
+                else:
+                    rows.append(_row(5, seg, "s5mode", variant, converged=True,
+                                     bic=-float(fit), n=n,
+                                     note=f"search fitness -> BIC/n; "
+                                          f"structure={struct_of[variant]} "
+                                          f"(ll/k unavailable)"))
             else:
+                # Log WHY: this branch was silent, so a failing family (notably
+                # lccm) only ever surfaced as "family refit failed (see log)"
+                # with nothing in the log. Distinguish None vs non-finite vs
+                # sentinel so the cause is readable without re-running.
+                _why = ("returned None"
+                        if fit is None else
+                        f"non-finite fitness ({fit!r})"
+                        if not np.isfinite(float(fit)) else
+                        f"sentinel fitness ({fit!r} <= -1e8)")
+                sys.stderr.write(
+                    f"[stage5-refit] FAILED segment={seg} variant={variant} "
+                    f"structure={struct_of[variant]} reason={_why}\n")
+                sys.stderr.flush()
                 rows.append(_row(5, seg, "s5mode", variant,
-                                 note="family refit failed (see log)"))
+                                 note=f"family refit failed ({_why})"))
         except Exception as exc:  # noqa: BLE001
             rows.append(_row(5, seg, "s5mode", variant,
                              note=f"{variant} raised: {exc!r}"))
+        finally:
+            _free_jax()   # release this variant's caches before the next
 
     # mxl / gse: recorded from the search's own GSE arm when it ran (the arm
     # already refits winner +/-GSE with identical k-counting and picks by BIC/n).
@@ -317,7 +370,7 @@ def run_s5mode_variants(seg: str, mode_genes, mode_cands: list, tours, persons,
     try:
         spec = {"segment": seg,
                 "mode_vars": [v for v, g in zip(mode_cands, genes) if int(g) == 1],
-                "structures_scored": [v for v in ("nl", "mnl") if v in variants]}
+                "structures_scored": [v for v in ("nl", "mnl", "lccm") if v in variants]}
         with open(os.path.join(out_dir, "winner_spec_mode.json"), "w",
                   encoding="utf-8") as fh:
             import json
@@ -336,7 +389,7 @@ def run_s5dest_variants(seg: str, dest_genes, dest_cands: list, seg_tours,
                         out_dir: str, variants=None,
                         warm_start=None, starter_uec=None) -> list:
     """Score the winning dest spec under each dest family. Returns rows."""
-    from ga_hypothesis_testing import _stage5_dest_only_fitness
+    from ga_hypothesis_testing import _stage5_dest_only_fitness, get_fit_info
     os.makedirs(out_dir, exist_ok=True)
     variants = variants or _shard.s5_dest_variants()
     rows = []
@@ -355,11 +408,24 @@ def run_s5dest_variants(seg: str, dest_genes, dest_cands: list, seg_tours,
                 lu_st_cached, skims, ls_cached, seg_acdc,
                 warm_start=warm_start, custom_uec=None)
             if fit is not None and np.isfinite(float(fit)) and float(fit) > -1e8:
-                rows.append(_row(5, seg, "s5dest", variant, converged=True,
-                                 bic=-float(fit), n=int(genes.sum()),
-                                 note="search fitness -> BIC/n; "
-                                      + ("distance-band NL" if variant == "nl_dist"
-                                         else "sampled MNL")))
+                # Genuine BIC from the fitted ll/k (see run_s5mode_variants).
+                # nl_dist and mnl differ in model form, so the search objective
+                # alone cannot adjudicate between them.
+                _dinfo = get_fit_info("s5dest", seg, "dest") or {}
+                if _dinfo.get("ll") is not None and _dinfo.get("k") is not None:
+                    rows.append(_row(5, seg, "s5dest", variant, converged=True,
+                                     ll=_dinfo["ll"], k=_dinfo["k"],
+                                     n=_dinfo.get("n", int(genes.sum())),
+                                     note=("distance-band NL" if variant == "nl_dist"
+                                           else "sampled MNL")
+                                          + f"; search_obj={float(fit):.6f}"))
+                else:
+                    rows.append(_row(5, seg, "s5dest", variant, converged=True,
+                                     bic=-float(fit), n=int(genes.sum()),
+                                     note="search fitness -> BIC/n; "
+                                          + ("distance-band NL" if variant == "nl_dist"
+                                             else "sampled MNL")
+                                          + " (ll/k unavailable)"))
             else:
                 rows.append(_row(5, seg, "s5dest", variant,
                                  note="family refit failed (see log)"))

@@ -1,0 +1,24 @@
+#!/bin/bash -l
+#PBS -N safety_diag_273
+#PBS -P FPAXJW8067
+#PBS -l walltime=06:00:00
+#PBS -l select=1:ncpus=8:mem=96GB
+#PBS -j oe
+#PBS -m n
+cd $PBS_O_WORKDIR
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+conda activate zigenv
+export PIPELINE_SKIMS_PATH=../demand_/skims_371.omx
+export STAGE5_ZONE_BRIDGE=1
+export STAGE5_STRICT_ZONES=0
+export JAX_PLATFORMS=cpu
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+echo "[$(date)] diag 27333960 starting"
+python -u validate_safety_arms.py \
+  --run-dir runs/safety_baseline__27333960.aqua \
+  --out runs/safety_validation_diag_27333960 \
+  --split random --frac 0.30 --segments work,edu,nonmand \
+  --skims ../demand_/skims_371.omx
+RC=$?
+echo "[$(date)] diag exit=$RC"
+exit $RC

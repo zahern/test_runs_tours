@@ -204,7 +204,7 @@ def publish_validation_figs(search_roots, fig_dir):
     import re as _re
     os.makedirs(fig_dir, exist_ok=True)
     _TRANSFER = _re.compile(r'(mtc_ab|mtc_|exampville_ab|exampville_|/mtc[^/]*|/exampville[^/]*)',
-                            re.IGNORECASE)
+                            _re.IGNORECASE)
     picks = {
         "dest_validation.png": ["**/val_stage5_dest_*.png", "**/shadow_price_validation_*.png",
                                 "**/val_SUMMARY_dashboard.png"],
@@ -309,8 +309,8 @@ def publish_transfer_tables(code_dir, tab_dir):
             written["exampville"] = out
             return written
         f.write("\\begin{table}[h]\n\\centering\n")
-        f.write("\\caption{Exampville three-arm comparison (E0 docs replication vs.\ "
-                "E1 pipeline default vs.\ E2 searched). Source "
+        f.write("\\caption{Exampville three-arm comparison (E0 docs replication vs.\\ "
+                "E1 pipeline default vs.\\ E2 searched). Source "
                 "\\texttt{runs/exampville\\_ab/exampville\\_metrics.json}.}"
                 "\\label{tab:auto_exampville}\n")
         f.write("\\begin{tabular}{l r r r r}\n\\toprule\nArm & Mode LL & Mode $\\rho^2$ & "
@@ -323,7 +323,7 @@ def publish_transfer_tables(code_dir, tab_dir):
         f.write("\\bottomrule\n\\end{tabular}\n\\end{table}\n")
         # stages 0-1 companion
         f.write("\\begin{table}[h]\n\\centering\n")
-        f.write("\\caption{Exampville Stages~0--1 (defaults vs.\ searched).}"
+        f.write("\\caption{Exampville Stages~0--1 (defaults vs.\\ searched).}"
                 "\\label{tab:auto_exampville01}\n")
         f.write("\\begin{tabular}{l r r r r}\n\\toprule\nArm & CDAP LL & CDAP $\\rho^2$ & "
                 "Work-freq MAE & Nonmand-freq MAE \\\\\n\\midrule\n")

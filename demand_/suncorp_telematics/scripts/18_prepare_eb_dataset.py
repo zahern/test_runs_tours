@@ -34,7 +34,13 @@ RES = os.path.join(PROJ, "results")
 ROOT = "/mnt/hpccs01/home/ahernz/test_runs_tours/demand_/suncorp_telematics/data"
 
 ROADS_GEOJSON = os.path.join(DATA, "osm_roads_suncorp.geojson")
-HB_EVENTS = os.path.join(ROOT, "hard_braking_events.csv")
+# Full-period rebuild (scripts/55_rebuild_hb_full.py, raw 2025-01-01..2026-03-31)
+# is preferred when present; the legacy provider file
+# (hard_braking_events.csv) claims EventStart dates out to Dec 2026 although
+# raw trips end 2026-03-31, so it must NOT be used once the rebuild exists.
+_HB_FULL = os.path.join(ROOT, "hard_braking_events_full.csv")
+_HB_LEGACY = os.path.join(ROOT, "hard_braking_events.csv")
+HB_EVENTS = _HB_FULL if os.path.exists(_HB_FULL) else _HB_LEGACY
 SEGMENT_ROADS = os.path.join(DATA, "segment_roads_part0_5000.csv.gz")
 ROAD_META = os.path.join(DATA, "road_meta.csv")
 

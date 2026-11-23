@@ -1,0 +1,1108 @@
+% ======================================================================
+% Preprint-format version of the TRB Annual Meeting paper
+% "Analysis of Hard Braking Events and Crash Counts: Count Regression
+%  involving Metaheuristic Model Search"
+%
+% Reformatted from trb_template.tex (trbunofficial.cls) into the
+% preprint template shipped in Preprint_template__1_.zip
+% (extarticle 8pt + local.sty, Montserrat, superscript numbered
+% references, tables & figures placed in order at first mention).
+%
+% Companion files: local.sty, tab_*.tex / fig_*.tex (tables & figures placed
+% in order at first mention in the body with \FloatBarrier after each block).
+% NOTE: back_tables.tex / back_figures.tex are retired and no longer \input.
+% Compile: pdflatex -> bibtex -> pdflatex x2
+% ======================================================================
+
+\documentclass[letterpaper,8pt]{extarticle}  % "extarticle" gives more global font size options. use 8pt with Montserrat
+\usepackage{import}
+\usepackage{local}
+\usepackage{placeins}
+\usepackage[left=.65in,top=.65in,bottom=.65in,right=.65in]{geometry}
+\usepackage{amssymb} % \checkmark used in the candidate-variable table
+
+% Long script and table names in \texttt cannot hyphenate, so a single name can
+% overflow the measure; \file{} adds a break opportunity after every escaped
+% underscore so a long name may wrap without changing how it is printed.
+\newcommand{\file}[1]{{\ttfamily\def\_{\textunderscore\allowbreak}#1}}
+
+% Last-resort fallback: TeX consults \emergencystretch only on the final pass,
+% when no break sequence in a paragraph satisfies \tolerance. The slack it
+% supplies is absorbed at the end of the line (through \rightskip) rather than
+% by widening word spaces, so an affected line ends a little short of the
+% measure instead of running into the margin. Paragraphs that break normally
+% are untouched.
+\setlength{\emergencystretch}{3em}
+
+% Compatibility shim: local.sty loads xcolor with the "table" option, which
+% pulls in colortbl >= v1.0l. That version typesets p/m columns through
+% \insert@pcolumn, an internal that only exists in newer LaTeX kernels /
+% array v2.6. On older installations (e.g. MiKTeX 24.1 + array v2.5g) the
+% macro is undefined and every p{}-column tabular fails. Alias it to the
+% classic \insert@column; \providecommand makes this a no-op once the TeX
+% installation is updated.
+\makeatletter
+\providecommand{\insert@pcolumn}{\insert@column}
+\makeatother
+
+% The preprint template sets \setcounter{secnumdepth}{0} (unnumbered
+% headings). This paper cross-references sections extensively
+% (\S\ref{sec:...}, \cref{sec:...}), so section numbering is re-enabled.
+\setcounter{secnumdepth}{3}
+
+\title{Analysis of Hard Braking Events and Crash Counts:  Count Regression involving Metaheuristic Model Search}
+
+\author{%
+\textbf{Zeke Ahern \orcidlink{0000-0001-2345-6789}\textcolor{Accent}{\textsuperscript{1}}} %
+\textbf{Amalan Mahandren\textcolor{Accent}{\textsuperscript{1}}} %
+\textbf{Alexander Paz\textcolor{Accent}{\textsuperscript{1,*}}}\\
+\begin{small}\textcolor{Accent}{\textsuperscript{1}}School of Civil and Environmental Engineering, Queensland University of Technology, Brisbane, QLD, Australia \\
+\textcolor{Accent}{\textsuperscript{*}}Correspondence: \textcolor{Accent}{z.ahern@qut.edu.au} \\ \end{small}
+}
+
+\date{}
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Abstract
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section*{Abstract}
+
+\begin{doublespacing}
+\begin{linenumbers}
+
+\noindent This study examines whether telematics-derived hard-braking events---safety-critical near misses that occur at roughly an order of magnitude higher frequency than crashes---can serve as leading indicators of crash frequency at the road-segment level, and quantifies the marginal contribution of such near-miss data beyond what road geometry alone explains. A network-wide dataset of 10{,}780 road segments in South East Queensland, aggregated from 46{,}307 sub-segment geometries and combining 30 road-geometry and traffic variables with 2.5 million severity-stratified hard-braking events (Candidate, Critical-Likely, and Extreme), is analysed with Negative Binomial count regression models estimated by maximum likelihood under a sequential four-stage decomposition of a bilevel combinatorial optimisation program: single-run genetic-algorithm (GA) variable selection; a single-start search over parameter roles (fixed, random-independent, and random-correlated); bivariate Negative Binomial copula estimation (stabilised inference-functions-for-margins on fully-significant margins, with a joint-maximum-likelihood refresh queued); and a severity-category multivariate analysis. The models are embedded in a battery of proxy-validity diagnostics comprising coefficient proportionality, specification transfer, a Davidson--MacKinnon encompassing test, bivariate residual correlation, random-parameter heterogeneity tests, and leave-one-region spatial transferability. Hard-braking counts are found to carry crash-relevant information beyond geometry (encompassing LR $=148.9$, $p<0.001$; $\Delta$BIC $\approx -140$), and severity-stratified counts exhibit decisive dependence with crashes at the category level; however, the two responses do not share a common structural form---feature overlap is low (Jaccard $=0.27$), coefficient proportionality is moderate ($r=0.69$), specification-transfer penalties are large, while aggregate copula dependence is affirmed under the validated rectangle (Gaussian--Joe mixture $\Delta=-11{,}753$; joint MLE converges for all families; identity gap $0.0$). Both responses display strong unobserved heterogeneity, favouring random-parameter specifications. An exposure-normalised hour-by-weekday risk index constructed from the timestamped events is threshold-robust (Spearman $\rho=0.98$ against an independent deceleration threshold), and because the hard-braking signal transfers across regions (9 of 11 LGAs, the proxy's $\Delta$LL gain in the crash model), it supports a transferability-gated time-based intervention schedule that concentrates the top decile of network-time cells. The collective evidence supports hard-braking telematics as a complementary screening layer that augments, rather than replaces, calibrated crash-frequency models.
+
+
+% ---------- Introduction ----------
+\section{Introduction}\label{sec:intro}
+
+Road trauma remains a critical public health issue in Australia. In the 2018--2019 period alone, 39{,}755 individuals were hospitalised, of whom 10{,}282 sustained life-threatening injuries \citep{BITRE2019}. By 2025, Australian road deaths had reached 1{,}337---the highest in 12 years---placing the national target of zero fatalities by 2030 under significant pressure. Traditional road safety analysis is based on models built from historical crash records to identify high-risk locations \cite{Miaou1993ModelingRelationships}. However, crash data suffer from several limitations, including but not limited to under-reporting, small sample sizes at individual sites, missing data, transferability, and the inherently reactive approach of using crash occurrence to reduce frequency and severity \cite{Lord2010TheAlternatives}. The majority of safety interventions remain reactive, triggered only after crash data has been collected. A proactive---rather than reactive---paradigm for identifying high-risk locations and dangerous driving behaviour before incidents occur is therefore a critical but underexplored challenge.\par
+
+The proliferation of connected vehicle technology and telematics-based insurance programs has generated unprecedented volumes of continuous driving behaviour data \cite{Ayuso2019TelematicsWomens}. Among the most promising metrics are hard braking events, safety-critical situations where a driver executes an evasive maneuver (large decelerations or sharp steering) to avoid a potential collision or an obstacle. These events occur at frequencies 10--15 times higher than actual crashes and may provide leading indicators of underlying safety risk \cite{Arumi2024CanEvents}. In a companion Australian study analysing connected vehicle telemetry from over 700{,}000 vehicles across New South Wales, \citet{Mihaita2026Proactive} benchmarked eight predictive models---spanning ensemble learning (Random Forests, XGBoost, LightGBM), deep learning (LSTM, N-BEATS), and classical time-series methods (ARIMA, Exponential Smoothing, Prophet)---for forecasting near-miss risky driving events at the Local Government Area level, identifying Sydney's inner and western LGAs as persistent high-risk zones. A further study by \citet{Grigorev2025Spatial} established a statistically significant spatial association between connected-vehicle near-miss clusters and official crash blackspots using Getis--Ord $G_i^{\ast}$ and Bivariate Local Moran's $I$ analysis, confirming that g-force proxies capture genuine crash-precursor risk rather than merely reflecting traffic volume. \citet{Park2023Heinrich} push the same logic onto Heinrich's law itself: using a network cross $K$-function on a Seoul street network, they show that near-miss and police-reported crash patterns share statistically significant spatial association, so the safety pyramid's frequency ratio can be read as a claim about shared locational risk factors rather than about counts alone.
+
+The safety pyramid hypothesis for road crashes posits that near-misses, conflicts, and crashes exist on a continuum of severity, with near-misses and hard braking events providing early warning of conditions that may lead to crashes \cite{Hyden1987TheTechnique}. Empirical validation of this relationship using large-scale telematics data at the road-segment level remains limited, particularly when controlling for established crash predictors such as traffic volume and road geometry.
+
+
+
+% ---------- Literature Review ----------
+\section{Literature Review}\label{sec:litreview}
+\subsection{Background}
+
+The pyramid posits a continuum: for every fatal or serious-injury crash there exist numerous minor
+crashes, property-damage-only incidents, and a much larger base of near-miss and hard braking
+events. Safety-relevant events where an evasive manner is likely to avert a
+collision. Under this framework, near-misses or hard braking events are not merely correlated with
+crashes but are likely causally antecedents. That is, the same latent underlying conditions (e.g., road
+geometry, traffic flow dynamics, driver behaviour) that generate near-misses, or hard braking, may
+also produce some of the crashes, but with a higher frequency that makes them statistically
+tractable at finer spatial and temporal resolutions. In addition, hard braking events may reveal problematic locations and issues before crashes occur thereby enabling preventive approaches. 
+
+Empirical validation of the pyramid at the road-segment level has accelerated
+with the availability of large-scale telematics data. \citet{Xu2024EstimatingStudy}
+analysed 59,277 near-miss events in New York City using grid-based Empirical
+Bayes methods and found that near-miss frequency had the strongest correlation
+with observed crash frequency among all studied variables, with an estimated
+near-miss-to-crash ratio of approximately 1,957:1, providing a potentially
+useful benchmark for urban safety estimation. \citet{Amoadu2024PrevalenceGhana} studied
+7,315 long-distance bus drivers in Ghana and reported that 96.9\% had
+experienced at least one near-miss in the preceding two years, compared to
+53.7\% who had experienced a crash, confirming that near-misses are an order
+of magnitude more frequent and therefore provide richer data for statistical
+analysis. \citet{Jomnonkwao2023ContributingApproach} examined motorcycle near-misses in Thailand
+using a random parameter probit model and found that 1,547 of 2,002
+respondents (77.2\%) had experienced near-misses. The study revealed that road surface type,
+night driving, and lane marking clarity were significant predictors which are characteristics
+that overlap substantially with established crash risk factors.
+
+%\subsection{Telematics Data and Near-Miss Detection}
+
+The proliferation of in-vehicle telematics and connected vehicle technology
+has transformed near-miss and hard braking detection from a labour-intensive observational
+task to a passive, continuous, population-scale data stream.
+\citet{Boylan2024ABehaviours} conducted a systematic review of 45 studies using
+in-vehicle telematics and found that acceleration, braking, and speed were
+the three most common variables used to characterise driving behaviour. In addition, machine learning has been the dominant analytical approach in insurance-focused applications. Their review recommended multi-level models to account for the hierarchical structure of telematics data (trips nested within drivers),
+a recommendation that carries over to segment-level aggregation where
+individual near-miss events are nested within road segments.
+
+\citet{Nie2025VehicleAnalysis} proposed a fundamentally different approach to extracting
+safety signals from telematics. Their method quantifies the ``roughness'', determined by the fractal dimension differences between road segments have a statistically significant effect on crash rates and
+reduce the false alarm rate from 52--94\% (other surrogates) to 46\% while
+maintaining 95\% recall. This illustrates that the \emph{how} of near-miss
+measurement, -not merely the whether, critically determines its
+effectiveness as a crash proxy. \citet{Ayuso2019TelematicsWomens} and \citet{Guo2010NearStudies}
+established the foundational link between telematics-detected events and
+crash risk at the driver level, showing that near-crash events occur at 10-15 times  more likely than crash frequency and that hard braking events derived from smartphone telematics are associated with
+increased claim frequency \citep{Arumi2024CanEvents}.
+
+\subsection{Analysing Safety using Hard Braking Data }
+
+
+\subsection{Hard Braking Event Construction and Mathematical Definition}
+\label{sec:hb-construction}
+A single deceleration threshold should not be treated as proof that an event was safety critical. Acceleration-only triggers have produced substantial false-detection problems in naturalistic-driving research, while jerk-based methods better distinguish abrupt evasive braking from planned firm braking  \citep{Dingus2006TheExperiment,McLaughlin2008AData, Bagdadi2013AssessingStudies}. The most directly validated telematics-only discriminator is peak-to-peak longitudinal jerk. Using a 1.0 g/s threshold, \citet{Bagdadi2013AssessingStudies} detected 86.0\% of 637 braking-related near-crashes, compared with 54.2\% using a 0.6 g peak-deceleration threshold. Accordingly, the recommended classification combines peak deceleration, peak-to-peak jerk, speed loss, duration and signal quality.
+For sensitive fleet or network screening, thresholds around 0.20 g for heavy commercial vehicles and approximately 0.27 g for connected passenger/light-vehicle observations are supported by published telematics studies \citep{Desai2020CorrelatingIndiana,Hossain2026EvaluatingTelematics}. These values identify hard-braking candidates; they do not establish that an individual event was a near-crash. \cite{Liu2023Smartphone-basedServices} also cite naturalistic-driving evidence indicating that approximately 0.50 g is an effective high-g threshold for predicting driver crash risk.
+
+
+
+
+\subsubsection*{Event Segmentation}
+
+A braking episode $e$ was defined as a continuous time interval satisfying:
+
+\begin{equation}
+\tilde{a}(t) \leq -a_{\text{th}},
+\end{equation}
+
+where $a_{\text{th}} = 0.20g$ for heavy vehicles and $0.27g$ for light vehicles \citep{Desai2020CorrelatingIndiana}. An episode began when the threshold was crossed and ended when acceleration returned near baseline ($>-0.05g$). Brief sub-threshold gaps were merged to prevent multiple counts from a single manoeuvre.
+
+\subsubsection*{Speed-Loss Condition}
+
+To satisfy the data-quality gate \citep{Liu2023Smartphone-basedServices}, events were retained only if accompanied by verified speed reduction. Let $v(t)$ denote vehicle speed. Speed loss for episode $e$ was defined as:
+
+\begin{equation}
+\Delta v^{(e)} = v(t_{\text{start}}) - \min_{t \in e} v(t).
+\end{equation}
+
+Episodes with $\Delta v^{(e)} \leq 0$ were discarded.
+
+\subsubsection*{Severity Classification}
+
+Each episode was classified according to peak deceleration
+\[
+A^{(e)} = \max_{t \in e} |\tilde{a}(t)|
+\]
+
+
+Events were categorised as:
+
+\begin{itemize}
+    \item \textbf{Hard Braking Candidate:} 
+    $A^{(e)} \geq 0.20g$ (heavy) or $0.27g$ (light).
+
+    \item \textbf{Critical-Likely Hard Braking:} 
+    $A^{(e)} \geq 0.50g$; or
+    ($A^{(e)} \geq 0.27g$ and $J^{(e)}_{\text{ptp}} \geq 1.0g/s$); or
+    for heavy vehicles,
+    $A^{(e)} \geq 0.20g$, $J^{(e)}_{\text{ptp}} \geq 1.2g/s$,
+    and $\Delta v^{(e)} \geq 15$ km/h within 2 s.
+
+    \item \textbf{Extreme (priority flag):}
+    $A^{(e)} \geq 0.75g$ or
+    $A^{(e)} \geq 0.60g$ and $J^{(e)}_{\text{ptp}} \geq 1.5g/s$.
+\end{itemize}
+
+These thresholds synthesise validation evidence from naturalistic-driving and connected-vehicle telematics studies \citep{Bagdadi2013AssessingStudies,Desai2020CorrelatingIndiana,Liu2023Smartphone-basedServices,Hossain2026EvaluatingTelematics}.
+
+\subsubsection*{Segment-Level Aggregation}
+
+Let $N_i^{(c)}$ denote the number of events of category $c$ occurring on segment $i$ during the observation window. The primary near-miss exposure variable was the count of critical-likely events:
+
+\begin{equation}
+y^{\text{NM}}_i = N_i^{(\text{critical})}.
+\end{equation}
+
+Per-kilometre rates were computed as:
+
+\begin{equation}
+\text{NM rate}_i = \frac{N_i^{(c)}}{L_i},
+\end{equation}
+
+where $L_i$ is segment length.
+
+
+
+Analysing safety using hard braking counts requires statistical models
+capable of capturing their relationship with crashes as well as handling overdispersion relative to the Poisson distribution.  The most direct approach treats hard braking counts as additional predictors in a crash frequency model \citep{Miaou1993ModelingRelationships}. The  Negative Binomial
+(NB) is the commonly adopted model form because it effectively captures crash frequency while accounting for pervasive overdispersion \citep{Lord2010TheAlternatives}. When hard braking covariates are
+added, their coefficient quantifies the marginal safety contribution beyond what road geometry alone explains. However, this approach treats hard braking as exogenous predictors, ignoring
+the possibility that both crashes and  hard braking are jointly determined by
+shared latent risk factors. 
+
+When both hard braking and crashes are modelled as response variables, their residual dependence
+after controlling for observed covariates can be captured with copulas. Copula-based crash-count
+models now form a substantial sub-literature. \citet{Yasmin2018AModel} developed a multivariate
+copula model of macro-level crash counts linking car, light-truck, van, and non-motorist counts at
+the traffic-analysis-zone level. \citet{Mothafer2018ATypes} used a composite-marginal-likelihood
+copula approach to capture asymmetric interdependence and heterogeneous dispersion across four
+freeway crash types, avoiding the simulated-maximum-likelihood burden of a full multivariate
+density. \citet{Park2021BayesianCopulas} embedded copula-linked random effects in a Bayesian
+multivariate count framework for crash counts by severity, showing that copulas encompass earlier
+multivariate Poisson-gamma and Poisson-lognormal mixtures as special cases.
+\citet{Bhowmik2021ExploringModeling} extended the closed-form copula approach with random
+parameters, finding that the resulting hybrid outperformed a purely simulation-based multivariate
+alternative for zonal crash counts by type. \citet{Yang2021Copula-basedMargins} developed a
+multivariate Gaussian copula framework for jointly modelling crash counts and three longitudinal
+conflict risk measures from connected vehicle data in Ann Arbor, Michigan. Their approach achieved
+better in-sample crash prediction than classical univariate models and connected directly to the
+potential for safety improvement metric used in high-risk location ranking.
+\citet{Ahmad2023Copula-basedVehicles} compared univariate NB models with traditional bivariate and
+copula-based bivariate NB models for jointly estimating fatal-plus-injury and property-damage-only
+crash frequencies, finding that copula-based bivariate models consistently outperformed univariate
+models and that the normal copula gave the best fit. Most recently, \citet{Lian2025InfluenceProcess}
+applied a Gaussian copula time-series count model to long-term fatal-crash trends.
+\citet{Song2026JointApproach} used a recursive copula structure to jointly model collision type and
+driver injury severity in truck-involved crashes, underscoring that copula-based dependence
+modelling has become state-of-the-art for jointly estimated, correlated crash outcomes.
+%\citet{CaldronOjeda2019} introduced the multivariate
+%NB-Lindley distribution, providing a tractable alternative to copula-based
+%approaches with an EM algorithm for parameter estimation suitable for
+%overdispersed multivariate count data.
+
+
+\subsection{Segment-Level Near-Miss Proxy Validation}
+
+Despite these advances, a critical gap remains. Driver-level studies
+\citep{Guo2010NearStudies,Arumi2024CanEvents,Ayuso2019TelematicsWomens} illustrate that telematics-detected events predict individual crash risk. Conflict-based studies
+\citep{Zheng2019ValidatingIndicators, Yang2021Copula-basedMargins} validate traffic conflict indicators against crash data at intersections and corridors. Urban-scale studies
+\citep{Xu2024EstimatingStudy} established aggregate near-miss crash correlations. However, no
+study has systematically tested whether hard braking counts can serve as
+\emph{valid proxy variables} for crash frequency at the road-segment level
+under rigorous econometric criteria of surrogate endpoint validation
+\citep{Prentice1989SurrogateCriteria}. Namely, (i) determining hard braking, geometry relationship
+share the same structural form as the likely crash contributing factors and their relationship;  (ii)
+hard braking encompass the predictive content of geometry for crashes; and (iii)
+determining residual dependence between hard braking and crashes after
+conditioning on all observed covariates. This study addresses each
+of these questions using a proxy variable analysis framework
+which is tested using 10,780 road segments from South East Queensland.
+
+% ---------- Data ----------
+\section{Data}\label{sec:data}
+
+\subsection{Data Sources and Integration}
+
+The dataset included 10,780 road segments (aggregated from 46,307 sub-segment geometries) from South East Queensland, Australia. Each segment contained four categories of variables:
+
+\begin{itemize}
+    \item \textbf{Road Geometry}: 30 candidate variables including but not limited to speed limit, number of lanes, curvature indicators (with straight as reference, moderate, sharp, very sharp), intersection presence/conflict, median presence/barrier, delineation posts, posted speed distributions, speed differential distributions, and roadside severity classifications (pole and ditch proximity categories).
+    \item \textbf{Traffic}: traffic volume (AADT), and interaction volume categories (very low through 100+ vehicles/day).
+    \item \textbf{Hard Braking Telematics}: 2,504,777 individual hard braking events detected in the vendor telematics extracts over calendar-year 2026 (an intensive March 2026 collection window contributed $\approx$1.65 million events, with a steady baseline of roughly 34,000 events per month across the remaining months), classified into three severity tiers---Candidate ($\geq 0.20g$ heavy vehicles / $0.27g$ light vehicles; $N=1{,}410{,}988$ segment-assigned events), Critical-Likely ($\geq 0.50g$ or meeting combined deceleration-jerk-speed-loss thresholds; $N=4{,}560$), and Extreme ($\geq 0.75g$ or $\geq 0.60g$ with peak-to-peak jerk $\geq 1.5g/s$; $N=384$)---geospatially snapped to the nearest road segment and aggregated by segment ID ($1{,}415{,}932$ assigned events in total across the $10{,}780$ segments).
+    \item \textbf{Crash Data}: Observed crash counts per segment (5-year average) and reference crash-count predictions from models calibrated by the Queensland Department of Transport and Main Roads (TMR).
+\end{itemize}
+
+Table~\ref{tab:segstats} presents descriptive statistics for the analysis sample.
+
+\input{tab_segstats.tex}
+
+\FloatBarrier
+
+
+% ---------- Methodology ----------
+\section{Methodology}\label{sec:methodology}
+
+Table~\ref{tab:notation} collects the notation used throughout the methodology and results: index sets, responses, model parameters, and the decision variables of the optimisation program of \S\ref{sec:mathprogram}.
+
+\begin{table}[!ht]
+  \footnotesize
+  \caption{Notation used throughout the paper.}\label{tab:notation}
+  \begin{center}
+    \begin{tabular}{lp{0.78\linewidth}}
+      \toprule
+      Symbol & Meaning \\
+      \midrule
+      \multicolumn{2}{l}{\emph{Indices and sets}} \\
+      $i \in \mathcal{I}$ & Road segments ($N = 10{,}780$, aggregated from 46{,}307 sub-segment geometries) \\
+      $m \in \mathcal{M}$ & Response index ($M = 2$: $m{=}1$ hard braking, $m{=}2$ crashes) \\
+      $k \in \mathcal{K}$ & Hard-braking severity category (Candidate, Critical-Likely, Extreme) \\
+      $j \in \mathcal{J}$ & Candidate road-geometry/traffic variable ($J = 30$) \\
+      \multicolumn{2}{l}{\emph{Data and responses}} \\
+      $y_i^{(m)}$ & Observed count of response $m$ on segment $i$ ($y_i^{\text{HB}}$, $y_i^{\text{Cr}}$) \\
+      $y_{ik}^{\text{HB}}$ & Hard-braking count of severity category $k$ on segment $i$; $\sum_k y_{ik}^{\text{HB}} = y_i^{\text{HB}}$ \\
+      $x_{ij}$ & Standardised value of variable $j$ on segment $i$ \\
+      $L_i$ & Segment length (km); $\log L_i$ enters as model offset \\
+      \multicolumn{2}{l}{\emph{Count model}} \\
+      $\lambda_i^{(m)}$ & Negative Binomial mean; $\log \lambda_i^{(m)} = \eta_i^{(m)} + \log L_i$ \\
+      $\alpha^{(m)}$ & NB overdispersion; $\mathrm{Var}(y_i) = \lambda_i + \alpha \lambda_i^2$ \\
+      $\eta_i^{(m)}$ & Linear predictor \\
+      \multicolumn{2}{l}{\emph{Structure-search decision variables (\S\ref{sec:mathprogram})}} \\
+      $z_j^{(m)} \in \{0,1\}$ & Inclusion indicator of variable $j$ in response $m$'s model \\
+      $r_j^{(m)} \in \mathcal{R}$ & Parameter role: 0 excluded, 1 fixed, 2 random-independent, 3 random-correlated (4--8 latent-class / zero-inflation roles, unstudied) \\
+      $d_j^{(m)} \in \mathcal{D}$ & Mixing distribution for random coefficients (normal, lognormal, triangular, uniform) \\
+      $\pi^{(m)}(j')$ & Heterogeneity-in-means mapping: variable $j'$ shifts the mean of random parameter $\pi^{(m)}(j')$ \\
+      $\mathcal{A}$ & Analyst constraint set $(Z^{+}, Z^{-}, \bar{\mathcal{R}}, \bar{\mathcal{D}})$: mandatory/excluded variables, permitted roles and mixing distributions (Eq.~\eqref{eq:analyst-constraints}) \\
+      \multicolumn{2}{l}{\emph{Random parameters}} \\
+      $\beta_j^{(m)}$ & Fixed-effect coefficient \\
+      $\beta_{j,i}^{(m)}$ & Segment-specific (random) coefficient $= \mu_j^{(m)} + \sum_{j'} \gamma_{j'}^{(m)} w_{i,j'} + \sigma_j^{(m)} \epsilon_{ij}(d_j^{(m)})$ \\
+      $\mu_j^{(m)}, \sigma_j^{(m)}$ & Mean and standard deviation of a random coefficient \\
+      $\epsilon_{ij}(d_j^{(m)})$ & Zero-mean draw from mixing distribution $d_j^{(m)}$ \\
+      \multicolumn{2}{l}{\emph{Copula coupling}} \\
+      $\psi$ & Copula family (Frank, Gaussian, Kimeldorf--Sampson) \\
+      $\theta$ & Copula dependence parameter; $C_\theta(u,v)$ copula CDF, $F_m(\cdot)$ NB marginal CDF \\
+      \multicolumn{2}{l}{\emph{Diagnostics and screening}} \\
+      $k$, $R^2_{\text{prop}}$ & Coefficient proportionality factor and proportionality fit (\S\ref{sec:coef-prop-note}) \\
+      TI & Koppelman--Wilmot transferability index (leave-one-LGA-out) \\
+      $EB_i$, $w_i$ & Empirical-Bayes posterior mean and shrinkage weight (\S\ref{sec:eb}) \\
+      $r_{dh}$ & Exposure-normalised hour $\times$ weekday hard-braking risk index (\S\ref{sec:time-model}) \\
+      \bottomrule
+    \end{tabular}
+  \end{center}
+\end{table}
+\FloatBarrier
+\subsection{Count Regression Framework}
+
+Let $y_i$ denote the observed crash count on segment $i$ with a Negative Binomial regression model is specified as:
+
+\begin{align}
+    y_i &\sim \text{NB}(\lambda_i, \alpha), \label{eq:nbmodel}\\
+    \log(\lambda_i) &= \beta_0 + \sum_{k=1}^{K} \beta_k x_{ik} + \log(L_i), \label{eq:nblinpred}
+\end{align}
+
+where $x_{ik}$ are standardized likely contributing factors, $\beta_k$ are their coefficients, $\log(L_i)$ is the log-segment-length offset, and $\alpha$ is the overdispersion parameter such that $\text{Var}(y_i) = \lambda_i + \alpha\lambda_i^2$.
+
+\subsection{Model Comparison Strategy}\label{sec:model-comparison}
+
+A series of optimisation-driven specifications were compared to isolate the marginal contribution of telematics-derived hard braking events to crash frequencies. A hard-braking-only model and a crash-count-only baseline (30 geometry variables, with straight alignment as the omitted reference curvature category) first establish each variable group's stand-alone predictive power. A combined model coupling both hard braking and crash count was then compared against it via a likelihood-ratio test (df$=6$) to assess whether hard braking data adds marginal predictive power beyond traffic and geometry characteristics. Alternative functional forms for traffic exposure---linear AADT, log-transformed AADT, and an AADT$\times$speed interaction---were also compared. 
+
+\subsection{Parsimonious Model Discovery}\label{sec:de-method}
+
+A significance-penalised Genetic Algorithm (GA) search---implemented as differential evolution over a binary inclusion mask---was used to generate alternative models, test the corresponding hypotheses, and identify parsimonious specifications while penalising insignificant predictors. Constraints were included to enable the consideration of model characteristics based on knowledge, experience, and specific data and problem context. Each of the 30 candidate geometry features was encoded as one continuous gene in $[0,1]$; a gene $>0.5$ includes that feature. A single population (size 15 per candidate gene) was evolved for up to 60 generations per response as one continuous run with no restarts (mutation $\in [0.4, 1.4]$, recombination $=0.7$, no polishing step, full budget always run with early-stopping disabled), seeded independently for each response (seed 42 for hard braking, 43 for crashes) for reproducibility. The single-run design is deliberate: the reported convergence trace is one uninterrupted GA trajectory, not several restarted chains stitched together, so plateau behaviour can be read as convergence of that run. Each candidate mask is evaluated by fitting an NB model and computing a \textit{penalised} BIC:
+
+\begin{equation}
+\text{BIC}^* = \text{BIC} + \lambda \cdot \sum_{j=1}^{K} \mathbf{1}\{p_j > \alpha\},\label{eq:penbic}
+\end{equation}
+
+where $\lambda = 10$ is the penalty per coefficient and $\alpha = 0.10$ is the significance threshold. This drives the GA search toward models where every component is statistically meaningful and/or included based on constraints set by the analyst. GA convergence is reported as best-so-far penalised BIC per generation together with the per-generation population spread, so both improvement and loss of diversity are visible; a flat best trace accompanied by a collapsed spread indicates genuine convergence rather than an exhausted restart budget. 
+
+\subsection{Problem Statement}\label{sec:mathprogram}
+
+The feature- and role-selection procedures described in this and the following section are a restricted case of a single, more general bilevel combinatorial optimisation problem. This section formalises the full mathematical program that the \texttt{metacount\allowbreak regressor} package solves heuristically, spanning variable inclusion, parameter roles, mixing distributions, copula-based multi-response coupling, and hard braking severity category decomposition. The full problem is presented below; the practical solution approach decomposes it into tractable subproblems via a single-run genetic algorithm (differential evolution), a single-start structure search, and a column-generation--inspired decomposition (no multi-restart chains).
+
+\subsubsection*{Parameter-Role Coding Scheme}
+
+Let $\mathcal{J} = \{1,\dots,J\}$ index the $J=30$ candidate geometry variables and $\mathcal{I}=\{1,\dots,N\}$ index the $N=10{,}780$ road segments (aggregated from 46,307 sub-segment geometries). Let $\mathcal{M} = \{1,\dots,M\}$ index the $M=2$ response variables ($m=1$: hard braking counts $y_i^{\text{HB}}$; $m=2$: observed crash counts $y_i^{\text{Cr}}$). Let $\mathcal{K} = \{1,\dots,K\}$ index $K=3$ hard braking severity categories (Candidate, Critical-Likely, Extreme), where $y_{ik}^{\text{HB}}$ denotes the count of severity category $k$ events on segment $i$, and $y_i^{\text{HB}} = \sum_{k \in \mathcal{K}} y_{ik}^{\text{HB}}$.
+
+For each response $m$, let $z_j^{(m)} \in \{0,1\}$ indicate whether variable $j$ enters the model for response $m$, and let $r_j^{(m)} \in \mathcal{R}$ denote its parameter role, where the full role space is
+\begin{equation}
+  \mathcal{R} = \{0,\,1,\,2,\,3,\,4,\,5,\,6,\,7,\,8\},
+\end{equation}
+with $0=\text{excluded}$, $1=\text{fixed}$, $2=\text{random-independent}$, $3=\text{random-correlated}$, $4=\text{grouped random}$, $5=\text{heterogeneity-in-means}$, $6=\text{zero-inflation (logit)}$, $7=\text{latent-class membership}$, $8=\text{latent-class--specific fixed}$. For variables assigned a random coefficient ($r_j^{(m)} \in \{2,3,4\}$), let $d_j^{(m)} \in \mathcal{D} = \{\text{normal}, \text{lognormal}, \text{triangular}, \text{uniform}\}$ denote the mixing distribution. Heterogeneity-in-means variables ($r_j^{(m)} = 5$) carry no distribution but shift the mean of another random parameter, formalised through a mapping $\pi^{(m)}(j')$ from each heterogeneity variable $j'$ to the random-parameter variable $\pi^{(m)}(j')$ whose mean it explains. Latent-class membership variables ($r_j^{(m)} \in \{7,8\}$) enter through a multinomial logit sub-model with class-specific coefficient vectors; zero-inflation variables ($r_j^{(m)} = 6$) enter a separate binary logit for the crash-free state probability. The {\em studied} role subspace in this paper restricts $r_j^{(m)} \in \{0,1,2,3\}$, leaving $\{4,\dots,8\}$ to future work (\S\ref{sec:discussion}).
+
+\subsubsection*{Single-Response Predictor Structure}
+
+Under a configuration $(z^{(m)}, r^{(m)}, d^{(m)}, \pi^{(m)})$ for response $m$, the linear predictor for segment $i$ is
+\begin{align}
+  \eta_{i}^{(m)} &= \sum_{j \in \mathcal{J}} z_j^{(m)} \Bigl[
+    \mathbf{1}\{r_j^{(m)} = 1\}\,\beta_j^{(m)}
+    + \mathbf{1}\{r_j^{(m)} \in \{2,3,4\}\}\,\beta_{j,i}^{(m)}
+  \Bigr] x_{ij}, \label{eq:mathprogram-eta-v2}\\[4pt]
+  \beta_{j,i}^{(m)} &= \mu_{j}^{(m)} + \!\!\sum_{j':\,\pi^{(m)}(j')=j}\!\! \gamma_{j'}^{(m)} w_{i,j'} \;+\; \sigma_{j}^{(m)}\,\epsilon_{ij}\bigl(d_j^{(m)}\bigr), \label{eq:mathprogram-beta-v2}
+\end{align}
+where $\mu_{j}^{(m)}$ is the mean coefficient across segments, the summation over $\pi^{(m)}(j')=j$ is the heterogeneity-in-means shift, while $\sigma_{j}^{(m)}\,\epsilon_{ij}(d_j^{(m)})$ is a zero-mean draw from distribution $d_j^{(m)}$, and $x_{ij}$ are standardised covariates. The count-generating model is Negative Binomial:
+\begin{equation}
+  y_i^{(m)} \sim \text{NB}\bigl(\lambda_i^{(m)}, \alpha^{(m)}\bigr),\qquad
+  \log\lambda_i^{(m)} = \eta_i^{(m)} + \log(L_i),
+\end{equation}
+with overdispersion $\alpha^{(m)}$ and segment-length offset $\log(L_i)$.
+
+\subsubsection*{Bivariate Copula Coupling}
+
+Dependence between the two responses, after conditioning on covariates, is parameterised through a copula function $C_\theta: [0,1]^2 \to [0,1]$ with dependence parameter $\theta$:
+\begin{align}
+  P\bigl(Y_i^{\text{HB}} = y_1,\, Y_i^{\text{Cr}} = y_2 \mid \mathbf{X}_i\bigr)
+    &= C_\theta\bigl(F_1(y_1), F_2(y_2)\bigr)
+     - C_\theta\bigl(F_1(y_1-1), F_2(y_2)\bigr) \nonumber\\
+    &\quad - C_\theta\bigl(F_1(y_1), F_2(y_2-1)\bigr)
+     + C_\theta\bigl(F_1(y_1-1), F_2(y_2-1)\bigr), \label{eq:mathprogram-copula-rect}
+\end{align}
+where $F_1(\cdot)$ and $F_2(\cdot)$ are the NB marginal CDFs. Three copula families are considered: Frank, Gaussian, and Kimeldorf--Sampson (Clayton), each parameterised by a scalar $\theta$. Independence is the special case $C(u,v; 0) = uv$, nested within each family.
+
+\subsubsection*{Hierarchical Hard Braking Category Decomposition}
+
+For severity-level analysis, the HB total can be disaggregated into category counts that follow a hierarchical compound structure. Let $y_i^{\text{HB}} = \sum_{k \in \mathcal{K}} y_{ik}$ where $y_{ik} \sim \text{NB}(\lambda_{ik}, \alpha_k)$. The multivariate category--crash system then admits a vine- or nested-copula representation:
+\begin{align}
+  &F\bigl(y_{i1},\dots,y_{iK}, y_i^{\text{Cr}} \mid \mathbf{X}_i\bigr) \nonumber\\
+  &\quad = C_{\theta_0}\Bigl(
+       C_{\theta_1}\bigl(F_{11}(y_{i1}),\dots,F_{1K}(y_{iK})\bigr),\;
+       F_2(y_i^{\text{Cr}})
+     \Bigr),
+\end{align}
+where $C_{\theta_1}$ couples the $K$ HB severity categories through an inner copula and $C_{\theta_0}$ couples the aggregated HB risk to crash frequency through an outer copula. This structure respects the natural hierarchy: severity categories nest within the HB construct, which in turn is linked to crashes.
+
+\subsubsection*{Complete Bilevel Mathematical Program}
+
+The feature-, role-, and distribution-selection procedures described in the preceding subsections form a bilevel combinatorial optimisation problem. The \emph{outer} (upper-level) problem searches over discrete specification choices---which variables to include, what parameter roles to assign, and which mixing distributions to use. The \emph{inner} (lower-level) problem solves for the continuous model parameters by maximum likelihood conditional on a fixed specification. This separation is structural: the outer decision variables are combinatorial and finite, while the inner problem is a smooth, gradient-based continuous optimisation. Let $\boldsymbol\Theta = (\boldsymbol\theta^{(1)}, \boldsymbol\theta^{(2)}, \theta)$ collect all marginal parameters for both responses and the copula dependence parameter; $\boldsymbol\Theta^\star$ denotes the joint maximum-likelihood estimates conditional on a given specification.
+
+\paragraph{Outer problem (combinatorial).}
+The outer-level decision variables are:
+\begin{itemize}[nosep]
+  \item $z^{(m)} \in \{0,1\}^J$ --- variable-inclusion mask for response $m$;
+  \item $r^{(m)} \in \mathcal{R}^J$ --- parameter-role assignment for response $m$;
+  \item $d^{(m)} \in \mathcal{D}^J$ --- mixing-distribution assignment for response $m$;
+  \item $\pi^{(m)}: \mathcal{J} \to \mathcal{J} \cup \{\varnothing\}$ --- heterogeneity-in-means mapping for response $m$;
+  \item $\psi \in \Psi$ --- copula family selection.
+\end{itemize}
+Given any feasible outer-level specification $(z,r,d,\pi,\psi)$, the inner MLE $\boldsymbol\Theta^\star$ is uniquely determined (up to regularity). The outer objective is the penalised joint BIC evaluated at $\boldsymbol\Theta^\star$:
+
+\begin{subequations}\label{eq:mathprogram-full}
+\begin{align}
+  \min_{\substack{z^{(1)},z^{(2)} \in \{0,1\}^J \\[2pt]
+          r^{(1)},r^{(2)} \in \mathcal{R}^J \\[2pt]
+          d^{(1)},d^{(2)} \in \mathcal{D}^J \\[2pt]
+          \pi^{(1)},\pi^{(2)},\; \psi \in \Psi}} \quad
+    &\underbrace{\text{BIC}_{\text{joint}}\bigl(\boldsymbol\Theta^\star\bigr)}_{\text{joint fit}}
+     + \underbrace{\lambda_1 \sum_{m=1}^{2} \sum_{j \in \mathcal{J}} z_j^{(m)} \cdot \mathbf{1}\bigl\{p_j^{(m)} > \alpha_1\bigr\}}_{\text{within-marginal significance penalty}} \nonumber\\
+    &\quad + \underbrace{\lambda_2 \sum_{m=1}^{2} \sum_{k \in \mathcal{K}} \sum_{j \in \mathcal{J}} z_{jk}^{(m)} \cdot \mathbf{1}\bigl\{p_{jk}^{(m)} > \alpha_2\bigr\}}_{\text{category-level significance penalty}} \label{eq:mathprogram-full-obj}
+\end{align}
+\end{subequations}
+subject to the following constraint system.
+
+\noindent\textbf{Inclusion and role consistency} (applies $\forall\, m \in \mathcal{M},\; \forall\, j \in \mathcal{J}$):
+\begin{align}
+  \sum_{j \in \mathcal{J}} z_j^{(m)} &\geq 2, \label{eq:mathprogram-c1-v2}\\
+  r_j^{(m)} = 0 &\;\Longleftrightarrow\; z_j^{(m)} = 0, \label{eq:mathprogram-c2-v2}\\
+  r_{j'}^{(m)} = 5 &\;\Longrightarrow\; r_{\pi^{(m)}(j')}^{(m)} \in \{2,3,4\}, \label{eq:mathprogram-c3-v2}
+\end{align}
+
+\noindent\textbf{Copula coupling and dependence structure} (applies $\forall\, \psi \in \Psi$):
+\begin{align}
+  \theta &\in \Theta_{\text{copula}} = [\theta_{\min}, \theta_{\max}], \label{eq:mathprogram-c4}\\
+  C_\theta(u,v; \theta=0) &= uv \quad\text{(independence nested within each family)}, \label{eq:mathprogram-c5}
+\end{align}
+
+\paragraph{Inner problem (continuous MLE).}
+For every feasible outer-level specification $s = (z,r,d,\pi,\psi)$, the inner MLE solves:
+\begin{align}
+  \boldsymbol\Theta^\star(s) &=
+    \arg\max_{\boldsymbol\Theta} \; \ell_{\text{joint}}\bigl(\boldsymbol\Theta \mid \mathbf{y}^{(1)}, \mathbf{y}^{(2)}, \mathbf{X}_{z^{(1)}}, \mathbf{X}_{z^{(2)}}, \psi\bigr), \label{eq:mathprogram-c6}\\[4pt]
+  \text{where}\quad \ell_{\text{joint}} &= \sum_{i=1}^{N} \log\Bigl[
+    C_\theta\bigl(F_1(y_{i}^{\text{HB}}), F_2(y_{i}^{\text{Cr}})\bigr)
+    - C_\theta\bigl(F_1(y_{i}^{\text{HB}}-1), F_2(y_{i}^{\text{Cr}})\bigr) \nonumber\\
+    &\qquad\; - C_\theta\bigl(F_1(y_{i}^{\text{HB}}), F_2(y_{i}^{\text{Cr}}-1)\bigr)
+    + C_\theta\bigl(F_1(y_{i}^{\text{HB}}-1), F_2(y_{i}^{\text{Cr}}-1)\bigr)
+  \Bigr]. \label{eq:mathprogram-c7}
+\end{align}
+The inner parameters $(\boldsymbol\beta^{(1)}, \boldsymbol\beta^{(2)}, \boldsymbol\alpha^{(1)}, \boldsymbol\alpha^{(2)}, \theta)$ are \emph{not} outer decision variables; they are determined entirely by the MLE conditional on $(z,r,d,\pi,\psi)$. The outer objective $\text{BIC}_{\text{joint}}(\boldsymbol\Theta^\star)$ therefore depends on the outer decisions only through the inner solution map $s \mapsto \boldsymbol\Theta^\star(s)$, which is itself the output of a continuous optimisation.
+
+\noindent\textbf{Hard braking category consistency} (applies $\forall\, k \in \mathcal{K}$):
+\begin{align}
+  y_i^{\text{HB}} &= \sum_{k \in \mathcal{K}} y_{ik}^{\text{HB}}, \label{eq:mathprogram-c8}\\
+  y_{ik}^{\text{HB}} &\sim \text{NB}\bigl(\lambda_{ik}^{\text{HB}}, \alpha_k^{\text{HB}}\bigr), \label{eq:mathprogram-c9}\\
+  \log\lambda_{ik}^{\text{HB}} &= \eta_{ik}^{\text{HB}} + \log(L_i), \label{eq:mathprogram-c10}
+\end{align}
+where $\eta_{ik}^{\text{HB}}$ follows the same structural form as Equation~\eqref{eq:mathprogram-eta-v2} but with potentially category-specific feature selection $z_{jk}^{(m)}$ and parameter roles.
+
+\noindent\textbf{Dantzig--Wolfe--inspired decomposition constraint} (structural separation of the combinatorial outer problem from the continuous inner MLE):
+\begin{align}
+  \mathcal{S} &= \bigl\{(z,r,d,\pi,\psi) \text{ satisfying \eqref{eq:mathprogram-c1-v2}--\eqref{eq:mathprogram-c3-v2}}\bigr\}, \label{eq:mathprogram-c11}\\
+  \mathcal{F} &= \bigl\{\boldsymbol\Theta \mid \nabla_{\boldsymbol\Theta}\,\ell_{\text{joint}} = \mathbf{0},\; \nabla^2_{\boldsymbol\Theta}\,\ell_{\text{joint}} \preceq \mathbf{0}\bigr\}, \label{eq:mathprogram-c12}
+\end{align}
+where $\mathcal{S}$ is the discrete feasible set of model structures (the outer search space) and $\mathcal{F}$ is the first- and second-order optimality set for the continuous inner MLE. Every candidate structure $s \in \mathcal{S}$ induces a restricted master problem in the outer loop, and the inner MLE $\boldsymbol\Theta^\star(s) \in \mathcal{F}$ is the continuous subproblem solved by gradient-based optimisation.
+
+\noindent\textbf{Computational tractability constraint}:
+\begin{align}
+  |\mathcal{S}| &= \bigl(|\mathcal{R}| \cdot |\mathcal{D}|\bigr)^{J \cdot M} \cdot |\Psi|^{K} \;\approx\; O\bigl(10^{60}\bigr), \label{eq:mathprogram-c13}
+\end{align}
+which is computationally intractable by enumeration. The practical solution approach decomposes the full bilevel program into a sequence of four subproblems, each of which is a restriction of the outer problem of Equations~\eqref{eq:mathprogram-full-obj}--\eqref{eq:mathprogram-c12} with the inner MLE solved at each outer candidate:
+
+\begin{enumerate}[label=\textbf{SP\arabic*.}, leftmargin=*]
+  \item \textbf{Differential Evolution Variable Selection} (\S\ref{sec:de-method}): Fix $r_j^{(m)} = 1$ (all fixed effects), $d_j^{(m)} = \text{normal}$, $\theta = 0$ (independence), and search $z^{(m)}$ via DE. The outer problem reduces to variable inclusion only; the inner MLE solves for $\boldsymbol\beta^{(m)}, \boldsymbol\alpha^{(m)}$ at each candidate $z^{(m)}$, and the objective reduces to penalised BIC of Equation~\eqref{eq:penbic} with only constraints \eqref{eq:mathprogram-c1-v2}--\eqref{eq:mathprogram-c2-v2} active.
+
+  \item \textbf{MCR Structure Role Search} (\S\ref{sec:mcr-method}): Fix $z^{(m)}$ from SP1, search $r^{(m)} \in \{0,1,2,3\}^J$ via DE-driven structure evaluation. The outer problem now includes role assignment; the inner MLE is approximated by evaluating $\ell_{\text{joint}}$ at candidate role configurations under independence ($\theta = 0$), since the role-search fitness is evaluated on fold-out NB log-likelihood. This activates constraint \eqref{eq:mathprogram-c3-v2}.
+
+  \item \textbf{Copula Dependence Estimation} (\S\ref{sec:results}): Fix $(z^{(m)}, r^{(m)})$ from SP2, free $\theta \in \Theta_{\text{copula}}$ and solve the IFM and joint-MLE restrictions of \eqref{eq:mathprogram-c5}--\eqref{eq:mathprogram-c7}. The IFM restriction fixes $\boldsymbol\theta^{(m)}$ at univariate MLEs and optimises only $\theta$; the joint-MLE restriction solves the full inner problem over $(\boldsymbol\beta^{(1)}, \boldsymbol\beta^{(2)}, \boldsymbol\alpha^{(1)}, \boldsymbol\alpha^{(2)}, \theta)$ simultaneously.
+
+  \item \textbf{Copula Structure Search} (\S\ref{sec:results}): Free $(z^{(1)}, z^{(2)})$ jointly and solve the full coupled bilevel problem with all outer constraints active, initialised from the SP2 configurations. The inner MLE is solved at every candidate joint specification. This is the closest practical approximation of the unrestricted bilevel program.
+\end{enumerate}
+
+Each subproblem inherits the bilevel structure of Equations~\eqref{eq:mathprogram-full-obj}--\eqref{eq:mathprogram-c12} under progressively relaxed outer restrictions, and each is computationally feasible (hours to low tens of hours on a 4-core CPU node). The sequential decomposition is a heuristic relaxation, not an exact solution---it trades the guarantee of global optimality across $(z,r,d,\pi)$ jointly for practical feasibility---but each subproblem's outer objective is a specialisation of the same general penalised BIC with the same significance-penalty structure, and each inner MLE is the same continuous likelihood problem, giving the decomposition a coherent bilevel optimisation-theoretic interpretation.
+
+\subsubsection*{Analyst-Imposed Restrictions on the Specification}
+
+In applied settings an analyst rarely searches the full structure space: engineering judgment, agency policy, and data-quality considerations are imposed as exogenous restrictions on specific elements of the formulation. These are formalised as an analyst constraint set $\mathcal{A} = (Z^{+}, Z^{-}, \bar{\mathcal{R}}, \bar{\mathcal{D}})$ acting on the decision variables:
+\begin{equation}
+  z_j^{(m)} = 1 \;\; \forall j \in Z^{+}_m, \qquad
+  z_j^{(m)} = 0 \;\; \forall j \in Z^{-}_m, \qquad
+  r_j^{(m)} \in \bar{\mathcal{R}}_j \subseteq \mathcal{R}, \qquad
+  d_j^{(m)} \in \bar{\mathcal{D}}_j \subseteq \mathcal{D},
+  \label{eq:analyst-constraints}
+\end{equation}
+so the feasible structure set contracts from $\mathcal{S}$ to $\mathcal{S}(\mathcal{A}) = \mathcal{S} \cap \mathcal{A}$ and the program of Equations~\eqref{eq:mathprogram-full-obj}--\eqref{eq:mathprogram-c12} is solved over the restricted set, with the inclusion floor of Equation~\eqref{eq:mathprogram-c1-v2} still enforced. The four families have direct operational readings: $Z^{+}$ makes a variable \emph{mandatory} (e.g., forcing traffic exposure into every specification); $Z^{-}$ \emph{excludes} a variable outright (e.g., categories with near-zero variance that would destabilise estimation); $\bar{\mathcal{R}}_j$ \emph{permits only listed roles} for a variable (e.g., constraining exposure to remain a fixed effect while letting roadside-severity dummies compete for random roles); and $\bar{\mathcal{D}}_j$ restricts the admissible mixing distributions. Because the restrictions act on the coding scheme of \S\ref{sec:mathprogram} rather than on the solver, they propagate through every subproblem: SP1 searches masks inside $Z^{+} \cup (\mathcal{J} \setminus Z^{-})$, SP2 searches roles inside $\bar{\mathcal{R}}$, and the copula stages inherit the restricted space. In this study the restrictions used were: the straight-alignment reference category is structurally excluded from $\mathcal{J}$ (perfect multicollinearity with the intercept); Interaction Volume 100+ vehicles/day is excluded a priori ($Z^{-}$, near-zero variance in the analysis sample); and the studied role space is $\bar{\mathcal{R}} = \{0,1,2,3\}$, with the latent-class and zero-inflation roles $\{4,\dots,8\}$ withheld from search. The restriction mechanism is what makes the metaheuristic search auditable: every deviation of the final specification from the unconstrained optimum is attributable either to the data (the penalised objective) or to an explicit entry in $\mathcal{A}$.
+
+\subsubsection*{Convergence Criteria and Decomposition-Level Progress}
+
+\Cref{tab:hyperparams} consolidates the hyperparameters of every search and estimator in the pipeline. Convergence is assessed \emph{within} each subproblem, and progress \emph{across} the decomposition. Within-stage criteria are: for SP1, a single-run GA (differential evolution) with 60 generations, population size 15 per candidate gene, mutation $\in[0.4,1.4]$ and recombination $0.7$ without polishing and with early-stopping disabled---the best-so-far penalised BIC improves by $\approx$40 units (hard braking) and $\approx$46 units (crashes) from the initial population to the optimum, plateaus by generation $\approx$18 and $\approx$27 respectively, and shows no further improvement through the remaining budget (\Cref{fig:de_conv_hb,fig:de_conv_crash}); no SA-with-restarts search is reported---all selection is single-run GA / single-start structure search; for SP2, the single-start structure role search under the same penalised objective (best-only checkpoint retained, so its trajectory is not replotted; the random walk of \S\ref{sec:randomwalk} provides the equivalent landscape evidence); for SP3, a one-dimensional deterministic profile of the dependence parameter $\theta$, which converges to machine precision; and for SP4, the single-run GA joint structure search (trace in the supplement, \file{fig\_copula.tex}). The Metropolis validation walks equilibrate within budget (plateaus by step $\approx$300 and $\approx$150 at acceptance rates of 12\% and 11\%; \S\ref{sec:randomwalk}). \Cref{tab:decomp_conv} reports the objective value entering and leaving each stage. Because the objective is re-defined at each stage (penalised BIC on the full sample; subsample BIC for the tractable role search; joint copula BIC), monotone improvement is asserted within stages---where the convergence trajectories above document it---and the cross-stage column records the specification change each stage delivers: the searches replace the exhaustive 30-variable baselines (SP0 row of \Cref{tab:decomp_conv}) with condensed, fully significant specifications that improve full-sample BIC by 2{,}081 units (hard braking) and 1{,}237 units (crashes) at materially fewer parameters, while the copula stages confirm that coupling the two condensed responses does not improve on independence.
+
+\begin{table}[!ht]
+  \footnotesize
+  \caption{Hyperparameters of all searches, estimators, and validation mechanisms in the pipeline.}\label{tab:hyperparams}
+  \begin{center}
+    \begin{tabular}{p{0.30\linewidth}p{0.62\linewidth}}
+      \toprule
+      Component & Hyperparameters \\
+      \midrule
+      GA variable selection (SP1, single run, no restarts) & 60 generations; population 15 per candidate gene; mutation $\in[0.4,1.4]$; recombination 0.7; no polishing, early-stopping disabled; penalty $\lambda=10$ per coefficient with $p>0.10$; seeds 42 (hard braking) / 43 (crashes) \\
+      Optimiser policy & single-run GA (differential evolution) and single-start structure search only; SA with restarts is not used \\
+      MCR role search (SP2, single start, no restarts) & single-start search over roles $\bar{\mathcal{R}}=\{0,1,2,3\}$; subsample $N=4{,}000$; NB dispersion retained; single latent class \\
+      Random-parameter refits & $R=200$ draws per random parameter; L-BFGS-B, max 5{,}000 iterations; SEs from JAX Hessian (fallback: scipy) \\
+      Copula IFM (SP3) & margins fixed at univariate MLEs; 1-D profile over $\theta$ per family (Frank, Gaussian, Kimeldorf--Sampson) \\
+      Copula joint MLE / structure search (SP4, single run) & $(\beta_1,\beta_2,\alpha_1,\alpha_2,\theta)$ optimised jointly; structure search: single-run GA over joint masks scored against full joint-MLE copula BIC \\
+      Conditional prediction & crash-count support $K$ adaptive: per-segment NB CDF $\geq 1-10^{-6}$, hard cap 200 ($K\leq60$ in reported runs) \\
+      Empirical Bayes & Hauer moment dispersion $\hat\alpha$; posterior weight $w=1/(1+\hat\alpha\hat\lambda)$; reference prior weighted by its own moment dispersion; 5-fold CV, seed 42 \\
+      Metropolis random walk (\S\ref{sec:randomwalk}) & 600 steps; $T=5$ BIC units; symmetric single-variable toggle; profile energy (Poisson IRLS + moment $\alpha$) with $\lambda=10$ penalty \\
+      Intervention scheduler (\S\ref{sec:time-model}) & top fraction 0.10 (floor: 16 of 168 cells); gate: $\Delta$LL$>0$, $\geq60\%$ positive folds, coefficient stability $\geq2$; shape-robustness threshold $\rho\geq0.90$ \\
+      \bottomrule
+    \end{tabular}
+  \end{center}
+\end{table}
+
+\begin{table}[!ht]
+  \footnotesize
+  \caption{Decomposition-level progress of the sequential solution. Stage objectives differ in definition (full-sample penalised BIC; subsample BIC for SP2; joint copula BIC for SP3--SP4) and are therefore not comparable across rows; monotone convergence holds within each stage (\Cref{fig:de_conv_hb,fig:de_conv_crash}; SP4 trace in the supplement). Hard-braking and crash BICs are on different likelihood scales---mean counts are $\approx$131 hard-braking events versus $1.83$ crashes per segment, so $-2\log L$ is intrinsically larger for hard braking---and are not comparable across columns; only within-column comparisons across stages are valid.}\label{tab:decomp_conv}
+  \begin{center}
+    \begin{tabular}{llrrl}
+      \toprule
+      Stage & Objective & Hard braking & Crash & Outcome \\
+      \midrule
+      SP0 & BIC, exhaustive 30-var baseline & 97{,}863 & 33{,}663 & $k=32$ each \\
+      SP1 & Penalised BIC, GA variable selection (single run) & 97{,}771 & 33{,}524 & fully significant; plateau by gen.\ $\approx$18/27 \\
+      SP2 & BIC, role search ($N=4{,}000$ subsample) & 35{,}242.5 & 12{,}134.2 & subsample-only; not comparable to SP0/SP1 \\
+      SP2$'$ & BIC, searched spec.\ refit (full $N$) & 95{,}782 & 32{,}426 & $k=26/19$; $-2{,}081/-1{,}237$ vs SP0 \\
+      SP3 & Joint BIC, stabilised IFM copula & 158{,}789--160{,}516 & --- & decisive (identity holds; \cref{tab:copula_identity}) \\
+      SP4 & Joint BIC, Joe structure search (100 refits) & 160{,}516$\to$160{,}457 & --- & $59.1$-unit gain from margins; $\hat\theta_{\text{Joe}}$ flat at $1.45$ \\
+      \bottomrule
+    \end{tabular}
+  \end{center}
+\end{table}
+
+% NOTE: the exhaustive 30-variable SP0 baseline coefficient tables
+% (hb_full_geo_nm.tex / hb_full_geo_crash.tex) are intentionally not shown:
+% their fit is already summarised in the SP0 row of Table~\ref{tab:decomp_conv},
+% and only searched best specifications are presented as full tables.
+\input{fig_convergence.tex}
+
+\FloatBarrier
+
+\Cref{tab:candidate-vars} lists all $J=30$ candidate variables together with the DE-selected final specifications. Both models find similar overlapping variables, supporting the relationship between hard braking and crash counts.
+
+\input{tab_candidate_vars.tex}
+
+\FloatBarrier
+
+
+
+
+\subsection{Specification Structure Search}\label{sec:mcr-method}
+
+The GA-selected feature subsets above only decide \emph{which} explanatory variables enter the model. To test whether the effect of a given geometry variable is homogeneous across the 10,780 segments, the GA-selected features are further searched over the \emph{role} assigned to each feature: fixed effects, or random parameters (correlated or independent, under normal, triangular, or log-normal distributions), using an optimisation-based structure-search evaluator guided by a single-start evolutionary solver with no restarts. Experimental settings include $R=200$ Halton draws per random parameter, single start (no restarts, no per-restart wall-clock stitching). This step searches over included variables and its level of heterogeneity. The best structure found is always refit on the full sample and reported, even when checkpoints allow earlier stages to be skipped. 
+
+
+
+\subsection{Proxy Variable Analysis Framework}\label{sec:proxy-method}
+
+To determine whether hard braking events can serve as a valid proxy or surrogate for crash frequency, i.e., whether the two responses share similar structural relationship with explanatory variables, an econometric framework is applied, based on surrogate endpoint validation methods from biostatistics \citep{Nikolaou2023AInvestigations} and non-nested hypothesis testing, following the transferability logic recently applied to crash modification factors by \citet{Davis2025TransferringConsiderations}.
+
+\begin{enumerate}
+    \item \textbf{Dual GA search.} The single-run GA (\S\ref{sec:de-method}) is run independently on both response variables ($y_1 =$ hard braking counts, $y_2 =$ observed crash counts) with the same set of likely contributing variables as candidates, and the structure search further condenses each GA-selected set into a smaller ``final'' specification. Feature overlap (Jaccard index) on these final specifications quantifies the similarity of the selected data-generating structures.
+    \item \textbf{Coefficient Proportionality Test.} Both responses are regressed on the full 30-variable geometry set. The proportionality hypothesis is tested using the correlation of standardised coefficient vectors and the proportionality $R^2 = 1 - \frac{\|\beta_{\text{crash}} - k\beta_{\text{NM}}\|^2}{\|\beta_{\text{crash}}\|^2}$ where $k$ is the OLS slope through the origin.
+    \item \textbf{Specification Transfer.} The final (condensed) feature set for each response is applied to the other response. The BIC penalty relative to the native specification measures transferability.
+    \item \textbf{Encompassing Test (Davidson-MacKinnon).} Predicted near-miss counts from the final NM specification are added to the crash regression. If these predictions render the variables jointly insignificant, hard braking events are a sufficient statistic for the crash relationship.
+    \item \textbf{Bivariate NB Copula (reported: stabilised IFM; queued: joint MLE).} Frank, Gaussian, Kimeldorf--Sampson (Clayton-family), Joe, and Gaussian--Joe mixture copulas link the two NB margins. Reported estimates use the two-step Inference-Functions-for-Margins (IFM) approach---marginal $\hat\beta,\hat\alpha$ fixed at their univariate MLEs on fully-significant DE-specification margins with multi-start optimisation of $\theta$ only---following \citep{Ahmad2023Copula-basedVehicles, Bhowmik2021ExploringModeling,Yasmin2018AModel,Song2026JointApproach}. A joint-MLE refresh ($\beta_1,\beta_2,\alpha_1,\alpha_2,\theta$ optimised simultaneously) landed (\cref{tab:joint_mle}), as did the single-run GA copula structure search (\cref{tab:eb_search_joint}).
+\end{enumerate}
+
+All models were estimated using the \texttt{metacount\allowbreak regressor} Python package (v1.0.20), which provides maximum likelihood estimation for count and frequency based models with assisted selection of the functional form, included variables and modelling of unobserved heterogeneity.  Model comparison employed AIC, BIC, and likelihood ratio tests. For the bivariate copula tests, the joint log-likelihood was computed using the discrete-distribution rectangle formula:
+
+\begin{equation}
+  \log L_{\text{joint}} = \sum_{i} \log\bigl[
+    C(F_1(y_{1i}), F_2(y_{2i})) - C(F_1(y_{1i}\!-\!1), F_2(y_{2i}))
+    - C(F_1(y_{1i}), F_2(y_{2i}\!-\!1)) + C(F_1(y_{1i}\!-\!1), F_2(y_{2i}\!-\!1))
+  \bigr],\label{eq:copula_ll}
+\end{equation}
+
+where $C(\cdot)$ is the copula CDF evaluated at the NB marginal CDF values, with the Frank, Gaussian, and Kimeldorf--Sampson (Clayton-family) copula families each considered in turn.
+
+% ---------- Results ----------
+\section{Results}\label{sec:results}
+
+\subsection{Dual GA Search: Optimal Feature Subsets (reported search)}\label{sec:ga-results}
+
+A significance-penalised single-run GA search over the 30 candidate geometry features (one run per response, no restarts; seeds 42/43) was used for both hard-braking and crash counts. The search considered the same 30 road-geometry candidates with curvature straight omitted as the reference category to avoid perfect multicollinearity. \Cref{fig:de_conv_hb,fig:de_conv_crash} show the single-run convergence trajectories for each response (best-so-far penalised BIC per generation; flat best trace plus collapsed population spread indicates convergence, not an exhausted restart budget).
+
+
+The reported GA best models are the fully-significant benchmarks in \S\ref{sec:de-results}, always refit on the full $N=10{,}780$ sample and reported even when earlier pipeline stages are resumed from checkpoint. No simulated-annealing (SA) search with restarts is used anywhere in the reported pipeline: all feature selection uses the single-run differential-evolution GA of \S\ref{sec:de-method} (one continuous run per response, no restarts, no multi-start stitching), and all role selection uses the single-start structure search of \S\ref{sec:mcr-method}. Prior-generation SA outputs (\file{sa\_best\_nm.tex}, \file{sa\_best\_crash.tex}, \file{fig\_sa\_conv.tex}; $N=10{,}302$) are retired from the paper and are not \texttt{\textbackslash input}.
+
+\FloatBarrier
+
+
+\subsection{GA Benchmarks and Overdispersion Evidence}\label{sec:de-results}
+
+The reported single-run GA feature search was run for each response under the penalised-BIC objective (\S\ref{sec:de-method}). Both resulting best models are parsimonious and \emph{fully significant}: every retained coefficient in the 14-variable hard-braking benchmark (LL$=-48{,}811$, BIC$=97{,}771$, $k=16$) and the 10-variable crash benchmark (LL$=-16{,}706$, BIC$=33{,}524$, $k=12$) is significant at $p<0.01$, including the Negative Binomial overdispersion terms. \Cref{fig:de_conv_hb,fig:de_conv_crash} show the convergence trajectories of the two searches---best penalised BIC versus generation---documenting what each fitted solution is solving: the hard-braking search reaches its optimum by generation $\approx$18 and the crash search by generation $\approx$27, after which both plateau without further improvement, so the reported benchmarks are converged optima of the penalised objective rather than under-optimised snapshots. An independent SparseEA-AGDS-style masked search (adaptive genetic operator plus dynamic variable scoring; single run, seeds 42/43; HPC job 25256286, \file{sparseaagds\_vs\_de.csv}) replicates the hard-braking benchmark \emph{exactly} (penalised BIC $=97{,}771.38$, 14 variables, zero insignificant) and lands within $9.1$ penalised-BIC units on crashes ($33{,}533.2$ vs.\ $33{,}524.1$) with one extra borderline variable (Interaction Volume: Low, $p=0.080$, retained under the $p<0.10$ rule). The DE benchmarks stay the reported specifications; the SparseEA-AGDS run serves as cross-solver validation, with the head-to-head comparison in \Cref{tab:sparseaagds_vs_de} (full SparseEA-AGDS coefficient tables held in the supplement since DE wins or ties; convergence in \Cref{fig:sparseaagds_conv}).
+
+\input{hb_de_best_nm.tex}
+
+\input{hb_de_best_crash.tex}
+
+\FloatBarrier
+
+The fixed-effect DE benchmarks above are the reported best models for each response---no fixed-vs-random comparison table is shown because the random-parameter extensions are not reportable as models: allowing the MCR-selected terms to vary (random-independent plus random-correlated blocks, $R=200$ Halton draws, full $N=10{,}780$) improves BIC by $1{,}980$ units for hard braking and $1{,}118$ units for crashes (fixed-vs-random LR $=2{,}100.8$, $df=13$ and $1{,}201.6$, $df=9$, both $p<0.001$), which evidences segment-level heterogeneity, but the random fits are not fully significant---neither hard-braking random-independent standard deviation reaches $p<0.05$, several rows are degenerate (SE $=0$, no test), selected correlated-block means sit far outside plausible standardised ranges (e.g.\ $-12.7$, $-7.4$), and the crash overdispersion term loses significance ($p=0.13$), with even some fixed coefficients destabilised (e.g.\ Number of Lanes $p=0.35$ in the hard-braking random fit). The full random-parameter coefficient tables are therefore supplement-only (\file{rp\_check\_HB\_random.csv}, \file{rp\_check\_Crash\_random.csv}; fit summary previously in \texttt{rp\_check.tex}, retired from the main text). The significance-constrained refit landed (\file{run\_refit\_significant.pbs}: REJECT/REJECT), as did every structured RP arm including GSE (\file{run\_gse\_rp\_pilot.pbs}: 8/8 REJECT) and an independent full-space selection (fixed ACCEPT, all RP REJECT): no admissible random-parameter specification was found, so fixed-effect models are reported and RP estimation is closed.
+
+\FloatBarrier
+
+
+\paragraph{Cross-solver validation (SparseEA-AGDS).} Stage-1 variable selection was re-run over the same 30 geometry candidates on the full $N=10{,}780$ sample with a SparseEA-AGDS-style solver (binary inclusion masks; adaptive crossover/mutation rates; dynamic variable scoring; single run, no restarts) under the identical fitness, penalty ($p$-threshold $0.05$, $3.0$ per insignificant), and seeds as the DE benchmarks (\file{refit\_sparsea\_agds.py}, HPC job \texttt{sparsea\_agds} 25256286 on \texttt{cpu1n019}: wall 06:39:25 / CPU 09:24:55, 4 cores, exit 0). \Cref{tab:sparseaagds_vs_de} compares the two solvers head-to-head from \file{sparseaagds\_vs\_de.csv}; only the winning DE coefficients are tabulated (\Cref{tab:hb_de_nm,tab:hb_de_crash} above) with the SparseEA-AGDS tables held in the supplement, and \Cref{fig:sparseaagds_conv} the per-generation best penalised-BIC traces.
+
+\begin{table}[!ht]
+  \centering
+  \caption{SparseEA-AGDS vs.\ DE benchmarks (full $N=10{,}780$ sample, penalised BIC; $p$-threshold $0.05$).}\label{tab:sparseaagds_vs_de}
+  \begin{tabular}{lrrrrrc}
+    \toprule
+    Response / solver & \#vars & LL & BIC & $k$ & penalised BIC & insig. \\
+    \midrule
+    HB, DE benchmark & 14 & $-48{,}811.41$ & $97{,}771.38$ & 16 & $97{,}771.38$ & 0/14 \\
+    HB, SparseEA-AGDS & 14 & $-48{,}811.41$ & $97{,}771.38$ & 16 & $97{,}771.38$ & 0/14 \\
+    Crash, DE benchmark & 10 & $-16{,}706.32$ & $33{,}524.07$ & 12 & $33{,}524.07$ & 0/10 \\
+    Crash, SparseEA-AGDS & 11 & $-16{,}704.76$ & $33{,}530.23$ & 13 & $33{,}533.23$ & 1/11 \\
+    \bottomrule
+  \end{tabular}
+  \begin{minipage}{0.95\linewidth}\footnotesize\emph{Note:} HB masks are identical (AADT, SL, NL, SKD\_SP, IC, IP, PA\_COM1, PSDSG24, PSDS1T24, IV\_VL, IV\_M, RSPSDL5, RSDSO, RSDSDL5). Crash SparseEA-AGDS adds Interaction Volume: Low ($p=0.080$) to the 10-variable DE mask; all other crash coefficients are significant at $p<0.01$. Source: \file{sparseaagds\_vs\_de.csv} (HPC job 25256286).\end{minipage}
+\end{table}
+
+% Full SparseEA-AGDS coefficient tables (hb_sparseaagds_best_nm/crash.tex) held
+% in the supplement: HB masks are identical to DE and crash DE wins by 9.1
+% penalised-BIC units, so only the best (DE) coefficients are shown.
+\begin{figure}[htbp]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{hb_sparseaagds_convergence_nm.png}
+    \caption{Hard braking (14 vars, BIC $97{,}771.38$)}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{hb_sparseaagds_convergence_crash.png}
+    \caption{Crashes (11 vars, BIC $33{,}530.23$)}
+  \end{subfigure}
+  \caption{SparseEA-AGDS single-run convergence: per-generation best penalised BIC (HPC job 25256286, seeds 42/43).}\label{fig:sparseaagds_conv}
+\end{figure}
+
+\FloatBarrier
+
+
+Across all fixed-effects specifications estimated on the current sample, the Negative Binomial overdispersion parameter is strongly significant---$\ln\hat\alpha=+4.23$ ($z=75.9$) for hard braking and $+2.86$ ($z=37.6$) for crashes, with Empirical-Bayes prior-model dispersions of $\hat\alpha=0.834$ (crashes) and $1.204$ (hard braking)---supporting the NB form over Poisson. The promised Poisson-versus-NB and functional-form comparisons are reported in \cref{sec:model-comparison-local}.
+
+\subsection{Fixed-Effects Model Comparison on the Current Sample}\label{sec:model-comparison-local}
+
+\Cref{tab:local_poisson_nb} reports the likelihood-ratio comparison of Poisson and Negative Binomial specifications on the current sample: NB is decisively preferred for both responses (boundary-corrected LR $=31{,}400.7$ for crashes), with large fitted dispersions. As an independent replication check, the locally re-estimated NegBin rows reproduce the HPC DE-benchmark fits to the second decimal. \Cref{tab:local_hierarchy} addresses exposure functional forms and the specification hierarchy: log-transformed AADT improves BIC by 362.7 units over linear AADT (an interaction term is statistically significant but fits worse than the log form), supporting logarithmic traffic-exposure elasticities.
+
+\input{local_model_comparison.tex}
+
+\FloatBarrier
+
+The hierarchy rows also carry an important nuance for the proxy interpretation: raw segment-level hard-braking tier counts alone have essentially no predictive power for crashes (worse BIC than an intercept-only model), and adding them directly alongside geometry yields no significant improvement (LR$=6.93$, $df=3$, $p=0.074$, all tier coefficients non-significant). The affirmative encompassing test (\cref{sec:results}) is therefore not driven by raw event tallies but by the \emph{model-predicted} hard-braking count---a geometry-weighted composite learned from telematics that condenses how the road environment shapes braking behaviour. This distinction mirrors the surrogate-safety-measures literature, which emphasises that near-miss events translate into crash risk only through calibrated, exposure-normalised mappings rather than raw counts \citep{Tarko2009SurrogateMeasures,Tarko2012UseCrash}, consistent with naturalistic-driving evidence that near-crashes proxy crashes through severity-stratified conversion factors rather than event frequencies themselves \citep{Guo2010EvaluatingRelationship}. It reinforces the paper's complementary-not-surrogate verdict.
+
+
+\subsection{Unobserved Heterogeneity Modelling Structure Search and Condensed Specifications}\label{sec:mcr-results}
+
+\Cref{tab:eb_mcr_roles} reports the best parameter-role assignment from the deep MCR structure searches on the SparseEA-searched specs (HB 14 vars, crash 11 vars): 3 starts, 600 iterations each, on an $N=3{,}000$-row subsample (HPC jobs \file{eb\_search\_mcrdeep} 25413415 and version-clean repeat \texttt{eb\_v154\_mcr} 25455077 on metacountregressor 1.0.154, both exit 0; reported roles are the 1.0.154 winners). \textbf{These BIC values are only comparable within this subsampled step and should not be compared to the $n=10{,}780$ BIC values reported elsewhere in this paper.} For hard braking (search BIC $=26{,}584.1$), three terms stay fixed (Speed Limit, Parking Access: Commercial, Interaction Volume: Very Low), one is random-independent (Intersection Conflict), and four form a random-correlated block (AADT, Interaction Volume: Medium, Roadside Severity: Other, Roadside Severity: Ditch $\leq$5m). For crashes (search BIC $=9{,}098.7$), four terms stay fixed (AADT, Speed Limit, Intersection Present, Roadside Severity: Ditch $>$10m), the independent block is empty, and three terms form a random-correlated block (Speed Differential: nil\%, Roadside Severity: Other, Roadside Severity: Ditch $\leq$5m). The empty independent block for crashes---replicated in the earlier shallow search---means crash-site heterogeneity moves as a bundle, consistent with a latent risk factor. The crash roles replicate exactly across the 1.0.151/153 and 1.0.154 deep searches (BIC $=9{,}098.7$ both).
+
+% --- Auto-populated: Part-S MCR role searches (deep + v154 rerun) ---
+\IfFileExists{eb_search_mcr_role.tex}{\input{eb_search_mcr_role.tex}}{%
+\begin{center}\fbox{\parbox{0.92\linewidth}{\textbf{TODO (pending MCR role search):} random-parameter role table withheld until \file{eb\_search\_mcr\_role.tex} lands.}}\label{tab:eb_mcr_roles}\end{center}}
+
+\FloatBarrier
+
+
+Re-estimating the searched variable sets on the full $n=10{,}780$ sample as fixed-effect Negative Binomial models yields the reported ``final'' condensed models (\cref{tab:pruned_specs}): an 11-variable hard-braking specification (LL$=-48{,}842$, BIC$=97{,}806$, $k=13$) and an 8-variable crash specification (LL$=-16{,}735$, BIC$=33{,}563$, $k=10$). Both are \emph{fully significant}---backward elimination requires zero steps at $p>0.10$, minimum $|z|$ is $5.18$ (hard braking) and $3.65$ (crashes), and both overdispersion terms are $p<0.001$---and both outperform their exhaustive 30-variable geometry baselines (hard braking BIC$=97{,}863$; crashes BIC$=33{,}663$; each $k=32$) while retaining fewer parameters. These fixed-effect condensed models are the specifications used for the specification-transfer, encompassing, and copula tests below, and for the coefficient proportionality test (see \cref{sec:coef-prop-note}).
+
+\input{pruned_specs.tex}
+
+\FloatBarrier
+
+\emph{Specification-quality note.} An unrestricted random-parameter re-estimation of the same searched variable-and-role assignment (random-independent plus random-correlated blocks, $R=200$) improves BIC jointly but is \emph{not} reported as a main table because it is not fully significant: two random-independent standard deviations are individually insignificant, selected correlated-block means are numerically degenerate (far outside plausible standardised ranges), correlated-block factor elements carry no individual tests, and the crash overdispersion term loses significance ($p=0.121$) once the correlated block is included. The full random-parameter coefficient tables (\file{hb\_final\_spec\_nm.tex}, \file{hb\_final\_spec\_crash.tex}) are therefore retired to the supplement (see \file{run\_refit\_significant.pbs}: fixed-effect pruning plus constrained random-block re-search with the degenerate means excluded and every retained SD gated on $p<0.10$). The degeneracy originates in the random-correlated block parameterisation rather than in the metaheuristic feature selection---consistent with the count-modelling literature's warning that untested mixing structures can absorb identification problems \citep{LordMannering2010StatisticalAnalysis,Mannering2016UnobservedHeterogeneity}. That refit landed with no admissible RP specification (REJECT/REJECT), and every subsequent structured RP arm---including GSE heterogeneity-in-means/variances and gradient-score terms (8/8 REJECT) and an independent full-space selection (fixed ACCEPT, all RP REJECT)---likewise failed to produce an admissible specification, so RP estimation is closed: the fixed-effect condensed specifications (\cref{tab:pruned_specs}) alongside the fully-significant DE benchmarks (\cref{sec:de-results}) are the reported parsimonious models.
+
+% --- Auto-populated: run_refit_significant.pbs (fully-significant refits) ---
+The significance-constrained refits (fixed-effect condensed specs, constrained random-parameter verdict) replace the retired tables automatically once written.
+\IfFileExists{hb_final_spec_fixed_nm.tex}{\input{hb_final_spec_fixed_nm.tex}}{}
+\IfFileExists{hb_final_spec_fixed_crash.tex}{\input{hb_final_spec_fixed_crash.tex}}{}
+
+% --- Auto-populated: run_bayes_hb_crash.pbs (fully Bayesian PyMC refits) ---
+% To queue: qsub -v BAYES_ARGS="--draws 1000 --tune 1000 --chains 4 --target-accept 0.95 --max-treedepth 12" run_bayes_hb_crash.pbs
+\IfFileExists{bayes_hb.tex}{\input{bayes_hb.tex}}{%
+\begin{center}\fbox{\parbox{0.92\linewidth}{\textbf{TODO (Bayesian refit not yet queued):} posterior-mean tables for the condensed specs ($\approx$15 terms each, standardized scale) will appear here once the corrected sampler lands; the invalid $n=169/156$ pilot tables are retired to the supplement.}}\end{center}}
+\IfFileExists{bayes_crash.tex}{\input{bayes_crash.tex}}{}
+
+\FloatBarrier
+
+\subsection{Best Models on the Full-Year Telematics: Search, Held-Out Prediction, and Transfer}\label{sec:best-models}
+
+The specifications above were selected on a single, short telematics window and evaluated only in-sample. This subsection consolidates the study's model evidence into a single narrative by (i) rebuilding both responses on the \emph{full year} of hard-braking telematics rather than the intensive one-month extract, (ii) refitting the differential-evolution feature sets selected above on that full-year table, holding the specifications fixed so that the step from the intensive window is a change of data rather than of specification, and (iii) validating every fitted model out-of-sample. The full-year re-aggregation snaps all matched hard-braking events onto the road-segment network under the same nearest-segment convention used to build the original table; \Cref{tab:hb_year_prov} reports the resulting monthly event coverage. This raises the telematics sample from the intensive one-month window to a full calendar year, so hard-braking exposure is now measured over a horizon far closer to the multi-year crash-averaging period, directly addressing the horizon-mismatch limitation noted in \S\ref{sec:limitations}.
+
+\begin{table}[!ht]
+  \centering
+  \caption{Full-year hard-braking telematics coverage by month (segment-matched events).}\label{tab:hb_year_prov}\small
+  \input{hb_year_provenance.tex}
+\end{table}
+
+\FloatBarrier
+
+\Cref{tab:master_models} is the consolidated best-models table: for the hard-braking and crash responses it reports the searched specification's in-sample fit \emph{alongside} its held-out predictive performance and its geographic-transfer behaviour, so model quality is no longer read from in-sample BIC alone. Held-out performance is estimated by random $K$-fold cross-validation (segments partitioned into $K=5$ folds, each fold predicted from a model fit on the remaining folds); the reported log-likelihood, log-scale RMSE, and rank correlation are averages over held-out folds. Because year-aggregated hard-braking counts are heavy-tailed---a small number of very high-volume segments dominate raw squared error---predictive skill for the hard-braking response is read from the rank correlation and the log-scale RMSE rather than raw-count RMSE.
+
+\begin{table}[!ht]
+  \centering
+  \caption{Best models on the full-year data: in-sample fit, held-out ($K$-fold) prediction, leave-one-LGA-out geographic transfer, and temporal transfer of the hard-braking model. The temporal cell of the crash row is n/a because the crash counts are a static multi-year total with no month split.}\label{tab:master_models}\small
+  \input{best_models_master.tex}
+\end{table}
+
+The consolidated \cref{tab:master_models} reports all three transferability designs---random $K$-fold held-out prediction, leave-one-LGA-out geographic transfer (each region fold predicted from all \emph{other} LGAs), and temporal transfer of the hard-braking model (earlier months $\to$ later months with a log-exposure offset)---so transferability is established directly in space, time, and out-of-sample. The temporal column reports the rank correlation of the hard-braking model across the month split ($\rho=0.411$), and its crash cell is n/a rather than a failed fit because the crash response is a static multi-year total with no monthly counterpart to hold out. The table also carries two spatial counts that measure different things and must not be read as one: the leave-one-LGA-out columns ask whether each response's \emph{own} model beats a naive intercept baseline in an unseen LGA (hard braking 8 of 11, crashes 10 of 11), whereas the 9-of-11 result reported for the hard-braking proxy in \S\ref{sec:hbcat-results} asks whether \emph{adding} that proxy to the crash model improves its out-of-sample log-likelihood (mean $\Delta$LL $=+61.5$). The per-fold detail tables (\file{oos\_kfold.tex}, \file{transfer\_spatial.tex}, \file{transfer\_temporal.tex}) duplicate \cref{tab:master_models} and are moved to the supplement (not \texttt{\textbackslash input} here).
+
+\FloatBarrier
+
+
+\subsection{Random-Walk Validation of Specification Stability}\label{sec:randomwalk}
+
+The searches above report a single best specification per response; this section shows that those solutions are members of stable, well-connected regions of the specification space rather than isolated spikes, using a Metropolis random walk over the structure space. The walk treats an inclusion mask $x \in \{0,1\}^{30}$ as a state and the significance-penalised BIC of Equation~\eqref{eq:penbic} as its energy $E(x)$, evaluated with the stable profile estimator of \S\ref{sec:eb} (Poisson IRLS coefficients with Hauer moment dispersion, held identical across all visited states so energies remain comparable). It proposes symmetric single-variable toggles, accepting with probability $\min\{1, \exp(-\Delta E / T)\}$ at temperature $T=5$ BIC units. Under a symmetric proposal the walk targets the Boltzmann distribution over specifications, $\Pr(x) \propto \exp(-E(x)/T)$, so long-run visitation frequencies estimate each variable's inclusion probability, and the energy trace reveals the local geometry of the objective.
+
+Starting from the final condensed specifications, 600 steps per response (\Cref{fig:randomwalk}, \Cref{tab:randomwalk}) yield acceptance rates of 12\% (hard braking) and 11\% (crashes)---a rugged but navigable landscape---and both traces descend to plateaus by step $\approx$300 and $\approx$150 respectively, indicating the walks equilibrate within budget. The visitation statistics identify a broad \emph{stable core} for each response: 17 variables with inclusion probability $P \geq 0.5$ for hard braking and 10 for crashes, containing at $P = 1.0$ seven of the eleven selected hard-braking variables (AADT, Skid Resistance, Intersection Conflict, Roadside Severity: Other, Interaction Volume: Medium, Speed Differential $>$24\%, Roadside Severity: Ditch $\leq$5m) and six of the eight selected crash variables (AADT, Speed Limit, Intersection Present, Speed Differential 1--24\% and nil\%, Roadside Severity: Ditch $\leq$5m). The walk also exposes the fragile members of the selected sets: Speed Limit, Parking Access (Commercial), and Intersection Present in the hard-braking specification, and Roadside Severity: Ditch $>$10m and Median Safety Barrier in the crash specification, are essentially never retained by the walk ($P < 0.15$), consistent with the weakly identified components flagged in the specification-quality note above. The modal sets under the Boltzmann distribution overlap the selected specifications at Jaccard $= 0.40$ (hard braking) and $0.50$ (crashes).
+
+Two validation conclusions follow. First, the metaheuristic optima sit on broad low-energy plateaus---many neighbouring specifications are statistically equivalent---so the reported benchmarks should be read as representatives of an equivalence class of near-sufficient specifications rather than as unique structures; this is precisely the reading the pruned fixed-effect re-estimations support. Second, the variables that matter for downstream use are those with strong marginal contributions, and they agree across the GA and random-walk mechanisms, giving two independent search procedures a common core. The replication caveat is sample sensitivity: repeating the walk on the $N=4{,}000$ subsample used by the role search reproduces the headline behaviour (accept rates 11--15\%, plateaued traces, the same leading variables) but shifts stable-core membership moderately (core Jaccard $0.52$ hard braking, $0.33$ crashes; inclusion-probability rank correlation $0.30$/$0.40$ against the full-sample walk), reinforcing that exact variable membership---not the core structure---is the least stable element of these specifications, and that final variable sets should be confirmed on the full sample.
+
+\input{fig_randomwalk.tex}
+
+\input{hb_randomwalk.tex}
+
+\FloatBarrier
+
+\subsection{State-Space Crash-Risk Estimation from Hard-Braking Events}\label{sec:state-space}
+
+The specification-stability walk above validates \emph{which} variables belong in the model; this section asks a complementary question: can the temporal pattern of hard-braking events be used to estimate latent crash risk that evolves over time? A state-space model is specified with a Negative Binomial observation equation and a Gaussian random-walk state equation, estimated on a panel of daily hard-braking counts across spatial grid cells covering the study area.
+
+Let $y_{g,t}$ denote the HB event count in grid cell $g$ on day $t$. The model is:
+\begin{align}
+  y_{g,t} &\sim \text{NB}\bigl(\lambda_{g,t},\;\alpha\bigr), \label{eq:ss-obs}\\
+  \log(\lambda_{g,t}) &= \mu + \gamma_{d[t]} + \beta'\mathbf{x}_g + \theta_t, \label{eq:ss-linear}\\
+  \theta_t &= \theta_{t-1} + \eta_t, \qquad \eta_t \sim \mathcal{N}(0,\,Q), \label{eq:ss-transition}
+\end{align}
+where $\gamma_{d[t]}$ is a day-of-week fixed effect, $\mathbf{x}_g$ are the DE-selected segment-level geometry covariates from the hard-braking specification (AADT, speed limit, lane count, skid resistance, intersection variables, parking access, speed differential, interaction volume, and roadside severity), and $\theta_t$ is the latent time-varying crash-risk component that evolves as a random walk. The state-space parameters $(Q, R)$ are estimated by maximum likelihood via a Kalman filter applied to the NB residuals.
+
+\Cref{tab:state_space} reports the estimated model in three panels. Panel~A shows the temporal model: daily HB counts across 13{,}400 grid cells over 457 observation days (1{,}245{,}357 panel observations, January 2025--March 2026), with Tuesday as the peak day and Sunday showing $\approx$36\% lower risk than Monday (DOW=Sun $-0.448$, $p<0.001$).
+
+\input{hb_state_space.tex}
+
+\FloatBarrier Panel~B shows the segment cross-sectional model: 14 DE-selected geometry covariates predict total HB events per segment, every coefficient significant at $p<0.001$ on the full $N=10{,}780$ sample. Panel~C reports the Kalman filter parameters: state variance $Q = 0.0327$ and observation variance $R = 0.0076$ at daily resolution. The headline latent-risk series is estimated at clock-hour resolution over the full window (10{,}912 hours, December 2024--April 2026) after removing the day-of-week $\times$ hour calendar norm, so $\hat\theta_t$ reads as deviation from calendar-expected risk: it ranges from $-0.75$ to $+0.32$ (SD $0.07$; $Q_h=0.0008$, $R_h=0.0018$), i.e.\ up to $\approx$38\% elevation above and $\approx$53\% depression below the calendar norm.
+
+The temporal decomposition (\Cref{fig:ss_temporal}) reveals a pronounced diurnal pattern with peak risk at 15:00 and trough at 02:00, consistent with afternoon commute dynamics. The day-of-week pattern shows mid-week concentration (Tuesday peak, Saturday/Sunday trough), which is operationally useful for scheduling targeted enforcement or variable-message signage. The hourly latent risk trajectory (\Cref{fig:ss_trace}) demonstrates that the state-space filter successfully extracts a smooth, interpretable crash-risk signal from the noisy hourly HB counts---a capability that the static count models of \S\ref{sec:model-comparison-local} cannot provide.
+
+\input{fig_state_space.tex}
+
+\FloatBarrier
+
+\subsection{Coefficient Proportionality Test}\label{sec:coef-prop-note}
+
+Figure~\ref{fig:coef_prop} plots the standardized coefficient vectors from the two full models. The proportionality factor is $k = 0.563$, meaning that crashes respond to the contributing factors with approximately 56\% of the magnitude observed for hard-braking events. The correlation is moderate ($r = 0.69$, $R^2_{\text{prop}} = 0.48$), indicating that the structural relationship cannot be directly transferred as a simple scalar term. When the searched unequal-dispersion specifications are compared instead of the full models, the retained coefficients become essentially proportional ($r = 1.00$, $R^2_{\text{prop}} = 0.99$), so departures from proportionality are concentrated in dispersion handling rather than in the mean structure. The numeric summary (\file{hb\_proportionality.tex}: $k=0.563$, $r=0.69$, searched $r=0.999$) duplicates these in-text values and is moved to the supplement.
+
+\input{fig_coef_prop.tex}
+
+\FloatBarrier
+
+
+
+\subsection{Specification Transfer}
+
+Applying the native hard-braking feature set to the crash response costs 71.1 BIC units relative to its native specification ($33{,}716$ vs.\ $33{,}644$); conversely, transferring the crash feature set to the hard-braking response costs 401.1 BIC units relative to the native hard-braking specification ($112{,}969$ vs.\ $112{,}568$). The symmetric transfer penalty is 236.1 BIC units. Both penalties are large---though no longer symmetric, with the hard-braking feature set transferring to crashes far more gracefully than the reverse---confirming that the two responses have distinct data-generating processes while the hard-braking signal remains crash-relevant.
+
+\input{hb_specification_transfer.tex}
+
+\FloatBarrier
+
+
+\subsection{Encompassing Test}
+
+The Davidson-MacKinnon encompassing tests if predicted hard braking count (from the final HB specification) encompass the likely contributing factors as predictors of crashes. The unrestricted model (crashes $\sim$ final-spec geometry $+$ predicted HB, LL$=-16{,}692$, BIC$=33{,}505$) is compared to the restricted model (crashes $\sim$ final-spec geometry alone, LL$=-16{,}766$, BIC$=33{,}644$) via a likelihood-ratio test.
+
+The LR test is highly significant (LR$=148.9$, $df=1$, $p<0.001$; $\Delta$BIC$=-139.6$), and the predicted-HB term enters the crash model significantly. This indicates that the hard-braking signal captures crash-relevant information beyond what the final specification alone explains, providing evidence for hard braking as a crash surrogate.
+
+\input{hb_encompassing.tex}
+
+\FloatBarrier
+
+
+
+
+\subsection{Bivariate NB Copula: Reported Estimation with Stabilised Evaluation}
+
+To formally test the residual dependence suggested above, Frank, Gaussian (Normal), Kimeldorf--Sampson (Clayton-family), Joe, and Gaussian--Joe mixture copulas linking the NM and crash NB margins were estimated by IFM with multi-start optimisation on the fully-significant DE-specification margins, using the discrete-distribution rectangle formula (Equation~\ref{eq:copula_ll}) throughout. A joint-MLE refresh on the current sample landed (HPC job \file{joint\_hbcrash} 25558508; all three families converged; \cref{tab:joint_mle}).
+
+\subsubsection{Aggregate copula: reported estimation}
+
+The candidate aggregate-copula result is the stabilised IFM estimation on DE-specification margins with multi-start optimisation (retired \file{copula\_joe.tex}), fully significant for every family (all $p<0.001$, zero floored rectangle evaluations)---and it now counts as evidence: the identity check closed with gap $0.0$ (\cref{tab:copula_identity}), exonerating the rectangle path and attributing the $\approx$15{,}700 gap to margin reconstruction across package versions (see \S\ref{sec:limitations}). Rectangle joint-vs-independence LRs on common margins---aggregate and category-level---are therefore valid evidence; the affirmative legs are the encompassing test, cross-LGA transfer, EB screening, the (plain-NB) proportionality/transfer diagnostics, and the dependence LRs. The earlier condensed-margin IFM comparison (\file{tab\_copula\_ifm.tex}), the per-family diagnostic table (\file{hb\_bivariate\_copula.tex}), the provisional-generation joint-MLE comparison (\file{tab\_copula\_joint.tex}, \file{tab\_copula\_pred.tex}, \file{fig\_copula.tex}), and the refreshed comparison (\file{tab\_copula\_joint\_refreshed.tex}, converged=NA and built on a mixed likelihood scale) are retired from the main text and are not \texttt{\textbackslash input}. The pre-offset stabilised-IFM table (\file{copula\_joe.tex}) is likewise retired: \cref{tab:joint_hb_crash,tab:joint_linkage} show the exposure-offset IFM estimates instead, and the identity verdict has auto-populated below (\cref{tab:copula_identity}, landed 2026-09-20: gap $0.0$, rectangle path exonerated).
+
+\input{joint_hb_crash.tex}
+
+\input{joint_linkage.tex}
+
+% --- Auto-populated: run_copula_identity.pbs (identity-check resolution) ---
+\IfFileExists{copula_identity.tex}{\input{copula_identity.tex}}{%
+\begin{center}\fbox{\parbox{0.92\linewidth}{\textbf{TODO (pending \file{run\_copula\_identity.pbs}):} aggregate-copula verdict table withheld until the rectangle-vs-marginal identity gap ($\approx$15{,}700 log-points) is resolved. No rectangle LR is counted as evidence meanwhile.}}\label{tab:copula_joe}\end{center}}
+
+\FloatBarrier
+
+\subsubsection{Copula Structure Search and Conditional Crash Prediction}
+
+The joint structure search is run as a SparseEA-AGDS search over the $2 \times 30$ joint inclusion mask (HB mask plus crash mask), warm-started at the core-search best masks (HB 14 / crash 11) and scored on copula joint BIC with IFM margins (\file{eb\_searched\_rp.py} Part S; \cref{tab:eb_search_joint}). Each candidate mask is scored by refitting both fixed NB margins and re-optimising the copula dependence; score $=$ joint BIC with $k=k_1+k_2+1$ (minimum 2 variables per response). The shallow Joe run never beat its own warm start in 12 generations (warm-start joint BIC $160{,}522.0$ vs.\ best evolved $160{,}701.3$), so the search was deepened to 60 generations $\times$ 30 population and extended to the Gumbel family---upper-tail dependence, motivated by the Gaussian--Joe mixture win (HPC job \file{eb\_v154\_joint} 25455078, exit 0). Package updates shifted the joint-BIC scale between estimator versions---the identical warm-start masks score $161{,}442$ under metacountregressor 1.0.154 and $147{,}467$ under 1.0.177---so the deepened search was re-run on 1.0.177 (HPC job \file{eb\_v154\_joint} 26527757, exit 0; \cref{tab:eb_search_joint} shows the promoted winner). Gumbel again won decisively on the joint BIC: best $132{,}297.6$ (seed 44; HB 17 / crash 13) and $132{,}441.2$ (seed 45; HB 20 / crash 9), both well past the Gumbel warm start ($147{,}466.9$), versus Joe's best $135{,}987.7$ on the same engine---a $\approx$3{,}690-unit margin for the upper-tail family at equal parameter count (the earlier 1.0.154-scale comparison---Gumbel $160{,}023.3$/$160{,}058.6$ vs.\ Joe $160{,}439.4$---agreed on the ranking but is not comparable across engine versions). The joint masks remain large relative to the benchmark specifications (17--20 HB, 9--15 crash variables; raw joint BIC carries no per-coefficient significance penalty), so they are treated as searched structures and their significance-pruned refits are reported below (\cref{tab:joint_mask_hb,tab:joint_mask_crash}), not as final specifications. The provisional-generation SA search (10-variable NM / 9-variable crash masks, Kimeldorf--Sampson $\hat\theta=2.39$, joint BIC $109{,}170$ vs.\ independence $108{,}203$, LR$=-958.0$, $p=1.00$; Pearson $r$ $0.376$ marginal vs.\ $0.397$ copula-conditional) and the greedy-toggle refresh (\file{copula\_struct.tex}: $59.1$-unit joint-BIC gain from two added HB covariates, $\hat\theta_{\text{Joe}}$ flat) are superseded by this SparseEA search. The conditional predictor $E[Y_{\text{crash}} \mid Y_{\text{NM}}, \mathbf{X}]$ uses adaptive support $K$ (per-segment NB CDF $\geq 1-10^{-6}$, cap $K \leq 60$), with the earlier convergence trace retained in the supplement (\file{fig\_copula.tex}: single-run trajectory).
+% --- Auto-populated: SparseEA joint search (Part S deep + v154 Gumbel) ---
+\IfFileExists{eb_search_joint_best.tex}{\input{eb_search_joint_best.tex}}{%
+\begin{center}\fbox{\parbox{0.92\linewidth}{\textbf{TODO (pending joint structure search):} joint-mask table withheld until \file{eb\_search\_joint\_best.tex} lands (deep Joe $\times$2 seeds + v154 Gumbel $\times$2 seeds + Joe queued).}}\label{tab:eb_search_joint}\end{center}}
+
+% --- Auto-populated: Gumbel-s44 joint convergence (promoted winner) ---
+\IfFileExists{eb_search_convergence_joint_gumbel.png}{%
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\linewidth]{eb_search_convergence_joint_gumbel.png}
+  \caption{SparseEA-AGDS convergence on the Gumbel joint BIC (60 generations $\times$ 30 population, seed 44, metacountregressor 1.0.177): best-so-far, population mean/median, and min--max band with per-individual traces. Warm start $147{,}467$ $\to$ searched $132{,}298$ (HB 17 / crash 13).}\label{fig:eb_joint_conv}
+\end{figure}}{}
+
+% --- Auto-populated: run_joint_mask_refit.pbs (pruned joint-mask coefficients) ---
+% To queue: qsub run_joint_mask_refit.pbs
+\IfFileExists{joint_mask_refit_hb.tex}{\input{joint_mask_refit_hb.tex}}{%
+\begin{center}\fbox{\parbox{0.92\linewidth}{\textbf{TODO (pending \file{run\_joint\_mask\_refit.pbs}):} pruned coefficient tables for the Gumbel joint masks (backward elimination to $p<0.10$) will appear here once the refit lands; the search itself records masks and BIC only, no coefficients or thetas.}}\end{center}}
+\IfFileExists{joint_mask_refit_crash.tex}{\input{joint_mask_refit_crash.tex}}{}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.7\linewidth]{eb_search_convergence_joint.png}
+  \caption{SparseEA-AGDS joint structure search convergence: best Joe-copula joint BIC versus generation, warm-started at the DE masks (HB 14 / crash 11).}\label{fig:joint_search_conv}
+\end{figure}
+
+\FloatBarrier
+
+\paragraph{Joint HB--crash run (VMT-years offset).} A companion joint pipeline refits the best-spec margins (HB 14, crash 10) under an exposure offset in VMT-years ($\log$ length $+$ $\log$ AADT $+$ $\log$ years) and re-estimates IFM dependence plus a joint-MLE pass (\file{joint\_hb\_crash.py}, HPC job \file{joint\_hbcrash} 25363153, exit 0; \cref{fig:joint_hbcrash}). Under this offset the single families collapse entirely ($\Delta$BIC $=+$3--4M with $\approx$2{,}300--3{,}200 floored rectangle evaluations each); only the Gaussian--Joe mixture survives ($\Delta$BIC $=-11{,}753$, LR $=11{,}780.9$, weight $0.91$ on Gaussian $\rho=0.61$), with residual Spearman $\rho=0.304$ ($p<10^{-228}$). The joint-MLE refresh with standardized regressors (HPC job 25558508) converged for all three families---Frank $\hat\theta=6.39$, Gaussian $\hat\rho=0.88$, Kimeldorf--Sampson $\hat\theta=1.77$, all $p=0$ (\Cref{tab:joint_mle})---so the joint estimates corroborate the mixture finding on this offset. Because the offset differs from the reported $\log$-length fits, these margins (HB LL $=-49{,}473.7$, crash LL $=-17{,}837.1$) are not comparable to the main-text fits; the run is descriptive and carries the same rectangle-identity caveat as above.
+
+\input{fig_joint.tex}
+
+% --- Auto-populated: joint-MLE refresh (package-native BivariateCopulaNB) ---
+% To queue: qsub -v JOINT_ARGS="--joint-mle" run_joint_hb_crash.pbs
+\IfFileExists{joint_mle.tex}{\input{joint_mle.tex}}{%
+\begin{center}\fbox{\parbox{0.92\linewidth}{\textbf{TODO (joint-MLE refresh not yet queued):} the package-native joint-MLE table (margins $+$ dependence estimated together) will appear here once \file{qsub -v JOINT\_ARGS="--joint-mle" run\_joint\_hb\_crash.pbs} lands and at least one family converges; non-converged runs are withheld by design.}}\end{center}}
+
+\FloatBarrier
+\begin{equation}
+E[Y_{\text{crash}} \mid Y_{\text{NM}} = y_1,\, \mathbf{X}]
+= \sum_{k=0}^{K} k \cdot \frac{P(Y_{\text{NM}}=y_1, Y_{\text{crash}}=k \mid \mathbf{X})}{P(Y_{\text{NM}}=y_1 \mid \mathbf{X})},
+\end{equation}
+where $K$ truncates the crash-count support of the conditional mean as described above.
+
+\subsubsection{Extended copulas: Joe family, parameterized dependence, random margins}
+
+The nominal pre-offset re-estimates (retired \file{copula\_joe.tex}, summarised here for the record) would, taken at face value, have reversed the aggregate null: Kimeldorf--Sampson nominally best ($\Delta$BIC$=-3{,}934$, LR$=3{,}943.0$), followed by Frank ($\Delta$BIC$=-3{,}687$) and Gaussian ($\Delta$BIC$=-3{,}100$), all nominal $p<0.001$ with zero floored rectangle evaluations. The Joe-family extensions pointed the same way (single-parameter Joe $\Delta$BIC$=-2{,}206$; Gaussian--Joe mixture $\Delta$BIC$=-3{,}086$; parameterized Joe $\Delta$BIC$=-2{,}235$; RP-margins mixture $\Delta$BIC$=-948$). The $-118{,}000$ rows from the earlier run are attributable to roughly 86 extreme observations whose CDF evaluations underflowed to the $10^{-300}$ floor, not to model fit. Nevertheless, because the independence-rectangle identity still fails by $\approx$15{,}700 log-points on this sample, none of these nominal LRs is counted as evidence; the exposure-offset estimates in \cref{tab:joint_hb_crash} supersede them (single families collapse at $\Delta$BIC $=+$3--4M; only the Gaussian--Joe mixture survives at $\Delta$BIC $=-11{,}753$).
+
+% (Table shown at first mention above; duplicate input removed)
+
+% --- Supplement-only HPC outputs (kept out of the main text for consistency) ---
+% The retired tables (copula_joe.tex, copula_struct.tex, tab_mcr.tex),
+% random-parameter and tier copula tables (copula_rp_all.tex,
+% copula_tiers.tex), and the retired Bayesian pilot compilations (old
+% $n=169$ / $n=156$ tables) are held in the supplement: they use superseded
+% searches, mixed likelihood scales, underflow-dominated rectangle
+% evaluations, or pilot subsamples, and are not on the reported scale.
+
+\FloatBarrier
+
+\subsection{Severity-Category Dependence, Latent Risk, and Spatial Transferability}\label{sec:hbcat-results}
+
+A bivariate latent-risk check correlates hard-braking and crash residuals after removing geometry-driven variation: the raw Spearman correlation ($\rho=0.251$) falls to a partial $\rho=0.147$ once geometry is partialled out ($p \approx 2.5\times10^{-53}$)---positive evidence of shared unobserved risk, but limited in magnitude.
+
+\input{hb_bivariate_latent.tex}
+
+\FloatBarrier
+
+
+Decomposing hard braking by severity tier nominally reverses the aggregate copula verdict: per-category Kimeldorf-copula estimates reject independence for every tier---Candidate, Critical-Likely and Extreme (LR$=4{,}138.8$, $1{,}666.9$ and $100.5$, respectively), all nominal $p<0.001$ (\cref{tab:cat_copula})---and with the rectangle machinery now validated (\cref{tab:copula_identity}), they count as evidence. Severity-stratified hard-braking counts therefore carry dependence information that aggregate counts obscure; the aggregate null reflects dilution across heterogeneous tiers rather than an absence of shared signal. The Candidate-tier margin is fully significant as reported; the Critical-Likely margin retains one borderline term (Intersection Present, $p=0.088$, retained under the $p<0.10$ penalised-BIC rule) and the Extreme-tier margin (only $N=384$ events) is \emph{not} fully significant as currently estimated (six of ten covariates $p>0.10$) and is therefore retired from the main text pending the significance-pruned refit in \file{run\_refit\_significant.pbs} (backward elimination to $p<0.10$, expected 3--4 retained covariates). The full category-level coefficient tables (\file{hb\_category\_hb\_candidate.tex}, \file{hb\_category\_hb\_critical.tex}, \file{hb\_category\_hb\_extreme.tex}) are moved to the supplement; only the copula-dependence summary is reported here.
+
+\input{hb_category_copula.tex}
+
+% --- Auto-populated: run_refit_significant.pbs (tier refits) ---
+\IfFileExists{hb_category_hb_extreme_refit.tex}{\input{hb_category_hb_extreme_refit.tex}}{}
+
+With the rectangle identity verified (\Cref{tab:copula_identity}), the Gaussian--Joe mixture by tier can be reported as evidence (\Cref{tab:copula_tier_mix}): Candidate $\Delta$BIC$=-11{,}801$ (LR$=11{,}828.9$), Critical-Likely $\Delta$BIC$=-6{,}236$, Extreme $\Delta$BIC$=-709$ (LR$=736.6$), all $p<0.001$ with converged optimizations. Dependence attenuates with severity while remaining decisive at every tier; the Extreme row inherits its margin's significance caveat above.
+
+\input{copula_tier_mix.tex}
+
+\FloatBarrier
+\IfFileExists{hb_category_hb_critical_refit.tex}{\input{hb_category_hb_critical_refit.tex}}{}
+
+\FloatBarrier
+
+
+Leave-one-LGA-out spatial transferability of the crash specification is poor (mean transfer index TI $=-2.116$): the crash model is region-specific. Yet substituting the hard-braking signal improves out-of-sample crash log-likelihood in 9 of 11 LGAs (mean $\Delta$LL $=+61.5$)---the hard-braking proxy travels across regions better than the crash model it augments.
+
+\input{hb_transferability.tex}
+
+\FloatBarrier
+
+
+\subsection{Spatial Association Between Hard Braking and Crashes}\label{sec:crossk-results}
+
+The diagnostics above treat the two responses as attributes of segments. \citet{Park2023Heinrich} argue that Heinrich's law makes a stronger claim---that near-misses and crashes share underlying locational risk factors---and test it as a spatial-association question. That claim is examined here in three steps: the frequency ratio, the rank concordance of hot segments, and a location test on the road network.
+
+At the network scale the frequency side is unambiguous: the 1,415,932 segment-assigned hard-braking events accompany the 19,716 recorded crashes, i.e.\ 71.8 hard-braking events per recorded crash. The ratio is not horizon-matched---one telematics year against a multi-year crash average---so it is an order-of-magnitude statement rather than a calibrated pyramid ratio, but it confirms that the event layer is nearly two orders of magnitude richer than the crash layer.
+
+The rank concordance is the practically relevant part. Ranking all 10,780 segments by hard-braking count alone---an ordering that never sees a crash---places 36.7\% of all observed crashes in the top decile (1,078 segments), a lift of 3.67 over the network mean; the top 5\% carries 24.6\% of crashes (lift 4.93) and the bottom decile 5.4\%. Of the 4,404 segments recording at least one crash, 3,930 (89.2\%) also carry hard-braking events, so the concordance is not carried by a handful of shared sites. For comparison, the Empirical-Bayes posterior ranking of \S\ref{sec:risk-cal} captures 63.1\% of crashes (lift 6.31) but consumes the observed crash counts themselves, while the geometry-only prior-mean model reaches 4.63 on the same decile-lift definition. A ranking built from the event layer alone, with no crash input of any kind, therefore recovers roughly four-fifths of the screening power of the geometry-based model.
+
+\IfFileExists{network_cross_k.tex}{%
+Rank concordance does not by itself establish co-location, so the location test is run directly. Each located segment carries two marks---its hard-braking rate $w_i^{(1)}$ and its crash rate $w_i^{(2)}$, both expressed per unit of exposure (vehicle-kilometres of daily traffic in the reported specification, or telemetry GPS points where a fleet exposure surface is available)---and the two patterns are compared along the road network rather than across straight lines. Normalising by exposure is what makes the test a statement about co-located \emph{risk} rather than about co-located traffic: with raw counts, any two responses that both scale with volume will appear spatially associated, which is precisely the confound this specification removes (the raw-count variant is retained as a robustness check). Segments are snapped to the nearest node of an OpenStreetMap graph of the study area (277,799 nodes and 349,017 edges, total length 50,786 km); the median snap error is 44 m, and the 8,979 segments within 250 m of the graph are retained (87.2\% of the located sample). The marked cross-$K$ function is
+\begin{equation}
+  K_{12}(r) = \frac{L_{\text{net}}}{N_1 N_2}\sum_{i}\sum_{j\neq i} w_i^{(1)} w_j^{(2)}\,\mathbf{1}\{d^{\text{net}}_{ij}\le r\},
+\end{equation}
+where $d^{\text{net}}_{ij}$ is the shortest-path distance between snapped segments, $L_{\text{net}}$ the total network length and $N_k=\sum_i w_i^{(k)}$; lags run from 0.25 km to 5 km. Inference follows the random-labelling logic of \citet{Park2023Heinrich} and \citet{Baddeley2021AnalysingNetworks}: crash counts are permuted across segment locations 499 times, holding the hard-braking surface and the crash-count distribution fixed, so the null is exactly that crashes sit where they sit for reasons unrelated to the hard-braking surface. Because the observed curve and every simulated curve are computed by the identical estimator without edge correction, edge bias cancels in the comparison and the statistic is read only against its envelope, never against $\pi r^2$. Because both responses concentrate in the urban core, a cumulative statistic of this kind rises with $r$ under pure heterogeneity even when no local co-location exists, and on a linear network the planar $\pi r^2$ baseline does not apply; the curve is therefore summarised as its deviation $K_{12}(r)-E_{\text{perm}}[K_{12}(r)]$ from the random-labelling expectation, the reported decision is taken at a pre-specified 1-km lag, and a sup-test over all lags is reported alongside as a global check. A curve above the envelope means crashes cluster around hard-braking mass beyond chance; a curve inside it means the two patterns are no more co-located than their marginal distributions imply. \Cref{tab:crossk} reports each severity tier and \Cref{fig:crossk} shows the curves.
+
+\input{network_cross_k.tex}
+
+\input{fig_network_cross_k.tex}
+
+Because the result depends on how segments are snapped to the graph and on how complete that graph is, the two are examined separately. \Cref{tab:crossk-sens-tol} varies the snap tolerance from 50\,m to no limit with the graph held fixed, so each row differs only in location error and in how many segments survive it. \Cref{tab:crossk-sens-graph} freezes the segment sample---to the segments that lie within the tolerance of \emph{every} graph, so no distance is measured from a displaced location---and changes only the network on which those distances are computed, from the full street graph down to motorways and tertiaries, so each row differs only in network completeness (and in the longer detours a sparser graph forces).
+
+\input{network_cross_k_sensitivity.tex}
+}{}
+
+Table~\ref{tab:synthesis} tallies the full diagnostic battery into affirmative (PRO) and negative (CON) evidence: nine affirmative (one weak) against five negative, with no pending checks (identity holds). The combined picture supports hard braking telematics as an informative complementary signal for crash-risk screening (encompassing test, category-level dependence, cross-LGA risk transfer) rather than as a structural surrogate for calibrated crash-count models.
+
+\input{hb_synthesis_evidence.tex}
+
+\FloatBarrier
+
+
+\input{eb_results.tex}
+
+\paragraph{Searched-specification priors (reported).} Re-estimating the EB prior-mean models on the searched condensed specifications (crash 8 vars, hard braking 10 vars) gives fully-significant priors (every $p\leq0.020$; \cref{tab:eb_spf_searched}), unlike the exhaustive 30-variable priors above. Shrinkage behaviour from the searched priors is shown in \cref{fig:eb_searched_screening} (HPC job \file{eb\_searched\_rp} 25393543, exit 0). The companion random-parameter check on the same searched specs rejects both random fits under the significance gate (HB: 0/2 SDs at $p<0.10$ with degenerate means; crash: same plus dispersion $p=0.12$; \file{eb\_searched\_verdict.csv}), while the fixed-vs-random likelihood ratios remain decisive (HB LR $=2{,}138.8$, crash LR $=1{,}220.8$, both $p<0.001$)---heterogeneity is present but no random specification is reportable. The random-SD forest plots (\cref{fig:eb_searched_sds}) show why: every 90\% interval crosses zero. Per the best-models-only rule no fixed-vs-random comparison table is shown (\file{eb\_searched\_rp.tex} retired to the supplement); the structured random-parameter pilot (heterogeneity-in-means/variances and GSE scores; HPC jobs \file{gse\_rp\_pilot} 25813910/25868424) landed with all 8 arms REJECT, confirming that no admissible random specification exists (see \S\ref{sec:limitations}).
+
+\input{eb_searched_spf.tex}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\linewidth]{eb_searched_screening.png}
+  \caption{EB shrinkage from the searched-specification prior means: (a) prior-reliability weight distribution; (b) EB posterior vs.\ observed crashes; (c) EB posterior vs.\ searched prior-mean prediction. (In-figure panel titles carry the legacy ``SPF'' label.)}\label{fig:eb_searched_screening}
+\end{figure}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=0.49\linewidth]{eb_searched_rp_sds_HB.png}
+  \includegraphics[width=0.49\linewidth]{eb_searched_rp_sds_Crash.png}
+  \caption{Random-parameter standard deviations on the searched specs with 90\% intervals (general SEs): hard braking (left) and crashes (right). Every interval crosses zero---the visual counterpart of the REJECT verdicts; no random specification is reported.}\label{fig:eb_searched_sds}
+\end{figure}
+
+\FloatBarrier
+
+\subsubsection{Risk-Level Screening Calibration}\label{sec:risk-cal}
+
+As a practical screening validation conducted directly on risk levels---rather than on raw event counts---segments were ranked by the EB crash-risk posterior and grouped into deciles (\cref{tab:risk_cal}). The gradient is strictly monotone: the riskiest tenth (D10) carries a $6.31\times$ lift over the network average and captures $63.1\%$ of all observed crashes, while the safest tenth captures $0.4\%$; the predictive-accuracy index reaches $\mathrm{PAI}=9.40$ for the top $5\%$ of segments. Rank-level agreement with observed counts is $\rho=0.699$, the OLS calibration slope is close to ideal ($1.072$), and calibration-in-the-large is $1.237$---the expected mild under-prediction from shrinkage toward the prior. Two caveats keep this honest: it is an \emph{in-sample} screening validation (the posterior incorporates the observed count at average weight $\approx0.29$), and its purpose is site-ranking, not magnitude forecasting. Its diagnostic value lies in the comparison against the unshrunk prior-mean model: ranking improves from $\rho=0.487$ to $0.699$ and $\mathrm{PAI}_{10}$ from $4.63$ to $6.31$, quantifying how much information the observed-count update---and, through the HB prior mean, the telematics layer---adds to pure geometric prediction. (These NB count regressions serve as EB shrinkage priors; they are not Highway Safety Manual--style SPFs, which predict reference-condition crashes from AADT and length with CMF adjustments.)
+
+\input{risk_calibration.tex}
+
+\FloatBarrier
+
+
+\subsubsection{Out-of-Sample Robustness and Magnitude Forecasting}\label{sec:oos}
+
+Both caveats can be bounded further with designs that local models permit. First, re-estimating the prior-mean model and its dispersion on training folds only (5-fold cross-fitting) and forming posteriors solely for held-out segments leaves the ranking conclusions intact out-of-sample ($\rho=0.887$, $\mathrm{PAI}_{10}=6.59$, CITL$=0.955$; \cref{tab:oos}): the calibration result is not an artefact of prior estimation. What cannot be designed away is the own-count update itself---it defines EB screening---and with fitted dispersion $\hat\phi\approx38$, the average posterior weight on the prior is only $0.20$ (just $14\%$ of segments are prior-dominated): posterior rankings are necessarily led by observed counts where they exist, while the prior layer carries the ranking for the vast low-count bulk.
+
+Second, magnitude forecasting requires dedicated calibrated count models rather than the posterior. Out-of-sample, Poisson and train-fold-recalibrated NegBin forecasters attain CITL$=1.00$--$1.04$, but per-segment RMSE remains above even a global-mean baseline (RMSE $11.2$ vs $5.0$; MAE $2.32$ vs $2.40$) because crash counts are extremely heavy-tailed---the top decile holds $63\%$ of events---so squared-error skill at segment level is unattainable from cross-sectional covariates alone. The practical resolution of both caveats is therefore a division of labour: use the EB layer for site ranking and priority ordering, where it demonstrably excels, and report magnitudes as calibrated network- or stratum-level aggregates rather than per-segment point forecasts.
+
+\input{oos_validation.tex}
+
+\FloatBarrier
+
+
+\subsection{Time-Based Hard-Braking Risk Model and Intervention Scheduling}\label{sec:time-model}
+
+The 2.5 million timestamped hard-braking events support a temporal complement to the segment count models: an exposure-normalised hour-by-weekday risk index
+\begin{equation}
+  r_{dh} = 10^4 \times \frac{N_{dh}}{P_{dh}},
+\end{equation}
+where $N_{dh}$ is the number of hard-braking events and $P_{dh}$ the GPS point exposure in hour $h$ of day-of-week $d$. Normalising by exposure is what makes the index interpretable as per-vehicle risk rather than traffic volume. \textbf{Value in one sentence:} it tells operators \emph{when} to intervene---patrols, variable-message signs, or variable speed management buy the most risk reduction on weekends 09:00--16:00 (Figure~\ref{fig:hb_time_heat}). The 16 priority cells (top decile of 168) are all Sat/Sun 08:00--16:00 and capture $10.8\%$ of events; the full 168-cell heatmap is retained in the supplement as \file{hb\_time\_intervention\_heatmap.png}.
+
+\input{fig_time_heat.tex}
+
+\FloatBarrier
+
+Two properties make this temporal model operationally useful rather than merely descriptive. First, it is \emph{threshold-robust}: the diurnal shape computed under the Candidate severity thresholds correlates at Spearman $\rho=0.98$ with the shape obtained from an independently computed $-0.30g$ scan, so intervention schedules keyed to the index do not hinge on the exact detection threshold. Second, its deployment is \emph{gated on the transferability evidence} of \S\ref{sec:hbcat-results}: because the hard-braking proxy improves out-of-sample crash log-likelihood in 9 of 11 leave-one-LGA-out LGAs (mean $\Delta$LL $=+61.5$) with stable coefficients (median $|\text{mean}|/\text{SD} = 7.2$), the transferability-gated scheduler activates and allocates the top-decile cells as priority intervention windows---enhanced enforcement, variable message signage, or variable speed management---with window-hours distributed across regions in proportion to the hard-braking proxy's transfer gain (\Cref{tab:hb_time_intervention}). A volume-weighted variant of the same ranking, which targets absolute event mass rather than per-exposure risk, captures $26.8\%$ of events in the same 16 cells and is available to operators budgeting enforcement hours.
+
+The temporal model is deliberately positioned as a screening-schedule layer, comparable in spirit to the Empirical-Bayes segment ranking of \S\ref{sec:eb} rather than to the crash-frequency models of \S\ref{sec:model-comparison-local}: validating genuine time-of-day crash prediction would require timestamped crash records, which the aggregate multi-year segment counts used here do not provide (\S\ref{sec:limitations}). Within that scope, the index demonstrates that the telematics layer extends beyond static segment screening to time-targeted intervention---the practical payoff of the transferability finding that hard-braking risk, unlike the calibrated crash model, travels across regions.
+
+\input{hb_time_intervention.tex}
+
+\subsection{Temporal stability of the telematics panel}\label{sec:temporal-stability}
+
+Because the hard-braking panel is timestamped (January 2025--March 2026), its generating process can be tested for stability directly---something the time-averaged crash counts do not permit. Grid-cell HB counts by calendar quarter (\Cref{tab:temporal_stability}) reject exact stability (Chow-type LR$=28.7$, $df=8$, $p<0.001$; quarter-dummy LR$=25.4$, $p<0.001$), but the magnitudes are modest: quarterly mean cell counts move between 520 and 597 with the soft 2026Q1 reading, while the dispersion is essentially constant ($\hat\alpha$ between 4.69 and 4.82 across all five quarters). Active cell coverage grows monotonically (8,501 to 9,938 cells) as the telematics fleet expands, so part of the detected drift is exposure growth rather than behavioural change. The practical implication is that pooled estimation is mildly misspecified but the NB dispersion structure---the quantity that governs shrinkage and screening---is stable across the window.
+
+\input{temporal_stability.tex}
+
+\FloatBarrier
+
+\subsection{Key Findings}
+
+\Cref{tab:best_models_summary} consolidates the full model-fit and proxy-validity evidence.
+
+\input{best_models_summary.tex}
+
+\FloatBarrier The partial residual correlation after controlling for geometry is small but clearly positive (partial $\rho=0.147$, $p<0.001$). The stabilised aggregate-copula estimation on DE-specification margins (retired \file{copula\_joe.tex}; e.g.\ Kimeldorf--Sampson $\Delta$BIC$=-3{,}934$, LR$=3{,}943.0$, nominal $p<0.001$) counts as evidence: the identity check closed with gap $0.0$ (\cref{tab:copula_identity}), so all rectangle-based dependence LRs on common margins are valid. Category-level dependence estimates (\cref{sec:hbcat-results}) share the validated machinery.
+
+Weighing the full diagnostic battery together (\cref{tab:synthesis,tab:best_models_summary}: nine affirmative (one weak) vs.~five negative checks, no pending), the evidence supports hard braking as a valid complementary \emph{screening} signal but not as a structural surrogate endpoint for crash-based models. The encompassing test is affirmative and highly significant (LR$=148.9$, $p<0.001$; $\Delta$BIC$=-139.6$), as is the gain from adding the hard-braking proxy to the crash model across LGAs (9 of 11 LGAs, mean $\Delta$LL $=+61.5$); category-level copula dependence is affirmative under the validated rectangle (\cref{tab:copula_identity}). Against this: the feature-overlap Jaccard index between the final hard-braking and crash specifications is low ($J=0.27$); full-model coefficient proportionality is moderate ($r=0.69$, $R^2_{\text{prop}}=0.48$), although the searched unequal-dispersion specification achieves essentially proportional coefficients ($r=1.00$); the specification-transfer penalty is large (+71.1 BIC transferring HB features to crashes, +401.1 in the reverse direction); the shared-latent-risk partial correlation is weak ($\rho=0.147$); and the aggregate copula verdict is affirmative (mixture $\Delta$BIC $=-11{,}753$; \cref{tab:joint_hb_crash}). Across these experiments, hard braking data does capture crash-relevant information not in geometry alone---per the encompassing test and the $\approx$140 BIC-unit gain reported there---but the structural data-generating processes differ enough that hard-braking models complement rather than replace crash-count models. Independently of the proxy-validity verdict, both responses exhibit strong, statistically significant unobserved heterogeneity across segments, and accounting for coefficient heterogeneity matters when calibrating such models.
+
+% ---------- Discussion ----------
+\section{Discussion}\label{sec:discussion}
+
+The 176-unit BIC improvement from adding predicted hard braking to the crash geometry specification represents strong statistical evidence that telematics data capture safety-relevant information beyond  variables traditionally considered for this type of analyses.
+
+Several mechanisms may explain this relationship. First, unlike geometry characteristics which may influence behaviour, hard braking frequency is a direct consequence of drivers actions and traffic flow dynamics (e.g., following distances, speed variability). Second, the spatial distribution of hard braking may reveal sites with potential for safety improvements where latent risk factors (e.g., poor sight distance, confusing signage) create conflict-prone conditions before they manifest as crashes. Third, the per-kilometer event rate normalizes for segment length, isolating the density of safety-critical events independently of exposure.
+
+The bivariate latent risk analysis (\cref{sec:hbcat-results}) provides a more qualified picture than the headline BIC gain might suggest: after both responses are regressed on the same 30 geometry variables, their residual dependence is positive but small (partial $\rho=0.147$). The stabilised aggregate-copula estimation on DE-specification margins is affirmative under the validated rectangle (\cref{tab:copula_identity}), as are the per-category dependence estimates (\cref{sec:hbcat-results}). The copula-conditional crash predictor $E[Y_{\text{crash}} \mid Y_{\text{NM}}, \mathbf{X}]$ shows a small gain in correlation and RMSE over the marginal model, so the coupling carries practical value alongside its statistical basis. The proxy variable analysis as a whole reveals that near-misses and crashes have distinct optimal geometric predictors (Jaccard $=0.27$ on final specifications, coefficient correlation $r=0.69$) with a large specification-transfer penalty (+236.1 BIC units symmetric), while three strands of evidence---the encompassing test, category-level copula dependence, and cross-LGA risk transfer---are affirmative (see \Cref{tab:best_models_summary} for the full diagnostic tally). This \emph{complementary but not surrogate} relationship---hard-braking counts add explanatory power (the $\approx$140 BIC-unit gain in the encompassing test) without sharing the crash model's structural form---is the key empirical finding, and is consistent with the mixed verdict in Table~\ref{tab:synthesis}.
+
+A second, independent finding from this run is that both hard braking and crash risk exhibit strong unobserved heterogeneity across segments. The random-parameters NB analysis shows that allowing the metatheuristic-identified terms to vary randomly across segments improves fit substantially for both responses (both improvements overwhelmingly significant)---but no admissible random-parameter specification survived significance gating (all structured arms including GSE rejected; estimation closed---see \S\ref{sec:limitations}). This heterogeneity is orthogonal to the proxy-surrogacy question---it says nothing about whether hard-braking counts predict crashes---but it is methodologically important: conventional fixed-parameter NB count models implicitly assume a single effect for each geometry variable that is constant across road segments. This analysis shows that assumption is violated for a substantial share of the variables retained by the structure search, including random-correlated blocks for both responses (Table~\ref{tab:eb_mcr_roles}).
+
+The dominance of the reference count model highlights a fundamental tension in safety modeling: calibrated crash-frequency count models benefit from decades of calibration, professional engineering judgment, and the intrinsic property that their reference predictions are, by construction, correlated with observed crashes. Telematics-augmented models, while promising and demonstrably informative beyond geometry alone, do not close that gap and cannot yet substitute for traditional calibrated count models.
+
+\subsection{Limitations}\label{sec:limitations}
+
+Several limitations warrant acknowledgment. The telematics observation window (calendar-year 2026, dominated by an intensive March 2026 collection period) is relatively short compared with the five-year crash averaging period, so hard-braking counts and crash counts are not measured over matching horizons; multi-year telematics panels would increase statistical power. The telematics sample derives from commercial fleet vehicles, which may not represent the general vehicle population. Spatial matching was performed on a pre-integrated dataset; the methodology does not account for potential endogeneity between hard braking frequency and crash occurrence (e.g., segments with known hazards may attract both more cautious driving and more crashes). The spatial-association test (\S\ref{sec:crossk-results}) measures distance along an OpenStreetMap road graph rather than by straight line, which respects rivers, motorway interchanges and one-way detours, at the price of depending on the graph's coverage and on node-level snapping (median error 44~m; segments more than 250~m from the graph are excluded, so 87\% of the located sample is analysed). Its 474 crash-bearing segments with no telematics coverage enter the frequency and rank comparisons but not the location test, and because the graph is a public extract rather than the agency's own network, the curve is read against its random-labelling envelope rather than as definitive travel distances. The four curvature alignment categories (moderate, sharp, very sharp, and the reference category, straight) are mutually exclusive and exhaustive, so the straight-alignment category was omitted to avoid perfect multicollinearity with the model intercept; curvature coefficients are interpreted relative to straight road alignment.
+
+Two further limitations relate specifically to the expanded proxy-analysis framework introduced in this paper. First, the metaheuristic role search (\cref{sec:mcr-results}) was re-estimated beyond its 4,000-row subsample as a deep MCR search on the SparseEA-searched specs (3 starts, $N=3{,}000$ subsample; \cref{tab:eb_mcr_roles}), with a version-clean repeat on metacountregressor 1.0.154 landed (HPC job \texttt{eb\_v154\_mcr} 25455077); while the resulting variable sets were re-validated as fully-significant fixed-effect refits on the full sample (\cref{tab:pruned_specs}), the subsample-based BIC values used to select the role assignment are not directly comparable to the full-sample figures reported elsewhere and the role search itself was not repeated on the full data. Second, no SA-with-restarts search is reported: prior-generation SA subsets, the provisional joint-MLE copula blocks, and the unrestricted random-parameter coefficient tables are retired to the supplement (not \texttt{\textbackslash input} in the main text). The joint structure search is now a SparseEA-AGDS search over the joint mask on the current 10,780-segment sample (shallow Joe plus Gumbel $\times$2 seeds and Joe, re-run on metacountregressor 1.0.177 after the engine shift, HPC job \file{eb\_v154\_joint} 26527757; \cref{tab:eb_search_joint}). The remaining queued HPC work therefore consists of strict refits on the current 10,780-segment sample---a significance-constrained random-parameter structure search (\file{run\_refit\_significant.pbs}, landed), a GSE structured random-parameter pilot with heterogeneity-in-means/variances and gradient-score terms (\file{run\_gse\_rp\_pilot.pbs}, landed, all arms REJECT), a joint-MLE copula refresh (landed: all three families converged; \cref{tab:joint_mle}), and a significance-pruned Extreme-tier refit (landed)---plus the fully Bayesian PyMC refit (\file{run\_bayes\_hb\_crash.pbs}, landed 2026-10-14: all parameters converged, $\hat R=1.0$, bulk ESS $\geq$4{,}000; \cref{tab:bayes_hb,tab:bayes_crash}), with the fully-significant fixed-effect condensed specifications (\cref{tab:pruned_specs}) and DE benchmarks (\S\ref{sec:de-results}) serving as the reported models in the interim. The Poisson-versus-NB and functional-form comparisons are now reported locally (\cref{sec:model-comparison-local}). Third, the copula anomaly---tail underflow plus a $\approx$15{,}700 independence-rectangle gap---is now resolved as two separate findings (\cref{tab:copula_identity}, landed 2026-09-20). The rectangle path is exonerated: exact, pmf-product, and CDF-rectangle likelihoods coincide to the decimal (gap $0.0$), so rectangle joint-vs-independence comparisons on common margins are valid evidence---covering the exposure-offset mixture ($\Delta$BIC $=-11{,}753$), the category-tier LRs, the Gumbel joint search, and the converged joint MLE. The 15{,}700 gap was margin reconstruction across package versions (suspected scipy \texttt{nbinom} inaccuracy at $r=1/\alpha\ll1$, i.e.\ $\alpha\approx69$ for hard braking), not a rectangle fault; cross-comparisons against externally fitted marginal LLs remain invalid. What stands as genuine tail behaviour is the single-family underflow itself: thousands of floored rectangle evaluations per family on the exposure offset, with only the mixture surviving. \file{run\_copula\_refresh.pbs} already ran but is superseded by the converged package-native joint MLE (\cref{tab:joint_mle}). The EB SPF exhaustive baseline (\file{eb\_results.tex}) retains insignificant covariates by construction and is read as a descriptive shrinkage prior, not a selected model; its significance-pruned counterpart landed in \file{run\_eb\_searched\_rp.pbs} (\cref{tab:eb_spf_searched}).
+
+% ---------- Conclusions ----------
+\section{Conclusions}\label{sec:conclusions}
+
+This study provides rigorous statistical evidence that telematics-derived hard braking metrics significantly improve crash frequency prediction at the road-segment level, adding $\approx$140 BIC units of explanatory power beyond the road geometry specification alone (via the encompassing test; see \Cref{tab:best_models_summary} for the full model-fit and proxy-validity summary). Strong, highly significant overdispersion across all fixed-effects specifications supports the Negative Binomial form over Poisson. The single-run GA specification search identifies parsimonious feature subsets and parameter-role assignments (fixed vs.\ random) that match or improve the fit of the exhaustive 30-variable models using fewer parameters.
+
+The expanded proxy-validity analysis conducted in this paper, now including the SparseEA joint structure search (\cref{tab:eb_search_joint}), a test of random-parameters heterogeneity, exposure-offset copula estimation with the joint-MLE refresh landed, a severity-category decomposition, and a spatial-transferability assessment, revises the study's earlier assessment: hard braking telematics is best characterised as an informative complementary signal with its own model structure, one that cannot directly replace the calibrated crash-modelling process.
+The encompassing test remains the strongest piece of affirmative evidence---joined now by cross-LGA risk transfer and the validated dependence LRs (aggregate mixture, category tiers, joint MLE)---while coefficient proportionality, feature overlap, specification transfer, and the aggregate residual correlation point to distinct underlying data-generating processes for hard braking and crash counts. At the same time, both responses show strong, statistically significant coefficient heterogeneity across segments (Random Parameters NB, with random-correlated blocks selected for both responses; Table~\ref{tab:eb_mcr_roles}), indicating that unobserved segment-level variation---not captured by models with fixed-parameters and road geometric factors or the copula link between the two responses---is an important feature of this dataset in its own right.
+
+From a practical standpoint, while hard braking telematics data cannot currently replace calibrated crash-frequency count models, and the evidence that it can substitute for crash data specifically is weaker than previously assessed, it still provides valuable complementary information (via the encompassing test and the $\approx$140 BIC-unit gain when used alongside traditional road safety variables). Road authorities should consider incorporating telematics-derived hard braking metrics into safety management systems as a continuously updating risk-monitoring layer that augments, rather than replaces, traditional crash-based analysis, and should account for coefficient heterogeneity across segments when calibrating such models. Temporal extension is operationalised directly on the existing telemetry (\S\ref{sec:time-model}): the exposure-normalised hour-by-weekday risk index constructed from the $2.5$ million timestamped events is threshold-robust (diurnal shapes correlate at Spearman $\rho=0.98$ between the Candidate thresholds and an independently computed $-0.30g$ scan), concentrates roughly $10.8\%$ of events in the top tenth of the 168 hour-by-weekday cells, and shows mild per-exposure elevation on weekends (weekday/weekend ratio $0.83$); because the hard-braking proxy is transferable across regions, these cells convert directly into a transferability-gated time-based intervention schedule, though validating genuine time-of-day crash-count prediction still requires timestamped crash records rather than the aggregate multi-year segment counts available to this study. Future research should therefore pair timestamped crash databases with the telematics panel in segment$\times$period Negative Binomial specifications, extend the temporal coverage beyond the intensive March 2026 collection window, improve representation of the vehicle fleet, resolve the copula estimation anomaly identified above, repeat the mixed-logit structure search on the full sample as computational resources allow, explore panel-data specifications that exploit within-segment variation over time, and extend the structure search to the latent-class membership and zero-inflation roles supported by the underlying role-coding scheme but not pursued in this study (\S\ref{sec:mathprogram}).
+
+\textbf{Scope note.} The latent-class membership roles ($r_j \in \{7,8\}$) and the zero-inflation role ($r_j = 6$) supported by the general \texttt{metacount\allowbreak regressor} role-coding scheme are not included in the role space $\{0,\dots,5\}$ used above. Extending the structure search to a multi-class specification with an explicit membership equation, and to a zero-inflation component with its own logit sub-model, is left as future work (\S\ref{sec:discussion}).
+\end{linenumbers}
+\end{doublespacing}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Acknowledgments
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section*{Acknowledgments}
+The authors thank the Queensland Department of Transport and Main Roads for providing access to the calibrated crash-frequency reference database. Telematics data were provided By CompassIot.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Author Contributions
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section*{Author Contributions}
+The authors confirm contribution to the paper as follows:
+study conception and design: Z. Ahern, A. Mahandren, A. Paz;
+data collection: A. Paz;
+analysis and interpretation of results:  Z. Ahern, A. Paz;
+draft manuscript preparation: Z. Ahern;
+manuscript revision: Z. Ahern, A. Paz.
+All authors reviewed the results and approved the final version of the manuscript.
+
+\section*{Author Competing Interests}
+The authors declared no potential conflicts of interest with respect to the research, authorship, and/or publication of this article.
+
+\section*{Funding}
+The authors disclosed no financial support for the research, authorship, and/or publication of this article
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{footnotesize}
+\bibliographystyle{unsrtnat} % natbib-compatible unsrt (citation-order numbering; supports \citet)
+\textnormal{\bibliography{trb_template}}
+\end{footnotesize}
+
+\end{document}

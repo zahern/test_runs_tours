@@ -100,3 +100,38 @@ build/
 # ── OS artefacts ────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+# Generated data (>95 MB) stripped from the unpushed history before the
+# 2026-11 push; the files stay on disk, they just are not tracked.
+/code/saved_data/cdap_output.csv
+/code/saved_data/osm_cache/australia-latest.osm.pbf
+/code/saved_data/stage1_output.csv
+/code/saved_data/stage2_output.csv
+/code/saved_data/stage3_output.csv
+/code/saved_data/stage4_output.csv
+/code/saved_data/stage5_output.csv
+/code/saved_data/synth_persons_mapped.csv
+/code/saved_data/synth_population_mapped.csv
+/code/saved_data/vehicle.dat
+/code/saved_data/zone_ids_sa2.zip
+/demand_/paper/Unofficial_Transportation_Research_Board__TRB__LaTeX_template/SEQ_maps/speed_mapped.gpkg
+/demand_/suncorp_telematics/results/event_points_full.csv.gz
+/demand_/suncorp_telematics/results/game_day_pred_15min.parquet
+/demand_/suncorp_telematics/results/game_day_pred_15min_sdfb.parquet
+/demand_/suncorp_telematics/results_seg/game_day_pred_15min.parquet
+/demand_/suncorp_telematics/results/segment_15min_panel.parquet
+/demand_/suncorp_telematics/results/segment_hour_panel.parquet
+/demand_/suncorp_telematics/results/segment_hour_pred_v2_full.parquet
+/demand_/suncorp_telematics/results/traffic_points_full.csv.gz
+/DTA/DTA_Brisbane_tested/AltPath.dat
+/DTA/DTA_Brisbane_tested/AltPath.itf
+/DTA/DTA_Brisbane_tested/AltTime.dat
+/DTA/DTA_Brisbane_tested/demand.dat
+/DTA/DTA_Brisbane_tested/output_path.dat
+/DTA/DTA_Brisbane_tested/output_vehicle.dat
+/DTA/DTA_Brisbane_tested/vehicle.dat
+/DTA/DTA_Brisbane_tested/VehTrajectory.dat
+/DTA/SEQ_Running_UE/runLog.dat
+/DTA/SEQ_Running_UE/vehicle.dat.bak_pre_guide
+/new_pop/saved_data/synth_persons.csv
+/new_pop/saved_data/synth_population.csv

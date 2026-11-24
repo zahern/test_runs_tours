@@ -3,19 +3,23 @@
 #PBS -l select=1:ncpus=1:mem=8gb
 #PBS -l walltime=00:15:00
 #PBS -j oe
-# Install the upstreamed SearchLibrium wheel (>= 0.0.270) into the zigenv 3.12
-# env. The patches that the pipeline used to file-swap at job start
-# (latent_class rail guards, mh_choice_estimator LC functions, lc_rail_guard)
-# now ship IN the wheel alongside build_latent_class and the larch LC
-# membership fix, so a plain pip install replaces the SEARCHLIBRIUM_SELFHEAL
-# patch step. Runs on a compute node (never the head node).
+# Install the latest SearchLibrium into the zigenv 3.12 env.
+#
+# Default: PyPI latest (>= 0.0.273, which ships the promoted larch LCCM fixes:
+# graph-None rebuild guards + LatentClass membership wiring for DataTree inputs,
+# plus the LarchLatentClass wrapper export). Set WHEEL=<path> to install a
+# specific wheel instead. Runs on a compute node (never the head node).
 set -euo pipefail
 cd "$PBS_O_WORKDIR" || exit 1
 echo "=== install_sl_wheel on $(hostname) at $(date) ==="
 
-WHEEL=${WHEEL:-"$PBS_O_WORKDIR/_patches/SearchLibrium/searchlibrium-0.0.270-py3-none-any.whl"}
-[[ -f "$WHEEL" ]] || { echo "FATAL: wheel not found: $WHEEL"; exit 1; }
-echo "wheel: $WHEEL"
+WHEEL=${WHEEL:-}
+if [[ -n "$WHEEL" ]]; then
+  [[ -f "$WHEEL" ]] || { echo "FATAL: wheel not found: $WHEEL"; exit 1; }
+  echo "source: wheel $WHEEL"
+else
+  echo "source: PyPI latest SearchLibrium"
+fi
 
 module load Anaconda3/2024.02-1
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -24,18 +28,52 @@ module unload Anaconda3          # so python/pip resolve to the zigenv 3.12 env
 export PATH="${CONDA_PREFIX:?conda activate zigenv failed}/bin:$PATH"
 
 echo "python : $(which python)  ($(python --version 2>&1))"
-# Replace just the package; keep its already-satisfied dependencies untouched.
-python -m pip install --no-deps --force-reinstall "$WHEEL"
+# Serialize with the per-job upgrades in pbs_pipeline_mode.pbs/job_ga_shard_single.pbs.
+(
+  flock -w 900 9 2>/dev/null || echo "(flock unavailable, proceeding without lock)"
+  if [[ -n "$WHEEL" ]]; then
+    # Replace just the package; keep its already-satisfied dependencies untouched.
+    python -m pip install --no-deps --force-reinstall "$WHEEL"
+  else
+    python -m pip install --upgrade --retries 2 --timeout 60 SearchLibrium
+  fi
+) 9>"${PBS_O_WORKDIR}/.pkg_upgrade.lock"
 
 echo "=== verify installed SL in the job's python ==="
 python - <<'PY'
+import sys
 import SearchLibrium as s
+
 print("SL", s.__version__, s.__file__)
-from SearchLibrium.larch_models import build_latent_class            # larch LC assembly
+from packaging.version import Version
+if Version(s.__version__) < Version("0.0.273"):
+    sys.exit(f"FATAL: installed SearchLibrium {s.__version__} < 0.0.273")
+
+from SearchLibrium.larch_models import (LarchLatentClass, build_latent_class)
 from SearchLibrium.mh_choice_estimator import estimate_dest_choice_lc, _fit_frame_mnl
 from SearchLibrium.latent_class import LatentClassMixedLogit
 from SearchLibrium.lc_rail_guard import lc_result_rail
+from SearchLibrium.larch_compat import apply_larch_patches
+
 assert hasattr(LatentClassMixedLogit, "_compute_rail_flags")
-print("OK: build_latent_class + LC estimator + rail guard all present")
+assert apply_larch_patches() is True
+
+# The promoted LCCM fixes must be active in the installed copy.
+from larch.model.numbamodel import NumbaModel
+import larch as lx
+guards = {
+    "NumbaModel._rebuild_fixed_arrays": getattr(
+        NumbaModel._rebuild_fixed_arrays, "_graph_none_guard", False),
+    "NumbaModel._rebuild_work_arrays": getattr(
+        NumbaModel._rebuild_work_arrays, "_graph_none_guard", False),
+}
+wiring = getattr(lx.LatentClass.__init__, "_qut_membership_wiring", False)
+print("LCCM compat markers:", guards, "membership_wiring=", wiring)
+if not all(guards.values()):
+    sys.exit("FATAL: graph-None rebuild guards missing")
+if not wiring:
+    sys.exit("FATAL: LatentClass membership datatree wiring missing")
+
+print("OK: latest SearchLibrium + LarchLatentClass + LCCM compat markers present")
 PY
 echo "=== DONE $(date) ==="

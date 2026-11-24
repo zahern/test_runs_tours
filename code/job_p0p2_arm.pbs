@@ -1,0 +1,59 @@
+#!/bin/bash
+#PBS -P FPAXJW8067
+#PBS -N p0p2_arm
+#PBS -l select=1:ncpus=8:mem=128gb
+#PBS -l walltime=08:00:00
+#PBS -j oe
+#PBS -m n
+
+# Fit and score one Stage-5 arm (P0 or P2) on the same 70/30 person split.
+# Both arms use the person-type route logsum; P2 uses the searched features.
+# Fit and score share stage5_arm_inputs.load_arm_inputs, and the scorer checks
+# that it reproduces the fitted mode log-likelihood before reporting holdout.
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$HOME/test_runs_tours/code}" || exit 1
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+conda activate zigenv || exit 1
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+export PYTHONPATH="${PBS_O_WORKDIR}:${PYTHONPATH:-}"
+export PIPELINE_SKIMS_PATH="../demand_/skims_371_routechoice.omx"
+export STAGE5_ROUTE_TYPE_TABLE="runs/route_choice_371/route_logsum_type.parquet"
+export STAGE5_MODE_ORTHOG=1 STAGE5_DEST_ORTHOG=1
+export STAGE5_STRICT_ESTIMATION=1 STAGE5_REQUIRE_DEST_ESTIMATION=1
+# Match tab:p0p2: universal 371-zone destination sets in both arms.
+export STAGE5_DEST_SAMPLE_SIZE=${STAGE5_DEST_SAMPLE_SIZE:-0}
+# 2026-11-25 specification fixes (recorded in fit_meta.json "inputs"):
+#   pooled generic in-vehicle time; monotone log-distance basis for
+#   non-mandatory; road crash on road-borne modes only (MODE_UEC).
+export STAGE5_POOLED_IVT=${STAGE5_POOLED_IVT:-1}
+export STAGE5_NONMAND_DIST_BASIS=${STAGE5_NONMAND_DIST_BASIS:-log}
+export STAGE5_MODE_STRUCTURE=${STAGE5_MODE_STRUCTURE:-nested}
+
+ARM="${ARM:?ARM required (P0 or P2)}"
+SEGS="${SEGS:-work edu nonmand}"
+ROOT="${ROOT:-runs/p0p2_routechoice}"
+# OUT_TAG names the output folder (default = ARM). OUT_TAG=P2LC with ARM=P2 and
+# STAGE5_MODE_STRUCTURE=lccm fits the safety latent-class arm on the P2
+# specifications without overwriting the P2 bundles.
+OUT_TAG="${OUT_TAG:-${ARM}}"
+mkdir -p "${ROOT}/${OUT_TAG}"
+for SEG in ${SEGS}; do
+  echo "=== ${OUT_TAG} (${ARM}) / ${SEG} fit $(date) structure=${STAGE5_MODE_STRUCTURE} ==="
+  MODE_ARGS=()
+  if [ "${ARM}" = "P2" ]; then
+    MODE_ARGS=(--mode-spec "${ROOT}/specs/${SEG}_P2_mode.json")
+  fi
+  python -u _fit_stage5_arm.py \
+      --segment "${SEG}" --arm "${ARM}" \
+      "${MODE_ARGS[@]}" \
+      --dest-spec "${ROOT}/specs/${SEG}_${ARM}_dest.json" \
+      --skims ../demand_/skims_371_routechoice.omx \
+      --out "${ROOT}/${OUT_TAG}/${SEG}" 2>&1 | tee "${ROOT}/${OUT_TAG}/${SEG}_fit.log"
+  echo "=== ${OUT_TAG} / ${SEG} score $(date) ==="
+  python -u _score_stage5_arm.py \
+      --models "${ROOT}/${OUT_TAG}/${SEG}/stage5_models.pkl" \
+      --segment "${SEG}" --arm "${OUT_TAG}" \
+      --skims ../demand_/skims_371_routechoice.omx --no-strict-repro \
+      --out "${ROOT}/${OUT_TAG}/${SEG}_score.json" 2>&1 | tee "${ROOT}/${OUT_TAG}/${SEG}_score.log"
+done
+echo "=== ${OUT_TAG} done $(date) ==="

@@ -79,6 +79,7 @@ import numpy as np
 import pandas as pd
 import logging
 import pickle
+import json
 import os
 import sys
 import glob
@@ -159,6 +160,102 @@ def _crash_force_include(skim_df=None) -> bool:
         logger.warning(f"_crash_force_include[auto]: detection failed ({_e}) — "
                        "keeping legacy force-include")
         return True
+
+
+_STAGE5_ROUTE_TERM = 'c_route_logsum_type'
+
+
+def _route_type_table_active() -> bool:
+    """True when a person-type route logsum table is configured and readable.
+
+    With the table present, ``c_route_logsum_type`` is the structural
+    time-safety inclusive value and must be in every destination
+    specification.  Without it, the destination CA falls back to the
+    median-person OD car time and the term must not be forced (it would be
+    unidentified).
+    """
+    try:
+        _p = os.environ.get('STAGE5_ROUTE_TYPE_TABLE', '').strip()
+        return bool(_p) and os.path.isfile(_p)
+    except Exception:
+        return False
+
+
+def _stage5_coef_sign_gate(coef_rows, expected: dict) -> list:
+    """Return coefficient names that violate an expected behavioural sign.
+
+    ``expected`` maps exact Larch coefficient names to -1 (must be negative)
+    or +1 (must be positive).  Rows without a finite value (holdfast/structural
+    terms) are skipped; the significance penalty handles near-zero terms.
+    """
+    bad = []
+    for _r in coef_rows or []:
+        try:
+            _name = str(_r.get('param', ''))
+            _sign = expected.get(_name)
+            if _sign is None:
+                continue
+            _val = float(_r.get('value', np.nan))
+            if not np.isfinite(_val):
+                continue
+            if (_sign < 0 and _val > 0) or (_sign > 0 and _val < 0):
+                bad.append(_name)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return bad
+
+
+def _load_stage5_seed_features(segments: list) -> dict:
+    """Load per-segment seed feature lists for the Stage-5 GA.
+
+    GA_STAGE5_SEED_FEATURES may name a ``stepwise_features.json`` directly (or
+    a comma-separated list of them).  GA_STAGE5_SEED_DIR (default: the code
+    dir's ``runs``) is searched as ``<dir>/stepwise_<seg>/stepwise_features.json``
+    so the stepwise jobs' outputs become the GA warm start automatically.
+    Returns {seg: {'mode_features': [...], 'dest_features': [...]}}.
+    """
+    candidates = []
+    explicit = os.environ.get('GA_STAGE5_SEED_FEATURES', '').strip()
+    if explicit:
+        candidates.extend(p.strip() for p in explicit.split(',') if p.strip())
+    seed_dir = (os.environ.get('GA_STAGE5_SEED_DIR', '').strip()
+                or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'runs'))
+    for seg in segments:
+        candidates.append(os.path.join(seed_dir, f'stepwise_{seg}',
+                                       'stepwise_features.json'))
+    # Fallback: the one-shot finalize report is a valid seed even when the
+    # stepwise search did not finish.  Stepwise files take precedence.
+    for seg in segments:
+        candidates.append(os.path.join(seed_dir, 'final_from_ga_best',
+                                       f'finalize_report_{seg}.json'))
+    out: dict = {}
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding='utf-8') as fh:
+                data = json.load(fh)
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(f"[Stage 5] seed file unreadable ({path}): {_e!r}")
+            continue
+        segs = data.get('segments', data) if isinstance(data, dict) else {}
+        if not isinstance(segs, dict):
+            continue
+        for seg, spec in segs.items():
+            if seg in out or not isinstance(spec, dict):
+                continue
+            mode_feats = list(spec.get('mode_features') or [])
+            dest_feats = list(spec.get('best_dest_features')
+                              or spec.get('dest_features') or [])
+            if not mode_feats and not dest_feats:
+                continue
+            out[seg] = {'mode_features': mode_feats,
+                        'dest_features': dest_feats}
+            print(f"  [Stage 5] seed features for {seg}: "
+                  f"mode={len(mode_feats)} dest={len(dest_feats)} "
+                  f"(from {path})")
+    return out
 
 
 def _ensure_utf8_console() -> None:
@@ -618,6 +715,131 @@ def _repair_require_one(
         pick = int(rng.choice(safe if safe else member_idx))
         genes[pick] = 1
     return genes
+
+
+def _feature_state_legal(
+    genes,
+    n_features: int,
+    min_features: int,
+    max_features: int,
+    fixed_idx,
+    feature_names: Optional[List[str]] = None,
+    collinear_groups: Optional[List[List[str]]] = None,
+    require_one_groups: Optional[List[List[str]]] = None,
+) -> bool:
+    """True when a chromosome's primary feature block meets every constraint."""
+    g = np.asarray(genes, dtype=int).ravel()
+    if g.size < n_features:
+        return False
+    base = g[:n_features]
+    if np.any((base != 0) & (base != 1)):
+        return False
+    if any(base[i] != 1 for i in fixed_idx):
+        return False
+    n_active = int(base.sum())
+    if (n_active < max(min_features, len(fixed_idx))
+            or n_active > max_features):
+        return False
+    if feature_names:
+        for group in collinear_groups or []:
+            idx = [feature_names.index(name) for name in group
+                   if name in feature_names]
+            if sum(base[i] for i in idx) > 1:
+                return False
+        for group in require_one_groups or []:
+            idx = [feature_names.index(name) for name in group
+                   if name in feature_names]
+            if idx and not any(base[i] for i in idx):
+                return False
+    return True
+
+
+def _repair_feature_state(
+    genes,
+    n_features: int,
+    min_features: int,
+    max_features: int,
+    rng: np.random.Generator,
+    fixed_idx,
+    feature_names: Optional[List[str]] = None,
+    collinear_groups: Optional[List[List[str]]] = None,
+    require_one_groups: Optional[List[List[str]]] = None,
+    blocked_features: Optional[set] = None,
+) -> np.ndarray:
+    """Apply the full repair chain to the primary feature block.
+
+    The optional tail (random-parameter / distribution genes) is preserved
+    untouched; only the base block is constrained.
+    """
+    g = np.asarray(genes, dtype=int).copy()
+    tail = g[n_features:].copy() if g.size > n_features else None
+    base = g[:n_features].copy()
+    base[list(fixed_idx)] = 1
+    if feature_names and collinear_groups:
+        base = _repair_collinearity(
+            base, feature_names, collinear_groups, rng,
+            protected_idx=fixed_idx)
+    base = _enforce_feature_bounds(
+        base, max(min_features, len(fixed_idx)), max_features, rng,
+        feature_names=feature_names,
+        collinear_groups=collinear_groups,
+        protected_idx=fixed_idx,
+        blocked_features=blocked_features or set())
+    if feature_names and require_one_groups:
+        base = _repair_require_one(
+            base, feature_names, require_one_groups, rng,
+            protected_idx=fixed_idx,
+            collinear_groups=collinear_groups)
+    return base if tail is None else np.concatenate([base, tail])
+
+
+def _legalize_or_sample(
+    genes,
+    sampler,
+    *,
+    n_features: int,
+    min_features: int,
+    max_features: int,
+    rng: np.random.Generator,
+    fixed_idx,
+    feature_names: Optional[List[str]] = None,
+    collinear_groups: Optional[List[List[str]]] = None,
+    require_one_groups: Optional[List[List[str]]] = None,
+    blocked_features: Optional[set] = None,
+    max_attempts: int = 50,
+) -> np.ndarray:
+    """Repair a perturbation; if the repair cannot satisfy the constraints,
+    draw from ``sampler`` until a legal state is found.
+
+    This is the shared boundary guarantee for GA/SA/AGDS: no perturbed
+    chromosome reaches the fitness function in an illegal state.
+    """
+    kw = dict(
+        n_features=n_features, min_features=min_features,
+        max_features=max_features, rng=rng, fixed_idx=fixed_idx,
+        feature_names=feature_names, collinear_groups=collinear_groups,
+        require_one_groups=require_one_groups,
+        blocked_features=blocked_features,
+    )
+    g = _repair_feature_state(genes, **kw)
+    if _feature_state_legal(
+            g, n_features, min_features, max_features, fixed_idx,
+            feature_names, collinear_groups, require_one_groups):
+        return g
+    for _ in range(max_attempts):
+        try:
+            cand = np.asarray(sampler(), dtype=int).ravel()
+        except Exception:
+            break
+        cand = _repair_feature_state(cand, **kw)
+        if _feature_state_legal(
+                cand, n_features, min_features, max_features, fixed_idx,
+                feature_names, collinear_groups, require_one_groups):
+            return cand
+    logger.warning(
+        "_legalize_or_sample: no fully legal chromosome after "
+        f"{max_attempts} attempts; returning the repaired state")
+    return g
 
 
 def _enforce_feature_bounds(
@@ -1325,6 +1547,323 @@ def _save_best_ckpt(searcher, individual) -> None:
         pass                                         # never break a search
 
 
+_CGROUP_LIMIT_PATHS = ("/sys/fs/cgroup/memory.max",                     # cgroup v2
+                       "/sys/fs/cgroup/memory/memory.limit_in_bytes")  # cgroup v1
+
+
+def _cgroup_mem_limit_bytes():
+    """The kernel's own memory ceiling, or None when it cannot be read.
+
+    GA_JAX_CACHE_MEM_LIMIT_GB is an env value the submit script copies from the
+    shard's requested ``mem``; reading the cgroup instead means the leash
+    tracks what the OOM killer actually enforces, and a changed ``-l mem``
+    takes effect without a matching env edit.
+    """
+    for _p in _CGROUP_LIMIT_PATHS:
+        try:
+            with open(_p, "r", encoding="utf-8") as _fh:
+                _v = _fh.read().strip()
+        except OSError:
+            continue
+        if not _v.isdigit():
+            continue                 # 'max' on an unlimited v2 hierarchy
+        _n = int(_v)
+        if 0 < _n < (1 << 50):       # v1 reports ~9.2e18 when unlimited
+            return _n
+    return None
+
+
+def _leash_trip_bytes():
+    """(trip, limit, source) bytes for the memory leash.
+
+    Trips at GA_LEASH_FRAC (default 0.55) of the real cgroup limit, falling
+    back to GA_JAX_CACHE_MEM_LIMIT_GB only when the cgroup is unreadable. The
+    old rule was 80% of that env value, and the submit script sets the env
+    value to the shard's whole ``mem`` — so the leash could not fire until 80%
+    of the job's memory was gone, which on nonmand left 25 GB of headroom and
+    was crossed inside a single 5-eval window.
+    """
+    try:
+        _frac = float(os.environ.get("GA_LEASH_FRAC", "0.55"))
+    except ValueError:
+        _frac = 0.55
+    _frac = min(max(_frac, 0.10), 0.95)
+    _cg = _cgroup_mem_limit_bytes()
+    if _cg:
+        return int(_cg * _frac), _cg, "cgroup"
+    try:
+        _gb = float(os.environ.get("GA_JAX_CACHE_MEM_LIMIT_GB", "48"))
+    except ValueError:
+        _gb = 48.0
+    return int(_gb * 1e9 * _frac), int(_gb * 1e9), "env"
+
+
+# Phase label for the memory trace (2026-11-07). The leash runs immediately
+# after each fitness call in GASearcher._evaluate, so a stage-5 fitness sets
+# this before doing any work and the row written for that evaluation carries
+# its label — no need to correlate the CSV against the PBS log by timestamp.
+_MEM_PHASE = {"label": ""}
+
+
+def _set_mem_phase(label: str) -> None:
+    """Label memory-trace rows written while this fitness is running."""
+    _MEM_PHASE["label"] = label
+
+
+def _malloc_stats():
+    """(arena, inuse, free) bytes held by the C allocator, or (None,)*3.
+
+    glibc only. ``arena - uordblks`` is free-but-retained space: an arena that
+    grows while ``uordblks`` stays flat is fragmentation, which neither
+    gc.collect() nor jax.clear_caches() can return — only malloc_trim() can.
+    Large numpy arrays are mmap'd and never appear here, so this measures the
+    small/medium-allocation churn the stage-5 flow generates per evaluation.
+    """
+    try:
+        import ctypes
+        _libc = ctypes.CDLL("libc.so.6")
+    except Exception:
+        return None, None, None
+
+    class _Mi2(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_size_t) for n in (
+            "arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks",
+            "fsmblks", "uordblks", "fordblks", "keepcost")]
+
+    try:
+        _libc.mallinfo2.restype = _Mi2
+        _m = _libc.mallinfo2()          # glibc >= 2.33
+        return int(_m.arena), int(_m.uordblks), int(_m.fordblks)
+    except Exception:
+        pass
+
+    class _Mi1(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_int) for n in (
+            "arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks",
+            "fsmblks", "uordblks", "fordblks", "keepcost")]
+
+    try:
+        _libc.mallinfo.restype = _Mi1
+        _m = _libc.mallinfo()
+        return int(_m.arena), int(_m.uordblks), int(_m.fordblks)
+    except Exception:
+        return None, None, None
+
+
+def _malloc_trim() -> int:
+    """Best-effort glibc malloc_trim(0); 1 when it released memory."""
+    try:
+        import ctypes
+        return int(ctypes.CDLL("libc.so.6").malloc_trim(0))
+    except Exception:
+        return 0
+
+
+def _jax_compiled_count() -> int:
+    """Entries in JAX's own cache registry (staging + compiled executables).
+
+    JAX keeps every ``util.cache`` / ``util.weakref_lru_cache`` instance in
+    ``jax._src.util._caches``, and each exposes ``cache_info().currsize``;
+    ``jax.clear_caches()`` empties exactly this registry. A count that grows
+    with evaluations is the compiled-artifact signature. -1 when the registry
+    cannot be read (older JAX), so callers can fall back.
+    """
+    try:
+        # Import the submodule directly: jax._src is a namespace where ``util``
+        # is not guaranteed to be an attribute yet. The registry is a
+        # WeakKeyDictionary, not a dict, so gate on keys() rather than type.
+        import jax._src.util as _util
+        _reg = getattr(_util, "_caches", None)
+        if _reg is None or not hasattr(_reg, "keys"):
+            return -1
+        _n = 0
+        for _c in list(_reg.keys()):
+            try:
+                _n += int(_c.cache_info().currsize)
+            except Exception:
+                continue
+        return _n
+    except Exception:
+        return -1
+
+
+# Legacy (JAX <= 0.4.20) explicit cache attributes, probed only when the
+# registry above is unavailable.
+_JAX_COMPILED_CACHES = (
+    "jax._src.interpreters.pxla._xla_callable_cache",
+    "jax._src.pjit._pjit_cache",
+    "jax._src.dispatch._lazy_cache",
+    "jax._src.interpreters.pxla._cpp_pjit_cache",
+)
+
+
+def _jax_live_stats():
+    """(n_arrays, live_gb, n_compiled) for the process right now.
+
+    live arrays/bytes are public API and separate 'XLA is holding the data'
+    from 'the executable cache is holding compiled artifacts'. n_compiled is
+    the registry count from _jax_compiled_count(), or -1 when unavailable.
+    """
+    import jax as _jx
+    _arrays = list(_jx.live_arrays())
+    _bytes = 0
+    for _a in _arrays:
+        try:
+            _bytes += int(getattr(_a, "nbytes", 0) or 0)
+        except Exception:
+            continue
+    _ncomp = _jax_compiled_count()
+    if _ncomp < 0:
+        for _path in _JAX_COMPILED_CACHES:
+            try:
+                _obj = _jx
+                for _part in _path.split(".")[1:]:
+                    _obj = getattr(_obj, _part)
+                _ncomp = max(_ncomp, len(_obj))
+            except Exception:
+                continue
+    return len(_arrays), _bytes / 1e9, _ncomp
+
+
+def _ga_clear_jit_caches() -> None:
+    """Best-effort clear of every per-compilation cache the stage-5 path uses.
+
+    Used by the leash's periodic clear (2026-11-08): the cache-on/off A/B
+    showed the ratchet is
+    process-global and ~88 MB/eval, unchanged with the destination-tree cache
+    off, and each genome compiles a fresh flow, so the executable cache has
+    almost no reuse to lose. Never raises into the search.
+    """
+    try:
+        import jax as _jax
+        _jax.clear_caches()
+    except Exception:
+        pass
+    for _mod, _cls in (('SearchLibrium.multinomial_logit', 'MultinomialLogit'),
+                       ('SearchLibrium.MixedLogit', 'MixedLogit')):
+        try:
+            _m = __import__(_mod, fromlist=[_cls])
+            getattr(_m, _cls)._clear_jit_cache()
+        except Exception:
+            continue
+    # 2026-10-08 OOM fix (othdiscr 26530734/26543528 + nonmand 26520869):
+    # jax + SearchLibrium clears alone did not stop the RSS ratchet because
+    # each stage-5 eval also compiles Larch/sharrow/numba flows (371-zone
+    # per-zone mangle/unmangle). Best-effort clear of those caches too so
+    # the leash actually bounds the stage-5 path.
+    try:
+        import gc as _gc2
+        _gc2.collect()
+    except Exception:
+        pass
+    for _imp in (
+        "import numba as _nb; _nb.core.registry.cpu_data._cres_cache.clear()",
+        "import sharrow as _sh; getattr(_sh, 'clear_caches', lambda: None)()",
+        "import larch as _la; getattr(getattr(_la, 'model', None), 'clear_caches', lambda: None)()",
+    ):
+        try:
+            exec(_imp, {'__builtins__': __builtins__})
+        except Exception:
+            continue
+    try:
+        import gc as _gc3
+        _gc3.collect()
+    except Exception:
+        pass
+
+
+def _ga_gc_census():
+    """(n_larch_models, n_nd, nd_bytes, nd_max_bytes, n_nd_1g, top5) or None.
+
+    One heap walk for every retention count the trace wants. The census used
+    to only count ``larch.Model`` instances, but the 2026-11-08 smaps curve of
+    a live dest shard showed the outside-arena growth is a handful of
+    multi-GB anonymous mappings (six new VMAs of 1.5-2.9 GB per eval, every
+    smaller bucket frozen), so the walk also sums numpy ``ndarray.nbytes``.
+
+    A direct ``isinstance(o, ndarray)`` pass is not enough: numpy untracks
+    arrays whose dtype holds no Python objects, so a 1 GB uint8/float64 buffer
+    never appears in ``gc.get_objects()`` (verified 2026-11-08 — the array was
+    present by identity outside the gc list). The walk therefore also reads
+    the tracked containers that hold those arrays (dict values, list/tuple/set
+    items, object ``__dict__`` values) and counts each array once by id.
+    Arrays reachable only through C-level state (XLA buffers, numba closures)
+    stay invisible, so ``nd_bytes`` is a lower bound on retained numpy data
+    and an upper bound per array (a view and its base are separate ids).
+    ``n_larch_models`` is -1 when larch cannot be imported. Expensive — call
+    it only when GA_MEM_CENSUS=1.
+    """
+    try:
+        import gc as _gc
+        import numpy as _np
+    except Exception:
+        return None
+    _lx_model = None
+    n_larch = -1
+    try:
+        import larch as _lx
+        # A different 'larch' package on the path can expose a non-class
+        # Model, and isinstance() then raises and aborts the whole walk.
+        _cand = getattr(_lx, "Model", None)
+        if isinstance(_cand, type):
+            _lx_model = _cand
+            n_larch = 0
+    except Exception:
+        pass
+    n_nd = 0
+    total = 0
+    n_1g = 0
+    top = []
+    seen = set()
+
+    def _note(_a):
+        nonlocal n_nd, total, n_1g
+        _id = id(_a)
+        if _id in seen:
+            return
+        seen.add(_id)
+        _b = int(getattr(_a, "nbytes", 0) or 0)
+        n_nd += 1
+        total += _b
+        if _b >= 1_000_000_000:
+            n_1g += 1
+        if _b > 50_000_000:
+            top.append((_b, getattr(_a, "shape", ""),
+                        str(getattr(_a, "dtype", ""))))
+            top.sort(reverse=True)
+            del top[5:]
+
+    try:
+        _objs = _gc.get_objects()
+    except Exception:
+        return None
+    for _o in _objs:
+        # A weak proxy whose referent died raises ReferenceError from
+        # isinstance(), so every inspection of a foreign object is guarded.
+        try:
+            if _lx_model is not None and isinstance(_o, _lx_model):
+                n_larch += 1
+            if isinstance(_o, _np.ndarray):
+                _note(_o)
+            elif isinstance(_o, dict):
+                for _v in _o.values():
+                    if isinstance(_v, _np.ndarray):
+                        _note(_v)
+            elif isinstance(_o, (list, tuple, set, frozenset)):
+                for _v in _o:
+                    if isinstance(_v, _np.ndarray):
+                        _note(_v)
+            else:
+                _d = getattr(_o, "__dict__", None)
+                if isinstance(_d, dict):
+                    for _v in _d.values():
+                        if isinstance(_v, _np.ndarray):
+                            _note(_v)
+        except Exception:
+            continue
+    return (n_larch, n_nd, total, (top[0][0] if top else 0), n_1g, top)
+
+
 def _ga_memory_leash() -> None:
     """Bound per-search memory growth (Larch/sharrow/JAX compiled artifacts).
 
@@ -1335,16 +1874,31 @@ def _ga_memory_leash() -> None:
     _maybe_clear_jax_caches leash only runs in the SearchLibrium/MetaCount
     fitness path — never in the stage-5 Larch path.
 
-    Every GA_LEASH_EVERY evals (default 5): gc.collect() always (cheap);
-    jax.clear_caches() + SearchLibrium JIT-cache clears only when RSS tops
-    80% of GA_JAX_CACHE_MEM_LIMIT_GB (default 48). psutil missing ⇒
-    gc-only. Throttled, logged at most once per call-site minute, never
-    raises into the search.
+    Every GA_LEASH_EVERY evals (default 1, i.e. every evaluation) RSS is
+    checked and gc.collect() runs (cheap next to a 20-60 s eval).
+    jax.clear_caches() + SearchLibrium JIT-cache clears run only when RSS
+    tops GA_LEASH_FRAC (default 0.55) of the real cgroup limit, falling back
+    to GA_JAX_CACHE_MEM_LIMIT_GB when the cgroup cannot be read. They also
+    run every GA_LEASH_JAX_CLEAR_EVERY leash calls (default 10; 0 disables)
+    so the ratchet is bounded between RSS trips: the cache-off A/B arm showed
+    the growth is process-global and each genome compiles a fresh flow, so
+    there is almost no cache reuse to lose. psutil missing ⇒ gc-only.
+    Throttled log, never raises into the search.
+
+    Telemetry (2026-11-07): every trace row also records the glibc arena vs
+    in-use split and JAX live-array bytes plus a compiled-cache count; with
+    GA_MEM_CENSUS=1 a gc walk adds reachable numpy ndarray bytes (a lower
+    bound, see _ga_gc_census), the largest array and the count over 1 GB. The
+    trip path logs the RSS recovered by the clears and by malloc_trim(). That
+    is what tells a ratchet apart: arena up with in-use flat means allocator
+    fragmentation, live/compiled growth means retained compiled artifacts.
+    A ``phase`` column (mode / dest / ...) says which search phase the row
+    belongs to, so Mode and Dest evals are separable without the PBS log.
     """
     try:
-        _every = int(os.environ.get('GA_LEASH_EVERY', '5'))
+        _every = int(os.environ.get('GA_LEASH_EVERY', '1'))
     except ValueError:
-        _every = 5
+        _every = 1
     if _every <= 0:
         return
     _ga_memory_leash.calls = int(getattr(_ga_memory_leash, 'calls', 0)) + 1
@@ -1363,25 +1917,68 @@ def _ga_memory_leash() -> None:
     # ── Memory trace (2026-10-08): one CSV row per leash call so the next
     # OOM can be diagnosed from the shape of growth (steady ratchet vs sudden
     # spike) instead of a single final RSS. ~1 append per 5 evals: negligible.
-    # Disable with GA_MEM_TRACE=0. GA_MEM_CENSUS=1 additionally counts live
-    # Larch models (gc walk — expensive, off by default).
+    # Disable with GA_MEM_TRACE=0. GA_MEM_CENSUS=1 additionally runs a gc
+    # walk (expensive, off by default) that counts live Larch models and
+    # numpy ndarrays: the 2026-11-08 smaps curve showed the outside-arena
+    # growth is a handful of multi-GB anonymous mappings, so the census also
+    # reports ndarray bytes, the largest array and the count over 1 GB.
     try:
         if int(os.environ.get("GA_MEM_TRACE", "1")) == 1:
             _tdir = (os.environ.get("GA_CHECKPOINT_DIR")
                      or os.environ.get("PIPELINE_OUT_DIR") or ".")
             _tpath = os.path.join(_tdir, "memory_trace.csv")
-            _n_larch = ""
+            _n_larch = _nd_n = _nd_gb = _nd_max = _nd_1g = ""
             if int(os.environ.get("GA_MEM_CENSUS", "0")) == 1:
-                try:
-                    import gc as _gc_c
-                    import larch as _lx_c
-                    _n_larch = str(sum(
-                        1 for _o in _gc_c.get_objects()
-                        if isinstance(_o, _lx_c.Model)))
-                except Exception:
-                    _n_larch = ""
-            _hdr = "timestamp,leash_calls,rss_gb,limit_gb,n_larch_models\n"
+                _census = _ga_gc_census()
+                if _census is not None:
+                    _c_nl, _c_n, _c_b, _c_max, _c_1g, _c_top = _census
+                    _n_larch = "" if _c_nl < 0 else str(_c_nl)
+                    _nd_n, _nd_gb = str(_c_n), f"{_c_b / 1e9:.3f}"
+                    _nd_max, _nd_1g = f"{_c_max / 1e9:.3f}", str(_c_1g)
+                    try:
+                        from pipeline_logger import logger as _lg_c
+                        _top_s = "; ".join(
+                            f"{_b / 1e9:.2f}GB {_sh} {_dt}"
+                            for _b, _sh, _dt in _c_top[:4]) or "none"
+                        _lg_c.info(
+                            f"GA census: ndarrays={_c_n} "
+                            f"{_c_b / 1e9:.2f} GB (reachable), "
+                            f">=1GB={_c_1g}, "
+                            f"larch_models={_n_larch or '?'}; top: {_top_s}")
+                    except Exception:
+                        pass
+            _hdr = ("timestamp,leash_calls,rss_gb,limit_gb,n_larch_models,"
+                    "arena_gb,inuse_gb,jax_arrays,jax_live_gb,jax_compiled,"
+                    "nd_arrays,nd_live_gb,nd_max_gb,nd_ge1g,phase\n")
             _new = not os.path.exists(_tpath)
+            if not _new:
+                # A resume run appends to the shard's existing trace. New
+                # columns would silently misalign the old rows, so roll the
+                # old file aside (kept, not deleted) and start a fresh one.
+                try:
+                    with open(_tpath, "r", encoding="utf-8") as _rf:
+                        _prev_hdr = _rf.readline().strip()
+                    if _prev_hdr and _prev_hdr != _hdr.strip():
+                        import time as _tr
+                        os.replace(_tpath, _tpath.replace(
+                            ".csv", f".v1_{int(_tr.time())}.csv"))
+                        _new = True
+                except Exception:
+                    _new = True
+            _arena_s = _inuse_s = _jna = _jgb_s = _jnc = ""
+            try:
+                _a, _u, _f = _malloc_stats()
+                if _a is not None:
+                    _arena_s = f"{_a / 1e9:.3f}"
+                    _inuse_s = f"{_u / 1e9:.3f}"
+            except Exception:
+                pass
+            if int(os.environ.get("GA_MEM_JAX_STATS", "1")) == 1:
+                try:
+                    _nja, _njg, _njc = _jax_live_stats()
+                    _jna, _jgb_s, _jnc = str(_nja), f"{_njg:.3f}", str(_njc)
+                except Exception:
+                    pass
             with open(_tpath, "a", encoding="utf-8") as _fh:
                 if _new:
                     _fh.write(_hdr)
@@ -1389,14 +1986,39 @@ def _ga_memory_leash() -> None:
                 _fh.write(f"{_tt.strftime('%Y-%m-%dT%H:%M:%S')},"
                           f"{_ga_memory_leash.calls},{_rss / 1e9:.3f},"
                           f"{os.environ.get('GA_JAX_CACHE_MEM_LIMIT_GB', '48')},"
-                          f"{_n_larch}\n")
+                          f"{_n_larch},{_arena_s},{_inuse_s},"
+                          f"{_jna},{_jgb_s},{_jnc},"
+                          f"{_nd_n},{_nd_gb},{_nd_max},{_nd_1g},"
+                          f"{_MEM_PHASE['label']}\n")
     except Exception:
         pass
+    _trip, _limit, _src = _leash_trip_bytes()
+    # Periodic cache clear (2026-11-08): bound the process-global ratchet
+    # between RSS trips instead of letting it climb to GA_LEASH_FRAC (52.8 GB
+    # of a 96 GB shard in the A/B runs). Default 10 leash calls; 0 disables.
+    # The 2026-11-08 smaps curve showed the clear frees the retained
+    # 256 MB-1 GB anonymous mappings and that they rebuild at 0.4-0.6 GB per
+    # eval: at the old 25 they had already reached 10.9-12.1 GB before the
+    # first clear, so 10 evals keeps them near 7 GB. Skipped on a trip call
+    # so the trip path's clears are not duplicated.
     try:
-        _lim_gb = float(os.environ.get('GA_JAX_CACHE_MEM_LIMIT_GB', '48'))
+        _clear_every = int(os.environ.get('GA_LEASH_JAX_CLEAR_EVERY', '10'))
     except ValueError:
-        _lim_gb = 48.0
-    if _rss < int(_lim_gb * 1e9 * 0.80):
+        _clear_every = 10
+    if _clear_every > 0 and _rss < _trip and \
+            _ga_memory_leash.calls % _clear_every == 0:
+        _ga_clear_jit_caches()
+        try:
+            _nclear = int(getattr(_ga_memory_leash, 'periodic_clears', 0)) + 1
+            _ga_memory_leash.periodic_clears = _nclear
+            if _nclear == 1 or _nclear % 20 == 0:
+                from pipeline_logger import logger as _lg2
+                _lg2.info(f"GA memory leash: periodic JAX clear #{_nclear} "
+                          f"at {_ga_memory_leash.calls} calls, "
+                          f"RSS {_rss / 1e9:.1f} GB")
+        except Exception:
+            pass
+    if _rss < _trip:
         return
     try:
         import time as _t
@@ -1406,8 +2028,11 @@ def _ga_memory_leash() -> None:
             _ga_memory_leash.last_log = _now
             try:
                 from pipeline_logger import logger as _lg
-                _lg.warning(f"GA memory leash: RSS {_rss / 1e9:.1f} GB "
-                            f"(>80% of {_lim_gb:.0f} GB) — clearing JIT caches")
+                _lg.warning(f"GA memory leash: RSS {_rss / 1e9:.1f} GB >= "
+                            f"trip {_trip / 1e9:.1f} GB ({_src} limit "
+                            f"{_limit / 1e9:.0f} GB x "
+                            f"{os.environ.get('GA_LEASH_FRAC', '0.55')}) "
+                            f"— clearing JIT caches")
             except Exception:
                 pass
         import jax as _jax
@@ -1443,6 +2068,38 @@ def _ga_memory_leash() -> None:
     try:
         import gc as _gc3
         _gc3.collect()
+    except Exception:
+        pass
+    # ── Reclaim accounting (2026-11-07): the clears above were measured to
+    # return 21 GB at one trip and nothing at others, with no way to say
+    # which pool it came from. Split it: RSS after the clears vs after
+    # malloc_trim(0), plus the arena/in-use split and JAX live state, so the
+    # trace shows whether the growth is compiled artifacts or retained arenas.
+    try:
+        import psutil as _ps2
+        _rss_post = int(_ps2.Process().memory_info().rss)
+    except Exception:
+        _rss_post = _rss
+    _trimmed = _malloc_trim()
+    try:
+        import psutil as _ps3
+        _rss_final = int(_ps3.Process().memory_info().rss)
+    except Exception:
+        _rss_final = _rss_post
+    _arena, _inuse, _ = _malloc_stats()
+    try:
+        _narr, _jgb, _ncomp = _jax_live_stats()
+    except Exception:
+        _narr, _jgb, _ncomp = -1, 0.0, -1
+    try:
+        from pipeline_logger import logger as _lg2
+        _lg2.warning(
+            f"GA memory leash aftermath: RSS {_rss / 1e9:.1f} -> "
+            f"{_rss_post / 1e9:.1f} GB after clears, -> "
+            f"{_rss_final / 1e9:.1f} GB after malloc_trim "
+            f"(released={_trimmed}); arena {(_arena or 0) / 1e9:.1f} GB, "
+            f"in-use {(_inuse or 0) / 1e9:.1f} GB; jax live arrays={_narr} "
+            f"({_jgb:.1f} GB), compiled={_ncomp}")
     except Exception:
         pass
 
@@ -1586,6 +2243,10 @@ class GeneticAlgorithm:
         # fitness cache   shared across restarts
         self._cache: dict = {}
         self.cache_hits   = 0
+        # Counts illegal states that were repaired at a search boundary. This
+        # should stay 0 in normal operation; a non-zero value means an operator
+        # produced an illegal perturbation and the safety net caught it.
+        self.n_repaired_states = 0
 
     def _active_feature_names(self, genes: np.ndarray, limit: int = 8) -> str:
         if not self.feature_names:
@@ -1601,6 +2262,27 @@ class GeneticAlgorithm:
         """Count the primary feature block, excluding optional gene metadata."""
         return int(np.asarray(genes)[:self.n_features].sum())
 
+    def _legalize_genes(self, genes: np.ndarray) -> np.ndarray:
+        """Repair a chromosome and guarantee a legal feature state.
+
+        Every boundary that can receive a perturbation (seed, crossover child,
+        mutation, restart and the fitness evaluation gate) routes through this
+        method. The normal repair chain is tried first; if it cannot satisfy
+        the hard constraints, a fresh legal individual is drawn.
+        """
+        return _legalize_or_sample(
+            genes,
+            lambda: self._random_individual().genes,
+            n_features=self.n_features,
+            min_features=self.min_features,
+            max_features=self.max_features,
+            rng=self.rng,
+            fixed_idx=self._fixed_idx,
+            feature_names=self.feature_names,
+            collinear_groups=self.collinear_groups,
+            require_one_groups=self.require_one_groups,
+        )
+
     # ÔöÇÔöÇ initialisation ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
     def _random_individual(self, n_active: int = None) -> Individual:
@@ -1609,29 +2291,45 @@ class GeneticAlgorithm:
             hi = max(min_active + 1, self.max_features + 1)
             n_active = int(self.rng.integers(min_active, hi))
         n_active = max(min_active, min(n_active, self.max_features))
-        genes    = np.zeros(self.n_features, dtype=int)
-        if self._fixed_idx:
-            genes[list(self._fixed_idx)] = 1
-        extra_needed = max(0, n_active - int(genes.sum()))
-        candidate_idx = [i for i in range(self.n_features) if i not in self._fixed_idx]
-        if extra_needed > 0 and candidate_idx:
-            active = self.rng.choice(candidate_idx, size=min(extra_needed, len(candidate_idx)), replace=False)
-            genes[active] = 1
-        if self.collinear_groups and self.feature_names:
-            genes = _repair_collinearity(genes, self.feature_names,
-                                         self.collinear_groups, self.rng,
-                                         protected_idx=self._fixed_idx)
-        genes = _enforce_feature_bounds(
-            genes, min_active, self.max_features, self.rng,
-            feature_names=self.feature_names,
-            collinear_groups=self.collinear_groups,
-            protected_idx=self._fixed_idx,
-        )
-        if self.require_one_groups and self.feature_names:
-            genes = _repair_require_one(genes, self.feature_names,
-                                        self.require_one_groups, self.rng,
-                                        protected_idx=self._fixed_idx,
-                                        collinear_groups=self.collinear_groups)
+
+        genes = None
+        for _attempt in range(50):
+            genes = np.zeros(self.n_features, dtype=int)
+            if self._fixed_idx:
+                genes[list(self._fixed_idx)] = 1
+            extra_needed = max(0, n_active - int(genes.sum()))
+            candidate_idx = [i for i in range(self.n_features)
+                             if i not in self._fixed_idx]
+            if extra_needed > 0 and candidate_idx:
+                active = self.rng.choice(
+                    candidate_idx,
+                    size=min(extra_needed, len(candidate_idx)),
+                    replace=False)
+                genes[active] = 1
+            if self.collinear_groups and self.feature_names:
+                genes = _repair_collinearity(genes, self.feature_names,
+                                             self.collinear_groups, self.rng,
+                                             protected_idx=self._fixed_idx)
+            genes = _enforce_feature_bounds(
+                genes, min_active, self.max_features, self.rng,
+                feature_names=self.feature_names,
+                collinear_groups=self.collinear_groups,
+                protected_idx=self._fixed_idx,
+            )
+            if self.require_one_groups and self.feature_names:
+                genes = _repair_require_one(
+                    genes, self.feature_names, self.require_one_groups,
+                    self.rng, protected_idx=self._fixed_idx,
+                    collinear_groups=self.collinear_groups)
+            if _feature_state_legal(
+                    genes, self.n_features, self.min_features,
+                    self.max_features, self._fixed_idx, self.feature_names,
+                    self.collinear_groups, self.require_one_groups):
+                return Individual(genes=genes)
+
+        logger.warning("GeneticAlgorithm: could not construct a fully legal "
+                       "random chromosome after 50 attempts; returning the "
+                       "last repaired state")
         return Individual(genes=genes)
 
     def _init_population(self, seed_individuals: list = None) -> List[Individual]:
@@ -1651,7 +2349,15 @@ class GeneticAlgorithm:
         pop = []
         if seed_individuals:
             for ind in seed_individuals[:self.elitism_k]:
-                pop.append(ind.copy())
+                copy_ind = ind.copy()
+                legal_genes = self._legalize_genes(copy_ind.genes)
+                if not np.array_equal(legal_genes, copy_ind.genes):
+                    # The seed was illegal: its stored fitness belongs to the
+                    # old genome, so it must be re-evaluated.
+                    copy_ind.genes = legal_genes
+                    copy_ind.fitness = -np.inf
+                    self.n_repaired_states += 1
+                pop.append(copy_ind)
 
         span  = max(self.max_features - self.min_features, 1)
         q1    = self.min_features + span // 4
@@ -1709,9 +2415,14 @@ class GeneticAlgorithm:
             return p1.copy(), p2.copy()
         # uniform crossover   each gene independently inherited from either parent
         mask = self.rng.integers(0, 2, size=self.n_features).astype(bool)
-        g1   = np.where(mask, p1.genes, p2.genes)
-        g2   = np.where(mask, p2.genes, p1.genes)
-        return Individual(genes=g1), Individual(genes=g2)
+        g1   = np.where(mask, p1.genes[:self.n_features],
+                        p2.genes[:self.n_features])
+        g2   = np.where(mask, p2.genes[:self.n_features],
+                        p1.genes[:self.n_features])
+        # A crossover child can violate min/max, collinearity or require-one
+        # even when both parents are legal. Repair before it reaches fitness.
+        return (Individual(genes=self._legalize_genes(g1)),
+                Individual(genes=self._legalize_genes(g2)))
 
     # ÔöÇÔöÇ mutation ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
@@ -1725,31 +2436,24 @@ class GeneticAlgorithm:
         if self._fixed_idx:
             genes[list(self._fixed_idx)] = 1
 
-        # repair: enforce min/max features
-        if self.collinear_groups and self.feature_names:
-            genes = _repair_collinearity(genes, self.feature_names,
-                                         self.collinear_groups, self.rng,
-                                         protected_idx=self._fixed_idx)
-        genes = _enforce_feature_bounds(
-            genes,
-            max(self.min_features, len(self._fixed_idx)),
-            self.max_features,
-            self.rng,
-            feature_names=self.feature_names,
-            collinear_groups=self.collinear_groups,
-            protected_idx=self._fixed_idx,
-        )
-        if self.require_one_groups and self.feature_names:
-            genes = _repair_require_one(genes, self.feature_names,
-                                        self.require_one_groups, self.rng,
-                                        protected_idx=self._fixed_idx,
-                                        collinear_groups=self.collinear_groups)
+        # A mutation is a perturbation, not a guaranteed legal state. Repair
+        # it here so no illegal genome ever reaches the fitness function.
+        genes = self._legalize_genes(genes)
 
         return Individual(genes=genes)
 
     # ÔöÇÔöÇ evaluation with caching ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
     def _evaluate_one(self, ind: Individual) -> Individual:
+        # Boundary guarantee: regardless of how an Individual was produced,
+        # never estimate an illegal specification.
+        if not _feature_state_legal(
+                ind.genes, self.n_features, self.min_features,
+                self.max_features, self._fixed_idx, self.feature_names,
+                self.collinear_groups, self.require_one_groups):
+            ind.genes = self._legalize_genes(ind.genes)
+            ind.fitness = -np.inf
+            self.n_repaired_states += 1
         key = ind.key()
         if key in self._cache:
             ind.fitness = self._cache[key]
@@ -2287,6 +2991,41 @@ class SparseEAAGDS(GeneticAlgorithm):
                 genes[pos:pos + 2] = 0
         return genes
 
+    def _legalize_genes(self, genes: np.ndarray) -> np.ndarray:
+        """Base legality plus a valid distribution-policy tail.
+
+        Always returns exactly ``n_genes`` bits: callers may pass a base-only
+        chromosome (from a seed or a base-block mutation), and the fallback
+        sampler can return a full AGDS chromosome.
+        """
+        genes = np.asarray(genes, dtype=int)
+        if len(genes) < self.n_genes:
+            base = np.zeros(self.n_features, dtype=int)
+            n_copy = min(len(genes), self.n_features)
+            base[:n_copy] = genes[:n_copy]
+            genes = base
+        genes = super()._legalize_genes(genes)
+        if len(genes) != self.n_genes:
+            normalised = np.zeros(self.n_genes, dtype=int)
+            n_copy = min(len(genes), self.n_genes)
+            normalised[:n_copy] = genes[:n_copy]
+            genes = normalised
+        if self.distribution_features:
+            genes = self._repair_distribution_tail(genes)
+        return genes
+
+    def _evaluate_one(self, ind: "Individual") -> "Individual":
+        """Base legality plus distribution-tail legality at the fitness gate."""
+        genes = np.asarray(ind.genes, dtype=int)
+        if len(genes) == self.n_genes:
+            tail_bad = not np.array_equal(
+                genes, self._repair_distribution_tail(genes))
+            if tail_bad:
+                ind.genes = self._legalize_genes(genes)
+                ind.fitness = -np.inf
+                self.n_repaired_states += 1
+        return super()._evaluate_one(ind)
+
     # -- refresh AGDS state whenever a population is (re)evaluated ---------
     def _evaluate(self, pop):
         pop = super()._evaluate(pop)
@@ -2335,7 +3074,8 @@ class SparseEAAGDS(GeneticAlgorithm):
                 continue
             choices = self.distribution_options.get(name, ('fixed',))
             policy[name] = choices[int(self.rng.integers(0, len(choices)))]
-        return Individual(genes=self.encode_distribution_genes(base.genes, policy),
+        genes = self.encode_distribution_genes(base.genes, policy)
+        return Individual(genes=self._repair_distribution_tail(genes),
                           metadata=copy.deepcopy(base.metadata))
 
     # -- (A) adaptive crossover -------------------------------------------
@@ -2355,9 +3095,11 @@ class SparseEAAGDS(GeneticAlgorithm):
                 a_tail = np.where(tail_mask, a_tail, p2.genes[self.n_features:self.n_genes])
                 b_tail = np.where(tail_mask, p2.genes[self.n_features:self.n_genes],
                                   p1.genes[self.n_features:self.n_genes])
-            a = Individual(genes=self._repair_distribution_tail(
+            # Uniform crossover can violate min/max/collinearity/require-one
+            # even when both parents are legal; legalise the full chromosome.
+            a = Individual(genes=self._legalize_genes(
                 np.concatenate([a_base, a_tail])))
-            b = Individual(genes=self._repair_distribution_tail(
+            b = Individual(genes=self._legalize_genes(
                 np.concatenate([b_base, b_tail])))
         a.metadata['agds_ps'] = ps
         b.metadata['agds_ps'] = ps
@@ -2385,24 +3127,10 @@ class SparseEAAGDS(GeneticAlgorithm):
             genes[list(self._fixed_idx)] = 1
 
         # reuse the base repair chain (collinearity / bounds / require-one)
-        if self.collinear_groups and self.feature_names:
-            genes = _repair_collinearity(genes, self.feature_names,
-                                         self.collinear_groups, self.rng,
-                                         protected_idx=self._fixed_idx)
-        genes = _enforce_feature_bounds(
-            genes,
-            max(self.min_features, len(self._fixed_idx)),
-            self.max_features,
-            self.rng,
-            feature_names=self.feature_names,
-            collinear_groups=self.collinear_groups,
-            protected_idx=self._fixed_idx,
-        )
-        if self.require_one_groups and self.feature_names:
-            genes = _repair_require_one(genes, self.feature_names,
-                                        self.require_one_groups, self.rng,
-                                        protected_idx=self._fixed_idx,
-                                        collinear_groups=self.collinear_groups)
+        # and guarantee legality before the distribution tail is rebuilt.
+        # AGDS legalisation returns a full chromosome, so keep only the base
+        # block here before re-attaching the mutated tail.
+        genes = self._legalize_genes(genes)[:self.n_features]
         if self.distribution_features:
             tail = distribution_tail
             name_to_idx = {name: idx for idx, name in enumerate(self.feature_names)}
@@ -2423,7 +3151,7 @@ class SparseEAAGDS(GeneticAlgorithm):
                     code = self._dist_code(name, choice)
                     tail[tail_pos] = code & 1
                     tail[tail_pos + 1] = (code >> 1) & 1
-            genes = self._repair_distribution_tail(np.concatenate([genes, tail]))
+            genes = self._legalize_genes(np.concatenate([genes, tail]))
         out = Individual(genes=genes)
         out.metadata['agds_ps'] = ps
         return out
@@ -2548,6 +3276,22 @@ class SimulatedAnnealing:
         }
         self._cache: dict = {}
         self.cache_hits = 0
+        self.n_repaired_states = 0
+
+    def _legalize_genes(self, genes: np.ndarray) -> np.ndarray:
+        """Repair a neighbour/seed and guarantee a legal feature state."""
+        return _legalize_or_sample(
+            genes,
+            lambda: self._random_genes(),
+            n_features=self.n_features,
+            min_features=self.min_features,
+            max_features=self.max_features,
+            rng=self.rng,
+            fixed_idx=self._fixed_idx,
+            feature_names=self.feature_names,
+            collinear_groups=self.collinear_groups,
+            require_one_groups=self.require_one_groups,
+        )
 
     def _random_genes(self, n_active: int = None) -> np.ndarray:
         min_active = max(self.min_features, len(self._fixed_idx))
@@ -2555,29 +3299,43 @@ class SimulatedAnnealing:
             hi = max(min_active + 1, self.max_features + 1)
             n_active = int(self.rng.integers(min_active, hi))
         n_active = max(min_active, min(n_active, self.max_features))
-        genes = np.zeros(self.n_features, dtype=int)
-        if self._fixed_idx:
-            genes[list(self._fixed_idx)] = 1
-        extra = max(0, n_active - int(genes.sum()))
-        cands = [i for i in range(self.n_features) if i not in self._fixed_idx]
-        if extra > 0 and cands:
-            chosen = self.rng.choice(cands, size=min(extra, len(cands)), replace=False)
-            genes[chosen] = 1
-        if self.collinear_groups and self.feature_names:
-            genes = _repair_collinearity(genes, self.feature_names,
-                                         self.collinear_groups, self.rng,
-                                         protected_idx=self._fixed_idx)
-        genes = _enforce_feature_bounds(
-            genes, min_active, self.max_features, self.rng,
-            feature_names=self.feature_names,
-            collinear_groups=self.collinear_groups,
-            protected_idx=self._fixed_idx,
-        )
-        if self.require_one_groups and self.feature_names:
-            genes = _repair_require_one(genes, self.feature_names,
-                                        self.require_one_groups, self.rng,
-                                        protected_idx=self._fixed_idx,
-                                        collinear_groups=self.collinear_groups)
+
+        genes = None
+        for _attempt in range(50):
+            genes = np.zeros(self.n_features, dtype=int)
+            if self._fixed_idx:
+                genes[list(self._fixed_idx)] = 1
+            extra = max(0, n_active - int(genes.sum()))
+            cands = [i for i in range(self.n_features)
+                     if i not in self._fixed_idx]
+            if extra > 0 and cands:
+                chosen = self.rng.choice(
+                    cands, size=min(extra, len(cands)), replace=False)
+                genes[chosen] = 1
+            if self.collinear_groups and self.feature_names:
+                genes = _repair_collinearity(
+                    genes, self.feature_names, self.collinear_groups,
+                    self.rng, protected_idx=self._fixed_idx)
+            genes = _enforce_feature_bounds(
+                genes, min_active, self.max_features, self.rng,
+                feature_names=self.feature_names,
+                collinear_groups=self.collinear_groups,
+                protected_idx=self._fixed_idx,
+            )
+            if self.require_one_groups and self.feature_names:
+                genes = _repair_require_one(
+                    genes, self.feature_names, self.require_one_groups,
+                    self.rng, protected_idx=self._fixed_idx,
+                    collinear_groups=self.collinear_groups)
+            if _feature_state_legal(
+                    genes, self.n_features, self.min_features,
+                    self.max_features, self._fixed_idx, self.feature_names,
+                    self.collinear_groups, self.require_one_groups):
+                return genes
+
+        logger.warning("SimulatedAnnealing: could not construct a fully legal "
+                       "random chromosome after 50 attempts; returning the "
+                       "last repaired state")
         return genes
 
     def _neighbor(self, genes: np.ndarray) -> np.ndarray:
@@ -2631,24 +3389,21 @@ class SimulatedAnnealing:
 
         idxs = self.rng.choice(mutable, size=n_flip, replace=False, p=weights)
         g[idxs] = 1 - g[idxs]
-        if self.collinear_groups and self.feature_names:
-            g = _repair_collinearity(g, self.feature_names,
-                                     self.collinear_groups, self.rng,
-                                     protected_idx=self._fixed_idx)
-        g = _enforce_feature_bounds(
-            g, max(self.min_features, len(self._fixed_idx)), self.max_features, self.rng,
-            feature_names=self.feature_names,
-            collinear_groups=self.collinear_groups,
-            protected_idx=self._fixed_idx,
-        )
-        if self.require_one_groups and self.feature_names:
-            g = _repair_require_one(g, self.feature_names,
-                                    self.require_one_groups, self.rng,
-                                    protected_idx=self._fixed_idx,
-                                    collinear_groups=self.collinear_groups)
-        return g
+        # The bit flips are a perturbation; the repair chain below is the
+        # guarantee that the SA state stays legal even when the perturbation
+        # would otherwise empty a require-one group or exceed max_features.
+        return self._legalize_genes(g)
 
     def _evaluate(self, genes: np.ndarray) -> float:
+        # Boundary guarantee: never estimate an illegal specification. The
+        # normal callers (_random_genes / _neighbor / run seed) already repair;
+        # this catches any future operator that forgets.
+        if not _feature_state_legal(
+                genes, self.n_features, self.min_features,
+                self.max_features, self._fixed_idx, self.feature_names,
+                self.collinear_groups, self.require_one_groups):
+            genes = self._legalize_genes(genes)
+            self.n_repaired_states += 1
         key = tuple(genes.tolist())
         if key in self._cache:
             self.cache_hits += 1
@@ -2676,7 +3431,10 @@ class SimulatedAnnealing:
         """
         n_steps_total = self.pop_size * self.n_generations
 
-        cur_genes = (seed_individuals[0].genes.copy()
+        # Seeds can come from an older run or a Stage-5 starter (e.g. the
+        # one-gene c_crash genome, below min_features). Legalise before the
+        # chain starts so every subsequent state remains reachable and legal.
+        cur_genes = (self._legalize_genes(seed_individuals[0].genes)
                      if seed_individuals else self._random_genes())
         cur_fit   = self._evaluate(cur_genes)
         best_genes = cur_genes.copy()
@@ -2923,6 +3681,7 @@ class BanditFeatureSearcher:
         # Fitness cache — shared across restarts
         self._cache: dict = {}
         self.cache_hits     = 0
+        self.n_repaired_states = 0
         # Beta arm posteriors — one per include gene + one per rand gene
         # (fixed features never updated)
         self._alpha = np.full(self.n_genes, alpha0, dtype=float)
@@ -2977,6 +3736,39 @@ class BanditFeatureSearcher:
         return [self.feature_names[fi]
                 for j, fi in enumerate(self._rand_feat_idx) if tail[j] == 1]
 
+    def _legalize_genes(self, genes: np.ndarray) -> np.ndarray:
+        """Repair a full bandit chromosome (include block + rand tail).
+
+        The MH kernel itself only proposes legal neighbours, but seeds can
+        arrive from the Stage-5 starter or an older run. This method is the
+        repair boundary for those entry points.
+        """
+        genes = np.asarray(genes, dtype=int).copy()
+        base, tail = self._split_genes(genes)
+        base = _repair_feature_state(
+            base,
+            n_features=self.n_features,
+            min_features=self.min_features,
+            max_features=self.max_features,
+            rng=self.rng,
+            fixed_idx=self._fixed_idx,
+            feature_names=self.feature_names,
+            collinear_groups=self.collinear_groups,
+            require_one_groups=self.require_one_groups,
+            blocked_features=getattr(self, '_blocked', set()),
+        )
+        g = self._attach_rand_genes(
+            base, tail if len(tail) == self.n_rand else None)
+        if self._mh_state_valid(g):
+            return g
+        for _ in range(50):
+            candidate = self._sample_chromosome()
+            if self._mh_state_valid(candidate):
+                return candidate
+        logger.warning("BanditFeatureSearcher: could not repair chromosome "
+                       "to a fully legal state after 50 samples")
+        return g
+
     def _sample_chromosome(self) -> np.ndarray:
         """Sample one chromosome via Thompson sampling."""
         genes = np.zeros(self.n_features, dtype=int)
@@ -2993,24 +3785,21 @@ class BanditFeatureSearcher:
             theta    = float(self.rng.beta(
                 max(self._alpha[i], 1e-6), max(self._beta[i], 1e-6)))
             genes[i] = int(self.rng.random() < theta)
-        # Enforce min/max bounds (may add/remove optional features)
-        genes = _enforce_feature_bounds(
-            genes, self.min_features, self.max_features, self.rng,
+        # Canonical repair order: collinearity -> bounds -> require-one. This
+        # is the same chain used by the GA/SA engines, so a Thompson sample is
+        # legal before it becomes an MH state or a seed.
+        genes = _repair_feature_state(
+            genes,
+            n_features=self.n_features,
+            min_features=self.min_features,
+            max_features=self.max_features,
+            rng=self.rng,
+            fixed_idx=self._fixed_idx,
+            feature_names=self.feature_names,
+            collinear_groups=self.collinear_groups,
+            require_one_groups=self.require_one_groups,
             blocked_features=_blocked,
-            protected_idx=self._fixed_idx,
         )
-        # Repair collinearity
-        if self.collinear_groups and self.feature_names:
-            genes = _repair_collinearity(
-                genes, self.feature_names, self.collinear_groups,
-                self.rng, protected_idx=self._fixed_idx,
-            )
-        if self.require_one_groups and self.feature_names:
-            genes = _repair_require_one(
-                genes, self.feature_names, self.require_one_groups,
-                self.rng, protected_idx=self._fixed_idx,
-                collinear_groups=self.collinear_groups,
-            )
         return self._attach_rand_genes(genes)
 
     def _directed_candidate(self, cur_genes: np.ndarray) -> np.ndarray:
@@ -3201,6 +3990,14 @@ class BanditFeatureSearcher:
         return candidate, float(np.log(probs[pick])), float(np.log(q_reverse))
 
     def _evaluate_one(self, ind: Individual) -> Individual:
+        # Boundary guarantee. The MH kernel only proposes legal neighbours,
+        # so this normally does nothing; if a seed or future operator slips
+        # through, repair it before estimation rather than evaluate an
+        # illegal specification.
+        if not self._mh_state_valid(ind.genes):
+            ind.genes = self._legalize_genes(ind.genes)
+            ind.fitness = -np.inf
+            self.n_repaired_states += 1
         key = tuple(ind.genes.tolist())
         if key in self._cache:
             ind.fitness = self._cache[key]
@@ -3318,22 +4115,44 @@ class BanditFeatureSearcher:
 
         # ── Initialise current state ────────────────────────────────────────
         # Start from the best seed if provided; otherwise draw via Thompson.
+        # A seed can be *invalid* under the hard search constraints (the Stage-5
+        # starter genome is only c_crash, below min_features=3). Starting the MH
+        # chain there is fatal: every candidate is legal, but the reverse move
+        # back to the invalid current state has zero proposal mass, so the
+        # Hastings correction makes log_alpha=-inf and the chain rejects every
+        # proposal forever (observed accept=0.00, frozen T and BIC/n).
+        def _draw_valid() -> np.ndarray:
+            return self._legalize_genes(self._sample_chromosome())
+
         if seed_individuals:
             best_seed = max(seed_individuals, key=lambda x: x.fitness
                             if np.isfinite(x.fitness) else -np.inf)
-            _seed_base, _seed_tail = self._split_genes(best_seed.genes.copy())
-            cur_genes = self._attach_rand_genes(
-                _seed_base,
-                _seed_tail if len(_seed_tail) == self.n_rand else None,
-            )
-            cur_fit   = best_seed.fitness
-            if not np.isfinite(cur_fit) or cur_fit <= -1e8:
-                cur_fit = self._evaluate_one(Individual(genes=cur_genes)).fitness
-            for ind in seed_individuals:
-                ind = self._evaluate_one(ind)
-                self._update_arms(ind.genes, ind.fitness)
+            _seed_original = best_seed.genes.copy()
+            _seed_genes = self._legalize_genes(_seed_original)
+            if self._mh_state_valid(_seed_genes):
+                cur_genes = _seed_genes
+                cur_fit   = (best_seed.fitness
+                             if np.array_equal(_seed_genes, _seed_original)
+                             else -np.inf)
+                if not np.isfinite(cur_fit) or cur_fit <= -1e8:
+                    cur_fit = self._evaluate_one(Individual(genes=cur_genes)).fitness
+                for ind in seed_individuals:
+                    ind = ind.copy()
+                    _original = ind.genes.copy()
+                    ind.genes = self._legalize_genes(_original)
+                    if not np.array_equal(ind.genes, _original):
+                        ind.fitness = -np.inf
+                    ind = self._evaluate_one(ind)
+                    self._update_arms(ind.genes, ind.fitness)
+            else:
+                if self.verbose:
+                    print("  Bandit-MH: seed cannot be repaired to a legal "
+                          "state — sampling a valid start instead", flush=True)
+                cur_genes = _draw_valid()
+                cur_fit   = self._evaluate_one(Individual(genes=cur_genes)).fitness
+                self._update_arms(cur_genes, cur_fit)
         else:
-            cur_genes = self._sample_chromosome()
+            cur_genes = _draw_valid()
             cur_fit   = self._evaluate_one(Individual(genes=cur_genes)).fitness
             self._update_arms(cur_genes, cur_fit)
 
@@ -3348,8 +4167,8 @@ class BanditFeatureSearcher:
             deltas: List[float] = []
             _fits: List[float] = []
             for _ in range(min(self.pop_size, 20)):
-                g = self._sample_chromosome()
-                f = self._evaluate_one(Individual(genes=g)).fitness
+                _cal = self._evaluate_one(Individual(genes=_draw_valid()))
+                g, f = _cal.genes, _cal.fitness
                 self._update_arms(g, f)
                 if np.isfinite(f) and f > -1e8:
                     deltas.append(abs(f - cur_fit))
@@ -3414,6 +4233,22 @@ class BanditFeatureSearcher:
             # quality feeds back into arm posteriors without per-step overhead.
             if gen % 10 == 0:
                 self._refresh_weakness()
+                # A newly blacklisted feature can still be active in the live
+                # and best chromosomes. Leaving it there makes the current
+                # state illegal, so every legal proposal has zero reverse
+                # Hastings mass and the chain freezes (accept=0.00) exactly as
+                # the invalid one-gene seed did. Repair both states now.
+                if not self._mh_state_valid(cur_genes):
+                    cur_genes = self._legalize_genes(cur_genes)
+                    cur_fit = self._evaluate_one(
+                        Individual(genes=cur_genes)).fitness
+                    self._update_arms(cur_genes, cur_fit)
+                    self.n_repaired_states += 1
+                if not self._mh_state_valid(best_genes):
+                    best_genes = self._legalize_genes(best_genes)
+                    best_fit = self._evaluate_one(
+                        Individual(genes=best_genes)).fitness
+                    self.n_repaired_states += 1
             bucket_fits: List[float] = []
             n_accepted = 0
 
@@ -3426,6 +4261,9 @@ class BanditFeatureSearcher:
                     bucket_fits.append(cur_fit)
                     continue
                 cand       = self._evaluate_one(Individual(genes=cand_genes))
+                # _evaluate_one may have repaired a boundary violation; keep
+                # the chain and the arm update on the legal genome.
+                cand_genes = cand.genes
                 cand_fit   = cand.fitness
 
                 # Update Beta posteriors regardless of acceptance
@@ -3489,6 +4327,7 @@ class BanditFeatureSearcher:
                 'worst_fitness': float(min(bucket_fits)) if bucket_fits else best_fit,
                 'n_features':    int(best_genes.sum()),
                 'diversity':     diversity,
+                'accept_rate':   accept_rate,
                 'mutation_rate': T,      # current temperature (analogous to mut rate)
                 'stagnation':    _since_improve,
             })
@@ -4385,6 +5224,7 @@ def _stage5_mode_only_fitness(
     structure: forwarded to _build_mode_model ('nested' default / 'flat').
         Lets shard variant arms score the same spec under each mode family.
     """
+    _set_mem_phase("mode")
     from stage5_destination_choice import (
         _filter_seg, _mode_tree, _build_mode_model, _estimate,
         _estimate_mixed_logit,
@@ -4503,6 +5343,24 @@ def _stage5_mode_only_fitness(
                                              _update_feature_weakness,
                                              _bic_per_obs)
         coef_rows = _larch_coef_rows(mode_mdl)
+        # Behavioural sign gate (mirrors finalize_ga_best.gate): crash and
+        # in-vehicle time must deter travel.  A positive estimate is not a
+        # finding to report; it means the genome's spec is unidentified.
+        _bad_sign = _stage5_coef_sign_gate(coef_rows, {
+            'c_crash_veh': -1.0,
+            'c_ivt_auto': -1.0,
+            'c_ivt_transit': -1.0,
+        })
+        if _bad_sign:
+            _seen_g = getattr(_stage5_mode_only_fitness, '_gate_logged', set())
+            if segment not in _seen_g:
+                _seen_g.add(segment)
+                _stage5_mode_only_fitness._gate_logged = _seen_g
+                logger.warning(
+                    f"Stage5 mode-only [{segment}]: sign gate rejected "
+                    f"{_bad_sign} (expected negative) — returning failure "
+                    f"sentinel for this genome.")
+            return -1e9
         sig_pen   = _metacount_significance_penalty(coef_rows)
         _update_feature_weakness(coef_rows, mode_vars)
         # Real ll/k/n for the leaderboard. k is the fitted free-parameter count
@@ -4676,11 +5534,24 @@ def _stage5_dest_only_fitness(
     CONVERGED ll=-9541 yet the baseline scored -1e9 with no cause in the
     logs because the raise site was swallowed).
     """
+    _set_mem_phase("dest")
     from stage5_destination_choice import (_dest_tree, _build_dest_model, _estimate,
                                            apply_dest_warm_start,
                                            quarantine_dest_cases,
                                            _build_dest_model_nl_distance)
     dest_vars = [v for v, g in zip(dest_candidates, dest_genes) if g == 1]
+    # Structural route logsum: whenever the person-type table is attached, the
+    # destination spec must contain c_route_logsum_type.  Forcing it here (and
+    # counting it in k below) makes the time-safety trade-off non-negotiable
+    # for every genome, including a genome that lost the gene to a mutation.
+    _forced_route = (
+        custom_uec is None
+        and _STAGE5_ROUTE_TERM in dest_candidates
+        and _route_type_table_active()
+        and _STAGE5_ROUTE_TERM not in dest_vars
+    )
+    if _forced_route:
+        dest_vars = dest_vars + [_STAGE5_ROUTE_TERM]
     if not dest_vars and custom_uec is None:
         return -1e9
     # Quarantine unrepresentable tours (out-of-universe/NaN chosen zones yield
@@ -4731,6 +5602,11 @@ def _stage5_dest_only_fitness(
     except Exception as _e:
         logger.warning(f"Stage5 dest-only [{segment}]: estimation raised ({_e!r})")
         return -1e9
+    if getattr(dest_mdl, '_estimation_failed', False):
+        logger.warning(
+            f"Stage5 dest-only [{segment}]: rejecting unidentified fit "
+            f"({getattr(dest_mdl, '_estimation_error', 'unknown')})")
+        return -1e9
     try:
         dest_ll = _scored_ll(dest_mdl, f"{segment}/dest")
     except Exception as _e:
@@ -4742,9 +5618,12 @@ def _stage5_dest_only_fitness(
         return -1e9
     try:
         n   = len(seg_acdc)  # fitted cases (post-quarantine, deterministic per segment)
-        k   = int(dest_genes.sum())
-        if k == 0 and custom_uec:
+        if custom_uec:
+            # An explicit UEC is the exact fitted spec; its length is the
+            # honest parameter count (the gene mask may be a subset).
             k = len(custom_uec)
+        else:
+            k = int(dest_genes.sum()) + (1 if _forced_route else 0)
         _seen = getattr(_stage5_dest_only_fitness, '_valid_logged', set())
         if segment not in _seen:
             print(f"    First valid Stage 5 dest model [{segment}]: LL={dest_ll:.2f}  n={n}  k={k}")
@@ -4755,6 +5634,27 @@ def _stage5_dest_only_fitness(
                                              _update_feature_weakness,
                                              _bic_per_obs)
         coef_rows = _larch_coef_rows(dest_mdl)
+        # Behavioural sign gate: the route logsum is a travel-time/cost
+        # inclusive value, so its coefficient must be negative.  A wrong-signed
+        # estimate means the specification is not identified (e.g. collinear
+        # with distance) and must never be scored as a valid genome.  Legacy
+        # destination crash terms, when explicitly enabled, carry the same
+        # deterrent sign.
+        _bad_sign = _stage5_coef_sign_gate(coef_rows, {
+            _STAGE5_ROUTE_TERM: -1.0,
+            'c_crash': -1.0,
+            'c_crash_safety_dest': -1.0,
+        })
+        if _bad_sign:
+            _seen_g = getattr(_stage5_dest_only_fitness, '_gate_logged', set())
+            if segment not in _seen_g:
+                _seen_g.add(segment)
+                _stage5_dest_only_fitness._gate_logged = _seen_g
+                logger.warning(
+                    f"Stage5 dest-only [{segment}]: sign gate rejected "
+                    f"{_bad_sign} (expected negative) — returning failure "
+                    f"sentinel for this genome.")
+            return -1e9
         sig_pen   = _metacount_significance_penalty(coef_rows)
         _update_feature_weakness(coef_rows, dest_vars)
         _record_fit_info("s5dest", segment, "dest",
@@ -5866,8 +6766,17 @@ def _cdap_candidates(data: pd.DataFrame) -> List[str]:
                  'mtwp',          # travel-to-work mode   strong CDAP predictor
                  'preferred_mode_DA', 'preferred_mode_Transit',
                  'preferred_mode_Walk', 'preferred_mode_Bike']
+    # Stage-0 person-type diagnostic terms: the route-choice lambda and the
+    # type's route shares, plus safety-accessibility x type interactions.
+    # Opt-in because adding them changes the Stage-0 search; the default pool
+    # is unchanged so existing CDAP results remain reproducible.
+    type_vars = []
+    if os.environ.get('CDAP_TYPE_CANDIDATES', '0').strip() == '1':
+        type_vars = ['route_lambda_min_per_resid_sd', 'route_p_safest',
+                     'route_expected_time_min', 'route_physical_crash_norm',
+                     'crash_acc_x_safe_low', 'crash_acc_x_safe_high']
     all_cands = (ptype_dummies + age_vars + hh_vars + access +
-                 work_vars + acc_cols + raw_synth + abs_cols)
+                 work_vars + acc_cols + raw_synth + abs_cols + type_vars)
     return [c for c in all_cands if c in data.columns]
 
 
@@ -7194,8 +8103,14 @@ def _stage5_dest_candidates() -> List[str]:
 
     Split into sub-pools:
     ALWAYS FIXED (backbone)   kept regardless of GA selection:
-        c_logsum, c_log_dist, c_dist, c_size_term, c_aggl, c_comp, c_crash,
-        c_incp_dist, c_veh_dist, key accessibility interactions
+        c_route_logsum_type, c_log_dist, c_dist, c_size_term, c_aggl,
+        c_comp, c_incp_dist, c_veh_dist, key accessibility interactions
+
+    The person-type route logsum (``c_route_logsum_type``) is the structural
+    time-safety inclusive value: it already embeds the fastest / balanced /
+    safest route trade-off, so the destination model does NOT carry a separate
+    crash term.  ``c_crash`` / ``c_crash_safety_dest`` are legacy genes offered
+    only under STAGE5_LEGACY_DEST_CRASH=1 for comparison runs.
 
     TESTED BY GA (additional enrichments):
         ÔÇó Land-use employment categories by sector
@@ -7244,7 +8159,21 @@ def _stage5_dest_candidates() -> List[str]:
     # accessibility step) - previously only 4 of the 8 were searchable.
     acc_dest = ['auto_work_acc', 'auto_edu_acc', 'auto_shop_acc',
                 'auto_nonmand_acc', 'walk_acc', 'bike_acc', 'transit_acc',
-                'recreation_acc', 'crash_acc']
+                'recreation_acc', 'crash_acc',
+                # CensusAtlas 2021 walkability / school / transit terms
+                # (coeff-name gated in DEST_UEC_FLAT; all segments offered,
+                # with the per-segment pool below deciding relevance).
+                'c_ca_walkability', 'c_ca_walk_amenities',
+                'c_ca_walk_city_pct', 'c_ca_walk_groceries',
+                'c_ca_walk_transit', 'c_ca_walk_school', 'c_ca_walk_parks',
+                'c_ca_walk_health', 'c_ca_walk_poi',
+                'c_ca_school_count', 'c_ca_schools_per_child',
+                'c_ca_schools_nearby', 'c_ca_school_students',
+                'c_ca_school_size', 'c_ca_school_icsea',
+                'c_ca_transit_stops', 'c_ca_transit_nearest',
+                'c_ca_transit_reach30', 'c_ca_transit_reach45',
+                'c_ca_transit_cbd', 'c_ca_drive_cbd',
+                'c_ca_transit_depart', 'c_ca_transit_routes']
     # ÔöÇÔöÇ Person attributes tested as interaction terms with destination ÔöÇÔöÇÔöÇÔöÇ
     # (person-by-destination interactions already in fixed backbone for income,
     # vehicles; GA tests additional demographics)
@@ -7289,11 +8218,21 @@ def _stage5_dest_candidates() -> List[str]:
     #    piecewise distance spline (replaces c_dist) + CBD/urban-core attractor.
     dist_spline = ['c_dist_0_2', 'c_dist_2_5', 'c_dist_5_10', 'c_cbd_dest',
                    'c_dist_sq']   # ActivitySim util_dist_squared (quadratic decay)
+    # -- Structural route logsum gene: always offered, fixed ON by the GA
+    #    runner.  It carries the person-specific time-safety trade-off, so the
+    #    destination model no longer needs a separate crash term.
+    route_gene = ['c_route_logsum_type']
+    # -- Legacy destination crash genes: OFF by default.  The crash effect is
+    #    identified through the route logsum; keeping a second destination
+    #    crash term would double-count it.  Opt in only for comparison runs.
+    safety_genes = []
+    if os.environ.get('STAGE5_LEGACY_DEST_CRASH', '0').strip() == '1':
+        safety_genes = ['c_crash', 'c_crash_safety_dest']
     candidates = list(dict.fromkeys(
         skim_extra + emp_work + emp_edu + emp_nonmand + pop_area +
         acc_dest + person_dest_int + acdc_themed + home_pull_vars +
         mode_lu_vars + dist_spline + occu_resid + power_dest +
-        _overlay_dest_interaction_genes()
+        route_gene + safety_genes + _overlay_dest_interaction_genes()
     ))
     return [candidate for candidate in candidates
             if _stage5_dest_candidate_maps_to_live_uec(candidate)]
@@ -7376,7 +8315,9 @@ def _stage5_dest_candidates_for_segment(segment: str) -> List[str]:
     """Purpose-aware stage 5 destination candidates by segment."""
     common = {
         'SOVTOLL_TIME__AM',
-        'c_crash',
+        # Structural person-type route logsum: carries the fastest / balanced /
+        # safest trade-off, so no separate destination crash term is needed.
+        'c_route_logsum_type',
         # Extended accessibility (accessibility_371_extended.csv): substrings
         # of the flat UEC expressions, so live-token mapping picks them up.
         'crime_violent', 'crash_smooth', 'transit_int',
@@ -7392,8 +8333,20 @@ def _stage5_dest_candidates_for_segment(segment: str) -> List[str]:
         'c_dist_0_2', 'c_dist_2_5', 'c_dist_5_10', 'c_cbd_dest', 'is_cbd',
         'c_dist_decay', 'c_dist_decay_slow',   # non-linear gravity distance-decay
         'c_dist_sq',   # ActivitySim util_dist_squared (quadratic distance decay)
-        'c_crash_safety_dest',   # per-agent safety utility x destination crash
+        # Walkability covariates (build_walkability_covariates.py): 15-min
+        # amenity coverage, walkable-junction density, terrain slope. Offered
+        # BOTH as coefficient names (coeff-name gating) and as column tokens
+        # (substring gating) so either route activates the term.
+        'c_walk15_cov', 'c_intersection', 'c_slope',
+        'walk15_cov', 'intersection_dens', 'slope_mean',
+        # CensusAtlas 2021 accessibility: overall walkability, walk coverage
+        # of city amenities and transit reach apply to every segment; the
+        # segment pools below add purpose-specific school/shop/transit terms.
+        'c_ca_walkability', 'c_ca_walk_city_pct',
+        'c_ca_transit_stops', 'c_ca_transit_reach30',
     }
+    if os.environ.get('STAGE5_LEGACY_DEST_CRASH', '0').strip() == '1':
+        common = common | {'c_crash', 'c_crash_safety_dest'}
     # E1 grid-feedback pilot genes (STAGE5_POWER_ACC=1 only).
     if os.environ.get('STAGE5_POWER_ACC', '0').strip() == '1':
         common = common | {'c_power_reliability', 'c_power_headroom',
@@ -7410,6 +8363,9 @@ def _stage5_dest_candidates_for_segment(segment: str) -> List[str]:
             'est_workers_resid',
             # composite work visitability (extended accessibility)
             'visit_work',
+            # CensusAtlas transit access to the CBD (work destination choice)
+            'c_ca_transit_reach45', 'c_ca_transit_cbd', 'c_ca_drive_cbd',
+            'c_ca_transit_depart',
         },
         'edu': {
             'Education', 'Primary', 'Secondary', 'HSENROLL', 'AGE0519',
@@ -7419,6 +8375,10 @@ def _stage5_dest_candidates_for_segment(segment: str) -> List[str]:
             'est_students_resid',
             # education density + composite edu visitability (extended)
             'attract_edu', 'visit_edu',
+            # CensusAtlas school accessibility / walk-to-school / quality
+            'c_ca_walk_school', 'c_ca_school_count',
+            'c_ca_schools_per_child', 'c_ca_schools_nearby',
+            'c_ca_school_students', 'c_ca_school_size', 'c_ca_school_icsea',
         },
         'nonmand': {
             'Shopping', 'Entertainment', 'OTHERMAINTENANCE', 'OTHERDISCRFacilities',
@@ -7430,6 +8390,11 @@ def _stage5_dest_candidates_for_segment(segment: str) -> List[str]:
             # purpose densities + composite visitability (extended)
             'attract_shop', 'attract_food', 'attract_health', 'attract_rec',
             'visit_shop', 'visit_social',
+            # CensusAtlas walk-to-shop / park / health / transit service
+            'c_ca_walk_amenities', 'c_ca_walk_groceries',
+            'c_ca_walk_transit', 'c_ca_walk_parks', 'c_ca_walk_health',
+            'c_ca_walk_poi', 'c_ca_transit_nearest',
+            'c_ca_transit_depart', 'c_ca_transit_routes',
         },
     }
     candidates = list(dict.fromkeys(sorted(common | by_seg.get(segment, set()))
@@ -9390,6 +10355,8 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
     seg_dest_cands = payload['seg_dest_cands']
     ga_kwargs      = payload['ga_kwargs']
     n_restarts     = payload['n_restarts']
+    _seed_mode_vars = list(payload.get('seed_mode_vars') or [])
+    _seed_dest_vars = list(payload.get('seed_dest_vars') or [])
 
     # ── Mode/dest split across PBS jobs ──────────────────────────────────
     # GA_STAGE5_RUN_MODE=0  → skip the mode GA (dest-only job); mode best is
@@ -9401,6 +10368,12 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
     # complementary job finishes it. Defaults keep the all-in-one behaviour.
     _run_mode = os.environ.get('GA_STAGE5_RUN_MODE', '1').strip() != '0'
     _run_dest = os.environ.get('GA_STAGE5_RUN_DEST', '1').strip() != '0'
+    # GA_STAGE5_FIX_MODE=1 freezes the mode specification at the seeded
+    # (stepwise/finalize) set and searches only the destination.  This is the
+    # reduced warm-started search; the mode model is still refitted once so its
+    # crash/time coefficients and sign gate are evaluated on this sample.
+    if os.environ.get('GA_STAGE5_FIX_MODE', '0').strip() == '1':
+        _run_mode = False
     if not _run_mode and not _run_dest:
         raise RuntimeError("Stage 5: GA_STAGE5_RUN_MODE=0 and "
                            "GA_STAGE5_RUN_DEST=0 — nothing to run")
@@ -9468,15 +10441,40 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
                 distribution_policy=distribution_policy)
 
         _bl_mode_genes   = np.ones(len(seg_mode_cands), dtype=int)
-        _bl_mode_fitness = _mode_fit(_bl_mode_genes)
-        if np.isfinite(_bl_mode_fitness) and _bl_mode_fitness <= -1e8:
-            # -1e9 is the FAILURE sentinel (see _stage5_mode_only_fitness), not
-            # a BIC.  Printing it through `-fitness` produced the misleading
-            # "BIC/n=1000000000.0000" (jobs 25929034/25929038).  Say so plainly.
-            print(f"    Mode baseline (all features): FAILED "
-                  f"(sentinel={_bl_mode_fitness:.3g})", flush=True)
-        else:
-            print(f"    Mode baseline (all features): BIC/n={-_bl_mode_fitness:.4f}")
+        _bl_mode_fitness = None
+        _bl_from_seed    = False
+        # Dest-only / frozen-mode job with a seed: evaluate the seeded mode
+        # spec FIRST and skip the all-features baseline.  The all-features spec
+        # contains CRASH, and when the crash coefficient is wrong-signed the
+        # mode sign gate rejects it; evaluating it anyway would abort a segment
+        # whose (already gate-cleaned) seed spec is perfectly valid.
+        _seed_m_pre = ([v for v in _seed_mode_vars if v in seg_mode_cands]
+                       if not _run_mode else [])
+        if _seed_m_pre:
+            _seed_mg_pre = np.array(
+                [1 if v in set(_seed_m_pre) else 0
+                 for v in seg_mode_cands], dtype=int)
+            _seed_mf_pre = _mode_fit(_seed_mg_pre)
+            if np.isfinite(_seed_mf_pre) and _seed_mf_pre > -1e8:
+                _bl_mode_genes, _bl_mode_fitness = _seed_mg_pre, _seed_mf_pre
+                _bl_from_seed = True
+                print(f"    Mode baseline (seeded, search frozen): "
+                      f"BIC/n={-_bl_mode_fitness:.4f} "
+                      f"feats={int(_seed_mg_pre.sum())}")
+            else:
+                print("    Seed mode spec FAILED — falling back to the "
+                      "all-features baseline")
+        if _bl_mode_fitness is None:
+            _bl_mode_fitness = _mode_fit(_bl_mode_genes)
+            if np.isfinite(_bl_mode_fitness) and _bl_mode_fitness <= -1e8:
+                # -1e9 is the FAILURE sentinel (see _stage5_mode_only_fitness),
+                # not a BIC.  Printing it through `-fitness` produced the
+                # misleading "BIC/n=1000000000.0000" (jobs 25929034/25929038).
+                print(f"    Mode baseline (all features): FAILED "
+                      f"(sentinel={_bl_mode_fitness:.3g})", flush=True)
+            else:
+                print(f"    Mode baseline (all features): "
+                      f"BIC/n={-_bl_mode_fitness:.4f}")
 
         # ── Validated warm start: the all-ON baseline can fail outright
         # (collinear full spec → singular Hessian → every eval returns the
@@ -9489,7 +10487,7 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
         # that unidentifies the baseline and trips this abort).
         _mode_fixed = [f for f in ['CRASH']
                        if f in seg_mode_cands and _crash_force_include(skim_df)]
-        if _bl_mode_fitness <= -1e8:
+        if (not _bl_from_seed) and _bl_mode_fitness <= -1e8:
             logger.warning(
                 f"[{seg}] mode all-features baseline FAILED "
                 f"(fitness={_bl_mode_fitness:.3g}) — trying minimal "
@@ -9551,6 +10549,21 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
             mode_searcher._cache[Individual(genes=_bl_mode_full).key()] = _bl_mode_fitness
             _bl_mode_seed = Individual(genes=_bl_mode_full, fitness=_bl_mode_fitness)
             _mode_seeds = [_bl_mode_seed]
+            # Seed the search with the stepwise/finalize mode specification.
+            _seed_m_run = [v for v in _seed_mode_vars if v in seg_mode_cands]
+            if _seed_m_run:
+                _seed_mg_run = np.array(
+                    [1 if v in set(_seed_m_run) else 0
+                     for v in seg_mode_cands], dtype=int)
+                _seed_mf_run = _mode_fit(_seed_mg_run)
+                if np.isfinite(_seed_mf_run) and _seed_mf_run > -1e8:
+                    _mode_seeds.append(Individual(genes=_seed_mg_run,
+                                                  fitness=_seed_mf_run))
+                    print(f"    Mode search seeded with stepwise/finalize "
+                          f"spec (BIC/n={-_seed_mf_run:.4f})")
+                else:
+                    print("    Seed mode spec failed during GA seeding — "
+                          "continuing from the all-features baseline")
             _sc_m = (_side_prog.get('mode') or {})
             try:
                 _sc_mg = np.asarray(_sc_m.get('genes'), dtype=int).ravel()
@@ -9577,11 +10590,59 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
             except Exception:
                 pass
         else:
-            # Dest-only job: reuse the mode best from a mode job's sidecar;
-            # fall back to the evaluated all-features baseline (already proven
-            # finite above) so the dest search anchors to a real mode spec.
+            # Dest-only job: prefer the seeded stepwise/finalize mode spec,
+            # then a sidecar best from a mode job, then the evaluated
+            # all-features baseline (already proven finite above) so the dest
+            # search anchors to a real mode spec.
             _sc_m = (_side_prog.get('mode') or {})
             _adopted = False
+            if _bl_from_seed:
+                best_mode_vars = [v for v, g in zip(seg_mode_cands,
+                                                   _bl_mode_genes) if g == 1]
+                best_mode_distribution = {}
+                mode_best = Individual(genes=np.asarray(_bl_mode_genes,
+                                                        dtype=int),
+                                       fitness=_bl_mode_fitness)
+                print(f"    Mode search SKIPPED — adopting the seeded spec "
+                      f"{best_mode_vars}  BIC/n={-_bl_mode_fitness:.4f}")
+                _adopted = True
+            # Trust the seeded spec exactly as the finalize gate left it: if
+            # CRASH was dropped there (wrong sign / unidentified), re-adding it
+            # here only buys an expensive failed fit.  If the seed DOES carry
+            # CRASH, the fallback below removes it on a gate failure.
+            _seed_m = [v for v in _seed_mode_vars if v in seg_mode_cands]
+            if _seed_m and not _adopted:
+                _seed_genes_m = np.array(
+                    [1 if v in set(_seed_m) else 0 for v in seg_mode_cands],
+                    dtype=int)
+                _seed_fit_m = _mode_fit(_seed_genes_m)
+                if _seed_fit_m <= -1e8 and 'CRASH' in _seed_m:
+                    # Wrong-signed/unidentified crash coefficient in the seeded
+                    # mode spec: adopt the spec without CRASH (the finalize
+                    # gate's rule) and report the crash effect as unidentified.
+                    _seed_m_nc = [v for v in _seed_m if v != 'CRASH']
+                    _seed_genes_nc = np.array(
+                        [1 if v in set(_seed_m_nc) else 0
+                         for v in seg_mode_cands], dtype=int)
+                    _seed_fit_nc = _mode_fit(_seed_genes_nc)
+                    if np.isfinite(_seed_fit_nc) and _seed_fit_nc > -1e8:
+                        print("    Seed mode spec: CRASH rejected by the sign "
+                              "gate — adopting the spec without CRASH "
+                              "(crash effect reported unidentified)")
+                        _seed_m, _seed_genes_m, _seed_fit_m = (
+                            _seed_m_nc, _seed_genes_nc, _seed_fit_nc)
+                if np.isfinite(_seed_fit_m) and _seed_fit_m > -1e8:
+                    print(f"    Mode search SKIPPED — seeded from "
+                          f"stepwise/finalize spec  BIC/n={-_seed_fit_m:.4f} "
+                          f"feats={len(_seed_m)}")
+                    best_mode_vars = list(_seed_m)
+                    best_mode_distribution = {}
+                    mode_best = Individual(genes=_seed_genes_m,
+                                           fitness=_seed_fit_m)
+                    _adopted = True
+                else:
+                    print("    Seed mode spec FAILED — falling back to "
+                          "sidecar/baseline mode spec")
             try:
                 _sc_mg = np.asarray(_sc_m.get('genes'), dtype=int).ravel()
                 _sc_mf = float(_sc_m.get('fitness', -np.inf))
@@ -9851,6 +10912,11 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
                     print(f"    Dest starter: ERROR ({_ste!r}) — cold starts")
             else:
                 print("    Dest starter: disabled (STAGE5_DEST_STARTER=0) — cold starts")
+            # The route logsum is structural: it is ON in the starter baseline
+            # whenever the person-type table is attached.
+            if (_STAGE5_ROUTE_TERM in seg_dest_cands
+                    and _route_type_table_active()):
+                _starter_genes[seg_dest_cands.index(_STAGE5_ROUTE_TERM)] = 1
 
             def _dest_fit(genes, uec=None):
                 if _lc_genes_on and uec is None and _lc_decode is not None:
@@ -9880,12 +10946,53 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
             _bl_starter_uec  = None
             try:
                 _bl_starter_uec = dict(dest_starter_terms())
+                if _route_type_table_active():
+                    # The route logsum already carries the safety trade-off;
+                    # a second destination crash term would double-count it
+                    # (and can trip the negative-sign gate on the baseline).
+                    _bl_starter_uec.pop('c_crash', None)
+                    _bl_starter_uec.pop('c_crash_safety_dest', None)
+                if (_STAGE5_ROUTE_TERM in seg_dest_cands
+                        and _route_type_table_active()
+                        and _STAGE5_ROUTE_TERM not in _bl_starter_uec):
+                    from stage5_destination_choice import (
+                        DEST_UEC_FLAT as _DUF_STARTER)
+                    _bl_starter_uec[_STAGE5_ROUTE_TERM] = (
+                        _DUF_STARTER[_STAGE5_ROUTE_TERM])
+                    print("    Dest baseline includes the person-type "
+                          "route logsum")
             except Exception as _ue:
                 logger.debug(f"Stage 5 [{seg}] starter-UEC override "
                              f"unavailable ({_ue!r}) — list-gated baseline")
                 _bl_starter_uec = None
             _bl_dest_fitness = _dest_fit(_bl_dest_genes, _bl_starter_uec)
             print(f"    Dest baseline (starter): BIC/n={-_bl_dest_fitness:.4f}")
+            # Stepwise/finalize destination features are the search's warm
+            # start.  Evaluate them once; when they beat the starter baseline,
+            # they become the baseline and the seed individual.
+            _seed_d_genes = None
+            _seed_d_fit = None
+            _seed_d_vals = [v for v in _seed_dest_vars if v in seg_dest_cands]
+            if _seed_d_vals:
+                _seed_d_genes = np.array(
+                    [1 if v in set(_seed_d_vals) else 0
+                     for v in seg_dest_cands], dtype=int)
+                if (_STAGE5_ROUTE_TERM in seg_dest_cands
+                        and _route_type_table_active()):
+                    _seed_d_genes[seg_dest_cands.index(_STAGE5_ROUTE_TERM)] = 1
+                _seed_d_fit = _dest_fit(_seed_d_genes)
+                if np.isfinite(_seed_d_fit) and _seed_d_fit > -1e8:
+                    print(f"    Dest seed (stepwise/finalize): "
+                          f"BIC/n={-_seed_d_fit:.4f} "
+                          f"feats={int(_seed_d_genes.sum())}")
+                    if _seed_d_fit > _bl_dest_fitness:
+                        _bl_dest_genes = _seed_d_genes.copy()
+                        _bl_dest_fitness = _seed_d_fit
+                        _bl_starter_uec = None
+                        print("    Dest baseline replaced by the seeded spec")
+                else:
+                    print("    Dest seed failed — keeping the starter baseline")
+                    _seed_d_genes, _seed_d_fit = None, None
             # Same fail-fast rule as mode: a failed starter baseline means every
             # downstream eval will also fail — abort now with the cause instead
             # of burning walltime on -1e9 evaluations. EXCEPTION: when the
@@ -9968,7 +11075,24 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
                     'completed':       True,
                 }
 
-            _dest_fixed = [f for f in ['c_crash'] if f in seg_dest_cands]
+            # Structural terms fixed ON in every destination genome.  The
+            # person-type route logsum is the time-safety inclusive value and
+            # must never be searched away.  Legacy destination crash terms are
+            # opt-in only (STAGE5_LEGACY_DEST_CRASH=1); by default the crash
+            # effect travels through the route logsum, not a second destination
+            # coefficient.
+            _dest_fixed = []
+            if (_STAGE5_ROUTE_TERM in seg_dest_cands
+                    and _route_type_table_active()):
+                _dest_fixed = [_STAGE5_ROUTE_TERM]
+            if os.environ.get('STAGE5_LEGACY_DEST_CRASH', '0').strip() == '1':
+                _dest_fixed += [f for f in ['c_crash']
+                                if f in seg_dest_cands
+                                and f not in _dest_fixed]
+            if os.environ.get('STAGE5_FORCE_CRASH', '0').strip() == '1':
+                _dest_fixed += [f for f in ['c_crash']
+                                if f in seg_dest_cands
+                                and f not in _dest_fixed]
             _ga_kwargs_dest = dict(ga_kwargs)
             _ga_kwargs_dest.pop('distribution_features', None)
             _ga_kwargs_dest.pop('distribution_options', None)
@@ -9997,6 +11121,12 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
             dest_searcher._cache[Individual(genes=_bl_dest_genes).key()] = _bl_dest_fitness
             _bl_dest_seed = Individual(genes=_bl_dest_genes, fitness=_bl_dest_fitness)
             _dest_seeds = [_bl_dest_seed]
+            if (_seed_d_genes is not None and _seed_d_fit is not None
+                    and not np.array_equal(_seed_d_genes, _bl_dest_genes)):
+                _dest_seeds.append(Individual(genes=_seed_d_genes,
+                                              fitness=_seed_d_fit))
+                print(f"    Dest search seeded with stepwise/finalize spec "
+                      f"(BIC/n={-_seed_d_fit:.4f})")
             _sc_d = (_side_prog.get('dest') or {})
             try:
                 _sc_dg = np.asarray(_sc_d.get('genes'), dtype=int).ravel()
@@ -10069,13 +11199,20 @@ def _ga_stage5_segment_worker(payload: dict) -> dict:
             # treated as a finished, salvageable gene set. A split job (mode-
             # or dest-only) is likewise incomplete by construction — the
             # complementary job finishes it, with progress via sidecar.
-            'walltime_hit':    bool(getattr(mode_searcher, '_walltime_hit', False)
-                                    or _dest_walltime_hit
-                                    or _GA_WALLTIME_HIT),
-            'completed':       bool(_run_mode and _run_dest
-                                    and not (getattr(mode_searcher, '_walltime_hit', False)
-                                             or _dest_walltime_hit
-                                             or _GA_WALLTIME_HIT)),
+            # A split shard is complete when every search it was asked to run
+            # finished.  Requiring BOTH mode and dest marks every destination-
+            # only engine-comparison run as incomplete even when all 10
+            # generations completed, which is why those shards carried
+            # PARTIAL/segments_completed=0.  Reused sub-models are complete by
+            # definition; only a requested search can trip the guard.
+            'walltime_hit':    bool(
+                (_run_mode and getattr(mode_searcher, '_walltime_hit', False))
+                or (_run_dest and _dest_walltime_hit)
+                or _GA_WALLTIME_HIT),
+            'completed':       bool(
+                (not _run_mode or not getattr(mode_searcher, '_walltime_hit', False))
+                and (not _run_dest or not _dest_walltime_hit)
+                and not _GA_WALLTIME_HIT),
         }
     finally:
         if _close_skims:
@@ -10109,13 +11246,43 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
     """
     import openmatrix as omx
     from stage5_destination_choice import (
-        _prep_hhts_tours, _skim_flat, _filter_seg, _ensure_person_behavioural_cols)
+        _prep_hhts_tours, _skim_flat, _filter_seg, _ensure_person_behavioural_cols,
+        attach_person_type)
     # Enrich persons to the same column set the mode/dest models build on
     # (_mode_tree/_dest_tree apply _ensure_person_behavioural_cols internally),
     # so candidate gating + the _filter_dest_candidates_by_signal pool filter
     # both see the columns genes can actually reference (travel_propensity,
     # safety_sensitivity, workstat_*, studying_*, occp_*).
     persons = _ensure_person_behavioural_cols(persons)
+    # Person-type key for the route-choice logsum table (safety x income
+    # terciles).  Without this the destination CA falls back to the
+    # median-person car time and the GA cannot see route heterogeneity.
+    persons = attach_person_type(persons)
+    try:
+        print(f"  Person types: "
+              f"{persons['person_type'].value_counts().to_dict()}")
+    except Exception:
+        pass
+    # Default the route-choice table to the local 371-zone run when the caller
+    # did not set one; an explicit env path always wins.
+    if not os.environ.get('STAGE5_ROUTE_TYPE_TABLE', '').strip():
+        _rt_default = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), 'runs', 'route_choice_371',
+            'route_logsum_type.parquet'))
+        if os.path.isfile(_rt_default):
+            os.environ['STAGE5_ROUTE_TYPE_TABLE'] = _rt_default
+            print(f"  Route-type logsum table: {_rt_default}")
+        else:
+            logger.warning(
+                "Stage 5: no STAGE5_ROUTE_TYPE_TABLE and the default "
+                f"{_rt_default} is missing — the destination model will fall "
+                "back to the median-person mode logsum and will NOT carry the "
+                "route-choice safety trade-off.")
+    elif not _route_type_table_active():
+        logger.warning(
+            "Stage 5: STAGE5_ROUTE_TYPE_TABLE points at a missing file "
+            f"({os.environ.get('STAGE5_ROUTE_TYPE_TABLE')!r}) — route-type "
+            "logsum disabled for this run.")
 
     print("\n[Stage 5] Preparing HHTS estimation data...")
     # Use the HHTS tours table (has tour_mode) rather than trips (has no tour_mode).
@@ -10170,6 +11337,8 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
     # gate mobility genes on the PERSON frame (the mode UEC reads person.<mode>_prop)
     mode_cands = _stage5_mode_candidates(persons)
     dest_cands = _stage5_dest_candidates()
+    if _route_type_table_active() and _STAGE5_ROUTE_TERM not in dest_cands:
+        dest_cands = dest_cands + [_STAGE5_ROUTE_TERM]
     n_mode     = len(mode_cands)
 
     # ÔöÇÔöÇ Segment mapping ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
@@ -10190,6 +11359,13 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
     valid_segs = _shard_filter(valid_segs, 5)
     print(f"  {len(tours)} HHTS tours | mode_cands={len(mode_cands)}  dest_cands={len(dest_cands)} | "
           f"valid segments: {valid_segs}")
+
+    # Stepwise/finalize feature sets are the warm start for the GA.  They are
+    # loaded once and passed to each worker as seed individuals; absent files
+    # simply leave the search on its starter baseline.
+    _seed5 = _load_stage5_seed_features(valid_segs)
+    if _seed5:
+        print(f"  Stage 5 seed feature sets: {sorted(_seed5)}")
 
     # ÔöÇÔöÇ Per-segment SEPARATE mode GA then dest GA ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
     # Separate GAs avoid joint-chromosome entanglement between mode and
@@ -10248,6 +11424,11 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
                                                            persons=persons)
         seg_mode_cands = [c for c in seg_mode_cands if c in mode_cands]
         seg_dest_cands = [c for c in seg_dest_cands if c in dest_cands]
+        # Structural route logsum: never let the per-segment signal filter or
+        # the global-pool intersection drop it.
+        if (_route_type_table_active()
+                and _STAGE5_ROUTE_TERM not in seg_dest_cands):
+            seg_dest_cands = seg_dest_cands + [_STAGE5_ROUTE_TERM]
 
         # CRASH is the safety-testing variable this run exists to evaluate
         # (see safety_baseline/safety_nosafety experiment modes). Force it
@@ -10286,6 +11467,8 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
             'n_restarts':     n_restarts,
             'skims_path':     skims_path,
             'skims':          skims if skims_path is None else None,
+            'seed_mode_vars': list((_seed5.get(seg) or {}).get('mode_features') or []),
+            'seed_dest_vars': list((_seed5.get(seg) or {}).get('dest_features') or []),
         }))
 
     if _pending:
@@ -10344,7 +11527,7 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
                         print(f"    Warning: could not save Stage 5 segment checkpoint: {_e}")
             else:
                 print(f"    ! Stage 5 segment '{seg_label}' did NOT complete "
-                      f"(walltime guard tripped) — left out of checkpoint; a "
+                      f"(walltime/memory guard tripped) — left out of checkpoint; a "
                       "resume run will re-search it. Best-so-far saved to "
                       f"{_ckpt_dir5 or '.'}/best_*.npz for salvage.")
                 _plog(f"[Stage 5] {seg_label} incomplete (walltime) — not checkpointed")
@@ -10403,8 +11586,12 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
 
     if 'CRASH' in mode_cands and 'CRASH' not in best_mode_feats:
         best_mode_feats.append('CRASH')
-    if 'c_crash' in dest_cands and 'c_crash' not in best_dest_feats:
-        best_dest_feats.append('c_crash')
+    # The person-type route logsum is structural: the consensus destination
+    # specification must always carry it.  Legacy destination crash terms are
+    # NOT re-appended — the route logsum already embeds the safety trade-off.
+    if (_STAGE5_ROUTE_TERM in dest_cands
+            and _STAGE5_ROUTE_TERM not in best_dest_feats):
+        best_dest_feats.append(_STAGE5_ROUTE_TERM)
 
     consensus_mode = np.array([1 if v in set(best_mode_feats) else 0 for v in mode_cands], dtype=int)
     consensus_dest = np.array([1 if v in set(best_dest_feats) else 0 for v in dest_cands], dtype=int)
@@ -10447,7 +11634,7 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
     if len(_completed_segs) < len(valid_segs):
         _n_done = len(_completed_segs)
         _msg = (f"Stage 5 incomplete: {_n_done}/{len(valid_segs)} segments "
-                f"completed (walltime guard tripped). Best-so-far genes for the "
+                f"completed (walltime/memory guard tripped). Best-so-far genes for the "
                 f"completed segment(s) are in "
                 f"{_ckpt_dir5 or '.'}/ga_stage5_segments.pkl and best_*.npz — a "
                 "resume run (GA_CHECKPOINT_DIR set) will finish the rest.")
@@ -10458,7 +11645,7 @@ def _run_ga_stage5(trips, persons, skims, landuse, ga_kwargs,
                 with open(os.path.join(_ckpt_dir5, 'PARTIAL'), 'w') as _fh:
                     _fh.write(
                         f"stage=5\nsegments_completed={_n_done}\n"
-                        f"note=walltime-guard-incomplete\n"
+                        f"note=walltime-or-memory-guard-incomplete\n"
                         f"fitness_metric=salvaged-partial (completed segments only)\n")
             except Exception:
                 pass
@@ -12292,6 +13479,14 @@ def run_ga_stage(
         _env_seed = None
     if _env_seed is not None:
         seed = _env_seed
+    # Run-level population override (e.g. a controlled engine comparison that
+    # must fit a fixed wall-clock budget). Kept separate from the stage gens
+    # override so callers can shrink both axes independently.
+    _global_pop = _positive_env_int('GA_POP_SIZE')
+    if _global_pop is not None:
+        ga_kwargs['pop_size'] = _global_pop
+        pop_size = _global_pop
+
     if stage == 2:
         _stage_gens = _positive_env_int('GA_SA2_GENS', 'GA_STAGE2_GENS')
         _stage_restarts = _positive_env_int('GA_SA2_RESTARTS', 'GA_STAGE2_RESTARTS')

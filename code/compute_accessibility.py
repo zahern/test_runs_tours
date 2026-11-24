@@ -114,9 +114,19 @@ ACCESSIBILITY_SPEC = {
         'cap_tt':      60.0,
     },
 
-    # ── Walk accessibility ─────────────────────────────────────────────────────
+    # ── Walk accessibility (gravity) ──────────────────────────────────────────
     # Walk focuses on local density: residential area + retail + EATOUT
     # residential m² is a strong indicator of walkable neighbourhood density
+    #
+    # NOTE: this is an OPPORTUNITY-POTENTIAL measure — it credits a zone for
+    # how much attractor mass sits within 7.5 km, decayed by distance. That is
+    # not the same thing as walkability: a precinct of warehouses/terminals
+    # with a lot of nearby floor area scores above the median of the 371 zones
+    # (Brisbane Airport SA2 302031036: walk_acc 5.16 vs median 4.76) while a
+    # walkability index puts it in the most car-dependent decile. Kept as-is
+    # because downstream stages consume it; the walkability alternative is
+    # 'walk_types_acc' below, and report_walk_comparison() prints where the
+    # two disagree.
     'walk_acc': {
         'attractor_cols': {
             'EATOUT':      3.0,
@@ -134,6 +144,36 @@ ACCESSIBILITY_SPEC = {
         'decay_type':  'logit',
         'decay_coeff': 1.5,
         'cap_tt':      7.5,
+    },
+
+    # ── Walk accessibility (15-minute distinct amenity types) ────────────────
+    # The walkability construction used by walkscore / 15-minute-city indices
+    # (and by CensusAtlas): credit a zone for an amenity TYPE if at least one
+    # place of that type is reachable inside a walk-time budget, then count the
+    # types. Scale-free (200 shops = 2 shops = "retail") and threshold-based,
+    # so it measures the MIX of daily needs rather than the volume of nearby
+    # floor area, and is not collinear with a continuous distance skim.
+    #
+    # type_cols maps type → candidate columns; whichever exist in the landuse
+    # frame are OR-ed (max), so the measure works with the legacy facility
+    # counts, the Overture POI counts, or both. The 0-8 scale matches the
+    # standard index; `measure='type_count'` dispatches to _type_count_access().
+    # Budget: 15 min at 4.8 km/h ≈ 1.20 km (ACC_WALK15_MIN / ACC_WALK15_KMH).
+    'walk_types_acc': {
+        'measure':      'type_count',
+        'type_cols': {
+            'food':       ['n_food', 'EATOUT'],
+            'retail':     ['n_retail', 'Shopping'],
+            'health':     ['n_health', 'Healthcare'],
+            'education':  ['n_education', 'Education', 'Primary', 'Secondary'],
+            'parks':      ['n_parks', 'lu_area_park', 'recreation_ground'],
+            'civic':      ['n_civic'],
+            'transit':    ['n_transit_stops', 'n_bus_stops'],
+            'recreation': ['n_recreation', 'Entertainment'],
+        },
+        'skim_col':      'DISTWALK',
+        'threshold_min': 15.0,
+        'walk_kmh':      4.8,
     },
 
     # ── Bike accessibility ────────────────────────────────────────────────────
@@ -472,6 +512,103 @@ def _is_time_matrix(col: str) -> bool:
     c = str(col).upper()
     return ('TIME' in c) or ('TOTIVT' in c) or ('WAIT' in c)
 
+
+def _type_count_access(acc_name: str, entry: dict, skim_matrices: dict,
+                       lu: pd.DataFrame, zone_ids: np.ndarray):
+    """Count DISTINCT attractor types reachable inside a walk-time budget.
+
+    Replaces the gravity form (Σ_j attractor_j · decay(tt_ij)) with the
+    walkability construction used by walkscore / 15-minute-city indices /
+    CensusAtlas: a zone is credited for an amenity TYPE if at least one place
+    of that type is reachable within the budget. Two consequences that matter
+    in a choice model:
+
+      * scale-free — a zone with 200 shops scores like a zone with 2, because
+        both satisfy "retail"; the measure describes the MIX of daily needs
+        rather than the volume of floor area nearby.
+      * threshold, not decay — a destination is either inside the budget or it
+        is not, so the measure is not collinear with a continuous distance
+        skim and can separate "walkable" from "near lots of buildings".
+
+    `type_cols` maps type → candidate columns; whichever are present in the
+    landuse frame are OR-ed (max), so the measure degrades gracefully between
+    the legacy facility counts and the Overture POI counts.
+
+    DISTWALK is in km (not a time matrix), so the budget converts to km; a
+    time-valued skim is used directly as minutes. Returns (counts, detail) —
+    detail is per-type reachability, populated only when
+    ACC_WALK_TYPES_DETAIL=1 (otherwise the accessibility table would gain 8
+    indicator columns that downstream covariate pools would see).
+    """
+    skim_col = entry['skim_col']
+    if skim_col not in skim_matrices:
+        raise ValueError(f"'{acc_name}' needs skim '{skim_col}'")
+    mat = np.asarray(skim_matrices[skim_col], dtype=np.float32)
+    n = mat.shape[0]
+
+    mins = float(os.environ.get('ACC_WALK15_MIN', entry.get('threshold_min', 15.0)))
+    if _is_time_matrix(skim_col):
+        limit = mins
+        budget_txt = f'{mins:.0f} min'
+    else:
+        kmh = float(os.environ.get('ACC_WALK15_KMH', entry.get('walk_kmh', 4.8)))
+        limit = kmh * mins / 60.0
+        budget_txt = f'{mins:.0f} min = {limit:.2f} km'
+
+    # 0 on an off-diagonal pair means NO PATH (the pivot fills missing pairs
+    # with 0), not a free walk — the same convention as zero_unreachable. The
+    # intrazonal diagonal stays True so a zone always reaches its own amenities.
+    reach = (mat > 0) & (mat <= limit)
+    np.fill_diagonal(reach, True)
+    # Degenerate-budget guard: zone centroids in a 371-SA2 system sit several
+    # km apart (SEQ DISTWALK off-diagonal min 1.12 km, p5 10.9 km), so a 15-min
+    # (1.2 km) budget can select almost no inter-zonal pairs and the "walkshed"
+    # collapses to the zone's own amenity inventory. That is a resolution limit
+    # of the skim, not a walkability finding — say so loudly instead of shipping
+    # a saturated column that looks valid. Measured on the 2026-11 371 build:
+    # 2 of 137,641 OD pairs inside 1.2 km -> mean 7.11/8, 41% of zones at 8.
+    _n_off = int((reach & ~np.eye(n, dtype=bool)).sum())
+    if _n_off < n:
+        logger.warning(
+            f"[Accessibility] '{acc_name}': only {_n_off} inter-zonal OD pair(s) "
+            f"inside {budget_txt} for {n} zones (fewer links than zones) — the "
+            f"skim's zone grain is coarser than the walkshed, so this measure is "
+            f"effectively counting amenity types present in each zone itself. "
+            f"Raise ACC_WALK15_MIN for a district-level mix measure, or use a "
+            f"finer-grain (SA1/address) walk skim for a true walkshed.")
+    reach_f = reach.astype(np.float32)
+
+    _lu = lu.reindex(zone_ids)
+    counts = np.zeros(n, dtype=np.float32)
+    detail = {}
+    detail_on = os.environ.get('ACC_WALK_TYPES_DETAIL', '0') == '1'
+    present, absent = [], []
+    for tname, cols in entry['type_cols'].items():
+        avail = [c for c in cols if c in _lu.columns]
+        if not avail:
+            absent.append(tname)
+            continue
+        vals = np.zeros(n, dtype=np.float32)
+        for c in avail:
+            vals = np.maximum(
+                vals,
+                pd.to_numeric(_lu[c], errors='coerce').fillna(0)
+                  .clip(lower=0).values.astype(np.float32))
+        has_type = (reach_f @ (vals > 0).astype(np.float32)) > 0
+        counts += has_type.astype(np.float32)
+        present.append(tname)
+        if detail_on:
+            detail[f'{acc_name}_type_{tname}'] = has_type.astype(np.int8)
+
+    if absent:
+        logger.info(f"[Accessibility] '{acc_name}': types with no landuse "
+                    f"column skipped: {absent}")
+    logger.info(f"[Accessibility] '{acc_name}': {len(present)}/{len(entry['type_cols'])} "
+                f"types present, budget {budget_txt}, "
+                f"{int((counts > 0).sum())}/{n} zones reach ≥1 type")
+    return counts.astype(np.int16), detail
+
+
 def compute_accessibility(
     landuse: pd.DataFrame,
     skim_df: pd.DataFrame,
@@ -568,6 +705,23 @@ def compute_accessibility(
     # compute each measure
     results = {}
     for acc_name, entry in spec.items():
+        # Measures declared with measure='type_count' do NOT use the gravity
+        # form: they count distinct reachable amenity types. Kept in this loop
+        # so they share the skim pivot, unit handling and env overrides.
+        if entry.get('measure') == 'type_count':
+            try:
+                _tc, _td = _type_count_access(acc_name, entry, skim_matrices,
+                                              lu, zone_ids)
+            except Exception as _tce:
+                logger.warning(f"  '{acc_name}': type-count measure failed "
+                               f"(non-fatal): {_tce}")
+                continue
+            results[acc_name] = _tc
+            results.update(_td)
+            print(f"  {acc_name:20s}: min={_tc.min():.0f}  "
+                  f"mean={float(_tc.mean()):.2f}  max={_tc.max():.0f}  "
+                  f"(distinct amenity types reachable)")
+            continue
         att_cols   = entry['attractor_cols']
         # Skip measures whose attractor columns are ALL absent (e.g. the
         # *_power_acc pair when no power build exists) instead of emitting a
@@ -682,12 +836,81 @@ def compute_accessibility(
         logger.warning(f"asim logsum accessibility failed (non-fatal, "
                        f"legacy gravity measures kept): {_le}")
 
+    # ── walk measure comparison ───────────────────────────────────────────
+    # walk_acc (gravity: distance-decayed attractor mass) and walk_types_acc
+    # (15-min distinct amenity types) answer "how walkable is this zone"
+    # differently on purpose. Report the agreement and, more usefully, the
+    # zones where they disagree — dense floor area with a thin walkable mix.
+    try:
+        _cmp_dir = (os.path.dirname(save_path) or '.') if save_path else None
+        report_walk_comparison(
+            acc_df,
+            out_path=(os.path.join(_cmp_dir, 'walk_acc_comparison.csv')
+                      if _cmp_dir else None))
+    except Exception as _we:                                  # noqa: BLE001
+        logger.warning(f"walk measure comparison failed (non-fatal): {_we}")
+
     if save_path:
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
         acc_df.to_csv(save_path)
         print(f"[Accessibility] saved → {save_path}")
 
     return acc_df
+
+
+def report_walk_comparison(acc_df: pd.DataFrame, out_path: str = None,
+                           top_n: int = 8) -> pd.DataFrame:
+    """Compare the gravity walk measure with the 15-minute type count.
+
+    walk_acc        gravity: log1p Σ_j attractor_j · logit(1.5 · DISTWALK_ij)
+    walk_types_acc  0–8 distinct amenity types reachable within 15 min
+
+    Prints rank agreement, the distribution of the type count, and the zones
+    the two measures disagree about most. The "gravity flatters" list is the
+    useful one: those zones rank well on distance-decayed floor area but reach
+    few distinct daily needs on foot — the airport/industrial-precinct
+    pathology that motivated the type-count measure.
+    """
+    need = ('walk_acc', 'walk_types_acc')
+    if not all(c in acc_df.columns for c in need):
+        return pd.DataFrame()
+    cmp = acc_df[list(need)].copy()
+    cmp.index.name = 'zone_id'
+    n = len(cmp)
+    cmp['rank_gravity'] = cmp['walk_acc'].rank(ascending=False, method='min')
+    cmp['rank_types'] = cmp['walk_types_acc'].rank(ascending=False, method='min')
+    # >0 → the type count ranks the zone BETTER (i.e. worse on gravity) than
+    # the gravity measure does.
+    cmp['rank_gain'] = cmp['rank_gravity'] - cmp['rank_types']
+    rho = float(cmp['walk_acc'].corr(cmp['walk_types_acc'], method='spearman'))
+    r = float(cmp['walk_acc'].corr(cmp['walk_types_acc']))
+
+    print("\n[Walk comparison] gravity walk_acc vs 15-min distinct amenity types")
+    print(f"  zones={n}  Spearman ρ={rho:.3f}  Pearson r={r:.3f}  "
+          f"types mean={cmp['walk_types_acc'].mean():.2f}")
+    vc = cmp['walk_types_acc'].value_counts().sort_index()
+    print("  types reachable: " + "  ".join(f"{int(k)}:{v}" for k, v in vc.items()))
+
+    def _show(title, sub):
+        if sub.empty:
+            return
+        print(f"  {title}")
+        for zid, row in sub.head(top_n).iterrows():
+            print(f"    {int(zid)}  walk_acc={row['walk_acc']:.2f} "
+                  f"(rank {int(row['rank_gravity'])})  "
+                  f"types={int(row['walk_types_acc'])} "
+                  f"(rank {int(row['rank_types'])})  "
+                  f"Δrank={int(row['rank_gain']):+d}")
+
+    _show("gravity flatters (near lots of floor area, thin walkable mix):",
+          cmp.sort_values('rank_gain'))
+    _show("type count flatters (walkable mix, low nearby density):",
+          cmp.sort_values('rank_gain', ascending=False))
+
+    if out_path:
+        cmp.sort_values('walk_acc', ascending=False).to_csv(out_path)
+        print(f"  comparison table → {out_path}")
+    return cmp
 
 
 # =============================================================================
@@ -937,6 +1160,7 @@ _ACC_LANDUSE_PAIRS = [
     ('auto_edu_acc',    'Education',  'education facilities'),
     ('auto_shop_acc',   'Shopping',   'shopping attractors'),
     ('walk_acc',        'retail',     'retail landuse area'),
+    ('walk_types_acc',  'n_addresses', 'address density (15-min type count)'),
     ('bike_acc',        'TOTEMP',     'total employment'),
     ('transit_acc',     'TOTEMP',     'total employment'),
     # NOTE (2026-09): the SEQ landuse extract leaves the `park` / `sport` /

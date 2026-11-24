@@ -1,0 +1,47 @@
+#!/bin/bash
+#PBS -P FPAXJW8067
+#PBS -N safety_contrast
+#PBS -l select=1:ncpus=8:mem=128gb
+#PBS -l walltime=06:00:00
+#PBS -j oe
+#PBS -m n
+
+# M_S vs M_0 safety contrast for one Stage-5 segment on the 30% holdout.
+# M_S: the fitted bundle with the safety-aware person-type route logsum.
+# M_0: the SAME bundle scored with the fastest-route (safety-blind) route table.
+# Every other setting is identical to the fit (job_p0p2_arm.pbs), so the only
+# difference between M_S and M_0 is the safety content of the route logsum.
+set -uo pipefail
+cd "${PBS_O_WORKDIR:-$HOME/test_runs_tours/code}" || exit 1
+source /mnt/hpccs01/home/ahernz/miniconda3/etc/profile.d/conda.sh
+conda activate zigenv || exit 1
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+export PYTHONPATH="${PBS_O_WORKDIR}:${PYTHONPATH:-}"
+# --- identical to the fit environment (job_p0p2_arm.pbs) ---
+export PIPELINE_SKIMS_PATH="../demand_/skims_371_routechoice.omx"
+export STAGE5_MODE_ORTHOG=1 STAGE5_DEST_ORTHOG=1
+export STAGE5_STRICT_ESTIMATION=1 STAGE5_REQUIRE_DEST_ESTIMATION=1
+export STAGE5_DEST_SAMPLE_SIZE=${STAGE5_DEST_SAMPLE_SIZE:-0}
+export STAGE5_POOLED_IVT=${STAGE5_POOLED_IVT:-1}
+export STAGE5_NONMAND_DIST_BASIS=${STAGE5_NONMAND_DIST_BASIS:-log}
+export STAGE5_MODE_STRUCTURE=${STAGE5_MODE_STRUCTURE:-nested}
+export STAGE5_LEGACY_DEST_CRASH=0
+
+SEG="${SEG:?SEG required}"
+TAG="${TAG:-P2}"
+MODELS="${MODELS:-runs/p0p2_routechoice/${TAG}/${SEG}/stage5_models.pkl}"
+OUT="${OUT:-runs/safety_contrast/${TAG}/${SEG}}"
+mkdir -p "${OUT}"
+SKIMS="../demand_/skims_371_routechoice.omx"
+echo "=== safety contrast ${TAG}/${SEG} $(date) models=${MODELS} ==="
+export STAGE5_ROUTE_TYPE_TABLE="runs/route_choice_371/route_logsum_type.parquet"
+python -u _score_stage5_arm.py \
+    --models "${MODELS}" --segment "${SEG}" --arm M_S \
+    --skims "${SKIMS}" --no-strict-repro \
+    --out "${OUT}/${SEG}_M_S.json" 2>&1 | tee "${OUT}/${SEG}_M_S.log"
+export STAGE5_ROUTE_TYPE_TABLE="runs/safety_contrast/route_logsum_type_fastest.parquet"
+python -u _score_stage5_arm.py \
+    --models "${MODELS}" --segment "${SEG}" --arm M_0 \
+    --skims "${SKIMS}" --no-strict-repro \
+    --out "${OUT}/${SEG}_M_0.json" 2>&1 | tee "${OUT}/${SEG}_M_0.log"
+echo "=== done ${TAG}/${SEG} $(date) ==="

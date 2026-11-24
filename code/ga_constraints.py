@@ -328,6 +328,7 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         # scattered ad-hoc _pf_set(..., 'maximum'/'minimum') calls in
         # _build_mode_model with one declarative list.
         'sign_constraints': {
+            'c_ivt': 'neg',   # pooled generic in-vehicle time (STAGE5_POOLED_IVT)
             'c_ivt_auto': 'neg', 'c_ivt_transit': 'neg',
             # PT access IVTs (STAGE5_PT_MODES=1; missing-name-safe otherwise).
             # Design defaults are negative; a fitted positive IVT would be
@@ -398,7 +399,12 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
     },
     # Stage 5 — destination choice (Larch MNL, flat CA)
     'stage5_dest': {
-        'force_include': ['c_crash'],
+        # c_crash is estimated, not fixed, but it must not be force-included:
+        # the search needs a crash-free comparator. STAGE5_FORCE_CRASH=1
+        # restores the old always-in behaviour.
+        'force_include': (['c_crash']
+                          if os.environ.get('STAGE5_FORCE_CRASH', '0').strip() == '1'
+                          else []),
         # Encoding validity: one encoding per person attribute (continuous
         # income x distance vs banded income x distance; continuous age vs
         # age-band interactions). Absent names are ignored.
@@ -506,6 +512,21 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             'c_attract_rec': 'pos',
             'c_visit_work': 'pos', 'c_visit_edu': 'pos',
             'c_visit_shop': 'pos', 'c_visit_social': 'pos',
+            # CensusAtlas walkability / school / transit accessibility:
+            # coverage, school supply/quality and transit reach attract;
+            # nearest-stop / CBD travel times deter.
+            'c_ca_walkability': 'pos', 'c_ca_walk_amenities': 'pos',
+            'c_ca_walk_city_pct': 'pos', 'c_ca_walk_groceries': 'pos',
+            'c_ca_walk_transit': 'pos', 'c_ca_walk_school': 'pos',
+            'c_ca_walk_parks': 'pos', 'c_ca_walk_health': 'pos',
+            'c_ca_walk_poi': 'pos',
+            'c_ca_school_count': 'pos', 'c_ca_schools_per_child': 'pos',
+            'c_ca_schools_nearby': 'pos', 'c_ca_school_students': 'pos',
+            'c_ca_school_size': 'pos', 'c_ca_school_icsea': 'pos',
+            'c_ca_transit_stops': 'pos', 'c_ca_transit_nearest': 'neg',
+            'c_ca_transit_reach30': 'pos', 'c_ca_transit_reach45': 'pos',
+            'c_ca_transit_cbd': 'neg', 'c_ca_drive_cbd': 'neg',
+            'c_ca_transit_depart': 'pos', 'c_ca_transit_routes': 'pos',
         },
         # ── Protected backbone (never removed by _prune_and_refit) ───────────
         'protected_backbone': [
@@ -513,8 +534,13 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             # exactly-one accessibility group with c_logsum (mutex + require-one).
             # Forcing it would permanently exclude the logsum; the require-one
             # group guarantees one of the two is always present regardless.
-            'c_size_term', 'log_correction', 'c_crash',
-        ],
+            # c_crash is likewise optional by default: the GA must be able to
+            # test a crash-free specification. Set STAGE5_FORCE_CRASH=1 to make
+            # the safety term a protected backbone again.
+            'c_size_term', 'log_correction',
+        ] + (['c_crash']
+             if os.environ.get('STAGE5_FORCE_CRASH', '0').strip() == '1'
+             else []),
         # ── Orthogonalization: when both terms are selected, residualize one on the other
         # Maps term -> term_to_residualize_on. The residualized version replaces the
         # original term in the utility, so collinear effects are separated.
@@ -527,8 +553,12 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         # must only contain DESTINATION coefficients (DEST_UEC / DEST_UEC_FLAT).
         'orthogonalize_on': {
             # Destination choice: crash residualized on distance
-            'c_crash':       'c_log_dist',
-            'c_crash_safety_dest': 'c_log_dist',
+            # Orthogonalise crash on the FULL distance basis, not just the
+            # log term: the compact spec may carry both c_log_dist and c_dist,
+            # and the residual must be clean of both. The multi-control
+            # materialiser in stage5_destination_choice accepts a list.
+            'c_crash':       ['c_log_dist', 'c_dist'],
+            'c_crash_safety_dest': ['c_log_dist', 'c_dist'],
             # NOTE: income pairs (c_incp_* on c_veh_*) are MODE coefficients and
             # live under stage5_mode.orthogonalize_on — listing them here is
             # dead weight (neither key is in DEST_UEC/DEST_UEC_FLAT) and trips
@@ -565,6 +595,35 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
             'c_visit_edu':      'c_size_term',
             'c_visit_shop':     'c_size_term',
             'c_visit_social':   'c_size_term',
+            # CensusAtlas accessibility: every CA term is a zone attribute
+            # correlated with zone size (the CBD scores high on transit
+            # reach, low on CBD time, and is also the biggest size term).
+            # Residualise on size_term so the GA/estimator reads the
+            # accessibility signal net of pure agglomeration, not a second
+            # size proxy.
+            'c_ca_walkability':        'c_size_term',
+            'c_ca_walk_amenities':     'c_size_term',
+            'c_ca_walk_city_pct':      'c_size_term',
+            'c_ca_walk_groceries':     'c_size_term',
+            'c_ca_walk_transit':       'c_size_term',
+            'c_ca_walk_school':        'c_size_term',
+            'c_ca_walk_parks':         'c_size_term',
+            'c_ca_walk_health':        'c_size_term',
+            'c_ca_walk_poi':           'c_size_term',
+            'c_ca_school_count':       'c_size_term',
+            'c_ca_schools_per_child':  'c_size_term',
+            'c_ca_schools_nearby':     'c_size_term',
+            'c_ca_school_students':    'c_size_term',
+            'c_ca_school_size':        'c_size_term',
+            'c_ca_school_icsea':       'c_size_term',
+            'c_ca_transit_stops':      'c_size_term',
+            'c_ca_transit_nearest':    'c_size_term',
+            'c_ca_transit_reach30':    'c_size_term',
+            'c_ca_transit_reach45':    'c_size_term',
+            'c_ca_transit_cbd':        'c_size_term',
+            'c_ca_drive_cbd':          'c_size_term',
+            'c_ca_transit_depart':     'c_size_term',
+            'c_ca_transit_routes':     'c_size_term',
             # ── Doctor-driven pairs (larch troubleshooting.overspecification
             # on the real QLD work fit: 120 near-null Hessian directions) ────
             # Direction 0 loads c_cbd_dest .53 / c_comp .51 /

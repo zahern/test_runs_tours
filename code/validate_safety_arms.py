@@ -240,6 +240,92 @@ def _od_skim_vars(coefs: dict) -> list:
     return out
 
 
+def _predict_mode_single(mode_fit, dt_m, seg, seg_df, seg_persons, mode_spec,
+                         mc, _saved_mode_uec):
+    """Rebuild a single-class (nested/MNL) mode model and return its probabilities."""
+    from stage5_destination_choice import _build_mode_model
+    _ivt_prev = os.environ.get("STAGE5_POOLED_IVT")
+    if not isinstance(_saved_mode_uec, dict) or not _saved_mode_uec:
+        os.environ["STAGE5_POOLED_IVT"] = "1" if "c_ivt" in (mc or {}) else "0"
+    try:
+        mm = _build_mode_model(
+            dt_m, seg, custom_mode_vars=mode_spec,
+            avail_vars_hint=list(seg_df.columns) + list(seg_persons.columns))
+    finally:
+        if _ivt_prev is None:
+            os.environ.pop("STAGE5_POOLED_IVT", None)
+        else:
+            os.environ["STAGE5_POOLED_IVT"] = _ivt_prev
+    try:
+        mm.doctor(repair_ch_av="+")
+    except Exception:
+        pass
+    n_mode_applied = _apply_coefs(mm, mc, holdfast=_holdfast_names(mode_fit))
+    try:
+        mode_crash_param = bool("c_crash_veh" in mm.pf.index)
+    except Exception:
+        mode_crash_param = False
+    mp = np.asarray(mm.probability(), dtype=float)
+    mp = np.nan_to_num(mp, nan=0.0, posinf=0.0, neginf=0.0)
+    rs = mp.sum(axis=1, keepdims=True)
+    mp = mp / np.where(rs > 0, rs, 1.0)
+    return mm, mp, mode_crash_param, n_mode_applied
+
+
+def _predict_mode_lccm(mode_fit, dt_m, seg, saved_uec, zero_crash: bool):
+    """Rebuild a latent-class mode model with the fitted values.
+
+    The single-class path would apply the '__c{k}' class coefficients to a
+    nested model with none of those names. Rebuild the same K-class model from
+    the saved base specification and evaluate larch's class-mixed probability
+    (sum over classes of membership share times within-class probability).
+    """
+    import re
+    from stage5_destination_choice import _build_mode_lccm, MODE_UEC
+    meta = getattr(mode_fit, "_stage5_lccm_meta", None) or {}
+    K = meta.get("n_classes") or len(
+        [k for k in (getattr(mode_fit, "_models", None) or {})
+         if isinstance(k, int)])
+    spec = saved_uec or getattr(mode_fit, "_stage5_mode_uec", None)
+    if not spec:
+        bases = {re.sub(r"__c\d+$", "", str(n)) for n in mode_fit.pf.index
+                 if re.search(r"__c\d+$", str(n))}
+        spec = {b: MODE_UEC[b] for b in bases if b in MODE_UEC}
+    spec = {str(k): (tuple(v) if isinstance(v, list) else v)
+            for k, v in spec.items()}
+    if zero_crash:
+        spec = {k: v for k, v in spec.items() if "crash" not in k.lower()}
+    lc = _build_mode_lccm(
+        dt_m, seg, n_classes=K or None,
+        membership_vars=meta.get("membership_vars") or None,
+        class_structures=meta.get("class_structures") or None,
+        custom_mode_vars=spec)
+    fitted = {str(n): float(v) for n, v in mode_fit.pf["value"].items()
+              if np.isfinite(v)}
+    n_set = 0
+    for n in lc.pf.index:
+        if n not in fitted:
+            continue
+        v = 0.0 if (zero_crash and "crash" in n.lower()) else fitted[n]
+        try:
+            lc.set_value(n, v)
+            n_set += 1
+        except Exception:
+            pass
+    missing = [n for n in lc.pf.index if n not in fitted]
+    if missing:
+        print(f"[{seg}] LCCM rebuild: {len(missing)} parameter(s) not in the "
+              f"fitted bundle, left at start values: {missing[:8]}", flush=True)
+    mp = np.asarray(lc.jax_probability(lc.pvals), dtype=float)
+    mp = mp.reshape(mp.shape[0], -1)
+    mp = np.nan_to_num(mp, nan=0.0, posinf=0.0, neginf=0.0)
+    rs = mp.sum(axis=1, keepdims=True)
+    mp = mp / np.where(rs > 0, rs, 1.0)
+    print(f"[{seg}] LCCM rebuild: K={K}, {n_set}/{len(lc.pf)} fitted values "
+          f"applied", flush=True)
+    return lc, mp, n_set
+
+
 def _predict_segment(seg, seg_df, seg_persons, models, landuse, skims,
                      skim_df, zero_crash: bool, crash_cols: dict):
     res = models.get(seg) or {}
@@ -293,31 +379,14 @@ def _predict_segment(seg, seg_df, seg_persons, models, landuse, skims,
     # in-vehicle-time encoding the bundle was fitted with, and the same
     # chosen-but-unavailable repair. Any difference makes this a different
     # model, which _score_stage5_arm's LL-reproduction guard now catches.
-    _ivt_prev = os.environ.get("STAGE5_POOLED_IVT")
-    if not isinstance(_saved_mode_uec, dict) or not _saved_mode_uec:
-        os.environ["STAGE5_POOLED_IVT"] = "1" if "c_ivt" in (mc or {}) else "0"
-    try:
-        mm = _build_mode_model(
-            dt_m, seg, custom_mode_vars=mode_spec,
-            avail_vars_hint=list(seg_df.columns) + list(seg_persons.columns))
-    finally:
-        if _ivt_prev is None:
-            os.environ.pop("STAGE5_POOLED_IVT", None)
-        else:
-            os.environ["STAGE5_POOLED_IVT"] = _ivt_prev
-    try:
-        mm.doctor(repair_ch_av="+")
-    except Exception:
-        pass
-    n_mode_applied = _apply_coefs(mm, mc, holdfast=_holdfast_names(mode_fit))
-    try:
-        mode_crash_param = bool("c_crash_veh" in mm.pf.index)
-    except Exception:
-        mode_crash_param = False
-    mp = np.asarray(mm.probability(), dtype=float)
-    mp = np.nan_to_num(mp, nan=0.0, posinf=0.0, neginf=0.0)
-    rs = mp.sum(axis=1, keepdims=True)
-    mp = mp / np.where(rs > 0, rs, 1.0)
+    if type(mode_fit).__name__ == "LatentClass":
+        mm, mp, n_mode_applied = _predict_mode_lccm(
+            mode_fit, dt_m, seg, _saved_mode_uec, zero_crash)
+        mode_crash_param = any("crash_veh" in str(n) for n in mm.pf.index)
+    else:
+        mm, mp, mode_crash_param, n_mode_applied = _predict_mode_single(
+            mode_fit, dt_m, seg, seg_df, seg_persons, mode_spec, mc,
+            _saved_mode_uec)
 
     # The mode logsum must be evaluated over the REAL destination zone IDs.
     # Without an explicit override, _logsums can fall back to Larch's internal

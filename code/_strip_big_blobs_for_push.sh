@@ -50,7 +50,14 @@ echo "remaining blobs > $LIMIT: $LEFT"
 
 NEW=$(git rev-parse push-clean)
 cd "$REPO"
-git fetch --quiet "$BARE" "push-clean:refs/heads/push-clean"
+# Copy back only the objects the repo lacks (the rewritten commits and trees;
+# every surviving blob is already here). A plain fetch re-packed the whole
+# history and pack-objects was OOM-killed (job 28994946).
+git --git-dir="$BARE" rev-list --objects --no-object-names "$BASE..push-clean"   | git cat-file --batch-check='%(objectname) %(objecttype)'   | awk '$2=="missing"{print $1}' > "$BARE/missing.txt"
+echo "objects to copy back: $(wc -l < "$BARE/missing.txt")"
+git --git-dir="$BARE" pack-objects --stdout --window=0 --depth=0 < "$BARE/missing.txt"   | git index-pack --stdin > /dev/null
+git update-ref refs/heads/push-clean "$NEW"
+git rev-list --objects "$BASE..push-clean" > /dev/null   # connectivity check
 echo "push-clean=$NEW (commits: $(git rev-list --count "$BASE..push-clean"))"
 echo "Apply with: git reset --mixed push-clean   (moves migrate-zones-371, keeps working files)"
 echo STRIP_OK

@@ -1814,21 +1814,29 @@ def _apply_nonmand_distance_basis(uec: dict, segment, route_active: bool) -> dic
     return uec
 
 
-def dest_live_tokens(tokens) -> list:
+def dest_live_tokens(tokens, segment=None) -> list:
     """Return only the candidate tokens that ACTUALLY map to a destination model
     term (directly, as a coeff name, via the isvar alias, or as a substring of a
     flat expression). Tokens not returned are no-ops — selecting them can't change
     the model — so the GA should not waste search budget (or report phantom
     "winners") on them. Reuses _dest_uec_flat_from_feature_list so the check is
-    exactly the build-time logic."""
+    exactly the build-time logic.
+
+    ``segment`` matters: the non-mandatory basis removes the short distance
+    bands and linear distance, so those genes are no-ops for that segment even
+    though they are live for work/education.  Passing the segment keeps the
+    search space identical to the fitted specification.
+    """
     try:
-        _backbone = set(_dest_uec_flat_from_feature_list(['__nomatch_sentinel__']).keys())
+        _backbone = set(_dest_uec_flat_from_feature_list(
+            ['__nomatch_sentinel__'], segment).keys())
     except Exception:
         return list(tokens)
     live = []
     for t in tokens:
         try:
-            if set(_dest_uec_flat_from_feature_list([str(t)]).keys()) - _backbone:
+            if set(_dest_uec_flat_from_feature_list(
+                    [str(t)], segment).keys()) - _backbone:
                 live.append(str(t))
         except Exception:
             live.append(str(t))          # keep on any failure (fail-open)
@@ -4683,6 +4691,10 @@ def _ensure_person_behavioural_cols(persons: pd.DataFrame) -> pd.DataFrame:
 _MODE_TIME_TRANSFORMS = {
     'c_ivt_auto':    ('SOVTOLL_TIME__AM',      lambda v: v / 60.0),
     'c_ivt_transit': ('WLK_LOC_WLK_TOTIVT__AM', lambda v: v / 60.0),
+    # Pooled generic IVT legs (one larch parameter c_ivt, see _mode_param_name):
+    # same skims and transforms as the mode-specific terms they replace.
+    'c_ivt':          ('SOVTOLL_TIME__AM',      lambda v: v / 60.0),
+    'c_ivt__transit': ('WLK_LOC_WLK_TOTIVT__AM', lambda v: v / 60.0),
     # PT access IVTs (STAGE5_PT_MODES=1): same residualize-on-DIST treatment as
     # the 5-mode time terms; the coeffs are absent from the spec on 5-mode runs,
     # so the downstream remap/swap silently skips them (missing-name-safe).
@@ -9570,6 +9582,12 @@ SEGMENT_COEFFICIENTS: dict = {
         # zones equally likely. A good starting point avoids bad local optima.
         "c_log_dist":        -2.0,  # log-distance deterrent (work: workers accept longer commutes)
         "c_logsum":           0.5,  # mode logsum (positive = accessible zones preferred)
+        # Person-type route logsum (minutes).  A negative start matters: the
+        # term otherwise begins at 0, where its gradient is tiny once log
+        # distance is in the model, and the stuck-component cleanup used to
+        # drop it (P0 non-mandatory collapsed to a 4-parameter distance-only
+        # model).  Structural inclusive values must never be dropped.
+        "c_route_logsum_type": -0.05,
         "c_crash":           -0.1,  # crash deterrent
         # ── Mode: distance / time ─────────────────────────────────────────
         "c_ivt_auto":        -1.20,
@@ -11287,9 +11305,74 @@ def _build_mode_lccm(dt, segment: str, n_classes: int = None,
         lc.set_cap(float(_os.environ.get('STAGE5_LCCM_CAP', '25')))
     except Exception:
         pass
+    _lccm_apply_class_constraints(lc, segment)
+    # Saved with the bundle (result['mode_uec']) so the scorer rebuilds the
+    # SAME class specification instead of a nested model from coefficient names.
+    lc._stage5_mode_uec = {str(k): v for k, v in base_uec.items()}
+    lc._stage5_lccm_meta = {'n_classes': K,
+                            'membership_vars': list(membership_vars or []),
+                            'class_structures': list(class_structures)}
     logger.info(f"[{segment}] LCCM built: {K} classes, structures="
                 f"{class_structures}, membership={membership_vars}, "
                 f"symmetry_break={_sb}")
+    return lc
+
+
+def _lccm_apply_class_constraints(lc, segment: str = ''):
+    """Carry the single-class constraints onto a LatentClass parameter frame.
+
+    The class within-models are built with locked nest scales and sign priors,
+    but LatentClass assembles its own frame from the '__c{k}'-suffixed names:
+    the sign priors (keyed on base names) never matched and the Mu locks were
+    lost, so P2LC edu fitted c_ivt__c1 = +0.04, positive auto cost and
+    Mu_NonMotor railed at 0.01 (job 28994714). Re-apply them by base name.
+    """
+    import re as _re
+    try:
+        from ga_constraints import sign_constraints as _sc
+        signs = _sc('stage5_mode')
+    except Exception:
+        signs = {}
+    _mu_fixed = float(os.environ.get('STAGE5_MU_FIXED_VALUE', '0.8'))
+    _mu_free = os.environ.get('STAGE5_ESTIMATE_MU', '0') == '1'
+    try:
+        names = list(lc.pf.index)
+    except Exception as _e:
+        logger.warning(f"[{segment}] LCCM constraints skipped (pf unreadable: {_e!r})")
+        return lc
+    n_sign = n_mu = 0
+    for p in names:
+        base = _re.sub(r'__c\d+$', '', str(p))
+        try:
+            if base == 'Mu_Root':
+                lc.lock_value(p, 1.0); n_mu += 1
+                continue
+            if base.startswith('Mu_'):
+                if _mu_free:
+                    _pf_set(lc, p, 'minimum', 0.05)
+                    _pf_set(lc, p, 'maximum', 1.0)
+                else:
+                    lc.lock_value(p, _mu_fixed)
+                n_mu += 1
+                continue
+            s = signs.get(base)
+            if s is None:
+                continue
+            cur = float(lc.pf.loc[p, 'value'])
+            if s == 'neg':
+                _hi = -0.001 if base == 'c_bike_time' else 0.0
+                _pf_set(lc, p, 'maximum', _hi)
+                if np.isfinite(cur) and cur > _hi:
+                    lc.set_value(p, _hi - 0.001)
+            elif s == 'pos':
+                _pf_set(lc, p, 'minimum', 0.0)
+                if np.isfinite(cur) and cur < 0:
+                    lc.set_value(p, 0.001)
+            n_sign += 1
+        except Exception as _e:
+            logger.debug(f"[{segment}] LCCM constraint on {p} skipped ({_e!r})")
+    logger.info(f"[{segment}] LCCM class constraints: {n_sign} sign bounds, "
+                f"{n_mu} nest scales ({'free' if _mu_free else f'locked at {_mu_fixed}'})")
     return lc
 
 
@@ -12043,6 +12126,15 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
                     _uec[k] = DEST_UEC_FLAT[k]
             if not _uec:
                 _uec = DEST_UEC_FLAT
+            # The non-mandatory distance basis applies to explicit UEC dicts as
+            # well.  The search's converged-starter baseline is passed as a dict,
+            # so without this it could estimate the band basis while every
+            # genome was evaluated on the log basis — a baseline that is not
+            # comparable with the genomes it anchors.  Idempotent for an
+            # already-filtered dict (the saved dest_uec of a fitted bundle).
+            _uec = _apply_nonmand_distance_basis(
+                _uec, segment,
+                bool(os.environ.get('STAGE5_ROUTE_TYPE_TABLE', '').strip()))
         elif custom_dest_vars is not None and isinstance(custom_dest_vars, (list, set, tuple)):
             _uec = _dest_uec_flat_from_feature_list(list(custom_dest_vars), segment)
             logger.info(
@@ -14627,7 +14719,17 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
                 # (or protecting it here) restores the always-kept behaviour.
                 'c_size_term', 'log_correction',
                 'c_log_dist', 'c_dist',
+                # The route-logsum inclusive value is the structural safety/time
+                # trade-off.  It must never be treated as a disposable "stuck
+                # near-zero" term: on P0 non-mandatory it starts at 0, the
+                # gradient there is tiny once log distance is in the model, and
+                # the cleanup dropped it, leaving a distance-only model with no
+                # safety term at all.  If it is genuinely unidentified, keep it
+                # and report a near-zero coefficient with its SE.
+                'c_route_logsum_type',
             }
+            if os.environ.get('STAGE5_ROUTE_TYPE_TABLE', '').strip():
+                _NEVER_DROP.add('c_logsum')
             if os.environ.get('STAGE5_DEST_FORCE_ACC', '0') == '1':
                 _NEVER_DROP.add('c_logsum')
             # Safety experiment contract: crash terms are FORCE-INCLUDED in the
@@ -23741,7 +23843,8 @@ def _run_segment(segment: str, tours: pd.DataFrame,
         if isinstance(dest_feature_override, dict):
             _dest_safe = dict(dest_feature_override)
         elif isinstance(dest_feature_override, list):
-            _dest_safe = _dest_uec_flat_from_feature_list(dest_feature_override)
+            _dest_safe = _dest_uec_flat_from_feature_list(
+                dest_feature_override, segment)
         else:
             _dest_safe = None
         logger.info(
@@ -28990,6 +29093,33 @@ def _patch_larch_unpickle():
                     cls._safe_setstate_patched = True
     except Exception as _e:
         logger.debug(f"_patch_larch_unpickle: {_e}")
+    # larch's .dc flow accessors forward every missing attribute to self._obj.
+    # While unpickling, _obj is not set yet, so the __setstate__ lookup recurses
+    # until RecursionError. LatentClass bundles pickle these accessors (P2LC,
+    # jobs 28994714/28994726). Raise AttributeError for _obj and dunders until
+    # _obj exists, so pickle falls back to the default __dict__ restore.
+    try:
+        from larch.dataset import flow as _flow
+        for _cname in ('_GenericFlow', '_DataArrayDC', '_DatasetDC',
+                       '_DatasetCaseIslice'):
+            _cls = getattr(_flow, _cname, None)
+            if (_cls is None or '__getattr__' not in _cls.__dict__
+                    or _cls.__dict__.get('_safe_getattr_patched')):
+                continue
+            _orig = _cls.__dict__['__getattr__']
+
+            def _safe_getattr(self, name, _orig=_orig):
+                if name == '_obj' or (name.startswith('__') and name.endswith('__')):
+                    try:
+                        object.__getattribute__(self, '_obj')
+                    except AttributeError:
+                        raise AttributeError(name) from None
+                return _orig(self, name)
+
+            _cls.__getattr__ = _safe_getattr
+            _cls._safe_getattr_patched = True
+    except Exception as _e:
+        logger.debug(f"_patch_larch_unpickle (flow accessors): {_e}")
 
 
 def load_models(path='saved_data/stage5_models.pkl'):

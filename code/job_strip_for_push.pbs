@@ -1,0 +1,17 @@
+#!/bin/bash
+#PBS -P FPAXJW8067
+#PBS -N strip_for_push
+#PBS -l select=1:ncpus=2:mem=32gb
+#PBS -l walltime=03:00:00
+#PBS -j oe
+#PBS -m n
+# Rewrite the unpushed range of the current branch without blobs > 95 MB, in a
+# bare clone beside the repo (same filesystem, so objects are hardlinked, not
+# copied). See _strip_big_blobs_for_push.sh. Does not touch the working tree.
+set -euo pipefail
+cd "${PBS_O_WORKDIR:-$HOME/test_runs_tours/code}" || exit 1
+export REPO="$(cd .. && pwd)"
+export BARE="$(dirname "$REPO")/tmp_push_strip.git"
+echo "repo=$REPO bare=$BARE host=$(hostname) $(date)"
+bash _strip_big_blobs_for_push.sh
+echo "=== done $(date) ==="

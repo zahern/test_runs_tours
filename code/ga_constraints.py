@@ -374,16 +374,14 @@ PIPELINE_CONSTRAINTS: Dict[str, dict] = {
         # 'node.column' reference (e.g. 'od.DIST') when no distance coefficient
         # exists in the mode spec — MODE_UEC carries no c_log_dist/c_dist term.
         'orthogonalize_on': {
-            # Time terms residualized on OD network distance (tour-level)
-            'c_walk_time':   'od.DIST',
-            'c_bike_time':   'od.DIST',
-            'c_ivt_auto':    'od.DIST',
-            'c_ivt_transit': 'od.DIST',
-            # PT access IVTs (STAGE5_PT_MODES=1): same treatment as the 5-mode
-            # time terms; missing-name-safe on 5-mode runs (both the materialiser
-            # and the swap skip coeffs absent from the spec/uec).
-            'c_ivt_pt_drive': 'od.DIST',
-            'c_ivt_pt_bike':  'od.DIST',
+            # Travel-time terms are NOT residualised on distance.  Time is
+            # almost a linear function of distance (time ~ distance / speed),
+            # so residualising it leaves only the small speed-deviation and the
+            # coefficient rails to the -0.001 sign bound.  Every Stage-5 mode
+            # fit since the constraint was added reported c_ivt_auto=-0.001,
+            # and pooling the terms (c_ivt) simply pooled two railed estimates.
+            # The mode utility carries no direct distance term, so there is no
+            # collinearity for this residualisation to solve.
             # Crash exposure residualized on OD distance (tour-level): crash
             # accumulates with trip length, so the raw term confounds safety
             # sensitivity with distance deterrence. The residual identifies

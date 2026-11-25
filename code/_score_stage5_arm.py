@@ -45,11 +45,27 @@ from validate_safety_arms import (  # noqa: E402
 
 
 def _mode_ll(pred) -> float:
-    """Sum log P(observed mode) for a _predict_segment result."""
+    """Log-likelihood of the observed mode, on the fit's own scale.
+
+    Larch's fitted ``mode_ll`` is the WEIGHTED log-likelihood because the mode
+    model carries ``weight_co_var='weight'``.  Comparing it with an unweighted
+    sum produced a spurious 8-12% "reproduction" gap on every arm.  Use the
+    tour weights returned by ``_predict_segment`` so the comparison is
+    like-for-like.
+    """
     mp = np.asarray(pred["mode_probs"], dtype=float)
     obs = np.asarray(pred["tour_mode"], dtype=int)
     idx = np.clip(obs - 1, 0, mp.shape[1] - 1)
-    return float(np.sum(np.log(np.clip(mp[np.arange(len(obs)), idx], 1e-12, 1.0))))
+    logp = np.log(np.clip(mp[np.arange(len(obs)), idx], 1e-12, 1.0))
+    w = pred.get("weight")
+    # LatentClass likelihoods are unweighted in larch; weighting the
+    # reproduction for them would compare two different objectives.
+    if not pred.get("mode_weighted", True):
+        w = None
+    if w is not None and np.asarray(w).size == len(logp):
+        w = np.asarray(w, dtype=float)
+        return float(np.sum(w * logp))
+    return float(np.sum(logp))
 
 
 def main() -> int:

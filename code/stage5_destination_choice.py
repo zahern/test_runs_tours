@@ -23404,9 +23404,13 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             except Exception:
                 _code_to_col = {c: i for i, c in enumerate(MODE_CODES)}
 
-            _calib_coef = {}
+            # Seed from the live vector: _mode_probs_from_model swaps only the
+            # ASCs into the live model, so the slopes written back below must
+            # be the live ones too, not a stale _final_pf snapshot.
+            _calib_coef = _live_param_vector(mode_mdl)
             try:
-                _pf_cal = getattr(mode_mdl, '_final_pf', None)
+                _pf_cal = (None if _calib_coef
+                           else getattr(mode_mdl, '_final_pf', None))
                 if isinstance(_pf_cal, pd.DataFrame) and 'value' in _pf_cal.columns:
                     _calib_coef = {
                         str(n): float(_pf_cal.loc[n, 'value'])
@@ -24408,6 +24412,18 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             except Exception as _lce:
                 logger.warning(f"_run_segment [{segment}]: LC parameter read "
                                f"failed ({_lce!r})")
+        # 0b. The live parameter vector -- the values loglike() evaluates and
+        #     the bundle's mode_ll/dest_ll are recorded at.  _final_pf is only
+        #     a snapshot from the last _estimate call; post-estimation steps
+        #     (ASC calibration, sign/Mu gates, refits on the same object) can
+        #     move the live values without refreshing it.  Saving the snapshot
+        #     is what broke fit/score reproduction: basis_P0_pin nonmand saved
+        #     c_walk_time=-0.334 / c_bike_time=-0.001 (LL -8987 when rebuilt)
+        #     while the model whose LL was reported held -0.532 / -0.028
+        #     (LL -7082.5).
+        _live = _live_param_vector(mdl)
+        if _live:
+            return _live
         # 1. _final_pf is the post-optimisation snapshot.
         try:
             pf = getattr(mdl, '_final_pf', None)
@@ -24619,6 +24635,9 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     except Exception as _e_lld:
         logger.debug(f"_run_segment [{segment}]: final dest LL unavailable "
                      f"({_e_lld!r})")
+    # mode_ll above is the live model's loglike(); save exactly that vector so
+    # _score_stage5_arm's reproduction guard rebuilds the same model.
+    mode_coef = _sync_saved_coefficients(mode_mdl, mode_coef, 'mode', segment)
 
     return dict(
         mode_model  = mode_mdl,
@@ -26048,6 +26067,63 @@ def _model_param_value(mdl, name):
         return float(pf.loc[name, 'value'])
     except Exception:
         return None
+
+
+def _live_param_vector(mdl) -> dict:
+    """{name: value} of the parameter vector the model's loglike() evaluates.
+
+    Reads larch's own pnames/pvals (the optimiser's storage), not the
+    ``_final_pf`` snapshot or ``_coef_cache``.  Returns {} when the model
+    cannot report them (e.g. a stripped, reloaded bundle) or any value is
+    non-finite, so callers fall back to the snapshot.
+    """
+    try:
+        names = [str(n) for n in mdl.pnames]
+        vals = np.asarray(mdl.pvals, dtype=float).ravel()
+    except Exception:
+        return {}
+    if not names or len(names) != len(vals) or not np.all(np.isfinite(vals)):
+        return {}
+    return dict(zip(names, (float(v) for v in vals)))
+
+
+def _sync_saved_coefficients(mdl, coef: dict, label: str, segment: str) -> dict:
+    """Make the saved coefficient dict, ``_final_pf`` and ``_coef_cache`` equal
+    the live vector, warning about every value that had drifted.
+
+    The bundle's LL is recorded from ``mdl.loglike()``; the scorer rebuilds the
+    model from the saved dict and must land on that same LL.
+    """
+    live = _live_param_vector(mdl)
+    if not live:
+        logger.warning(f"_run_segment [{segment}]: {label} live parameter vector "
+                       "unavailable; saving the post-estimation snapshot as is")
+        return coef
+    out = dict(coef or {})
+    drift = [(k, out.get(k), v) for k, v in live.items()
+             if k not in out or not abs(float(out[k]) - v) <= 1e-9 * max(1.0, abs(v))]
+    if drift:
+        logger.warning(
+            f"_run_segment [{segment}]: {label} saved coefficients differed from "
+            f"the live model on {len(drift)} parameter(s); saving the live values "
+            "(the ones the reported LL refers to). e.g. "
+            + ", ".join(f"{k}: {a if a is None else round(float(a), 5)}"
+                        f"->{v:.5f}" for k, a, v in drift[:6]))
+    out.update(live)
+    try:
+        pf = getattr(mdl, '_final_pf', None)
+        if isinstance(pf, pd.DataFrame) and 'value' in pf.columns:
+            for k, v in live.items():
+                if k in pf.index:
+                    pf.loc[k, 'value'] = v
+    except Exception as _e:
+        logger.debug(f"_sync_saved_coefficients [{segment}/{label}]: "
+                     f"_final_pf refresh skipped ({_e!r})")
+    try:
+        mdl._coef_cache = dict(out)
+    except Exception:
+        pass
+    return out
 
 
 def _model_case_ids(mdl):

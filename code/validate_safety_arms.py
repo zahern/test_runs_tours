@@ -320,6 +320,19 @@ def _predict_mode_lccm(mode_fit, dt_m, seg, saved_uec, zero_crash: bool):
               f"fitted bundle, left at start values: {missing[:8]}", flush=True)
     mp = np.asarray(lc.jax_probability(lc.pvals), dtype=float)
     mp = mp.reshape(mp.shape[0], -1)
+    # With nested class models the array holds EVERY graph node (elemental
+    # alternatives first, then the nests); larch's own LatentClass loglike
+    # keeps only pr[..., :n_alts].  Renormalising over all nodes mixed nest
+    # probabilities into the mode shares (P2LC: 7-15% LL reproduction gaps).
+    try:
+        n_alts = int(lc.dataset.dc.n_alts)
+    except Exception:
+        try:
+            _m0 = next(m for k, m in lc._models.items() if isinstance(k, int))
+            n_alts = len(list(_m0.graph.elementals))
+        except Exception:
+            n_alts = mp.shape[1]
+    mp = mp[:, :n_alts]
     mp = np.nan_to_num(mp, nan=0.0, posinf=0.0, neginf=0.0)
     rs = mp.sum(axis=1, keepdims=True)
     mp = mp / np.where(rs > 0, rs, 1.0)
@@ -385,10 +398,13 @@ def _predict_segment(seg, seg_df, seg_persons, models, landuse, skims,
         mm, mp, n_mode_applied = _predict_mode_lccm(
             mode_fit, dt_m, seg, _saved_mode_uec, zero_crash)
         mode_crash_param = any("crash_veh" in str(n) for n in mm.pnames)
+        # larch's LatentClass likelihood ignores case weights.
+        mode_weighted = False
     else:
         mm, mp, mode_crash_param, n_mode_applied = _predict_mode_single(
             mode_fit, dt_m, seg, seg_df, seg_persons, mode_spec, mc,
             _saved_mode_uec)
+        mode_weighted = bool(getattr(mm, "weight_co_var", None))
 
     # The mode logsum must be evaluated over the REAL destination zone IDs.
     # Without an explicit override, _logsums can fall back to Larch's internal
@@ -572,6 +588,9 @@ def _predict_segment(seg, seg_df, seg_persons, models, landuse, skims,
         "tour_mode": pd.to_numeric(seg_df["tour_mode"], errors="coerce").fillna(0).astype(int).to_numpy(),
         "otaz": pd.to_numeric(seg_df["OTAZ"], errors="coerce").fillna(0).astype(int).to_numpy(),
         "dtaz": pd.to_numeric(seg_df["DTAZ"], errors="coerce").fillna(0).astype(int).to_numpy(),
+        # Whether the fitted mode likelihood is case-weighted, so LL
+        # reproduction compares like with like.
+        "mode_weighted": bool(mode_weighted),
         "mode_coefs_applied": int(n_mode_applied),
         "mode_crash_coef_present": bool("c_crash_veh" in mc),
         "mode_crash_param_present": bool(mode_crash_param),

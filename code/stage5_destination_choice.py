@@ -1807,10 +1807,24 @@ def _apply_nonmand_distance_basis(uec: dict, segment, route_active: bool) -> dic
         uec.pop(k, None)
     if 'c_log_dist' in DEST_UEC_FLAT:
         uec['c_log_dist'] = DEST_UEC_FLAT['c_log_dist']
+    # The quadratic long-trip correction is part of the basis for BOTH arms.
+    # Without it the P0 utility is log-distance + route logsum only, the two
+    # free parameters start on a flat gradient, and phase-1 leaves them at their
+    # priors ("ALL free params unmoved").  P2 identifies the route term with
+    # log distance + quadratic; giving P0 the same basis makes the arm
+    # comparison a comparison of the searched extras, not of the distance shape.
+    if 'c_dist_sq' in DEST_UEC_FLAT:
+        uec['c_dist_sq'] = DEST_UEC_FLAT['c_dist_sq']
     if route_active:
         uec.pop('c_dist', None)
     elif 'c_dist' in DEST_UEC_FLAT:
         uec['c_dist'] = DEST_UEC_FLAT['c_dist']
+    # STAGE5_DEST_INTRAZONAL=1: own-zone constant. The route table has no
+    # intrazonal rows, so own-zone cells fall back to SOV time (~0 min) and look
+    # nearly free; c_intrazonal absorbs that instead of a log-distance term
+    # forced against its sign prior (P0 probe 29022456).
+    if os.environ.get('STAGE5_DEST_INTRAZONAL', '0') == '1':
+        uec['c_intrazonal'] = DEST_UEC_FLAT['c_intrazonal']
     return uec
 
 
@@ -9921,6 +9935,40 @@ SKIM_TO_EXPR = {
 }
 
 
+_PRUNE_CACHE = None
+
+
+def _prune_terms(kind: str) -> set:
+    """Terms excluded from a refit so every reported coefficient is estimable.
+
+    Reads ``STAGE5_PRUNE_FILE`` (JSON ``{"mode": [...], "dest": [...]}``).  The
+    lists are generated from a previous fit's holdfast/at-bound report.  A term
+    that was holdfast at zero contributed nothing to the likelihood, so removing
+    it does not change the fit; it only removes a dead coefficient from the
+    model and its report.  Intentional normalisations (size term, log
+    correction, nest scales) must never be listed.
+    """
+    global _PRUNE_CACHE
+    if _PRUNE_CACHE is None:
+        path = os.environ.get('STAGE5_PRUNE_FILE', '').strip()
+        _PRUNE_CACHE = {'mode': set(), 'dest': set()}
+        if path and os.path.isfile(path):
+            try:
+                with open(path, encoding='utf-8') as fh:
+                    blob = json.load(fh)
+                _PRUNE_CACHE = {
+                    'mode': {str(x) for x in (blob.get('mode') or [])},
+                    'dest': {str(x) for x in (blob.get('dest') or [])},
+                }
+                logger.info(
+                    f"STAGE5_PRUNE_FILE {path}: "
+                    f"{len(_PRUNE_CACHE['mode'])} mode, "
+                    f"{len(_PRUNE_CACHE['dest'])} destination term(s) pruned")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"STAGE5_PRUNE_FILE {path} unreadable: {exc!r}")
+    return _PRUNE_CACHE.get(kind, set())
+
+
 def _mode_spec_custom(m, Mode, custom_vars: list, segment: str = 'all'):
     """
     GA-restricted mode spec.  Each MODE_UEC term is either:
@@ -10187,6 +10235,19 @@ def _mode_spec_custom(m, Mode, custom_vars: list, segment: str = 'all'):
     # the group's modes) for any selected generic gene
     for coeff, (expr, mf) in _generic_inject.items():
         filtered_uec[coeff] = (expr, mf)
+
+    # Drop terms a previous fit could not estimate (holdfast at zero or at a
+    # sign bound).  Keeping them would put non-estimable coefficients back in
+    # the reported model.
+    _prune_mode = _prune_terms('mode')
+    if _prune_mode:
+        _before = len(filtered_uec)
+        filtered_uec = {k: v for k, v in filtered_uec.items()
+                        if k not in _prune_mode}
+        if len(filtered_uec) != _before:
+            logger.info(
+                f"_mode_spec_custom [{segment}]: pruned "
+                f"{_before - len(filtered_uec)} non-estimable term(s)")
 
     # _build_mode_utility records the resolved spec on the model itself.
     m = _build_mode_utility(m, Mode, segment, uec=filtered_uec)
@@ -12146,6 +12207,19 @@ def _build_dest_model(dt, segment: str, custom_dest_vars=None, od_vars_hint=None
         _seg_uec = {k: (expr, segs) for k, (expr, segs) in _uec.items()
                     if segs is None or segment in segs}
 
+        # Drop terms a previous fit could not estimate (holdfast at zero or at
+        # a sign bound), so the refitted model contains only estimable
+        # coefficients.
+        _prune_dest = _prune_terms('dest')
+        if _prune_dest:
+            _before_prune = len(_seg_uec)
+            _seg_uec = {k: v for k, v in _seg_uec.items()
+                        if k not in _prune_dest}
+            if len(_seg_uec) != _before_prune:
+                logger.info(
+                    f"_build_dest_model [{segment}]: pruned "
+                    f"{_before_prune - len(_seg_uec)} non-estimable term(s)")
+
         # Exclude terms referencing collinear/person-zone-interaction CA columns
         _dropped_terms = {k: v for k, v in _seg_uec.items() if v[0] in _dt_collinear}
         if _dropped_terms:
@@ -12475,6 +12549,9 @@ def _build_dest_model_nl_distance(dt, segment: str, custom_dest_vars=None, od_va
     
     _seg_uec = {k: (expr, segs) for k, (expr, segs) in _uec.items()
                 if segs is None or segment in segs}
+    _prune_dest = _prune_terms('dest')
+    if _prune_dest:
+        _seg_uec = {k: v for k, v in _seg_uec.items() if k not in _prune_dest}
     
     # Remove collinear terms (same logic as MNL)
     _dt_collinear = set(getattr(dt, 'attrs', {}).get('_collinear_cols', []))
@@ -14269,7 +14346,26 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
     _force_jax_retry = os.environ.get('LARCH_FORCE_JAX', '1').strip() != '0'
     _is_dest_large = ('c_log_dist' in getattr(model, 'pf', pd.DataFrame()).index
                       if hasattr(model, 'pf') else False)
-    if _force_jax_retry and _is_dest_large and 'numba' not in _cur_engine.lower():
+    # The numba-retry ban exists because finite differences over a large
+    # destination model (many free parameters x 371-zone expansion) OOM or
+    # stall.  A small destination model (few free parameters) does not carry
+    # that cost, and for it jax can return a zero gradient at the starting
+    # point: P0 non-mandatory has 3 free parameters and every one stayed
+    # unmoved, so the route term never identified.  Allow the numba retry when
+    # the free-parameter count is small.
+    _n_free_model = None
+    try:
+        _pf_rt = model.pf
+        _hf_rt = (_pf_rt['holdfast'].fillna(False).astype(bool)
+                  if 'holdfast' in _pf_rt.columns
+                  else pd.Series(False, index=_pf_rt.index))
+        _n_free_model = int((~_hf_rt).sum())
+    except Exception:
+        _n_free_model = None
+    _small_dest = bool(_is_dest_large and _n_free_model is not None
+                       and _n_free_model <= 8)
+    if (_force_jax_retry and _is_dest_large and not _small_dest
+            and 'numba' not in _cur_engine.lower()):
         # Already on jax and stuck: keep jax, retry below with relaxed opts.
         _retry_engine = 'jax'
     else:
@@ -14279,11 +14375,17 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
         # ASC — and was previously left at priors with only ASC calibration
         # papering over it).
         _retry_engine = 'numba' if 'numba' not in _cur_engine.lower() else 'jax'
-        if _force_jax_retry and _retry_engine == 'numba' and _is_dest_large:
+        # Only LARGE destination models are barred from numba. This override
+        # used to fire for small ones too, so the _small_dest exception above
+        # never took effect and P0 non-mandatory "retried" on jax again
+        # (job 29011096: "retrying once with compute_engine='jax'").
+        if (_force_jax_retry and _retry_engine == 'numba' and _is_dest_large
+                and not _small_dest):
             logger.info("_estimate: large dest model stuck on jax → retrying on jax "
                         "(numba retry disabled by LARCH_FORCE_JAX=1)")
             _retry_engine = 'jax'
     if _all_free_params_stuck():
+        _stuck_gradient_probe(model, _cur_engine)
         logger.warning(
             f"_estimate: ALL free params unmoved after phase-1 (zero gradient, "
             f"engine={_cur_engine or '?'}) — retrying once with "
@@ -14350,9 +14452,11 @@ def _estimate(model, two_phase: bool = False, search_mode: bool = False):
                     pass
             else:
                 logger.warning(
-                    f"_estimate: {_retry_engine} retry moved the parameters — "
-                    f"{_cur_engine or 'the previous'} engine gradient is broken "
-                    "for this model family."
+                    f"_estimate: {_retry_engine} retry moved the parameters where "
+                    f"{_cur_engine or 'the previous'} did not. Check the "
+                    "_stuck_gradient_probe line: if analytic == fd the gradient is "
+                    "fine and the stall is a scaling / first-step problem "
+                    "(P0 nonmand, job 29022456: |g| ~ 4.5e5 at the start)."
                 )
                 # Process-local escalation: if jax could not move a single
                 # parameter and numba could, every later _lx_model() in this
@@ -15524,6 +15628,69 @@ def _param_tstats(model) -> dict:
     return out
 
 
+def _stuck_gradient_probe(model, engine: str = '', max_params: int = 8):
+    """Log the engine's analytic gradient next to a central finite difference.
+
+    Called when phase-1 left every free parameter at its start value. If the
+    finite difference is clearly non-zero while the analytic gradient is zero
+    or NaN, the engine's gradient is broken for this utility (the fix is an
+    engine switch); if both are ~0 the likelihood really is flat there (a data
+    or specification problem). Also counts non-finite values in the model's
+    data arrays. Never raises; restores the parameter vector.
+    """
+    try:
+        pf = model.pf
+        hf = (pf['holdfast'].fillna(False).astype(bool)
+              if 'holdfast' in pf.columns else pd.Series(False, index=pf.index))
+        names = list(pf.index)
+        free = [p for p in names if not hf.get(p, False)][:max_params]
+        x0 = np.asarray(model.pvals, dtype=float).copy()
+        try:
+            ll0 = float(model.loglike(x0))
+        except Exception:
+            ll0 = float('nan')
+        try:
+            g = np.asarray(model.d_loglike(x0), dtype=float).ravel()
+        except Exception as _ge:
+            g = None
+            logger.warning(f"_stuck_gradient_probe: analytic gradient failed ({_ge!r})")
+        rows = []
+        for p in free:
+            i = names.index(p)
+            h = 1e-4 * max(1.0, abs(x0[i]))
+            xp, xm = x0.copy(), x0.copy()
+            xp[i] += h
+            xm[i] -= h
+            try:
+                fd = (float(model.loglike(xp)) - float(model.loglike(xm))) / (2 * h)
+            except Exception:
+                fd = float('nan')
+            an = float(g[i]) if g is not None and i < len(g) else float('nan')
+            rows.append(f"{p}: start={x0[i]:.4g} analytic={an:.6g} fd={fd:.6g}")
+        try:
+            model.pvals = x0
+        except Exception:
+            pass
+        nonfinite = {}
+        try:
+            ds = getattr(model, 'dataset', None)
+            if ds is not None:
+                for v in ds.data_vars:
+                    a = np.asarray(ds[v].values)
+                    if a.dtype.kind == 'f':
+                        n = int((~np.isfinite(a)).sum())
+                        if n:
+                            nonfinite[str(v)] = n
+        except Exception:
+            pass
+        logger.warning(
+            f"_stuck_gradient_probe [engine={engine or '?'}] LL={ll0:.4f} | "
+            + " | ".join(rows)
+            + f" | non-finite data: {nonfinite or 'none'}")
+    except Exception as _e:
+        logger.warning(f"_stuck_gradient_probe failed ({_e!r})")
+
+
 def _apply_sign_constraints(model, stage: str):
     """
     Enforce declarative sign priors from ga_constraints.sign_constraints(stage):
@@ -15535,6 +15702,10 @@ def _apply_sign_constraints(model, stage: str):
         signs = _sc(stage)
     except Exception:
         signs = {}
+    if stage == 'stage5_dest' and os.environ.get('STAGE5_LOGDIST_FREE', '0') == '1':
+        # With the route logsum carrying the impedance, log distance is a shape
+        # correction, not a deterrent; its sign is left to the data.
+        signs = {k: v for k, v in signs.items() if k != 'c_log_dist'}
     for p, s in signs.items():
         if p not in model.pf.index:
             continue
@@ -24222,6 +24393,18 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     # Prefer _final_pf (snapshot cached by _estimate) so values are stable
     # even after Larch rebuilds the property.
     def _extract_coef(mdl, label='model'):
+        # 0. LatentClass: its pf comes back as a (name, i) cross product
+        #    (14,884 rows for 122 parameters, P2LC 29012928), so read the
+        #    parameter vector directly.
+        if type(mdl).__name__ == 'LatentClass':
+            try:
+                out = {str(n): float(v) for n, v in zip(mdl.pnames, mdl.pvals)
+                       if np.isfinite(float(v))}
+                if out:
+                    return out
+            except Exception as _lce:
+                logger.warning(f"_run_segment [{segment}]: LC parameter read "
+                               f"failed ({_lce!r})")
         # 1. _final_pf is the post-optimisation snapshot.
         try:
             pf = getattr(mdl, '_final_pf', None)

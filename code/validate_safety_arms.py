@@ -300,10 +300,12 @@ def _predict_mode_lccm(mode_fit, dt_m, seg, saved_uec, zero_crash: bool):
         membership_vars=meta.get("membership_vars") or None,
         class_structures=meta.get("class_structures") or None,
         custom_mode_vars=spec)
-    fitted = {str(n): float(v) for n, v in mode_fit.pf["value"].items()
-              if np.isfinite(v)}
+    # pnames/pvals, not pf: a fitted LatentClass's pf comes back as a
+    # (name, i) cross product, so name lookups matched nothing (0/122 applied).
+    fitted = {str(n): float(v) for n, v in zip(mode_fit.pnames, mode_fit.pvals)
+              if np.isfinite(float(v))}
     n_set = 0
-    for n in lc.pf.index:
+    for n in map(str, lc.pnames):
         if n not in fitted:
             continue
         v = 0.0 if (zero_crash and "crash" in n.lower()) else fitted[n]
@@ -312,7 +314,7 @@ def _predict_mode_lccm(mode_fit, dt_m, seg, saved_uec, zero_crash: bool):
             n_set += 1
         except Exception:
             pass
-    missing = [n for n in lc.pf.index if n not in fitted]
+    missing = [str(n) for n in lc.pnames if str(n) not in fitted]
     if missing:
         print(f"[{seg}] LCCM rebuild: {len(missing)} parameter(s) not in the "
               f"fitted bundle, left at start values: {missing[:8]}", flush=True)
@@ -321,7 +323,7 @@ def _predict_mode_lccm(mode_fit, dt_m, seg, saved_uec, zero_crash: bool):
     mp = np.nan_to_num(mp, nan=0.0, posinf=0.0, neginf=0.0)
     rs = mp.sum(axis=1, keepdims=True)
     mp = mp / np.where(rs > 0, rs, 1.0)
-    print(f"[{seg}] LCCM rebuild: K={K}, {n_set}/{len(lc.pf)} fitted values "
+    print(f"[{seg}] LCCM rebuild: K={K}, {n_set}/{len(lc.pnames)} fitted values "
           f"applied", flush=True)
     return lc, mp, n_set
 
@@ -382,7 +384,7 @@ def _predict_segment(seg, seg_df, seg_persons, models, landuse, skims,
     if type(mode_fit).__name__ == "LatentClass":
         mm, mp, n_mode_applied = _predict_mode_lccm(
             mode_fit, dt_m, seg, _saved_mode_uec, zero_crash)
-        mode_crash_param = any("crash_veh" in str(n) for n in mm.pf.index)
+        mode_crash_param = any("crash_veh" in str(n) for n in mm.pnames)
     else:
         mm, mp, mode_crash_param, n_mode_applied = _predict_mode_single(
             mode_fit, dt_m, seg, seg_df, seg_persons, mode_spec, mc,

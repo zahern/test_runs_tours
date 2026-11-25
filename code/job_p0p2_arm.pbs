@@ -39,16 +39,28 @@ OUT_TAG="${OUT_TAG:-${ARM}}"
 mkdir -p "${ROOT}/${OUT_TAG}"
 for SEG in ${SEGS}; do
   echo "=== ${OUT_TAG} (${ARM}) / ${SEG} fit $(date) structure=${STAGE5_MODE_STRUCTURE} ==="
+  # Prune terms a previous fit could not estimate, so the refitted model has
+  # only estimable coefficients (see _make_prune_specs.py).
+  PRUNE_FILE="${ROOT}/specs/prune_${OUT_TAG}_${SEG}.json"
+  if [ -f "${PRUNE_FILE}" ]; then
+    export STAGE5_PRUNE_FILE="${PRUNE_FILE}"
+    echo "    prune file: ${PRUNE_FILE}"
+  else
+    unset STAGE5_PRUNE_FILE
+  fi
   MODE_ARGS=()
   if [ "${ARM}" = "P2" ]; then
     MODE_ARGS=(--mode-spec "${ROOT}/specs/${SEG}_P2_mode.json")
   fi
-  python -u _fit_stage5_arm.py \
-      --segment "${SEG}" --arm "${ARM}" \
-      "${MODE_ARGS[@]}" \
-      --dest-spec "${ROOT}/specs/${SEG}_${ARM}_dest.json" \
-      --skims ../demand_/skims_371_routechoice.omx \
-      --out "${ROOT}/${OUT_TAG}/${SEG}" 2>&1 | tee "${ROOT}/${OUT_TAG}/${SEG}_fit.log"
+  # SCORE_ONLY=1 re-scores the existing bundle (e.g. after a scorer fix).
+  if [ "${SCORE_ONLY:-0}" != "1" ]; then
+    python -u _fit_stage5_arm.py \
+        --segment "${SEG}" --arm "${ARM}" \
+        "${MODE_ARGS[@]}" \
+        --dest-spec "${ROOT}/specs/${SEG}_${ARM}_dest.json" \
+        --skims ../demand_/skims_371_routechoice.omx \
+        --out "${ROOT}/${OUT_TAG}/${SEG}" 2>&1 | tee "${ROOT}/${OUT_TAG}/${SEG}_fit.log"
+  fi
   echo "=== ${OUT_TAG} / ${SEG} score $(date) ==="
   python -u _score_stage5_arm.py \
       --models "${ROOT}/${OUT_TAG}/${SEG}/stage5_models.pkl" \

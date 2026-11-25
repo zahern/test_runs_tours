@@ -27,6 +27,8 @@ export STAGE5_DEST_SAMPLE_SIZE=${STAGE5_DEST_SAMPLE_SIZE:-0}
 #   non-mandatory; road crash on road-borne modes only (MODE_UEC).
 export STAGE5_POOLED_IVT=${STAGE5_POOLED_IVT:-1}
 export STAGE5_NONMAND_DIST_BASIS=${STAGE5_NONMAND_DIST_BASIS:-log}
+# Own-zone constant in the non-mandatory destination basis (basis_*_iz won).
+export STAGE5_DEST_INTRAZONAL=${STAGE5_DEST_INTRAZONAL:-1}
 export STAGE5_MODE_STRUCTURE=${STAGE5_MODE_STRUCTURE:-nested}
 
 ARM="${ARM:?ARM required (P0 or P2)}"

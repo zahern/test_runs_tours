@@ -1819,11 +1819,14 @@ def _apply_nonmand_distance_basis(uec: dict, segment, route_active: bool) -> dic
         uec.pop('c_dist', None)
     elif 'c_dist' in DEST_UEC_FLAT:
         uec['c_dist'] = DEST_UEC_FLAT['c_dist']
-    # STAGE5_DEST_INTRAZONAL=1: own-zone constant. The route table has no
-    # intrazonal rows, so own-zone cells fall back to SOV time (~0 min) and look
-    # nearly free; c_intrazonal absorbs that instead of a log-distance term
-    # forced against its sign prior (P0 probe 29022456).
-    if os.environ.get('STAGE5_DEST_INTRAZONAL', '0') == '1':
+    # Own-zone constant (default ON; STAGE5_DEST_INTRAZONAL=0 disables). The
+    # route table has no intrazonal rows, so own-zone cells fall back to SOV
+    # time (~0 min) and look nearly free; c_intrazonal absorbs that instead of
+    # a log-distance term forced against its sign prior (P0 probe 29022456).
+    # Basis comparison 2026-11-25 (runs/p0p2_routechoice/basis_*): nonmand dest
+    # LL −22,670 → −18,929 (P0), −21,449 → −17,832 (P2); without it the route
+    # coefficient is inflated ~2.3× (−0.118 vs −0.051 in P0).
+    if os.environ.get('STAGE5_DEST_INTRAZONAL', '1') == '1':
         uec['c_intrazonal'] = DEST_UEC_FLAT['c_intrazonal']
     return uec
 
@@ -24446,6 +24449,32 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     mode_coef = _extract_coef(mode_mdl, 'mode')
     dest_coef = _extract_coef(dest_mdl, 'destination')
 
+    # ── Recompute the LL at the FINAL saved coefficient vector ─────────────
+    # Post-estimation steps (sign censoring, holdfast locks, ASC calibration)
+    # change parameter values after _estimate cached its LL.  Reporting the
+    # cached LL while saving the changed vector is exactly why the scorer could
+    # not reproduce the fit (2.8-24% gaps on identical cases): the LL described
+    # a different parameter point.  Score the live model once more at the
+    # values that are actually written to the bundle.
+    try:
+        _ll_mode_final = float(mode_mdl.loglike())
+        if np.isfinite(_ll_mode_final):
+            mode_ll = _ll_mode_final
+            logger.info(f"_run_segment [{segment}]: mode LL recomputed at "
+                        f"final coefficients = {_ll_mode_final:.3f}")
+    except Exception as _llm_e:
+        logger.warning(f"_run_segment [{segment}]: final mode LL recompute "
+                       f"failed ({_llm_e!r}); keeping _cached_ll")
+    try:
+        _ll_dest_final = float(dest_mdl.loglike())
+        if np.isfinite(_ll_dest_final):
+            dest_ll = _ll_dest_final
+            logger.info(f"_run_segment [{segment}]: dest LL recomputed at "
+                        f"final coefficients = {_ll_dest_final:.3f}")
+    except Exception as _lld_e:
+        logger.warning(f"_run_segment [{segment}]: final dest LL recompute "
+                       f"failed ({_lld_e!r}); keeping _cached_ll")
+
     # Alternative estimation path: if Larch destination estimation produced no
     # coefficients, estimate a compact sampled-alternative conditional logit
     # with JAX instead of using fixed defaults.
@@ -24571,6 +24600,25 @@ def _run_segment(segment: str, tours: pd.DataFrame,
     # This drives _frozen_person_dist_offsets during prediction (work segment only).
     _dist_het = _estimate_dest_dist_heterogeneity(seg, dest_coef, segment)
     _s_log_dist = _dist_het.get('s_log_dist', 0.5)
+
+    # Final LL at the exact coefficient vector that will be written to the
+    # bundle.  Any estimator fallback above may have changed dest_coef after
+    # the earlier recompute, so do it once more here; the scorer compares its
+    # rebuild against these values.
+    try:
+        _llm = float(mode_mdl.loglike())
+        if np.isfinite(_llm):
+            mode_ll = _llm
+    except Exception as _e_llm:
+        logger.debug(f"_run_segment [{segment}]: final mode LL unavailable "
+                     f"({_e_llm!r})")
+    try:
+        _lld = float(dest_mdl.loglike())
+        if np.isfinite(_lld):
+            dest_ll = _lld
+    except Exception as _e_lld:
+        logger.debug(f"_run_segment [{segment}]: final dest LL unavailable "
+                     f"({_e_lld!r})")
 
     return dict(
         mode_model  = mode_mdl,

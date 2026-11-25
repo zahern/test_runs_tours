@@ -30,16 +30,48 @@ rm -f log_full_pipeline_dta_tested.out log_full_pipeline_dta_tested.err
 conda activate zigenv
 module unload Anaconda3
 
+# Keep the next run on the fixed SearchLibrium (>= 0.0.272).  This job runs
+# outside pbs_pipeline_mode.pbs, so it does not get that script's upgrade.
+echo "[pkg] Ensuring latest SearchLibrium..."
+(
+  flock -w 900 9 2>/dev/null || echo "[pkg] (flock unavailable, proceeding)"
+  pip install --upgrade -q --retries 1 --timeout 20 SearchLibrium
+) 9>"${PBS_O_WORKDIR}/.pkg_upgrade.lock" \
+  || echo "[pkg] WARNING: SearchLibrium upgrade failed; using installed copy"
+python _preflight_sl_version.py \
+  || { echo "FATAL: SearchLibrium preflight failed"; exit 3; }
+
 export JAX_PLATFORM_NAME=cpu
 export JAX_PLATFORMS=cpu
 export CUDA_VISIBLE_DEVICES=""
 export TF_CPP_MIN_LOG_LEVEL=3
 export XLA_FLAGS="--xla_force_host_platform_device_count=${NCPUS:-8}"
 
+# Stage-5 specification, aligned with job_p0p2_arm.pbs (the basis comparison
+# of 2026-11-25, runs/p0p2_routechoice/basis_*_iz). Each can be overridden
+# with qsub -v NAME=value.
+export PIPELINE_SKIMS_PATH="${PIPELINE_SKIMS_PATH:-../demand_/skims_371_routechoice.omx}"
+export STAGE5_ROUTE_TYPE_TABLE="${STAGE5_ROUTE_TYPE_TABLE:-runs/route_choice_371/route_logsum_type.parquet}"
+export STAGE5_MODE_ORTHOG=${STAGE5_MODE_ORTHOG:-1} STAGE5_DEST_ORTHOG=${STAGE5_DEST_ORTHOG:-1}
+export STAGE5_STRICT_ESTIMATION=${STAGE5_STRICT_ESTIMATION:-1}
+export STAGE5_REQUIRE_DEST_ESTIMATION=${STAGE5_REQUIRE_DEST_ESTIMATION:-1}
+export STAGE5_DEST_SAMPLE_SIZE=${STAGE5_DEST_SAMPLE_SIZE:-0}
+export STAGE5_POOLED_IVT=${STAGE5_POOLED_IVT:-1}
+export STAGE5_NONMAND_DIST_BASIS=${STAGE5_NONMAND_DIST_BASIS:-log}
+export STAGE5_DEST_INTRAZONAL=${STAGE5_DEST_INTRAZONAL:-1}
+export STAGE5_MODE_STRUCTURE=${STAGE5_MODE_STRUCTURE:-nested}
+for _f in "${PIPELINE_SKIMS_PATH}" "${STAGE5_ROUTE_TYPE_TABLE}"; do
+  [ -f "${_f}" ] || { echo "FATAL: missing Stage-5 input ${_f}"; exit 4; }
+done
+echo "[stage5] skims=${PIPELINE_SKIMS_PATH} route_table=${STAGE5_ROUTE_TYPE_TABLE}"
+echo "[stage5] orthog=${STAGE5_MODE_ORTHOG}/${STAGE5_DEST_ORTHOG} pooled_ivt=${STAGE5_POOLED_IVT}" \
+     "nonmand_basis=${STAGE5_NONMAND_DIST_BASIS} intrazonal=${STAGE5_DEST_INTRAZONAL}" \
+     "dest_sample=${STAGE5_DEST_SAMPLE_SIZE} structure=${STAGE5_MODE_STRUCTURE}"
+
 export NEW_POP_MAPPED=1
 export NEW_POP=0
 export GA_ESTIMATOR=sa_bandit
-export GA_RESULTS_PKL="runs/ga_parallel/run06/merged/ga_results.pkl"
+export GA_RESULTS_PKL="runs/ga_parallel/qld_pypi271/merged/ga_results.pkl"
 
 mkdir -p runs/full_pipeline_dta_tested/plots
 mkdir -p saved_data

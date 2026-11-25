@@ -2242,6 +2242,171 @@ def _da_avail_series(df: pd.DataFrame) -> pd.Series:
     return pd.Series(np.ones(n, dtype=np.int8), index=df.index)
 
 
+def _prepare_mode_seg(seg: pd.DataFrame, skim_df, segment: str,
+                      keep_index: bool = False) -> pd.DataFrame:
+    """OD skim merge and mode availability flags for one segment's tours.
+
+    Shared by estimation (_run_segment) and the holdout scorer
+    (validate_safety_arms._predict_segment).  The scorer used to keep
+    _prep_hhts_tours' walk/bike flags (reported tour_distance) while the fit
+    recomputed them from skim DISTWALK/DISTBIKE, so the rebuilt work-segment
+    model had a different choice set (0.7-1.2% mode-LL reproduction gap on
+    identical cases, 2026-11-25).  ``keep_index`` keeps the caller's index
+    through the left merge (the fit path keeps its historical RangeIndex).
+    """
+    seg = seg.copy()
+    # ── merge OD skim values onto seg for the mixed logit ─────────────────
+    # _estimate_mixed_logit needs per-observation IVT/distance values.
+    # The HHTS tour table has OTAZ/DTAZ but no skim columns.  We merge the
+    # key columns here so the MXL baseline gets real variation to estimate.
+    _MERGE_COLS = [
+        'SOVTOLL_TIME__AM', 'SOVTOLL_DIST__AM', 'DISTWALK', 'DISTBIKE',
+        'WLK_LOC_WLK_TOTIVT__AM', 'WLK_LOC_WLK_WAIT__AM',
+        'WLK_LOC_WLK_BOARDS__AM', 'WLK_LOC_DRV_TOTIVT__AM',
+        'WLK_LOC_DRV_WAIT__AM', 'WLK_LOC_DRV_BOARDS__AM',
+        'WLK_LOC_DRV_DTIM__AM', 'WLK_LOC_DRV_DDIST__AM',
+    ]
+    if skim_df is not None and not skim_df.empty:
+        avail_merge = [c for c in _MERGE_COLS if c in skim_df.columns]
+        if avail_merge:
+            sk_sub = (skim_df[['OTAZ', 'DTAZ'] + avail_merge]
+                      .drop_duplicates(['OTAZ', 'DTAZ']))
+            # drop any existing skim cols to avoid _x/_y suffixes
+            seg = seg.drop(columns=[c for c in avail_merge if c in seg.columns],
+                           errors='ignore')
+            _idx_before = seg.index
+            seg = seg.merge(sk_sub, on=['OTAZ', 'DTAZ'], how='left')
+            if keep_index and len(seg) == len(_idx_before):
+                seg.index = _idx_before
+            # fill missing (zone not in skim) with plausible defaults
+            for col, default in [
+                ('SOVTOLL_TIME__AM', 30.0),
+                ('SOVTOLL_DIST__AM', 20.0),
+                ('DISTWALK', 20.0), ('DISTBIKE', 20.0),
+                ('WLK_LOC_WLK_TOTIVT__AM', 45.0),
+                ('WLK_LOC_WLK_WAIT__AM', 20.0),
+                ('WLK_LOC_WLK_BOARDS__AM', 2.0),
+                ('WLK_LOC_DRV_TOTIVT__AM', 45.0),
+                ('WLK_LOC_DRV_WAIT__AM', 15.0),
+                ('WLK_LOC_DRV_BOARDS__AM', 2.0),
+                ('WLK_LOC_DRV_DTIM__AM', 15.0),
+                ('WLK_LOC_DRV_DDIST__AM', 8.0),
+            ]:
+                if col in seg.columns:
+                    seg[col] = pd.to_numeric(seg[col], errors='coerce').fillna(default)
+            logger.info(
+                f"_run_segment [{segment}]: merged {len(avail_merge)} skim cols; "
+                f"IVT median={seg['SOVTOLL_TIME__AM'].median():.1f} min")
+
+            # ── recompute walk/bike availability from actual distances ────
+            # Use DISTWALK/DISTBIKE directly with realistic zone-level thresholds.
+            # Estimation availability must match prediction thresholds (WALK_MAX_KM=6.0,
+            # BIKE_MAX_KM=25.0 in _predict_batch) so that frozen probability cells
+            # computed from HHTS data transfer correctly to the synthetic population.
+            # Mismatched thresholds suppress walk/bike in HHTS estimation while
+            # allowing them in prediction, causing frozen probs to underweight
+            # active modes.
+            def _to_km(_s: pd.Series) -> pd.Series:
+                _v = pd.to_numeric(_s, errors='coerce').fillna(0.0).clip(lower=0.0)
+                try:
+                    _p95 = float(_v.quantile(0.95))
+                except Exception:
+                    _p95 = float(_v.max()) if len(_v) else 0.0
+                # Some skim builds store DISTWALK/DISTBIKE in meters.
+                return _v / 1000.0 if _p95 > 500.0 else _v
+
+            if 'DISTWALK' in seg.columns:
+                intra_mask = seg['OTAZ'] == seg['DTAZ']
+                wd_km = _to_km(seg['DISTWALK'])
+                seg['walk_avail'] = ((intra_mask) | (wd_km < WALK_MAX_KM)).astype(int)
+            if 'DISTBIKE' in seg.columns:
+                intra_mask = seg['OTAZ'] == seg['DTAZ']
+                bd_km = _to_km(seg['DISTBIKE'])
+                seg['bike_avail'] = ((intra_mask) | (bd_km < BIKE_MAX_KM)).astype(int)
+            elif 'SOVTOLL_TIME__AM' in seg.columns:
+                # IVT proxy if distance skims absent
+                intra_mask = seg['OTAZ'] == seg['DTAZ']
+                ivt = seg['SOVTOLL_TIME__AM']
+                seg['walk_avail'] = ((intra_mask) | (ivt < 10.0)).astype(int)    # was 5.0
+                seg['bike_avail'] = ((intra_mask) | (ivt < 20.0)).astype(int)    # was 12.0
+            logger.info(
+                f"_run_segment [{segment}]: walk_avail={seg['walk_avail'].sum()} "
+                f"bike_avail={seg['bike_avail'].sum()} (of {len(seg)})"
+            )
+    # Guarantee walk_avail / bike_avail are always present in seg so that
+    # avail_vars_hint always includes them regardless of whether skim_df had
+    # DISTWALK/DISTBIKE.  Default to fully available (1) - the distance-based
+    # computation above has already set tighter thresholds when data was present.
+    if 'walk_avail' not in seg.columns:
+        seg['walk_avail'] = 1
+    if 'bike_avail' not in seg.columns:
+        seg['bike_avail'] = 1
+    # Same guarantee for the materialized DA flag (see _prep_hhts_tours):
+    # recompute from seg's own CARLICENCE/vehrd so _build_mode_model picks
+    # the repair-friendly column over the expression fallback.
+    if 'da_avail' not in seg.columns and \
+            os.environ.get('STAGE5_DA_AVAIL_COL', '1').strip() != '0':
+        try:
+            seg['da_avail'] = _da_avail_series(seg)
+        except Exception:
+            pass
+    # Same guarantee for the PT availability flags (STAGE5_PT_MODES=1; see
+    # _prep_hhts_tours): _run_segment also serves frames that never pass
+    # through _prep_hhts_tours (trip-like tables, GA/vv frames), and the
+    # _build_mode_model fallbacks ("(bikes > 0)" / expression DA) are exactly
+    # what the materialized columns exist to avoid.
+    if STAGE5_PT_MODES:
+        try:
+            if 'pt_drive_avail' not in seg.columns:
+                if 'da_avail' in seg.columns:
+                    seg['pt_drive_avail'] = pd.to_numeric(
+                        seg['da_avail'], errors='coerce').fillna(0).astype(np.int8)
+                else:
+                    seg['pt_drive_avail'] = _da_avail_series(seg)
+            if 'pt_bike_avail' not in seg.columns:
+                _bk = (pd.to_numeric(seg['bikes'], errors='coerce').fillna(0) > 0) \
+                    if 'bikes' in seg.columns else pd.Series(False, index=seg.index)
+                seg['pt_bike_avail'] = _bk.astype(np.int8)
+        except Exception as _pte:
+            logger.debug(f"_run_segment [{segment}]: PT availability skipped ({_pte})")
+    return seg
+
+
+def _repair_chosen_mode_avail(seg: pd.DataFrame) -> pd.DataFrame:
+    """Mark each tour's chosen mode available (estimation and its reproduction)."""
+    # Guarantee chosen alternatives are marked available in estimation data.
+    # This prevents chosen_but_not_available diagnostics and Inf likelihood.
+    if 'tour_mode' in seg.columns:
+        try:
+            if 'walk_avail' in seg.columns:
+                seg.loc[seg['tour_mode'] == MODE_MAP['Walk'], 'walk_avail'] = 1
+            if 'bike_avail' in seg.columns:
+                seg.loc[seg['tour_mode'] == MODE_MAP['Bike'], 'bike_avail'] = 1
+            if 'CARLICENCE' in seg.columns:
+                # Coerce first (see _prep_hhts_tours): bool-dtype CARLICENCE
+                # makes `.loc[mask] = 1` raise TypeError on pandas 3.
+                try:
+                    seg['CARLICENCE'] = pd.to_numeric(
+                        seg['CARLICENCE'], errors='coerce').fillna(1).astype(int)
+                except Exception:
+                    pass
+                seg.loc[seg['tour_mode'] == MODE_MAP['DA'], 'CARLICENCE'] = 1
+            # PT alternatives (6-8, STAGE5_PT_MODES=1): same policy as above —
+            # PT_Bike always repaired (mirrors Bike), PT_Drive only when PLC is
+            # off (mirrors the DA identifying-variation policy; see
+            # _prep_hhts_tours).
+            if STAGE5_PT_MODES:
+                if 'pt_drive_avail' in seg.columns and not STAGE5_ENABLE_PLC:
+                    seg.loc[seg['tour_mode'] == MODE_MAP['PT_Drive'],
+                            'pt_drive_avail'] = 1
+                if 'pt_bike_avail' in seg.columns:
+                    seg.loc[seg['tour_mode'] == MODE_MAP['PT_Bike'],
+                            'pt_bike_avail'] = 1
+        except Exception:
+            pass
+    return seg
+
+
 def _da_avail_for_tours(tour_rows: pd.DataFrame,
                         persons: pd.DataFrame) -> np.ndarray:
     """Person-level DA availability aligned, row-for-row, to ``tour_rows``.
@@ -22872,117 +23037,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
             print(f"           Purpose column values: {seg[next((c for c in ['primary_purpose','main_purpose','purpose'] if c in seg.columns), seg.columns[0])].value_counts().head(10).to_dict()}")
         return {}
 
-    # ── merge OD skim values onto seg for the mixed logit ─────────────────
-    # _estimate_mixed_logit needs per-observation IVT/distance values.
-    # The HHTS tour table has OTAZ/DTAZ but no skim columns.  We merge the
-    # key columns here so the MXL baseline gets real variation to estimate.
-    _MERGE_COLS = [
-        'SOVTOLL_TIME__AM', 'SOVTOLL_DIST__AM', 'DISTWALK', 'DISTBIKE',
-        'WLK_LOC_WLK_TOTIVT__AM', 'WLK_LOC_WLK_WAIT__AM',
-        'WLK_LOC_WLK_BOARDS__AM', 'WLK_LOC_DRV_TOTIVT__AM',
-        'WLK_LOC_DRV_WAIT__AM', 'WLK_LOC_DRV_BOARDS__AM',
-        'WLK_LOC_DRV_DTIM__AM', 'WLK_LOC_DRV_DDIST__AM',
-    ]
-    if skim_df is not None and not skim_df.empty:
-        avail_merge = [c for c in _MERGE_COLS if c in skim_df.columns]
-        if avail_merge:
-            sk_sub = (skim_df[['OTAZ', 'DTAZ'] + avail_merge]
-                      .drop_duplicates(['OTAZ', 'DTAZ']))
-            # drop any existing skim cols to avoid _x/_y suffixes
-            seg = seg.drop(columns=[c for c in avail_merge if c in seg.columns],
-                           errors='ignore')
-            seg = seg.merge(sk_sub, on=['OTAZ', 'DTAZ'], how='left')
-            # fill missing (zone not in skim) with plausible defaults
-            for col, default in [
-                ('SOVTOLL_TIME__AM', 30.0),
-                ('SOVTOLL_DIST__AM', 20.0),
-                ('DISTWALK', 20.0), ('DISTBIKE', 20.0),
-                ('WLK_LOC_WLK_TOTIVT__AM', 45.0),
-                ('WLK_LOC_WLK_WAIT__AM', 20.0),
-                ('WLK_LOC_WLK_BOARDS__AM', 2.0),
-                ('WLK_LOC_DRV_TOTIVT__AM', 45.0),
-                ('WLK_LOC_DRV_WAIT__AM', 15.0),
-                ('WLK_LOC_DRV_BOARDS__AM', 2.0),
-                ('WLK_LOC_DRV_DTIM__AM', 15.0),
-                ('WLK_LOC_DRV_DDIST__AM', 8.0),
-            ]:
-                if col in seg.columns:
-                    seg[col] = pd.to_numeric(seg[col], errors='coerce').fillna(default)
-            logger.info(
-                f"_run_segment [{segment}]: merged {len(avail_merge)} skim cols; "
-                f"IVT median={seg['SOVTOLL_TIME__AM'].median():.1f} min")
-
-            # ── recompute walk/bike availability from actual distances ────
-            # Use DISTWALK/DISTBIKE directly with realistic zone-level thresholds.
-            # Estimation availability must match prediction thresholds (WALK_MAX_KM=6.0,
-            # BIKE_MAX_KM=25.0 in _predict_batch) so that frozen probability cells
-            # computed from HHTS data transfer correctly to the synthetic population.
-            # Mismatched thresholds suppress walk/bike in HHTS estimation while
-            # allowing them in prediction, causing frozen probs to underweight
-            # active modes.
-            def _to_km(_s: pd.Series) -> pd.Series:
-                _v = pd.to_numeric(_s, errors='coerce').fillna(0.0).clip(lower=0.0)
-                try:
-                    _p95 = float(_v.quantile(0.95))
-                except Exception:
-                    _p95 = float(_v.max()) if len(_v) else 0.0
-                # Some skim builds store DISTWALK/DISTBIKE in meters.
-                return _v / 1000.0 if _p95 > 500.0 else _v
-
-            if 'DISTWALK' in seg.columns:
-                intra_mask = seg['OTAZ'] == seg['DTAZ']
-                wd_km = _to_km(seg['DISTWALK'])
-                seg['walk_avail'] = ((intra_mask) | (wd_km < WALK_MAX_KM)).astype(int)
-            if 'DISTBIKE' in seg.columns:
-                intra_mask = seg['OTAZ'] == seg['DTAZ']
-                bd_km = _to_km(seg['DISTBIKE'])
-                seg['bike_avail'] = ((intra_mask) | (bd_km < BIKE_MAX_KM)).astype(int)
-            elif 'SOVTOLL_TIME__AM' in seg.columns:
-                # IVT proxy if distance skims absent
-                intra_mask = seg['OTAZ'] == seg['DTAZ']
-                ivt = seg['SOVTOLL_TIME__AM']
-                seg['walk_avail'] = ((intra_mask) | (ivt < 10.0)).astype(int)    # was 5.0
-                seg['bike_avail'] = ((intra_mask) | (ivt < 20.0)).astype(int)    # was 12.0
-            logger.info(
-                f"_run_segment [{segment}]: walk_avail={seg['walk_avail'].sum()} "
-                f"bike_avail={seg['bike_avail'].sum()} (of {len(seg)})"
-            )
-    # Guarantee walk_avail / bike_avail are always present in seg so that
-    # avail_vars_hint always includes them regardless of whether skim_df had
-    # DISTWALK/DISTBIKE.  Default to fully available (1) - the distance-based
-    # computation above has already set tighter thresholds when data was present.
-    if 'walk_avail' not in seg.columns:
-        seg['walk_avail'] = 1
-    if 'bike_avail' not in seg.columns:
-        seg['bike_avail'] = 1
-    # Same guarantee for the materialized DA flag (see _prep_hhts_tours):
-    # recompute from seg's own CARLICENCE/vehrd so _build_mode_model picks
-    # the repair-friendly column over the expression fallback.
-    if 'da_avail' not in seg.columns and \
-            os.environ.get('STAGE5_DA_AVAIL_COL', '1').strip() != '0':
-        try:
-            seg['da_avail'] = _da_avail_series(seg)
-        except Exception:
-            pass
-    # Same guarantee for the PT availability flags (STAGE5_PT_MODES=1; see
-    # _prep_hhts_tours): _run_segment also serves frames that never pass
-    # through _prep_hhts_tours (trip-like tables, GA/vv frames), and the
-    # _build_mode_model fallbacks ("(bikes > 0)" / expression DA) are exactly
-    # what the materialized columns exist to avoid.
-    if STAGE5_PT_MODES:
-        try:
-            if 'pt_drive_avail' not in seg.columns:
-                if 'da_avail' in seg.columns:
-                    seg['pt_drive_avail'] = pd.to_numeric(
-                        seg['da_avail'], errors='coerce').fillna(0).astype(np.int8)
-                else:
-                    seg['pt_drive_avail'] = _da_avail_series(seg)
-            if 'pt_bike_avail' not in seg.columns:
-                _bk = (pd.to_numeric(seg['bikes'], errors='coerce').fillna(0) > 0) \
-                    if 'bikes' in seg.columns else pd.Series(False, index=seg.index)
-                seg['pt_bike_avail'] = _bk.astype(np.int8)
-        except Exception as _pte:
-            logger.debug(f"_run_segment [{segment}]: PT availability skipped ({_pte})")
+    seg = _prepare_mode_seg(seg, skim_df, segment)
 
     transit_submode_model = _fit_transit_submode(seg, landuse=landuse)
     logger.info(
@@ -22992,36 +23047,7 @@ def _run_segment(segment: str, tours: pd.DataFrame,
         f"features={transit_submode_model.get('feature_names', [])}"
     )
 
-    # Guarantee chosen alternatives are marked available in estimation data.
-    # This prevents chosen_but_not_available diagnostics and Inf likelihood.
-    if 'tour_mode' in seg.columns:
-        try:
-            if 'walk_avail' in seg.columns:
-                seg.loc[seg['tour_mode'] == MODE_MAP['Walk'], 'walk_avail'] = 1
-            if 'bike_avail' in seg.columns:
-                seg.loc[seg['tour_mode'] == MODE_MAP['Bike'], 'bike_avail'] = 1
-            if 'CARLICENCE' in seg.columns:
-                # Coerce first (see _prep_hhts_tours): bool-dtype CARLICENCE
-                # makes `.loc[mask] = 1` raise TypeError on pandas 3.
-                try:
-                    seg['CARLICENCE'] = pd.to_numeric(
-                        seg['CARLICENCE'], errors='coerce').fillna(1).astype(int)
-                except Exception:
-                    pass
-                seg.loc[seg['tour_mode'] == MODE_MAP['DA'], 'CARLICENCE'] = 1
-            # PT alternatives (6-8, STAGE5_PT_MODES=1): same policy as above —
-            # PT_Bike always repaired (mirrors Bike), PT_Drive only when PLC is
-            # off (mirrors the DA identifying-variation policy; see
-            # _prep_hhts_tours).
-            if STAGE5_PT_MODES:
-                if 'pt_drive_avail' in seg.columns and not STAGE5_ENABLE_PLC:
-                    seg.loc[seg['tour_mode'] == MODE_MAP['PT_Drive'],
-                            'pt_drive_avail'] = 1
-                if 'pt_bike_avail' in seg.columns:
-                    seg.loc[seg['tour_mode'] == MODE_MAP['PT_Bike'],
-                            'pt_bike_avail'] = 1
-        except Exception:
-            pass
+    seg = _repair_chosen_mode_avail(seg)
 
     seg_coeffs = SEGMENT_COEFFICIENTS.get(segment, {})
     print(f"  {len(seg)} estimation tours | "

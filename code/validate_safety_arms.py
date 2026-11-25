@@ -355,6 +355,15 @@ def _predict_segment(seg, seg_df, seg_persons, models, landuse, skims,
     # crash and distance exposure maps miss every OD key.
     seg_df = _bridge_tours_zones_auto(
         seg_df, skims, skim_df, f"_predict_segment[{seg}]")
+    # Same skim merge, walk/bike/DA/PT availability flags and chosen-mode
+    # repair as _run_segment applies before _mode_tree at estimation.  Without
+    # it the rebuild kept _prep_hhts_tours' reported-distance walk/bike flags,
+    # a different choice set from the fit's skim-distance flags (work segment:
+    # 0.7-1.2% mode-LL reproduction gap on identical cases, all arms).
+    from stage5_destination_choice import (
+        _prepare_mode_seg, _repair_chosen_mode_avail)
+    seg_df = _repair_chosen_mode_avail(
+        _prepare_mode_seg(seg_df, skim_df, seg, keep_index=True))
 
     mv, mc = _free_vars_and_coefs(mode_fit)
     if not mv or not mc:
